@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/device/fastly",
+    "crates/geo/fastly",
+    # Test fixture that proves the integration seam from outside core. A
+    # workspace member so it shares workspace settings and lints; no default
+    # member and no adapter build reaches it, and only the Axum adapter's tests
+    # depend on it.
+    "crates/integrations/seam-probe",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -95,6 +102,7 @@ rustls-pemfile = "2"
 scraper = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
+serde_yaml_ng = "0.10"
 sha2 = "0.10.9"
 simple_logger = "5"
 spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
@@ -109,6 +117,8 @@ toml = "1.1"
 toml_edit = "0.23.10"
 tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
+trusted-server-device-fastly = { path = "crates/device/fastly" }
+trusted-server-geo-fastly = { path = "crates/geo/fastly" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
 url = "2.5.8"

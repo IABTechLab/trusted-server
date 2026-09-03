@@ -1,0 +1,27 @@
+[package]
+name = "trusted-server-integration-seam-probe"
+description = "Test fixture integration that exercises the Trusted Server integration seam from outside the core crate. Never ship in a deployment."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true }
+validator = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }

@@ -13,35 +13,13 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
 
+use crate::auction::AuctionProviderBuilder;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
-use crate::integrations::{
-    adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
-    didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
-    gpt_diagnostics::GptDiagnosticsConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
-    osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
-    testlight::TestlightConfig,
-};
-use crate::settings::{IntegrationConfig, Settings};
+use crate::integrations::IntegrationBuilder;
+use crate::settings::Settings;
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
-#[cfg(test)]
-const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
-    "prebid",
-    "aps",
-    "adserver_mock",
-    "testlight",
-    "nextjs",
-    "permutive",
-    "lockr",
-    "didomi",
-    "sourcepoint",
-    "osano",
-    "google_tag_manager",
-    "datadome",
-    "gpt",
-    "gpt_diagnostics",
-];
 
 /// Typed app-config root used by the `ts` CLI.
 ///
@@ -118,69 +96,47 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
     }
 }
 
-/// Runs Trusted Server deploy-time validation for pushed app config.
+/// Runs Trusted Server deploy-time validation for pushed app config with the
+/// built-in integrations and auction providers only.
 ///
 /// This supplements [`Settings`] structural validation with checks that should
 /// fail before an operator publishes a config blob: placeholder secrets,
-/// enabled integration startup checks, auction provider references, and EC
-/// partner registry construction.
+/// integration startup checks, auction provider references, and EC partner
+/// registry construction.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError`] when the config should not be deployed.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    validate_settings_for_deploy_with(settings, &[], &[])
+}
+
+/// Validates settings for deployment with the built-in integrations and
+/// auction providers followed by the externally supplied builders an adapter
+/// registers. Every builder validates, enabled or not, so a typo in a
+/// disabled block is still caught.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when the config should not be deployed.
+pub fn validate_settings_for_deploy_with(
+    settings: &Settings,
+    extra_integrations: &[IntegrationBuilder],
+    extra_auction_providers: &[AuctionProviderBuilder],
+) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    let enabled_auction_providers = validate_enabled_integrations(settings)?;
+    for builder in crate::integrations::all_builders(extra_integrations) {
+        builder.validate(settings)?;
+    }
+    let mut enabled_auction_providers = HashSet::new();
+    for builder in crate::auction::all_provider_builders(extra_auction_providers) {
+        if builder.validate(settings)? {
+            enabled_auction_providers.insert(builder.name());
+        }
+    }
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
-}
-
-fn validate_enabled_integrations(
-    settings: &Settings,
-) -> Result<HashSet<&'static str>, Report<TrustedServerError>> {
-    let mut enabled_auction_providers = HashSet::new();
-
-    if validate_prebid(settings)? {
-        enabled_auction_providers.insert("prebid");
-    }
-    if validate_integration::<ApsConfig>(settings, "aps")? {
-        enabled_auction_providers.insert("aps");
-    }
-    if validate_integration::<AdServerMockConfig>(settings, "adserver_mock")? {
-        enabled_auction_providers.insert("adserver_mock");
-    }
-    validate_integration::<TestlightConfig>(settings, "testlight")?;
-    validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
-    validate_integration::<PermutiveConfig>(settings, "permutive")?;
-    validate_integration::<LockrConfig>(settings, "lockr")?;
-    validate_integration::<DidomiIntegrationConfig>(settings, "didomi")?;
-    validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
-    validate_integration::<OsanoConfig>(settings, "osano")?;
-    validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
-    if let Some(config) = settings.integration_config::<DataDomeConfig>("datadome")? {
-        crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(config)?;
-    }
-    validate_integration::<GptConfig>(settings, "gpt")?;
-    validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
-
-    Ok(enabled_auction_providers)
-}
-
-fn validate_prebid(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    prebid::validate_config_for_startup(settings).map(|config| config.is_some())
-}
-
-fn validate_integration<T>(
-    settings: &Settings,
-    integration_id: &str,
-) -> Result<bool, Report<TrustedServerError>>
-where
-    T: IntegrationConfig,
-{
-    settings
-        .integration_config::<T>(integration_id)
-        .map(|config| config.is_some())
 }
 
 fn validate_auction_provider_names(
@@ -220,8 +176,44 @@ fn report_to_validation_errors(report: &Report<TrustedServerError>) -> Validatio
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use crate::auction::AuctionProvider;
+    use crate::integrations::{
+        IntegrationRegistration, lockr::LockrConfig, permutive::PermutiveConfig,
+        sourcepoint::SourcepointConfig,
+    };
     use crate::test_support::tests::crate_test_settings_str;
+
+    /// Message an external builder rejects with, so the test can prove the
+    /// rejection reached the caller intact.
+    const EXTERNAL_REJECTION_MESSAGE: &str = "seam probe refuses to deploy";
+
+    /// Stands in for a vendor integration builder that never enables.
+    fn build_nothing(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    /// Stands in for a vendor auction provider builder that never registers.
+    fn build_no_providers(
+        _settings: &Settings,
+    ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
+        Ok(Vec::new())
+    }
+
+    fn reject_deploy(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Configuration {
+            message: EXTERNAL_REJECTION_MESSAGE.to_string(),
+        }))
+    }
+
+    fn report_enabled(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -469,7 +461,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "production-secret-key-32-bytes-min"
 
 [[handlers]]
@@ -687,17 +685,140 @@ password = "production-admin-password-32-bytes"
         );
     }
 
+    /// Counts calls to [`record_validate_call`]. A builder holds plain fn
+    /// pointers and cannot capture, so the recording has to go through a
+    /// static.
+    static RECORDED_VALIDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_validate_call(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        RECORDED_VALIDATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(false)
+    }
+
+    /// Every builder handed to deploy validation has its `validate` run, and
+    /// reporting disabled does not excuse a builder from validating.
     #[test]
-    fn deploy_validation_covers_registered_integration_builders() {
-        let validated_ids: HashSet<&'static str> =
-            DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
-        let missing_ids = crate::integrations::registered_builder_ids()
-            .filter(|id| !validated_ids.contains(id))
-            .collect::<Vec<_>>();
+    fn deploy_validation_runs_every_builder_it_is_given() {
+        RECORDED_VALIDATE_CALLS.store(0, Ordering::SeqCst);
+        let extra_integrations = [IntegrationBuilder::new(
+            "seam-probe-integration",
+            "seam-probe-crate",
+            build_nothing,
+            record_validate_call,
+        )];
+        let extra_auction_providers = [AuctionProviderBuilder::new(
+            "seam-probe-provider",
+            "seam-probe-crate",
+            build_no_providers,
+            record_validate_call,
+        )];
+
+        validate_settings_for_deploy_with(
+            &valid_settings(),
+            &extra_integrations,
+            &extra_auction_providers,
+        )
+        .expect("should accept settings whose external builders report disabled");
+
+        assert_eq!(
+            RECORDED_VALIDATE_CALLS.load(Ordering::SeqCst),
+            2,
+            "both external builders should validate even though each reports disabled"
+        );
+    }
+
+    /// Deploy validation reaches each built-in builder's own config type, one
+    /// id at a time, by planting a block that type cannot deserialize. Every
+    /// integration config carries a boolean `enabled`, so a string there fails
+    /// for all of them.
+    ///
+    /// This catches deploy validation ceasing to validate the built-ins, or
+    /// validating only the enabled ones. It cannot catch a builder deleted
+    /// from `BUILT_IN_BUILDERS`, because the loop below reads the same
+    /// constant the validation walks; no independent list of the built-ins
+    /// exists in the crate.
+    #[test]
+    fn deploy_validation_reaches_every_built_in_builder() {
+        for id in crate::integrations::builders()
+            .iter()
+            .map(IntegrationBuilder::id)
+            .chain(
+                crate::auction::provider_builders()
+                    .iter()
+                    .map(AuctionProviderBuilder::name),
+            )
+        {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config(id, &serde_json::json!({ "enabled": "not-a-boolean" }))
+                .expect("should insert the probe config");
+
+            assert!(
+                validate_settings_for_deploy(&settings).is_err(),
+                "deploy validation should reach the `{id}` builder and reject its planted config"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_validation_surfaces_an_external_integration_builders_rejection() {
+        let extra = [IntegrationBuilder::new(
+            "seam-probe",
+            "seam-probe-crate",
+            build_nothing,
+            reject_deploy,
+        )];
+
+        let err = validate_settings_for_deploy_with(&valid_settings(), &extra, &[])
+            .expect_err("should surface the external integration builder's rejection");
 
         assert!(
-            missing_ids.is_empty(),
-            "deploy validation should cover all registered integration builders: {missing_ids:?}"
+            err.to_string().contains(EXTERNAL_REJECTION_MESSAGE),
+            "should keep the external builder's message intact: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_surfaces_an_external_auction_providers_rejection() {
+        let extra = [AuctionProviderBuilder::new(
+            "seam-probe",
+            "seam-probe-crate",
+            build_no_providers,
+            reject_deploy,
+        )];
+
+        let err = validate_settings_for_deploy_with(&valid_settings(), &[], &extra)
+            .expect_err("should surface the external auction provider builder's rejection");
+
+        assert!(
+            err.to_string().contains(EXTERNAL_REJECTION_MESSAGE),
+            "should keep the external builder's message intact: {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_external_auction_provider_satisfies_a_configured_provider_name() {
+        let mut settings = valid_settings();
+        settings.auction.enabled = true;
+        settings.auction.providers = vec!["probe".to_string()];
+        let extra = [AuctionProviderBuilder::new(
+            "probe",
+            "seam-probe-crate",
+            build_no_providers,
+            report_enabled,
+        )];
+
+        validate_settings_for_deploy_with(&settings, &[], &extra)
+            .expect("an external auction provider should satisfy its configured name");
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject the configured name without the external builder");
+
+        assert!(
+            err.to_string()
+                .contains("no enabled integration provides it"),
+            "should report the unprovided auction provider name: {err:?}"
         );
     }
 

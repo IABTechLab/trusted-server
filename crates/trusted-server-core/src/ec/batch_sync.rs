@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::TrustedServerError;
 
 use super::auth::authenticate_bearer;
-use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
 use super::kv::{KvIdentityGraph, UpsertResult};
 use super::log_id;
+use super::provider::{AcceptedProviders, EdgeCookieProvider};
 use super::rate_limiter::RateLimiter;
 use super::registry::PartnerRegistry;
 
@@ -101,15 +101,17 @@ pub fn handle_batch_sync(
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
+    provider: Option<&dyn EdgeCookieProvider>,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, registry, rate_limiter, req)
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, provider, req)
 }
 
 fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
+    provider: Option<&dyn EdgeCookieProvider>,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // 1. Authenticate
@@ -153,7 +155,12 @@ fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings);
+    let (accepted, errors) = process_mappings(
+        writer,
+        &partner.source_domain,
+        &body.mappings,
+        &AcceptedProviders::active(provider),
+    );
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -183,19 +190,24 @@ fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
     mappings: &[SyncMapping],
+    accepted_providers: &AcceptedProviders<'_>,
 ) -> (usize, Vec<MappingError>) {
     let mut accepted: usize = 0;
     let mut errors = Vec::new();
 
     for (idx, mapping) in mappings.iter().enumerate() {
-        let ec_id = normalize_ec_id_for_kv(&mapping.ec_id);
-        if !is_valid_ec_id(&ec_id) {
+        // The global cookie bounds, then the provider that owns the
+        // identifier's code, which canonicalizes its own value part and decides
+        // whether the canonical form is one of its own. A partner echoing back
+        // an identifier a non-HMAC provider created is accepted here; an
+        // identifier under a code this deployment does not read is not.
+        let Some(ec_id) = accepted_providers.canonical_kv_key(&mapping.ec_id) else {
             errors.push(MappingError {
                 index: idx,
                 reason: REASON_INVALID_EC_ID,
             });
             continue;
-        }
+        };
 
         if mapping.partner_uid.trim().is_empty() || mapping.partner_uid.len() > MAX_UID_LENGTH {
             errors.push(MappingError {
@@ -266,17 +278,49 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    use crate::ec::provider::{HmacProvider, IdentityInput, ProviderCode};
     use crate::error::TrustedServerError;
+    use crate::evidence::RequestInfo;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
-    // EC ID validation tests are in generation.rs (is_valid_ec_id).
-    // Verify the import works here with a basic smoke test.
-    #[test]
-    fn is_valid_ec_id_smoke_test() {
-        let valid = format!("{}.ABC123", "a".repeat(64));
-        assert!(is_valid_ec_id(&valid));
-        assert!(!is_valid_ec_id(&"a".repeat(64)));
+    /// The built-in provider, standing in for a deployment that selected it.
+    fn hmac_provider() -> HmacProvider {
+        HmacProvider::new(Redacted::new("test-secret-key-32-bytes-minimum".to_owned()))
+    }
+
+    /// A non-HMAC provider whose identifiers are opaque, modeling the
+    /// host-signal provider PR #1044 adds: valid identifiers that the built-in
+    /// HMAC grammar rejects outright.
+    #[derive(Debug)]
+    struct OpaqueProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::provider::EdgeCookieProvider for OpaqueProvider {
+        fn id(&self) -> &'static str {
+            "opaque"
+        }
+
+        fn code(&self) -> ProviderCode {
+            crate::provider_code!("t0op")
+        }
+
+        async fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
+        ) -> Result<crate::ec::provider::GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_owned()
+        }
     }
 
     struct MockRateLimiter {
@@ -421,7 +465,7 @@ mod tests {
             .body(EdgeBody::from("not-json"))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, None, req)
             .expect("should return oversized response");
 
         assert_eq!(
@@ -447,7 +491,7 @@ mod tests {
             .body(EdgeBody::from(oversized_body))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, None, req)
             .expect("should return oversized response");
 
         assert_eq!(
@@ -466,7 +510,13 @@ mod tests {
             mapping(&format!("{}.ABC123", "a".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let provider = hmac_provider();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&provider)),
+        );
 
         assert_eq!(accepted, 1, "should count successful writes as accepted");
         assert_eq!(errors.len(), 2, "should reject invalid mappings only");
@@ -493,7 +543,13 @@ mod tests {
             mapping(&format!("{}.ABC123", "c".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let provider = hmac_provider();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&provider)),
+        );
 
         assert_eq!(accepted, 1, "should keep accepted count before failure");
         assert_eq!(
@@ -521,7 +577,7 @@ mod tests {
             .expect("should build test request");
 
         let response =
-            handle_batch_sync(&kv, &registry, &limiter, req).expect("should return response");
+            handle_batch_sync(&kv, &registry, &limiter, None, req).expect("should return response");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,
@@ -581,7 +637,13 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-2", 101)];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let provider = hmac_provider();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&provider)),
+        );
 
         assert_eq!(accepted, 0, "should not accept ineligible mappings");
         assert_eq!(errors.len(), 2, "should report both errors");
@@ -592,12 +654,103 @@ mod tests {
     }
 
     #[test]
+    fn process_mappings_accepts_an_identifier_from_the_active_non_hmac_provider() {
+        // A deployment whose active provider is not the built-in HMAC one still
+        // has to accept the identifiers that provider created. Before the
+        // dispatch these were rejected outright by the HMAC grammar, so a
+        // partner could never sync a mapping against them.
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let mappings = vec![mapping("t0op~Opaque_Value_MixedCase", "uid-1", 100)];
+
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&OpaqueProvider)),
+        );
+
+        assert_eq!(accepted, 1, "the active provider's identifier is accepted");
+        assert!(
+            errors.is_empty(),
+            "should report no errors, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn process_mappings_rejects_a_code_no_configured_provider_reads() {
+        // The other side of the dispatch: a code belonging to a provider this
+        // deployment neither runs nor reads is not an identifier here, whatever
+        // its shape.
+        let writer = MockWriter::new(vec![]);
+        let hmac_shaped = format!("t0zz~{}.ABC123", "a".repeat(64));
+        let mappings = vec![
+            mapping("t0zz~Opaque_Value", "uid-1", 100),
+            mapping(&hmac_shaped, "uid-2", 100),
+        ];
+
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&OpaqueProvider)),
+        );
+
+        assert_eq!(accepted, 0, "an unknown provider code is not accepted");
+        assert_eq!(errors.len(), 2, "both mappings should be rejected");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.reason == REASON_INVALID_EC_ID),
+            "should reject as an invalid EC ID, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn process_mappings_canonicalizes_through_the_owning_provider() {
+        // KV normalization is dispatched the same way as validation. The
+        // built-in provider lowercases its hash segment, so a partner echoing
+        // uppercase hex still writes the row created at generation time, while
+        // the opaque provider's own normalization leaves its value untouched.
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let uppercase = format!("hmac~{}.ABC123", "A".repeat(64));
+        let provider = hmac_provider();
+        let accepted_providers = AcceptedProviders::active(Some(&provider));
+
+        assert_eq!(
+            accepted_providers.canonical_kv_key(&uppercase),
+            Some(format!("hmac~{}.ABC123", "a".repeat(64))),
+            "the built-in provider should lowercase only its hash segment"
+        );
+        assert_eq!(
+            AcceptedProviders::active(Some(&OpaqueProvider))
+                .canonical_kv_key("t0op~Opaque_Value_MixedCase"),
+            Some("t0op~Opaque_Value_MixedCase".to_owned()),
+            "an opaque provider's identifier should be keyed verbatim"
+        );
+
+        let mappings = vec![mapping(&uppercase, "uid-1", 100)];
+        let (accepted, errors) =
+            process_mappings(&writer, "partner", &mappings, &accepted_providers);
+        assert_eq!(accepted, 1, "uppercase hex should still be accepted");
+        assert!(
+            errors.is_empty(),
+            "should report no errors, got: {errors:?}"
+        );
+    }
+
+    #[test]
     fn process_mappings_counts_unchanged_as_accepted() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Unchanged)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100)];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let provider = hmac_provider();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&provider)),
+        );
 
         assert_eq!(accepted, 1, "should count unchanged mappings as accepted");
         assert!(
@@ -615,12 +768,41 @@ mod tests {
             mapping(&ec_id, "uid-old", 100),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let provider = hmac_provider();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&provider)),
+        );
 
         assert_eq!(
             accepted, 2,
             "timestamps are compatibility fields and should not reject older mappings"
         );
         assert!(errors.is_empty(), "should accept valid mappings");
+    }
+
+    #[test]
+    fn process_mappings_accepts_a_minted_coded_ec_id() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        // Partners echo the identifier identify gave them, which carries the
+        // provider-code envelope since the creation path applies it.
+        let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
+        let mappings = vec![mapping(&ec_id, "uid-1", 1)];
+
+        let provider = hmac_provider();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedProviders::active(Some(&provider)),
+        );
+
+        assert_eq!(accepted, 1, "should accept a coded HMAC identifier");
+        assert!(
+            errors.is_empty(),
+            "should report no format error for a coded HMAC identifier"
+        );
     }
 }

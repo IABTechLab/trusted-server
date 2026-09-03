@@ -35,7 +35,13 @@ fn test_router() -> RouterService {
             proxy_secret = "route-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
         "#,
     )
     .expect("should parse route test settings");
@@ -368,7 +374,9 @@ async fn tsjs_route_is_routed_not_5xx() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
     let router = test_router();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let src = trusted_server_core::tsjs::tsjs_script_src(
+        &trusted_server_core::tsjs_bundle::compile_time_parts(&["creative"]),
+    );
     let req = request_builder()
         .method("GET")
         .uri(src)
@@ -971,5 +979,60 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
         resp.status().as_u16(),
         401,
         "admin/keys/deactivate without credentials must return 401"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Edge Cookie provider availability
+// ---------------------------------------------------------------------------
+
+/// Test settings selecting a vendor Edge Cookie provider this adapter does not
+/// inject, with the `[ec.providers.<key>]` block configuration validation
+/// requires. `acme` is a fictional vendor key.
+const UNINJECTED_PROVIDER_TOML: &str = r#"
+    [[handlers]]
+    path = "^/_ts/admin"
+    username = "admin"
+    password = "admin-pass"
+
+    [publisher]
+    domain = "test-publisher.example.com"
+    cookie_domain = ".test-publisher.example.com"
+    origin_url = "https://origin.test-publisher.example.com"
+    proxy_secret = "route-test-proxy-secret"
+
+    [ec]
+    provider = "acme"
+
+    [ec.providers.acme]
+    endpoint = "https://ec.acme.example.com"
+
+    # An Edge Cookie provider is configured, so single-jurisdiction operation
+    # is acknowledged because no geo provider is selected.
+    [geo]
+    assume_single_jurisdiction = true
+"#;
+
+/// A provider selection this adapter can never supply must fail while the
+/// application state is built, before any request is served.
+///
+/// Configuration validation accepts this pair (the `[ec.providers.acme]` block
+/// is present), and this adapter injects no vendor Edge Cookie provider, so only
+/// the composition root can catch it. Without the startup check the deployment
+/// would come up and answer every request.
+#[test]
+fn selecting_a_provider_this_adapter_cannot_supply_fails_at_startup() {
+    let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
+        .expect("should parse settings selecting an uninjected provider");
+
+    // `RouterService` is not `Debug`, so take the error side directly rather
+    // than through `expect_err`.
+    let error = TrustedServerApp::routes_with_settings(settings)
+        .err()
+        .expect("building state with an uninjected provider should fail");
+
+    assert!(
+        error.to_string().contains("acme"),
+        "the startup error should name the selected provider, got: {error}"
     );
 }

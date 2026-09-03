@@ -606,8 +606,13 @@ impl PlatformHttpClient for StubHttpClient {
 
 pub(crate) struct NoopGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for NoopGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &crate::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }
@@ -686,6 +691,145 @@ pub(crate) fn build_services_with_config(
 
 pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
+}
+
+/// Build a [`RuntimeServices`] with an injected geo provider, so a test can
+/// drive a geo outcome through the [`PlatformGeo`] seam rather than
+/// constructing the resolved status by hand.
+///
+/// This is the only way to reach the lookup-failure path, because the seam is
+/// what turns an `Err` into the requires-signal floor.
+pub(crate) fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(geo)
+        .client_info(ClientInfo::default())
+        .build()
+}
+
+/// Build a [`RuntimeServices`] carrying an Edge Cookie provider, so a test can
+/// exercise the seam an opaque-identifier vendor provider reaches core through.
+pub(crate) fn noop_services_with_ec_provider(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    // A fixed client IP, so a provider that reads one (the built-in HMAC
+    // provider does) can run.
+    noop_services_with_ec_provider_and_ip(
+        ec_provider,
+        Some("203.0.113.10".parse().expect("should parse test client IP")),
+    )
+}
+
+/// Build a [`RuntimeServices`] with an injected Edge Cookie provider and no
+/// client IP, modeling a host that cannot determine one.
+///
+/// Whether that matters is the provider's decision, so this exists to test
+/// both answers: a provider reading other evidence still creates an
+/// identifier, and one that needs the IP refuses.
+/// A config store that answers one known key, so a test can prove a provider
+/// reached the config store it was handed rather than a value it already held.
+#[derive(Debug)]
+pub(crate) struct FixedConfigStore {
+    pub(crate) store: &'static str,
+    pub(crate) key: &'static str,
+    pub(crate) value: &'static str,
+}
+
+impl PlatformConfigStore for FixedConfigStore {
+    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        if store_name.as_ref() == self.store && key == self.key {
+            Ok(self.value.to_owned())
+        } else {
+            Err(Report::new(PlatformError::ConfigStore))
+        }
+    }
+
+    fn put(
+        &self,
+        _store_id: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// Build a [`RuntimeServices`] carrying both an Edge Cookie provider and a
+/// config store the provider is expected to read through, so a test can prove
+/// the services reaching the provider are the ones the caller supplied.
+pub(crate) fn services_with_ec_provider_and_config_store(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+    config_store: Arc<dyn PlatformConfigStore>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(config_store)
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            ..ClientInfo::default()
+        })
+        .resolved_ec_provider(ec_provider)
+        .build()
+}
+
+pub(crate) fn noop_services_with_ec_provider_without_client_ip(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    noop_services_with_ec_provider_and_ip(ec_provider, None)
+}
+
+/// Build a [`RuntimeServices`] carrying an Edge Cookie provider that a
+/// composition root already resolved, the way a production adapter threads it.
+///
+/// Use this to check that the request path reuses that instance rather than
+/// resolving `[ec] provider` for itself.
+pub(crate) fn noop_services_with_resolved_ec_provider(
+    resolved: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            ..ClientInfo::default()
+        })
+        .resolved_ec_provider(resolved)
+        .build()
+}
+
+fn noop_services_with_ec_provider_and_ip(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+    client_ip: Option<IpAddr>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip,
+            ..ClientInfo::default()
+        })
+        .resolved_ec_provider(ec_provider)
+        .build()
 }
 
 /// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied

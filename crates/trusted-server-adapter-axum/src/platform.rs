@@ -186,8 +186,13 @@ impl PlatformBackend for AxumPlatformBackend {
 /// No-op geo implementation — geographic lookup is unavailable in local development.
 pub struct AxumPlatformGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for AxumPlatformGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }
@@ -533,7 +538,10 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 /// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
 /// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
 /// emitted once per process.
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+    settings: &trusted_server_core::settings::Settings,
+) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
         log::warn!(
@@ -578,9 +586,12 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         // API-route integration flow by reusing a poisoned connection after a
         // truncated POST. Revisit pooling if profiling shows allocation cost.
         .http_client(Arc::new(AxumPlatformHttpClient::new()))
-        .geo(Arc::clone(GEO.get_or_init(|| {
-            Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>
-        })))
+        // Route through the [geo] provider selector like the Fastly adapter,
+        // so the selector behaves the same on every adapter.
+        .geo(trusted_server_core::platform::build_geo_provider(
+            settings,
+            Arc::clone(GEO.get_or_init(|| Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>)),
+        ))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -598,6 +609,21 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
 mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
+
+    /// The services graph a provider is handed, built the same way the request
+    /// path builds it so the tests exercise the production shape.
+    fn test_services() -> RuntimeServices {
+        let req = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ctx = edgezero_core::context::RequestContext::new(
+            req,
+            edgezero_core::params::PathParams::default(),
+        );
+        build_runtime_services(&ctx, &trusted_server_core::settings::Settings::default())
+    }
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -682,13 +708,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn geo_always_returns_none() {
+    #[tokio::test]
+    async fn geo_always_returns_none() {
         let geo = AxumPlatformGeo;
-        let no_ip = geo.lookup(None).expect("should not error");
+        let no_ip = geo
+            .lookup(None, &test_services())
+            .await
+            .expect("should not error");
         assert!(no_ip.is_none(), "should return None for no IP");
         let with_ip = geo
-            .lookup(Some("127.0.0.1".parse().expect("should parse IP")))
+            .lookup(
+                Some("127.0.0.1".parse().expect("should parse IP")),
+                &test_services(),
+            )
+            .await
             .expect("should not error");
         assert!(with_ip.is_none(), "should return None for any IP");
     }

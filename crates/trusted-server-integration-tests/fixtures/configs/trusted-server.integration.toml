@@ -9,10 +9,23 @@ cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration-test-proxy-secret"
 
+# Viceroy does not resolve geolocation for the loopback test client, so the
+# request carries no country and the top of the permissions.yaml rules tree
+# supplies the baseline the permission model uses.
+[geo]
+# Viceroy maps the loopback client to US/CA (see viceroy-template.toml), so
+# the platform geo provider resolves a real place and the EC lifecycle
+# scenarios exercise the US state opt-out machinery, the same posture the
+# retired default_country setting pointed at, now through the real lookup.
+provider = "platform"
+
 [ec]
-passphrase = "integration-test-ec-secret-padded-32"
+provider = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
+
+[ec.providers.hmac]
+passphrase = "integration-test-ec-secret-padded-32"
 
 [[ec.partners]]
 name = "Integration Test Partner"

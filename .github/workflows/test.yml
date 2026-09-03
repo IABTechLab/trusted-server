@@ -65,8 +65,12 @@ jobs:
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
 
   test-axum:
-    name: cargo test (axum native)
-    runs-on: ubuntu-latest
+    name: cargo test (axum native, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -103,12 +107,33 @@ jobs:
         run: |
           cargo test --package trusted-server-openrtb-codegen --target "$(rustc -vV | sed -n 's/host: //p')"
 
+      # The core library's unit tests otherwise run only on the WebAssembly
+      # targets, which build with panic=abort, so their harness stops at the
+      # first failing test and reports every later one as never run. A run that
+      # looks like a single failure can hide many more. This native run reports
+      # them all at once, which is what makes a red build readable.
+      - name: Run host-target core library tests
+        run: |
+          cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/host: //p')"
+
+      # The seam-probe fixture crate's own unit tests only run when invoked on
+      # the host target, because no adapter alias compiles its test target. Run
+      # them here so a fault in the seam fixture cannot sit unseen behind a
+      # green gate set.
+      - name: Run host-target seam-probe integration tests
+        run: |
+          cargo test --package trusted-server-integration-seam-probe --target "$(rustc -vV | sed -n 's/host: //p')"
+
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
   test-cloudflare:
-    name: cargo check (cloudflare native + wasm32-unknown-unknown)
-    runs-on: ubuntu-latest
+    name: cargo check (cloudflare native + wasm32-unknown-unknown, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 

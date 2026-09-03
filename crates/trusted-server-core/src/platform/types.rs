@@ -9,6 +9,9 @@ use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::ec::device::DeviceProvider;
+use crate::ec::provider::EdgeCookieProvider;
+use crate::evidence::HostSignals;
 
 /// Geographic information extracted from a request.
 ///
@@ -18,7 +21,7 @@ use super::{
 pub struct GeoInfo {
     /// City name.
     pub city: String,
-    /// Two-letter country code.
+    /// ISO 3166-1 alpha-2 country code, for example `US` or `GB`.
     pub country: String,
     /// Continent name.
     pub continent: String,
@@ -28,7 +31,8 @@ pub struct GeoInfo {
     pub longitude: f64,
     /// DMA (Designated Market Area) / metro code.
     pub metro_code: i64,
-    /// Region code.
+    /// ISO 3166-2 subdivision code without the country prefix, for example `CA`
+    /// for California, or `None` when no region resolves.
     pub region: Option<String>,
     /// Autonomous System Number (e.g. `7922` = Comcast).
     /// Used to distinguish home ISP vs. corporate VPN.
@@ -188,6 +192,18 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Host-computed client signals (TLS JA4, HTTP/2), when the host
+    /// supplies them. `None` on a host that exposes none, so a provider that
+    /// requires them cannot be built and the request stops.
+    pub(crate) host_signals: Option<Arc<dyn HostSignals>>,
+    /// The Edge Cookie provider this deployment already resolved from
+    /// `[ec] provider` while it built application state.
+    ///
+    /// `None` when the adapter resolved nothing here, in which case the request
+    /// path resolves the selection itself, which is what a deployment that
+    /// selects no provider, the Axum adapter, and the core tests all do.
+    pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    pub(crate) device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl RuntimeServices {
@@ -275,6 +291,40 @@ impl RuntimeServices {
         &self.client_info
     }
 
+    /// Returns the host-computed client signals, when the host supplies
+    /// them.
+    ///
+    /// A provider that derives identity from the TLS JA4 or HTTP/2 signals
+    /// takes these as an injected service. The result is `None` on a host that
+    /// exposes none, so such a provider cannot be built there and the request
+    /// stops rather than creating a degraded identifier.
+    #[must_use]
+    pub fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
+        self.host_signals.clone()
+    }
+
+    /// Returns the Edge Cookie provider the composition root already resolved,
+    /// when the adapter threaded one through.
+    ///
+    /// Resolving `[ec] provider` reads no request data, so the answer is the
+    /// same for every request and an adapter that resolves it once while it
+    /// builds application state can hand the result here instead of the
+    /// request path resolving the same settings again. `None` means nothing was
+    /// threaded, so the request path resolves for itself. Read this through
+    /// [`request_provider`](crate::ec::provider::request_provider) rather than
+    /// directly, so both answers are handled in one place.
+    #[must_use]
+    pub fn resolved_ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
+        self.resolved_ec_provider.clone()
+    }
+
+    /// The device provider a module supplied, when `[device] provider` selected
+    /// one. `None` leaves core's own device classification in place.
+    #[must_use]
+    pub fn device_provider(&self) -> Option<Arc<dyn DeviceProvider>> {
+        self.device_provider.clone()
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -291,6 +341,80 @@ impl RuntimeServices {
     pub fn with_kv_store(self, store: Arc<dyn PlatformKvStore>) -> Self {
         Self {
             kv_store: store,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the resolved Edge Cookie provider
+    /// replaced.
+    ///
+    /// Adapters that build their per-request services through a shared helper
+    /// with no application state in hand use this to thread the provider the
+    /// composition root resolved. `None` leaves the request path to resolve
+    /// `[ec] provider` for itself, which is what the Axum adapter and a
+    /// deployment selecting no provider both do.
+    #[must_use]
+    pub fn with_resolved_ec_provider(
+        self,
+        resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    ) -> Self {
+        Self {
+            resolved_ec_provider,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the geo provider replaced by
+    /// `geo`.
+    ///
+    /// Adapters use this to apply the module-supplied geo provider selected by
+    /// `[geo] provider`, so a vendor module can resolve location in place of
+    /// the host's own lookup without the rest of the runtime services graph
+    /// being rebuilt.
+    #[must_use]
+    pub fn with_geo(self, geo: Arc<dyn PlatformGeo>) -> Self {
+        Self { geo, ..self }
+    }
+
+    /// Returns a clone of this instance with the per-request client metadata
+    /// replaced.
+    ///
+    /// A response-side path that builds the rest of the services graph once and
+    /// varies only the client metadata per request uses this to apply the real
+    /// client data without rebuilding the graph. A provider called from such a
+    /// path still needs that data.
+    #[must_use]
+    pub fn with_client_info(self, client_info: ClientInfo) -> Self {
+        Self {
+            client_info,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the Edge Cookie provider replaced.
+    ///
+    /// Adapters use this to apply the module-supplied provider selected by
+    /// `[ec] provider`, the same way they apply a module's geo provider, so a
+    /// vendor declares identity on its registration rather than through a
+    /// second extension mechanism. The registry already matched the selector
+    /// against the registered modules, so the module's provider is the
+    /// resolved answer and lands on the one seam the request path reads.
+    #[must_use]
+    pub fn with_ec_provider(self, ec_provider: Arc<dyn EdgeCookieProvider>) -> Self {
+        Self {
+            resolved_ec_provider: Some(ec_provider),
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the device provider replaced.
+    ///
+    /// Adapters use this to apply the module-supplied provider selected by
+    /// `[device] provider`.
+    #[must_use]
+    pub fn with_device_provider(self, device_provider: Arc<dyn DeviceProvider>) -> Self {
+        Self {
+            device_provider: Some(device_provider),
             ..self
         }
     }
@@ -342,6 +466,9 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    host_signals: Option<Arc<dyn HostSignals>>,
+    resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -357,6 +484,9 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            host_signals: None,
+            resolved_ec_provider: None,
+            device_provider: None,
         }
     }
 
@@ -436,6 +566,29 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the host-computed client signals service.
+    ///
+    /// Optional: a host that exposes no TLS or HTTP/2 signals leaves this
+    /// unset, so a provider that requires them cannot be built and the request
+    /// stops.
+    #[must_use]
+    pub fn host_signals(mut self, host_signals: Arc<dyn HostSignals>) -> Self {
+        self.host_signals = Some(host_signals);
+        self
+    }
+
+    /// Set the Edge Cookie provider the composition root already resolved.
+    ///
+    /// Optional. This is the provider the selector actually chose, so setting
+    /// it keeps the request path from resolving the same settings a second
+    /// time. It is the single seam through which a vendor or host Edge Cookie
+    /// provider reaches the request path.
+    #[must_use]
+    pub fn resolved_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
+        self.resolved_ec_provider = Some(provider);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -476,6 +629,9 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
+            host_signals: self.host_signals,
+            resolved_ec_provider: self.resolved_ec_provider,
+            device_provider: self.device_provider,
         }
     }
 }

@@ -17,6 +17,7 @@ use crate::http_util::is_navigation_request;
 use crate::response_privacy::enforce_synthesized_html_cache_privacy;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
+use crate::tsjs_bundle::JsModulePart;
 
 use super::IntegrationRegistration;
 
@@ -102,13 +103,20 @@ impl GptDiagnosticsRequestDecision {
         Some(script)
     }
 
-    /// Build the synchronous standalone diagnostics module tag.
+    /// Build the synchronous standalone diagnostics module tag for `module`,
+    /// the registry's part for [`GPT_DIAGNOSTICS_INTEGRATION_ID`].
+    ///
+    /// Returns `None` when this decision is not active.
     #[must_use]
-    pub fn module_script_tag(&self) -> Option<String> {
+    pub fn module_script_tag(&self, module: &JsModulePart) -> Option<String> {
+        debug_assert_eq!(
+            module.id, GPT_DIAGNOSTICS_INTEGRATION_ID,
+            "should tag the diagnostics module"
+        );
         self.active.then(|| {
             format!(
                 "<script src=\"{}\"></script>",
-                tsjs::tsjs_single_module_script_src(GPT_DIAGNOSTICS_INTEGRATION_ID)
+                tsjs::tsjs_single_module_script_src(module)
             )
         })
     }
@@ -130,6 +138,12 @@ impl GptDiagnosticsRequestDecision {
 #[cfg(test)]
 mod head_seam_invariant_tests {
     use super::*;
+
+    /// The compile-time diagnostics module, as the registry would serve it.
+    fn diagnostics_part() -> JsModulePart {
+        JsModulePart::compile_time(GPT_DIAGNOSTICS_INTEGRATION_ID)
+            .expect("should have compiled the diagnostics module in")
+    }
 
     /// Every combination of the three fields the decision carries.
     fn all_decisions() -> Vec<GptDiagnosticsRequestDecision> {
@@ -162,9 +176,10 @@ mod head_seam_invariant_tests {
         //
         // If a future change makes a script emit without also requiring the stamp,
         // this fails here rather than silently in a cached template.
+        let module = diagnostics_part();
         for decision in all_decisions() {
-            let injects =
-                decision.bootstrap_script().is_some() || decision.module_script_tag().is_some();
+            let injects = decision.bootstrap_script().is_some()
+                || decision.module_script_tag(&module).is_some();
             if injects {
                 assert!(
                     decision.requires_private_no_store(),
@@ -184,7 +199,7 @@ mod head_seam_invariant_tests {
             "should not inject a bootstrap for an inert decision"
         );
         assert_eq!(
-            decision.module_script_tag(),
+            decision.module_script_tag(&diagnostics_part()),
             None,
             "should not inject a module for an inert decision"
         );
@@ -209,6 +224,19 @@ struct ConsoleCookieState {
     canonical: bool,
 }
 
+/// Validates the GPT diagnostics configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the GPT diagnostics configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register GPT diagnostics when explicitly enabled.
 ///
 /// # Errors
@@ -226,7 +254,7 @@ pub fn register(
 
     Ok(Some(
         IntegrationRegistration::builder(GPT_DIAGNOSTICS_INTEGRATION_ID)
-            .without_js()
+            .with_standalone_js()
             .build(),
     ))
 }
@@ -303,6 +331,19 @@ pub fn prepare_request(
 
     request.extensions_mut().insert(decision.clone());
     Ok(decision)
+}
+
+/// Builder hook: prepares the request and discards the decision, which stays
+/// in the request extensions for the publisher path to read.
+///
+/// # Errors
+///
+/// Returns the error from [`prepare_request`].
+pub(crate) fn prepare_request_hook(
+    settings: &Settings,
+    request: &mut Request<EdgeBody>,
+) -> Result<(), Report<TrustedServerError>> {
+    prepare_request(settings, request).map(|_| ())
 }
 
 /// Read the request decision, defaulting to inactive when not prepared.
@@ -479,6 +520,10 @@ mod tests {
             !registry
                 .js_module_ids_deferred()
                 .contains(&GPT_DIAGNOSTICS_INTEGRATION_ID)
+        );
+        assert!(
+            registry.js_part(GPT_DIAGNOSTICS_INTEGRATION_ID).is_some(),
+            "should serve the diagnostics module standalone"
         );
     }
 

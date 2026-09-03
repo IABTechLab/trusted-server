@@ -378,10 +378,12 @@ mod tests {
 
     struct NoopGeo;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformGeo for NoopGeo {
-        fn lookup(
+        async fn lookup(
             &self,
             _client_ip: Option<std::net::IpAddr>,
+            _services: &trusted_server_core::platform::RuntimeServices,
         ) -> Result<Option<trusted_server_core::platform::GeoInfo>, Report<PlatformError>> {
             Ok(None)
         }

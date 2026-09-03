@@ -304,7 +304,11 @@ let result = match (method, path.as_str()) {
     },
     
     // Fallback to publisher origin
-    _ => handle_publisher_request(&settings, &integration_registry, &runtime_services, req),
+    _ => handle_publisher_request(
+        AppContext { settings: &settings, integration_registry: &integration_registry },
+        &runtime_services,
+        req,
+    ),
 }
 ```
 
@@ -552,9 +556,12 @@ Set `mock = false` in APS config when real APS integration is ready.
 ### Example Test Flow
 
 ```rust
-let orchestrator = AuctionOrchestrator::new(config);
-orchestrator.register_provider(Arc::new(PrebidAuctionProvider::try_new(prebid_config)?));
-orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
+let mut orchestrator = AuctionOrchestrator::new(config);
+orchestrator.register_provider(
+    Arc::new(PrebidAuctionProvider::try_new(prebid_config)?),
+    "example-crate",
+)?;
+orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)), "example-crate")?;
 
 let result = orchestrator.run_auction(&request, &context, &services).await?;
 

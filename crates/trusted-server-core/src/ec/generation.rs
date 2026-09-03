@@ -10,8 +10,8 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 
+use crate::ec::provider::{HMAC_PROVIDER_CODE, PROVIDER_CODE_SEPARATOR, split_provider_code};
 use crate::error::TrustedServerError;
-use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -81,19 +81,39 @@ fn generate_random_suffix(length: usize) -> String {
 ///
 /// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
 pub fn generate_ec_id(
-    settings: &Settings,
+    passphrase: &str,
     client_ip: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
-        .change_context(TrustedServerError::EdgeCookie {
+    generate_hmac_ec_id(passphrase, &[client_ip])
+}
+
+/// Creates an Edge Cookie identifier as HMAC-SHA256 over the given parts plus a
+/// random suffix, in the `{64hex}.{6alnum}` format.
+///
+/// The parts are joined with a unit separator (`\u{1f}`), which cannot appear in
+/// a client IP, User-Agent, or TLS and HTTP/2 signal, so distinct part lists
+/// cannot collide. A provider that derives identity from multiple request
+/// signals (for example a Fastly provider over JA4, H2, IP, and UA) passes them
+/// as separate parts. Each part must be pre-normalized by the caller.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
+pub fn generate_hmac_ec_id(
+    passphrase: &str,
+    parts: &[&str],
+) -> Result<String, Report<TrustedServerError>> {
+    let mut mac = HmacSha256::new_from_slice(passphrase.as_bytes()).change_context(
+        TrustedServerError::EdgeCookie {
             message: "Failed to create HMAC instance".to_string(),
-        })?;
-    mac.update(client_ip.as_bytes());
+        },
+    )?;
+    // A unit separator cannot occur in any part, so distinct lists never collide.
+    mac.update(parts.join("\u{1f}").as_bytes());
     let hmac_hash = hex::encode(mac.finalize().into_bytes());
 
-    // Append random 6-character alphanumeric suffix for additional uniqueness.
-    let random_suffix = generate_random_suffix(6);
-    let ec_id = format!("{hmac_hash}.{random_suffix}");
+    // Append a random 6-character alphanumeric suffix for additional uniqueness.
+    let ec_id = format!("{hmac_hash}.{}", generate_random_suffix(6));
 
     log::trace!("Generated fresh EC ID: {}", super::log_id(&ec_id));
 
@@ -120,12 +140,33 @@ pub fn ec_hash(ec_id: &str) -> &str {
 /// so internal EC IDs are already lowercase. This normalization is a
 /// defense-in-depth measure for EC IDs submitted by external partners
 /// (via batch sync) that may use uppercase hex.
+///
+/// An identifier this function creates carries the built-in provider's code
+/// envelope (`hmac~` before the value, see
+/// [`PROVIDER_CODE_SEPARATOR`](super::provider::PROVIDER_CODE_SEPARATOR)),
+/// and partners echo that form back, so the envelope is kept and only the
+/// value inside it is lowercased. That keeps the key identical to the one
+/// written at creation. An identifier under any other provider's code is not
+/// HMAC-shaped and is returned unchanged, because only that provider knows
+/// how to normalize it.
 #[must_use]
 pub fn normalize_ec_id_for_kv(ec_id: &str) -> String {
-    let mut parts = ec_id.splitn(2, '.');
+    let (code, bare) = match split_provider_code(ec_id) {
+        (Some(code), bare) if code == HMAC_PROVIDER_CODE.as_str() => (Some(code), bare),
+        (Some(_), _) => return ec_id.to_owned(),
+        (None, bare) => (None, bare),
+    };
+    let mut parts = bare.splitn(2, '.');
     let hash = parts.next().unwrap_or_default();
     let suffix = parts.next().unwrap_or_default();
-    format!("{}.{}", hash.to_ascii_lowercase(), suffix)
+    match code {
+        Some(code) => format!(
+            "{code}{PROVIDER_CODE_SEPARATOR}{}.{}",
+            hash.to_ascii_lowercase(),
+            suffix
+        ),
+        None => format!("{}.{}", hash.to_ascii_lowercase(), suffix),
+    }
 }
 
 /// Checks whether a string is a valid 64-character hex EC hash prefix.
@@ -139,17 +180,35 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Checks whether a string matches the expected EC ID format.
+/// Checks whether a string is a built-in HMAC identifier, bare or enveloped.
 ///
-/// The format is `{64hex}.{6alnum}` where the first part is a 64-character
-/// **lowercase** hex string and the second part is a 6-character alphanumeric
-/// string. Only lowercase hex is accepted; callers must normalize before
-/// validation to prevent duplicate KV keys from case-variant EC IDs. The HMAC
-/// prefix is lowercase because it comes from `hex::encode`; the random suffix
-/// allows mixed-case alphanumeric characters by construction.
+/// The bare format is `{64hex}.{6alnum}` where the first part is a
+/// 64-character **lowercase** hex string and the second part is a 6-character
+/// alphanumeric string. Only lowercase hex is accepted; callers must
+/// normalize before validation to prevent duplicate KV keys from case-variant
+/// EC IDs. The HMAC prefix is lowercase because it comes from `hex::encode`;
+/// the random suffix allows mixed-case alphanumeric characters by
+/// construction.
+///
+/// An identifier this provider creates carries the provider-code envelope,
+/// `hmac~` before the bare value, so both the enveloped and the legacy bare
+/// form are accepted here. An identifier under any other provider's code is
+/// not an HMAC identifier and is rejected.
+///
+/// This is the built-in provider's grammar, not the deployment's. The
+/// partner-facing paths (pull sync, batch sync, the admin lookup) dispatch by
+/// provider code through
+/// [`AcceptedProviders`](super::provider::AcceptedProviders), which reaches
+/// this only for an identifier the built-in provider owns, or as the fallback
+/// for a stateless deployment that has selected no provider at all.
 #[must_use]
 pub fn is_valid_ec_id(value: &str) -> bool {
-    let mut parts = value.split('.');
+    let bare = match split_provider_code(value) {
+        (Some(code), bare) if code == HMAC_PROVIDER_CODE.as_str() => bare,
+        (Some(_), _) => return false,
+        (None, bare) => bare,
+    };
+    let mut parts = bare.split('.');
     let Some(hmac_part) = parts.next() else {
         return false;
     };
@@ -175,7 +234,39 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::test_support::tests::create_test_settings;
+    const TEST_PASSPHRASE: &str = "test-secret-key-32-bytes-minimum";
+
+    #[test]
+    fn generate_hmac_ec_id_is_stable_per_parts_and_collision_resistant() {
+        // The 64-char hex prefix is HMAC over the parts and is stable for the
+        // same parts; the random suffix varies, so compare prefixes only.
+        let prefix = |parts: &[&str]| {
+            generate_hmac_ec_id(TEST_PASSPHRASE, parts)
+                .expect("should generate")
+                .split('.')
+                .next()
+                .expect("should have a prefix")
+                .to_owned()
+        };
+
+        assert_eq!(
+            prefix(&["a", "b"]),
+            prefix(&["a", "b"]),
+            "the same parts should yield the same stable prefix"
+        );
+        assert_ne!(
+            prefix(&["a", "b"]),
+            prefix(&["a", "c"]),
+            "different parts should yield a different prefix"
+        );
+        // The unit separator prevents a join collision: ["a", "b"] must not hash
+        // the same as ["ab"].
+        assert_ne!(
+            prefix(&["a", "b"]),
+            prefix(&["ab"]),
+            "the separator should prevent ['a','b'] colliding with ['ab']"
+        );
+    }
 
     #[test]
     fn normalize_ipv4_unchanged() {
@@ -215,8 +306,7 @@ mod tests {
 
     #[test]
     fn generate_produces_valid_format() {
-        let settings = create_test_settings();
-        let ec_id = generate_ec_id(&settings, "192.168.1.1").expect("should generate EC ID");
+        let ec_id = generate_ec_id(TEST_PASSPHRASE, "192.168.1.1").expect("should generate EC ID");
         assert!(
             is_valid_ec_id(&ec_id),
             "should match EC ID format: {{64hex}}.{{6alnum}}, got: {ec_id}"
@@ -225,10 +315,10 @@ mod tests {
 
     #[test]
     fn generate_same_ip_produces_consistent_hash_prefix() {
-        let settings = create_test_settings();
-        let first = generate_ec_id(&settings, "192.168.1.1").expect("should generate first EC ID");
+        let first =
+            generate_ec_id(TEST_PASSPHRASE, "192.168.1.1").expect("should generate first EC ID");
         let second =
-            generate_ec_id(&settings, "192.168.1.1").expect("should generate second EC ID");
+            generate_ec_id(TEST_PASSPHRASE, "192.168.1.1").expect("should generate second EC ID");
 
         assert_eq!(
             ec_hash(&first),
@@ -319,6 +409,39 @@ mod tests {
         assert!(
             !is_valid_ec_id(&extra_segment),
             "should reject extra segments"
+        );
+    }
+
+    #[test]
+    fn is_valid_ec_id_accepts_the_hmac_envelope() {
+        let coded = format!("hmac~{}.ABC123", "a".repeat(64));
+        assert!(
+            is_valid_ec_id(&coded),
+            "should accept a created identifier carrying the hmac code"
+        );
+    }
+
+    #[test]
+    fn is_valid_ec_id_rejects_other_provider_codes() {
+        let coded = format!("t0op~{}.ABC123", "a".repeat(64));
+        assert!(
+            !is_valid_ec_id(&coded),
+            "should reject an identifier carrying another provider's code"
+        );
+    }
+
+    #[test]
+    fn normalize_ec_id_for_kv_keeps_the_hmac_envelope() {
+        let coded = format!("hmac~{}.ABC123", "A".repeat(64));
+        assert_eq!(
+            normalize_ec_id_for_kv(&coded),
+            format!("hmac~{}.ABC123", "a".repeat(64)),
+            "should lowercase the hash and keep the code prefix"
+        );
+        assert_eq!(
+            normalize_ec_id_for_kv("t0op~MixedCase"),
+            "t0op~MixedCase",
+            "should leave another provider's identifier unchanged"
         );
     }
 }

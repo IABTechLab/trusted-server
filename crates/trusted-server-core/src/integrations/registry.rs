@@ -7,14 +7,17 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
+use sha2::{Digest as _, Sha256};
 
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
+use crate::ec::device::DeviceProvider;
 use crate::ec::kv::KvIdentityGraph;
+use crate::ec::provider::{EcProviderSelection, EdgeCookieProvider};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
-use crate::platform::RuntimeServices;
+use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
 use crate::settings::Settings;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
@@ -329,6 +332,11 @@ pub struct RequestFilterInput<'a> {
     pub services: &'a RuntimeServices,
     pub request: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
+    /// The permission state resolved for this request at the start of the
+    /// request cycle, so a filter reads the same permissions the rest of the
+    /// request uses rather than resolving its own. `None` only on paths that
+    /// build no EC context, such as batch sync and admin diagnostics.
+    pub permissions: Option<&'a crate::permissions::PermissionState>,
     /// Whether the request matches a registered integration proxy route.
     pub is_integration_route: bool,
 }
@@ -409,6 +417,10 @@ pub struct RequestFilterRegistryInput<'a> {
     pub services: &'a RuntimeServices,
     pub req: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
+    /// The permission state resolved for this request at the start of the
+    /// request cycle, passed on to every filter. `None` only on paths that
+    /// build no EC context, such as batch sync and admin diagnostics.
+    pub permissions: Option<&'a crate::permissions::PermissionState>,
 }
 
 /// Outcome returned by [`IntegrationRegistry::filter_request`].
@@ -582,17 +594,53 @@ pub trait IntegrationHeadInjector: Send + Sync {
     }
 }
 
+/// A browser module a registration carries, for a module built outside
+/// `trusted-server-js`. The crate embeds its built IIFE with `include_str!`
+/// and states its SHA-256 as a literal next to it; the registry verifies the
+/// two agree when it is built, and the served `?v=` hash is derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarriedJsModule {
+    /// The built IIFE.
+    pub source: &'static str,
+    /// SHA-256 of `source`, hex encoded, lower case.
+    pub sha256: &'static str,
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
     pub js_deferred: bool,
     pub js_disabled: bool,
+    /// Browser module carried by the registration, when the module is not
+    /// compiled into `trusted-server-js`.
+    pub js_module: Option<CarriedJsModule>,
+    /// Serve the module only on its own `/static/tsjs=tsjs-<id>.min.js` path,
+    /// never in the unified bundle and never as a deferred tag; the
+    /// integration injects the tag itself when it decides to.
+    pub js_standalone: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// Geo provider this module supplies, selectable by `[geo] provider`.
+    ///
+    /// Declaring one does not make it active, because the module is only asked
+    /// to resolve location when `[geo] provider` names this module's id.
+    pub geo_provider: Option<Arc<dyn PlatformGeo>>,
+    /// Edge Cookie provider this module supplies, selectable by `[ec] provider`.
+    ///
+    /// Declaring one does not make it active, because the module is only asked
+    /// to create an identifier when `[ec] provider` names this module's id. This
+    /// is the same route geo takes, so identity is not a second extension
+    /// mechanism sitting beside the integration system.
+    pub ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// Device provider this module supplies, selectable by `[device] provider`.
+    ///
+    /// Declaring one does not make it active, because the module is only asked
+    /// to classify a request when `[device] provider` names this module's id.
+    pub device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl IntegrationRegistration {
@@ -613,12 +661,17 @@ impl IntegrationRegistrationBuilder {
                 integration_id,
                 js_deferred: false,
                 js_disabled: false,
+                js_module: None,
+                js_standalone: false,
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             },
         }
     }
@@ -665,11 +718,46 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Declare the geo provider this module supplies.
+    ///
+    /// The provider only resolves location when `[geo] provider` names this
+    /// module's id, and a declared provider the selector does not choose is
+    /// logged as a warning when the registry is built.
+    #[must_use]
+    pub fn with_geo_provider(mut self, provider: Arc<dyn PlatformGeo>) -> Self {
+        self.registration.geo_provider = Some(provider);
+        self
+    }
+
+    /// Declare the Edge Cookie provider this module supplies.
+    ///
+    /// The provider only creates identifiers when `[ec] provider` names this
+    /// module's id, and a declared provider the selector does not choose is
+    /// logged as a warning when the registry is built, the same as geo.
+    #[must_use]
+    pub fn with_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
+        self.registration.ec_provider = Some(provider);
+        self
+    }
+
+    /// Declare the device provider this module supplies.
+    ///
+    /// The provider only classifies requests when `[device] provider` names
+    /// this module's id, and a declared provider the selector does not choose
+    /// is logged as a warning when the registry is built, the same as geo.
+    #[must_use]
+    pub fn with_device_provider(mut self, provider: Arc<dyn DeviceProvider>) -> Self {
+        self.registration.device_provider = Some(provider);
+        self
+    }
+
     /// Mark this integration's JS module for deferred loading via
     /// `<script defer>` instead of the main synchronous bundle.
     #[must_use]
     pub fn with_deferred_js(mut self) -> Self {
         self.registration.js_deferred = true;
+        self.registration.js_disabled = false;
+        self.registration.js_standalone = false;
         self
     }
 
@@ -677,6 +765,28 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn without_js(mut self) -> Self {
         self.registration.js_disabled = true;
+        self.registration.js_deferred = false;
+        self.registration.js_standalone = false;
+        self
+    }
+
+    /// Carry a browser module built outside `trusted-server-js`.
+    #[must_use]
+    pub fn with_js_module(mut self, module: CarriedJsModule) -> Self {
+        self.registration.js_module = Some(module);
+        self
+    }
+
+    /// Serve the module standalone only; see
+    /// [`IntegrationRegistration::js_standalone`].
+    ///
+    /// The three delivery flags are exclusive and the last builder call wins,
+    /// so this clears the disabled and deferred flags as those methods clear
+    /// this one.
+    #[must_use]
+    pub fn with_standalone_js(mut self) -> Self {
+        self.registration.js_standalone = true;
+        self.registration.js_disabled = false;
         self.registration.js_deferred = false;
         self
     }
@@ -701,14 +811,42 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
+    // Every builder considered at construction, enabled or not, in order.
+    builder_ids: Vec<(&'static str, &'static str)>,
     enabled_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
     disabled_js_ids: Vec<&'static str>,
+    // Enabled modules served only on their own path, never in the bundle.
+    standalone_js_ids: Vec<&'static str>,
+    // Modules carried by their registrations, verified against their
+    // declared hash at construction.
+    carried_js: Vec<(&'static str, CarriedJsModule)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// JS module IDs to include in the bundle that come from a source other than
+    /// a registered integration, for example a module tied to the selected Edge
+    /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
+    extra_js_module_ids: Vec<&'static str>,
+    // Preparers from every builder, enabled or not, in registration order.
+    request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
+    // Geo providers declared by the enabled registrations, in registration
+    // order. Declaring one does not activate it.
+    geo_providers: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
+    // Edge Cookie providers each declaring module supplies, in registration
+    // order. `[ec] provider` picks at most one of them.
+    ec_providers: Vec<(&'static str, Arc<dyn EdgeCookieProvider>)>,
+    // Device providers each declaring module supplies, in registration order.
+    // `[device] provider` picks at most one of them.
+    device_providers: Vec<(&'static str, Arc<dyn DeviceProvider>)>,
+    // The provider `[geo] provider` resolved to, or `None` when the selector
+    // is `platform` and the adapter's own host lookup stands. Unset and `none`
+    // both resolve the disabled provider.
+    geo_provider: Option<Arc<dyn PlatformGeo>>,
+    ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -722,16 +860,270 @@ impl Default for IntegrationRegistryInner {
             head_router: Router::new(),
             options_router: Router::new(),
             routes: Vec::new(),
+            builder_ids: Vec::new(),
             enabled_integration_ids: Vec::new(),
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
+            standalone_js_ids: Vec::new(),
+            carried_js: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            extra_js_module_ids: Vec::new(),
+            request_preparers: Vec::new(),
+            geo_providers: Vec::new(),
+            ec_providers: Vec::new(),
+            device_providers: Vec::new(),
+            geo_provider: None,
+            ec_provider: None,
+            device_provider: None,
         }
     }
+}
+
+/// Reserved value of `[geo] provider` that resolves no location at all.
+const GEO_PROVIDER_NONE: &str = "none";
+
+/// `[geo] provider` value opting in to the adapter's own host geo lookup.
+const GEO_PROVIDER_PLATFORM: &str = "platform";
+
+/// `[device] provider` value naming the User-Agent-only provider core supplies.
+///
+/// The same choice as leaving the selector unset, spelled explicitly.
+const DEVICE_PROVIDER_BUILTIN: &str = "builtin";
+
+/// `[device] provider` value opting in to the host provider the adapter builds.
+///
+/// Resolved by `build_device_provider` in [`device`](crate::ec::device) rather
+/// than by a module, so the registry supplies nothing for it.
+const DEVICE_PROVIDER_FASTLY: &str = "fastly";
+
+/// Resolves the Edge Cookie provider `[ec] provider` names, when a module
+/// supplies it.
+///
+/// Unlike geo, identity has providers built into core, so a selector naming one
+/// of those is not an error here. This returns `Some` only when a registered
+/// module declared a provider under that name, and core resolves the rest.
+fn resolve_ec_provider(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Option<Arc<dyn EdgeCookieProvider>> {
+    // `None` spells statelessness and never names a module, so only a named
+    // selection can match one.
+    let selector = match settings.ec.provider.as_ref() {
+        Some(EcProviderSelection::Named(key)) => Some(key.as_str()),
+        Some(EcProviderSelection::None) | None => None,
+    };
+    let resolved = selector.and_then(|key| {
+        inner
+            .ec_providers
+            .iter()
+            .find(|(id, _)| *id == key)
+            .map(|(_, provider)| Arc::clone(provider))
+    });
+
+    for (id, _) in &inner.ec_providers {
+        if selector != Some(*id) {
+            log::warn!(
+                "integration module `{id}` declares an Edge Cookie provider that `[ec] provider` does not select"
+            );
+        }
+    }
+
+    resolved
+}
+
+/// Resolves the device provider `[device] provider` names, when a module
+/// supplies it.
+///
+/// As with identity, core has a built-in device provider, so a selector naming
+/// it is not an error here.
+fn resolve_device_provider(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<Option<Arc<dyn DeviceProvider>>, Report<TrustedServerError>> {
+    let selector = settings.device.provider.as_deref();
+    let resolved = match selector {
+        // Unset and `builtin` both name the provider core supplies itself, and
+        // `fastly` names the host provider the adapter builds, so the registry
+        // supplies nothing for any of the three.
+        None | Some(DEVICE_PROVIDER_BUILTIN) | Some(DEVICE_PROVIDER_FASTLY) => None,
+        Some(module_id) => Some(module_device_provider(module_id, inner)?),
+    };
+
+    // A module-supplied device provider may declare the permissions its data
+    // use requires, but nothing enforces that declaration yet. Device
+    // classification runs before the permission set for the request is
+    // assembled, so there is no per-request gate to check it against. Selecting
+    // a provider is an operator decision and not a per-request permission
+    // decision, so honoring the declaration by silently ignoring it would let a
+    // vendor state a requirement that never binds. Refuse the selection instead,
+    // loudly and at startup, until a real per-request device gate exists.
+    if let Some(provider) = resolved.as_ref()
+        && provider.required_permissions() != crate::permissions::PermissionSet::none()
+    {
+        let declared = provider
+            .required_permissions()
+            .iter()
+            .map(crate::permissions::Permission::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "integration module `{}` declares a device provider requiring `{declared}`, \
+             and Trusted Server has no per-request gate that can enforce that yet, so the \
+             selection is refused rather than silently ignored",
+            selector.unwrap_or_default(),
+        );
+        return Err(Report::new(TrustedServerError::Configuration { message }));
+    }
+
+    for (id, _) in &inner.device_providers {
+        if selector != Some(*id) {
+            log::warn!(
+                "integration module `{id}` declares a device provider that `[device] provider` does not select"
+            );
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Looks up the device provider declared by the module `module_id`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the module and the
+/// capability when the module declares no device provider, is registered but
+/// not enabled, or is not registered at all. Without this a mistyped selector
+/// would fall back to core's built-in provider with nothing said, which is the
+/// silent wrong answer the geo selector already refuses to give.
+fn module_device_provider(
+    module_id: &str,
+    inner: &IntegrationRegistryInner,
+) -> Result<Arc<dyn DeviceProvider>, Report<TrustedServerError>> {
+    if let Some((_, provider)) = inner
+        .device_providers
+        .iter()
+        .find(|(id, _)| *id == module_id)
+    {
+        return Ok(Arc::clone(provider));
+    }
+
+    let message = if inner
+        .enabled_integration_ids
+        .iter()
+        .copied()
+        .any(|id| id == module_id)
+    {
+        format!(
+            "`[device] provider` selects integration module `{module_id}`, which declares no device provider"
+        )
+    } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
+        format!(
+            "`[device] provider` selects integration module `{module_id}`, which is registered but not enabled, so its device provider is unavailable"
+        )
+    } else {
+        format!(
+            "`[device] provider` selects integration module `{module_id}`, which is not registered; the registered modules that declare a device provider are [{}]",
+            inner
+                .device_providers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Err(Report::new(TrustedServerError::Configuration { message }))
+}
+
+/// Resolves `[geo] provider` against the modules that declared a geo provider.
+///
+/// Returns the disabled provider when the selector is unset or `none`, `None`
+/// when it is `platform` so the adapter's own host lookup stands, and the
+/// module's provider otherwise. A module that declares a geo provider the
+/// selector does not choose is logged as a warning when the registry is built,
+/// so an operator can see a module shipping a capability the deployment never
+/// uses.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the selector names a
+/// module that is not registered, is registered but not enabled, or is enabled
+/// and declares no geo provider.
+fn resolve_geo_provider(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<Option<Arc<dyn PlatformGeo>>, Report<TrustedServerError>> {
+    let selector = settings.geo.provider.as_deref();
+    let resolved = match selector {
+        // Unset resolves nothing and makes no host geo call, so a default
+        // deployment is not tied to any host geo service. `none` spells the
+        // same choice explicitly.
+        None | Some(GEO_PROVIDER_NONE) => Some(Arc::new(DisabledGeo) as Arc<dyn PlatformGeo>),
+        // `platform` opts in to the adapter's own host lookup, so the registry
+        // supplies nothing and the adapter's provider stands.
+        Some(GEO_PROVIDER_PLATFORM) => None,
+        Some(module_id) => Some(module_geo_provider(module_id, inner)?),
+    };
+
+    for (id, _) in &inner.geo_providers {
+        if selector != Some(*id) {
+            log::warn!(
+                "integration module `{id}` declares a geo provider that `[geo] provider` does not select"
+            );
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Looks up the geo provider declared by the module `module_id`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the module and the
+/// capability when the module declares no geo provider, is registered but not
+/// enabled, or is not registered at all.
+fn module_geo_provider(
+    module_id: &str,
+    inner: &IntegrationRegistryInner,
+) -> Result<Arc<dyn PlatformGeo>, Report<TrustedServerError>> {
+    if let Some((_, provider)) = inner.geo_providers.iter().find(|(id, _)| *id == module_id) {
+        return Ok(Arc::clone(provider));
+    }
+
+    // Only an enabled registration reaches the collection loop, so a module
+    // that exists but is switched off must say so rather than read as a module
+    // that never declared the capability.
+    let message = if inner
+        .enabled_integration_ids
+        .iter()
+        .copied()
+        .any(|id| id == module_id)
+    {
+        format!(
+            "`[geo] provider` selects integration module `{module_id}`, which declares no geo provider"
+        )
+    } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
+        format!(
+            "`[geo] provider` selects integration module `{module_id}`, which is registered but not enabled, so its geo provider is unavailable"
+        )
+    } else {
+        format!(
+            "`[geo] provider` selects integration module `{module_id}`, which is not registered; the registered modules that declare a geo provider are [{}]",
+            inner
+                .geo_providers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Err(Report::new(TrustedServerError::Configuration { message }))
 }
 
 /// Summary of registered integration capabilities.
@@ -780,22 +1172,64 @@ pub struct IntegrationRegistry {
 }
 
 impl IntegrationRegistry {
-    /// Build a registry from the provided settings.
+    /// Build a registry from the built-in integrations.
     ///
     /// # Errors
     ///
-    /// Returns an error if route registration fails due to duplicate routes or invalid paths.
+    /// Returns an error if route registration fails due to duplicate routes or
+    /// invalid paths, or when a registration carries a browser module whose
+    /// declared SHA-256 does not match its source.
     ///
     /// # Panics
     ///
     /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
     pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        Self::with_registrations(settings, &[])
+    }
+
+    /// Build a registry from the built-in integrations followed by `extra`,
+    /// the builders an adapter or a vendor crate supplies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when two builders claim the same integration id, when
+    /// route registration fails due to duplicate routes or invalid paths, when
+    /// a builder fails, or when a registration carries a browser module whose
+    /// declared SHA-256 does not match its source.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    pub fn with_registrations(
+        settings: &Settings,
+        extra: &[crate::integrations::IntegrationBuilder],
+    ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
 
-        for builder in crate::integrations::builders() {
-            if let Some(registration) = (builder.build)(settings)? {
+        for builder in crate::integrations::all_builders(extra) {
+            if let Some((_, first_source)) =
+                inner.builder_ids.iter().find(|(id, _)| *id == builder.id())
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "integration id `{}` is registered twice, by `{first_source}` and by `{}`",
+                        builder.id(),
+                        builder.source()
+                    ),
+                }));
+            }
+            inner.builder_ids.push((builder.id(), builder.source()));
+            // Preparers are collected before the enabled check, so an
+            // integration can sanitize its own reserved query or cookie in a
+            // deployment that has it switched off.
+            if let Some(prepare) = builder.prepare_request() {
+                inner.request_preparers.push(prepare);
+            }
+
+            if let Some(registration) = builder.build(settings)? {
                 debug_assert_eq!(
-                    registration.integration_id, builder.id,
+                    registration.integration_id,
+                    builder.id(),
                     "integration builder ID should match registration ID"
                 );
                 inner
@@ -859,17 +1293,103 @@ impl IntegrationRegistry {
                     .extend(registration.html_post_processors);
                 inner.head_injectors.extend(registration.head_injectors);
                 inner.request_filters.extend(registration.request_filters);
+                if let Some(provider) = registration.geo_provider {
+                    inner
+                        .geo_providers
+                        .push((registration.integration_id, provider));
+                }
+                if let Some(provider) = registration.ec_provider {
+                    inner
+                        .ec_providers
+                        .push((registration.integration_id, provider));
+                }
+                if let Some(provider) = registration.device_provider {
+                    inner
+                        .device_providers
+                        .push((registration.integration_id, provider));
+                }
                 if registration.js_disabled {
                     inner.disabled_js_ids.push(registration.integration_id);
                 } else if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
+                if registration.js_standalone {
+                    inner.standalone_js_ids.push(registration.integration_id);
+                }
+                if let Some(module) = registration.js_module {
+                    // The served `?v=` hash and its memo trust this value, so a
+                    // stale literal is a startup error rather than a stale
+                    // script. The cost is one SHA-256 of each carried module
+                    // per registry build, and only the Axum dev server builds
+                    // the registry once, because its `main` builds the router
+                    // before serving. Fastly starts a fresh Wasm instance per
+                    // request, and `edgezero_adapter_cloudflare::run_app` and
+                    // `edgezero_adapter_spin::run_app` both call `build_app`
+                    // inside the per-request entry point, so those three pay
+                    // it on every request.
+                    let actual = hex::encode(Sha256::digest(module.source.as_bytes()));
+                    if actual != module.sha256 {
+                        return Err(Report::new(TrustedServerError::Configuration {
+                            message: format!(
+                                "Integration `{}` carries a browser module whose declared SHA-256 does not match its source (declared {}, actual {actual})",
+                                registration.integration_id, module.sha256
+                            ),
+                        }));
+                    }
+                    inner.carried_js.push((registration.integration_id, module));
+                }
             }
         }
+
+        // A client-cycle Edge Cookie provider ships a page script that posts its
+        // result to the resolve endpoint. The script rides the tsjs bundle, so
+        // include its module when that provider is selected. The same module
+        // list drives both the served bundle and the injected `<script>` hash,
+        // so they stay consistent.
+        if settings.ec.provider.as_ref().is_some_and(|selection| {
+            selection.key() == crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY
+        }) {
+            inner.extra_js_module_ids.push("ec_client_fixed");
+        }
+        let geo_provider = resolve_geo_provider(settings, &inner)?;
+        inner.ec_provider = resolve_ec_provider(settings, &inner);
+        inner.device_provider = resolve_device_provider(settings, &inner)?;
+        inner.geo_provider = geo_provider;
 
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// The geo provider `[geo] provider` selected, or `None` when the selector
+    /// is `platform` and the adapter's own host lookup stands. Unset and `none`
+    /// both resolve the disabled provider.
+    #[must_use]
+    pub fn geo_provider(&self) -> Option<Arc<dyn PlatformGeo>> {
+        self.inner.geo_provider.clone()
+    }
+
+    /// The Edge Cookie provider `[ec] provider` selected from a module, or
+    /// `None` when the selector names a provider built into core or nothing.
+    #[must_use]
+    pub fn ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
+        self.inner.ec_provider.clone()
+    }
+
+    /// The device provider `[device] provider` selected from a module, or
+    /// `None` when the selector names a provider built into core or nothing.
+    #[must_use]
+    pub fn device_provider(&self) -> Option<Arc<dyn DeviceProvider>> {
+        self.inner.device_provider.clone()
+    }
+
+    /// Every integration id the registry was built from, enabled or not, in
+    /// registration order. A registry test enumerates this to check every
+    /// builder was considered, while the deploy validation test iterates the
+    /// builder lists themselves rather than this method.
+    #[must_use]
+    pub fn registered_builder_ids(&self) -> Vec<&'static str> {
+        self.inner.builder_ids.iter().map(|(id, _)| *id).collect()
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -893,6 +1413,27 @@ impl IntegrationRegistry {
         self.find_route(method, path).is_some()
     }
 
+    /// Runs every registered integration's request preparer, in registration
+    /// order, before routing.
+    ///
+    /// Preparers run whether or not their integration is enabled, so an
+    /// integration can sanitize its own reserved query or cookie in a
+    /// deployment that has it switched off.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first preparer's error.
+    pub fn prepare_request(
+        &self,
+        settings: &Settings,
+        request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        for prepare in &self.inner.request_preparers {
+            prepare(settings, request)?;
+        }
+        Ok(())
+    }
+
     /// Run pre-routing request filters.
     ///
     /// Request header mutations are applied immediately so later filters and
@@ -911,6 +1452,7 @@ impl IntegrationRegistry {
             services,
             req,
             geo_info,
+            permissions,
         } = input;
         let mut accumulated = RequestFilterEffects::default();
         let is_integration_route = self.has_route(req.method(), req.uri().path());
@@ -922,6 +1464,7 @@ impl IntegrationRegistry {
                     services,
                     request: req,
                     geo_info,
+                    permissions,
                     is_integration_route,
                 })
                 .await?;
@@ -973,8 +1516,8 @@ impl IntegrationRegistry {
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
             if is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
-                    log::warn!("EC generation failed for integration proxy: {err:?}");
+                if let Err(err) = ec_context.generate_if_needed(settings, kv, services).await {
+                    log::error!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
                 log::debug!(
@@ -1142,8 +1685,9 @@ impl IntegrationRegistry {
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
     /// Always includes JS-only modules with no Rust-side registration.
-    /// Includes enabled integrations only when the generated TSJS registry has a
-    /// corresponding browser module.
+    /// Includes enabled integrations only when a browser module serves their
+    /// id, either compiled into `trusted-server-js` or carried by the
+    /// registration, and excludes modules served standalone only.
     #[must_use]
     pub fn js_module_ids(&self) -> Vec<&'static str> {
         // Core JS-only modules that do not have a Rust-side registration.
@@ -1152,15 +1696,134 @@ impl IntegrationRegistry {
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
         for id in &self.inner.enabled_integration_ids {
-            if trusted_server_js::module_bundle(id).is_some()
-                && !self.inner.disabled_js_ids.contains(id)
+            if self.js_part(id).is_some()
+                && !self.inner.standalone_js_ids.contains(id)
                 && !ids.contains(id)
             {
                 ids.push(*id);
             }
         }
 
+        // Modules not tied to a registered integration, for example the
+        // client-cycle provider's page script.
+        for id in &self.inner.extra_js_module_ids {
+            if !ids.contains(id) {
+                ids.push(id);
+            }
+        }
+
         ids
+    }
+
+    /// The module part for one id: the registration that carries it, else
+    /// the compile-time module, for an enabled integration or an always-on
+    /// core module (`core`, `creative`). `None` when nothing serves that id
+    /// or the integration registered without JS.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::integrations::IntegrationRegistry;
+    ///
+    /// let registry = IntegrationRegistry::default();
+    ///
+    /// assert!(registry.js_part("core").is_some());
+    /// assert!(registry.js_part("lockr").is_none());
+    /// ```
+    #[must_use]
+    pub fn js_part(&self, id: &'static str) -> Option<crate::tsjs_bundle::JsModulePart> {
+        if self.inner.disabled_js_ids.contains(&id) {
+            return None;
+        }
+        if let Some((carried_id, module)) = self
+            .inner
+            .carried_js
+            .iter()
+            .find(|(carried_id, _)| *carried_id == id)
+        {
+            return Some(crate::tsjs_bundle::JsModulePart {
+                id: carried_id,
+                source: module.source,
+                sha256: module.sha256,
+            });
+        }
+        if id != "core" && id != "creative" && !self.integration_enabled(id) {
+            return None;
+        }
+        crate::tsjs_bundle::JsModulePart::compile_time(id)
+    }
+
+    /// Ids of enabled modules served standalone only. Only enabled
+    /// registrations reach the construction loop, so every id here is enabled.
+    #[must_use]
+    pub fn js_standalone_ids(&self) -> Vec<&'static str> {
+        self.inner.standalone_js_ids.clone()
+    }
+
+    /// Resolves a module id given as request text (the stem of a
+    /// `tsjs-<id>.min.js` filename) to this registry's own `&'static str`
+    /// id, covering bundle, deferred and standalone modules.
+    ///
+    /// `trusted_server_js::all_module_ids` knows only compile-time modules,
+    /// so a carried module could never be looked up through it. Returns
+    /// `None` for an id this registry serves nowhere, which includes a
+    /// disabled or unknown integration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::integrations::IntegrationRegistry;
+    ///
+    /// let registry = IntegrationRegistry::default();
+    ///
+    /// assert_eq!(registry.js_module_id("creative"), Some("creative"));
+    /// assert_eq!(registry.js_module_id("not-a-module"), None);
+    /// ```
+    #[must_use]
+    pub fn js_module_id(&self, stem: &str) -> Option<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .chain(self.js_standalone_ids())
+            .find(|id| *id == stem)
+    }
+
+    /// Parts of the unified bundle: core, then every immediate module.
+    #[must_use]
+    pub fn js_parts_immediate(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        self.parts_for(&self.js_module_ids_immediate())
+    }
+
+    /// Parts served with `<script defer>`, one file each. Core is not
+    /// included.
+    #[must_use]
+    pub fn js_parts_deferred(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        self.js_module_ids_deferred()
+            .into_iter()
+            .filter_map(|id| self.js_part(id))
+            .collect()
+    }
+
+    /// Every part this registry can serve (bundle, deferred and standalone),
+    /// for cache hashes. Each id appears once.
+    #[must_use]
+    pub fn js_parts_all(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        let mut ids = self.js_module_ids();
+        for id in self.js_standalone_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        self.parts_for(&ids)
+    }
+
+    /// Core first, then the part for each id that has one.
+    fn parts_for(&self, ids: &[&'static str]) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        let mut parts = Vec::with_capacity(ids.len() + 1);
+        if let Some(core) = crate::tsjs_bundle::JsModulePart::compile_time("core") {
+            parts.push(core);
+        }
+        parts.extend(ids.iter().filter_map(|id| self.js_part(id)));
+        parts
     }
 
     /// Return JS module IDs for the main (synchronous) bundle, excluding
@@ -1211,14 +1874,25 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
+                geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
@@ -1240,14 +1914,25 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
+                geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
@@ -1265,14 +1950,25 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
+                geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
@@ -1330,23 +2026,83 @@ impl IntegrationRegistry {
                 head_router,
                 options_router,
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
+                geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use error_stack::Report;
+
+    use super::{CarriedJsModule, IntegrationRegistration};
+    use crate::error::TrustedServerError;
+    use crate::settings::Settings;
+
+    /// A browser module built outside `trusted-server-js`, carried by the
+    /// `probe` registration.
+    pub(crate) const PROBE_JS: &str = "(function(){window.__probe=1;})();";
+    // SHA-256 of PROBE_JS, hex; `probe_js_hash_literal_matches_its_source`
+    // keeps it honest.
+    pub(crate) const PROBE_JS_SHA256: &str =
+        "4a8781b3f95646b33f2d4aa92eeaa93ce4b93e87b3d3f20333682ce33eb2f961";
+
+    /// Builds a registration for the `probe` integration on every call.
+    pub(crate) fn probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(IntegrationRegistration::builder("probe").build()))
+    }
+
+    /// Builds a `probe` registration that carries [`PROBE_JS`] on every call.
+    pub(crate) fn carried_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .build(),
+        ))
+    }
+
+    /// Validates nothing and reports the integration as enabled.
+    pub(crate) fn validate_nothing(
+        _settings: &Settings,
+    ) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{
+        PROBE_JS, PROBE_JS_SHA256, carried_probe_registration, probe_registration, validate_nothing,
+    };
     use super::*;
     use crate::constants::COOKIE_TS_EC;
+    use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
 
@@ -1465,6 +2221,45 @@ mod tests {
                 request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
             }))
+        }
+    }
+
+    /// Records the permission state each filter invocation received, so a test
+    /// can assert what the registry handed to the filter.
+    #[derive(Default)]
+    struct RecordingPermissionsFilter {
+        seen: std::sync::Mutex<Option<Option<crate::permissions::PermissionState>>>,
+    }
+
+    impl RecordingPermissionsFilter {
+        /// The permission state observed by the last invocation, or `None` when
+        /// the filter has not run.
+        fn seen(&self) -> Option<Option<crate::permissions::PermissionState>> {
+            *self
+                .seen
+                .lock()
+                .expect("should lock the recorded permission state")
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationRequestFilter for RecordingPermissionsFilter {
+        fn integration_id(&self) -> &'static str {
+            "recording-permissions"
+        }
+
+        async fn filter_request(
+            &self,
+            input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            *self
+                .seen
+                .lock()
+                .expect("should lock the recorded permission state") =
+                Some(input.permissions.copied());
+            Ok(RequestFilterDecision::Continue(
+                RequestFilterEffects::default(),
+            ))
         }
     }
 
@@ -1613,6 +2408,7 @@ mod tests {
                 services: &services,
                 req: &mut req,
                 geo_info: None,
+                permissions: None,
             }))
             .expect("should run request filter");
 
@@ -1637,6 +2433,55 @@ mod tests {
             }
             RequestFilterRegistryOutcome::Respond { .. } => panic!("should continue routing"),
         }
+    }
+
+    #[test]
+    fn filter_request_passes_the_resolved_permission_state_to_each_filter() {
+        let filter = Arc::new(RecordingPermissionsFilter::default());
+        let registry = IntegrationRegistry::from_request_filters(vec![
+            filter.clone() as Arc<dyn IntegrationRequestFilter>
+        ]);
+        let settings = crate::test_support::tests::create_test_settings();
+        let services = crate::platform::test_support::noop_services();
+        let permissions =
+            PermissionState::new(PermissionSet::none().with(Permission::StoreOnDevice));
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/page")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+            settings: &settings,
+            services: &services,
+            req: &mut req,
+            geo_info: None,
+            permissions: Some(&permissions),
+        }))
+        .expect("should run request filter");
+
+        assert_eq!(
+            filter.seen(),
+            Some(Some(permissions)),
+            "the filter should observe exactly the permission state resolved for the request"
+        );
+
+        // A path that builds no EC context passes no permissions, and the
+        // filter must see that absence rather than an empty state.
+        futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+            settings: &settings,
+            services: &services,
+            req: &mut req,
+            geo_info: None,
+            permissions: None,
+        }))
+        .expect("should run request filter");
+
+        assert_eq!(
+            filter.seen(),
+            Some(None),
+            "an absent permission state should reach the filter as `None`"
+        );
     }
 
     #[test]
@@ -2168,6 +3013,22 @@ mod tests {
     }
 
     #[test]
+    fn js_module_ids_include_client_fixed_when_provider_selected() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
+            crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY,
+        ));
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "selecting the client-fixed provider should inject its demo page script"
+        );
+    }
+
+    #[test]
     fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
@@ -2195,6 +3056,20 @@ mod tests {
         assert!(
             metadata.iter().any(|integration| integration.id == "osano"),
             "should include JS-only Osano registration in metadata"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_exclude_client_fixed_without_provider() {
+        let registry =
+            IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
+                .expect("should create registry");
+
+        assert!(
+            !registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "the demo page script should not ship unless the client-fixed provider is selected"
         );
     }
 
@@ -2290,6 +3165,779 @@ mod tests {
         assert_eq!(
             recombined, all_sorted,
             "should reconstruct full module list from immediate + deferred"
+        );
+    }
+
+    fn duplicate_lockr_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(IntegrationRegistration::builder("lockr").build()))
+    }
+
+    #[test]
+    fn with_registrations_adds_an_external_builder_after_the_built_ins() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with an external builder");
+
+        assert!(
+            registry.integration_enabled("probe"),
+            "should register the external integration"
+        );
+        let ids = registry.registered_builder_ids();
+        assert_eq!(
+            ids.last().copied(),
+            Some("probe"),
+            "should order the external builder after every built-in"
+        );
+    }
+
+    #[test]
+    fn with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "lockr",
+                &serde_json::json!({ "enabled": true, "app_id": "test-app-id" }),
+            )
+            .expect("should insert lockr config");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "lockr",
+            "seam-probe",
+            duplicate_lockr_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a duplicate integration id");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("lockr")
+                && message.contains("trusted-server-core")
+                && message.contains("seam-probe"),
+            "error should name the id and both sources: {message}"
+        );
+    }
+
+    fn enable_prebid(settings: &mut Settings) {
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example.com/prebid/trusted-prebid.js",
+                }),
+            )
+            .expect("should insert prebid config");
+    }
+
+    fn enable_gpt_diagnostics(settings: &mut Settings) {
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+            .expect("should insert gpt_diagnostics config");
+    }
+
+    fn carried_probe_builder() -> crate::integrations::IntegrationBuilder {
+        crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_probe_registration,
+            validate_nothing,
+        )
+    }
+
+    const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn lying_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: ZERO_SHA256,
+                })
+                .build(),
+        ))
+    }
+
+    fn disabled_carried_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .without_js()
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn probe_js_hash_literal_matches_its_source() {
+        assert_eq!(
+            hex::encode(Sha256::digest(PROBE_JS.as_bytes())),
+            PROBE_JS_SHA256,
+            "should keep the PROBE_JS_SHA256 literal equal to the hash of PROBE_JS"
+        );
+    }
+
+    #[test]
+    fn a_carried_js_module_is_served_in_the_immediate_parts() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [carried_probe_builder()];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with a carried module");
+
+        let parts = registry.js_parts_immediate();
+        assert_eq!(
+            parts.first().map(|part| part.id),
+            Some("core"),
+            "should put core first in the immediate parts"
+        );
+        let probe = parts
+            .iter()
+            .find(|part| part.id == "probe")
+            .expect("should include the carried probe module in the immediate parts");
+        assert_eq!(
+            probe.source, PROBE_JS,
+            "should serve the carried source verbatim"
+        );
+        assert_eq!(
+            probe.sha256, PROBE_JS_SHA256,
+            "should carry the declared hash on the part"
+        );
+        assert!(
+            registry.js_module_ids_immediate().contains(&"probe"),
+            "should list the carried module among the immediate module ids"
+        );
+    }
+
+    #[test]
+    fn a_carried_js_module_with_a_wrong_hash_is_rejected_at_registry_build() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            lying_probe_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a carried module whose declared hash is wrong");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("probe") && message.contains("does not match"),
+            "error should name the integration and say the hash does not match: {message}"
+        );
+        assert!(
+            message.contains(ZERO_SHA256) && message.contains(PROBE_JS_SHA256),
+            "error should quote the declared and the actual hash: {message}"
+        );
+    }
+
+    #[test]
+    fn js_part_is_none_for_an_integration_registered_without_js() {
+        // The carried lookup would answer `Some` on its own, so this proves the
+        // disabled check runs first. No built-in integration can stand in: the
+        // only `without_js` built-in with a Rust registration, `aps`, has no
+        // compile-time module either.
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            disabled_carried_probe_registration,
+            validate_nothing,
+        )];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+
+        assert!(
+            registry.integration_enabled("probe"),
+            "should still register the integration"
+        );
+        assert!(
+            registry.js_part("probe").is_none(),
+            "should not serve a module for an integration registered without JS"
+        );
+        assert!(
+            !registry.js_module_ids().contains(&"probe"),
+            "should keep a without-JS integration out of the bundle module ids"
+        );
+    }
+
+    #[test]
+    fn the_last_js_delivery_flag_set_on_the_builder_wins() {
+        let disabled_last = IntegrationRegistration::builder("probe")
+            .with_standalone_js()
+            .without_js()
+            .build();
+        assert!(
+            disabled_last.js_disabled && !disabled_last.js_standalone && !disabled_last.js_deferred,
+            "without_js after with_standalone_js should leave only disabled set"
+        );
+
+        let deferred_last = IntegrationRegistration::builder("probe")
+            .with_standalone_js()
+            .with_deferred_js()
+            .build();
+        assert!(
+            deferred_last.js_deferred && !deferred_last.js_standalone && !deferred_last.js_disabled,
+            "with_deferred_js after with_standalone_js should leave only deferred set"
+        );
+
+        let deferred_after_disabled = IntegrationRegistration::builder("probe")
+            .without_js()
+            .with_deferred_js()
+            .build();
+        assert!(
+            deferred_after_disabled.js_deferred
+                && !deferred_after_disabled.js_disabled
+                && !deferred_after_disabled.js_standalone,
+            "with_deferred_js after without_js should leave only deferred set"
+        );
+
+        let standalone_last = IntegrationRegistration::builder("probe")
+            .without_js()
+            .with_deferred_js()
+            .with_standalone_js()
+            .build();
+        assert!(
+            standalone_last.js_standalone
+                && !standalone_last.js_disabled
+                && !standalone_last.js_deferred,
+            "with_standalone_js last should leave only standalone set"
+        );
+    }
+
+    #[test]
+    fn a_standalone_js_module_is_served_alone_and_not_in_the_bundle() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        enable_gpt_diagnostics(&mut settings);
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            !registry.js_module_ids().contains(&"gpt_diagnostics"),
+            "should keep a standalone module out of the bundle module ids"
+        );
+        assert!(
+            registry.js_part("gpt_diagnostics").is_some(),
+            "should serve the standalone module as a part"
+        );
+        assert_eq!(
+            registry.js_standalone_ids(),
+            vec!["gpt_diagnostics"],
+            "should list the enabled standalone module"
+        );
+        assert!(
+            registry.js_part("lockr").is_none(),
+            "should not serve a module for an integration that is not enabled"
+        );
+    }
+
+    #[test]
+    fn js_parts_all_covers_bundle_deferred_and_standalone_modules() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        enable_prebid(&mut settings);
+        enable_gpt_diagnostics(&mut settings);
+        let extra = [carried_probe_builder()];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+
+        let ids = registry
+            .js_parts_all()
+            .into_iter()
+            .map(|part| part.id)
+            .collect::<Vec<_>>();
+        for expected in ["core", "creative", "probe", "prebid", "gpt_diagnostics"] {
+            assert_eq!(
+                ids.iter().filter(|id| **id == expected).count(),
+                1,
+                "should list `{expected}` exactly once in {ids:?}"
+            );
+        }
+    }
+
+    /// A builder function for an integration that is never enabled, so its
+    /// preparer is the only thing the registry can take from it.
+    fn never_enabled_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    /// Preparers cannot capture, because a builder holds plain function
+    /// pointers, so they record the order they ran in here.
+    static PREPARER_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    fn record_first_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        PREPARER_ORDER
+            .lock()
+            .expect("should lock the preparer order")
+            .push("first");
+        Ok(())
+    }
+
+    fn record_second_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        PREPARER_ORDER
+            .lock()
+            .expect("should lock the preparer order")
+            .push("second");
+        Ok(())
+    }
+
+    /// Records whether the preparer registered after the failing one ran.
+    static PREPARER_AFTER_FAILURE: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    const FAILING_PREPARER_MESSAGE: &str = "probe preparer refused the request";
+
+    fn failing_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Configuration {
+            message: FAILING_PREPARER_MESSAGE.to_owned(),
+        }))
+    }
+
+    fn record_after_failure_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        PREPARER_AFTER_FAILURE
+            .lock()
+            .expect("should lock the after-failure record")
+            .push("after");
+        Ok(())
+    }
+
+    fn plain_request() -> Request<EdgeBody> {
+        Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/article")
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    #[test]
+    fn prepare_request_runs_every_preparer_in_registration_order_enabled_or_not() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe-first",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(record_first_preparer),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-second",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(record_second_preparer),
+        ];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with request preparers");
+        assert!(
+            !registry.integration_enabled("probe-first"),
+            "should leave the first probe integration disabled"
+        );
+        assert!(
+            !registry.integration_enabled("probe-second"),
+            "should leave the second probe integration disabled"
+        );
+        PREPARER_ORDER
+            .lock()
+            .expect("should lock the preparer order")
+            .clear();
+        let mut request = plain_request();
+
+        registry
+            .prepare_request(&settings, &mut request)
+            .expect("should run every request preparer");
+
+        assert_eq!(
+            *PREPARER_ORDER
+                .lock()
+                .expect("should lock the preparer order"),
+            vec!["first", "second"],
+            "should run both preparers in registration order even though neither integration is enabled"
+        );
+    }
+
+    #[test]
+    fn prepare_request_surfaces_the_first_preparer_error() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe-failing",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(failing_preparer),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-after-failure",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(record_after_failure_preparer),
+        ];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with request preparers");
+        PREPARER_AFTER_FAILURE
+            .lock()
+            .expect("should lock the after-failure record")
+            .clear();
+        let mut request = plain_request();
+
+        let error = registry
+            .prepare_request(&settings, &mut request)
+            .expect_err("should surface the failing preparer's error");
+
+        assert!(
+            error.to_string().contains(FAILING_PREPARER_MESSAGE),
+            "should keep the preparer's message intact: {error}"
+        );
+        assert!(
+            PREPARER_AFTER_FAILURE
+                .lock()
+                .expect("should lock the after-failure record")
+                .is_empty(),
+            "should not run a preparer registered after the failing one"
+        );
+    }
+
+    #[test]
+    fn prepare_request_runs_the_built_in_gpt_diagnostics_preparer() {
+        // The adapters call the registry rather than naming GPT diagnostics, so
+        // the built-in table is what attaches the sanitizing preparer. This is
+        // asserted here rather than through an adapter route test because the
+        // stripped query is only visible on the publisher HTML path, which needs
+        // a live origin the adapter test harnesses do not have.
+        let settings = crate::test_support::tests::create_test_settings();
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/article?ts_console=1&keep=yes")
+            .header(header::COOKIE, "__Host-ts-console=1; keep-me=yes")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        registry
+            .prepare_request(&settings, &mut request)
+            .expect("should run the built-in preparers");
+
+        assert_eq!(
+            request.uri().query(),
+            Some("keep=yes"),
+            "should strip the reserved diagnostics query and keep the rest"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(header::COOKIE)
+                .map(|value| value.to_str().expect("cookie should be text")),
+            Some("keep-me=yes"),
+            "should strip the reserved diagnostics cookie and keep the rest"
+        );
+    }
+
+    /// Example country code returned by the test geo provider. `ZZ` is the
+    /// user-assigned code, so it names no real place.
+    const GEO_PROBE_COUNTRY: &str = "ZZ";
+
+    /// A geo provider that resolves one fixed location, so a test can tell the
+    /// module's provider apart from the "no location" one.
+    #[derive(Debug)]
+    struct FixedCountryGeo;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformGeo for FixedCountryGeo {
+        async fn lookup(
+            &self,
+            _client_ip: Option<std::net::IpAddr>,
+            _services: &crate::platform::RuntimeServices,
+        ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
+            Ok(Some(GeoInfo {
+                city: "Example City".to_owned(),
+                country: GEO_PROBE_COUNTRY.to_owned(),
+                continent: "Example".to_owned(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                region: None,
+                asn: None,
+            }))
+        }
+    }
+
+    /// Builds a `geo-probe` registration that declares a geo provider.
+    fn geo_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("geo-probe")
+                .with_geo_provider(Arc::new(FixedCountryGeo))
+                .build(),
+        ))
+    }
+
+    /// A device provider that declares it needs a permission, which nothing can
+    /// enforce per request yet.
+    #[derive(Debug)]
+    struct PermissionDemandingDevice;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::device::DeviceProvider for PermissionDemandingDevice {
+        fn id(&self) -> &'static str {
+            "device-probe"
+        }
+
+        async fn detect(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _services: &crate::platform::RuntimeServices,
+        ) -> crate::ec::device::DeviceSignals {
+            crate::ec::device::DeviceSignals {
+                is_mobile: 2,
+                ja4_class: None,
+                platform_class: None,
+                h2_fp_hash: None,
+                known_browser: None,
+                looks_like_browser: false,
+            }
+        }
+
+        fn required_permissions(&self) -> crate::permissions::PermissionSet {
+            crate::permissions::PermissionSet::none()
+                .with(crate::permissions::Permission::StoreOnDevice)
+        }
+    }
+
+    fn device_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("device-probe")
+                .with_device_provider(Arc::new(PermissionDemandingDevice))
+                .build(),
+        ))
+    }
+
+    fn device_probe_builders() -> [crate::integrations::IntegrationBuilder; 1] {
+        [crate::integrations::IntegrationBuilder::new(
+            "device-probe",
+            "seam-probe",
+            device_probe_registration,
+            validate_nothing,
+        )]
+    }
+
+    #[test]
+    fn a_module_device_provider_declaring_permissions_is_refused_at_startup() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.device.provider = Some("device-probe".to_owned());
+
+        let error = IntegrationRegistry::with_registrations(&settings, &device_probe_builders())
+            .err()
+            .expect("should refuse a device provider whose permissions nothing can enforce");
+
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("device-probe"),
+            "the failure should name the module, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "requiring `{}`",
+                crate::permissions::Permission::StoreOnDevice.as_str()
+            )),
+            "the failure should say why it was refused, got: {rendered}"
+        );
+    }
+
+    fn geo_probe_builders() -> [crate::integrations::IntegrationBuilder; 1] {
+        [crate::integrations::IntegrationBuilder::new(
+            "geo-probe",
+            "seam-probe",
+            geo_probe_registration,
+            validate_nothing,
+        )]
+    }
+
+    fn settings_selecting_geo_provider(provider: &str) -> Settings {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.geo.provider = Some(provider.to_owned());
+        settings
+    }
+
+    #[tokio::test]
+    async fn geo_provider_resolves_the_provider_declared_by_the_selected_module() {
+        let settings = settings_selecting_geo_provider("geo-probe");
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .expect("should build registry with a module geo provider");
+
+        let provider = registry
+            .geo_provider()
+            .expect("should resolve the module's geo provider");
+        let resolved = provider
+            .lookup(None, &noop_services())
+            .await
+            .expect("should look up without failing")
+            .expect("should resolve a location");
+        assert_eq!(
+            resolved.country, GEO_PROBE_COUNTRY,
+            "should resolve through the module's own provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn geo_provider_none_resolves_no_location() {
+        let settings = settings_selecting_geo_provider("none");
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .expect("should build registry with the disabled geo provider");
+
+        let provider = registry
+            .geo_provider()
+            .expect("should resolve the disabled geo provider");
+        assert!(
+            provider
+                .lookup(None, &noop_services())
+                .await
+                .expect("should look up without failing")
+                .is_none(),
+            "should resolve no location when the selector is `none`"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unset_geo_selector_resolves_the_disabled_provider_and_platform_opts_in() {
+        // Unset is the permission model's privacy default: it resolves the
+        // disabled provider, so no client IP ever reaches a host geo service.
+        // It is deliberately not the same as leaving the adapter's own lookup
+        // in place, which is what `platform` now spells.
+        let settings = crate::test_support::tests::create_test_settings();
+        assert!(
+            settings.geo.provider.is_none(),
+            "the shared test settings should leave the geo selector unset"
+        );
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .expect("should build registry with an unset geo selector");
+
+        let provider = registry
+            .geo_provider()
+            .expect("an unset selector should resolve the disabled provider, not nothing");
+        assert!(
+            provider
+                .lookup(None, &noop_services())
+                .await
+                .expect("should look up without failing")
+                .is_none(),
+            "the disabled provider should resolve no location and make no host call"
+        );
+
+        // `platform` is the explicit opt-in to the adapter's own lookup, and it
+        // is the one case that resolves nothing here so the adapter's provider
+        // stands.
+        let platform = settings_selecting_geo_provider(GEO_PROVIDER_PLATFORM);
+        let registry = IntegrationRegistry::with_registrations(&platform, &geo_probe_builders())
+            .expect("should build registry with the platform geo selector");
+        assert!(
+            registry.geo_provider().is_none(),
+            "`platform` should leave the adapter's own host lookup in place"
+        );
+    }
+
+    #[test]
+    fn geo_provider_rejects_a_module_that_declares_no_geo_provider() {
+        let settings = settings_selecting_geo_provider("probe");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a module that declares no geo provider");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("probe") && message.contains("geo provider"),
+            "error should name the module and the capability: {message}"
+        );
+    }
+
+    #[test]
+    fn geo_provider_rejects_a_module_that_is_registered_but_not_enabled() {
+        let settings = settings_selecting_geo_provider("probe-disabled");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe-disabled",
+            "seam-probe",
+            never_enabled_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a module that is registered but not enabled");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("probe-disabled")
+                && message.contains("not enabled")
+                && message.contains("geo provider"),
+            "error should name the module, that it is not enabled, and the capability: {message}"
+        );
+    }
+
+    #[test]
+    fn geo_provider_rejects_a_module_that_is_not_registered() {
+        let settings = settings_selecting_geo_provider("absent-module");
+
+        let error = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .err()
+            .expect("should reject a selector naming nothing registered");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("absent-module") && message.contains("not registered"),
+            "error should name the module and say it is not registered: {message}"
         );
     }
 }

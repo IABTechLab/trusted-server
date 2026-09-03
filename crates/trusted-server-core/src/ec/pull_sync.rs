@@ -19,7 +19,7 @@ use crate::platform::{
 };
 use crate::settings::Settings;
 
-use super::generation::{ec_hash, is_valid_ec_id};
+use super::generation::ec_hash;
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
 use super::rate_limiter::RateLimiter;
@@ -55,16 +55,26 @@ struct PullSyncResponse {
 
 /// Builds post-send pull-sync context from the route EC context.
 ///
-/// Returns `None` when consent denies EC or there is no active EC ID.
+/// Returns `None` when sharing is not permitted or there is no active EC ID.
+/// Pull sync sends the identifier to a partner, so it needs the same
+/// permission pair as bidstream EIDs (storage plus personalised-ad
+/// selection), not only the provider's storage permission.
 #[must_use]
 pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext> {
-    if !ec_context.ec_allowed() {
+    if !ec_context.ec_sharing_allowed() {
         return None;
     }
 
+    // Accept an identifier from whichever provider this deployment reads,
+    // dispatched by the identifier's provider code, rather than only the
+    // built-in HMAC shape. A host-signal or vendor provider's identifiers are
+    // valid here for the same reason they are valid in the organic path.
     let ec_id_ref = ec_context.ec_value()?;
-    if !is_valid_ec_id(ec_id_ref) {
-        log::debug!("Pull sync: skipping dispatch because active EC ID is invalid format");
+    if !ec_context.accepts_id(ec_id_ref) {
+        log::debug!(
+            "Pull sync: skipping dispatch because the active EC ID is not one this \
+             deployment's providers accept"
+        );
         return None;
     }
 
@@ -499,6 +509,88 @@ mod tests {
         );
     }
 
+    /// A non-HMAC provider whose identifiers are opaque, modeling the
+    /// host-signal provider PR #1044 adds: valid identifiers that the built-in
+    /// HMAC grammar rejects outright.
+    #[derive(Debug)]
+    struct OpaqueProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::provider::EdgeCookieProvider for OpaqueProvider {
+        fn id(&self) -> &'static str {
+            "opaque"
+        }
+
+        fn code(&self) -> crate::ec::provider::ProviderCode {
+            crate::provider_code!("t0op")
+        }
+
+        async fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &crate::ec::provider::IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
+        ) -> Result<
+            crate::ec::provider::GeneratedEdgeCookie,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+    }
+
+    #[test]
+    fn build_pull_sync_context_accepts_the_active_non_hmac_provider() {
+        // A deployment whose active provider is not the built-in HMAC one must
+        // still dispatch pull sync for the identifiers that provider created.
+        // The built-in grammar rejected every non-`hmac` code, so these
+        // identifiers worked in the organic path and were silently skipped
+        // here.
+        const OPAQUE_ID: &str = "t0op~Opaque_Value_MixedCase";
+
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from("opaque"));
+        let services = crate::platform::test_support::noop_services_with_ec_provider(
+            std::sync::Arc::new(OpaqueProvider),
+        );
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .header("cookie", format!("ts-ec={OPAQUE_ID}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let geo = crate::geo::GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+
+        let ec_context =
+            EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+                .expect("should read EC context");
+        assert_eq!(
+            ec_context.ec_value(),
+            Some(OPAQUE_ID),
+            "the opaque identifier should read back before pull sync sees it"
+        );
+
+        let context = build_pull_sync_context(&ec_context)
+            .expect("should dispatch pull sync for the active provider's identifier");
+        assert_eq!(
+            context.ec_id(),
+            OPAQUE_ID,
+            "should carry the identifier through unchanged"
+        );
+    }
+
     #[test]
     fn build_pull_sync_context_rejects_invalid_ec_id() {
         let consent = ConsentContext {
@@ -709,6 +801,25 @@ mod tests {
             rotated,
             vec!["beta.example.com", "gamma.example.com", "alpha.example.com"],
             "hour 1 rotation should move beta to front"
+        );
+    }
+
+    #[test]
+    fn build_pull_sync_context_accepts_a_minted_coded_ec_id() {
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        // The form the creation path produces since the provider-code envelope.
+        let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
+        let ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+
+        let context = build_pull_sync_context(&ec_context)
+            .expect("should build pull sync context for a coded HMAC identifier");
+        assert_eq!(
+            context.ec_id(),
+            ec_id,
+            "should dispatch the coded identifier as created"
         );
     }
 }

@@ -400,6 +400,19 @@ fn build(
     Ok(Some(GoogleTagManagerIntegration::new(config)))
 }
 
+/// Validates the Google Tag Manager configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Google Tag Manager configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Google Tag Manager integration when enabled.
 ///
 /// # Errors
@@ -1566,12 +1579,18 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 enabled = true
 container_id = "GTM-PARSED"
 upstream_url = "https://custom.gtm.example"
+
+[geo]
+assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
         let config = settings
@@ -1599,10 +1618,16 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"
+
+[geo]
+assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
         let config = settings

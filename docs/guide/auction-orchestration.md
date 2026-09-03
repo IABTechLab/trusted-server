@@ -215,20 +215,24 @@ The orchestrator is composed of several modules:
 
 ### Provider Auto-Discovery
 
-Providers register themselves at startup via builder functions. The `build_orchestrator()` function in `auction/mod.rs` iterates all registered builders, passes the application settings, and each builder returns zero or more providers depending on whether its config section is present and enabled:
+Providers register themselves at startup through `AuctionProviderBuilder`, which names the provider, names the crate it came from, and points at a build function and a validate function. The `build_orchestrator()` function in `auction/mod.rs` walks the built-in builders, passes the application settings to each, and each build function returns zero or more providers depending on whether its config section is present and enabled.
 
 ```rust
-// Each integration registers its own builder
-fn provider_builders() -> &'static [ProviderBuilder] {
-    &[
+// The built-in auction providers, in registration order.
+const BUILT_IN_PROVIDER_BUILDERS: &[AuctionProviderBuilder] = &[
+    AuctionProviderBuilder::new(
+        "prebid",
+        CORE_SOURCE,
         prebid::register_auction_provider,
-        aps::register_providers,
-        adserver_mock::register_providers,
-    ]
-}
+        prebid::validate,
+    ),
+    // aps and adserver_mock follow in the same shape.
+];
 ```
 
-This means you only need to add a config section to `trusted-server.toml` for a provider to be automatically discovered and registered.
+This means you only need to add a config section to `trusted-server.toml` for a built-in provider to be discovered and registered.
+
+A provider can also come from a crate outside core. `build_orchestrator_with_providers(settings, extra)` takes the built-in builders followed by the ones an adapter supplies, and two builders claiming one provider name are refused with a message naming both crates. See [Modules That Live Outside Core](./integration-guide.md#modules-that-live-outside-core).
 
 ## Auction Strategies
 

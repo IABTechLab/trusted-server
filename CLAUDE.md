@@ -20,6 +20,11 @@ crates/
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
+  device/
+    fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device provider)
+  edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC provider is in core)
+  geo/                                  # vendor geo provider crates (host geo is injected by the adapter)
+  integrations/                         # Integration modules that ship outside core (seam-probe)
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -58,7 +63,9 @@ fastly compute serve
 # Deploy to Fastly
 fastly compute publish
 
-# Run Axum dev server (native — no Viceroy)
+# Run Axum dev server (native — no Viceroy). Settings load at runtime from the
+# platform config store on every adapter; publish an operator config with
+# `ts config push` (see trusted-server.example.toml for the template).
 cargo run -p trusted-server-adapter-axum
 
 # Test Axum adapter only
@@ -141,6 +148,20 @@ cd crates/trusted-server-js/lib && node build-all.mjs
 ```bash
 cargo install viceroy --version 0.17.0 --locked --force
 ```
+
+### Windows (use WSL for the Linux-only tests)
+
+The Rust adapter tests run natively on Windows through the cargo aliases
+(`cargo test-fastly` via Viceroy, `cargo test-axum`, `cargo test-cloudflare`),
+and CI runs these on both `ubuntu-latest` and `windows-latest`.
+
+The Docker-based integration suite (`scripts/integration-tests.sh`) and the
+Cloudflare worker build (`crates/trusted-server-adapter-cloudflare/build.sh`,
+which uses `worker-build` + `wrangler dev`) are Linux tools. On Windows run them
+inside WSL (Ubuntu) with Docker Desktop's WSL integration enabled. Provision the
+WSL distro with the same toolchain as `.tool-versions` (rustup + the
+`wasm32-wasip1` / `wasm32-unknown-unknown` targets, Node, Viceroy, wrangler), then
+run the scripts from a clone on the WSL native filesystem for fast builds.
 
 ---
 
@@ -269,11 +290,47 @@ impl core::error::Error for MyError {}
 
 ## Other guidelines
 
+- Use US English spelling everywhere: code, identifiers, comments,
+  documentation, tests, commit messages, and configuration. For example, write
+  `color`, `behavior`, and `optimize`, not `colour`, `behaviour`, or `optimise`.
+  Where a term comes from an external source (for example the IAB TCF purpose
+  names), match that source's spelling even when it is not US English.
 - Use only example or fictional information in comments, tests, docs, examples,
   and similar non-runtime materials. (eg. for urls use: example.com domains only)
 - Do not write or commit real domains, customer names, credentials,
   configuration values, or other potentially sensitive real-world information in
   comments, tests, docs, or examples.
+
+### Permission model terminology
+
+Permissions are the primitive. A provider declares the permissions it requires
+(`required_permissions`) and the system decides whether each is _set_. Consent
+is only one of many ways a permission may be established. Country or
+jurisdiction rules (a `Granted` group baseline), legitimate interest, or
+configuration can set a permission with no consent at all.
+
+- A provider that needs nothing **requires no permission**. Never write that it
+  "runs without any consent".
+- A gated provider **runs once its required permissions are set**, by whatever
+  method.
+
+**Evidence is not rationed, use is.** Every provider and every integration sees
+all the evidence available for a request, including host signals such as the TLS
+JA4 and HTTP/2 signals. The core never decides which vendor may see what,
+because withholding a signal from one vendor and not another discriminates
+between them, and the core stays neutral. What a vendor may *do* with the
+evidence is governed by the permissions it declares and the system sets. Access
+is universal, use is gated.
+
+The practical consequence: never "fix" a vendor's access to a signal by hiding
+the signal. If a use needs controlling, express it as a permission. A change
+that removes evidence from a provider's reach is working against the
+architecture, not protecting it.
+
+- Reserve "consent" for the consent subsystem (`consent/`, `ConsentContext`,
+  GDPR and TCF strings) where it genuinely means a consent signal. In the
+  permission layer prefer "permission", "set" / "unset", and "signal" (consent
+  is one kind of signal, alongside privacy and opt-out signals).
 
 ---
 
@@ -288,6 +345,41 @@ impl core::error::Error for MyError {}
 
 Good: `"Add feature flags to Real type tests that require serde"`
 Bad: `"fix: added feature flags"`
+
+---
+
+## Provider Architecture
+
+Each vendor-differentiated capability is pluggable behind its own trait, so a
+deployment selects an implementation and the core stays neutral:
+
+| Capability            | Trait                                    | Selector            | Built-in (core)                         | Vendor / host crates         |
+| --------------------- | ---------------------------------------- | ------------------- | --------------------------------------- | ---------------------------- |
+| Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
+| Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
+| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
+
+Principles for adding or changing a provider:
+
+- **Core stays neutral.** The trait and the host-neutral default live in
+  `trusted-server-core`. Host-specific and vendor implementations live in their
+  own crates and are injected by the adapter (for example `build_device_provider`
+  and `build_geo_provider`), so core never depends on a host SDK or a vendor, and
+  the default request path makes no host-specific calls.
+- **Providers read request evidence, not a fixed parameter set.** A provider must
+  be able to see everything about the request it needs (User-Agent, headers, and
+  host signals such as the TLS JA4 and HTTP/2 signals) through an evidence
+  abstraction rather than a hard-coded struct of fields. Host signals come from
+  the host (the Fastly SDK) and are opt-in, so a neutral provider triggers no
+  host signal calls.
+- **Providers are separated by capability but composed per request, and one may
+  need another's output.** Geo resolves the country and region the permission
+  model uses, and the permission model gates whether the Edge Cookie provider
+  runs. Device signals gate Edge Cookie writes (the browser / bot gate). When
+  multiple vendor providers share a backend (for example a vendor's Edge Cookie,
+  geo, and device provider on one cloud pipeline) they share a single call per
+  request rather than calling independently. Give a provider the inputs and
+  upstream results it needs explicitly, rather than having it reach into globals.
 
 ---
 
@@ -308,6 +400,27 @@ IntegrationRegistration::builder(ID)
 - Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
 
+### Pluggable Capabilities
+
+Each capability below is composed from builders, so a deployment can add one
+from a crate core does not name:
+
+| Capability         | Trait / type                                                              | Selector                                                                                                     | Built-in (core)                                                       | Vendor crates                  |
+| ------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- | ------------------------------ |
+| Integration module | `IntegrationBuilder` (`integrations/mod.rs`)                              | `[integrations.<id>]` enables it; adapters add outside builders through `routes_with_registrations` / `build_state_with_registrations` | `BUILT_IN_BUILDERS` (prebid, aps, nextjs, datadome, didomi, lockr, ...) | `crates/integrations/<vendor>` |
+| Auction provider   | `AuctionProviderBuilder` (`auction/mod.rs`)                               | `[auction] providers`                                                                                        | prebid, aps, adserver_mock                                            | `crates/integrations/<vendor>` |
+| Geo / location     | `PlatformGeo` (`platform/traits.rs`), declared with `.with_geo_provider()` | `[geo] provider`                                                                                             | `DisabledGeo` when unset or `none`, host lookup with `platform`       | `crates/integrations/<vendor>` |
+| Edge Cookie identity | `EdgeCookieProvider` (`ec/provider.rs`), declared with `.with_ec_provider()` | `[ec] provider`                                                                                          | HMAC, client-fixed (opt-in, no default)                              | `crates/integrations/<vendor>` |
+| Device detection   | `DeviceProvider` (`ec/device.rs`), declared with `.with_device_provider()` | `[device] provider`                                                                                        | User-Agent only (default)                                            | `crates/integrations/<vendor>` |
+
+- A vendor crate supplies its id, its source label, a build function, a
+  validate function and optionally a request preparer. Duplicate ids or
+  provider names are refused at startup, naming both sources.
+- `crates/integrations/seam-probe` is the worked example, driven end to end by
+  `crates/trusted-server-adapter-axum/tests/seam_probe.rs`.
+- A vendor's validate function does **not** run through `ts config validate` or
+  `ts config push`, which use the built-in builders only.
+
 ## JS Build Pipeline
 
 - `build-all.mjs` discovers `src/integrations/*/index.ts` and builds each as a separate IIFE.
@@ -324,7 +437,7 @@ IntegrationRegistration::builder(ID)
 | --------------------- | ---------------------------------------------------------- |
 | `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
 | `fastly.toml`                   | Fastly service configuration and build settings                 |
-| `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
+| `trusted-server.example.toml`   | Source-controlled app-config template (includes the `[ec]` / `[geo]` / `[device]` provider selectors) |
 | `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
 | `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
 | `.env.dev`                      | Local development environment variables                         |

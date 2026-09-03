@@ -357,6 +357,8 @@ You can create your own integrations by implementing the integration traits:
 
 See the [Integration Guide](./integration-guide.md) for details on building custom integrations.
 
+An integration does not have to live in `trusted-server-core`. It can ship in its own crate that a deployment composes in at startup, which keeps the vendor's code and release cycle its own. See [Modules That Live Outside Core](./integration-guide.md#modules-that-live-outside-core).
+
 ## Common Questions
 
 ### Can I enable multiple integrations?

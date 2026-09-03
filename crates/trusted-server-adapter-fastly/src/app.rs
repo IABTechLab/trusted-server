@@ -30,6 +30,7 @@
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
+//! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -101,7 +102,9 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, AuctionProviderBuilder, build_orchestrator_with_providers,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
@@ -109,24 +112,29 @@ use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
-use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::provider::request_provider;
+use trusted_server_core::ec::provider::{EdgeCookieProvider, build_reusable_provider};
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
-    IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome,
+    IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects,
+    RequestFilterRegistryInput, RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::permissions::PermissionState;
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, build_geo_provider,
+};
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
+    AppContext, AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
     handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
     publisher_response_into_streaming_response,
 };
@@ -139,6 +147,7 @@ use trusted_server_core::settings_data::{
     config_key, config_store_name, get_settings_from_config_store,
 };
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_device_fastly::FastlyHostSignals;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -160,6 +169,17 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// The Edge Cookie provider `[ec] provider` selects, resolved once here.
+    ///
+    /// This adapter runs a fresh instance per request, so application state and
+    /// the request path used to resolve the same selection twice for every
+    /// request, once to check it could be satisfied and once to use it.
+    /// Resolving reads no request data, so the result is kept and handed to
+    /// every request through
+    /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
+    /// `None` for a deployment that selects no provider, and for one whose
+    /// provider must be resolved per request.
+    pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -180,13 +200,62 @@ pub(crate) fn load_settings_from_config_store(
     get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &key)
 }
 
+/// Build the application state from explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, or when the auction orchestrator or the integration registry
+/// fail to initialize.
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations(settings, &[], &[])
+}
+
+/// Build the application state from explicit settings, composing the built-in
+/// integrations and auction providers with the externally supplied builders in
+/// `integrations` and `auction_providers`.
+///
+/// A deployment that ships a vendor crate calls this to add that crate's
+/// integration and auction provider builders without the adapter naming the
+/// vendor.
+///
+/// # Errors
+///
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, or when the auction orchestrator or the integration registry
+/// fail to initialize, which includes two builders claiming the same
+/// integration id or auction provider name.
+pub(crate) fn build_state_with_registrations(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+    auction_providers: &[AuctionProviderBuilder],
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
+    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+
+    // Composition root: resolve the provider selection once, before any request
+    // is served, so a selection this adapter can never supply fails here rather
+    // than on the first request, and keep what the resolution produced so the
+    // request path does not resolve the same settings again. The registry is
+    // built first because a module can supply the vendor Edge Cookie provider
+    // the selector names, and resolving without it would reject a selection
+    // this deployment can in fact satisfy.
+    //
+    // This adapter injects host signals on every request, so a startup instance
+    // with no captured signals answers the only question the check asks,
+    // which is whether the service exists at all. That same emptiness is why
+    // `build_reusable_provider` hands back nothing for a provider built from
+    // those signals, leaving it to be resolved per request against the
+    // signals that request actually carried.
+    let resolved_ec_provider = build_reusable_provider(
+        &settings.ec,
+        Some(Arc::new(FastlyHostSignals::default())),
+        registry.ec_provider(),
+    )?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -197,6 +266,7 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        resolved_ec_provider,
     }))
 }
 
@@ -253,6 +323,12 @@ pub(crate) fn runtime_services_for_consent_route(
 /// absent (e.g. tests that dispatch without the entry point). Scheme detection
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
+///
+/// Applies the module-supplied providers selected by `[geo]`, `[ec]` and
+/// `[device] provider` on top of the base services. Unset and `none` resolve
+/// the disabled geo provider, `platform` leaves the Fastly lookup standing,
+/// and any other key names a module's provider. Identity and device are
+/// applied the same way when a module supplies them.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
         .request()
@@ -264,7 +340,24 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
-    RuntimeServices::builder()
+    // The TLS JA4 and HTTP/2 signals arrive as trusted internal headers
+    // injected by the entry point. They build the host-signal service a
+    // host-signal provider reads. Fastly always supplies the capability, so the
+    // service is always set even when a request carried no signal.
+    let tls_ja4 = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-ja4")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let h2_fingerprint = ctx
+        .request()
+        .headers()
+        .get("x-ts-h2-fingerprint")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let builder = RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
@@ -275,9 +368,61 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .geo(build_geo_provider(
+            &state.settings,
+            Arc::new(FastlyPlatformGeo),
+        ))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
+        .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
+
+    // Hand every request the provider resolved at the composition root, so the
+    // request path reuses that instance instead of resolving `[ec] provider`
+    // again. Nothing is set for a deployment that selects no provider, or one
+    // whose provider is built from this request's own host signals, and both
+    // are resolved on the request path instead.
+    let services = match state.resolved_ec_provider.clone() {
+        Some(provider) => builder.resolved_ec_provider(provider).build(),
+        None => builder.build(),
+    };
+
+    // Unset and `"none"` both resolve nothing, so no client IP reaches a host
+    // geo service. `"platform"` opts in to the Fastly lookup below, and any
+    // other key names an integration module that declares a geo provider.
+    let mut services = services;
+    if let Some(provider) = state.registry.geo_provider() {
+        services = services.with_geo(provider);
+    }
+    if let Some(provider) = state.registry.ec_provider() {
+        services = services.with_ec_provider(provider);
+    }
+    if let Some(provider) = state.registry.device_provider() {
+        services = services.with_device_provider(provider);
+    }
+    services
+}
+
+/// Builds the services graph handed to a provider on a response-side finalize
+/// path.
+///
+/// The finalize paths run after the handler, where the per-request services
+/// built by [`build_per_request_services`] are already out of scope, but a geo
+/// provider still needs real platform services to resolve a location. The
+/// middleware builds this once and clones it per request with
+/// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
+/// call.
+pub(crate) fn build_finalize_services(
+    settings: &Settings,
+    kv_store: Arc<dyn PlatformKvStore>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(FastlyPlatformConfigStore))
+        .secret_store(Arc::new(FastlyPlatformSecretStore))
+        .kv_store(kv_store)
+        .backend(Arc::new(FastlyPlatformBackend))
+        .http_client(Arc::new(FastlyPlatformHttpClient))
+        .geo(build_geo_provider(settings, Arc::new(FastlyPlatformGeo)))
+        .client_info(ClientInfo::default())
         .build()
 }
 
@@ -394,13 +539,13 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
-fn build_ec_request_state(
+async fn build_ec_request_state(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
     let device_signals = device_signals_for(req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     if !is_real_browser {
         log::info!(
             "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
@@ -413,34 +558,29 @@ fn build_ec_request_state(
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed during EC setup: {e}");
-            None
-        });
-
     let (ec_context, setup_error) =
-        match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
+        match EcContext::read_from_request_resolving_geo(settings, req, services).await {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
                 (context, None)
             }
             Err(report) => (EcContext::default(), Some(report)),
         };
+    let geo_info = ec_context.geo_info().cloned();
 
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
-    // consent withdrawals. Revocations keep the write path so tombstones stay
-    // authoritative even for privacy-extension-heavy clients.
+    // when the request carries an explicit withdrawal signal. The write path
+    // stays open for withdrawal so tombstones remain authoritative even for
+    // privacy-extension-heavy clients that do not look like known browsers. A
+    // merely not-permitted (pre-consent or fail-closed) request writes nothing,
+    // so it does not need the graph.
     let kv_graph = crate::maybe_identity_graph(settings);
-    let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
-    {
-        kv_graph.clone()
-    } else {
-        None
-    };
+    let finalize_kv_graph =
+        if setup_error.is_none() && (is_real_browser || ec_context.storage_withdrawn()) {
+            kv_graph.clone()
+        } else {
+            None
+        };
     let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
@@ -479,11 +619,15 @@ enum PreRoute {
 /// mutations are applied to `req` so the routed handler observes them; response
 /// effects are returned for the entry point to apply after EC finalization. A
 /// filter that responds (e.g. a `DataDome` challenge) short-circuits routing.
+///
+/// `permissions` carries the state resolved when the EC context was built, so
+/// every filter reads the same permissions as the rest of the request.
 async fn run_pre_route_filters(
     state: &AppState,
     services: &RuntimeServices,
     req: &mut Request,
     geo_info: Option<&GeoInfo>,
+    permissions: Option<&PermissionState>,
 ) -> PreRoute {
     match state
         .registry
@@ -492,6 +636,7 @@ async fn run_pre_route_filters(
             services,
             req,
             geo_info,
+            permissions,
         })
         .await
     {
@@ -555,7 +700,12 @@ async fn execute_named(
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
                     let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                    // The selected provider decides which identifiers this
+                    // deployment recognizes, so build it here rather than
+                    // assuming the built-in HMAC shape. The read-only
+                    // diagnostic builds no EC request state to borrow it from.
+                    let provider = request_provider(&state.settings.ec, &services)?;
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, provider.as_deref(), &req)
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
@@ -564,14 +714,11 @@ async fn execute_named(
         return Ok(response);
     }
 
-    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-        &state.settings,
-        &mut req,
-    ) {
+    if let Err(report) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&report));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut ec = build_ec_request_state(&state.settings, &services, &req).await;
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -583,13 +730,20 @@ async fn execute_named(
         ));
     }
 
-    let effects =
-        match run_pre_route_filters(&state, &services, &mut req, ec.geo_info.as_ref()).await {
-            PreRoute::ShortCircuit { response, effects } => {
-                return Ok(attach_dispatch_extensions(response, ec, effects));
-            }
-            PreRoute::Continue { effects } => effects,
-        };
+    let effects = match run_pre_route_filters(
+        &state,
+        &services,
+        &mut req,
+        ec.geo_info.as_ref(),
+        Some(ec.ec_context.permissions()),
+    )
+    .await
+    {
+        PreRoute::ShortCircuit { response, effects } => {
+            return Ok(attach_dispatch_extensions(response, ec, effects));
+        }
+        PreRoute::Continue { effects } => effects,
+    };
 
     let response = run_named_route(&state, &services, req, handler, &mut ec)
         .await
@@ -638,6 +792,19 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::EcResolve => {
+            // The resolve endpoint persists the identity-graph row before
+            // creating, so it takes the same bot-gated graph as generation: an
+            // unrecognized client gets no graph, and therefore no new Edge Cookie.
+            handle_ec_resolve(
+                &state.settings,
+                req,
+                &ec.ec_context,
+                ec.kv_graph.as_ref(),
+                services,
+            )
+            .await
+        }
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -712,14 +879,18 @@ async fn run_named_route(
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
+        // A partner echoes back an identifier the deployment's own provider
+        // created, so validation and KV normalization are dispatched through
+        // that provider rather than the built-in HMAC grammar.
+        let provider = request_provider(&state.settings.ec, services)?;
+        handle_batch_sync(&kv, &partner_registry, &limiter, provider.as_deref(), req)
     });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
@@ -757,14 +928,11 @@ async fn dispatch_fallback(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-        &state.settings,
-        &mut req,
-    ) {
+    if let Err(report) = state.registry.prepare_request(&state.settings, &mut req) {
         return http_error(&report);
     }
 
-    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    let mut ec = build_ec_request_state(&state.settings, services, &req).await;
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -772,7 +940,14 @@ async fn dispatch_fallback(
 
     // Pre-route integration request filters (DataDome protection, etc.) run
     // before the route-type decision, matching legacy `route_request` ordering.
-    let effects = match run_pre_route_filters(state, services, &mut req, ec.geo_info.as_ref()).await
+    let effects = match run_pre_route_filters(
+        state,
+        services,
+        &mut req,
+        ec.geo_info.as_ref(),
+        Some(ec.ec_context.permissions()),
+    )
+    .await
     {
         PreRoute::ShortCircuit { response, effects } => {
             return attach_dispatch_extensions(response, ec, effects);
@@ -823,9 +998,10 @@ async fn dispatch_fallback(
             && is_navigation_request(&req)
             && let Err(err) = ec
                 .ec_context
-                .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+                .generate_if_needed(&state.settings, ec.kv_graph.as_ref(), services)
+                .await
         {
-            log::warn!("EC generation failed for publisher proxy: {err:?}");
+            log::error!("EC generation failed for publisher proxy: {err:?}");
         }
 
         // Publisher pages read consent data, so the consent KV store must be
@@ -848,7 +1024,10 @@ async fn dispatch_fallback(
                             registry: Some(&partner_registry),
                         };
                         match handle_publisher_request(
-                            &state.settings,
+                            AppContext {
+                                settings: &state.settings,
+                                integration_registry: state.registry.as_ref(),
+                            },
                             &publisher_services,
                             ec.kv_graph.as_ref(),
                             &mut ec.ec_context,
@@ -1057,6 +1236,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    EcResolve,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -1158,6 +1338,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         handler: NamedRouteHandler::ClearTester,
     },
     NamedRoute {
+        path: "/_ts/api/v1/ec/resolve",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::EcResolve,
+    },
+    NamedRoute {
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
@@ -1254,7 +1439,8 @@ impl TrustedServerApp {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
-                Arc::new(FastlyPlatformGeo),
+                build_geo_provider(&state.settings, Arc::new(FastlyPlatformGeo)),
+                build_finalize_services(&state.settings, Arc::clone(&state.default_kv_store)),
             ))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
@@ -1319,8 +1505,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
-        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
+        AppContext, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
         build_per_request_services, build_state_from_settings, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
     };
@@ -1372,7 +1558,13 @@ mod tests {
                 allowed_domains = ["*.example", "*.example.com"]
 
                 [ec]
+                provider = "hmac"
+
+                [ec.providers.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
+
+                [geo]
+                assume_single_jurisdiction = true
 
                 [request_signing]
                 enabled = false
@@ -1441,7 +1633,13 @@ mod tests {
             allowed_domains = ["*.example", "*.example.com"]
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
 
             [request_signing]
             enabled = false
@@ -1524,6 +1722,14 @@ mod tests {
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        // Resolved the same way the composition root resolves it, so this
+        // router behaves like a served one.
+        let resolved_ec_provider = trusted_server_core::ec::provider::build_reusable_provider(
+            &settings.ec,
+            None,
+            registry.ec_provider(),
+        )
+        .expect("should resolve the Edge Cookie provider selection");
         let state = Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
@@ -1532,6 +1738,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            resolved_ec_provider,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -1888,7 +2095,13 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse production-shaped settings");
@@ -2137,6 +2350,25 @@ mod tests {
             set_cookie,
             "ts-tester=; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=0",
             "tester cookie clear should use publisher.cookie_domain"
+        );
+    }
+
+    #[test]
+    fn dispatch_ec_resolve_routes_to_resolve_handler() {
+        // Parity guard: POST /_ts/api/v1/ec/resolve must reach the resolve
+        // handler, not the publisher fallback or a router-level 405. The test
+        // request carries no Origin, so the handler's own origin guard answers
+        // 403, proving the request was handled here rather than proxied to
+        // the publisher origin (which would error without a live backend).
+        let router = test_router();
+        let response =
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/ec/resolve")))
+                .expect("should route request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "POST ec/resolve should reach the resolve handler's origin guard, not the publisher"
         );
     }
 
@@ -2541,7 +2773,13 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
 
             [request_signing]
             enabled = false
@@ -2802,6 +3040,12 @@ mod tests {
                     [ec]
                     passphrase = "test-secret-key-32-bytes-minimum"
 
+                    # The deprecated passphrase migrates to the hmac provider, so
+                    # single-jurisdiction operation is acknowledged because no
+                    # geo provider is selected.
+                    [geo]
+                    assume_single_jurisdiction = true
+
                     [auction]
                     enabled = true
                     providers = []
@@ -2858,7 +3102,10 @@ mod tests {
                             Err(report) => return Ok(super::http_error(&report)),
                         };
                     let response = match handle_publisher_request(
-                        &settings,
+                        AppContext {
+                            settings: &settings,
+                            integration_registry: registry.as_ref(),
+                        },
                         &services,
                         None,
                         &mut ec_context,
@@ -2956,7 +3203,13 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
 
             [request_signing]
             enabled = false

@@ -18,8 +18,7 @@ use validator::{Validate, ValidationError};
 
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
-    AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest, AuctionResponse, Bid,
-    BidRenderer, MediaType,
+    AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidRenderer, MediaType,
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -35,6 +34,17 @@ use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
+/// Renderer type tag carried on the wire by an APS bid, read by the browser to
+/// select the APS renderer.
+pub const APS_RENDERER_TYPE: &str = "aps";
+
+/// Wire key carrying [`ApsRendererV1::bid_id`], for callers that read the bid
+/// identifier out of a renderer payload without deserializing the rest.
+///
+/// `ApsRendererV1` renames its fields to camelCase, so this is `bidId` rather
+/// than the Rust field name. `renderer_bid_id_key_matches_the_serialized_form`
+/// pins the two together.
+pub const APS_RENDERER_BID_ID_KEY: &str = "bidId";
 const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
 const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
@@ -47,6 +57,45 @@ const MAX_LANGUAGE_BYTES: usize = 8;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
+
+/// APS creative tag type accepted by the Trusted Server renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApsTagType {
+    /// APS loads the creative URL in a nested iframe.
+    Iframe,
+    /// APS fetches creative HTML and executes it in its nested renderer frame.
+    Script,
+}
+
+/// Version 1 APS renderer descriptor shared with browser clients.
+///
+/// Carried by a bid as the payload of a [`BidRenderer`] tagged
+/// [`APS_RENDERER_TYPE`], so it travels with the APS integration rather than
+/// with the neutral auction types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApsRendererV1 {
+    /// Renderer contract version.
+    pub version: u8,
+    /// APS account identifier used to initialize the fixed runner.
+    pub account_id: String,
+    /// Selected `OpenRTB` bid identifier.
+    pub bid_id: String,
+    /// Optional `OpenRTB` creative identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creative_id: Option<String>,
+    /// APS creative delivery mode.
+    pub tag_type: ApsTagType,
+    /// HTTPS creative URL consumed by the fixed APS runner.
+    pub creative_url: String,
+    /// Base64-encoded exact one-bid APS response envelope.
+    pub aax_response: String,
+    /// Creative width.
+    pub width: u32,
+    /// Creative height.
+    pub height: u32,
+}
 
 const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
 <meta charset="utf-8">
@@ -719,7 +768,7 @@ impl ApsAuctionProvider {
         if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
             return None;
         }
-        Some(BidRenderer::Aps(ApsRendererV1 {
+        let descriptor = ApsRendererV1 {
             version: 1,
             account_id: self.config.account_id.clone(),
             bid_id: input.bid_id.to_string(),
@@ -729,7 +778,17 @@ impl ApsAuctionProvider {
             aax_response: BASE64_STANDARD.encode(serialized),
             width: input.width,
             height: input.height,
-        }))
+        };
+        match BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor) {
+            Ok(renderer) => Some(renderer),
+            Err(error) => {
+                log::warn!(
+                    "Dropping APS bid '{}': its renderer descriptor could not be built: {error:?}",
+                    input.bid_id
+                );
+                None
+            }
+        }
     }
 
     fn increment_reason(reasons: &mut BTreeMap<String, u64>, reason: &'static str) {
@@ -1262,6 +1321,19 @@ impl IntegrationHeadInjector for ApsRendererIntegration {
             .into_iter()
             .collect()
     }
+}
+
+/// Validates the APS configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the APS configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<ApsConfig>(APS_INTEGRATION_ID)
+        .map(|config| config.is_some())
 }
 
 /// Register the APS static renderer endpoint when APS is enabled.
@@ -1816,7 +1888,7 @@ mod tests {
             .renderer
             .as_ref()
             .expect("should include renderer")
-            .as_aps()
+            .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
             .expect("should be APS renderer");
         let decoded = BASE64_STANDARD
             .decode(&renderer.aax_response)
@@ -1870,7 +1942,7 @@ mod tests {
             bid.renderer
                 .as_ref()
                 .expect("should retain renderer")
-                .as_aps()
+                .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
                 .expect("should be APS renderer")
                 .creative_id
                 .is_none()
@@ -2282,7 +2354,7 @@ mod tests {
             .renderer
             .as_ref()
             .expect("should keep script renderer")
-            .as_aps()
+            .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
             .expect("should be APS renderer");
         assert_eq!(renderer.tag_type, ApsTagType::Script);
     }
@@ -2612,5 +2684,40 @@ mod tests {
         assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
         assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
         assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
+    }
+
+    #[test]
+    fn renderer_bid_id_key_matches_the_serialized_form() {
+        let descriptor = ApsRendererV1 {
+            version: 1,
+            account_id: "example-account".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "fictional-base64".to_string(),
+            width: 300,
+            height: 250,
+        };
+        let renderer = BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor)
+            .expect("should build APS renderer descriptor");
+
+        assert_eq!(
+            renderer
+                .payload_field(APS_RENDERER_TYPE, APS_RENDERER_BID_ID_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some(descriptor.bid_id.as_str()),
+            "should name the wire key `ApsRendererV1` serializes `bid_id` to"
+        );
+        assert_eq!(
+            renderer
+                .payload_field(APS_RENDERER_TYPE, APS_RENDERER_BID_ID_KEY)
+                .and_then(serde_json::Value::as_str),
+            renderer
+                .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
+                .as_ref()
+                .map(|full| full.bid_id.as_str()),
+            "should read the same value as deserializing the whole descriptor"
+        );
     }
 }

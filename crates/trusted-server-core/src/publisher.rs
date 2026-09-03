@@ -54,7 +54,7 @@ use crate::auction::types::{
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
@@ -65,6 +65,8 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
+use crate::integrations::aps::{APS_RENDERER_BID_ID_KEY, APS_RENDERER_TYPE};
+use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
     contains_publisher_esi_directive,
@@ -517,8 +519,11 @@ fn encode_complete_body(
 /// Serves two types of bundles:
 /// - **Unified bundle** (`tsjs-unified.min.js`): core + immediate (non-deferred)
 ///   integration modules.
-/// - **Deferred module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
-///   modules loaded with `defer` (e.g., prebid).
+/// - **Single module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
+///   modules loaded with `defer` (e.g., prebid) or registered as standalone.
+///
+/// Every module comes from the registry's parts, so a module a registration
+/// carries is served and versioned like a compile-time one.
 ///
 /// # Errors
 ///
@@ -539,28 +544,28 @@ pub fn handle_tsjs_dynamic(
 
     if UNIFIED_FILENAMES.contains(&filename) {
         // Serve core + immediate modules (excludes deferred like prebid).
-        let module_ids = integration_registry.js_module_ids_immediate();
-        let body = trusted_server_js::concatenate_modules(&module_ids);
-        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        let parts = integration_registry.js_parts_immediate();
+        let body = crate::tsjs_bundle::compose(&parts);
+        let hash = crate::tsjs_bundle::compose_hash(&parts);
         return Ok(serve_tsjs_static(req, &body, &hash, edge_header));
     }
 
-    if let Some(module_id) = parse_single_module_filename(filename) {
-        // Deferred modules and the conditionally injected diagnostics module
-        // are served as content-addressed standalone assets. Delivery remains
-        // cookie-independent so the static response can stay publicly cached.
-        let deferred_ids = integration_registry.js_module_ids_deferred();
-        let diagnostics_standalone = module_id
-            == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_INTEGRATION_ID
-            && integration_registry.integration_enabled(module_id);
-        if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
+    if let Some(module_id) = parse_single_module_filename(filename, integration_registry) {
+        // Deferred modules and standalone modules are served as
+        // content-addressed single files. Delivery remains cookie-independent
+        // so the static response can stay publicly cached.
+        let deferred = integration_registry.js_module_ids_deferred();
+        let standalone = integration_registry.js_standalone_ids();
+        if !deferred.contains(&module_id) && !standalone.contains(&module_id) {
             return Ok(not_found_response());
         }
-        if let (Some(content), Some(hash)) = (
-            trusted_server_js::module_bundle(module_id),
-            trusted_server_js::single_module_hash(module_id),
-        ) {
-            return Ok(serve_tsjs_static(req, content, hash, edge_header));
+        if let Some(part) = integration_registry.js_part(module_id) {
+            return Ok(serve_tsjs_static(
+                req,
+                part.source,
+                part.sha256,
+                edge_header,
+            ));
         }
     }
 
@@ -596,20 +601,22 @@ fn request_version_hash(req: &Request<EdgeBody>) -> Option<&str> {
     })
 }
 
-/// Extract a module ID from a deferred-module filename like `tsjs-sourcepoint.min.js`.
+/// Extract a module ID from a single-module filename like `tsjs-sourcepoint.min.js`.
 ///
-/// Returns `Some(&'static str)` if the filename matches a known JS module ID,
-/// `None` otherwise. The caller must additionally verify that the module is
-/// both deferred and enabled via the [`IntegrationRegistry`].
+/// Returns `Some(&'static str)` if the filename names a module the registry
+/// serves somewhere (bundle, deferred or standalone), resolved through the
+/// registry so a carried module is found. `None` otherwise. The caller must
+/// additionally verify that the module is deferred or standalone.
 #[must_use]
-fn parse_single_module_filename(filename: &str) -> Option<&'static str> {
+fn parse_single_module_filename(
+    filename: &str,
+    registry: &IntegrationRegistry,
+) -> Option<&'static str> {
     let stem = filename
         .strip_prefix("tsjs-")
         .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
 
-    trusted_server_js::all_module_ids()
-        .into_iter()
-        .find(|&id| id == stem)
+    registry.js_module_id(stem)
 }
 
 /// Parameters for processing response streaming.
@@ -622,6 +629,9 @@ struct ProcessResponseParams<'a> {
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
+    /// Head script carrying this request's permission state, or [`None`] under a
+    /// shared-template mode. See [`template_permissions_script`].
+    permissions_script: Option<&'a str>,
     ad_slots_script: Option<&'a str>,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
     suppress_datadome_client_side_tag: bool,
@@ -653,6 +663,7 @@ impl PublisherBodyProcessor {
                 request_scheme: &params.request_scheme,
                 settings,
                 integration_registry,
+                permissions_script: permissions_script_for(params, settings),
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
                 ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
                 suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -734,6 +745,7 @@ fn process_response_streaming<W: Write>(
             request_scheme: params.request_scheme,
             settings: params.settings,
             integration_registry: params.integration_registry,
+            permissions_script: params.permissions_script.map(str::to_string),
             ad_slots_script: params.ad_slots_script.map(str::to_string),
             ad_bids_state: params.ad_bids_state.clone(),
             suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -1230,6 +1242,9 @@ struct HtmlStreamProcessorParams<'a> {
     request_scheme: &'a str,
     settings: &'a Settings,
     integration_registry: &'a IntegrationRegistry,
+    /// Head script carrying this request's permission state, or [`None`] under a
+    /// shared-template mode. See [`template_permissions_script`].
+    permissions_script: Option<String>,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
     suppress_datadome_client_side_tag: bool,
@@ -1384,6 +1399,20 @@ pub(crate) fn body_close_injection(
     }
 }
 
+/// The head script this response's permission state belongs in, if any.
+///
+/// Derived here rather than carried on [`OwnedProcessResponseParams`] so the state
+/// has one representation on the request (the JSON) and the head-or-seam decision is
+/// taken from the same effective mode both seams use. Under a shared-template mode
+/// the answer is [`None`] and the seam carries the state instead.
+fn permissions_script_for(
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+) -> Option<String> {
+    let mode = effective_assembly_mode(settings, params.template_cache_key.is_some());
+    template_permissions_script(mode, &params.permissions_json)
+}
+
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
@@ -1410,6 +1439,7 @@ fn create_html_stream_processor(
         .flatten();
 
     let config = config
+        .with_permissions_script(params.permissions_script)
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
         .with_gpt_diagnostics(gpt_diagnostics)
         .with_body_close(body_close)
@@ -1585,6 +1615,14 @@ pub struct OwnedProcessResponseParams {
     ///
     /// Request-scoped, so it travels with the request rather than into the template.
     pub(crate) seam_ad_slots: Option<String>,
+    /// This request's resolved permission state as page JSON, from
+    /// [`PermissionState::page_json`].
+    ///
+    /// Carried as the JSON rather than as a rendered script because it is delivered in
+    /// two different places: the head under an inline response, and the `</body>` seam
+    /// under a shared-template one. An empty string means no caller filled it in and
+    /// renders as the empty state.
+    pub(crate) permissions_json: String,
     /// Origin policy headers to store with the template and replay on a hit.
     pub(crate) policy_headers: Vec<(String, String)>,
     pub(crate) content_encoding: String,
@@ -1950,7 +1988,7 @@ fn assemble_if_shared(
     Ok((out, Some(AssemblyResponseState::ByteSeamFallback)))
 }
 
-/// Fingerprint of every configuration input plus the compiled browser bundle.
+/// Hash of every configuration input plus the browser modules this registry serves.
 ///
 /// This intentionally over-invalidates. Trying to maintain a hand-written list already
 /// omitted publisher origin identity and creative-opportunity shaping fields. A digest of
@@ -1958,17 +1996,23 @@ fn assemble_if_shared(
 /// safe by default: a change misses until someone proves it irrelevant, never cross-serves
 /// an old template under new behavior.
 ///
+/// The module digest covers the parts this registry can actually serve, carried modules
+/// included, so a vendor crate that rebuilds its browser module moves the hash, and
+/// templates keyed under the previous hash are no longer read. It also narrows the
+/// module set from every module compiled into the binary to the ones this deployment can
+/// serve. That is safe because a module this deployment never serves appears in no bundle
+/// hash and no injected URL, so it cannot change what a template renders.
+///
 /// # Panics
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
-fn template_fingerprint(settings: &Settings) -> String {
+fn template_fingerprint(settings: &Settings, integration_registry: &IntegrationRegistry) -> String {
     use sha2::Digest as _;
 
     let mut hasher = sha2::Sha256::new();
-    hasher.update(
-        trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
-    );
+    hasher
+        .update(crate::tsjs_bundle::compose_hash(&integration_registry.js_parts_all()).as_bytes());
     // `serde_json::Value` uses a sorted object map without `preserve_order`, making
     // independently deserialized HashMaps canonical before they are serialized again.
     let canonical = serde_json::to_value(settings)
@@ -1996,21 +2040,28 @@ fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> 
 /// calls `scheduleInitialAdInit`, which schedules `adInit` for precisely the traffic
 /// that opted out. Absent is not the same as empty here.
 ///
+/// It is never nothing at all any more, because the permission state has to reach the
+/// page whether or not the ad stack ran, and a shared template's head cannot carry it.
+/// The no-ad-stack answer is [`build_permissions_seam_script`], which sets the state and
+/// schedules no ad init.
+///
 /// Shared by the miss path and by **both** hit finalizers. They previously each spelled
 /// the decision out, and the two hit paths spelled it `unwrap_or("[]")` — so the gate
 /// held on a cache miss and was ignored on every cache hit.
 fn seam_script_for(params: &OwnedProcessResponseParams) -> String {
-    params
-        .seam_ad_slots
-        .as_deref()
-        .map(|slots| params.ad_bids_state.build_seam_script(slots))
-        .unwrap_or_default()
+    match params.seam_ad_slots.as_deref() {
+        Some(slots) => params
+            .ad_bids_state
+            .build_seam_script(slots, &params.permissions_json),
+        None => build_permissions_seam_script(&params.permissions_json),
+    }
 }
 
 /// Builds the injection state a cached template needs on the way out.
 ///
-/// The template carries no auction state — that is what makes it shareable — so the
-/// per-reader parts are attached here, from this request.
+/// The template carries no auction state and no permission state, which is what makes
+/// it shareable, so the per-reader parts are attached here, from this request. Both
+/// leave through the seam, never through the cached head.
 fn build_template_assembly_params(
     entry: &crate::platform::TemplateEntry,
     settings: &Settings,
@@ -2018,6 +2069,7 @@ fn build_template_assembly_params(
     request_scheme: &str,
     price_granularity: PriceGranularity,
     ad_bids_state: AdBidsState,
+    permissions_json: String,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         csp_nonce_observed: None,
@@ -2032,6 +2084,7 @@ fn build_template_assembly_params(
         request_scheme: request_scheme.to_string(),
         content_type: entry.metadata.content_type.clone(),
         // The template already carries the head seam; re-injecting would duplicate it.
+        permissions_json,
         ad_slots_script: None,
         ad_bids_state,
         auction_observation: None,
@@ -2626,6 +2679,13 @@ fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
     is_navigation_request(req)
 }
 
+/// Whether an integration marked this request's response as personalized.
+fn request_requires_personalized_delivery(req: &Request<EdgeBody>) -> bool {
+    req.extensions()
+        .get::<crate::response_privacy::PersonalizedResponse>()
+        .is_some()
+}
+
 /// Removes request headers that can produce a bodyless or partial origin response.
 fn strip_conditional_and_range_headers(req: &mut Request<EdgeBody>) {
     req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -2649,14 +2709,14 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
         && status != StatusCode::NOT_MODIFIED
 }
 
-/// Prevent shared caches from replaying tag-suppressed HTML to other clients.
-fn apply_datadome_client_tag_cache_privacy(
+/// Prevent shared caches from replaying personalized HTML to other clients.
+fn apply_personalized_response_cache_privacy(
     response: &mut Response<EdgeBody>,
     method: &Method,
-    suppress_datadome_client_side_tag: bool,
+    response_is_personalized: bool,
     content_type: &str,
 ) {
-    if suppress_datadome_client_side_tag
+    if response_is_personalized
         && response_carries_body(method, response.status())
         && is_html_content_type(content_type)
     {
@@ -2769,6 +2829,7 @@ pub fn stream_publisher_body<W: Write>(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<(), Report<TrustedServerError>> {
+    let permissions_script = permissions_script_for(params, settings);
     let borrowed = ProcessResponseParams {
         content_encoding: &params.content_encoding,
         origin_host: &params.origin_host,
@@ -2778,6 +2839,7 @@ pub fn stream_publisher_body<W: Write>(
         settings,
         content_type: &params.content_type,
         integration_registry,
+        permissions_script: permissions_script.as_deref(),
         ad_slots_script: params.ad_slots_script.as_deref(),
         ad_bids_state: params.ad_bids_state.script_cell(),
         suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -2880,6 +2942,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         request_scheme: &params.request_scheme,
         settings,
         integration_registry,
+        permissions_script: permissions_script_for(params, settings),
         ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
         ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
         suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -3117,8 +3180,8 @@ impl AdBidsState {
     }
 
     /// Build the shared-template seam, retaining the same debug prefix as inline.
-    fn build_seam_script(&self, slots_json: &str) -> String {
-        let seam = build_seam_script(slots_json, &self.bids());
+    fn build_seam_script(&self, slots_json: &str, permissions_json: &str) -> String {
+        let seam = build_seam_script(slots_json, &self.bids(), permissions_json);
         let prefix = self
             .debug_prefix
             .lock()
@@ -4019,6 +4082,18 @@ pub struct AuctionDispatch<'a> {
     pub registry: Option<&'a PartnerRegistry>,
 }
 
+/// The operator configuration and the integrations built from it.
+///
+/// Both are built together with the application state and always travel
+/// together, so they pass as one argument rather than two. [`AuctionDispatch`]
+/// groups the auction side of the same call for the same reason.
+pub struct AppContext<'a> {
+    /// Operator configuration for this deployment.
+    pub settings: &'a Settings,
+    /// Integrations registered for this deployment.
+    pub integration_registry: &'a IntegrationRegistry,
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
@@ -4034,7 +4109,7 @@ pub struct AuctionDispatch<'a> {
 /// Returns a [`TrustedServerError`] if the proxy request fails or the
 /// origin backend is unreachable.
 pub async fn handle_publisher_request(
-    settings: &Settings,
+    app: AppContext<'_>,
     services: &RuntimeServices,
     kv: Option<&KvIdentityGraph>,
     ec_context: &mut EcContext,
@@ -4042,6 +4117,11 @@ pub async fn handle_publisher_request(
     mut req: Request<EdgeBody>,
     edge_header: EdgeCacheHeader,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    let AppContext {
+        settings,
+        integration_registry,
+    } = app;
+
     log::debug!("Proxying request to publisher_origin");
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
@@ -4078,14 +4158,25 @@ pub async fn handle_publisher_request(
     // this handler; subresource requests are likewise filtered there.
     let ec_allowed = ec_context.ec_allowed();
     log::debug!(
-        "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}",
+        "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}, sharing={}",
         ec_context.ec_value().is_some(),
+        ec_context.ec_sharing_allowed(),
     );
 
     let consent_context = ec_context.consent().clone();
-    let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
+    // The identifier forwarded into the auction request (user.id) is sharing
+    // beyond the edge, so it rides the same permission pair as bidstream EIDs
+    // (storage plus personalised-ad selection), not only the provider's gate.
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| ec_context.ec_sharing_allowed());
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
+    // Resolved at the start of the request, so take it here, before the mutable
+    // borrows further down. Every HTML response carries it to the page, whether the
+    // ad stack runs or not, so the value is read once and cloned rather than
+    // recomputed per delivery point.
+    let permissions_json = ec_context.permissions().page_json();
 
     let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
         TrustedServerError::Proxy {
@@ -4366,19 +4457,25 @@ pub async fn handle_publisher_request(
             .creative_opportunities
             .as_ref()
             .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
+    let response_is_personalized = request_requires_personalized_delivery(&req);
+    // A personalized response is request-scoped (for example, an IP exclusion), while a
+    // template cache template is shared across readers. A shared template can represent
+    // neither the personalized nor the ordinary variant safely for the other population.
+    let personalization_requires_origin = response_is_personalized;
+    let personalization_requires_full_body =
+        response_is_personalized && is_html_document_request(&req);
+    let request_requires_origin = request_bypasses_template_cache(req.headers())
+        || gpt_diagnostics.requires_private_no_store()
+        || personalization_requires_origin;
+    // The only DataDome-specific signal core still reads. It decides nothing about caching
+    // or the origin path, because it travels to `HtmlProcessorConfig` so DataDome's own
+    // head injection can leave its client-side tag out, and it moves out of core with
+    // the DataDome integration. Read from the request rather than derived from the
+    // neutral personalization marker above, so the two concerns stay separate.
     let suppress_datadome_client_side_tag = req
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
         .is_some();
-    // Tag suppression is request-scoped (for example, an IP exclusion), while a template cache
-    // template is shared across readers. A shared template can represent neither the
-    // suppressed nor unsuppressed variant safely for the other population.
-    let datadome_suppression_requires_origin = suppress_datadome_client_side_tag;
-    let datadome_suppression_requires_full_body =
-        suppress_datadome_client_side_tag && is_html_document_request(&req);
-    let request_requires_origin = request_bypasses_template_cache(req.headers())
-        || gpt_diagnostics.requires_private_no_store()
-        || datadome_suppression_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
     let reader_supports_assembly = reader_compression.is_ok();
     // A failed negotiation bypasses template cache below, so this value is used only on an
@@ -4386,7 +4483,7 @@ pub async fn handle_publisher_request(
     // a panic-prone invariant in the public request handler.
     let reader_compression = reader_compression.unwrap_or(Compression::None);
 
-    if should_run_ad_stack || datadome_suppression_requires_full_body {
+    if should_run_ad_stack || personalization_requires_full_body {
         // HTML document contexts whose output may be synthesized must not
         // receive a cached 304 or partial 206. Non-document subresources contain
         // no executable injected tag, so retain their validators and ranges.
@@ -4452,7 +4549,7 @@ pub async fn handle_publisher_request(
                 .map(CreativeOpportunitiesConfig::template_cache_vary)
                 .unwrap_or_else(|| VarySpec::new([]))
                 .values_from(req.headers()),
-            template_fingerprint: template_fingerprint(settings),
+            template_fingerprint: template_fingerprint(settings, integration_registry),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
@@ -4534,6 +4631,7 @@ pub async fn handle_publisher_request(
                         request_scheme,
                         price_granularity,
                         ad_bids_state.clone(),
+                        permissions_json.clone(),
                     );
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
@@ -4766,10 +4864,10 @@ pub async fn handle_publisher_request(
             }
         }
     }
-    apply_datadome_client_tag_cache_privacy(
+    apply_personalized_response_cache_privacy(
         &mut response,
         &request_method,
-        suppress_datadome_client_side_tag,
+        response_is_personalized,
         &origin_content_type,
     );
     apply_publisher_asset_cache_policy(
@@ -4896,6 +4994,7 @@ pub async fn handle_publisher_request(
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     content_type,
+                    permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
                     suppress_datadome_client_side_tag,
@@ -4961,10 +5060,10 @@ fn apply_auction_eids_and_device(
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+        gate_eids_by_permissions(merged_eids, targeting.ec_context.permissions());
     if had_eids && auction_request.user.eids.is_none() {
         log::warn!(
-            "{} auction EIDs stripped by TCF consent gating",
+            "{} auction EIDs stripped by permission gating",
             targeting.path_label
         );
     }
@@ -5169,13 +5268,20 @@ pub(crate) fn build_bid_map_with_auction_id(
                 // OpenRTB bid ID. The latter is the last resort: it is unique per
                 // bid instance rather than a creative, but GAM echoes it verbatim
                 // so the render bridge can find the exact winning bid.
-                let renderer_bid_id = bid.renderer.as_ref().and_then(|renderer| {
-                    renderer
-                        .as_aps()
-                        .map(|renderer| renderer.bid_id.as_str())
-                });
+                //
+                // Borrow the one field wanted rather than deserializing the
+                // whole descriptor, which would clone a payload carrying a
+                // base64 encoding of a creative envelope of up to 256 KB, once
+                // per bid per page view.
+                let renderer_bid_id = bid
+                    .renderer
+                    .as_ref()
+                    .and_then(|renderer| {
+                        renderer.payload_field(APS_RENDERER_TYPE, APS_RENDERER_BID_ID_KEY)
+                    })
+                    .and_then(serde_json::Value::as_str);
                 let hb_adid = non_empty(bid.cache_id.as_deref())
-                    .or_else(|| renderer_bid_id.and_then(|id| non_empty(Some(id))))
+                    .or_else(|| non_empty(renderer_bid_id))
                     .or_else(|| non_empty(bid.ad_id.as_deref()))
                     .or_else(|| non_empty(bid.bid_id.as_deref()));
                 if let Some(id) = hb_adid {
@@ -5414,6 +5520,7 @@ else t.bids=b;\
 pub(crate) fn build_seam_script(
     slots_json: &str,
     bid_map: &serde_json::Map<String, serde_json::Value>,
+    permissions_json: &str,
 ) -> String {
     // The local test script probes the minified `var a=JSON.parse`,
     // `var b=JSON.parse`, and `s(b,a)` literals below. Update the harness with any
@@ -5423,14 +5530,37 @@ pub(crate) fn build_seam_script(
     format!(
         "<script>(function(){{\
 var t=window.tsjs=window.tsjs||{{}};\
+t.permissions=JSON.parse(\"{}\");\
 var a=JSON.parse(\"{}\");\
 var b=JSON.parse(\"{}\");\
 var s=t.scheduleInitialAdInit;\
 if(typeof s===\"function\")s(b,a);\
 else{{t.adSlots=a;t.bids=b;}}\
 }})();</script>",
+        html_escape_for_script(&permissions_json_or_empty(permissions_json)),
         html_escape_for_script(slots_json),
         html_escape_for_script(&bids)
+    )
+}
+
+/// Build the `</body>` seam script for a request whose ad stack did not run.
+///
+/// The head of a shared template carries nothing request-scoped, so the seam is
+/// the only place this reader's permission state can be delivered. Before this
+/// existed the seam was empty whenever the ad stack was skipped, which left a
+/// bot-classified or permission-denied visitor with no state on the page at all.
+///
+/// Carries the state and nothing else. It deliberately does not set `adSlots` or
+/// `bids` and does not call `scheduleInitialAdInit`, because scheduling `adInit`
+/// for traffic that opted out is what the gate in [`seam_script_for`] exists to
+/// prevent.
+pub(crate) fn build_permissions_seam_script(permissions_json: &str) -> String {
+    format!(
+        "<script>(function(){{\
+var t=window.tsjs=window.tsjs||{{}};\
+t.permissions=JSON.parse(\"{}\");\
+}})();</script>",
+        html_escape_for_script(&permissions_json_or_empty(permissions_json))
     )
 }
 
@@ -6120,6 +6250,61 @@ pub(crate) fn template_ad_slots_script(
     }
 }
 
+/// The permission-state `<script>` the head carries, when this mode's head can
+/// carry one.
+///
+/// [`None`] under [`AssemblyMode::Esi`], unconditionally, for the same reason
+/// [`template_ad_slots_script`] returns [`None`] there. The processed document
+/// is cached and served to many readers, so a head carrying this reader's
+/// resolved permissions would freeze one earlier visitor's state into every
+/// later reader's page. Under that mode the state travels in the per-request
+/// `</body>` seam instead (see [`build_seam_script`] and
+/// [`build_permissions_seam_script`]).
+///
+/// Under [`AssemblyMode::Inline`] the response is per-navigation, so the head is
+/// safe and every HTML document gets the script, whether or not the ad stack
+/// ran. A visitor who is bot-classified or whose permissions are unset still
+/// needs to be told what is set, because that answer is what page code reads
+/// instead of guessing from a CMP.
+pub(crate) fn template_permissions_script(
+    mode: AssemblyMode,
+    permissions_json: &str,
+) -> Option<String> {
+    match mode {
+        AssemblyMode::Esi => None,
+        AssemblyMode::Inline => Some(build_permissions_script(permissions_json)),
+    }
+}
+
+/// Build the `tsjs.permissions` `<script>` tag from the request's resolved
+/// permission state.
+///
+/// The payload is [`PermissionState::page_json`], escaped the same way the
+/// slots and bids payloads are, so a Data Use name can never close the script
+/// element.
+pub(crate) fn build_permissions_script(permissions_json: &str) -> String {
+    let escaped = html_escape_for_script(&permissions_json_or_empty(permissions_json));
+    format!(
+        "<script>(window.tsjs=window.tsjs||{{}}).permissions=JSON.parse(\"{}\");</script>",
+        escaped
+    )
+}
+
+/// The permission state as page JSON, substituting the empty state for an unset
+/// value.
+///
+/// [`PermissionState::page_json`] never returns an empty string, so this only
+/// covers a params value nothing filled in. `JSON.parse("")` throws, and a
+/// thrown head script takes the rest of the snippet with it, so an unset value
+/// renders as the empty state rather than as broken JavaScript.
+fn permissions_json_or_empty(permissions_json: &str) -> Cow<'_, str> {
+    if permissions_json.is_empty() {
+        Cow::Owned(PermissionState::default().page_json())
+    } else {
+        Cow::Borrowed(permissions_json)
+    }
+}
+
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
@@ -6404,7 +6589,12 @@ pub async fn handle_page_bids(
     };
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
-    let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
+    // Same sharing pair as the navigation path: page-bids builds an auction
+    // request, so its user.id egress needs storage plus personalised-ad
+    // selection, matching the EID gate.
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| ec_context.ec_sharing_allowed());
     let consent_context = ec_context.consent();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
@@ -6656,7 +6846,13 @@ mod tests {
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::types::AuctionResponse;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
-    use crate::integrations::IntegrationRegistry;
+    use crate::integrations::registry_test_support::{
+        PROBE_JS, PROBE_JS_SHA256, carried_probe_registration, validate_nothing,
+    };
+    use crate::integrations::{
+        CarriedJsModule, IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
+    };
+    use crate::permissions::{Permission, PermissionSet};
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
         build_services_with_secret_http_client_and_client_ip, noop_services,
@@ -6666,6 +6862,40 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
+
+    /// A resolved permission state as page JSON, for tests that need a payload
+    /// with something in it rather than the empty state.
+    ///
+    /// Built through [`PermissionState::page_json`] so no test spells the page
+    /// shape out and a change to that shape is caught here.
+    fn permissions_json_fixture() -> String {
+        PermissionState::new(
+            PermissionSet::none()
+                .with(Permission::StoreOnDevice)
+                .with(Permission::SelectBasicAds),
+        )
+        .page_json()
+    }
+
+    /// Settings parsed from `toml`, with the allowed-domain list
+    /// [`create_test_settings`] sets.
+    ///
+    /// The Prebid integration refuses to build while the external bundle host of
+    /// the shared fixture is missing from `proxy.allowed_domains`, so a fixture
+    /// that extends `crate_test_settings_str()` with its own sections and parses
+    /// the result itself has to carry that list over. Otherwise it describes a
+    /// configuration no deployment could run, and no registry could be built from
+    /// it.
+    fn settings_from_toml(toml: &str) -> Settings {
+        let mut settings = Settings::from_toml(toml).expect("should parse test settings");
+        settings.proxy.allowed_domains = create_test_settings().proxy.allowed_domains;
+        settings
+    }
+
+    /// Integration registry for a test's `settings`.
+    fn test_registry(settings: &Settings) -> IntegrationRegistry {
+        IntegrationRegistry::new(settings).expect("should create integration registry")
+    }
 
     fn make_test_bid_with_creative(creative: &str) -> Bid {
         Bid {
@@ -6802,7 +7032,7 @@ mod tests {
             &AuctionDebugCommentOptions::default(),
         );
 
-        let seam = state.build_seam_script("[]");
+        let seam = state.build_seam_script("[]", &PermissionState::default().page_json());
 
         assert!(
             seam.contains("<!-- ts-debug:"),
@@ -7532,6 +7762,7 @@ mod tests {
             request_host: settings.publisher.domain.clone(),
             request_scheme: "https".to_owned(),
             content_type: "application/json".to_owned(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -7728,8 +7959,12 @@ mod tests {
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let mut ec_context =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
+        let registry = test_registry(settings);
         handle_publisher_request(
-            settings,
+            AppContext {
+                settings,
+                integration_registry: &registry,
+            },
             services,
             None,
             &mut ec_context,
@@ -7807,6 +8042,7 @@ mod tests {
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
                 integrations: IntegrationRegistry::empty_for_tests(),
+                permissions_script: template_permissions_script(mode, &permissions_json_fixture()),
                 ad_slots_script,
                 ad_bids_state,
                 max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -7891,6 +8127,7 @@ mod tests {
             for forbidden in [
                 ".adSlots",
                 ".bids=",
+                "permissions",
                 "__tsjs_gpt_diagnostics_active",
                 "history.replaceState",
             ] {
@@ -7899,6 +8136,63 @@ mod tests {
                     "{mode:?}: template contains request-scoped `{forbidden}`:\n{rendered}"
                 );
             }
+        }
+
+        #[test]
+        fn inline_documents_carry_the_permission_state_before_the_slots_and_bundle() {
+            // Arrange / Act
+            let rendered = render(
+                AssemblyMode::Inline,
+                RequestShape {
+                    ad_stack_ran: true,
+                    diagnostics_active: false,
+                    bids_available: true,
+                },
+            );
+
+            // Assert
+            let permissions = rendered
+                .find(".permissions=JSON.parse(")
+                .expect("should inject the permission state into an inline head");
+            let slots = rendered
+                .find(".adSlots=JSON.parse(")
+                .expect("should inject the slots into an inline head");
+            let bundle = rendered
+                .find("id=\"trustedserver-js\"")
+                .expect("should inject the tsjs bundle into an inline head");
+            assert!(
+                permissions < slots && permissions < bundle,
+                "the permission state should precede the slots and the bundle, \
+                 because both may read it as soon as they run:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("necessary.operations.storage"),
+                "the state should carry the set Data Use names:\n{rendered}"
+            );
+        }
+
+        #[test]
+        fn inline_documents_with_no_ad_stack_still_carry_the_permission_state() {
+            // Arrange / Act: the ad stack is skipped for bots, prefetches and
+            // readers whose permissions are unset. Each still gets an answer.
+            let rendered = render(
+                AssemblyMode::Inline,
+                RequestShape {
+                    ad_stack_ran: false,
+                    diagnostics_active: false,
+                    bids_available: false,
+                },
+            );
+
+            // Assert
+            assert!(
+                rendered.contains(".permissions=JSON.parse("),
+                "a document with no ad stack should still carry the state:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains(".adSlots="),
+                "no ad stack means no slots:\n{rendered}"
+            );
         }
 
         #[test]
@@ -7937,6 +8231,75 @@ mod tests {
     mod template_fingerprint_tests {
         use super::*;
 
+        use crate::integrations::IntegrationBuilderFn;
+        use sha2::Digest as _;
+
+        /// Hash for a configuration, through a registry built from it.
+        fn fingerprint(settings: &Settings) -> String {
+            let registry =
+                IntegrationRegistry::new(settings).expect("should create integration registry");
+            template_fingerprint(settings, &registry)
+        }
+
+        /// A browser module a vendor crate carries, before its rebuild.
+        const CARRIED_BEFORE: &str = "(function(){window.__carried=1;})();";
+
+        /// The same module after the vendor rebuilt it.
+        const CARRIED_AFTER: &str = "(function(){window.__carried=2;})();";
+
+        /// Hex SHA-256 of `source`, leaked so it can be stated as the
+        /// `&'static str` [`CarriedJsModule`] declares. Two short strings for the
+        /// life of the test binary.
+        fn leaked_hash(source: &str) -> &'static str {
+            Box::leak(hex::encode(sha2::Sha256::digest(source.as_bytes())).into_boxed_str())
+        }
+
+        /// Registration carrying [`CARRIED_BEFORE`]. A `fn` pointer cannot
+        /// capture, so the two sources need a function each.
+        fn carrying_before(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("probe")
+                    .with_js_module(CarriedJsModule {
+                        source: CARRIED_BEFORE,
+                        sha256: leaked_hash(CARRIED_BEFORE),
+                    })
+                    .build(),
+            ))
+        }
+
+        /// Registration carrying [`CARRIED_AFTER`], the rebuilt module.
+        fn carrying_after(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("probe")
+                    .with_js_module(CarriedJsModule {
+                        source: CARRIED_AFTER,
+                        sha256: leaked_hash(CARRIED_AFTER),
+                    })
+                    .build(),
+            ))
+        }
+
+        /// Hash for `settings` through a registry whose `probe`
+        /// integration carries the module `registration` supplies.
+        fn fingerprint_with_carried(
+            settings: &Settings,
+            registration: IntegrationBuilderFn,
+        ) -> String {
+            let extra = [IntegrationBuilder::new(
+                "probe",
+                "fingerprint-probe",
+                registration,
+                validate_nothing,
+            )];
+            let registry = IntegrationRegistry::with_registrations(settings, &extra)
+                .expect("should build a registry with a carried module");
+            template_fingerprint(settings, &registry)
+        }
+
         /// Base settings with one integration's config replaced.
         ///
         /// Edits the parsed `[integrations]` map rather than appending TOML, so the two
@@ -7963,8 +8326,8 @@ mod tests {
             // integration off changed the injected `<script>` set and left the cache key
             // untouched, and every reader kept getting the template built while it was on.
             assert_ne!(
-                template_fingerprint(&settings_with_prebid(true, 1000)),
-                template_fingerprint(&settings_with_prebid(false, 1000)),
+                fingerprint(&settings_with_prebid(true, 1000)),
+                fingerprint(&settings_with_prebid(false, 1000)),
                 "the enabled integration set must select a different template"
             );
         }
@@ -7974,8 +8337,8 @@ mod tests {
             // Config reaches the template directly: the prebid head insert carries the
             // account ID, timeout and bidder list into bytes shared between readers.
             assert_ne!(
-                template_fingerprint(&settings_with_prebid(true, 1000)),
-                template_fingerprint(&settings_with_prebid(true, 2500)),
+                fingerprint(&settings_with_prebid(true, 1000)),
+                fingerprint(&settings_with_prebid(true, 2500)),
                 "an integration's configuration must select a different template"
             );
         }
@@ -7986,11 +8349,11 @@ mod tests {
             // An unsorted digest would differ between two requests to the same binary and
             // the cache would never hit — a fix that quietly disables the feature.
             let settings = settings_with_prebid(true, 1000);
-            let first = template_fingerprint(&settings);
+            let first = fingerprint(&settings);
 
             for _ in 0..16 {
                 assert_eq!(
-                    template_fingerprint(&settings),
+                    fingerprint(&settings),
                     first,
                     "the same configuration must always fingerprint identically"
                 );
@@ -7998,7 +8361,7 @@ mod tests {
             // A second, independently parsed `Settings` builds a fresh `HashMap` with a
             // different iteration order, which is what actually exercises the sort.
             assert_eq!(
-                template_fingerprint(&settings_with_prebid(true, 1000)),
+                fingerprint(&settings_with_prebid(true, 1000)),
                 first,
                 "two equal configurations must fingerprint identically"
             );
@@ -8014,11 +8377,25 @@ mod tests {
                 .as_mut()
                 .expect("fixture should configure creative opportunities")
                 .gam_network_id = "different-network".to_string();
-            assert_ne!(template_fingerprint(&base), template_fingerprint(&creative));
+            assert_ne!(fingerprint(&base), fingerprint(&creative));
 
             let mut origin = base.clone();
             origin.publisher.origin_host_header_override = Some("tenant.example.com".to_string());
-            assert_ne!(template_fingerprint(&base), template_fingerprint(&origin));
+            assert_ne!(fingerprint(&base), fingerprint(&origin));
+        }
+
+        #[test]
+        fn a_change_to_a_carried_module_changes_the_fingerprint() {
+            // A module a vendor crate carries is not in the compile-time map, so a
+            // hash built from that map alone would not move when the vendor
+            // rebuilt its bundle and a cached template would keep the stale `?v=`.
+            let settings = create_test_settings();
+
+            assert_ne!(
+                fingerprint_with_carried(&settings, carrying_before),
+                fingerprint_with_carried(&settings, carrying_after),
+                "a rebuilt carried module must select a different template"
+            );
         }
     }
 
@@ -8032,7 +8409,68 @@ mod tests {
                     "atf".to_string(),
                     serde_json::json!({"hb_pb": "1.50"}),
                 )]),
+                &permissions_json_fixture(),
             )
+        }
+
+        #[test]
+        fn the_seam_carries_the_permission_state_with_the_probed_literals() {
+            // Arrange / Act
+            let script = seam();
+
+            // Assert
+            assert!(
+                script.contains("t.permissions=JSON.parse("),
+                "the seam should set the permission state: {script}"
+            );
+            assert!(
+                script.contains("necessary.operations.storage"),
+                "the state should carry the set Data Use names: {script}"
+            );
+            assert!(
+                script.find("t.permissions=") < script.find("var a=JSON.parse"),
+                "the state should be set before the slots, so anything the \
+                 scheduler runs can already read it: {script}"
+            );
+            for probed in ["var a=JSON.parse", "var b=JSON.parse", "s(b,a)"] {
+                assert!(
+                    script.contains(probed),
+                    "`scripts/template-cache-local-test.sh` probes `{probed}`; \
+                     update the harness with any rewrite of it: {script}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_request_with_no_ad_stack_still_receives_its_permission_state() {
+            // Arrange: `seam_ad_slots` is `None` exactly when the ad stack did not
+            // run, which is where the seam used to be empty.
+            let settings = create_test_settings();
+            let mut params = make_stream_params(&settings, "");
+            params.permissions_json = permissions_json_fixture();
+
+            // Act
+            let seam = seam_script_for(&params);
+
+            // Assert
+            assert!(
+                seam.contains("t.permissions=JSON.parse("),
+                "an opted-out or bot-classified reader should still be told what \
+                 is set: {seam}"
+            );
+            assert!(
+                seam.contains("necessary.operations.storage"),
+                "the state should carry the set Data Use names: {seam}"
+            );
+            assert!(
+                !seam.contains("scheduleInitialAdInit"),
+                "scheduling ad init for traffic that opted out is what the \
+                 no-ad-stack gate exists to prevent: {seam}"
+            );
+            assert!(
+                !seam.contains("adSlots"),
+                "a permissions-only seam should define no slots: {seam}"
+            );
         }
 
         #[test]
@@ -8836,7 +9274,12 @@ mod tests {
             request: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(WinningBidProvider));
+            orchestrator
+                .register_provider(
+                    Arc::new(WinningBidProvider),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             run_with_orchestrator(
                 settings,
                 services,
@@ -8863,7 +9306,10 @@ mod tests {
             };
             let mut ec_context = EcContext::new_for_test(None, consent);
             let publisher_response = handle_publisher_request(
-                settings,
+                AppContext {
+                    settings,
+                    integration_registry: &registry,
+                },
                 services,
                 None,
                 &mut ec_context,
@@ -10301,7 +10747,10 @@ mod tests {
             };
             let mut ec_context = EcContext::new_for_test(None, consent);
             let publisher_response = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -10412,10 +10861,12 @@ mod tests {
         /// as a substring rather than requiring inference.
         struct StubGeo(&'static str);
 
+        #[async_trait::async_trait(?Send)]
         impl crate::platform::PlatformGeo for StubGeo {
-            fn lookup(
+            async fn lookup(
                 &self,
                 _client_ip: Option<std::net::IpAddr>,
+                _services: &crate::platform::RuntimeServices,
             ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
                 Ok(Some(GeoInfo {
                     city: self.0.to_string(),
@@ -10469,7 +10920,10 @@ mod tests {
             };
             let mut ec_context = EcContext::new_for_test(Some(user.ec_id.to_string()), consent);
             let publisher_response = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -10854,6 +11308,9 @@ mod tests {
             suppressed_request
                 .extensions_mut()
                 .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+            suppressed_request
+                .extensions_mut()
+                .insert(crate::response_privacy::PersonalizedResponse);
             let suppressed = run(&settings, &services, suppressed_request).await;
             assert_eq!(
                 suppressed
@@ -11533,8 +11990,12 @@ mod tests {
                 .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
                 .body(EdgeBody::empty())
                 .expect("should build authenticated request");
+            let registry = test_registry(&settings);
             let _ = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -12574,7 +13035,7 @@ mod tests {
 
     #[tokio::test]
     async fn publisher_asset_cache_policy_applies_to_non_html_response() {
-        let settings = Settings::from_toml(&format!(
+        let settings = settings_from_toml(&format!(
             r#"{}
 
             [[cache.asset_rules]]
@@ -12588,8 +13049,7 @@ mod tests {
             immutable = true
         "#,
             crate_test_settings_str()
-        ))
-        .expect("should parse settings with cache rule");
+        ));
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -12634,7 +13094,7 @@ mod tests {
 
     #[tokio::test]
     async fn publisher_asset_policy_response_with_cookie_is_private_after_finalization() {
-        let settings = Settings::from_toml(&format!(
+        let settings = settings_from_toml(&format!(
             r#"{}
 
             [[cache.asset_rules]]
@@ -12648,8 +13108,7 @@ mod tests {
             immutable = true
         "#,
             crate_test_settings_str()
-        ))
-        .expect("should parse settings with cache rule");
+        ));
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -12695,7 +13154,7 @@ mod tests {
 
     #[tokio::test]
     async fn publisher_asset_cache_policy_skips_html_response() {
-        let settings = Settings::from_toml(&format!(
+        let settings = settings_from_toml(&format!(
             r#"{}
 
             [[cache.asset_rules]]
@@ -12709,8 +13168,7 @@ mod tests {
             fingerprint_style = "hex"
         "#,
             crate_test_settings_str()
-        ))
-        .expect("should parse settings with cache rule");
+        ));
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -12904,8 +13362,7 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml)
-                .expect("should parse settings with auction and creative opportunities enabled")
+            settings_from_toml(&toml)
         }
 
         fn settings_with_disabled_ad_templates() -> Settings {
@@ -12914,7 +13371,7 @@ mod tests {
                  [creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml).expect("should parse settings with disabled ad templates")
+            settings_from_toml(&toml)
         }
 
         fn settings_with_disabled_auction() -> Settings {
@@ -12923,12 +13380,11 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml).expect("should parse settings with disabled auction")
+            settings_from_toml(&toml)
         }
 
         fn settings_without_creative_opportunities() -> Settings {
-            Settings::from_toml(&crate_test_settings_str())
-                .expect("should parse settings without creative opportunities")
+            settings_from_toml(&crate_test_settings_str())
         }
 
         fn settings_with_dispatching_provider() -> Settings {
@@ -12937,8 +13393,7 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml)
-                .expect("should parse settings with the dispatching test provider")
+            settings_from_toml(&toml)
         }
 
         fn services_with_telemetry(
@@ -13081,8 +13536,12 @@ mod tests {
         ) -> PublisherResponse {
             let mut ec_context = EcContext::new_for_test(None, consent);
 
+            let registry = test_registry(settings);
             handle_publisher_request(
-                settings,
+                AppContext {
+                    settings,
+                    integration_registry: &registry,
+                },
                 services,
                 None,
                 &mut ec_context,
@@ -13701,7 +14160,12 @@ mod tests {
                 // Arrange
                 let settings = settings_with_dispatching_provider();
                 let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-                orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+                orchestrator
+                    .register_provider(
+                        Arc::new(DispatchingTestProvider),
+                        crate::integrations::CORE_SOURCE,
+                    )
+                    .expect("should register");
                 let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
                 let stub = Arc::new(StubHttpClient::new());
 
@@ -13985,6 +14449,8 @@ mod tests {
             .expect("should build conditional request");
         req.extensions_mut()
             .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        req.extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -14033,6 +14499,8 @@ mod tests {
             .expect("should build conditional iframe request");
         req.extensions_mut()
             .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        req.extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -14081,6 +14549,8 @@ mod tests {
             .expect("should build conditional subresource request");
         req.extensions_mut()
             .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        req.extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -14199,8 +14669,12 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
+        let registry = test_registry(&settings);
         let _ = handle_publisher_request(
-            &settings,
+            AppContext {
+                settings: &settings,
+                integration_registry: &registry,
+            },
             &services,
             None,
             &mut ec_context,
@@ -14264,6 +14738,7 @@ mod tests {
                 services: &services,
                 req: &mut req,
                 geo_info: None,
+                permissions: None,
             })
             .await
             .expect("should run DataDome filter");
@@ -14347,7 +14822,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build cacheable HTML response");
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut response,
             &Method::GET,
             true,
@@ -14393,7 +14868,7 @@ mod tests {
             .header(header::CACHE_CONTROL, "no-store")
             .body(EdgeBody::empty())
             .expect("should build no-store HTML response");
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut no_store_response,
             &Method::GET,
             true,
@@ -14418,7 +14893,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build cacheable response");
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut response,
             &Method::GET,
             false,
@@ -14433,7 +14908,7 @@ mod tests {
             "unsuppressed HTML should retain its existing cache policy"
         );
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut response,
             &Method::GET,
             true,
@@ -14446,6 +14921,86 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("public, max-age=600"),
             "non-HTML should retain its existing cache policy"
+        );
+    }
+
+    #[test]
+    fn a_personalized_response_marker_from_any_integration_forces_private_caching() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "public, max-age=600")
+            .header("surrogate-control", "max-age=600")
+            .header("fastly-surrogate-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
+            .header(header::ETAG, "\"origin-tag\"")
+            .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build cacheable HTML response");
+
+        super::apply_personalized_response_cache_privacy(
+            &mut response,
+            &Method::GET,
+            true,
+            "text/html; charset=utf-8",
+        );
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "a personalized response should be private and non-storable"
+        );
+        for header_name in [
+            "surrogate-control",
+            "fastly-surrogate-control",
+            "cloudflare-cdn-cache-control",
+            "cdn-cache-control",
+        ] {
+            assert!(
+                response.headers().get(header_name).is_none(),
+                "a personalized response should not retain {header_name}"
+            );
+        }
+        for header_name in [header::ETAG, header::LAST_MODIFIED] {
+            assert!(
+                !response.headers().contains_key(&header_name),
+                "a personalized response should not retain {header_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_reads_the_neutral_marker_not_the_datadome_type() {
+        let mut personalized = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build personalized request");
+        personalized
+            .extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
+
+        assert!(
+            super::request_requires_personalized_delivery(&personalized),
+            "the neutral marker alone should mark a response personalized"
+        );
+
+        let ordinary = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build ordinary request");
+
+        assert!(
+            !super::request_requires_personalized_delivery(&ordinary),
+            "a request carrying no marker should not be personalized"
         );
     }
 
@@ -15323,37 +15878,64 @@ mod tests {
 
     #[test]
     fn parse_single_module_filename_extracts_known_id() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.min.js"),
-            Some("sourcepoint"),
-            "should extract sourcepoint from minified filename"
+            parse_single_module_filename("tsjs-prebid.min.js", &registry),
+            Some("prebid"),
+            "should extract prebid from minified filename"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.js"),
-            Some("sourcepoint"),
-            "should extract sourcepoint from unminified filename"
+            parse_single_module_filename("tsjs-prebid.js", &registry),
+            Some("prebid"),
+            "should extract prebid from unminified filename"
+        );
+    }
+
+    #[test]
+    fn parse_single_module_filename_resolves_a_carried_module_id() {
+        let settings = create_test_settings();
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried module");
+
+        assert_eq!(
+            parse_single_module_filename("tsjs-probe.min.js", &registry),
+            Some("probe"),
+            "should resolve a module id trusted-server-js has never heard of"
         );
     }
 
     #[test]
     fn parse_single_module_filename_rejects_unknown_ids() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
         assert_eq!(
-            parse_single_module_filename("tsjs-evil.min.js"),
+            parse_single_module_filename("tsjs-evil.min.js", &registry),
             None,
             "should reject unknown module names"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-core.min.js"),
-            Some("core"),
-            "should accept any known module ID (deferred check happens in caller)"
+            parse_single_module_filename("tsjs-core.min.js", &registry),
+            None,
+            "should not resolve core, which is only ever served inside the bundle"
         );
         assert_eq!(
-            parse_single_module_filename("prebid.min.js"),
+            parse_single_module_filename("prebid.min.js", &registry),
             None,
             "should reject without tsjs- prefix"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.txt"),
+            parse_single_module_filename("tsjs-prebid.txt", &registry),
             None,
             "should reject non-js extension"
         );
@@ -15494,6 +16076,212 @@ mod tests {
         );
     }
 
+    fn body_text(response: http::Response<EdgeBody>) -> String {
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should read the tsjs response body")
+            .to_vec();
+        String::from_utf8(bytes).expect("should serve UTF-8 JavaScript")
+    }
+
+    fn cache_control_text(response: &http::Response<EdgeBody>) -> String {
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn carried_deferred_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .with_deferred_js()
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_a_carried_module_in_the_unified_bundle_under_the_composed_hash() {
+        let settings = create_test_settings();
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried module");
+        let parts = registry.js_parts_immediate();
+        let expected_hash = crate::tsjs_bundle::compose_hash(&parts);
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={expected_hash}"),
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
+
+        assert_eq!(response.status(), StatusCode::OK, "should serve the bundle");
+        assert!(
+            cache_control_text(&response).contains("immutable"),
+            "should treat the composed hash as the matching version"
+        );
+        let body = body_text(response);
+        let core = trusted_server_js::module_bundle("core").expect("should have compiled core in");
+        assert!(
+            body.starts_with(core),
+            "should put the compile-time core first in the bundle"
+        );
+        assert!(
+            body.contains("window.__probe=1"),
+            "should serve the carried module inside the unified bundle"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_a_carried_deferred_module_standalone() {
+        let settings = create_test_settings();
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_deferred_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried deferred module");
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-probe.min.js?v={PROBE_JS_SHA256}"),
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should serve a carried deferred module as its own file"
+        );
+        assert!(
+            cache_control_text(&response).contains("immutable"),
+            "should treat the carried module's own hash as the matching version"
+        );
+        assert_eq!(
+            body_text(response),
+            PROBE_JS,
+            "should serve the carried source verbatim"
+        );
+    }
+
+    fn carried_standalone_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .with_standalone_js()
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_a_standalone_module_by_registration_flag_not_by_name() {
+        // The module the registration marks standalone is one a vendor crate
+        // carries, so nothing in the binary knows its name. A branch that named
+        // an integration instead of reading the flag could not serve it, and a
+        // reintroduced constant would fail this test rather than pass it.
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "lockr",
+                &serde_json::json!({ "enabled": true, "app_id": "test-app-id" }),
+            )
+            .expect("should insert lockr config");
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "standalone-probe",
+            carried_standalone_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried standalone module");
+        assert!(
+            registry.js_module_ids_immediate().contains(&"lockr"),
+            "fixture should put lockr in the unified bundle"
+        );
+        assert!(
+            !registry.js_module_ids().contains(&"probe"),
+            "a standalone module should stay out of the bundled module ids"
+        );
+
+        let standalone = handle_tsjs_dynamic(
+            &build_request(
+                Method::GET,
+                &format!(
+                    "https://publisher.example/static/tsjs=tsjs-probe.min.js?v={PROBE_JS_SHA256}"
+                ),
+            ),
+            &registry,
+            EdgeCacheHeader::SMaxageFallback,
+        )
+        .expect("should handle tsjs request");
+        assert_eq!(
+            standalone.status(),
+            StatusCode::OK,
+            "should serve a module its registration marks standalone"
+        );
+        assert!(
+            cache_control_text(&standalone).contains("immutable"),
+            "should treat the carried module's own hash as the matching version"
+        );
+        assert_eq!(
+            body_text(standalone),
+            PROBE_JS,
+            "should serve the standalone module as its own file"
+        );
+
+        let unified = handle_tsjs_dynamic(
+            &build_request(
+                Method::GET,
+                "https://publisher.example/static/tsjs=tsjs-unified.min.js",
+            ),
+            &registry,
+            EdgeCacheHeader::SMaxageFallback,
+        )
+        .expect("should handle tsjs request");
+        assert!(
+            !body_text(unified).contains(PROBE_JS),
+            "a standalone module should stay out of the unified bundle"
+        );
+
+        let bundled_only = handle_tsjs_dynamic(
+            &build_request(
+                Method::GET,
+                "https://publisher.example/static/tsjs=tsjs-lockr.min.js",
+            ),
+            &registry,
+            EdgeCacheHeader::SMaxageFallback,
+        )
+        .expect("should handle tsjs request");
+        assert_eq!(
+            bundled_only.status(),
+            StatusCode::NOT_FOUND,
+            "should not serve a bundle-only module as a single file"
+        );
+    }
+
     #[test]
     fn tsjs_dynamic_keeps_short_cache_for_mismatched_hash() {
         let settings = create_test_settings();
@@ -15592,6 +16380,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -15645,6 +16434,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -15687,6 +16477,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -15807,6 +16598,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -15865,6 +16657,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -15926,6 +16719,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -15987,6 +16781,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -16048,6 +16843,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -16097,6 +16893,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -16290,6 +17087,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                         .to_string(),
@@ -16359,6 +17157,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                         .to_string(),
@@ -16430,6 +17229,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -16494,6 +17294,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -16640,6 +17441,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -17024,6 +17826,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: Some(AuctionObservationContext::from_parts(
@@ -17211,6 +18014,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -17286,6 +18090,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -17344,6 +18149,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -17457,6 +18263,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -17519,6 +18326,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -17561,12 +18369,13 @@ mod tests {
             build_bid_map, build_bids_script, diagnostics_auction_id, html_escape_for_script,
             write_bids_to_state,
         };
-        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
+        use crate::auction::types::{Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
         use crate::http_util::RequestInfo;
+        use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
         use crate::price_bucket::PriceGranularity;
         use crate::settings::Settings;
         use std::collections::HashMap;
@@ -18735,17 +19544,23 @@ mod tests {
             bid.creative = Some("<script>reject()</script>".to_string());
             bid.nurl = None;
             bid.burl = None;
-            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
-                version: 1,
-                account_id: "example-account".to_string(),
-                bid_id: "selected-bid".to_string(),
-                creative_id: None,
-                tag_type: ApsTagType::Iframe,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "fictional-base64</script>".to_string(),
-                width: 300,
-                height: 250,
-            }));
+            bid.renderer = Some(
+                BidRenderer::from_typed(
+                    APS_RENDERER_TYPE,
+                    &ApsRendererV1 {
+                        version: 1,
+                        account_id: "example-account".to_string(),
+                        bid_id: "selected-bid".to_string(),
+                        creative_id: None,
+                        tag_type: ApsTagType::Iframe,
+                        creative_url: "https://creative.example/render".to_string(),
+                        aax_response: "fictional-base64</script>".to_string(),
+                        width: 300,
+                        height: 250,
+                    },
+                )
+                .expect("should build APS renderer descriptor"),
+            );
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
             let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
@@ -18762,6 +19577,71 @@ mod tests {
             let script = build_bids_script(&map);
             assert!(!script.contains("</script></script>"));
             assert!(script.contains("\\u003C/script\\u003E"));
+        }
+
+        #[test]
+        fn bid_map_prefers_the_renderer_bid_id_over_ad_id_and_the_openrtb_bid_id() {
+            // Every hb_adid source carries a different value, so the assertion
+            // below passes only when the renderer field is the one read. The
+            // envelope is oversized on purpose: reading this field must not
+            // copy it.
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "ad-id-value", "", "");
+            bid.bid_id = Some("openrtb-bid-id".to_string());
+            bid.cache_id = None;
+            bid.creative = Some("<script>reject()</script>".to_string());
+            bid.renderer = Some(
+                BidRenderer::from_typed(
+                    APS_RENDERER_TYPE,
+                    &ApsRendererV1 {
+                        version: 1,
+                        account_id: "example-account".to_string(),
+                        bid_id: "renderer-bid-id".to_string(),
+                        creative_id: None,
+                        tag_type: ApsTagType::Iframe,
+                        creative_url: "https://creative.example/render".to_string(),
+                        aax_response: "A".repeat(200 * 1024),
+                        width: 300,
+                        height: 250,
+                    },
+                )
+                .expect("should build APS renderer descriptor"),
+            );
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include APS bid");
+
+            assert_eq!(
+                obj["hb_adid"], "renderer-bid-id",
+                "should read hb_adid from the renderer payload rather than ad_id or bid_id"
+            );
+        }
+
+        #[test]
+        fn bid_map_ignores_a_renderer_bid_id_carried_under_another_type_tag() {
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "example", "ad-id-value", "", "");
+            bid.cache_id = None;
+            bid.renderer = Some(
+                BidRenderer::new("example", serde_json::json!({ "bidId": "renderer-bid-id" }))
+                    .expect("should build renderer descriptor"),
+            );
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include the bid");
+
+            assert_eq!(
+                obj["hb_adid"], "ad-id-value",
+                "should ignore a bidId carried under a tag that is not the APS renderer"
+            );
         }
 
         #[test]
@@ -19460,10 +20340,15 @@ mod tests {
             winning_bid: bool,
         ) -> AuctionOrchestrator {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
-                captured_request,
-                winning_bid,
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(AuctionIdTestProvider {
+                        captured_request,
+                        winning_bid,
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             orchestrator
         }
 
@@ -20284,7 +21169,7 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml).expect("should parse settings with a capturing provider")
+            settings_from_toml(&toml)
         }
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
@@ -20369,9 +21254,14 @@ mod tests {
             captured: &Arc<Mutex<Option<AuctionRequest>>>,
         ) -> AuctionOrchestrator {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(RequestCapturingProvider {
-                captured: Arc::clone(captured),
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(RequestCapturingProvider {
+                        captured: Arc::clone(captured),
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             orchestrator
         }
 
@@ -20453,8 +21343,12 @@ mod tests {
                 .body(EdgeBody::empty())
                 .expect("should build test request");
 
+            let registry = test_registry(&settings);
             let _ = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -20537,8 +21431,12 @@ mod tests {
                 .expect("should build test request");
             let slots = slots_with_over_limit_dynamic_sibling();
 
+            let registry = test_registry(&settings);
             let _ = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,

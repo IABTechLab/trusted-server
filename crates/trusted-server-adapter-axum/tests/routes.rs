@@ -13,13 +13,13 @@ use trusted_server_adapter_axum::app::TrustedServerApp;
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
 
-/// Build the full application router from explicit test settings.
+/// Explicit test settings for the route tests.
 ///
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-fn test_router() -> edgezero_core::router::RouterService {
-    let settings = trusted_server_core::settings::Settings::from_toml(
+fn test_settings() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -33,12 +33,21 @@ fn test_router() -> edgezero_core::router::RouterService {
             proxy_secret = "integration-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+/// Build the full application router from explicit test settings.
+fn test_router() -> edgezero_core::router::RouterService {
+    TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
 }
 
@@ -214,7 +223,9 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
     let mut svc = make_service();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let src = trusted_server_core::tsjs::tsjs_script_src(
+        &trusted_server_core::tsjs_bundle::compile_time_parts(&["creative"]),
+    );
     let req = Request::builder()
         .method("GET")
         .uri(src)
@@ -827,5 +838,100 @@ async fn first_party_proxy_rebuild_is_routed() {
         resp.status().as_u16(),
         404,
         "/first-party/proxy-rebuild must be routed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Edge Cookie provider availability
+// ---------------------------------------------------------------------------
+
+/// Test settings selecting a vendor Edge Cookie provider this adapter does not
+/// inject, with the `[ec.providers.<key>]` block configuration validation
+/// requires. `acme` is a fictional vendor key.
+const UNINJECTED_PROVIDER_TOML: &str = r#"
+    [[handlers]]
+    path = "^/_ts/admin"
+    username = "admin"
+    password = "admin-pass"
+
+    [publisher]
+    domain = "test-publisher.example.com"
+    cookie_domain = ".test-publisher.example.com"
+    origin_url = "https://origin.test-publisher.example.com"
+    proxy_secret = "integration-test-proxy-secret"
+
+    [ec]
+    provider = "acme"
+
+    [ec.providers.acme]
+    endpoint = "https://ec.acme.example.com"
+
+    # An Edge Cookie provider is configured, so single-jurisdiction operation
+    # is acknowledged because no geo provider is selected.
+    [geo]
+    assume_single_jurisdiction = true
+"#;
+
+/// A provider selection this adapter can never supply must fail while the
+/// application state is built, before any request is served.
+///
+/// Configuration validation accepts this pair (the `[ec.providers.acme]` block
+/// is present), and the Axum dev server injects no vendor Edge Cookie provider,
+/// so only the composition root can catch it. Without the startup check the
+/// deployment would come up and answer every request.
+#[test]
+fn selecting_a_provider_this_adapter_cannot_supply_fails_at_startup() {
+    let settings = trusted_server_core::settings::Settings::from_toml(UNINJECTED_PROVIDER_TOML)
+        .expect("should parse settings selecting an uninjected provider");
+
+    // `RouterService` is not `Debug`, so take the error side directly rather
+    // than through `expect_err`.
+    let error = trusted_server_adapter_axum::app::TrustedServerApp::routes_with_settings(settings)
+        .err()
+        .expect("building state with an uninjected provider should fail");
+
+    assert!(
+        error.to_string().contains("acme"),
+        "the startup error should name the selected provider, got: {error}"
+    );
+}
+
+/// Builds a registration claiming an id a built-in integration already owns.
+fn duplicate_lockr_registration(
+    _settings: &trusted_server_core::settings::Settings,
+) -> Result<
+    Option<trusted_server_core::integrations::IntegrationRegistration>,
+    error_stack::Report<trusted_server_core::error::TrustedServerError>,
+> {
+    Ok(Some(
+        trusted_server_core::integrations::IntegrationRegistration::builder("lockr").build(),
+    ))
+}
+
+fn validate_nothing(
+    _settings: &trusted_server_core::settings::Settings,
+) -> Result<bool, error_stack::Report<trusted_server_core::error::TrustedServerError>> {
+    Ok(true)
+}
+
+#[test]
+fn routes_with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
+    let extra = [trusted_server_core::integrations::IntegrationBuilder::new(
+        "lockr",
+        "seam-probe",
+        duplicate_lockr_registration,
+        validate_nothing,
+    )];
+
+    let error = TrustedServerApp::routes_with_registrations(test_settings(), &extra, &[])
+        .err()
+        .expect("should reject a duplicate integration id supplied through the adapter");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("lockr")
+            && message.contains("trusted-server-core")
+            && message.contains("seam-probe"),
+        "error should name the id and both sources: {message}"
     );
 }

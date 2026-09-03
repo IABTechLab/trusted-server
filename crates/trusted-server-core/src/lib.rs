@@ -47,6 +47,7 @@ pub mod creative_opportunities;
 pub mod ec;
 pub(crate) mod edge_cookie;
 pub mod error;
+pub mod evidence;
 pub mod geo;
 pub mod host_header;
 pub(crate) mod host_rewrite;
@@ -55,6 +56,7 @@ pub mod http_util;
 pub mod integrations;
 pub mod models;
 pub mod openrtb;
+pub mod permissions;
 pub mod platform;
 pub mod price_bucket;
 pub mod proxy;
@@ -72,6 +74,7 @@ pub mod streaming_replacer;
 pub mod test_support;
 pub mod tester_cookie;
 pub mod tsjs;
+pub mod tsjs_bundle;
 
 #[cfg(test)]
 mod migration_guards;

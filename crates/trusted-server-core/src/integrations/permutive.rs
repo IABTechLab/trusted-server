@@ -303,6 +303,19 @@ fn build(
     Ok(Some(PermutiveIntegration::new(config)))
 }
 
+/// Validates the Permutive configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Permutive configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<PermutiveConfig>(PERMUTIVE_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Permutive integration.
 ///
 /// # Errors

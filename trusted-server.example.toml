@@ -6,10 +6,13 @@
 # `trusted-server.toml`. Copy it (`ts config init`), fill in the required
 # values, and push it (`ts config push`) as an EdgeZero app-config blob.
 #
-# Only three sections are REQUIRED for the server to start and pass validation:
+# Only two sections are REQUIRED for the server to start and pass validation:
 #   1. [[handlers]] covering /_ts/admin  (admin authentication)
 #   2. [publisher]                       (domain + origin)
-#   3. [ec] passphrase                   (Edge Cookie identity secret)
+#
+# Edge Cookie identity is optional and stays off until an [ec] provider is
+# selected, so no identity secret is needed to start. See the Edge Cookie
+# section below.
 #
 # Everything below those is OPTIONAL. Most optional blocks are commented out —
 # uncomment and edit one to enable it — but a few integrations are kept as active
@@ -70,21 +73,50 @@ proxy_secret = "change-me-proxy-secret"
 
 
 # -----------------------------------------------------------------------------
-# REQUIRED — Edge Cookie (EC) identity
+# OPTIONAL — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
-# Secret used to derive EC identifiers. Must be >= 32 chars and non-placeholder
-# in production (deploy validation rejects known placeholders).
-passphrase = "trusted-server-placeholder-secret"
+# Edge Cookie identity is OFF by default: with no provider selected, Trusted
+# Server runs statelessly and generates no Edge Cookie. Activate one by
+# uncommenting the selector AND its [ec.providers.<key>] block together (a
+# block with no selector is rejected at startup). Deployment tooling can merge
+# a TRUSTED_SERVER__EC__PROVIDER environment value into the published
+# configuration before it is loaded; the running server itself reads its
+# settings from the platform config store, not the environment. The built-in
+# hmac provider is host-neutral, and a vendor provider ships in its own crate
+# that the adapter composes in.
+# provider = "hmac"
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
 ec_store = "ec_identity_store"
+# Extra origins allowed to POST the client resolve endpoint. The endpoint
+# always accepts https://<publisher.domain> and nothing else by default. List
+# further origins here if the pages that resolve identity are served from
+# another origin, www being the common case. Each entry is a serialized origin
+# (RFC 6454) compared by the same-origin test, so the scheme, host and port all
+# have to match, and a subdomain is never accepted just for being a subdomain.
+# resolve_allowed_origins = ["https://www.example.com"]
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+
+# Built-in HMAC provider block. Uncomment it together with the
+# `provider = "hmac"` selector above. The secret used to derive EC identifiers
+# must be >= 32 bytes and non-placeholder in production (deploy validation
+# rejects known placeholders).
+# [ec.providers.hmac]
+# passphrase = "replace-with-32-plus-byte-random-secret"
+
+# Built-in host-signal provider block. Creates the identifier from the host's TLS
+# JA4 and HTTP/2 signals instead of the client IP, so it needs a host that
+# supplies those signals (Fastly does). Uncomment it together with
+# `provider = "host-signals"` above, and give it its own secret on the same
+# terms as the hmac block.
+# [ec.providers.host-signals]
+# passphrase = "replace-with-32-plus-byte-random-secret"
 
 # Optional identity partners (SSP/DSP/identity vendors). Each needs a real,
 # non-placeholder api_token (>= 32 bytes) at deploy. Configure real partners via
@@ -101,10 +133,45 @@ pull_sync_concurrency = 3
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
 
+# Which module resolves location. Leave the whole section out to keep the
+# host's own lookup, which is what every adapter ships with today.
+# [geo]
+# `none` resolves no location at all, or name a registered module that declares
+# a geo provider to have that module resolve location instead of the host.
+# provider = "none"
+
 
 # =============================================================================
 # OPTIONAL — Core features (disabled/omitted by default)
 # =============================================================================
+
+# Device-detection provider. Selects how a request is classified into device
+# signals (browser/bot gating). Default "builtin" classifies from the User-Agent
+# alone and makes no host call, so a default deployment stays host-neutral. The
+# opt-in "fastly" provider adds the host's TLS/H2 signals to the gate.
+# Override at deployment with TRUSTED_SERVER__device__provider.
+# [device]
+# provider = "builtin"   # or "fastly" to add TLS/H2 signal evidence
+
+[geo]
+# Geo / IP intelligence provider. No provider is the default: Trusted Server
+# resolves no geolocation and makes no host geo call, so a default deployment is
+# not tied to any host geo service. Opt into the host lookup with
+# provider = "platform". Override with TRUSTED_SERVER__geo__provider.
+# provider = "platform"
+#
+# The permission baseline for a request the geo provider leaves unmatched
+# (and, with no geo provider, for every request) is the top of the rules tree
+# in the permissions.yaml compiled into the build (the repository sample is
+# config/permissions/vanilla.yaml). Edit that file to
+# change it.
+#
+# With no geo provider, every request is treated as that top node, so a
+# visitor from another jurisdiction receives its permission rules. A
+# deployment that runs an Edge Cookie provider without a geo provider must
+# acknowledge that by uncommenting the line below, or select a geo provider
+# instead.
+# assume_single_jurisdiction = true
 
 # Custom headers added to every response (e.g. X-Robots-Tag: noindex).
 # [response_headers]
@@ -147,11 +214,10 @@ pull_sync_concurrency = 3
 # check_expiration = true         # check TCF consent freshness
 # max_consent_age_days = 395      # max age before consent is treated as expired (~13 months)
 #
-# [consent.gdpr]
-# applies_in = ["AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","IS","LI","NO","GB"]
-#
-# [consent.us_states]
-# privacy_states = ["CA","VA","CO","CT","UT","MT","OR","TX","FL","DE","IA","NE","NH","NJ","TN","MN","MD","IN","KY","RI"]
+# Which places fall under GDPR, and which US states have a comprehensive
+# privacy law, are no longer listed here. They are the `jurisdiction` values in
+# the permissions.yaml rules tree, so one file states the policy for both the
+# permission baseline and the consent handling.
 #
 # [consent.us_privacy_defaults]
 # notice_given = true             # has the publisher shown CCPA notice?

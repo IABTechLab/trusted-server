@@ -377,6 +377,19 @@ fn build(settings: &Settings) -> Result<Option<Arc<GptIntegration>>, Report<Trus
     Ok(Some(GptIntegration::new(config)))
 }
 
+/// Validates the GPT configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the GPT configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<GptConfig>(GPT_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the GPT integration.
 ///
 /// # Errors
