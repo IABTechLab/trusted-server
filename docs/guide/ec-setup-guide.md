@@ -93,7 +93,7 @@ Look for:
 
 Endpoint: `POST /_ts/api/v1/batch-sync`
 
-Important: request field is `ec_id` (full `{64hex}.{6alnum}` value). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Valid mappings are idempotent last-write-wins: unchanged UIDs are accepted without a write, and different UIDs replace the stored value.
+Important: request field is `ec_id` (full `{64hex}.{6alnum}` value). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Within one request, valid mappings are grouped by normalized EC ID and the last valid UID for each group is applied once; unchanged UIDs are accepted without a write. Group outcomes are reported for every original mapping, and infrastructure failures abort the remaining groups. See the [API Reference](/guide/api-reference) for the complete accounting and failure contract.
 
 ```bash
 BATCH_UID="${PARTNER_UID}-batch"
