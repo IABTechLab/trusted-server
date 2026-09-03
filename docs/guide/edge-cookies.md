@@ -124,7 +124,7 @@ flowchart TD
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
 
-The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Consent interpretation for each request remains based on the live request signals listed above.
+The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, withdrawal tombstones, and same-TTL completion markers that prevent stale point-read misses from rewriting completed tombstones. Consent interpretation for each request remains based on the live request signals listed above.
 
 ## Partner Sync Channels
 
