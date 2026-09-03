@@ -688,6 +688,91 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] with an injected geo provider, so a test can
+/// drive a geo outcome through the [`PlatformGeo`] seam rather than
+/// constructing the resolved status by hand.
+///
+/// This is the only way to reach the lookup-failure path, because the seam is
+/// what turns an `Err` into the requires-signal floor.
+pub(crate) fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(geo)
+        .client_info(ClientInfo::default())
+        .build()
+}
+
+/// Build a [`RuntimeServices`] carrying an Edge Cookie provider, so a test can
+/// exercise the seam an opaque-identifier vendor provider reaches core through.
+pub(crate) fn noop_services_with_ec_provider(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    // A fixed client IP, so a provider that reads one (the built-in HMAC
+    // provider does) can run.
+    noop_services_with_ec_provider_and_ip(
+        ec_provider,
+        Some("203.0.113.10".parse().expect("should parse test client IP")),
+    )
+}
+
+/// Build a [`RuntimeServices`] with an injected Edge Cookie provider and no
+/// client IP, modeling a host that cannot determine one.
+///
+/// Whether that matters is the provider's decision, so this exists to test both
+/// answers: a provider reading other evidence still creates an identifier, and
+/// one that needs the IP refuses.
+pub(crate) fn noop_services_with_ec_provider_without_client_ip(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    noop_services_with_ec_provider_and_ip(ec_provider, None)
+}
+
+/// Build a [`RuntimeServices`] carrying an Edge Cookie provider that a
+/// composition root already resolved, the way a production adapter threads it.
+///
+/// Use this to check that the request path reuses that instance rather than
+/// resolving `[ec] provider` for itself.
+pub(crate) fn noop_services_with_resolved_ec_provider(
+    resolved: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            ..ClientInfo::default()
+        })
+        .resolved_ec_provider(resolved)
+        .build()
+}
+
+fn noop_services_with_ec_provider_and_ip(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+    client_ip: Option<IpAddr>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip,
+            ..ClientInfo::default()
+        })
+        .resolved_ec_provider(ec_provider)
+        .build()
+}
+
 /// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
 /// recording (or otherwise custom) sink, so tests can assert which terminal
 /// auction events were emitted.

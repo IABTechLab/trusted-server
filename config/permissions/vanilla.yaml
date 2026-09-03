@@ -1,0 +1,562 @@
+# The place rules for Trusted Server's permission model, and the jurisdiction
+# each place falls under. The `name` at the top is the display name a tool
+# such as the permissions inspector shows for this file.
+#
+# The vocabulary is not ours. The permissions are the IAB Tech Lab Privacy
+# Taxonomy Data Uses, with the IAB TCF Europe purposes mapped onto them where
+# no Data Use exists yet. That is deliberate, because a permission a provider
+# declares should be stated in the industry's own terms rather than in a
+# vocabulary this project invented, so a reader can check it against the
+# taxonomy rather than against us.
+#
+# No policy ever ships with Trusted Server. The builder of a deployment
+# chooses the permissions.yaml compiled into their image, an operator overlay
+# is the recorded follow-on, and the visitor's signals decide the rest at
+# runtime. This copy is the repository's plain vanilla sample, compiled into
+# test and demo builds so the rules stay visible and reviewable in version
+# control. The samples live in config/permissions, and choosing one is always
+# an explicit choice by whoever builds, configures, or inspects.
+#
+# There are three parts:
+#   groups   named permission baselines, defined once and referenced by rules
+#   rules    a tree of places, from the whole world down to a single region,
+#            each naming the group and the jurisdiction that apply there
+#   signals  how each session signal (TCF, US-style opt-out) maps onto Data Uses,
+#            so no signal-to-permission policy lives in the code
+#
+# The rules tree
+# --------------
+# `rules` is one tree. Its top stands for the whole world, countries sit under
+# it, and a country's regions sit under that country:
+#
+#   rules:
+#     group: gdpr-eu
+#     jurisdiction: gdpr       # inherited by every country not overriding it,
+#                              # and the answer when no country resolves
+#     GB: gdpr-uk              # inherits gdpr
+#     US:
+#       group: us-opt-out
+#       jurisdiction: non-regulated
+#       CA:
+#         group: us-opt-out
+#         jurisdiction: us-state
+#       NY: us-opt-out         # inherits non-regulated
+#
+# Every node names a `group`. Writing a plain group name (`GB: gdpr-uk`) is the
+# short form of a node with that group, no jurisdiction of its own, and nothing
+# below it. To give a node regions, or a jurisdiction, write it as a block with
+# a `group:` line and the rest beside it. A block with no `group:` line is an
+# error, because then the node says nothing.
+#
+# Any node may also name a `jurisdiction`, which is the consent handling that
+# applies there. A node that names none inherits the nearest one above it. The
+# top of the tree must name both `group` and `jurisdiction`, so inheritance
+# always ends somewhere, and the top node is also the answer for a visitor whose
+# place the geo provider could not resolve at all.
+#
+# A `jurisdiction` is one of:
+#   gdpr           the EU, EEA and UK regime
+#   us-state       a US state with a comprehensive privacy law. It carries no
+#                  state code, because the region naming it is the state, so
+#                  only a region may name it, never a country or the top
+#   non-regulated  a place with no matching regulation
+#   unknown        declining to name one
+#
+# Place codes are the codes a geo provider returns, matched without regard to
+# upper or lower case:
+#   country  ISO 3166-1 alpha-2 (for example FR, US, GB)
+#   region   ISO 3166-2 subdivision, with no country prefix (for example CA for
+#            California, written under US)
+# The Fastly geo provider emits these codes directly, and any other provider
+# must do the same. Those codes are at most three letters long, so a place code
+# can never be confused with the reserved words `group`, `jurisdiction` and
+# `permissions`. Where the tree puts a code also tells the two DE codes apart,
+# since ISO 3166-1 DE is Germany at the country level and ISO 3166-2 DE is
+# Delaware under US.
+#
+# The most specific place wins, and whatever a node does not answer falls back
+# to the node above it. A visitor is matched on their region if it is listed,
+# otherwise on their country, otherwise on the top of the tree. So the top node
+# is also the answer for a country nobody has written a rule for.
+#
+# A geo provider that reports an outright lookup failure is the exception. It
+# resolves every permission to the requires-signal floor, and its jurisdiction
+# to unknown, rather than to the top of the tree, though no geo provider shipped
+# today reports one.
+# A permission flag is one of:
+#   granted          set without any signal (for example strictly necessary)
+#   requires_signal  set only when a signal grants it (opt-in)
+#   denied           never set, even when a signal grants it
+#
+# Permission names are the IAB Privacy Taxonomy Data Uses, mapped from the IAB
+# TCF Europe purposes. Every group below lists every Data Use so its policy is
+# fully explicit. Two purposes have no Data Use yet: TCF purpose 1 (device
+# storage) uses a proposed `necessary.operations.storage` key, and TCF purpose
+# 11 (limited-data content selection) keeps its TCF identifier
+# `select-basic-content`. Both are flagged for an upstream taxonomy addition.
+#
+# Trusted Server is not the policy authority, and this repository file is a
+# sample modeling common practice rather than legal advice. Service operations
+# and legal obligations are granted, the ad-tech Data Uses follow each
+# jurisdiction's regime through the `signals` mapping, umbrella Data Uses are
+# denied so every grant is named at the specific level, and Data Uses a web
+# request never exercises are denied. A deployer edits this file to set its
+# own policy per jurisdiction.
+#
+# Named baselines. Each group lists every Data Use and its flag, so a group's
+# meaning is explicit. (A `default: <flag>` shorthand is also accepted for any
+# Data Use a group omits.)
+name: Vanilla
+
+groups:
+  # European Union and EEA, where the model is opt-in, so every modeled ad-tech
+  # Data Use requires a TCF consent signal.
+  gdpr-eu:
+    # Service operations, security, fraud prevention and legal obligations run
+    # on their own lawful footing and are never carried by a consent string,
+    # matching TCF special purposes 1 and 2 where they touch ad delivery.
+    necessary.operations.security: granted
+    necessary.operations.authentication: granted
+    necessary.operations.debugging: granted
+    necessary.operations.website_use: granted
+    necessary.operations.quality_assurance: granted
+    necessary.operations.support: granted
+    necessary.operations.upgrades: granted
+    necessary.operations.payment_processing: granted
+    necessary.operations.notifications.email: granted
+    necessary.operations.notifications.sms: granted
+    necessary.operations.survey: granted
+    necessary.fraud_detection: granted
+    necessary.legal_obligation.age_verification: granted
+    necessary.legal_obligation.content_moderation: granted
+    necessary.legal_obligation.dsr: granted
+    necessary.legal_obligation.hold: granted
+    disclosure.law_enforcement: granted
+    disclosure.outside_counsel: granted
+    functional.security: granted
+    functional.performance: granted
+    analytics.reporting.system: granted
+    analytics.ad_reporting.ad_fraud_detection: granted
+    advertising_marketing.serving: granted
+    # The modeled ad-tech Data Uses. Each maps to a TCF purpose in `signals`
+    # below, so a consent record grants it and an absent consent revokes it.
+    necessary.operations.storage: requires_signal
+    advertising_marketing.first_party.contextual: requires_signal
+    advertising_marketing.frequency_capping: requires_signal
+    advertising_marketing.negative_targeting: requires_signal
+    advertising_marketing.profiling: requires_signal
+    advertising_marketing.first_party.targeted: requires_signal
+    advertising_marketing.third_party.targeted: requires_signal
+    advertising_marketing.personalize.profiling: requires_signal
+    advertising_marketing.personalize.content: requires_signal
+    advertising_marketing.personalize.system: requires_signal
+    functional.personalization: requires_signal
+    analytics.ad_reporting.measure_ad_performance: requires_signal
+    analytics.ad_reporting.ad_delivery_and_targeting: requires_signal
+    analytics.ad_reporting.ad_viewability: requires_signal
+    analytics.ad_reporting.content_performance: requires_signal
+    analytics.ad_reporting.market_research: requires_signal
+    analytics.ad_reporting.campaign_insights: requires_signal
+    necessary.operations.improve: requires_signal
+    select-basic-content: requires_signal
+    # Marketing channel consent arrives through its own opt-in rather than
+    # the TC string, so these require a signal no TCF record supplies.
+    advertising_marketing.communications.email: requires_signal
+    advertising_marketing.communications.sms: requires_signal
+    # Sale or sharing of data.
+    disclosure.sale: denied
+    disclosure.share: denied
+    disclosure.third_party_sale: denied
+    # Umbrella Data Uses stay denied so every grant is named at the specific
+    # level, and a reviewer sees exactly what the policy permits.
+    advertising_marketing: denied
+    advertising_marketing.communications: denied
+    advertising_marketing.first_party: denied
+    advertising_marketing.personalize: denied
+    advertising_marketing.third_party: denied
+    analytics: denied
+    analytics.ad_reporting: denied
+    analytics.reporting: denied
+    disclosure: denied
+    functional: denied
+    necessary: denied
+    necessary.employment: denied
+    necessary.employment.hr: denied
+    necessary.legal_obligation: denied
+    necessary.operations: denied
+    necessary.operations.notifications: denied
+    # Data Uses a server handling web requests never exercises.
+    necessary.employment.hr.hiring: denied
+
+  # United Kingdom: device storage proceeds without a signal under the reformed
+  # ePrivacy regime, and the ad-tech Data Uses stay opt-in.
+  gdpr-uk:
+    # Service operations, security, fraud prevention and legal obligations run
+    # on their own lawful footing and are never carried by a consent string,
+    # matching TCF special purposes 1 and 2 where they touch ad delivery.
+    necessary.operations.security: granted
+    necessary.operations.authentication: granted
+    necessary.operations.debugging: granted
+    necessary.operations.website_use: granted
+    necessary.operations.quality_assurance: granted
+    necessary.operations.support: granted
+    necessary.operations.upgrades: granted
+    necessary.operations.payment_processing: granted
+    necessary.operations.notifications.email: granted
+    necessary.operations.notifications.sms: granted
+    necessary.operations.survey: granted
+    necessary.fraud_detection: granted
+    necessary.legal_obligation.age_verification: granted
+    necessary.legal_obligation.content_moderation: granted
+    necessary.legal_obligation.dsr: granted
+    necessary.legal_obligation.hold: granted
+    disclosure.law_enforcement: granted
+    disclosure.outside_counsel: granted
+    functional.security: granted
+    functional.performance: granted
+    analytics.reporting.system: granted
+    analytics.ad_reporting.ad_fraud_detection: granted
+    advertising_marketing.serving: granted
+    # The modeled ad-tech Data Uses. Each maps to a TCF purpose in `signals`
+    # below, so a consent record grants it and an absent consent revokes it.
+    necessary.operations.storage: granted
+    advertising_marketing.first_party.contextual: requires_signal
+    advertising_marketing.frequency_capping: requires_signal
+    advertising_marketing.negative_targeting: requires_signal
+    advertising_marketing.profiling: requires_signal
+    advertising_marketing.first_party.targeted: requires_signal
+    advertising_marketing.third_party.targeted: requires_signal
+    advertising_marketing.personalize.profiling: requires_signal
+    advertising_marketing.personalize.content: requires_signal
+    advertising_marketing.personalize.system: requires_signal
+    functional.personalization: requires_signal
+    analytics.ad_reporting.measure_ad_performance: requires_signal
+    analytics.ad_reporting.ad_delivery_and_targeting: requires_signal
+    analytics.ad_reporting.ad_viewability: requires_signal
+    analytics.ad_reporting.content_performance: requires_signal
+    analytics.ad_reporting.market_research: requires_signal
+    analytics.ad_reporting.campaign_insights: requires_signal
+    necessary.operations.improve: requires_signal
+    select-basic-content: requires_signal
+    # Marketing channel consent arrives through its own opt-in rather than
+    # the TC string, so these require a signal no TCF record supplies.
+    advertising_marketing.communications.email: requires_signal
+    advertising_marketing.communications.sms: requires_signal
+    # Sale or sharing of data.
+    disclosure.sale: denied
+    disclosure.share: denied
+    disclosure.third_party_sale: denied
+    # Umbrella Data Uses stay denied so every grant is named at the specific
+    # level, and a reviewer sees exactly what the policy permits.
+    advertising_marketing: denied
+    advertising_marketing.communications: denied
+    advertising_marketing.first_party: denied
+    advertising_marketing.personalize: denied
+    advertising_marketing.third_party: denied
+    analytics: denied
+    analytics.ad_reporting: denied
+    analytics.reporting: denied
+    disclosure: denied
+    functional: denied
+    necessary: denied
+    necessary.employment: denied
+    necessary.employment.hr: denied
+    necessary.legal_obligation: denied
+    necessary.operations: denied
+    necessary.operations.notifications: denied
+    # Data Uses a server handling web requests never exercises.
+    necessary.employment.hr.hiring: denied
+
+  # United States: an opt-out model, so the modeled ad-tech Data Uses and the
+  # sale and sharing disclosures are granted until an opt-out signal revokes
+  # the ones it covers.
+  us-opt-out:
+    # Service operations, security, fraud prevention and legal obligations run
+    # on their own lawful footing and are never carried by a consent string,
+    # matching TCF special purposes 1 and 2 where they touch ad delivery.
+    necessary.operations.security: granted
+    necessary.operations.authentication: granted
+    necessary.operations.debugging: granted
+    necessary.operations.website_use: granted
+    necessary.operations.quality_assurance: granted
+    necessary.operations.support: granted
+    necessary.operations.upgrades: granted
+    necessary.operations.payment_processing: granted
+    necessary.operations.notifications.email: granted
+    necessary.operations.notifications.sms: granted
+    necessary.operations.survey: granted
+    necessary.fraud_detection: granted
+    necessary.legal_obligation.age_verification: granted
+    necessary.legal_obligation.content_moderation: granted
+    necessary.legal_obligation.dsr: granted
+    necessary.legal_obligation.hold: granted
+    disclosure.law_enforcement: granted
+    disclosure.outside_counsel: granted
+    functional.security: granted
+    functional.performance: granted
+    analytics.reporting.system: granted
+    analytics.ad_reporting.ad_fraud_detection: granted
+    advertising_marketing.serving: granted
+    # The modeled ad-tech Data Uses. Each maps to a TCF purpose in `signals`
+    # below, so a consent record grants it and an absent consent revokes it.
+    necessary.operations.storage: granted
+    advertising_marketing.first_party.contextual: granted
+    advertising_marketing.frequency_capping: granted
+    advertising_marketing.negative_targeting: granted
+    advertising_marketing.profiling: granted
+    advertising_marketing.first_party.targeted: granted
+    advertising_marketing.third_party.targeted: granted
+    advertising_marketing.personalize.profiling: granted
+    advertising_marketing.personalize.content: granted
+    advertising_marketing.personalize.system: granted
+    functional.personalization: granted
+    analytics.ad_reporting.measure_ad_performance: granted
+    analytics.ad_reporting.ad_delivery_and_targeting: granted
+    analytics.ad_reporting.ad_viewability: granted
+    analytics.ad_reporting.content_performance: granted
+    analytics.ad_reporting.market_research: granted
+    analytics.ad_reporting.campaign_insights: granted
+    necessary.operations.improve: granted
+    select-basic-content: granted
+    # Marketing channel consent arrives through its own opt-in rather than
+    # the TC string, so these require a signal no TCF record supplies.
+    advertising_marketing.communications.email: requires_signal
+    advertising_marketing.communications.sms: requires_signal
+    # Sale or sharing of data.
+    disclosure.sale: granted
+    disclosure.share: granted
+    disclosure.third_party_sale: granted
+    # Umbrella Data Uses stay denied so every grant is named at the specific
+    # level, and a reviewer sees exactly what the policy permits.
+    advertising_marketing: denied
+    advertising_marketing.communications: denied
+    advertising_marketing.first_party: denied
+    advertising_marketing.personalize: denied
+    advertising_marketing.third_party: denied
+    analytics: denied
+    analytics.ad_reporting: denied
+    analytics.reporting: denied
+    disclosure: denied
+    functional: denied
+    necessary: denied
+    necessary.employment: denied
+    necessary.employment.hr: denied
+    necessary.legal_obligation: denied
+    necessary.operations: denied
+    necessary.operations.notifications: denied
+    # Data Uses a server handling web requests never exercises.
+    necessary.employment.hr.hiring: denied
+
+# The place tree. Each node names the `group` that applies there, and may name
+# the `jurisdiction` too, either as a plain group name or as a block with a
+# `group:` line and the rest beside it. See the header for the full format.
+rules:
+  # The whole world. `group` is the baseline for a visitor whose place the geo
+  # provider could not resolve, and `jurisdiction` is the consent handling for
+  # that same visitor. Both are required, and every country below inherits the
+  # jurisdiction unless it names its own.
+  group: gdpr-eu
+  jurisdiction: gdpr
+
+  # European Union (27). Each inherits the top node's gdpr jurisdiction.
+  AT: gdpr-eu
+  BE: gdpr-eu
+  BG: gdpr-eu
+  HR: gdpr-eu
+  CY: gdpr-eu
+  CZ: gdpr-eu
+  DK: gdpr-eu
+  EE: gdpr-eu
+  FI: gdpr-eu
+  FR: gdpr-eu
+  DE: gdpr-eu
+  GR: gdpr-eu
+  HU: gdpr-eu
+  IE: gdpr-eu
+  IT: gdpr-eu
+  LV: gdpr-eu
+  LT: gdpr-eu
+  LU: gdpr-eu
+  MT: gdpr-eu
+  NL: gdpr-eu
+  PL: gdpr-eu
+  PT: gdpr-eu
+  RO: gdpr-eu
+  SK: gdpr-eu
+  SI: gdpr-eu
+  ES: gdpr-eu
+  SE: gdpr-eu
+
+  # European Economic Area (non-EU): GDPR applies through the EEA agreement.
+  IS: gdpr-eu
+  LI: gdpr-eu
+  NO: gdpr-eu
+
+  # United Kingdom, which keeps the GDPR jurisdiction under its own regime.
+  GB: gdpr-uk
+
+  # Australia, where no GDPR or US state law applies.
+  AU:
+    group: us-opt-out
+    jurisdiction: non-regulated
+
+  # United States. Every state follows this country node until a region under it
+  # says otherwise, so a state appears below only where its own law applies. The
+  # regions listed are the states with an active comprehensive privacy law, each
+  # naming `us-state` so the consent gates treat the visitor as covered by it. A
+  # region may also carry a `permissions:` map to vary single Data Uses on top of
+  # its group, for example:
+  #   CA:
+  #     group: us-opt-out
+  #     jurisdiction: us-state
+  #     permissions:
+  #       advertising_marketing.first_party.targeted: denied
+  # Each `permissions` entry maps a Data Use to granted, requires_signal, or
+  # denied. Or name a stricter group.
+  US:
+    group: us-opt-out
+    jurisdiction: non-regulated
+    # California.
+    CA:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Virginia.
+    VA:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Colorado.
+    CO:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Connecticut.
+    CT:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Utah.
+    UT:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Montana.
+    MT:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Oregon.
+    OR:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Texas.
+    TX:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Florida.
+    FL:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Delaware.
+    DE:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Iowa.
+    IA:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Nebraska.
+    NE:
+      group: us-opt-out
+      jurisdiction: us-state
+    # New Hampshire.
+    NH:
+      group: us-opt-out
+      jurisdiction: us-state
+    # New Jersey.
+    NJ:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Tennessee.
+    TN:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Minnesota.
+    MN:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Maryland.
+    MD:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Indiana.
+    IN:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Kentucky.
+    KY:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Rhode Island.
+    RI:
+      group: us-opt-out
+      jurisdiction: us-state
+
+# How each session signal maps onto Data Uses. The permission engine reads this,
+# so no signal-to-permission policy lives in the code. For each Data Use a signal
+# produces a grant or a revoke, which the resolver then applies against the group
+# baseline above (a grant sets a `requires_signal` Data Use, a revoke drops a
+# `granted` one, and `denied` always wins so no signal can set it).
+signals:
+  # A present TCF v2 record (a standalone TC string, or the EU TCF section of a
+  # GPP string). With authoritative true, each listed TCF purpose grants the
+  # Data Use it maps to when the record consents to that purpose, and revokes it
+  # otherwise; with authoritative false the record is ignored. The flag governs
+  # only the TCF record's own grants and revokes: an opt-out signal below always
+  # suppresses the Data Uses it revokes, even alongside a consenting TCF record,
+  # because an explicit opt-out is never overridden by another signal. This is
+  # the interim home for the purpose to Data Use mapping, and a purpose may
+  # grant one Data Use or a list of them. Once the IAB Privacy Taxonomy tcf
+  # column is finalized (fideslang) that becomes the single source and this
+  # block is dropped.
+  tcf:
+    authoritative: true
+    purposes:
+      1: necessary.operations.storage
+      2:
+        - advertising_marketing.first_party.contextual
+        - advertising_marketing.frequency_capping
+        - advertising_marketing.negative_targeting
+      3: advertising_marketing.profiling
+      4:
+        - advertising_marketing.first_party.targeted
+        - advertising_marketing.third_party.targeted
+      5: advertising_marketing.personalize.profiling
+      6:
+        - advertising_marketing.personalize.content
+        - advertising_marketing.personalize.system
+        - functional.personalization
+      7:
+        - analytics.ad_reporting.measure_ad_performance
+        - analytics.ad_reporting.ad_delivery_and_targeting
+        - analytics.ad_reporting.ad_viewability
+      8: analytics.ad_reporting.content_performance
+      9:
+        - analytics.ad_reporting.market_research
+        - analytics.ad_reporting.campaign_insights
+      10: necessary.operations.improve
+      11: select-basic-content
+  # US-style opt-out of sale or sharing. It applies when any listed source is
+  # set, and it suppresses the Data Uses it revokes even when a TCF record
+  # consents to them. The list below models the US state opt-out scope, being
+  # sale, sharing, targeted advertising, and device storage as the
+  # conservative reading, so an opted-out visitor gets no Edge Cookie
+  # written and no identifier shared, whilst contextual advertising and
+  # measurement continue after an opt-out. A deployer can widen the list, or write `revokes: all` to drop
+  # every granted Data Use. An opt-out suppresses use for the request; it is
+  # never a destructive withdrawal of an already-issued identifier.
+  us_opt_out:
+    sources: [gpc, gpp_sale_opt_out, us_privacy_opt_out]
+    revokes:
+      - necessary.operations.storage
+      - disclosure.sale
+      - disclosure.share
+      - disclosure.third_party_sale
+      - advertising_marketing.first_party.targeted
+      - advertising_marketing.third_party.targeted
+      - advertising_marketing.profiling

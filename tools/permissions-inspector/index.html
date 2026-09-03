@@ -1,0 +1,863 @@
+<title>Permissions Inspector</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http%3A//www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%9B%82</text></svg>">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --paper:#FAFAF7; --panel:#FFFFFF; --ink:#1F2428; --muted:#5B6570;
+  --line:#E3E3DC; --accent:#0E7490; --accent-soft:#E3F1F5;
+  --set:#15803D; --set-soft:#E6F4EA; --signal:#B45309; --signal-soft:#FBF0DF;
+  --denied:#9F1239; --denied-soft:#F7E8EC; --code-bg:#F2F2ED;
+  --chip-ink:#FFFFFF;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#15191D; --panel:#1D2329; --ink:#E8EAEC; --muted:#9AA5AF;
+    --line:#313A42; --accent:#4CB8D4; --accent-soft:#123C48;
+    --set:#4ADE80; --set-soft:#12331E; --signal:#F5B04E; --signal-soft:#3A2A12;
+    --denied:#F17997; --denied-soft:#3B1622; --code-bg:#12161A;
+    --chip-ink:#10151A;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#15191D; --panel:#1D2329; --ink:#E8EAEC; --muted:#9AA5AF;
+  --line:#313A42; --accent:#4CB8D4; --accent-soft:#123C48;
+  --set:#4ADE80; --set-soft:#12331E; --signal:#F5B04E; --signal-soft:#3A2A12;
+  --denied:#F17997; --denied-soft:#3B1622; --code-bg:#12161A;
+  --chip-ink:#10151A;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{
+  background:var(--paper); color:var(--ink); margin:0;
+  font-family:"Public Sans",-apple-system,"Segoe UI",Arial,sans-serif;
+  font-size:15px; line-height:1.55;
+}
+.wrap{max-width:1180px; margin:0 auto; padding:28px 24px 80px}
+header h1{font-size:30px; font-weight:800; margin:0 0 6px; letter-spacing:-0.01em; text-wrap:balance}
+header .sub{color:var(--muted); margin:0}
+header .draft{display:inline-block; margin:10px 0 0; font-size:12px; font-weight:600;
+  letter-spacing:0.06em; text-transform:uppercase; color:var(--accent);
+  border:1px solid var(--accent); border-radius:3px; padding:2px 8px}
+.cols{display:grid; grid-template-columns:minmax(320px,5fr) minmax(320px,7fr); gap:18px; margin-top:24px}
+@media (max-width:900px){.cols{grid-template-columns:1fr}}
+.card{background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px 18px 16px}
+.card h2{font-size:13px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase;
+  color:var(--muted); margin:0 0 12px}
+.tabs{display:flex; gap:6px; margin-bottom:12px}
+.tabs button{font:inherit; font-size:13px; font-weight:600; padding:6px 12px; cursor:pointer;
+  border:1px solid var(--line); background:var(--panel); color:var(--muted); border-radius:5px}
+.tabs button[aria-selected="true"]{background:var(--accent); border-color:var(--accent); color:var(--chip-ink)}
+.tabs button:focus-visible, .presets button:focus-visible, select:focus-visible,
+input:focus-visible, textarea:focus-visible, .filters button:focus-visible{
+  outline:2px solid var(--accent); outline-offset:1px}
+textarea{width:100%; min-height:220px; resize:vertical; background:var(--code-bg); color:var(--ink);
+  border:1px solid var(--line); border-radius:6px; padding:10px;
+  font-family:"IBM Plex Mono",Consolas,monospace; font-size:12px; line-height:1.5}
+textarea.tc{min-height:64px}
+input[type=text], input[type=url], select{font:inherit; width:100%; background:var(--panel); color:var(--ink);
+  border:1px solid var(--line); border-radius:6px; padding:8px 10px}
+label.field{display:block; font-size:13px; font-weight:600; margin:12px 0 4px}
+label.field:first-of-type{margin-top:0}
+label.check{display:flex; align-items:flex-start; gap:8px; margin-top:10px; font-size:14px; cursor:pointer}
+label.check input{margin-top:3px}
+.hint{font-size:12.5px; color:var(--muted); margin-top:4px}
+.filestat{font-size:13px; color:var(--muted); margin-top:8px}
+.filestat.ok::before{content:"✓ "; color:var(--set); font-weight:700}
+.filestat.err{color:var(--denied); white-space:pre-wrap}
+.presets{display:flex; flex-wrap:wrap; gap:6px; margin-top:8px}
+.presets button{font:inherit; font-size:12.5px; padding:5px 10px; cursor:pointer;
+  border:1px solid var(--line); border-radius:99px; background:var(--panel); color:var(--ink)}
+.presets button:hover{border-color:var(--accent); color:var(--accent)}
+.urlrow{display:flex; gap:8px}
+.urlrow button{font:inherit; font-weight:600; padding:8px 14px; cursor:pointer;
+  border:1px solid var(--accent); background:var(--accent); color:var(--chip-ink); border-radius:6px}
+.purposes{display:flex; flex-wrap:wrap; gap:5px; margin-top:10px}
+.purpose{font-size:11.5px; font-weight:600; border-radius:4px; padding:2px 7px;
+  background:var(--code-bg); color:var(--muted); border:1px solid var(--line)}
+.purpose.on{background:var(--set-soft); color:var(--set); border-color:transparent}
+.purpose.off{background:var(--denied-soft); color:var(--denied); border-color:transparent}
+.verdict{margin-top:18px}
+.engine{font-size:12.5px; color:var(--muted); margin:0 0 10px; padding:6px 10px;
+  border:1px dashed var(--line); border-radius:6px; display:inline-block}
+.engine a{color:var(--accent)}
+.engineline{font-size:12px; color:var(--muted); margin:10px 0 0}
+.engineline a{color:var(--accent)}
+.engine strong{color:var(--set)}
+.verdict .headline{font-size:22px; font-weight:800; letter-spacing:-0.01em; margin:0 0 4px; text-wrap:balance}
+.verdict .headline .n{color:var(--accent)}
+.chainrow{display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:12px 0 4px}
+.crumb{font-family:"IBM Plex Mono",monospace; font-size:13px; padding:3px 9px; border-radius:5px;
+  border:1px dashed var(--line); color:var(--muted)}
+.crumb.hit{border:1px solid var(--accent); color:var(--accent); font-weight:600; background:var(--accent-soft)}
+.arrow{color:var(--muted)}
+.chip{font-size:12px; font-weight:700; padding:3px 10px; border-radius:99px}
+.chip.group{background:var(--accent); color:var(--chip-ink)}
+.chip.jur{background:var(--ink); color:var(--paper)}
+.why{color:var(--muted); margin:8px 0 0}
+.jurnote{margin:10px 0 0; padding:10px 12px; border-left:3px solid var(--accent);
+  background:var(--accent-soft); border-radius:0 6px 6px 0; font-size:13.5px}
+.filters{display:flex; gap:6px; margin:18px 0 10px; align-items:center}
+.filters button{font:inherit; font-size:12.5px; font-weight:600; padding:5px 12px; cursor:pointer;
+  border:1px solid var(--line); border-radius:99px; background:var(--panel); color:var(--muted)}
+.filters button[aria-pressed="true"]{background:var(--ink); color:var(--paper); border-color:var(--ink)}
+.tblwrap{overflow-x:auto; border:1px solid var(--line); border-radius:8px}
+table{border-collapse:collapse; width:100%; min-width:640px; background:var(--panel)}
+th{font-size:11.5px; letter-spacing:0.07em; text-transform:uppercase; color:var(--muted);
+  text-align:left; padding:9px 12px; border-bottom:1px solid var(--line)}
+td{padding:7px 12px; border-bottom:1px solid var(--line); vertical-align:top}
+tr:last-child td{border-bottom:none}
+td.du{font-family:"IBM Plex Mono",monospace; font-size:12.5px; white-space:nowrap}
+tr.cat td{background:var(--code-bg); font-weight:700; font-size:12px; letter-spacing:0.05em;
+  text-transform:uppercase; color:var(--muted)}
+.state{display:inline-block; font-size:11.5px; font-weight:700; padding:2px 9px; border-radius:99px; white-space:nowrap}
+.state.set{background:var(--set-soft); color:var(--set)}
+.state.unset{background:var(--code-bg); color:var(--muted); border:1px solid var(--line)}
+.base{display:inline-block; font-size:11.5px; font-weight:600; padding:2px 8px; border-radius:4px; white-space:nowrap}
+.base.granted{background:var(--set-soft); color:var(--set)}
+.base.requires_signal{background:var(--signal-soft); color:var(--signal)}
+.base.denied{background:var(--denied-soft); color:var(--denied)}
+td.reason{font-size:13px; color:var(--muted)}
+footer{margin-top:28px; font-size:13px; color:var(--muted)}
+footer a{color:var(--accent)}
+.helpbtn{font:inherit; font-size:11px; font-weight:700; width:17px; height:17px; line-height:1;
+  margin-left:7px; cursor:pointer; border:1px solid var(--line); border-radius:50%;
+  background:var(--panel); color:var(--muted); vertical-align:middle; padding:0}
+.helpbtn:hover{border-color:var(--accent); color:var(--accent)}
+.purpose{cursor:pointer}
+.helpwrap{position:fixed; inset:0; background:rgba(0,0,0,0.35); z-index:20; display:flex;
+  justify-content:flex-end}
+.helppanel{background:var(--panel); color:var(--ink); width:min(420px,92vw); height:100%;
+  overflow-y:auto; padding:22px 22px 28px; border-left:1px solid var(--line);
+  box-shadow:-8px 0 30px rgba(0,0,0,0.15)}
+.helppanel h3{margin:0 0 2px; font-size:18px; font-weight:800; letter-spacing:-0.01em; text-wrap:balance}
+.helppanel .key{font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--muted);
+  word-break:break-all; margin:0 0 14px}
+.helppanel p{font-size:14px; margin:0 0 12px}
+.helppanel .authority{margin-top:16px; padding-top:12px; border-top:1px solid var(--line);
+  font-size:13px; color:var(--muted)}
+.helppanel .authority a{color:var(--accent)}
+.helppanel .closer{float:right; font:inherit; font-size:14px; font-weight:700; cursor:pointer;
+  border:1px solid var(--line); background:var(--panel); color:var(--muted);
+  border-radius:6px; padding:4px 10px}
+.helppanel .flagged{font-size:12.5px; font-weight:600; color:var(--signal);
+  background:var(--signal-soft); border-radius:4px; padding:2px 8px; display:inline-block; margin-bottom:10px}
+</style>
+
+<div class="wrap">
+<header>
+  <h1>🛂 Permissions Inspector</h1>
+  <p class="sub">Trusted Server never ships a permission policy. The builder
+  of a deployment chooses the <code>permissions.yaml</code> baked into their
+  compiled image, the operator of that image can overlay another, and the
+  visitor's own signals decide the rest at runtime. This page reads such a
+  policy document, written in the IAB Tech Lab Privacy Taxonomy's own
+  vocabulary, and answers the question a policy owner actually has: for a
+  visitor in a given place, with given consent signals, which Data Uses are
+  set? Everything runs in this browser tab. Nothing is sent anywhere.</p>
+  <p class="engineline" id="engine-top"></p>
+</header>
+
+<div class="cols">
+  <section class="card" aria-label="Policy source">
+    <h2>Step 1 · The policy baseline</h2>
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" id="tab-shipped">Repository samples</button>
+      <button role="tab" aria-selected="false" id="tab-paste">Paste your own</button>
+      <button role="tab" aria-selected="false" id="tab-url">From a URL</button>
+    </div>
+    <div id="pane-shipped">
+      <label class="field" for="testfile">Test policy</label>
+      <select id="testfile"></select>
+      <p class="hint">The samples in the repository's config/permissions
+      directory. No policy ever ships with Trusted Server: the builder bakes
+      their chosen file into the image, the operator can overlay another, and
+      choosing is always explicit.</p>
+    </div>
+    <div id="pane-paste" hidden>
+      <textarea id="yaml-in" spellcheck="false" aria-label="permissions.yaml content"></textarea>
+      <p class="hint">Paste any <code>permissions.yaml</code>. The same
+      validation the server applies at startup runs here, so a file this page
+      rejects is a file the server rejects.</p>
+    </div>
+    <div id="pane-url" hidden>
+      <div class="urlrow">
+        <input type="url" id="url-in" placeholder="https://example.com/permissions.yaml" aria-label="URL of a permissions.yaml">
+        <button id="url-go">Load</button>
+      </div>
+      <p class="hint">Loads a published policy document, for example one hosted
+      by a trade body. The host must allow cross-origin requests, or be
+      the same host serving this page.</p>
+    </div>
+    <p class="filestat" id="filestat"></p>
+  </section>
+
+  <section class="card" aria-label="Visitor and signals">
+    <h2>Step 2 · The visitor's input</h2>
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" id="vtab-location">Location</button>
+      <button role="tab" aria-selected="false" id="vtab-tcf">TCF consent</button>
+      <button role="tab" aria-selected="false" id="vtab-gpc">Privacy Control</button>
+    </div>
+    <div id="vpane-location">
+    <label class="field" for="country">Country</label>
+    <select id="country"></select>
+    <label class="field" for="region">Region or state</label>
+    <select id="region"></select>
+    <label class="check"><input type="checkbox" id="geofail">
+      <span>The geo lookup <strong>failed outright</strong> (every permission
+      drops to the requires-signal floor and the jurisdiction is unknown)</span></label>
+    </div>
+
+    <div id="vpane-tcf" hidden>
+    <label class="field" for="tc">TCF consent string</label>
+    <textarea class="tc" id="tc" spellcheck="false" placeholder="Paste a TC string, or use a sample below"></textarea>
+    <div class="presets">
+      <button id="tc-all">Sample: all 11 purposes consented</button>
+      <button id="tc-storage">Sample: storage only (purpose 1)</button>
+      <button id="tc-none">Sample: nothing consented</button>
+      <button id="tc-clear">No TCF record</button>
+    </div>
+    <p class="hint">To decode a real TC string, or build one purpose by
+    purpose, use the <a href="https://iabgpp.com/" target="_blank" rel="noopener">IAB
+    GPP encoder and decoder</a>, which also handles GPP and US state
+    strings, then paste the result here.</p>
+    <div class="purposes" id="purposes"></div>
+    </div>
+
+    <div id="vpane-gpc" hidden>
+    <label class="check" style="margin-top:0"><input type="checkbox" id="gpc">
+      <span><strong>Global Privacy Control</strong> is on (a US-style opt-out
+      of sale or sharing, which also covers a GPP or US Privacy opt-out)</span></label>
+    <p class="hint">Future signal kinds get their own tab here, so the input
+    stays uncluttered as the model grows.</p>
+    </div>
+  </section>
+</div>
+
+<section class="verdict card" aria-label="Result" id="result-card">
+  <h2>Step 3 · What the application layer gets</h2>
+  <p class="engine" id="engine"></p>
+  <p class="headline" id="headline"></p>
+  <div class="chainrow" id="chain"></div>
+  <p class="why" id="why"></p>
+  <div class="jurnote" id="jurnote"></div>
+  <div class="filters" id="filters">
+    <button aria-pressed="true" data-f="all">All Data Uses</button>
+    <button aria-pressed="false" data-f="set">Set</button>
+    <button aria-pressed="false" data-f="unset">Not set</button>
+    <button aria-pressed="false" data-f="interesting">Where signals matter</button>
+  </div>
+  <div class="tblwrap">
+    <table>
+      <thead><tr>
+        <th>Data Use (IAB Privacy Taxonomy)</th>
+        <th>Policy baseline</th>
+        <th>For this visitor</th>
+        <th>Why</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</section>
+
+<div class="helpwrap" id="helpwrap" hidden>
+  <div class="helppanel" role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <button class="closer" id="help-close">Close ✕</button>
+    <h3 id="help-title"></h3>
+    <p class="key" id="help-key"></p>
+    <span class="flagged" id="help-flag" hidden>Awaiting a Privacy Taxonomy addition</span>
+    <p id="help-desc"></p>
+    <div class="authority" id="help-auth"></div>
+  </div>
+</div>
+
+<footer>
+  <p>The resolution rules are trusted-server's own. The most specific place wins,
+  region then country then the top of the tree. A group states a baseline per
+  Data Use as granted, requires_signal or denied. A TCF record grants the
+  Data Use a consented purpose maps to and revokes a granted one it does not,
+  an opt-out suppresses the Data Uses the policy's revoke list names, even
+  beside a consenting TCF record, and denied always wins. This page is a read-only inspector. A
+  companion editor is planned separately. Inspecting the policy with the same
+  code that enforces it is the point: what you verify here is what runs.</p>
+  <p class="engineline" id="engine-bottom"></p>
+</footer>
+</div>
+
+<script type="application/json" id="du-info">{"advertising_marketing": {"name": "Advertising & Marketing", "description": "Enables marketing, promotion, advertising and sales activities for the product, service, application or system.", "source": "taxonomy"}, "advertising_marketing.communications": {"name": "Advertising Communications", "description": "Uses combined channels to message and market to a customer, user or prospect.", "source": "taxonomy"}, "advertising_marketing.communications.email": {"name": "Email Marketing Communications", "description": "Sends email marketing communications.", "source": "taxonomy"}, "advertising_marketing.communications.sms": {"name": "SMS Marketing Communications", "description": "Sends SMS marketing communications.", "source": "taxonomy"}, "advertising_marketing.first_party": {"name": "First-Party Advertising", "description": "Serves advertisements based on first party data collected or derived about the user.", "source": "taxonomy"}, "advertising_marketing.first_party.contextual": {"name": "First-Party Contextual Advertising", "description": "Serves advertisements based on current content being viewed by the user of the system or service.", "source": "taxonomy"}, "advertising_marketing.first_party.targeted": {"name": "First-Party Targeted Advertising", "description": "Targets advertisements based on data collected or derived about the user from use of the system.", "source": "taxonomy"}, "advertising_marketing.frequency_capping": {"name": "Frequency Capping", "description": "Restricts the number of times a specific advertisement is shown to an individual.", "source": "taxonomy"}, "advertising_marketing.negative_targeting": {"name": "Negative Targeting", "description": "Enforces rules used to ensure a certain audience or group is not targeted by advertising.", "source": "taxonomy"}, "advertising_marketing.personalize": {"name": "Personalized Advertising", "description": "Personalizes advertising content, profiles and systems presented to the user.", "source": "taxonomy"}, "advertising_marketing.personalize.content": {"name": "Personalized Content", "description": "Personalizes the content of the product, service, application or system.", "source": "taxonomy"}, "advertising_marketing.personalize.profiling": {"name": "Personalized Profiling", "description": "Creates profiles for the purpose of serving content.", "source": "taxonomy"}, "advertising_marketing.personalize.system": {"name": "Personalized System", "description": "Personalizes the system.", "source": "taxonomy"}, "advertising_marketing.profiling": {"name": "Advertising Profiling", "description": "Creates audience profiles for the purpose of targeted advertising", "source": "taxonomy"}, "advertising_marketing.serving": {"name": "Ad Serving", "description": "Services to the delivery of advertising and content.", "source": "taxonomy"}, "advertising_marketing.third_party": {"name": "Third-Party Advertising", "description": "Serves advertisements based on data within the system or joined with data provided by 3rd parties.", "source": "taxonomy"}, "advertising_marketing.third_party.targeted": {"name": "Third-Party Targeted Advertising", "description": "Targets advertisements based on data within the system or joined with data provided by 3rd parties.", "source": "taxonomy"}, "analytics": {"name": "Analytics", "description": "Provides analytics for activities such as system and advertising performance reporting, insights and advertising fraud detection.", "source": "taxonomy"}, "analytics.ad_reporting": {"name": "Ad Reporting", "description": "Provides analytics for reporting on advertising activity, such as performance measurement, viewability, fraud detection, market research and campaign insights.", "source": "taxonomy"}, "analytics.ad_reporting.ad_delivery_and_targeting": {"name": "Ad Delivery & Targeting", "description": "Provides analytics for reporting on advertising delivery and targeting.", "source": "taxonomy"}, "analytics.ad_reporting.ad_fraud_detection": {"name": "Ad Fraud Detection", "description": "Provides analytics for reporting on fraud detection.", "source": "taxonomy"}, "analytics.ad_reporting.ad_viewability": {"name": "Ad Viewability", "description": "Provides analytics for reporting on viewability of ads.", "source": "taxonomy"}, "analytics.ad_reporting.campaign_insights": {"name": "Campaign Insights Reporting", "description": "Provides analytics for reporting of campaign insights related to advertising and promotion activities.", "source": "taxonomy"}, "analytics.ad_reporting.content_performance": {"name": "Content Performance Reporting", "description": "Analytics for reporting on content performance.", "source": "taxonomy"}, "analytics.ad_reporting.market_research": {"name": "Market Research", "description": "Provides analytics for reporting of market research.", "source": "taxonomy"}, "analytics.ad_reporting.measure_ad_performance": {"name": "Measure Ad Performance", "description": "Provides analytics for reporting of advertising performance.", "source": "taxonomy"}, "analytics.reporting": {"name": "Analytics Reporting", "description": "Provides analytics for general reporting, such as reporting on system activity and performance.", "source": "taxonomy"}, "analytics.reporting.system": {"name": "System Reporting", "description": "Provides analytics for reporting on system activity.", "source": "taxonomy"}, "disclosure": {"name": "Disclosure", "description": "Provides information regarding whether the data is being transmitted to other parties.", "source": "taxonomy"}, "disclosure.law_enforcement": {"name": "Disclosure to Law Enforcement", "description": "Discloses data for legal obligations arising out of law enforcement requiring it for emergency purposes", "source": "taxonomy"}, "disclosure.outside_counsel": {"name": "Disclosure to Outside Counsel", "description": "Discloses data for legal obligations, including contracts, applicable laws or regulations.", "source": "taxonomy"}, "disclosure.sale": {"name": "Information Sale", "description": "Disclosures data for purposes of sharing data, such as for cross-contextual/targeted advertising or for purposes of selling the data for monetary value", "source": "taxonomy"}, "disclosure.share": {"name": "Information Sharing", "description": "Disclosures data for purposes of sharing data, such as for cross-contextual/targeted advertising", "source": "taxonomy"}, "disclosure.third_party_sale": {"name": "Disclosure of Third-Party Sale", "description": "Discloses data for cross-contextual/targeted advertising", "source": "taxonomy"}, "functional": {"name": "Functional", "description": "Facilitates enhanced operations for the service or product, including personalization.", "source": "taxonomy"}, "functional.performance": {"name": "Performance Optimmization", "description": "Enhancing performance of the services, products, applications or systems.", "source": "taxonomy"}, "functional.personalization": {"name": "Personalization", "description": "Functions relating to personalizing the services, products, applications or systems.", "source": "taxonomy"}, "functional.security": {"name": "Enhanced Security", "description": "Enhancing security of the services, products, applications or systems.", "source": "taxonomy"}, "necessary": {"name": "Necessary", "description": "Provides essential functions such as legal compliance, security, basic system operations and support that the product or service requires to operate and to meet legal and security requirements.", "source": "taxonomy"}, "necessary.employment": {"name": "Employment", "description": "Provides essential activities for employment.", "source": "taxonomy"}, "necessary.employment.hr": {"name": "Human Resources", "description": "Essential human resources activites for an organization.", "source": "taxonomy"}, "necessary.employment.hr.hiring": {"name": "Hiring", "description": "Essential hiring activities for an organization.", "source": "taxonomy"}, "necessary.fraud_detection": {"name": "Fraud Detection", "description": "Detects possible fraud or misuse of the product, service, application or system.", "source": "taxonomy"}, "necessary.legal_obligation": {"name": "Legal Obligation", "description": "Provides service to meet a legal or compliance obligation such as consent management.", "source": "taxonomy"}, "necessary.legal_obligation.age_verification": {"name": "Age Verification", "description": "Provides service to verify minimum legal age.", "source": "taxonomy"}, "necessary.legal_obligation.content_moderation": {"name": "Content Moderation", "description": "Provides service to moderate content.", "source": "taxonomy"}, "necessary.legal_obligation.dsr": {"name": "DSR/Privacy Request", "description": "Provides service to meet a data subject rights request.", "source": "taxonomy"}, "necessary.legal_obligation.hold": {"name": "Legal Hold", "description": "Provides service to meet a legal hold.", "source": "taxonomy"}, "necessary.operations": {"name": "Operations", "description": "Provides essential functions such as legal compliance, security, basic system operations, and support. Without the 'necessary' data use, the product or service cannot operate or meet legal and security requirements", "source": "taxonomy"}, "necessary.operations.authentication": {"name": "Service Authentication", "description": "Authenticate users to the product, service, application or system.", "source": "taxonomy"}, "necessary.operations.debugging": {"name": "Operations Debugging", "description": "Necessary to debug the product, service, application, or system.", "source": "taxonomy"}, "necessary.operations.improve": {"name": "Operations Improvement", "description": "Necessary to optimize and improve support for the product, service, application or system.", "source": "taxonomy"}, "necessary.operations.notifications": {"name": "Service Notifications", "description": "Sends notifications about the product, service, application or system.", "source": "taxonomy"}, "necessary.operations.notifications.email": {"name": "Email Notifications", "description": "Sends email notifications about the product, service, application or system.", "source": "taxonomy"}, "necessary.operations.notifications.sms": {"name": "SMS Notifications", "description": "Sends SMS notifications about the product, service, application or system.", "source": "taxonomy"}, "necessary.operations.payment_processing": {"name": "Payment Processing", "description": "necessary to processes payments for the product, service, application or system.", "source": "taxonomy"}, "necessary.operations.quality_assurance": {"name": "Quality Assuarance", "description": "Necessary to provide quality assurance for the product, service, application, or system.", "source": "taxonomy"}, "necessary.operations.security": {"name": "Service Security", "description": "necessary to provide security for the product, service, application or system", "source": "taxonomy"}, "necessary.operations.support": {"name": "Operations Support", "description": "Provides support for the product, service, application or system.", "source": "taxonomy"}, "necessary.operations.survey": {"name": "Operational Survey", "description": "Information relating to surveys provided to assist with improving the website, product, service, application or systems.", "source": "taxonomy"}, "necessary.operations.upgrades": {"name": "Service Upgrades", "description": "Provides timely system upgrade information options.", "source": "taxonomy"}, "necessary.operations.website_use": {"name": "Operational Website Use", "description": "Provides information relating to how consumers use the website, product, service, application, or system.", "source": "taxonomy"}, "necessary.operations.storage": {"name": "Device Storage (proposed)", "description": "A proposed key for IAB TCF Europe purpose 1, Store and/or access information on a device. The permissions file uses it because the Privacy Taxonomy has no Data Use for device storage yet, and it is flagged for an upstream taxonomy addition.", "source": "proposed"}, "select-basic-content": {"name": "Use Limited Data to Select Content (TCF purpose 11)", "description": "IAB TCF Europe purpose 11. It keeps its TCF identifier because the Privacy Taxonomy has no matching Data Use yet, and it is flagged for an upstream taxonomy addition.", "source": "proposed"}}</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+/* ---------- country names for friendlier dropdowns ---------- */
+const COUNTRY_NAMES = {AT:"Austria",BE:"Belgium",BG:"Bulgaria",HR:"Croatia",CY:"Cyprus",CZ:"Czechia",
+DK:"Denmark",EE:"Estonia",FI:"Finland",FR:"France",DE:"Germany",GR:"Greece",HU:"Hungary",IE:"Ireland",
+IT:"Italy",LV:"Latvia",LT:"Lithuania",LU:"Luxembourg",MT:"Malta",NL:"Netherlands",PL:"Poland",
+PT:"Portugal",RO:"Romania",SK:"Slovakia",SI:"Slovenia",ES:"Spain",SE:"Sweden",IS:"Iceland",
+LI:"Liechtenstein",NO:"Norway",GB:"United Kingdom",AU:"Australia",US:"United States",
+JP:"Japan",BR:"Brazil",CA:"Canada",IN:"India",ZA:"South Africa"};
+const US_STATE_NAMES = {CA:"California",VA:"Virginia",CO:"Colorado",CT:"Connecticut",UT:"Utah",
+MT:"Montana",OR:"Oregon",TX:"Texas",FL:"Florida",DE:"Delaware",IA:"Iowa",NE:"Nebraska",
+NH:"New Hampshire",NJ:"New Jersey",TN:"Tennessee",MN:"Minnesota",MD:"Maryland",IN:"Indiana",
+KY:"Kentucky",RI:"Rhode Island"};
+const TCF_PURPOSE_NAMES = {1:"Store and/or access information on a device",
+2:"Use limited data to select advertising",3:"Create profiles for personalised advertising",
+4:"Use profiles to select personalised advertising",5:"Create profiles to personalise content",
+6:"Use profiles to select personalised content",7:"Measure advertising performance",
+8:"Measure content performance",9:"Understand audiences through statistics",
+10:"Develop and improve services",11:"Use limited data to select content"};
+const CATEGORY_LABELS = {advertising_marketing:"Advertising and marketing",analytics:"Analytics",
+disclosure:"Disclosure",functional:"Functional",necessary:"Necessary",
+"select-basic-content":"TCF purpose 11 (awaiting a taxonomy key)"};
+
+/* ---------- parse and validate, mirroring the server's startup checks ---------- */
+const RESERVED = new Set(["group","jurisdiction","permissions"]);
+const FLAGS = new Set(["granted","requires_signal","denied"]);
+const JURISDICTIONS = new Set(["gdpr","us-state","non-regulated","unknown"]);
+
+function parsePolicy(text){
+  const doc = jsyaml.load(text);
+  if (!doc || typeof doc !== "object") throw new Error("The file is empty or not a YAML mapping.");
+  if (!doc.groups || typeof doc.groups !== "object") throw new Error("Missing `groups` section.");
+  if (!doc.rules || typeof doc.rules !== "object") throw new Error("Missing `rules` section.");
+  const groups = {};
+  for (const [name, g] of Object.entries(doc.groups)){
+    if (!g || typeof g !== "object") throw new Error("Group `"+name+"` is not a mapping.");
+    const def = g.default;
+    if (def !== undefined && !FLAGS.has(def)) throw new Error("Group `"+name+"` default `"+def+"` is not a flag.");
+    const uses = {};
+    for (const [du, flag] of Object.entries(g)){
+      if (du === "default") continue;
+      if (!FLAGS.has(flag)) throw new Error("Group `"+name+"`, Data Use `"+du+"`: `"+flag+"` is not granted, requires_signal or denied.");
+      uses[du] = flag;
+    }
+    groups[name] = {uses, def: def === undefined ? "denied" : def};
+  }
+  function parseNode(raw, path, depth){
+    if (typeof raw === "string"){
+      if (!groups[raw]) throw new Error("Node "+path+" names group `"+raw+"`, which `groups` does not define.");
+      return {group: raw, jurisdiction: null, permissions: {}, children: {}};
+    }
+    if (!raw || typeof raw !== "object") throw new Error("Node "+path+" is neither a group name nor a mapping.");
+    const node = {group: null, jurisdiction: null, permissions: {}, children: {}};
+    for (const [key, val] of Object.entries(raw)){
+      if (key === "group"){
+        if (!groups[val]) throw new Error("Node "+path+" names group `"+val+"`, which `groups` does not define.");
+        node.group = val;
+      } else if (key === "jurisdiction"){
+        if (!JURISDICTIONS.has(val)) throw new Error("Node "+path+": `"+val+"` is not a jurisdiction.");
+        if (val === "us-state" && depth < 2) throw new Error("Node "+path+" names `us-state`, which only a region may name, never a country or the top.");
+        node.jurisdiction = val;
+      } else if (key === "permissions"){
+        for (const [du, flag] of Object.entries(val || {})){
+          if (!FLAGS.has(flag)) throw new Error("Node "+path+", permissions."+du+": `"+flag+"` is not a flag.");
+          node.permissions[du] = flag;
+        }
+      } else {
+        if (key.length > 3) throw new Error("Node "+path+": `"+key+"` is neither a reserved word nor a place code (codes are at most three characters).");
+        node.children[key.toUpperCase()] = parseNode(val, path+" > "+key, depth+1);
+      }
+    }
+    if (!node.group) throw new Error("Node "+path+" has no `group` line, so the node says nothing.");
+    return node;
+  }
+  const top = parseNode(doc.rules, "rules", 0);
+  if (!top.jurisdiction) throw new Error("The top of `rules` must name a `jurisdiction`, so inheritance always ends somewhere.");
+  const signals = doc.signals || {};
+  const tcf = signals.tcf || {authoritative:false, purposes:{}};
+  const usOptOut = signals.us_opt_out || null;
+  const allUses = new Set();
+  for (const g of Object.values(groups)) for (const du of Object.keys(g.uses)) allUses.add(du);
+  return {groups, top, tcf, usOptOut, allUses: [...allUses].sort()};
+}
+
+/* ---------- resolution, mirroring the trusted-server precedence ---------- */
+function resolve(policy, country, region){
+  const chain = [{label:"World", node: policy.top, hit:false}];
+  let matched = policy.top;
+  if (country){
+    const c = policy.top.children[country.toUpperCase()];
+    if (c){
+      chain.push({label: country.toUpperCase(), node: c, hit:false});
+      matched = c;
+      if (region){
+        const r = c.children[region.toUpperCase()];
+        if (r){ chain.push({label: region.toUpperCase(), node: r, hit:false}); matched = r; }
+      }
+    }
+  }
+  chain[chain.length-1].hit = true;
+  let jurisdiction = null;
+  for (const step of chain) if (step.node.jurisdiction) jurisdiction = step.node.jurisdiction;
+  const overrides = {};
+  for (const step of chain) Object.assign(overrides, step.node.permissions);
+  return {matched, chain, jurisdiction, overrides};
+}
+
+/* ---------- TC string encode and decode (core segment, v2) ---------- */
+const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+function makeTcString(consented){
+  const bits = new Array(230).fill(0);
+  const put = (start, len, val) => { for (let i=0;i<len;i++) bits[start+len-1-i] = (val>>i)&1; };
+  put(0,6,2);            // version 2
+  put(78,12,1);          // cmpId, a placeholder
+  put(102,12,"EN".charCodeAt(0)-65); // consentLanguage first letter
+  put(108,6,"N".charCodeAt(0)-65);
+  put(114,12,48);        // vendorListVersion, a placeholder
+  put(126,6,4);          // tcfPolicyVersion
+  put(132,1,1);          // isServiceSpecific
+  for (const p of consented) if (p>=1 && p<=24) bits[152+p-1]=1;
+  let out = "";
+  for (let i=0;i<bits.length;i+=6){
+    let v=0; for (let j=0;j<6;j++) v=(v<<1)|(bits[i+j]||0);
+    out += B64URL[v];
+  }
+  return out;
+}
+function decodeTc(str){
+  const core = str.trim().split(".")[0];
+  if (!core) return null;
+  const bits = [];
+  for (const ch of core){
+    const v = B64URL.indexOf(ch);
+    if (v < 0) return {error:"`"+ch+"` is not a valid TC string character."};
+    for (let j=5;j>=0;j--) bits.push((v>>j)&1);
+  }
+  const read = (start,len)=>{ let v=0; for(let i=0;i<len;i++) v=(v<<1)|(bits[start+i]||0); return v; };
+  const version = read(0,6);
+  if (version !== 2) return {error:"This looks like TC string version "+version+". Only version 2 is read."};
+  const consented = new Set();
+  for (let p=1;p<=24;p++) if (bits[152+p-1]) consented.add(p);
+  return {version, consented};
+}
+
+/* ---------- the effective decision per Data Use ---------- */
+function evaluate(policy, res, tc, optOut, geoFail){
+  const duToPurposes = {};
+  for (const [p, v] of Object.entries(policy.tcf.purposes || {})){
+    for (const du of Array.isArray(v) ? v : [v])
+      (duToPurposes[du] = duToPurposes[du] || []).push(Number(p));
+  }
+  const revokes = policy.usOptOut ? policy.usOptOut.revokes : "all";
+  const revokeAll = revokes === "all";
+  const revokeSet = new Set(Array.isArray(revokes) ? revokes : []);
+  const group = policy.groups[res.matched.group];
+  const rows = [];
+  for (const du of policy.allUses){
+    let baseline = res.overrides[du] !== undefined ? res.overrides[du]
+                 : group.uses[du] !== undefined ? group.uses[du] : group.def;
+    let baseNote = res.overrides[du] !== undefined ? "node override" : null;
+    if (geoFail && baseline === "granted") baseline = "requires_signal";
+    if (geoFail) baseNote = "geo-failure floor";
+    const purposes = duToPurposes[du] || [];
+    const tcfActive = tc && !tc.error && policy.tcf.authoritative;
+    const consent = tcfActive && purposes.some(p => tc.consented.has(p));
+    const pLabel = purposes.length ? "TCF purpose "+purposes.join(", ") : null;
+    let set, reason;
+    if (baseline === "denied"){
+      set = false; reason = "Denied by the policy. No signal can set a denied Data Use.";
+    } else if (optOut && (revokeAll || revokeSet.has(du)) && (baseline === "granted" || consent)){
+      set = false; reason = "Suppressed by the opt-out, which revokes this Data Use. An explicit opt-out is never overridden by another signal.";
+    } else if (baseline === "granted"){
+      if (tcfActive && purposes.length && !consent){
+        set = false; reason = "Granted baseline, but the TCF record does not consent to "+pLabel+", which revokes it.";
+      } else {
+        set = true; reason = "Granted by the policy without any signal.";
+      }
+    } else { // requires_signal
+      if (consent){ set = true; reason = "Requires a signal, and the TCF record consents to "+pLabel+"."; }
+      else if (tcfActive && purposes.length){ set = false; reason = "Requires a signal. The TCF record is present but does not consent to "+pLabel+"."; }
+      else if (purposes.length){ set = false; reason = "Requires a signal ("+pLabel+"), and none is present."; }
+      else { set = false; reason = "Requires a signal, and no signal maps to this Data Use."; }
+    }
+    rows.push({du, baseline, baseNote, set, reason, interesting: purposes.length > 0 || baseline === "granted"});
+  }
+  return rows;
+}
+
+/* ---------- the real trusted-server engine, compiled to WebAssembly ---------- */
+let WASM = null, WASM_META = null;
+let sourceMode = "shipped";
+function wasmOut(ptr){
+  const len = new DataView(WASM.memory.buffer).getUint32(ptr, true);
+  const text = new TextDecoder().decode(new Uint8Array(WASM.memory.buffer, ptr + 4, len));
+  WASM.ts_free(ptr, 4 + len);
+  return JSON.parse(text);
+}
+function wasmStr(fn, s){
+  const bytes = new TextEncoder().encode(s);
+  const inPtr = WASM.ts_alloc(bytes.length);
+  new Uint8Array(WASM.memory.buffer, inPtr, bytes.length).set(bytes);
+  const outPtr = fn(inPtr, bytes.length);
+  WASM.ts_free(inPtr, bytes.length);
+  return wasmOut(outPtr);
+}
+const wasmEval = o => wasmStr(WASM.ts_eval, JSON.stringify(o));
+const wasmValidate = yaml => wasmStr(WASM.ts_validate, yaml);
+async function initWasm(){
+  try {
+    const response = await fetch("./permissions_inspector_wasm.wasm");
+    if (!response.ok) throw new Error("HTTP " + response.status + " (run scripts/build-inspector-wasm.sh first)");
+    const mod = await WebAssembly.compile(await response.arrayBuffer());
+    const imports = {};
+    for (const imp of WebAssembly.Module.imports(mod)){
+      (imports[imp.module] = imports[imp.module] || {})[imp.name] = () => {
+        throw new Error("unused import called: " + imp.module + "." + imp.name);
+      };
+    }
+    const inst = await WebAssembly.instantiate(mod, imports);
+    WASM = inst.exports;
+    WASM_META = wasmOut(WASM.ts_meta());
+  } catch (e){
+    WASM = null;
+    WASM_META = {error: String(e)};
+  }
+  selectTab(sourceMode);
+}
+
+/* ---------- balloon help ---------- */
+const DU_INFO = JSON.parse($("du-info").textContent);
+const AUTH_REPO = '<a href="https://github.com/IABTechLab/fideslang" target="_blank" rel="noopener">IABTechLab/fideslang</a>';
+const AUTH_FILE = '<a href="https://github.com/jwrosewell/fideslang/blob/sync-code-taxonomy-to-restructured-data-uses/data_files/data_uses.yml" target="_blank" rel="noopener">data_uses.yml</a>';
+const AUTH_PR = '<a href="https://github.com/IABTechLab/fideslang/pull/205" target="_blank" rel="noopener">PR #205</a>';
+const AUTH_TCFES = '<a href="https://github.com/InteractiveAdvertisingBureau/iabtcf-es" target="_blank" rel="noopener">iabtcf-es</a>';
+const AUTH_GPP = '<a href="https://iabgpp.com/" target="_blank" rel="noopener">IAB GPP encoder and decoder</a>';
+function openHelp(title, key, desc, flagged, authorityHtml){
+  $("help-title").textContent = title;
+  $("help-key").textContent = key;
+  $("help-desc").textContent = desc;
+  $("help-flag").hidden = !flagged;
+  $("help-auth").innerHTML = authorityHtml;
+  $("helpwrap").hidden = false;
+  $("help-close").focus();
+}
+function openDuHelp(du){
+  const i = DU_INFO[du];
+  if (!i) return;
+  const auth = i.source === "taxonomy"
+    ? "This wording is the taxonomy's own, quoted from "+AUTH_FILE+" in the IAB Tech Lab Privacy Taxonomy repository, "+AUTH_REPO+". The restructured Data Uses are being synced to that repository's main branch through "+AUTH_PR+"."
+    : "The authority on Data Uses is the IAB Tech Lab Privacy Taxonomy repository, "+AUTH_REPO+". This key is not in the taxonomy yet. The permissions file flags it for an upstream addition, and no proposal has been filed there so far.";
+  openHelp(i.name, du, i.description, i.source !== "taxonomy", auth);
+}
+function openPurposeHelp(p, du){
+  openHelp("TCF purpose "+p+": "+TCF_PURPOSE_NAMES[p], "maps to "+du,
+    "When a TCF consent record consents to this purpose, the permission engine grants the Data Use it maps to. When the record is present but does not consent, a granted baseline is revoked.",
+    false,
+    "The authority on TCF purposes is IAB Europe's Transparency and Consent Framework, with the official encoder and decoder library at "+AUTH_TCFES+". Decode any real TC string, or create one, with the "+AUTH_GPP+". The mapping of purposes onto Data Uses is carried in the permissions file itself, in its signals section.");
+}
+$("help-close").onclick = () => { $("helpwrap").hidden = true; };
+$("helpwrap").addEventListener("click", e => { if (e.target === $("helpwrap")) $("helpwrap").hidden = true; });
+document.addEventListener("keydown", e => { if (e.key === "Escape") $("helpwrap").hidden = true; });
+
+/* ---------- UI state ---------- */
+let policy = null;
+let filter = "all";
+
+function setStatus(msg, ok){
+  const el = $("filestat");
+  el.textContent = msg;
+  el.className = "filestat " + (ok ? "ok" : "err");
+}
+
+function loadPolicy(text, label){
+  let rustVerdict = "";
+  if (WASM){
+    const v = wasmValidate(text);
+    rustVerdict = v.ok ? " The trusted-server parser accepts this file."
+      : " The trusted-server parser rejects it: " + v.error;
+  }
+  try {
+    policy = parsePolicy(text);
+    const countries = Object.keys(policy.top.children).length;
+    setStatus(label+" parsed: "+Object.keys(policy.groups).length+" groups, "+countries+
+      " countries in the rules tree, "+policy.allUses.length+" Data Uses." + (rustVerdict || " The server would accept this file."), true);
+    rebuildCountries();
+    render();
+  } catch (e){
+    policy = null;
+    setStatus("The server would reject this file at startup.\n"+e.message, false);
+    $("headline").textContent = "Fix the policy document to see a result.";
+    $("chain").innerHTML = ""; $("why").textContent = ""; $("jurnote").textContent = "";
+    $("tbody").innerHTML = "";
+  }
+}
+
+function rebuildCountries(){
+  const sel = $("country");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const optU = new Option("Location cannot be resolved (no country)", "");
+  sel.add(optU);
+  const codes = Object.keys(policy.top.children).sort((a,b)=>
+    (COUNTRY_NAMES[a]||a).localeCompare(COUNTRY_NAMES[b]||b));
+  for (const c of codes) sel.add(new Option((COUNTRY_NAMES[c]||c)+" ("+c+")", c));
+  sel.add(new Option("Japan (JP), a country with no rule of its own", "JP"));
+  sel.add(new Option("Brazil (BR), a country with no rule of its own", "BR"));
+  sel.value = [...sel.options].some(o=>o.value===prev) ? prev : "";
+  rebuildRegions();
+}
+function rebuildRegions(){
+  const sel = $("region");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  sel.add(new Option("No region selected", ""));
+  const c = policy && policy.top.children[$("country").value];
+  if (c){
+    for (const r of Object.keys(c.children).sort()){
+      sel.add(new Option((US_STATE_NAMES[r]||r)+" ("+r+")", r));
+    }
+    if (Object.keys(c.children).length){
+      sel.add(new Option("Somewhere else in this country (for example GA)", "__other__"));
+    }
+  }
+  sel.disabled = !c || !Object.keys(c.children).length;
+  sel.value = [...sel.options].some(o=>o.value===prev) ? prev : "";
+}
+
+const JUR_NOTES = {
+  gdpr: "GDPR handling applies, the EU, EEA and UK regime. Consent arrives as a TCF record, and without one every opt-in Data Use stays unset, so the deployment fails closed.",
+  "us-state": "This visitor is covered by a US state comprehensive privacy law, so opt-out signals such as Global Privacy Control are honored and converted for downstream partners.",
+  "non-regulated": "No GDPR or US state law applies here, so the group baseline stands as written and signals still apply on top of it.",
+  unknown: "No jurisdiction is named, which is handled conservatively."
+};
+
+function render(){
+  if (!policy) return;
+  const geoFail = $("geofail").checked;
+  const country = geoFail ? "" : $("country").value;
+  const region = $("region").value === "__other__" ? "" : $("region").value;
+  const res = resolve(policy, country, region === "__other__" ? "" : region);
+  const tcText = $("tc").value.trim();
+  const tc = tcText ? decodeTc(tcText) : null;
+  const optOut = $("gpc").checked;
+  const jurisdiction = geoFail ? "unknown" : res.jurisdiction;
+
+  // purposes strip
+  const ps = $("purposes"); ps.innerHTML = "";
+  if (tc && tc.error){
+    const d = document.createElement("span");
+    d.className = "purpose off"; d.textContent = tc.error; ps.appendChild(d);
+  } else if (tc){
+    for (let p=1;p<=11;p++){
+      const d = document.createElement("span");
+      d.className = "purpose "+(tc.consented.has(p)?"on":"off");
+      d.title = TCF_PURPOSE_NAMES[p]+" (click for details)";
+      d.textContent = "P"+p+(tc.consented.has(p)?" ✓":" ✗");
+      d.onclick = () => { const v = (policy.tcf.purposes||{})[p];
+        openPurposeHelp(p, Array.isArray(v) ? v.join(", ") : (v || "no Data Use")); };
+      ps.appendChild(d);
+    }
+  }
+
+  $("vtab-tcf").textContent = "TCF consent" + (tcText ? " ✓" : "");
+  $("vtab-gpc").textContent = "Privacy Control" + (optOut ? " ✓" : "");
+  const rows = evaluate(policy, res, tc, optOut, geoFail);
+  let parity = null;
+  if (WASM && sourceMode === "shipped"){
+    const rr = wasmEval({
+      geo: geoFail ? "failed" : (country ? "located" : "none"),
+      country: country || null, region: region || null,
+      tc: tcText || null, gpc: optOut });
+    if (rr && rr.ok){
+      const rustSet = new Set(rr.set);
+      parity = rows.filter(r => r.set === rustSet.has(r.du)).length;
+      for (const r of rows){
+        const rust = rustSet.has(r.du);
+        if (r.set !== rust){
+          r.reason += " The trusted-server engine says " + (rust ? "set" : "not set") + ", and its answer is shown.";
+          r.set = rust;
+        }
+      }
+    }
+  }
+  const engine = $("engine");
+  let engineLine = "";
+  if (WASM && WASM_META && WASM_META.commit){
+    engineLine = "WebAssembly: " +
+      '<a href="https://github.com/IABTechLab/trusted-server/blob/' + WASM_META.commit + '/crates/trusted-server-core/src/permissions.rs" target="_blank" rel="noopener">trusted-server-core</a> v' +
+      (WASM_META.version || "?") + " · " + WASM_META.branch + " · " +
+      WASM_META.commit + " · " + WASM_META.date;
+  } else {
+    engineLine = "Engine: this page's JS mirror (WebAssembly unavailable in this browser).";
+  }
+  $("engine-top").innerHTML = engineLine;
+  $("engine-bottom").innerHTML = engineLine;
+  if (WASM && sourceMode === "shipped"){
+    engine.innerHTML = "Computed by the real trusted-server code running in this page." +
+      (parity === null ? "" : " The page's JS mirror agrees on " + parity + " of " + rows.length + " Data Uses.");
+  } else if (WASM){
+    engine.textContent = "Pasted and loaded files are validated by the trusted-server parser, and evaluated by this page's JS mirror.";
+  } else {
+    engine.textContent = "Computed by this page's JS mirror.";
+  }
+  const setCount = rows.filter(r=>r.set).length;
+
+  // headline and chain
+  let who;
+  if (geoFail) who = "a visitor whose geo lookup failed";
+  else if (!country) who = "a visitor whose location cannot be resolved";
+  else {
+    const cn = COUNTRY_NAMES[country] || country;
+    who = "a visitor in " + (region && US_STATE_NAMES[region] ? US_STATE_NAMES[region]+", "+cn : cn);
+  }
+  $("headline").innerHTML = '<span class="n">'+setCount+"</span> of "+rows.length+
+    " Data Uses are set for "+who+".";
+
+  const chain = $("chain"); chain.innerHTML = "";
+  if (geoFail){
+    const c = document.createElement("span");
+    c.className = "crumb hit"; c.textContent = "geo failure floor"; chain.appendChild(c);
+  } else {
+    res.chain.forEach((step,i)=>{
+      if (i){ const a=document.createElement("span"); a.className="arrow"; a.textContent="→"; chain.appendChild(a); }
+      const c=document.createElement("span");
+      c.className="crumb"+(step.hit?" hit":""); c.textContent=step.label; chain.appendChild(c);
+    });
+  }
+  const g=document.createElement("span"); g.className="chip group";
+  g.textContent="group: "+(geoFail?res.matched.group+" (floored)":res.matched.group); chain.appendChild(g);
+  const j=document.createElement("span"); j.className="chip jur";
+  j.textContent="jurisdiction: "+jurisdiction; chain.appendChild(j);
+
+  let why;
+  if (geoFail) why = "The geo provider reported an outright lookup failure, the one case that does not fall back to the top of the tree. Every permission resolves to the requires-signal floor and the jurisdiction to unknown.";
+  else if (!country) why = "No country resolved, so the top of the tree answers. Its group is the baseline and its jurisdiction is the consent handling for exactly this visitor.";
+  else {
+    const last = res.chain[res.chain.length-1];
+    if (res.chain.length === 3) why = "The region is listed under its country, and the most specific place wins.";
+    else if (region && !policy.top.children[country].children[region.toUpperCase()])
+      why = "The region has no rule of its own, so it falls back to the country node above it.";
+    else if (policy.top.children[country]) why = "The country is listed in the tree"+(last.node.jurisdiction?" and names its own jurisdiction.":" and inherits the jurisdiction from the node above it.");
+    else why = "No rule names this country, so it falls back to the top of the tree, whose group and jurisdiction answer for every unlisted place.";
+  }
+  if ($("region").value === "__other__") why = "The chosen region has no rule of its own, so it falls back to the country node above it. " + (why || "");
+  $("why").textContent = why;
+  $("jurnote").textContent = JUR_NOTES[jurisdiction] || "";
+
+  // table
+  const tbody = $("tbody"); tbody.innerHTML = "";
+  let lastCat = null;
+  for (const r of rows){
+    if (filter==="set" && !r.set) continue;
+    if (filter==="unset" && r.set) continue;
+    if (filter==="interesting" && !r.interesting) continue;
+    const cat = r.du.split(".")[0];
+    if (cat !== lastCat){
+      lastCat = cat;
+      const tr = document.createElement("tr"); tr.className="cat";
+      const td = document.createElement("td"); td.colSpan = 4;
+      td.textContent = CATEGORY_LABELS[cat] || cat;
+      tr.appendChild(td); tbody.appendChild(tr);
+    }
+    const tr = document.createElement("tr");
+    const td1 = document.createElement("td"); td1.className="du"; td1.textContent = r.du;
+    const hb = document.createElement("button"); hb.className="helpbtn"; hb.textContent="?";
+    hb.setAttribute("aria-label", "What does "+r.du+" mean?");
+    hb.onclick = () => openDuHelp(r.du);
+    td1.appendChild(hb);
+    const td2 = document.createElement("td");
+    const b = document.createElement("span"); b.className="base "+r.baseline;
+    b.textContent = r.baseline + (r.baseNote ? " · "+r.baseNote : "");
+    td2.appendChild(b);
+    const td3 = document.createElement("td");
+    const s = document.createElement("span"); s.className="state "+(r.set?"set":"unset");
+    s.textContent = r.set ? "SET" : "not set"; td3.appendChild(s);
+    const td4 = document.createElement("td"); td4.className="reason"; td4.textContent = r.reason;
+    tr.append(td1,td2,td3,td4); tbody.appendChild(tr);
+  }
+  if (!tbody.children.length){
+    const tr = document.createElement("tr");
+    const td = document.createElement("td"); td.colSpan=4; td.className="reason";
+    td.textContent = "No Data Uses match this filter.";
+    tr.appendChild(td); tbody.appendChild(tr);
+  }
+}
+
+/* ---------- wiring ---------- */
+let shippedYaml = "";
+function selectTab(which){
+  for (const t of ["shipped","paste","url"]){
+    $("tab-"+t).setAttribute("aria-selected", String(t===which));
+    $("pane-"+t).hidden = t!==which;
+  }
+  sourceMode = which;
+  if (which==="shipped"){
+    if (shippedYaml) loadPolicy(shippedYaml, "Sample " + ($("testfile").selectedOptions[0] ? $("testfile").selectedOptions[0].textContent.split(" · ")[0] : ""));
+  }
+  if (which==="paste"){
+    if (!$("yaml-in").value) $("yaml-in").value = shippedYaml;
+    loadPolicy($("yaml-in").value, "Pasted file");
+  }
+}
+$("tab-shipped").onclick = () => selectTab("shipped");
+$("tab-paste").onclick = () => selectTab("paste");
+$("tab-url").onclick = () => selectTab("url");
+$("yaml-in").addEventListener("input", () => loadPolicy($("yaml-in").value, "Pasted file"));
+$("testfile").addEventListener("change", async () => {
+  await loadSample($("testfile").value);
+});
+async function loadSample(file){
+  try {
+    const response = await fetch("../../config/permissions/" + file);
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    shippedYaml = await response.text();
+    const label = $("testfile").selectedOptions[0] ? $("testfile").selectedOptions[0].textContent.split(" · ")[0] : file;
+    loadPolicy(shippedYaml, "Sample " + label);
+  } catch (e){
+    setStatus("Could not load config/permissions/" + file + " (" + e.message + ").", false);
+  }
+}
+$("url-go").onclick = async () => {
+  const u = $("url-in").value.trim();
+  if (!u) return;
+  setStatus("Loading "+u+" …", true);
+  try {
+    const r = await fetch(u);
+    if (!r.ok) throw new Error("HTTP "+r.status);
+    loadPolicy(await r.text(), "Loaded file");
+  } catch (e){
+    setStatus("Could not load the URL ("+e.message+"). In this draft preview the sandbox blocks outside requests; hosted on the project site this loads any published policy document.", false);
+  }
+};
+function selectVisitorTab(which){
+  for (const t of ["location","tcf","gpc"]){
+    $("vtab-"+t).setAttribute("aria-selected", String(t===which));
+    $("vpane-"+t).hidden = t!==which;
+  }
+}
+$("vtab-location").onclick = () => selectVisitorTab("location");
+$("vtab-tcf").onclick = () => selectVisitorTab("tcf");
+$("vtab-gpc").onclick = () => selectVisitorTab("gpc");
+$("country").addEventListener("change", () => { rebuildRegions(); render(); });
+$("region").addEventListener("change", render);
+$("geofail").addEventListener("change", render);
+$("gpc").addEventListener("change", render);
+$("tc").addEventListener("input", render);
+$("tc-all").onclick = () => { $("tc").value = makeTcString([1,2,3,4,5,6,7,8,9,10,11]); render(); };
+$("tc-storage").onclick = () => { $("tc").value = makeTcString([1]); render(); };
+$("tc-none").onclick = () => { $("tc").value = makeTcString([]); render(); };
+$("tc-clear").onclick = () => { $("tc").value = ""; render(); };
+for (const b of $("filters").querySelectorAll("button")){
+  b.onclick = () => {
+    filter = b.dataset.f;
+    for (const x of $("filters").querySelectorAll("button")) x.setAttribute("aria-pressed", String(x===b));
+    render();
+  };
+}
+(async () => {
+  try {
+    const listResponse = await fetch("./policies.json");
+    if (!listResponse.ok) throw new Error("HTTP " + listResponse.status);
+    for (const entry of await listResponse.json()){
+      $("testfile").add(new Option(entry.name + " · " + entry.file, entry.file));
+    }
+    await loadSample($("testfile").value);
+  } catch (e){
+    setStatus("Could not list the samples (" + e.message + "). Run scripts/build-inspector-wasm.sh and serve the repository root with a local web server.", false);
+  }
+  selectTab("shipped");
+  await initWasm();
+  $("country").value = "US"; rebuildRegions(); $("region").value = "CA"; render();
+})();
+</script>

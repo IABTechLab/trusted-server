@@ -4,6 +4,53 @@
 
 [local_server]
 
+    # Maps the loopback client to California, United States, so the platform
+    # geo provider resolves a real place and the permission model applies the
+    # US/CA rules from the permissions.yaml tree. This replaces the retired
+    # [geo] default_country lever with the genuine lookup path.
+    [local_server.geolocation]
+        format = "inline-toml"
+
+        [local_server.geolocation.addresses."127.0.0.1"]
+            as_name = "Integration Test"
+            as_number = 64496
+            area_code = 0
+            city = "Test City"
+            conn_speed = "broadband"
+            conn_type = "wired"
+            continent = "NA"
+            country_code = "US"
+            country_code3 = "USA"
+            country_name = "United States"
+            latitude = 0.0
+            longitude = 0.0
+            metro_code = 0
+            postal_code = "00000"
+            proxy_description = "?"
+            proxy_type = "?"
+            region = "CA"
+            utc_offset = -800
+
+        [local_server.geolocation.addresses."::1"]
+            as_name = "Integration Test"
+            as_number = 64496
+            area_code = 0
+            city = "Test City"
+            conn_speed = "broadband"
+            conn_type = "wired"
+            continent = "NA"
+            country_code = "US"
+            country_code3 = "USA"
+            country_name = "United States"
+            latitude = 0.0
+            longitude = 0.0
+            metro_code = 0
+            postal_code = "00000"
+            proxy_description = "?"
+            proxy_type = "?"
+            region = "CA"
+            utc_offset = -800
+
     [local_server.backends]
 
     [local_server.kv_stores]

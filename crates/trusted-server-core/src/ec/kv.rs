@@ -712,6 +712,19 @@ impl KvIdentityGraph {
         }
 
         // Compute cluster size via prefix list.
+        //
+        // `ec_hash` takes everything before the first `.`, so a coded
+        // identifier yields `hmac~<hash>` and a legacy bare one yields
+        // `<hash>`. Prefix matching is anchored at the start of the key, so
+        // the two never see each other: while pre-epic bare cookies are still
+        // being read back, two rows for the same client IP that straddle the
+        // envelope each count only their own half and `cluster_size`
+        // under-reports. That is accepted, not a defect to work around here.
+        // The count is reported in identify responses and gates nothing, and
+        // bridging it would mean a second prefix scan on every request for the
+        // whole migration window. See section 3 of the pluggable-providers
+        // design. Anyone making this count gate a decision has to fix the
+        // bridge first.
         let hash_prefix = ec_hash(ec_id);
         let cluster_size = self.count_hash_prefix_keys(hash_prefix)?;
 

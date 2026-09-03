@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::edge_cookie::get_ec_id;
+use crate::edge_cookie::recognized_ec_id;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
@@ -184,13 +184,17 @@ impl IntegrationProxy for TestlightIntegration {
                 .await?;
         let req = http::Request::from_parts(parts, EdgeBody::empty());
 
-        // Read EC ID from the ts-ec cookie forwarded by the client.
-        // The registry strips x-ts-ec before dispatching, so only the cookie is available here.
-        let ec_id = get_ec_id(&req)
+        // Read the EC ID from the ts-ec cookie forwarded by the client. The
+        // registry strips x-ts-ec before dispatching, so only the cookie is
+        // available here. The value goes into the proxied body as `user.id` and
+        // leaves the edge, so only one the selected provider recognizes is
+        // accepted, and a stateless deployment supplies none.
+        let ec_id = recognized_ec_id(settings, services, &req)
             .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "EC ID not found in ts-ec cookie — the client must carry a valid EC cookie",
+                    "No EC ID this deployment's Edge Cookie provider recognizes was found \
+                     in the ts-ec cookie",
                 ))
             })?;
 
@@ -464,6 +468,94 @@ mod tests {
             assert_eq!(
                 response_json["ok"], true,
                 "should preserve the upstream JSON response body"
+            );
+        });
+    }
+
+    /// A well-formed identifier carrying a provider code no deployment here
+    /// reads, the shape a partner or another deployment would hand back.
+    const FOREIGN_CODED_EC_ID: &str = "zz00~someone-elses-identifier";
+
+    fn testlight_auction_request(ec_id: &str) -> http::Request<EdgeBody> {
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://edge.example.com/integrations/testlight/auction")
+            .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
+            .expect("should build request");
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_TS_EC.clone(),
+            http::HeaderValue::from_str(ec_id).expect("should build EC header value"),
+        );
+        req
+    }
+
+    fn testlight_integration() -> Arc<TestlightIntegration> {
+        TestlightIntegration::new(TestlightConfig {
+            enabled: true,
+            endpoint: "https://example.com/openrtb".to_string(),
+            timeout_ms: 1000,
+            shim_src: tsjs::tsjs_unified_script_src(),
+            rewrite_scripts: true,
+        })
+    }
+
+    #[test]
+    fn handle_refuses_to_egress_an_ec_id_the_provider_does_not_recognize() {
+        futures::executor::block_on(async {
+            // The identifier ends up in the proxied body as `user.id` and leaves
+            // the edge, so a value this deployment did not issue must stop here
+            // rather than be handed to the upstream endpoint.
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, br#"{"ok":true}"#.to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+
+            let refused = testlight_integration()
+                .handle(
+                    &settings,
+                    &services,
+                    testlight_auction_request(FOREIGN_CODED_EC_ID),
+                )
+                .await
+                .expect_err("a foreign provider code should not be proxied upstream");
+            drop(refused);
+
+            assert!(
+                stub.recorded_backend_names().is_empty(),
+                "no upstream call should be made with an unrecognized identifier"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_refuses_to_egress_any_ec_id_in_a_stateless_deployment() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, br#"{"ok":true}"#.to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            // The value is one the built-in provider would recognize, so only
+            // the absence of a selected provider can withhold it.
+            let mut settings = create_test_settings();
+            settings.ec.provider = None;
+            settings.ec.providers.hmac = None;
+
+            let refused = testlight_integration()
+                .handle(
+                    &settings,
+                    &services,
+                    testlight_auction_request(VALID_SYNTHETIC_ID),
+                )
+                .await
+                .expect_err("a deployment that creates no identifier should proxy none");
+            drop(refused);
+
+            assert!(
+                stub.recorded_backend_names().is_empty(),
+                "no upstream call should be made without a recognized identifier"
             );
         });
     }
