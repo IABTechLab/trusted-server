@@ -18,6 +18,7 @@ use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_USER_AGENT,
+    HEADER_X_TS_ERROR, HEADER_X_TS_JS_ASSET_PROXY,
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -29,8 +30,6 @@ use crate::proxy::{ProxyRequestConfig, proxy_request};
 use crate::settings::{IntegrationConfig, Settings};
 
 pub(crate) const JS_ASSET_PROXY_INTEGRATION_ID: &str = "js_asset_proxy";
-const HEADER_X_TS_JS_ASSET_PROXY: &str = "X-TS-JS-Asset-Proxy";
-const HEADER_X_TS_ERROR: &str = "X-TS-Error";
 const JS_ASSET_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const X_CONTENT_TYPE_OPTIONS_NOSNIFF: &str = "nosniff";
 const ERROR_ORIGIN_UNREACHABLE: &str = "js-asset-origin-unreachable";
@@ -284,14 +283,16 @@ impl JsAssetProxyIntegration {
         let mut config = ProxyRequestConfig::new(origin_url)
             .with_streaming()
             .with_stream_response()
-            .without_forward_headers();
+            .without_forward_headers()
+            .without_ec_id();
         config.follow_redirects = false;
-        config.forward_ec_id = false;
 
         for header_name in [
             &HEADER_ACCEPT,
             &HEADER_ACCEPT_LANGUAGE,
             &HEADER_ACCEPT_ENCODING,
+            &header::IF_NONE_MATCH,
+            &header::IF_MODIFIED_SINCE,
         ] {
             if let Some(value) = req.headers().get(header_name).cloned() {
                 config = config.with_header(header_name.clone(), value);
@@ -374,6 +375,11 @@ impl JsAssetProxyIntegration {
         let upstream_vary = Self::combined_header_values(&parts.headers, &header::VARY);
         let upstream_cache_control =
             Self::combined_header_values(&parts.headers, &header::CACHE_CONTROL);
+        let body = if status == StatusCode::NOT_MODIFIED {
+            EdgeBody::empty()
+        } else {
+            body
+        };
 
         let mut finalized = Response::new(body);
         *finalized.status_mut() = status;
@@ -513,7 +519,7 @@ impl IntegrationProxy for JsAssetProxyIntegration {
             }
         };
 
-        if !response.status().is_success() {
+        if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
             log::warn!(
                 "JS asset origin returned status {} for path {} host {}",
                 response.status(),
@@ -1348,6 +1354,71 @@ mod tests {
     }
 
     #[test]
+    fn handle_forwards_conditional_headers_and_preserves_not_modified() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = JsAssetProxyIntegration::new(config_with_assets(vec![asset(
+                "/assets/vendor.js",
+                "https://cdn.example.com/vendor.js",
+                JsAssetProxyMode::Enabled,
+            )]));
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                StatusCode::NOT_MODIFIED.as_u16(),
+                b"must not reach the client".to_vec(),
+                vec![(header::ETAG.as_str(), "\"current\"")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut request = build_http_request(
+                Method::GET,
+                "https://publisher.example.com/assets/vendor.js",
+            );
+            request.headers_mut().insert(
+                header::IF_NONE_MATCH,
+                http::HeaderValue::from_static("\"current\""),
+            );
+            request.headers_mut().insert(
+                header::IF_MODIFIED_SINCE,
+                http::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+            );
+
+            let response = integration
+                .handle(&settings, &services, request)
+                .await
+                .expect("should proxy conditional asset response");
+
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok()),
+                Some("\"current\"")
+            );
+            let response_body = response
+                .into_body()
+                .into_bytes_bounded(1024)
+                .await
+                .expect("should collect not-modified JS asset body");
+            assert!(
+                response_body.is_empty(),
+                "not-modified responses should not contain a body"
+            );
+            let request_headers = stub.recorded_request_headers();
+            assert_eq!(request_headers.len(), 1);
+            assert!(request_headers[0].iter().any(|(name, value)| {
+                name == header::IF_NONE_MATCH.as_str() && value == "\"current\""
+            }));
+            assert!(request_headers[0].iter().any(|(name, value)| {
+                name == header::IF_MODIFIED_SINCE.as_str()
+                    && value == "Wed, 21 Oct 2015 07:28:00 GMT"
+            }));
+        });
+    }
+
+    #[test]
     fn handle_maps_upstream_outcomes_and_respects_streaming_capability() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -1379,7 +1450,7 @@ mod tests {
 
             let streaming_stub = Arc::new(StubHttpClient::new());
             streaming_stub.set_streaming_responses_supported(true);
-            streaming_stub.push_response(200, b"ok".to_vec());
+            streaming_stub.push_streaming_response(200, b"streamed".to_vec());
             let streaming_services = build_services_with_http_client(
                 Arc::clone(&streaming_stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
@@ -1396,6 +1467,16 @@ mod tests {
                 .expect("should proxy streaming asset response");
             assert_eq!(success.status(), StatusCode::OK);
             assert_eq!(streaming_stub.recorded_stream_response_flags(), vec![true]);
+            assert!(
+                matches!(success.body(), EdgeBody::Stream(_)),
+                "streaming-capable clients should preserve the origin response stream"
+            );
+            let streamed_body = success
+                .into_body()
+                .into_bytes_bounded(1024)
+                .await
+                .expect("should collect streamed JS asset body");
+            assert_eq!(streamed_body.as_ref(), b"streamed");
 
             let unavailable_stub = Arc::new(StubHttpClient::new());
             let unavailable_services = build_services_with_http_client(

@@ -90,7 +90,7 @@ mod tests {
         );
         assert!(
             config.contains(
-                "[integrations.js_asset_proxy]\nenabled = false\n# Uncomment to override upstream cache headers for every asset below.\n# cache_ttl_seconds = 3600"
+                "[integrations.js_asset_proxy]\nenabled = false\n# Uncomment to override upstream cache headers for every asset below.\n# This replaces upstream directives, including private and no-store.\n# Use only when each asset's bytes are identical for every visitor.\n# cache_ttl_seconds = 3600\n# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets\n# that vary by browser User-Agent or use integrity hashes for UA-specific bytes."
             ),
             "initialized config should document the optional cache override"
         );
