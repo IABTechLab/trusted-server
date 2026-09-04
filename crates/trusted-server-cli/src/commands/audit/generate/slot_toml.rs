@@ -1843,13 +1843,15 @@ slot_id = "sidebar"
             diagnostics
                 .notes
                 .iter()
-                .any(|note| note.contains("prefix `ad`"))
+                .any(|note| note.contains("prefix `ad`")),
+            "the broad tuned ancestor should be named"
         );
         assert!(
             diagnostics
                 .notes
                 .iter()
-                .any(|note| note.contains("prefix `ad-side`"))
+                .any(|note| note.contains("prefix `ad-side`")),
+            "the narrower tuned ancestor should be named"
         );
     }
 

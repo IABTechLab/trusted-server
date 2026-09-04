@@ -310,20 +310,49 @@ fn looks_random_suffix(value: &str) -> bool {
     if value.bytes().all(|byte| byte.is_ascii_hexdigit()) && distinct >= 4 {
         return true;
     }
-    if value.bytes().all(|byte| byte.is_ascii_uppercase()) && distinct >= 4 {
+    // Single-case runs look generated only when they also lack the vowel spread
+    // of a word. ALL-CAPS placement labels such as `BILLBOARD` are ordinary
+    // publisher markup, while `zzqxwvkm` is a hash, and case alone cannot tell
+    // them apart in either direction.
+    let single_case = value.bytes().all(|byte| byte.is_ascii_uppercase())
+        || value.bytes().all(|byte| byte.is_ascii_lowercase());
+    if single_case && distinct >= 4 && !has_vowel_structure(value) {
         return true;
     }
 
     has_random_case_alternation(value) && !has_wordlike_camel_segments(value)
 }
 
-/// Number of distinct ASCII bytes in a candidate token.
+/// Whether letters are spread with the vowel density of a word.
+///
+/// English placement labels run roughly 30-50% vowels and hashes cluster far
+/// below, so a quarter-of-the-letters floor separates `SKYSCRAPER` from
+/// `zzqxwvkm` without reading letter case.
+fn has_vowel_structure(value: &str) -> bool {
+    let letters = value.bytes().filter(u8::is_ascii_alphabetic).count();
+    let vowels = value
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphabetic() && is_ascii_vowel(*byte))
+        .count();
+    letters > 0 && vowels * 4 >= letters
+}
+
+/// Number of distinct byte values in a candidate token.
+///
+/// A four-word bitset covers every byte without the 256-byte scan a flag array
+/// would need for tokens this short.
 fn distinct_ascii_bytes(value: &str) -> usize {
-    let mut seen = [false; 256];
+    let mut seen = [0_u64; 4];
+    let mut distinct = 0_usize;
     for byte in value.bytes() {
-        seen[usize::from(byte)] = true;
+        let word = usize::from(byte >> 6);
+        let bit = 1_u64 << (byte & 0b0011_1111);
+        if seen[word] & bit == 0 {
+            seen[word] |= bit;
+            distinct += 1;
+        }
     }
-    seen.into_iter().filter(|present| *present).count()
+    distinct
 }
 
 /// Whether every CamelCase component contains a vowel-like letter.
@@ -1401,9 +1430,12 @@ mod tests {
             "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
             "vendor-tag_20260820AbCdEfGh_slot_inarticle_1",
             "vendor-tag_20260820deadbeef_slot_inarticle_1",
-            "vendor-tag_20260820ABCDEFGH_slot_inarticle_1",
+            "vendor-tag_20260820XKMPQRST_slot_inarticle_1",
             "vendor-tag_20260820ABCD1234_slot_inarticle_1",
             "vendor-tag_20260820A1B2C3D4_slot_inarticle_1",
+            // Vowel-free single-case runs are hashes in either case.
+            "vendor-tag_20260820zzqxwvkm_slot_inarticle_1",
+            "vendor-tag_20260820qwrtypsd_slot_inarticle_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_1-container",
             "vendor-tag_1724112345678AbCdEfGh_slot_sidebar_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_stable",
@@ -1439,6 +1471,14 @@ mod tests {
             "promo-20260820Top10Stories-sidebar",
             "ad-19700101Thumbnail-rail",
             "ad-00000001AAAAAAAA-rail",
+            // ALL-CAPS is a common publisher convention for placement labels,
+            // including the standard IAB format names.
+            "promo-20260820BILLBOARD-sidebar",
+            "promo-20260820HEADLINE-sidebar",
+            "promo-20260820LEADERBOARD-sidebar",
+            "promo-20260820SKYSCRAPER-sidebar",
+            "promo-20260820INARTICLE-sidebar",
+            "promo-20260820RECTANGLE-sidebar",
             // The token is trailing, so the prefix before it still identifies
             // this element and normalization/collision handling own the case.
             "vendor-tag_slot_inarticle_1724112345678AbCdEfGh",
