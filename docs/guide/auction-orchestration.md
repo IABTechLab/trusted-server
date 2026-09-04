@@ -757,8 +757,8 @@ timeout_ms = 500               # Mediator budget (called after providers)
 ### Environment Variable Overrides
 
 The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
-override auction values that already exist in the TOML. EdgeZero v0.0.4 does
-not create missing leaves, so existing configs must add **both**
+override auction values that already exist in the TOML. EdgeZero's env overlay
+does not create missing leaves, so existing configs must add **both**
 `rewrite_creatives = true` and `sanitize_creatives = false` under `[auction]`
 before relying on the corresponding environment overrides — an override for a
 missing leaf is silently ignored.
