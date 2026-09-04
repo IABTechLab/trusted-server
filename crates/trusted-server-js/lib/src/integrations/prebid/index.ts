@@ -13,6 +13,14 @@
 
 import type _pbjsDefault from 'prebid.js';
 
+import {
+  consumePublisherFirstImpressionDelivery,
+  FIRST_IMPRESSION_LEASE_MS,
+  firstImpressionClaim,
+  registerPublisherFirstImpressionAuctions,
+  releasePublisherFirstImpressionAuction,
+  resolveFirstImpressionElement,
+} from '../../core/first_impression';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
@@ -130,7 +138,7 @@ const TS_REFRESH_TARGETING_KEYS = [
 ] as const;
 const MAX_PUBLISHER_AD_UNIT_SNAPSHOTS = 256;
 const MAX_PENDING_PUBLISHER_BIDS = 2048;
-const PENDING_PUBLISHER_DELIVERY_TTL_MS = 5000;
+const PENDING_PUBLISHER_DELIVERY_TTL_MS = FIRST_IMPRESSION_LEASE_MS;
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -375,10 +383,19 @@ type PendingPublisherBid = {
   adUnitCode: string;
   expiresAt: number;
   registrationId: number;
+  generation: number;
+  element: HTMLElement;
+  retainUntilContextChange: boolean;
+  firstImpressionToken?: string;
 };
 type PendingPublisherCode = {
+  adUnitCode: string;
   expiresAt: number;
   registrationId: number;
+  generation: number;
+  element: HTMLElement;
+  retainUntilContextChange: boolean;
+  firstImpressionToken?: string;
 };
 type RemoveAdUnit = (adUnitCode?: string | string[]) => unknown;
 type PrebidWithRemoveAdUnit = {
@@ -388,8 +405,9 @@ type PrebidWithRemoveAdUnit = {
 
 let publisherAdUnitSnapshots = new Map<string, PublisherAdUnitSnapshot>();
 let pendingPublisherBids = new Map<string, PendingPublisherBid>();
-let pendingPublisherCodes = new Map<string, PendingPublisherCode>();
+let pendingPublisherCodes = new Map<string, Map<number, PendingPublisherCode>>();
 let pendingPublisherRegistrationId = 0;
+let publisherFirstImpressionTokens = new Map<string, Set<string>>();
 let syntheticRefreshAdUnits = new WeakSet<TrustedServerAdUnit>();
 type TrustedServerBidRequest = {
   adUnitCode?: string;
@@ -414,6 +432,7 @@ type RefreshGptSlot = {
   getSlotElementId?: () => string;
   getAdUnitPath?: () => string;
   getTargeting?: (key: string) => string[];
+  setTargeting?: (key: string, value: string | string[]) => RefreshGptSlot;
   clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
 };
@@ -819,41 +838,179 @@ function clearRefreshTargeting(slot: RefreshGptSlot): void {
   }
 }
 
+function restoreTrustedServerFirstImpressionTargeting(slot: RefreshGptSlot): void {
+  const ts = window.tsjs;
+  const injectedSlot = findInjectedSlotForRefresh(slot);
+  const element = [refreshSlotElementId(slot), injectedSlot?.div_id]
+    .filter((elementId): elementId is string => Boolean(elementId))
+    .map((elementId) => document.getElementById(elementId))
+    .find((candidate): candidate is HTMLElement =>
+      Boolean(candidate && ts && firstImpressionClaim(ts, candidate)?.owner === 'trusted_server')
+    );
+  const claim = ts && element ? firstImpressionClaim(ts, element) : undefined;
+  if (claim?.owner !== 'trusted_server' || !claim.targeting || !slot.setTargeting) return;
+  clearRefreshTargeting(slot);
+  for (const [key, value] of Object.entries(claim.targeting)) slot.setTargeting(key, value);
+}
+
+/** Track a first-impression token until its exact auction is consumed or abandoned. */
+function trackPublisherFirstImpressionToken(adUnitCode: string, token: string): void {
+  const tokens = publisherFirstImpressionTokens.get(adUnitCode) ?? new Set<string>();
+  tokens.add(token);
+  publisherFirstImpressionTokens.set(adUnitCode, tokens);
+}
+
+function forgetPublisherFirstImpressionToken(adUnitCode: string, token?: string): void {
+  const tokens = publisherFirstImpressionTokens.get(adUnitCode);
+  if (!tokens) return;
+  if (token === undefined) {
+    if (window.tsjs) {
+      for (const current of tokens) releasePublisherFirstImpressionAuction(window.tsjs, current);
+    }
+    publisherFirstImpressionTokens.delete(adUnitCode);
+    return;
+  }
+  tokens.delete(token);
+  if (tokens.size === 0) publisherFirstImpressionTokens.delete(adUnitCode);
+}
+
 /** Remove pending delivery state for an ad unit, optionally from one registration only. */
 function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: number): void {
-  const pendingCode = pendingPublisherCodes.get(adUnitCode);
-  if (registrationId !== undefined && pendingCode?.registrationId !== registrationId) return;
+  const registrations = pendingPublisherCodes.get(adUnitCode);
+  if (registrations) {
+    if (registrationId === undefined) {
+      pendingPublisherCodes.delete(adUnitCode);
+    } else {
+      const pending = registrations.get(registrationId);
+      if (!pending?.retainUntilContextChange) registrations.delete(registrationId);
+      if (registrations.size === 0) pendingPublisherCodes.delete(adUnitCode);
+    }
+  }
 
-  pendingPublisherCodes.delete(adUnitCode);
   for (const [adId, pendingBid] of pendingPublisherBids) {
     if (
       pendingBid.adUnitCode === adUnitCode &&
-      (registrationId === undefined || pendingBid.registrationId === registrationId)
+      (registrationId === undefined || pendingBid.registrationId === registrationId) &&
+      (registrationId === undefined || !pendingBid.retainUntilContextChange)
+    ) {
+      pendingPublisherBids.delete(adId);
+      if (pendingBid.firstImpressionToken) {
+        forgetPublisherFirstImpressionToken(adUnitCode, pendingBid.firstImpressionToken);
+      }
+    }
+  }
+}
+
+function removeConsumedPublisherRegistration(adUnitCode: string, registrationId: number): void {
+  const registrations = pendingPublisherCodes.get(adUnitCode);
+  const pendingCode = registrations?.get(registrationId);
+  registrations?.delete(registrationId);
+  if (registrations?.size === 0) pendingPublisherCodes.delete(adUnitCode);
+
+  const tokens = new Set<string>();
+  if (pendingCode?.firstImpressionToken) tokens.add(pendingCode.firstImpressionToken);
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (pendingBid.adUnitCode !== adUnitCode || pendingBid.registrationId !== registrationId) {
+      continue;
+    }
+    pendingPublisherBids.delete(adId);
+    if (pendingBid.firstImpressionToken) tokens.add(pendingBid.firstImpressionToken);
+  }
+  for (const token of tokens) forgetPublisherFirstImpressionToken(adUnitCode, token);
+}
+
+function pendingPublisherContextIsCurrent(
+  pending: PendingPublisherBid | PendingPublisherCode
+): boolean {
+  return (
+    pending.generation === (window.tsjs?.navGeneration ?? 0) &&
+    pending.element.isConnected &&
+    document.getElementById(pending.element.id) === pending.element &&
+    resolvePublisherDeliveryElement(pending.adUnitCode) === pending.element
+  );
+}
+
+function resolvePublisherDeliveryElement(adUnitCode: string): HTMLElement | undefined {
+  const direct = resolveFirstImpressionElement(adUnitCode);
+  if (direct) return direct;
+
+  const gpt = (
+    window as unknown as {
+      googletag?: { pubads?(): { getSlots?(): RefreshGptSlot[] } };
+    }
+  ).googletag;
+  const matches = (gpt?.pubads?.().getSlots?.() ?? [])
+    .filter((slot) => {
+      const injectedSlot = findInjectedSlotForRefresh(slot);
+      return refreshSlotElementId(slot) === adUnitCode || injectedSlot?.div_id === adUnitCode;
+    })
+    .map((slot) => {
+      const elementId = refreshSlotElementId(slot);
+      return elementId ? document.getElementById(elementId) : null;
+    })
+    .filter((element): element is HTMLElement => Boolean(element?.isConnected));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function pendingPublisherContextMatchesSlot(
+  pending: PendingPublisherBid | PendingPublisherCode,
+  slot: RefreshGptSlot
+): boolean {
+  if (!pendingPublisherContextIsCurrent(pending)) return false;
+  const injectedSlot = findInjectedSlotForRefresh(slot);
+  return [refreshSlotElementId(slot), injectedSlot?.div_id]
+    .filter((code): code is string => typeof code === 'string' && code.length > 0)
+    .some((code) => {
+      const exact = document.getElementById(code);
+      return (
+        exact === pending.element ||
+        Boolean(exact && (pending.element.contains(exact) || exact.contains(pending.element))) ||
+        resolvePublisherDeliveryElement(code) === pending.element
+      );
+    });
+}
+
+/** Discard delivery state that outlived the publisher auction which created it. */
+function prunePendingPublisherBids(now = Date.now()): void {
+  for (const [adUnitCode, registrations] of pendingPublisherCodes) {
+    for (const [registrationId, pendingCode] of registrations) {
+      if (
+        !pendingPublisherContextIsCurrent(pendingCode) ||
+        (pendingCode.expiresAt <= now && !pendingCode.retainUntilContextChange)
+      ) {
+        registrations.delete(registrationId);
+      }
+    }
+    if (registrations.size === 0) pendingPublisherCodes.delete(adUnitCode);
+  }
+
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (
+      !pendingPublisherContextIsCurrent(pendingBid) ||
+      (pendingBid.expiresAt <= now && !pendingBid.retainUntilContextChange)
     ) {
       pendingPublisherBids.delete(adId);
     }
   }
 }
 
-/** Discard delivery state that outlived the publisher auction which created it. */
-function prunePendingPublisherBids(now = Date.now()): void {
-  for (const [adUnitCode, pendingCode] of pendingPublisherCodes) {
-    if (pendingCode.expiresAt <= now) pendingPublisherCodes.delete(adUnitCode);
-  }
+/** Store a short-lived pending publisher ad-unit code without erasing overlaps. */
+function storePendingPublisherCode(pendingCode: PendingPublisherCode): void {
+  const registrations = pendingPublisherCodes.get(pendingCode.adUnitCode) ?? new Map();
+  registrations.set(pendingCode.registrationId, pendingCode);
+  pendingPublisherCodes.set(pendingCode.adUnitCode, registrations);
 
-  for (const [adId, pendingBid] of pendingPublisherBids) {
-    if (pendingBid.expiresAt <= now) pendingPublisherBids.delete(adId);
-  }
-}
-
-/** Store a short-lived pending publisher ad-unit code for delivery correlation. */
-function storePendingPublisherCode(adUnitCode: string, pendingCode: PendingPublisherCode): void {
-  pendingPublisherCodes.delete(adUnitCode);
-  pendingPublisherCodes.set(adUnitCode, pendingCode);
-
-  if (pendingPublisherCodes.size > MAX_PENDING_PUBLISHER_BIDS) {
-    const oldestCode = pendingPublisherCodes.keys().next().value;
-    if (oldestCode !== undefined) removePendingPublisherBidsForCode(oldestCode);
+  let registrationCount = 0;
+  for (const pending of pendingPublisherCodes.values()) registrationCount += pending.size;
+  if (registrationCount > MAX_PENDING_PUBLISHER_BIDS) {
+    for (const [adUnitCode, pendingRegistrations] of pendingPublisherCodes) {
+      const evictable = [...pendingRegistrations.values()].find(
+        (pending) => !pending.retainUntilContextChange
+      );
+      if (!evictable) continue;
+      removePendingPublisherBidsForCode(adUnitCode, evictable.registrationId);
+      break;
+    }
   }
 }
 
@@ -868,29 +1025,18 @@ function storePendingPublisherBid(adId: string, pendingBid: PendingPublisherBid)
   }
 }
 
-/** Register every requested publisher code and any bid IDs returned for that auction. */
-function registerPendingPublisherBids(
+function publisherResponseAdIds(
   publisherAdUnitCodes: Set<string>,
   bidResponses: unknown
-): number {
-  prunePendingPublisherBids();
-  const registrationId = ++pendingPublisherRegistrationId;
-  const expiresAt = Date.now() + PENDING_PUBLISHER_DELIVERY_TTL_MS;
-
-  for (const adUnitCode of publisherAdUnitCodes) {
-    removePendingPublisherBidsForCode(adUnitCode);
-    storePendingPublisherCode(adUnitCode, { expiresAt, registrationId });
-  }
-
-  if (!bidResponses || typeof bidResponses !== 'object' || Array.isArray(bidResponses)) {
-    return registrationId;
-  }
+): Map<string, string[]> {
+  const adIds = new Map<string, string[]>();
+  if (!bidResponses || typeof bidResponses !== 'object' || Array.isArray(bidResponses))
+    return adIds;
 
   for (const [responseCode, responseGroup] of Object.entries(bidResponses)) {
     if (!responseGroup || typeof responseGroup !== 'object') continue;
     const bids = (responseGroup as { bids?: unknown }).bids;
     if (!Array.isArray(bids)) continue;
-
     for (const bid of bids) {
       if (!bid || typeof bid !== 'object') continue;
       const response = bid as { adId?: unknown; adUnitCode?: unknown };
@@ -898,29 +1044,91 @@ function registerPendingPublisherBids(
       const adUnitCode =
         typeof response.adUnitCode === 'string' ? response.adUnitCode : responseCode;
       if (!adId || !adUnitCode || !publisherAdUnitCodes.has(adUnitCode)) continue;
+      adIds.set(adUnitCode, [...(adIds.get(adUnitCode) ?? []), adId]);
+    }
+  }
+  return adIds;
+}
 
-      storePendingPublisherBid(adId, { adUnitCode, expiresAt, registrationId });
+/** Register every requested publisher code and any bid IDs returned for that auction. */
+function registerPendingPublisherBids(
+  publisherAdUnitCodes: Set<string>,
+  bidResponses: unknown,
+  firstImpressionTokens: Map<string, string>
+): number {
+  prunePendingPublisherBids();
+  const registrationId = ++pendingPublisherRegistrationId;
+  const expiresAt = Date.now() + PENDING_PUBLISHER_DELIVERY_TTL_MS;
+  const responseAdIds = publisherResponseAdIds(publisherAdUnitCodes, bidResponses);
+
+  for (const adUnitCode of publisherAdUnitCodes) {
+    const element = resolvePublisherDeliveryElement(adUnitCode);
+    if (!element) continue;
+    const firstImpressionToken = firstImpressionTokens.get(adUnitCode);
+    const retainUntilContextChange = Boolean(
+      firstImpressionToken &&
+      window.tsjs &&
+      firstImpressionClaim(window.tsjs, element)?.owner === 'trusted_server'
+    );
+    storePendingPublisherCode({
+      adUnitCode,
+      expiresAt,
+      registrationId,
+      generation: window.tsjs?.navGeneration ?? 0,
+      element,
+      retainUntilContextChange,
+      firstImpressionToken,
+    });
+  }
+
+  for (const [adUnitCode, adIds] of responseAdIds) {
+    const element = resolvePublisherDeliveryElement(adUnitCode);
+    if (!element) continue;
+    const firstImpressionToken = firstImpressionTokens.get(adUnitCode);
+    const retainUntilContextChange = Boolean(
+      firstImpressionToken &&
+      window.tsjs &&
+      firstImpressionClaim(window.tsjs, element)?.owner === 'trusted_server'
+    );
+    for (const adId of adIds) {
+      storePendingPublisherBid(adId, {
+        adUnitCode,
+        expiresAt,
+        registrationId,
+        generation: window.tsjs?.navGeneration ?? 0,
+        element,
+        retainUntilContextChange,
+        firstImpressionToken,
+      });
     }
   }
 
   return registrationId;
 }
 
-/**
- * Partition slots by whether they belong to a pending publisher auction.
- *
- * A current `hb_adid` is the precise signal. When publishers intentionally
- * omit that targeting, a short-lived requested-code match preserves delivery
- * for no-bid and custom-targeting auctions. Without an ID, that fallback cannot
- * distinguish a delayed delivery from the first independent refresh, so it may
- * conservatively suppress one auction before its one-shot state is consumed.
- * A non-empty unmatched ID remains independent so stale targeting cannot
- * suppress a fresh auction. Every match is consumed once.
- */
-function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): Set<RefreshGptSlot> {
+interface PublisherDeliveryPartition {
+  deliverySlots: Set<RefreshGptSlot>;
+  suppressedSlots: Set<RefreshGptSlot>;
+}
+
+/** Consume the equivalent one-shot suppression owned by the inner GPT wrapper. */
+function consumeGptPublisherRefreshSuppression(slot: RefreshGptSlot): void {
+  const elementId = refreshSlotElementId(slot);
+  const handoff = elementId ? window.tsjs?.gptSlotHandoffs?.[elementId] : undefined;
+  if (handoff?.suppressPublisherRefresh) handoff.suppressPublisherRefresh = false;
+}
+
+/** Restore TS targeting and consume any equivalent GPT-wrapper handoff. */
+function prepareSuppressedPublisherSlot(slot: RefreshGptSlot): void {
+  restoreTrustedServerFirstImpressionTargeting(slot);
+  consumeGptPublisherRefreshSuppression(slot);
+}
+
+/** Partition correlated publisher deliveries from one losing first-impression delivery. */
+function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliveryPartition {
   prunePendingPublisherBids();
   const deliverySlots = new Set<RefreshGptSlot>();
-  const deliveredCodes = new Set<string>();
+  const suppressedSlots = new Set<RefreshGptSlot>();
 
   for (const slot of targetSlots) {
     const adIds = slot.getTargeting?.('hb_adid');
@@ -928,25 +1136,45 @@ function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): Set<RefreshGptSl
       ? adIds
           .filter((adId): adId is string => typeof adId === 'string' && adId.length > 0)
           .map((adId) => pendingPublisherBids.get(adId))
-          .find((bid): bid is PendingPublisherBid => bid !== undefined)
+          .find(
+            (bid): bid is PendingPublisherBid =>
+              bid !== undefined && pendingPublisherContextMatchesSlot(bid, slot)
+          )
       : undefined;
     const hasAdId =
       Array.isArray(adIds) && adIds.some((adId) => typeof adId === 'string' && adId.length > 0);
     const injectedSlot = findInjectedSlotForRefresh(slot);
-    const pendingCode = hasAdId
-      ? undefined
-      : [refreshSlotElementId(slot), injectedSlot?.div_id]
+    const pendingCodeCandidates = [
+      ...new Map(
+        [refreshSlotElementId(slot), injectedSlot?.div_id]
           .filter((code): code is string => typeof code === 'string' && code.length > 0)
-          .find((code) => pendingPublisherCodes.has(code));
-    const adUnitCode = pendingBid?.adUnitCode ?? pendingCode;
-    if (!adUnitCode) continue;
+          .flatMap((code) => [...(pendingPublisherCodes.get(code)?.values() ?? [])])
+          .filter(
+            (pending) =>
+              pendingPublisherContextMatchesSlot(pending, slot) &&
+              (!hasAdId || pending.retainUntilContextChange)
+          )
+          .map((pending) => [pending.registrationId, pending] as const)
+      ).values(),
+    ];
+    const pendingCode = pendingCodeCandidates.length === 1 ? pendingCodeCandidates[0] : undefined;
+    const pending = pendingBid ?? pendingCode;
+    if (!pending) {
+      if (pendingCodeCandidates.some((candidate) => candidate.retainUntilContextChange)) {
+        suppressedSlots.add(slot);
+      }
+      continue;
+    }
 
-    deliverySlots.add(slot);
-    deliveredCodes.add(adUnitCode);
+    const suppress =
+      pending.firstImpressionToken && window.tsjs
+        ? consumePublisherFirstImpressionDelivery(window.tsjs, pending.firstImpressionToken)
+        : false;
+    removeConsumedPublisherRegistration(pending.adUnitCode, pending.registrationId);
+    (suppress ? suppressedSlots : deliverySlots).add(slot);
   }
 
-  deliveredCodes.forEach((adUnitCode) => removePendingPublisherBidsForCode(adUnitCode));
-  return deliverySlots;
+  return { deliverySlots, suppressedSlots };
 }
 
 /** Evict publisher state after Prebid removes one or more ad units. */
@@ -955,6 +1183,9 @@ function removePublisherState(adUnitCode?: string | string[]): void {
     publisherAdUnitSnapshots.clear();
     pendingPublisherBids.clear();
     pendingPublisherCodes.clear();
+    for (const code of publisherFirstImpressionTokens.keys()) {
+      forgetPublisherFirstImpressionToken(code);
+    }
     return;
   }
 
@@ -962,6 +1193,7 @@ function removePublisherState(adUnitCode?: string | string[]): void {
   for (const code of adUnitCodes) {
     publisherAdUnitSnapshots.delete(code);
     removePendingPublisherBidsForCode(code);
+    forgetPublisherFirstImpressionToken(code);
   }
 }
 
@@ -1084,6 +1316,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pendingPublisherBids = new Map();
   pendingPublisherCodes = new Map();
   pendingPublisherRegistrationId = 0;
+  publisherFirstImpressionTokens = new Map();
   syntheticRefreshAdUnits = new WeakSet();
 
   const prebidWithRemoveAdUnit = pbjs as unknown as PrebidWithRemoveAdUnit;
@@ -1176,7 +1409,22 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
     const opts = { ...(requestObj ?? {}) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const adUnits = ((opts as any).adUnits || pbjs.adUnits || []) as TrustedServerAdUnit[];
+    const explicitAdUnits = (opts as any).adUnits as TrustedServerAdUnit[] | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const requestedAdUnitCodes = Array.isArray((opts as any).adUnitCodes)
+      ? new Set(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ((opts as any).adUnitCodes as unknown[]).filter(
+            (code): code is string => typeof code === 'string'
+          )
+        )
+      : undefined;
+    const adUnits = (explicitAdUnits ?? (pbjs.adUnits as TrustedServerAdUnit[]) ?? []).filter(
+      (unit) =>
+        explicitAdUnits !== undefined ||
+        requestedAdUnitCodes === undefined ||
+        requestedAdUnitCodes.has(unit.code ?? '')
+    );
     const isSyntheticRefresh =
       adUnits.length > 0 && adUnits.every((unit) => syntheticRefreshAdUnits.has(unit));
     const publisherAdUnitCodes = new Set(
@@ -1185,6 +1433,20 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         .map((unit) => unit.code)
         .filter((code): code is string => typeof code === 'string' && code.length > 0)
     );
+    const firstImpressionTokens =
+      !isSyntheticRefresh && !window.tsjs?.adInitRefreshInProgress
+        ? registerPublisherFirstImpressionAuctions(
+            (window.tsjs ??= {} as TsjsApi),
+            publisherAdUnitCodes
+          )
+        : new Map<string, string>();
+    for (const [adUnitCode, token] of firstImpressionTokens) {
+      trackPublisherFirstImpressionToken(adUnitCode, token);
+      window.setTimeout(
+        () => forgetPublisherFirstImpressionToken(adUnitCode, token),
+        PENDING_PUBLISHER_DELIVERY_TTL_MS
+      );
+    }
 
     // Ensure every ad unit has a trustedServer bid entry
     for (const unit of adUnits) {
@@ -1280,7 +1542,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       syncPrebidEidsCookie();
       const registrationId = isSyntheticRefresh
         ? undefined
-        : registerPendingPublisherBids(publisherAdUnitCodes, args[0]);
+        : registerPendingPublisherBids(publisherAdUnitCodes, args[0], firstImpressionTokens);
       if (typeof originalBidsBack !== 'function') return;
 
       try {
@@ -1291,11 +1553,23 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
             removePendingPublisherBidsForCode(code, registrationId)
           );
         }
+        for (const [adUnitCode, token] of firstImpressionTokens) {
+          releasePublisherFirstImpressionAuction(window.tsjs!, token);
+          forgetPublisherFirstImpressionToken(adUnitCode, token);
+        }
         throw error;
       }
     };
 
-    return originalRequestBids(opts);
+    try {
+      return originalRequestBids(opts);
+    } catch (error) {
+      for (const [adUnitCode, token] of firstImpressionTokens) {
+        releasePublisherFirstImpressionAuction(window.tsjs!, token);
+        forgetPublisherFirstImpressionToken(adUnitCode, token);
+      }
+      throw error;
+    }
   };
 
   // Apply initial configuration
@@ -1403,11 +1677,16 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         return originalRefresh(slots, opts);
       }
 
-      const deliverySlots = publisherDeliverySlots(targetSlots);
-      const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
+      const { deliverySlots, suppressedSlots } = publisherDeliverySlots(targetSlots);
+      suppressedSlots.forEach(prepareSuppressedPublisherSlot);
+      const remainingSlots = targetSlots.filter((slot) => !suppressedSlots.has(slot));
+      if (remainingSlots.length === 0) return;
+      const forwardedSlots = suppressedSlots.size > 0 ? remainingSlots : slots;
+      const independentSlots = remainingSlots.filter((slot) => !deliverySlots.has(slot));
       if (independentSlots.length === 0) {
-        recordPrebidRefreshForDiagnostics(targetSlots);
-        return dispatchPrebidRefresh(originalRefresh, slots, opts);
+        remainingSlots.forEach(consumeGptPublisherRefreshSuppression);
+        recordPrebidRefreshForDiagnostics(remainingSlots);
+        return dispatchPrebidRefresh(originalRefresh, forwardedSlots, opts);
       }
 
       // Clear stale Trusted Server/Prebid targeting from independent slots before
@@ -1421,7 +1700,29 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
       );
       if (!auctionSlots.length) {
-        return originalRefresh(slots, opts);
+        const immediateSlotCodes = new Map<RefreshGptSlot, string>();
+        remainingSlots.forEach((slot) => {
+          const elementId = refreshSlotElementId(slot);
+          if (elementId) immediateSlotCodes.set(slot, elementId);
+        });
+        const immediateTokens = registerPublisherFirstImpressionAuctions(
+          (window.tsjs ??= {} as TsjsApi),
+          immediateSlotCodes.values()
+        );
+        const immediateSuppressedSlots = new Set<RefreshGptSlot>();
+        for (const [slot, elementId] of immediateSlotCodes) {
+          const token = immediateTokens.get(elementId);
+          if (token && window.tsjs && consumePublisherFirstImpressionDelivery(window.tsjs, token)) {
+            immediateSuppressedSlots.add(slot);
+          }
+        }
+        immediateSuppressedSlots.forEach(prepareSuppressedPublisherSlot);
+        const immediateSlots = remainingSlots.filter((slot) => !immediateSuppressedSlots.has(slot));
+        if (immediateSlots.length === 0) return;
+        immediateSlots.forEach(consumeGptPublisherRefreshSuppression);
+        const immediateForwardedSlots =
+          immediateSuppressedSlots.size > 0 ? immediateSlots : forwardedSlots;
+        return originalRefresh(immediateForwardedSlots, opts);
       }
 
       const adUnits = auctionSlots.map((slot) => {
@@ -1464,6 +1765,20 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // unrelated GPT slots whose targeting this wrapper only cleared for
       // `targetSlots` — leaving their next request dependent on stale state.
       const refreshAdUnitCodes = adUnits.map((unit) => unit.code);
+      const refreshTs = (window.tsjs ??= {} as TsjsApi);
+      const refreshGeneration = refreshTs.navGeneration ?? 0;
+      const delayedRefreshCodes = new Map<RefreshGptSlot, string>();
+      const delayedRefreshElements = new Map<RefreshGptSlot, HTMLElement>();
+      remainingSlots.forEach((slot) => {
+        const elementId = refreshSlotElementId(slot);
+        if (elementId) delayedRefreshCodes.set(slot, elementId);
+        const element = elementId ? resolveFirstImpressionElement(elementId) : undefined;
+        if (element) delayedRefreshElements.set(slot, element);
+      });
+      const refreshFirstImpressionTokens = registerPublisherFirstImpressionAuctions(
+        refreshTs,
+        delayedRefreshCodes.values()
+      );
       adUnits.forEach((unit) => syntheticRefreshAdUnits.add(unit));
 
       // Preserve GPT Single Request Architecture: when a publisher refresh
@@ -1477,19 +1792,56 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         if (completed) return;
         completed = true;
         if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
+
+        // The publisher refresh itself started before this asynchronous auction.
+        // Reconcile its per-slot token only when the callback is ready to issue
+        // GPT: TS may have won an already-overlapping first impression while the
+        // auction was pending, while a publisher-first token prevents TS from
+        // claiming the slot midway through the same refresh.
+        const callbackFilteredSlots = new Set<RefreshGptSlot>();
+        const callbackSuppressedSlots = new Set<RefreshGptSlot>();
+        for (const slot of remainingSlots) {
+          const elementId = delayedRefreshCodes.get(slot);
+          const token = elementId ? refreshFirstImpressionTokens.get(elementId) : undefined;
+          const element = delayedRefreshElements.get(slot);
+          const contextIsStale = Boolean(
+            element &&
+            ((window.tsjs?.navGeneration ?? 0) !== refreshGeneration ||
+              !element.isConnected ||
+              document.getElementById(element.id) !== element)
+          );
+          const suppress = Boolean(
+            token && window.tsjs && consumePublisherFirstImpressionDelivery(window.tsjs, token)
+          );
+          if (contextIsStale) {
+            callbackFilteredSlots.add(slot);
+          } else if (suppress) {
+            callbackFilteredSlots.add(slot);
+            callbackSuppressedSlots.add(slot);
+          }
+        }
+        callbackSuppressedSlots.forEach(prepareSuppressedPublisherSlot);
+
+        const completedSlots = remainingSlots.filter((slot) => !callbackFilteredSlots.has(slot));
+        if (completedSlots.length === 0) return;
+        const completedAdUnitCodes = refreshAdUnitCodes.filter(
+          (_code, index) => !callbackFilteredSlots.has(auctionSlots[index])
+        );
         if (applyTargeting) {
           try {
-            pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
+            pbjs.setTargetingForGPTAsync?.(completedAdUnitCodes);
           } catch (error) {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
-        recordPrebidRefreshForDiagnostics(targetSlots);
-        // Preserve the publisher's original refresh form. In particular, a bare
-        // GPT refresh remains bare so GPT resolves its registered slot set when
-        // the auction completes; the dispatch wrapper only scopes the shared
-        // diagnostics context around the delegated call.
-        dispatchPrebidRefresh(originalRefresh, slots, opts);
+        completedSlots.forEach(consumeGptPublisherRefreshSuppression);
+        recordPrebidRefreshForDiagnostics(completedSlots);
+        // Preserve the publisher's original refresh form unless one losing
+        // first-impression slot was filtered. A delayed bare call must also
+        // become explicit so slots added after the auction snapshot cannot join.
+        const completedForwardedSlots =
+          slots === undefined || callbackFilteredSlots.size > 0 ? completedSlots : forwardedSlots;
+        dispatchPrebidRefresh(originalRefresh, completedForwardedSlots, opts);
       }
 
       try {
