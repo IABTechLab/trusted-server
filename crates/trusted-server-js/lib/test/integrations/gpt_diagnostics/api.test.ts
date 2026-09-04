@@ -232,6 +232,7 @@ describe('GptDiagnosticsApiController', () => {
               },
               auctionWinner: { bidder: 'example', priceBucket: '1.20' },
               serverAuctionTimings: { auctionResolvedMs: 84 },
+              serverAuctionTimingOrigin: 'spa_auction' as const,
               trustedServerCreativeFailures: ['cache_fetch_failed' as const],
             },
           ],
@@ -293,6 +294,7 @@ describe('GptDiagnosticsApiController', () => {
     expect(cycle?.serverAuctionTimings).not.toBe(
       source.slots[0]?.requests[0]?.serverAuctionTimings
     );
+    expect(cycle?.serverAuctionTimingOrigin).toBe('spa_auction');
     expect(snapshot.metadata).not.toBe(source.metadata);
     expect(snapshot.metadata.droppedAttributionIssues).toBe(2);
   });
