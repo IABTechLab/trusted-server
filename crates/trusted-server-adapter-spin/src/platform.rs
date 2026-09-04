@@ -149,6 +149,51 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 }
 
+/// Reads Trusted Server app config from Spin component variables, with no
+/// request in hand.
+///
+/// Application state is built before any request context exists, so the
+/// per-request [`ConfigStoreHandleAdapter`] cannot serve it. Spin component
+/// variables are ambient rather than request-scoped, which is how
+/// `SpinSecretStoreAdapter` already reads secrets, so the same variables are
+/// read directly here. Both paths map keys through [`spin_variable_name`], so
+/// start-up and the request path read the same variable for the same key.
+///
+/// Outside the Spin runtime, which includes every `cargo test` run on the host,
+/// there are no component variables and every read reports that rather than
+/// falling back to a configuration compiled into the binary.
+pub struct SpinPlatformConfigStore;
+
+impl PlatformConfigStore for SpinPlatformConfigStore {
+    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+        {
+            let variable_name = spin_variable_name(key, PlatformError::ConfigStore)?;
+            futures::executor::block_on(spin_sdk::variables::get(&variable_name)).map_err(|error| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "config store lookup failed for key `{key}` as Spin variable                      `{variable_name}`: {error}"
+                ))
+            })
+        }
+        #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+        {
+            Err(Report::new(PlatformError::ConfigStore).attach(format!(
+                "no config store is available for key `{key}` outside the Spin runtime, where                  component variables cannot be read"
+            )))
+        }
+    }
+
+    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store writes are not supported on Spin"))
+    }
+
+    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store writes are not supported on Spin"))
+    }
+}
+
 fn spin_variable_name(
     key: &str,
     error_context: PlatformError,

@@ -10,7 +10,6 @@ use http::{Request, Response, StatusCode};
 use url::Url;
 
 use super::auth::authenticate_bearer;
-use super::consent::ec_consent_granted;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
@@ -62,7 +61,7 @@ pub fn handle_identify(
         );
     };
 
-    if !ec_consent_granted(ec_context.consent()) {
+    if !ec_context.ec_allowed() {
         return json_response_with_origin(
             StatusCode::FORBIDDEN,
             &serde_json::json!({ "consent": "denied" }),
@@ -87,40 +86,53 @@ pub fn handle_identify(
     let mut uid: Option<String> = None;
     let mut cluster_size: Option<u32> = None;
 
-    match kv.get(ec_id) {
-        Ok(Some((entry, generation))) => {
-            if !entry.consent.ok {
-                // Tombstone entries preserve the withdrawal signal for 24 hours.
-                // Do not extract IDs or evaluate cluster size because that would
-                // write back with the live-entry TTL.
-                log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
-            } else {
-                // Extract only this partner's UID.
-                if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
-                    && !partner_uid.uid.is_empty()
-                {
-                    uid = Some(partner_uid.uid.clone());
-                }
-
-                // Evaluate cluster size lazily for identify responses. Existing
-                // stored cluster_size values are reused without a prefix-list call.
-                match kv.evaluate_cluster(ec_id, &entry, generation) {
-                    Ok(size) => {
-                        cluster_size = size;
+    // Read the identity-graph row under the provider's canonical form of the
+    // identifier, the same key generation wrote, rather than under the value the
+    // browser carries. The two are the same string for the built-in HMAC
+    // provider and differ for any provider whose canonical form is not the
+    // cookie value. `None` means no provider this deployment reads owns the
+    // identifier, so there is no row to look for and the response is not
+    // degraded.
+    if let Some(kv_key) = ec_context.ec_kv_key() {
+        match kv.get(&kv_key) {
+            Ok(Some((entry, generation))) => {
+                if !entry.consent.ok {
+                    // Tombstone entries preserve the withdrawal signal for 24
+                    // hours. Do not extract IDs or evaluate cluster size because
+                    // that would write back with the live-entry TTL.
+                    log::trace!("Identify found tombstone for '{}'", log_id(&kv_key));
+                } else {
+                    // Extract only this partner's UID.
+                    if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
+                        && !partner_uid.uid.is_empty()
+                    {
+                        uid = Some(partner_uid.uid.clone());
                     }
-                    Err(err) => {
-                        log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
+
+                    // Evaluate cluster size lazily for identify responses.
+                    // Existing stored cluster_size values are reused without a
+                    // prefix-list call.
+                    match kv.evaluate_cluster(&kv_key, &entry, generation) {
+                        Ok(size) => {
+                            cluster_size = size;
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Cluster evaluation failed for '{}': {err:?}",
+                                log_id(&kv_key)
+                            );
+                        }
                     }
                 }
             }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            log::warn!(
-                "Identify KV read failed for EC ID '{}': {err:?}",
-                log_id(ec_id)
-            );
-            degraded = true;
+            Ok(None) => {}
+            Err(err) => {
+                log::warn!(
+                    "Identify KV read failed for EC ID '{}': {err:?}",
+                    log_id(&kv_key)
+                );
+                degraded = true;
+            }
         }
     }
 
@@ -332,7 +344,6 @@ fn apply_cors_headers(response: &mut Response<EdgeBody>, origin: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
@@ -352,13 +363,23 @@ mod tests {
         );
     }
 
-    fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
+    /// The identifier [`CanonicalizingProvider`] creates, as the browser
+    /// carries it in the `ts-ec` cookie.
+    const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
+
+    /// The identity-graph key generation writes that identifier's row under.
+    /// Pinned to the creation path by
+    /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
+    /// `ec` module tests, which asserts both the key it writes and the key
+    /// [`EcContext::ec_kv_key`] derives.
+    const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
+
+    fn make_ec_context(ec_allowed: bool, ec_value: Option<&str>) -> EcContext {
         let consent = ConsentContext {
-            jurisdiction,
             source: ConsentSource::Cookie,
             ..ConsentContext::default()
         };
-        EcContext::new_for_test(ec_value.map(str::to_owned), consent)
+        EcContext::new_for_test_gated(ec_value.map(str::to_owned), consent, ec_allowed)
     }
 
     fn make_test_partner(source_domain: &str, api_token: &str) -> EcPartner {
@@ -472,7 +493,7 @@ mod tests {
             .uri("https://edge.test-publisher.com/identify")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct unauthorized response");
@@ -514,7 +535,7 @@ mod tests {
             .header("authorization", "Bearer wrong-token")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct unauthorized response");
@@ -539,7 +560,7 @@ mod tests {
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::Unknown, None);
+        let ec_context = make_ec_context(false, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct denied response");
@@ -573,7 +594,7 @@ mod tests {
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct no-content response");
@@ -599,7 +620,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build test request");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct degraded identify response");
@@ -652,7 +673,7 @@ mod tests {
             .header("origin", "https://evil.example")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct forbidden response");
@@ -678,7 +699,7 @@ mod tests {
             .header("origin", "https://www.test-publisher.com")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct no-content response with CORS headers");
@@ -754,6 +775,59 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("Origin, Authorization"),
             "should vary on identity request inputs for preflight"
+        );
+    }
+
+    #[test]
+    fn handle_identify_reads_the_row_under_the_providers_canonical_key() {
+        // A provider whose canonical form is not the cookie value keys its row
+        // under the canonical form at generation. Identify has to look there,
+        // or every such deployment reads a miss for every request and reports
+        // no partner UID at all.
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::in_memory("identify-canonical-store");
+        kv.create(
+            CANONICAL_KV_KEY,
+            &crate::ec::kv_types::KvEntry::minimal(
+                "ssp.example.com",
+                "partner-uid-123",
+                1_741_824_000,
+            ),
+        )
+        .expect("should write the row generation keys by the canonical form");
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.test-publisher.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ec_context = make_ec_context(true, Some(CANONICAL_COOKIE_VALUE))
+            .with_provider_for_test(std::sync::Arc::new(
+                crate::ec::tests::CanonicalizingProvider,
+            ));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should build identify response");
+
+        assert_eq!(response.status(), StatusCode::OK, "should return 200");
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode identify response JSON");
+        assert_eq!(
+            body["ec"], CANONICAL_COOKIE_VALUE,
+            "should echo the identifier the browser carries, not the graph key"
+        );
+        assert_eq!(
+            body["uid"], "partner-uid-123",
+            "should find the row generation keyed by the provider's canonical form"
+        );
+        assert_eq!(
+            body["degraded"],
+            serde_json::Value::Bool(false),
+            "a hit under the canonical key is not a degraded read"
         );
     }
 }

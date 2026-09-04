@@ -20,6 +20,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -476,9 +477,46 @@ impl EcPartner {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Ec {
-    /// Publisher passphrase used as HMAC key for EC generation.
-    #[validate(custom(function = Ec::validate_passphrase))]
-    pub passphrase: Redacted<String>,
+    /// The key of the Edge Cookie identity provider to activate.
+    ///
+    /// Names one of the blocks under [`providers`](Self::providers), for
+    /// example `"hmac"`. Set it in the `[ec]` TOML section. Deployment tooling
+    /// can merge a `TRUSTED_SERVER__EC__PROVIDER` environment value into the
+    /// published configuration before it is loaded, so the same compiled
+    /// WebAssembly can switch providers at deployment. The running server reads
+    /// its settings from the platform config store, not the environment. When
+    /// absent, no Edge Cookie is generated and Trusted Server runs statelessly,
+    /// and the explicit `"none"` spells the same choice. Selecting a provider
+    /// whose block is missing is rejected at startup by
+    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    ///
+    /// Typed as [`EcProviderSelection`], which reads and writes the same
+    /// string, so every check that asks which provider is selected matches on
+    /// one vocabulary rather than comparing string literals.
+    #[serde(default)]
+    pub provider: Option<EcProviderSelection>,
+
+    /// Deprecated location of the HMAC passphrase, read so a configuration
+    /// written for the previous release still starts.
+    ///
+    /// [`migrate_legacy_ec_layout`](Self::migrate_legacy_ec_layout) maps it
+    /// to `provider = "hmac"` with the passphrase in the `[ec.providers.hmac]`
+    /// block and logs a deprecation warning, so a fleet can move configuration
+    /// and binaries independently. A configuration carrying both the old and
+    /// the new form is rejected rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<Redacted<String>>,
+
+    /// Configuration blocks for the available Edge Cookie identity providers.
+    ///
+    /// Each provider has its own optional `[ec.providers.<key>]` block. The
+    /// [`provider`](Self::provider) selector names which one is active. Exactly
+    /// one block may be present, and it must be the one the selector names, so
+    /// [`validate_provider_selection`](Self::validate_provider_selection)
+    /// rejects an unselected block.
+    #[serde(default)]
+    #[validate(nested)]
+    pub providers: EcProviders,
 
     /// Fastly KV store name for the EC identity graph.
     #[serde(default)]
@@ -566,6 +604,221 @@ impl Ec {
         }
         Ok(())
     }
+
+    /// Validates that the selected provider names a configured block.
+    ///
+    /// When [`provider`](Self::provider) is set, the matching block under
+    /// [`providers`](Self::providers) must be present, so a deployment that
+    /// selects a provider (in TOML or via the environment override) but has not
+    /// configured it fails fast at startup rather than silently running
+    /// stateless. When no provider is selected, Trusted Server runs statelessly
+    /// and this check passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected
+    /// provider's `[ec.providers.<key>]` block is absent, when a provider block
+    /// is configured with no selector or alongside `"none"`, or when a
+    /// configured block is not the selected one. Any selector name is accepted
+    /// so long as its block is present, so there is no unknown-key check.
+    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        let Some(selection) = self.provider.as_ref() else {
+            if !self.providers.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "[ec.providers.*] blocks are configured but no [ec] provider is \
+                              selected. Set [ec] provider = \"<key>\" to activate one, or \
+                              remove the blocks to run statelessly"
+                        .to_owned(),
+                }));
+            }
+            return Ok(());
+        };
+
+        // `"none"` is explicit statelessness: the same meaning as omitting the
+        // selector, spelled out. It is subject to the same rule that no
+        // provider blocks may be left configured.
+        let EcProviderSelection::Named(key) = selection else {
+            if !self.providers.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "[ec] provider = \"none\" selects stateless operation, but \
+                              [ec.providers.*] blocks are configured. Remove the blocks, or \
+                              select the provider they configure"
+                        .to_owned(),
+                }));
+            }
+            return Ok(());
+        };
+
+        // Every provider is configured by the `[ec.providers.<key>]` block that
+        // carries its own name, so the check is the same lookup for all of
+        // them. A provider the adapter injects has the contents of its block
+        // validated by that adapter when it builds the provider.
+        let key = key.as_str();
+        if !self.providers.has_block(key) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Edge Cookie provider `{key}` is selected but has no `[ec.providers.{key}]` configuration"
+                ),
+            }));
+        }
+
+        // Every configured block must be the selected one. An unreferenced
+        // block is almost always a mistake (a mistyped selector or a stale
+        // block), and accepting it silently invites configuration drift.
+        let unreferenced: Vec<String> = self
+            .providers
+            .configured_keys()
+            .filter(|configured| *configured != key)
+            .map(str::to_owned)
+            .collect();
+        if unreferenced.is_empty() {
+            Ok(())
+        } else {
+            Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec.providers.{}] is configured but `{key}` is selected. Remove the \
+                     unselected block, or correct the selector",
+                    unreferenced.join("], [ec.providers.")
+                ),
+            }))
+        }
+    }
+
+    /// Migrates the deprecated `[ec] passphrase` form to the provider layout.
+    ///
+    /// A configuration still carrying the old key keeps working for one
+    /// release cycle: it maps to `provider = "hmac"` with the passphrase in
+    /// the `[ec.providers.hmac]` block, and a deprecation warning names the
+    /// new location. A configuration carrying both forms is rejected so a
+    /// half-edited file fails loudly instead of one form silently winning.
+    ///
+    /// The deprecated key is held to the same passphrase rules as the new
+    /// `[ec.providers.hmac]` block. Derive validation runs before this
+    /// migration and the deprecated field carries no `#[validate]` attribute of
+    /// its own, so without the check here a short or empty passphrase in the old
+    /// location would start a deployment that the new location rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when both the deprecated
+    /// key and any part of the provider configuration are present, or when the
+    /// deprecated passphrase fails [`Self::validate_passphrase`].
+    pub fn migrate_legacy_ec_layout(&mut self) -> Result<(), Report<TrustedServerError>> {
+        let Some(passphrase) = self.passphrase.take() else {
+            return Ok(());
+        };
+        if self.provider.is_some() || !self.providers.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[ec] passphrase (deprecated) and the [ec] provider configuration \
+                          are both present. Keep exactly one form: move the passphrase to \
+                          [ec.providers.hmac] and delete the old key"
+                    .to_owned(),
+            }));
+        }
+        Self::validate_passphrase(&passphrase).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec] passphrase (deprecated) is invalid ({err}): use a random secret \
+                     of at least {} bytes, placed in [ec.providers.hmac]",
+                    Self::MIN_PASSPHRASE_LENGTH,
+                ),
+            })
+        })?;
+        log::warn!(
+            "[ec] passphrase is deprecated; move it to [ec.providers.hmac] passphrase and \
+             set [ec] provider = \"hmac\""
+        );
+        self.provider = Some(EcProviderSelection::from(HMAC_PROVIDER_KEY));
+        self.providers.hmac = Some(HmacProviderConfig { passphrase });
+        Ok(())
+    }
+}
+
+/// Configuration blocks for the available Edge Cookie identity providers.
+///
+/// Each provider is configured in its own `[ec.providers.<key>]` block, for
+/// example:
+///
+/// ```toml
+/// [ec.providers.hmac]
+/// passphrase = "replace-with-32-plus-byte-random-secret"
+/// ```
+///
+/// The active provider is chosen by the [`Ec::provider`] selector, and the one
+/// block present must be the one it names (see
+/// [`Ec::validate_provider_selection`]).
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+pub struct EcProviders {
+    /// The built-in HMAC-over-client-IP provider, keyed `hmac`.
+    #[serde(default)]
+    #[validate(nested)]
+    pub hmac: Option<HmacProviderConfig>,
+
+    /// Configuration blocks for vendor or host providers that live in their own
+    /// crates and are injected by the adapter. Any `[ec.providers.<key>]` block
+    /// whose key is not a built-in is captured here as raw values, and the
+    /// adapter that constructs the provider deserializes its own block into the
+    /// vendor crate's config type. Core never names a vendor, so a new provider
+    /// adds nothing here.
+    #[serde(flatten)]
+    vendor: HashMap<String, JsonValue>,
+}
+
+impl EcProviders {
+    /// Returns the raw configuration block for a vendor provider `key`, or
+    /// `None` when no `[ec.providers.<key>]` block is present. The adapter that
+    /// builds the provider deserializes this into its own config type.
+    #[must_use]
+    pub fn vendor_config(&self, key: &str) -> Option<&JsonValue> {
+        self.vendor.get(key)
+    }
+
+    /// Whether a `[ec.providers.<key>]` block is present for `key`.
+    ///
+    /// The answer is the same question for every provider, whichever crate
+    /// supplies it, so nothing calling this has to know which providers are
+    /// built into core.
+    #[must_use]
+    pub fn has_block(&self, key: &str) -> bool {
+        self.configured_keys().any(|configured| configured == key)
+    }
+
+    /// The keys of every configured `[ec.providers.<key>]` block.
+    ///
+    /// The typed built-in block is reported under the name it is configured
+    /// with, so it appears alongside the vendor blocks rather than being
+    /// counted separately by each caller. This is the one place that mapping is
+    /// made, and it goes away when the built-in provider becomes a module and
+    /// its block joins the others.
+    pub(crate) fn configured_keys(&self) -> impl Iterator<Item = &str> {
+        self.hmac
+            .iter()
+            .map(|_| HMAC_PROVIDER_KEY)
+            .chain(self.vendor.keys().map(String::as_str))
+    }
+
+    /// Whether any provider configuration block is present.
+    ///
+    /// Used by [`Ec::validate_provider_selection`] to reject a half-migrated
+    /// configuration that carries provider blocks with no selector, which
+    /// would otherwise silently run stateless.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.configured_keys().next().is_none()
+    }
+}
+
+/// Configuration for the built-in HMAC Edge Cookie provider.
+///
+/// Mapped from the `[ec.providers.hmac]` TOML block. Unknown keys are
+/// rejected, so a mistyped setting fails at startup instead of being accepted
+/// silently and leaving the intended setting at its default.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HmacProviderConfig {
+    /// Publisher passphrase used as the HMAC key for EC generation.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
@@ -2917,6 +3170,8 @@ impl Settings {
             })
         })?;
 
+        settings.ec.migrate_legacy_ec_layout()?;
+        settings.ec.validate_provider_selection()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
@@ -3001,8 +3256,10 @@ impl Settings {
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
         let mut insecure_fields: Vec<String> = Vec::new();
 
-        if Ec::is_placeholder_passphrase(self.ec.passphrase.expose()) {
-            insecure_fields.push("ec.passphrase".to_owned());
+        if let Some(hmac) = &self.ec.providers.hmac
+            && Ec::is_placeholder_passphrase(hmac.passphrase.expose())
+        {
+            insecure_fields.push("ec.providers.hmac.passphrase".to_owned());
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
@@ -4365,9 +4622,14 @@ mod tests {
         );
         assert_eq!(settings.publisher.origin_host_header_override, None);
         assert_eq!(
-            settings.ec.passphrase.expose(),
-            "test-secret-key-32-bytes-minimum"
+            settings.ec.provider.as_ref(),
+            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            "test settings should select the hmac EC provider"
         );
+        let Some(hmac) = &settings.ec.providers.hmac else {
+            panic!("test settings should configure the hmac EC provider");
+        };
+        assert_eq!(hmac.passphrase.expose(), "test-secret-key-32-bytes-minimum");
 
         settings.validate().expect("Failed to validate settings");
     }
@@ -4535,6 +4797,34 @@ mod tests {
     }
 
     #[test]
+    fn provider_selection_allows_no_provider_for_stateless_operation() {
+        let ec = Ec::default();
+        assert!(ec.provider.is_none(), "default Ec selects no provider");
+        ec.validate_provider_selection()
+            .expect("should allow no provider selected and run statelessly");
+    }
+
+    #[test]
+    fn provider_selection_rejects_a_selector_without_a_configured_block() {
+        // Point the selector at a provider whose `[ec.providers.<key>]` block is
+        // absent, mirroring a deployment that sets the env override to a
+        // provider it never configured.
+        let toml_str =
+            crate_test_settings_str().replace(r#"provider = "hmac""#, r#"provider = "acme""#);
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("selecting an unconfigured provider should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "unconfigured provider selection should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
     fn cache_asset_rule_globs_respect_path_separators() {
         let toml_str = format!(
             r#"{}
@@ -4637,6 +4927,25 @@ mod tests {
                 .expect("should evaluate disabled cache rules")
                 .is_none(),
             "disabled rules should never match"
+        );
+    }
+
+    #[test]
+    fn provider_blocks_without_a_selector_are_rejected() {
+        // A half-migrated configuration that carries an [ec.providers.hmac]
+        // block but never selects it would silently run stateless; reject it
+        // at startup instead.
+        let toml_str = crate_test_settings_str().replace("provider = \"hmac\"\n", "");
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a provider block with no selector should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
         );
     }
 
@@ -4754,6 +5063,97 @@ mod tests {
     }
 
     #[test]
+    fn legacy_passphrase_migrates_to_the_hmac_provider() {
+        let mut ec = Ec {
+            passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
+            ..Ec::default()
+        };
+        ec.migrate_legacy_ec_layout()
+            .expect("should migrate the deprecated form");
+        assert_eq!(
+            ec.provider.as_ref(),
+            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            "the deprecated passphrase should select the hmac provider"
+        );
+        assert_eq!(
+            ec.providers
+                .hmac
+                .as_ref()
+                .expect("should configure the hmac block")
+                .passphrase
+                .expose(),
+            "test-secret-key-32-bytes-minimum",
+            "the passphrase should move into the hmac block"
+        );
+        assert!(
+            ec.passphrase.is_none(),
+            "the deprecated field should be consumed by the migration"
+        );
+    }
+
+    /// The crate test configuration with its `[ec]` section rewritten to the
+    /// deprecated single-passphrase form.
+    fn legacy_ec_settings_str(passphrase: &str) -> String {
+        let base = crate_test_settings_str();
+        let (before, rest) = base
+            .split_once("[ec]")
+            .expect("should find the [ec] section in the test settings");
+        let (_, after) = rest
+            .split_once("[request_signing]")
+            .expect("should find the [request_signing] section in the test settings");
+        let legacy =
+            format!("{before}[ec]\npassphrase = \"{passphrase}\"\n\n[request_signing]{after}");
+        assert!(
+            !legacy.contains("[ec.providers.hmac]"),
+            "the legacy configuration should carry no provider block"
+        );
+        legacy
+    }
+
+    #[test]
+    fn a_legacy_passphrase_is_held_to_the_passphrase_rules() {
+        // Derive validation runs before the migration and the deprecated field
+        // carries no `#[validate]` attribute, so the migration itself has to
+        // apply the passphrase rules. Without that, a value the new
+        // `[ec.providers.hmac]` block rejects would still start a deployment
+        // from the old location.
+        let short = Settings::from_toml(&legacy_ec_settings_str("short"))
+            .expect_err("a short legacy passphrase should be rejected");
+        assert!(
+            format!("{short:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {short:?}"
+        );
+
+        let empty = Settings::from_toml(&legacy_ec_settings_str(""))
+            .expect_err("an empty legacy passphrase should be rejected");
+        assert!(
+            format!("{empty:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {empty:?}"
+        );
+
+        let settings =
+            Settings::from_toml(&legacy_ec_settings_str("test-secret-key-32-bytes-minimum"))
+                .expect("a legacy passphrase of adequate length should still start");
+        assert_eq!(
+            settings.ec.provider.as_ref(),
+            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            "an adequate legacy passphrase should still select the hmac provider"
+        );
+        assert_eq!(
+            settings
+                .ec
+                .providers
+                .hmac
+                .as_ref()
+                .expect("should configure the hmac block")
+                .passphrase
+                .expose(),
+            "test-secret-key-32-bytes-minimum",
+            "an adequate legacy passphrase should still move into the hmac block"
+        );
+    }
+
+    #[test]
     fn cache_asset_rule_validation_rejects_invalid_config() {
         let duplicate_ids = format!(
             r#"{}
@@ -4827,6 +5227,95 @@ mod tests {
         assert!(
             format!("{missing_matcher_err:?}").contains("exactly one matcher"),
             "should explain missing matcher: {missing_matcher_err:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_passphrase_alongside_provider_config_is_rejected() {
+        let mut ec = Ec {
+            passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
+            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            ..Ec::default()
+        };
+        let err = ec
+            .migrate_legacy_ec_layout()
+            .expect_err("both forms present should be rejected");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_hmac_provider_block_is_rejected() {
+        // A mistyped key in a provider block used to be dropped silently, which
+        // leaves the setting the operator meant to change at its default.
+        let toml_str = crate_test_settings_str().replace(
+            "passphrase = \"test-secret-key-32-bytes-minimum\"",
+            "passphrase = \"test-secret-key-32-bytes-minimum\"\n            typo_key = \"x\"",
+        );
+        assert!(
+            toml_str.contains("typo_key"),
+            "the test configuration should carry the unknown key"
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an unknown key in [ec.providers.hmac] should be rejected");
+        assert!(
+            format!("{err:?}").contains("typo_key"),
+            "should name the unknown key: {err:?}"
+        );
+    }
+
+    #[test]
+    fn provider_none_is_explicit_stateless() {
+        let ec = Ec {
+            provider: Some(EcProviderSelection::None),
+            ..Ec::default()
+        };
+        ec.validate_provider_selection()
+            .expect("explicit none with no blocks should be valid");
+    }
+
+    #[test]
+    fn provider_none_with_configured_blocks_is_rejected() {
+        let ec = Ec {
+            provider: Some(EcProviderSelection::None),
+            providers: EcProviders {
+                hmac: Some(HmacProviderConfig {
+                    passphrase: Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),
+                }),
+                ..EcProviders::default()
+            },
+            ..Ec::default()
+        };
+        assert!(
+            ec.validate_provider_selection().is_err(),
+            "none alongside configured blocks should be rejected"
+        );
+    }
+
+    #[test]
+    fn an_unselected_provider_block_is_rejected() {
+        // A vendor selector with the vendor block present, plus a stray hmac
+        // block, is almost always a stale or mistyped configuration.
+        let toml_str = crate_test_settings_str().replace(
+            "provider = \"hmac\"",
+            "provider = \"acme\"\n\n            [ec.providers.acme]\n            api_key = \"example\"",
+        );
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a configured but unselected block should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
         );
     }
 
@@ -5224,7 +5713,9 @@ origin_host_header_overide = "www.example.com""#,
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.providers.hmac = Some(HmacProviderConfig {
+            passphrase: Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),
+        });
         settings.handlers[0].password =
             Redacted::new("replace-with-admin-password-32-bytes".to_owned());
 
@@ -5863,6 +6354,9 @@ origin_host_header_overide = "www.example.com""#,
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )
@@ -5894,6 +6388,9 @@ origin_host_header_overide = "www.example.com""#,
             max_buffered_body_bytes = 0
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         );
@@ -7048,6 +7545,9 @@ origin_host_header_overide = "www.example.com""#,
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -7381,6 +7881,9 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7465,6 +7968,9 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7501,6 +8007,9 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7543,6 +8052,9 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
