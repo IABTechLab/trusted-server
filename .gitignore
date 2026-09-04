@@ -63,3 +63,4 @@ src/*.html
 # leftover local build artifacts (node_modules, target, dist) that remain on disk.
 /crates/js/
 /crates/integration-tests/
+wrangler.integration.generated.toml

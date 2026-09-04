@@ -3951,6 +3951,8 @@ async fn collect_non_html_auction(
     params
         .timings
         .record_auction_wait(placement, wait_started.elapsed());
+    // T0-anchored timeline mark (spec section 18): final bid or timeout.
+    params.timings.mark_auction_resolved();
     let delivered_winner_slots = write_bids_to_state(
         &result.winning_bids,
         params.price_granularity,
@@ -3960,6 +3962,9 @@ async fn collect_non_html_auction(
         settings.debug.inject_adm_for_testing,
         auction_id.as_deref(),
     );
+    // T0-anchored timeline mark (spec section 18): winning bids are in page
+    // state, available to the response pipeline.
+    params.timings.mark_auction_committed();
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -4010,6 +4015,8 @@ async fn collect_stream_auction(
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
     timings.record_auction_wait(*placement, wait_started.elapsed());
+    // T0-anchored timeline mark (spec section 18): final bid or timeout.
+    timings.mark_auction_resolved();
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",
         result.winning_bids.len()
@@ -4023,6 +4030,9 @@ async fn collect_stream_auction(
         settings.debug.inject_adm_for_testing,
         auction_id.as_deref(),
     );
+    // T0-anchored timeline mark (spec section 18): winning bids are in page
+    // state, available to the response pipeline.
+    timings.mark_auction_committed();
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -4340,6 +4350,10 @@ pub async fn handle_publisher_request(
                 .await
             {
                 DispatchAuctionOutcome::Dispatched(dispatched) => {
+                    // T0-anchored timeline mark (spec section 18): bid
+                    // requests have left the edge. A failed dispatch never
+                    // marks, so all three auction offsets stay null for it.
+                    timings.mark_auction_dispatched(observation.auction_id.to_string());
                     auction_request_for_telemetry = Some(auction_request);
                     auction_observation = Some(observation);
                     Some(dispatched)
