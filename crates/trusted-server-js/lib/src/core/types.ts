@@ -108,6 +108,34 @@ export interface AuctionBidData {
   debug_bid?: AuctionDebugBidData;
 }
 
+/** Server-measured auction timings relative to their documented server-side origin. */
+export interface AuctionDiagnosticsData {
+  auctionDispatchedMs?: number;
+  auctionResolvedMs?: number;
+  auctionCommittedMs?: number;
+  auctionWaitMs?: number;
+  auctionWaitPlacement?: 'pre_header' | 'in_stream';
+}
+
+/** Auction path presented by GPT diagnostics. */
+export type GptDiagnosticsAuctionType = 'ssat' | 'trusted_server' | 'client_side' | 'competing';
+
+/** Clock origin for server auction timings, independent of aggregate auction classification. */
+export type GptDiagnosticsServerAuctionTimingOrigin = 'navigation' | 'spa_auction';
+
+/** Sanitized winning-bid facts already exposed in GPT targeting. */
+export interface GptDiagnosticsAuctionWinner {
+  bidder: string;
+  priceBucket: string;
+}
+
+/** Internal Trusted Server auction evidence attached to the next GPT request. */
+export interface GptDiagnosticsAuctionFacts {
+  auctionType?: Extract<GptDiagnosticsAuctionType, 'ssat' | 'trusted_server'>;
+  winner?: GptDiagnosticsAuctionWinner;
+  serverTimings?: AuctionDiagnosticsData;
+}
+
 export type GptDiagnosticsCallbackKind =
   | 'slotRequested'
   | 'slotResponseReceived'
@@ -181,12 +209,37 @@ export type GptDiagnosticsTrustedServerOpportunity =
   | 'unrenderable_candidate'
   | 'no_candidate';
 
-/** A safe failure category observed while obtaining or posting creative markup. */
+/**
+ * A safe failure category observed while obtaining or posting creative markup.
+ *
+ * The `aps_` members cover the APS Universal Creative render path, where a
+ * blank slot is otherwise indistinguishable from a filled one: Ad Manager
+ * reports a non-empty 1x1 render whether or not the creative ever drew. Each
+ * member names the exact guard that stopped the render.
+ */
 export type GptDiagnosticsCreativeFailure =
   | 'missing_render_source'
   | 'cache_fetch_failed'
   | 'invalid_cache_payload'
-  | 'response_post_failed';
+  | 'response_post_failed'
+  // Reported by the sandboxed renderer document and relayed by the creative.
+  | 'aps_bad_hash'
+  | 'aps_nonce_mismatch'
+  | 'aps_source_mismatch'
+  | 'aps_descriptor_keys'
+  | 'aps_descriptor_fields'
+  | 'aps_descriptor_envelope'
+  | 'aps_runner_script_error'
+  // Observed by the Universal Creative source around its renderer frame.
+  | 'aps_frame_timeout'
+  | 'aps_frame_load_error'
+  | 'aps_frame_reported_failure'
+  | 'aps_unknown'
+  // Observed on the Trusted Server side of the capability handshake.
+  | 'aps_consumed_tombstone'
+  | 'aps_source_not_in_ad_unit'
+  | 'aps_missing_renderer_url'
+  | 'aps_tombstone_capacity';
 
 /** Delivery evidence derived for a GPT request cycle. */
 export type GptDiagnosticsDelivery =
@@ -224,6 +277,11 @@ export interface GptDiagnosticsRequestCycle {
   requestPath?: GptDiagnosticsRequestPath;
   requestIntentId?: number;
   trustedServerAuctionId?: string;
+  auctionType?: GptDiagnosticsAuctionType;
+  auctionWinner?: GptDiagnosticsAuctionWinner;
+  serverAuctionTimings?: AuctionDiagnosticsData;
+  /** Retained separately because `auctionType` can become `competing`. */
+  serverAuctionTimingOrigin?: GptDiagnosticsServerAuctionTimingOrigin;
   opportunityToRequestMs?: number;
   replacedRequestNumber?: number;
   previousRenderToRequestMs?: number;
@@ -332,7 +390,8 @@ export interface GptDiagnosticsRecorder {
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
-    requestedSlotSizes?: ReadonlyArray<Size>
+    requestedSlotSizes?: ReadonlyArray<Size>,
+    auctionFacts?: GptDiagnosticsAuctionFacts
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
@@ -365,6 +424,39 @@ export interface GptSlotHandoff {
   suppressPublisherRefresh: boolean;
 }
 
+export type FirstImpressionOwner = 'publisher' | 'trusted_server';
+export type FirstImpressionPhase = 'auctioning' | 'delivery_pending' | 'requested' | 'rendered';
+
+/** One publisher auction participating in the current navigation's first impression. */
+export interface FirstImpressionPublisherAuction {
+  token: string;
+  adUnitCode: string;
+  expiresAt: number;
+  suppressDelivery: boolean;
+}
+
+/** First-impression ownership for one exact physical slot element. */
+export interface FirstImpressionSlotClaim {
+  generation: number;
+  slotElementId: string;
+  element: HTMLElement;
+  owner: FirstImpressionOwner;
+  phase: FirstImpressionPhase;
+  expiresAt: number;
+  publisherAuctions: Record<string, FirstImpressionPublisherAuction>;
+  /** No later publisher auction may join this TS-owned first impression. */
+  publisherRegistrationClosed?: boolean;
+  targeting?: Record<string, string | string[]>;
+}
+
+/** Bounded first-impression state shared by the GPT bootstrap, GPT, and Prebid bundles. */
+export interface FirstImpressionState {
+  generation: number;
+  nextToken: number;
+  slots: Record<string, FirstImpressionSlotClaim>;
+  fallbackSlots: Record<string, HTMLElement>;
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -392,6 +484,8 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /** Server-measured timing evidence for the auction that populated `bids`. */
+  auctionDiagnostics?: AuctionDiagnosticsData;
   /**
    * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
    * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
@@ -436,6 +530,10 @@ export interface TsjsApi {
   gptSlotHandoffs?: Record<string, GptSlotHandoff>;
   /** True only while TS calls a GPT function that the handoff wrappers observe. */
   gptSlotHandoffInternal?: boolean;
+  /** Per-navigation first-impression ownership shared by GPT and Prebid. */
+  firstImpression?: FirstImpressionState;
+  /** Guards the shared production GPT lifecycle listener installation. */
+  firstImpressionListenersInstalled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
   /** Internal one-shot state shared by bootstrap and bundle scheduler installs. */
@@ -473,7 +571,8 @@ export interface TsjsApi {
    */
   scheduleInitialAdInit?: (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    initialAuctionDiagnostics?: AuctionDiagnosticsData
   ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;

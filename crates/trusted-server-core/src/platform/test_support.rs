@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::SigningKey;
@@ -132,6 +133,10 @@ impl PlatformSecretStore for HashMapSecretStore {
 pub(crate) struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
+    fn naming_policy(&self) -> super::BackendNamingPolicy {
+        super::BackendNamingPolicy::Axum
+    }
+
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
@@ -178,6 +183,10 @@ impl PlatformHttpClient for NoopHttpClient {
 pub(crate) struct StubBackend;
 
 impl PlatformBackend for StubBackend {
+    fn naming_policy(&self) -> super::BackendNamingPolicy {
+        super::BackendNamingPolicy::Axum
+    }
+
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Ok("stub-backend".to_owned())
     }
@@ -197,6 +206,7 @@ struct StubPendingResponse {
     backend_name: String,
     status: u16,
     body: Vec<u8>,
+    headers: Vec<(String, String)>,
 }
 
 /// Test stub for [`PlatformHttpClient`] that records call backend names and
@@ -213,20 +223,34 @@ struct StubPendingResponse {
 /// sites.
 /// Upper bound on the request body bytes captured per `send` call.
 const MAX_RECORDED_BODY_BYTES: usize = 64 * 1024 * 1024;
+type RecordedHeaderBytes = Vec<Vec<(String, Vec<u8>)>>;
 
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
-    // Queued select() errors — each pop makes the next select() return ready: Err.
-    select_errors: Mutex<VecDeque<()>>,
+    // Raw header values, including invalid UTF-8 values that cannot be represented
+    // by `recorded_request_headers`.
+    request_header_bytes: Mutex<RecordedHeaderBytes>,
+    // Queued select() outcomes; true makes that select return ready: Err.
+    select_errors: Mutex<VecDeque<bool>>,
+    // Queued direct wait() errors for pending-stream failure-path tests.
+    wait_errors: Mutex<VecDeque<()>>,
+    // Test-only overrides for backend metadata on returned pending handles.
+    pending_backend_name_overrides: Mutex<VecDeque<Option<String>>>,
+    // Test-only wall-clock delays applied before each select result is returned.
+    select_delays: Mutex<VecDeque<Duration>>,
     // Reported by supports_concurrent_fanout(); set false to emulate
     // platforms whose send_async executes eagerly (e.g. Cloudflare Workers).
     concurrent_fanout: std::sync::atomic::AtomicBool,
+    // Reported by has_enforceable_total_request_deadline(); set true to emulate
+    // a future adapter with a hard total request deadline.
+    enforceable_total_request_deadline: std::sync::atomic::AtomicBool,
     // Reported by supports_streaming_responses(); set true to emulate Fastly's
     // streaming response support.
     streaming_responses_supported: std::sync::atomic::AtomicBool,
+    pending_streaming_responses_supported: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
     cache_bypass_flags: Mutex<Vec<bool>>,
     stream_response_flags: Mutex<Vec<bool>>,
@@ -249,9 +273,15 @@ impl StubHttpClient {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
+            request_header_bytes: Mutex::new(Vec::new()),
             select_errors: Mutex::new(VecDeque::new()),
+            wait_errors: Mutex::new(VecDeque::new()),
+            pending_backend_name_overrides: Mutex::new(VecDeque::new()),
+            select_delays: Mutex::new(VecDeque::new()),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
+            enforceable_total_request_deadline: std::sync::atomic::AtomicBool::new(false),
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
+            pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
             cache_bypass_flags: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
@@ -267,9 +297,21 @@ impl StubHttpClient {
             .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Make `has_enforceable_total_request_deadline()` report the given value.
+    pub(crate) fn set_enforceable_total_request_deadline(&self, supported: bool) {
+        self.enforceable_total_request_deadline
+            .store(supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Make `supports_streaming_responses()` report the given value.
     pub fn set_streaming_responses_supported(&self, supported: bool) {
         self.streaming_responses_supported
+            .store(supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make `supports_pending_streaming_responses()` report the given value.
+    pub fn set_pending_streaming_responses_supported(&self, supported: bool) {
+        self.pending_streaming_responses_supported
             .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -320,6 +362,44 @@ impl StubHttpClient {
         self.select_errors
             .lock()
             .expect("should lock select_errors")
+            .push_back(true);
+    }
+
+    /// Make the next `select()` complete successfully before a later queued error.
+    pub(crate) fn push_select_success(&self) {
+        self.select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .push_back(false);
+    }
+
+    /// Override backend metadata on the next pending handle returned by
+    /// [`Self::send_async`]. `None` removes the metadata entirely.
+    pub(crate) fn push_pending_backend_name_override(&self, backend_name: Option<&str>) {
+        self.pending_backend_name_overrides
+            .lock()
+            .expect("should lock pending backend name overrides")
+            .push_back(backend_name.map(str::to_string));
+    }
+
+    /// Queue a wall-clock delay before the next [`Self::select`] or direct
+    /// [`Self::wait`] result.
+    ///
+    /// This is test-only timing control for deadline behavior. It deliberately
+    /// uses a caller-selected, generous contrast with the tested budget rather
+    /// than relying on scheduler races.
+    pub(crate) fn push_select_delay(&self, delay: Duration) {
+        self.select_delays
+            .lock()
+            .expect("should lock select_delays")
+            .push_back(delay);
+    }
+
+    /// Inject an error for the next direct pending-request `wait()`.
+    pub fn push_wait_error(&self) {
+        self.wait_errors
+            .lock()
+            .expect("should lock wait_errors")
             .push_back(());
     }
 
@@ -335,6 +415,16 @@ impl StubHttpClient {
         self.request_headers
             .lock()
             .expect("should lock request_headers")
+            .clone()
+    }
+
+    /// Return raw request header values captured per request, in order.
+    ///
+    /// Unlike [`Self::recorded_request_headers`], this includes malformed bytes.
+    pub(crate) fn recorded_request_header_bytes(&self) -> Vec<Vec<(String, Vec<u8>)>> {
+        self.request_header_bytes
+            .lock()
+            .expect("should lock request_header_bytes")
             .clone()
     }
 
@@ -398,8 +488,18 @@ impl PlatformHttpClient for StubHttpClient {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn has_enforceable_total_request_deadline(&self) -> bool {
+        self.enforceable_total_request_deadline
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn supports_streaming_responses(&self) -> bool {
         self.streaming_responses_supported
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn supports_pending_streaming_responses(&self) -> bool {
+        self.pending_streaming_responses_supported
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -407,6 +507,8 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let stream_response = request.stream_response && self.supports_streaming_responses();
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         self.calls
             .lock()
             .expect("should lock calls")
@@ -448,6 +550,16 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
+        let header_bytes = request
+            .request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        self.request_header_bytes
+            .lock()
+            .expect("should lock request_header_bytes")
+            .push(header_bytes);
 
         // Capture the outgoing request body so tests can assert it is forwarded.
         // Propagate collection failures instead of recording an empty body, so
@@ -471,20 +583,17 @@ impl PlatformHttpClient for StubHttpClient {
             .pop_front()
             .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
 
-        let mut builder = edgezero_core::http::response_builder().status(response.status);
-        for (name, value) in response.headers {
-            builder = builder.header(name, value);
-        }
-        let body = if response.stream_body {
-            edgezero_core::body::Body::stream(futures::stream::iter([bytes::Bytes::from(
-                response.body,
-            )]))
-        } else {
-            edgezero_core::body::Body::from(response.body)
-        };
-        let edge_response = builder
-            .body(body)
-            .change_context(PlatformError::HttpClient)?;
+        let stream_response = stream_response || response.stream_body;
+        let edge_response = build_stub_pending_response(
+            StubPendingResponse {
+                backend_name: request.backend_name,
+                status: response.status,
+                body: response.body,
+                headers: response.headers,
+            },
+            stream_response,
+            request_is_head,
+        )?;
 
         Ok(PlatformResponse::new(edge_response))
     }
@@ -497,12 +606,14 @@ impl PlatformHttpClient for StubHttpClient {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("Image Optimizer is not supported with StubHttpClient send_async"));
         }
-        if request.stream_response {
+        if request.stream_response && !self.supports_pending_streaming_responses() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("streaming responses are not supported with StubHttpClient send_async"));
         }
 
         let backend_name = request.backend_name.clone();
+        let stream_response = request.stream_response;
+        let request_method = request.request.method().clone();
         self.calls
             .lock()
             .expect("should lock calls")
@@ -511,6 +622,18 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock cache bypass flags")
             .push(request.bypass_cache);
+        self.stream_response_flags
+            .lock()
+            .expect("should lock stream response flags")
+            .push(stream_response);
+        self.request_methods
+            .lock()
+            .expect("should lock request methods")
+            .push(request_method.to_string());
+        self.request_uris
+            .lock()
+            .expect("should lock request URIs")
+            .push(request.request.uri().to_string());
 
         let headers: Vec<(String, String)> = request
             .request
@@ -527,6 +650,16 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
+        let header_bytes = request
+            .request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        self.request_header_bytes
+            .lock()
+            .expect("should lock request_header_bytes")
+            .push(header_bytes);
 
         // Capture the outgoing request body, mirroring `send()`, so tests
         // exercising the async fan-out path (`request_bids` providers) can
@@ -559,8 +692,20 @@ impl PlatformHttpClient for StubHttpClient {
             backend_name: backend_name.clone(),
             status: response.status,
             body: response.body,
+            headers: response.headers,
         };
-        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
+        let override_name = self
+            .pending_backend_name_overrides
+            .lock()
+            .expect("should lock pending backend name overrides")
+            .pop_front();
+        let pending = PlatformPendingRequest::new(pending)
+            .with_response_handling(stream_response, request_method);
+        Ok(match override_name {
+            Some(Some(name)) => pending.with_backend_name(name),
+            Some(None) => pending,
+            None => pending.with_backend_name(backend_name),
+        })
     }
 
     /// Always marks the first pending request in the input as ready (FIFO order).
@@ -576,6 +721,23 @@ impl PlatformHttpClient for StubHttpClient {
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with empty pending_requests list"));
+        }
+
+        if pending_requests
+            .iter()
+            .any(PlatformPendingRequest::stream_response)
+        {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("stream-marked pending request requires direct wait"));
+        }
+
+        let delay = self
+            .select_delays
+            .lock()
+            .expect("should lock select_delays")
+            .pop_front();
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
         }
 
         let ready_platform = pending_requests.remove(0);
@@ -604,7 +766,7 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock select_errors")
             .pop_front()
-            .is_some();
+            .unwrap_or(false);
 
         if should_error {
             return Ok(PlatformSelectResult {
@@ -616,10 +778,7 @@ impl PlatformHttpClient for StubHttpClient {
             });
         }
 
-        let edge_response = edgezero_core::http::response_builder()
-            .status(stub.status)
-            .body(edgezero_core::body::Body::from(stub.body))
-            .change_context(PlatformError::HttpClient)?;
+        let edge_response = build_stub_pending_response(stub, false, false)?;
 
         let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(ready_backend_name));
 
@@ -629,6 +788,63 @@ impl PlatformHttpClient for StubHttpClient {
             failed_backend_name: None,
         })
     }
+
+    async fn wait(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let delay = self
+            .select_delays
+            .lock()
+            .expect("should lock select_delays")
+            .pop_front();
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+
+        if self
+            .wait_errors
+            .lock()
+            .expect("should lock wait_errors")
+            .pop_front()
+            .is_some()
+        {
+            return Err(
+                Report::new(PlatformError::HttpClient).attach("injected direct pending wait error")
+            );
+        }
+        let stream_response = pending.stream_response();
+        let request_is_head = pending.request_method() == Some(&edgezero_core::http::Method::HEAD);
+        let stub = pending.downcast::<StubPendingResponse>().map_err(|_| {
+            Report::new(PlatformError::HttpClient)
+                .attach("unexpected inner type in StubHttpClient::wait")
+        })?;
+        let backend_name = stub.backend_name.clone();
+        let response = build_stub_pending_response(stub, stream_response, request_is_head)?;
+        Ok(PlatformResponse::new(response).with_backend_name(backend_name))
+    }
+}
+
+fn build_stub_pending_response(
+    stub: StubPendingResponse,
+    stream_response: bool,
+    request_is_head: bool,
+) -> Result<edgezero_core::http::Response, Report<PlatformError>> {
+    let mut builder = edgezero_core::http::response_builder().status(stub.status);
+    for (name, value) in stub.headers {
+        builder = builder.header(name, value);
+    }
+    let carries_body = !request_is_head
+        && !(100..200).contains(&stub.status)
+        && !matches!(stub.status, 204 | 205 | 304);
+    let body = if !carries_body {
+        edgezero_core::body::Body::empty()
+    } else if stream_response {
+        edgezero_core::body::Body::stream(futures::stream::iter([bytes::Bytes::from(stub.body)]))
+    } else {
+        edgezero_core::body::Body::from(stub.body)
+    };
+    builder.body(body).change_context(PlatformError::HttpClient)
 }
 
 pub(crate) struct NoopGeo;
@@ -746,6 +962,25 @@ pub(crate) fn build_services_with_http_client(
     build_services_with_secret_and_http_client(NoopSecretStore, http_client)
 }
 
+/// Build test services that dispatch HTTP requests with an attested client IP.
+pub(crate) fn build_services_with_http_client_and_client_ip(
+    http_client: Arc<dyn PlatformHttpClient>,
+    client_ip: IpAddr,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some(client_ip),
+            ..ClientInfo::default()
+        })
+        .build()
+}
+
 pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
@@ -793,11 +1028,20 @@ pub(crate) fn build_services_with_backend_and_http_client(
 }
 
 /// Build a [`RuntimeServices`] with a custom secret store, [`StubBackend`], and HTTP client.
-pub(crate) fn build_services_with_secret_and_http_client(
+pub(crate) fn build_services_with_config_secret_and_http_client(
+    config_store: impl PlatformConfigStore + 'static,
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
-    build_services_with_secret_http_client_and_client_ip(secret_store, http_client, None)
+    RuntimeServices::builder()
+        .config_store(Arc::new(config_store))
+        .secret_store(Arc::new(secret_store))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo::default())
+        .build()
 }
 
 pub(crate) fn build_services_with_secret_http_client_and_client_ip(
@@ -819,6 +1063,14 @@ pub(crate) fn build_services_with_secret_http_client_and_client_ip(
             ..ClientInfo::default()
         })
         .build()
+}
+
+/// Build test services with a custom secret store and the standard test config store.
+pub(crate) fn build_services_with_secret_and_http_client(
+    secret_store: impl PlatformSecretStore + 'static,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
+    build_services_with_config_secret_and_http_client(NoopConfigStore, secret_store, http_client)
 }
 
 #[cfg(test)]
@@ -975,8 +1227,13 @@ mod tests {
     }
 
     #[test]
-    fn stub_http_client_send_async_rejects_stream_response() {
+    fn stub_http_client_pending_stream_wait_is_direct_and_preserves_streaming() {
         let stub = StubHttpClient::new();
+        stub.set_streaming_responses_supported(true);
+        stub.set_pending_streaming_responses_supported(true);
+        stub.push_response(200, b"streamed publisher body".to_vec());
+        // A direct single-handle wait must not route through select().
+        stub.push_select_error();
         let req = PlatformHttpRequest::new(
             request_builder()
                 .method("GET")
@@ -987,12 +1244,19 @@ mod tests {
         )
         .with_stream_response();
 
-        let err = futures::executor::block_on(stub.send_async(req))
-            .expect_err("should reject async streaming-response requests");
+        let pending = futures::executor::block_on(stub.send_async(req))
+            .expect("should start async streaming-response request");
+        let response = futures::executor::block_on(stub.wait(pending))
+            .expect("should wait directly for streaming response");
 
         assert!(
-            format!("{err:?}").contains("streaming responses"),
-            "should explain unsupported async streaming-response path: {err:?}"
+            response.response.body().is_stream(),
+            "should preserve the pending response body as a stream"
+        );
+        assert_eq!(
+            stub.recorded_stream_response_flags(),
+            vec![true],
+            "should record the streaming response request"
         );
     }
 

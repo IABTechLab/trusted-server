@@ -1640,7 +1640,14 @@ container_id = "GTM-DEFAULT"
             )
             .expect("should update gtm config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1680,7 +1687,14 @@ container_id = "GTM-DEFAULT"
             .expect("should update gtm config");
 
         // 2. Setup Pipeline
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1746,7 +1760,14 @@ container_id = "GTM-DEFAULT"
             .expect("should update config");
 
         // Inlined Pipeline Creation
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -2072,7 +2093,14 @@ container_id = "GTM-DEFAULT"
             )
             .expect("should update config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -2138,7 +2166,14 @@ container_id = "GTM-DEFAULT"
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -2204,7 +2239,14 @@ container_id = "GTM-DEFAULT"
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 

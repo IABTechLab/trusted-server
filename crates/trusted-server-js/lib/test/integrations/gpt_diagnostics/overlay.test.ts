@@ -110,7 +110,7 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.destroy();
   });
 
-  it('presents the request path and Trusted Server delivery evidence without winner claims', () => {
+  it('presents request-path, auction, winner, timing, and delivery evidence', () => {
     const frames: Array<() => void> = [];
     let now = 10;
     const store = new GptDiagnosticsStore({
@@ -125,7 +125,19 @@ describe('GptDiagnosticsOverlay', () => {
       responseSentSlot,
       'auction-response-sent',
       'renderable_candidate',
-      'auction-123'
+      'auction-123',
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example-bidder', priceBucket: '1.20' },
+        serverTimings: {
+          auctionDispatchedMs: 4,
+          auctionResolvedMs: 84,
+          auctionCommittedMs: 85,
+          auctionWaitMs: 80,
+          auctionWaitPlacement: 'in_stream',
+        },
+      }
     );
     store.recordSlotRequested(responseSentSlot);
     now = 11;
@@ -162,7 +174,19 @@ describe('GptDiagnosticsOverlay', () => {
     store.recordTrustedServerOpportunity(
       selectedSlot,
       'auction-selected',
-      'unrenderable_candidate'
+      'unrenderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        serverTimings: {
+          auctionDispatchedMs: 0,
+          auctionResolvedMs: 40,
+          auctionCommittedMs: 41,
+          auctionWaitMs: 40,
+          auctionWaitPlacement: 'pre_header',
+        },
+      }
     );
     store.recordPrebidRefresh([selectedSlot]);
     store.recordSlotRequested(selectedSlot);
@@ -248,6 +272,13 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Request path: Trusted Server direct');
     expect(responseSentArticle).toContain('Request intent: 1');
     expect(responseSentArticle).toContain('Trusted Server auction: auction-123');
+    expect(responseSentArticle).toContain('Auction type: SSAT');
+    expect(responseSentArticle).toContain('Winning bidder: example-bidder');
+    expect(responseSentArticle).toContain('Winning bid price bucket: 1.20');
+    expect(responseSentArticle).toContain('Navigation T0 → auction dispatched 4 ms');
+    expect(responseSentArticle).toContain('Navigation T0 → auction resolved 84 ms');
+    expect(responseSentArticle).toContain('Navigation T0 → bids committed 85 ms');
+    expect(responseSentArticle).toContain('Auction wait (in stream) 80 ms');
     expect(responseSentArticle).toContain('Opportunity → request 0 ms');
     expect(responseSentArticle).toContain('Direct opportunity: Renderable candidate');
     expect(responseSentArticle).toContain('Trusted Server creative request observed at 13 ms');
@@ -271,6 +302,9 @@ describe('GptDiagnosticsOverlay', () => {
 
     const selectedArticle = slotArticle(root!, 'selected-slot').textContent ?? '';
     expect(selectedArticle).toContain('Request path: Competing paths');
+    expect(selectedArticle).toContain('Auction type: Competing auctions');
+    expect(selectedArticle).toContain('SPA auction T0 → auction dispatched 0 ms');
+    expect(selectedArticle).toContain('SPA auction T0 → auction resolved 40 ms');
     expect(selectedArticle).toContain('Direct opportunity: Unrenderable candidate');
     expect(selectedArticle).toContain('Trusted Server creative request observed at 23 ms');
     expect(selectedArticle).not.toContain('Trusted Server markup response sent');
@@ -466,17 +500,17 @@ describe('GptDiagnosticsOverlay', () => {
     expect(root!.textContent).toContain('GPT observed');
     expect(root!.textContent).toContain('callback issues');
     expect(root!.textContent).toContain('attribution issues');
-    expect(root!.textContent).toContain('filled-slot');
+    expect(root!.textContent).toContain('Ad #1 · filled-slot');
     expect(root!.textContent).toContain('/example/site/filled-slot');
     expect(root!.textContent).toContain('Empty');
     expect(root!.textContent).toContain('Previous requests (1)');
     expect(root!.textContent).toContain('Requested slot sizes 300×250, 728×90, 320×50, 970×250');
     expect(root!.textContent).toContain('GPT-reported fill size 300×250');
-    expect(root!.textContent).toContain('Observed outer slot box 320×270');
+    expect(root!.textContent).toContain('Size filled 320×270');
     expect(root!.textContent).toContain('Backfill yes');
     expect(root!.textContent).toContain('GPT slot onload observed');
     expect(root!.textContent).toContain('GPT impressionViewable observed');
-    expect(root!.textContent).toContain('Request → response 10 ms');
+    expect(root!.textContent).toContain('GAM request → response 10 ms');
     expect(root!.textContent).toContain('GPT visibility 60%');
     expect(root!.textContent).toContain('Requesting');
     expect(root!.textContent).toContain('Ambiguous binding');

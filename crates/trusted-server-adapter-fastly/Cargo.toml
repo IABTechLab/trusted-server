@@ -27,12 +27,13 @@ log = { workspace = true }
 log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 trusted-server-core = { workspace = true }
+rand = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
+toml = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }

@@ -9,10 +9,12 @@ use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, he
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(target_arch = "wasm32")]
-use trusted_server_core::config_payload::settings_from_config_blob;
+use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
@@ -22,6 +24,8 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::platform::StoreName;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -44,11 +48,23 @@ use crate::platform::build_runtime_services;
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "wasm32")]
-static CLOUDFLARE_CONFIG_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+thread_local! {
+    static CLOUDFLARE_CONFIG_JSON: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };
+    static CLOUDFLARE_ENV: std::cell::OnceCell<worker::Env> = const { std::cell::OnceCell::new() };
+}
 
 #[cfg(target_arch = "wasm32")]
 pub fn set_cloudflare_config_json(value: String) {
-    let _ = CLOUDFLARE_CONFIG_JSON.set(value);
+    CLOUDFLARE_CONFIG_JSON.with(|slot| {
+        let _ = slot.set(value);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_cloudflare_env(env: worker::Env) {
+    CLOUDFLARE_ENV.with(|slot| {
+        let _ = slot.set(env);
+    });
 }
 
 /// Application state built once at startup and shared across all requests.
@@ -76,18 +92,22 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "Cloudflare startup settings require a Worker config binding".to_string(),
+    })
+    .attach("use TrustedServerApp::routes_with_settings for host tests"))
 }
 
 #[cfg(target_arch = "wasm32")]
 fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
-    let raw_config = CLOUDFLARE_CONFIG_JSON.get().ok_or_else(|| {
+    let raw_config = CLOUDFLARE_CONFIG_JSON.with(|slot| slot.get().cloned());
+    let raw_config = raw_config.ok_or_else(|| {
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
         .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
     })?;
-    let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(&raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: "invalid Cloudflare TRUSTED_SERVER_CONFIG JSON".to_string(),
         })
@@ -101,7 +121,16 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
                 message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
             })
         })?;
-    settings_from_config_blob(envelope)
+    let env = CLOUDFLARE_ENV
+        .with(|slot| slot.get().cloned())
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "Cloudflare Worker environment is unavailable during startup".to_string(),
+            })
+        })?;
+    let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
+    let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
+    settings_from_config_blob(envelope, &secret_store, &default_secret_store)
 }
 
 /// Build the application state from explicit settings.
@@ -113,8 +142,10 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -523,13 +554,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     // Build the geo-aware EC context so the auction consent gate
                     // sees the caller's jurisdiction — `EcContext::default()`
                     // fails it closed for consented users.
-                    let ec_context = build_ec_context(&s.settings, &services, &req);
+                    let mut ec_context = build_ec_context(&s.settings, &services, &req);
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
                         None,
                         None,
-                        &ec_context,
+                        &mut ec_context,
                         &services,
                         req,
                     )
@@ -587,13 +618,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // preflight fall through to a permissive origin would reopen exactly
         // the cross-site hole the canonical path closes.
         let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
-            let ec_context = build_ec_context(&s.settings, &services, &req);
+            let mut ec_context = build_ec_context(&s.settings, &services, &req);
             let auction = AuctionDispatch {
                 orchestrator: &s.orchestrator,
                 slots: s.settings.creative_opportunity_slots(),
                 registry: None,
             };
-            handle_page_bids(&s.settings, &services, None, auction, &ec_context, req).await
+            handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req).await
         });
         let page_bids_preflight =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
@@ -623,5 +654,151 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         }
 
         router.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aps_profile_settings() -> Settings {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            trusted_server_core::auction::ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                notifications: trusted_server_core::auction::NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"example-account"}),
+            },
+        );
+        settings
+    }
+
+    #[test]
+    fn startup_registers_aps_renderer_route() {
+        let state = build_state_with_settings(aps_profile_settings())
+            .expect("Cloudflare startup should register APS renderer");
+        assert!(
+            state.registry.has_route(
+                &edgezero_core::http::Method::GET,
+                "/integrations/aps/renderer"
+            ),
+            "Cloudflare startup registry should expose the APS renderer"
+        );
+    }
+
+    #[test]
+    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.enabled = false;
+        settings.auction.providers =
+            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
+                .map(|id| {
+                    (
+                        id.parse().expect("should parse provider ID"),
+                        trusted_server_core::auction::ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "standard".to_string(),
+                            endpoint: format!("https://{id}.example/openrtb"),
+                            timeout_ms: None,
+                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                            notifications:
+                                trusted_server_core::auction::NotificationConfig::default(),
+                            profile_config: serde_json::json!({}),
+                        },
+                    )
+                })
+                .collect();
+
+        build_state_with_settings(settings)
+            .expect("disabled Cloudflare auction should accept dormant fanout");
+    }
+
+    #[test]
+    fn startup_rejects_multi_provider_auction_plan() {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.enabled = true;
+        settings.auction.providers =
+            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
+                .map(|id| {
+                    (
+                        id.parse().expect("should parse provider ID"),
+                        trusted_server_core::auction::ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "standard".to_string(),
+                            endpoint: format!("https://{id}.example/openrtb"),
+                            timeout_ms: None,
+                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                            notifications:
+                                trusted_server_core::auction::NotificationConfig::default(),
+                            profile_config: serde_json::json!({}),
+                        },
+                    )
+                })
+                .collect();
+
+        let error = match build_state_with_settings(settings) {
+            Ok(_) => panic!("Cloudflare startup should reject multi-provider fanout"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("concurrent provider fanout"),
+            "should identify unsupported fanout: {error:?}"
+        );
     }
 }

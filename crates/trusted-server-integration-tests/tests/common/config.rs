@@ -1,7 +1,6 @@
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
-use trusted_server_core::config::validate_settings_for_deploy;
-use trusted_server_core::settings::Settings;
+use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::common::runtime::{TestError, TestResult};
 
@@ -10,18 +9,19 @@ const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.int
 
 pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
     let origin_url = format!("http://127.0.0.1:{origin_port}");
-    let mut settings = Settings::from_toml(APP_CONFIG).map_err(|report| {
+    let app_config: TrustedServerAppConfig = toml::from_str(APP_CONFIG).map_err(|error| {
         Report::new(TestError::ConfigGeneration).attach(format!(
-            "invalid Trusted Server integration config: {report:?}"
+            "invalid Trusted Server integration config: {error}"
         ))
     })?;
+    let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
-    validate_settings_for_deploy(&settings).map_err(|report| {
+    let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))
     })?;
 
-    let data = serde_json::to_value(&settings).map_err(|error| {
+    let data = serde_json::to_value(&app_config).map_err(|error| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("failed to serialize integration settings: {error}"))
     })?;
@@ -45,6 +45,8 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
 #[cfg(test)]
 mod tests {
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
+    const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
+    const VICEROY_SERVICE_ID: &str = "0000000000000000000000";
 
     #[test]
     fn local_fastly_config_defines_runtime_kv_stores() {
@@ -68,5 +70,28 @@ mod tests {
             }),
             "fastly.toml should preserve the pre-seeded local EC test row"
         );
+    }
+
+    #[test]
+    fn local_fastly_configs_scope_runtime_secret_mapping_to_viceroy_service() {
+        let runtime_mapping_key = format!(
+            "EDGEZERO__SERVICES__{VICEROY_SERVICE_ID}__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME"
+        );
+
+        for (name, config) in [
+            ("root fastly.toml", FASTLY_CONFIG),
+            ("integration Viceroy template", VICEROY_TEMPLATE),
+        ] {
+            let parsed: toml::Value =
+                toml::from_str(config).expect("should parse local Fastly configuration");
+            let contents =
+                &parsed["local_server"]["config_stores"]["edgezero_runtime_env"]["contents"];
+
+            assert_eq!(
+                contents[&runtime_mapping_key].as_str(),
+                Some("ts_secrets"),
+                "{name} should scope its secret-store mapping to Viceroy's service id"
+            );
+        }
     }
 }

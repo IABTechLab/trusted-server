@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
+use rand::Rng as _;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
 use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
@@ -14,7 +16,13 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::access_telemetry::{
+    AccessTelemetrySnapshot, RouteClass, RouteMetadata, access_event_row,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::constants::{
+    ENV_FASTLY_IS_STAGING, ENV_FASTLY_POP, ENV_FASTLY_SERVICE_ID, ENV_FASTLY_SERVICE_VERSION,
+};
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -23,13 +31,15 @@ use trusted_server_core::ec::pull_sync::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::platform::{RuntimeServices, TimedKvStore};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::publisher::TemplateCacheResponseState;
+use trusted_server_core::request_timing::{Phase, RequestTimings, append_server_timing_if_private};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::config_store_name;
 
 mod app;
 mod backend;
@@ -44,7 +54,9 @@ mod rate_limiter;
 mod template_cache;
 mod tinybird;
 
-use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
+use crate::app::{
+    EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, load_settings_from_config_store,
+};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
@@ -55,9 +67,8 @@ use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
-fn open_trusted_server_config_store(env: &EnvConfig) -> Result<ConfigStoreHandle, fastly::Error> {
-    let store_name = config_store_name(env);
-    let store = EdgeZeroFastlyConfigStore::try_open(store_name.as_ref()).map_err(|e| {
+fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandle, fastly::Error> {
+    let store = EdgeZeroFastlyConfigStore::try_open(store_name).map_err(|e| {
         fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
@@ -87,16 +98,17 @@ fn main() {
 
     logging::init_logger();
     let env = runtime_env_config(TrustedServerApp::stores());
-    edgezero_main(req, &env);
+    let runtime_stores = RuntimeStoreConfig::from_env(&env);
+    edgezero_main(req, &runtime_stores);
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
+fn edgezero_main(mut req: FastlyRequest, runtime_stores: &RuntimeStoreConfig) {
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match load_settings_from_config_store(env) {
+        match load_settings_from_config_store(runtime_stores) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
             }
@@ -113,19 +125,43 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
         return;
     }
 
-    let config_store = match open_trusted_server_config_store(env) {
-        Ok(cs) => cs,
-        Err(e) => {
-            log::error!("failed to open config store: {e}");
-            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_body_text_plain("Internal Server Error")
-                .send_to_client();
-            return;
-        }
-    };
+    let timings = RequestTimings::new();
 
-    let (app, app_state) = TrustedServerApp::build_app_with_state(env);
+    let (config_store, app, app_state) = {
+        let _appbuild = timings.span(Phase::AppBuild);
+        let config_store =
+            match open_trusted_server_config_store(runtime_stores.config_store_name.as_ref()) {
+                Ok(cs) => cs,
+                Err(e) => {
+                    log::error!("failed to open config store: {e}");
+                    FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_body_text_plain("Internal Server Error")
+                        .send_to_client();
+                    return;
+                }
+            };
+        let (app, app_state) = TrustedServerApp::build_app_with_state(runtime_stores);
+        (config_store, app, app_state)
+    };
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
+    let server_timing_enabled = settings_snapshot
+        .as_deref()
+        .is_some_and(|settings| settings.observability.server_timing_enabled);
+    // Both read once here rather than at each `send_edgezero_response` call
+    // site: if `app_state` failed to build, there is no settings snapshot to
+    // read them from at all, so every call site would need the same
+    // degraded-mode fallback. `access_sample_rate` defaults to `0.0` (never
+    // sampled in) and `publisher_domain` to `"unknown"` in that case.
+    let access_sample_rate = settings_snapshot
+        .as_deref()
+        .map_or(0.0, |settings| settings.tinybird.access_sample_rate);
+    let access_telemetry_enabled = settings_snapshot
+        .as_deref()
+        .is_some_and(|settings| settings.tinybird.enabled && settings.tinybird.access_enabled);
+    let publisher_domain = settings_snapshot.as_deref().map_or_else(
+        || "unknown".to_owned(),
+        |settings| settings.publisher.domain.clone(),
+    );
     let trusted_client_ip = settings_snapshot
         .as_deref()
         .and_then(|settings| settings.trusted_client_ip.as_ref());
@@ -144,6 +180,10 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
     {
         req.set_header("fastly-ssl", "1");
     }
+
+    // Capture the method before dispatch consumes the request. The resolved
+    // client IP is retained below in `ClientInfo`.
+    let request_method = req.get_method_str().to_owned();
 
     // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
     // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
@@ -176,6 +216,7 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
             core_req.extensions_mut().insert(config_store);
             core_req.extensions_mut().insert(device_signals);
             core_req.extensions_mut().insert(client_info);
+            core_req.extensions_mut().insert(timings.clone());
             match futures::executor::block_on(app.router().oneshot(core_req)) {
                 Ok(response) => response,
                 Err(error) => edge_error_response(error),
@@ -194,14 +235,34 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+    // Read rather than pop: the access-telemetry snapshot built later in
+    // `send_edgezero_response` reads this same extension, so it must still
+    // be attached to `response` at that point.
+    let geo_lookup_state = response
+        .extensions()
+        .get::<GeoLookupState>()
+        .cloned()
+        .unwrap_or(GeoLookupState::NotAttempted);
 
     if !take_finalize_sentinel(&mut response) {
         if let Some(settings) = settings_snapshot.as_deref() {
-            apply_entry_point_finalize_headers(settings, &mut response, client_ip);
+            apply_entry_point_finalize_headers(
+                settings,
+                &mut response,
+                client_ip,
+                &geo_lookup_state,
+                &timings,
+            );
         } else {
-            match load_settings_from_config_store(env) {
+            match load_settings_from_config_store(runtime_stores) {
                 Ok(settings) => {
-                    apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
+                    apply_entry_point_finalize_headers(
+                        &settings,
+                        &mut response,
+                        client_ip,
+                        &geo_lookup_state,
+                        &timings,
+                    );
                 }
                 Err(e) => {
                     log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
@@ -214,12 +275,24 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
         policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
-    if let Some(ec_state) = ec_state {
+    if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &ec_state, &mut response) {
+            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response, &timings) {
                 Ok(partner_registry) => {
-                    send_edgezero_response(response, request_filter_effects.as_ref());
+                    let outcome = send_edgezero_response(
+                        response,
+                        request_filter_effects.as_ref(),
+                        &SendContext {
+                            timings: timings.clone(),
+                            server_timing_enabled,
+                            method: request_method.clone(),
+                            publisher_domain: publisher_domain.clone(),
+                            access_sample_rate,
+                            access_telemetry_enabled,
+                        },
+                    );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    emit_access_telemetry_after_send(settings, &outcome, &timings);
                     return;
                 }
                 Err(e) => {
@@ -229,16 +302,33 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
                 }
             }
         } else {
-            match load_settings_from_config_store(env) {
+            match load_settings_from_config_store(runtime_stores) {
                 Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
+                    match apply_edgezero_ec_finalize(
+                        &settings,
+                        &mut ec_state,
+                        &mut response,
+                        &timings,
+                    ) {
                         Ok(partner_registry) => {
-                            send_edgezero_response(response, request_filter_effects.as_ref());
+                            let outcome = send_edgezero_response(
+                                response,
+                                request_filter_effects.as_ref(),
+                                &SendContext {
+                                    timings: timings.clone(),
+                                    server_timing_enabled,
+                                    method: request_method.clone(),
+                                    publisher_domain: publisher_domain.clone(),
+                                    access_sample_rate,
+                                    access_telemetry_enabled,
+                                },
+                            );
                             run_edgezero_pull_sync_after_send(
                                 &settings,
                                 &partner_registry,
                                 &ec_state,
                             );
+                            emit_access_telemetry_after_send(&settings, &outcome, &timings);
                             return;
                         }
                         Err(e) => {
@@ -255,7 +345,27 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
         }
     }
 
-    send_edgezero_response(response, request_filter_effects.as_ref());
+    let outcome = send_edgezero_response(
+        response,
+        request_filter_effects.as_ref(),
+        &SendContext {
+            timings: timings.clone(),
+            server_timing_enabled,
+            method: request_method,
+            publisher_domain,
+            access_sample_rate,
+            access_telemetry_enabled,
+        },
+    );
+    // The asset/admin/error fallback path: no `EcFinalizeState` (or the ec
+    // finalize branch above failed), so there is no pull-sync dispatch here
+    // at all — telemetry is the only post-send step. When `app_state` never
+    // built there is nothing to emit either: `access_telemetry_enabled` was
+    // necessarily false without a settings snapshot, so the outcome carries
+    // no access snapshot, and reloading settings here could not change that.
+    if let Some(settings) = settings_snapshot.as_deref() {
+        emit_access_telemetry_after_send(settings, &outcome, &timings);
+    }
 }
 
 fn edge_error_response(error: EdgeError) -> HttpResponse {
@@ -283,30 +393,46 @@ fn apply_entry_point_finalize_headers(
     settings: &Settings,
     response: &mut HttpResponse,
     client_ip: Option<std::net::IpAddr>,
+    geo_state: &GeoLookupState,
+    timings: &RequestTimings,
 ) {
-    let geo_info = resolve_geo_for_response(response, client_ip, |client_ip| {
+    let geo_info = resolve_geo_for_response(response, geo_state, client_ip, |client_ip| {
+        let _span = timings.span(Phase::Geo);
         FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
             log::warn!("entry-point geo lookup failed: {e}");
             None
         })
     });
     apply_finalize_headers(settings, geo_info.as_ref(), response);
+
+    // This path runs only when the middleware chain was bypassed (e.g. a
+    // router-level 404/405 for an unregistered method), so `geo_state` may
+    // still be `NotAttempted` even after a fresh lookup just ran above.
+    // Write the resolved outcome back so the access-telemetry snapshot built
+    // later in `send_edgezero_response` sees what was actually looked up,
+    // not the stale carried-in state.
+    let resolved_state = match &geo_info {
+        Some(info) => GeoLookupState::Resolved(info.clone()),
+        None => GeoLookupState::Attempted,
+    };
+    response.extensions_mut().insert(resolved_state);
 }
 
 fn apply_edgezero_ec_finalize(
     settings: &Settings,
-    ec_state: &EcFinalizeState,
+    ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
+    timings: &RequestTimings,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
     let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        maybe_identity_graph(settings)
+        identity_graph_with_timing(settings, timings)
     } else {
         None
     };
     ec_finalize_response(
         settings,
-        &ec_state.ec_context,
+        &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
         ec_state.eids_cookie.as_deref(),
@@ -328,6 +454,219 @@ fn run_edgezero_pull_sync_after_send(
     }
 }
 
+/// Builds and emits the access-telemetry row for one delivered response,
+/// when access telemetry is enabled and this request is sampled in.
+///
+/// Called last at every `send_edgezero_response` call site in
+/// [`edgezero_main`] — after `run_edgezero_pull_sync_after_send` on the two
+/// EC-finalized paths, and directly after send on the asset/admin/error
+/// fallback path, which never builds an [`EcFinalizeState`] or route-scoped
+/// `RuntimeServices` at all. The Tinybird transport context is therefore
+/// constructed fresh from `settings` here rather than threaded through
+/// either of those per-route types, so every response class can emit.
+///
+/// Sampled-out requests return silently — that is the expected, high-volume
+/// case and not worth a log line. The sampling roll uses the rate stored on
+/// the snapshot itself, so the emission probability always matches the
+/// row's `sample_rate` column by construction. Every other drop (row
+/// build, token load, send, or non-2xx status — all folded into
+/// `emit_access_event`'s `Result`) logs exactly one warning naming the
+/// reason.
+fn emit_access_telemetry_after_send(
+    settings: &Settings,
+    outcome: &DeliveryOutcome,
+    timings: &RequestTimings,
+) {
+    if !settings.tinybird.enabled || !settings.tinybird.access_enabled {
+        return;
+    }
+
+    // No snapshot means access telemetry was disabled when the response
+    // was sent (the flag is read once, before dispatch); nothing to emit.
+    let Some(snapshot) = &outcome.snapshot else {
+        return;
+    };
+
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let epoch_ms = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
+    // Sample with the rate stored on the snapshot itself — the same value
+    // serialized into the row's `sample_rate` column — so the emission
+    // probability and the row's claimed rate cannot diverge, which the
+    // documented `sum(1.0 / sample_rate)` volume estimator depends on.
+    let roll = rand::thread_rng().r#gen::<f64>();
+    if !tinybird::sampled_in(snapshot.sample_rate, roll) {
+        return;
+    }
+
+    let row = access_event_row(snapshot, &timings.snapshot(), epoch_ms);
+    let target = tinybird::TinybirdEventsTarget::from_access_config(settings.tinybird.clone());
+    let result = futures::executor::block_on(tinybird::emit_access_event(
+        &platform::FastlyPlatformHttpClient,
+        &target,
+        row,
+    ));
+    if let Err(error) = result {
+        log::warn!("access telemetry emission dropped: {error:?}");
+    }
+}
+
+/// Per-response context threaded into [`send_edgezero_response`] so the
+/// function stays at or under seven parameters.
+struct SendContext {
+    /// The request's phase-timing collector.
+    timings: RequestTimings,
+    /// Whether `observability.server_timing_enabled` is set.
+    server_timing_enabled: bool,
+    /// The request's HTTP method, captured before the request was consumed
+    /// by dispatch.
+    method: String,
+    /// The configured publisher domain.
+    publisher_domain: String,
+    /// The configured access-telemetry sample rate.
+    access_sample_rate: f64,
+    /// Whether `tinybird.enabled` and `tinybird.access_enabled` were both
+    /// set when settings were first read. Gates building the
+    /// [`AccessTelemetrySnapshot`] at all: the snapshot costs env reads and
+    /// `String` allocations on the pre-send path, which a disabled
+    /// deployment (the default) should not pay.
+    access_telemetry_enabled: bool,
+}
+
+/// Outcome of handing a finalized response to the client.
+pub(crate) struct DeliveryOutcome {
+    /// Response body size in bytes.
+    #[allow(dead_code)]
+    pub bytes: u64,
+    /// Whether delivery completed or failed partway. Collected as
+    /// groundwork; not yet emitted on any surface.
+    #[allow(dead_code)]
+    pub result: DeliveryResult,
+    /// Access-telemetry dimensions captured for this response at the
+    /// freeze point. `None` when access telemetry was disabled at snapshot
+    /// time; the emitter treats that as nothing to send.
+    pub snapshot: Option<AccessTelemetrySnapshot>,
+}
+
+/// Whether [`send_edgezero_response`] completed delivery or failed partway.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryResult {
+    /// The response was handed to the client in full.
+    Complete,
+    /// Delivery started but did not finish cleanly: some bytes reached the
+    /// client's transport before a stream error, or the transport could not
+    /// be closed cleanly after every byte was written.
+    Partial,
+    /// Delivery failed before any bytes reached the client.
+    Error,
+}
+
+/// Thin Fastly-adapter wrapper around
+/// [`append_server_timing_if_private`], the freeze point shared with the
+/// Axum adapter's terminal timing layer. See that function's doc for the
+/// emission rules (always stamps `mark_headers_ready`; appends rather than
+/// overwrites; never promotes a response to shared-cacheable).
+pub(crate) fn apply_server_timing_header(
+    response: &mut HttpResponse,
+    timings: &RequestTimings,
+    server_timing_enabled: bool,
+) {
+    append_server_timing_if_private(response, timings, server_timing_enabled);
+}
+
+/// A [`Write`](std::io::Write) wrapper that tallies bytes successfully written
+/// to the inner writer.
+///
+/// Wraps the client transport during a streaming drive so a truncated or
+/// failed drive still reports how many bytes actually reached it, instead of
+/// the placeholder `0` a failed/aborted drive would otherwise report.
+struct CountingWriter<W> {
+    inner: W,
+    bytes: u64,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, bytes: 0 }
+    }
+
+    /// Bytes successfully written to the inner writer so far.
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes = self.bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Drives a streaming `EdgeZero` body through `output`, tallying bytes written
+/// and timing the drive into `timings`.
+///
+/// Stamps `resp_bytes` and `request_elapsed` immediately once the drive
+/// returns — before the caller does anything transport-specific (finishing
+/// the streaming body, logging) — so `request_elapsed` never includes that
+/// work. Returns the counting writer (so the caller can recover both the
+/// tallied byte count and the wrapped transport) alongside the drive's
+/// result.
+fn drive_streaming_body<W: std::io::Write>(
+    body: EdgeBody,
+    output: W,
+    timings: &RequestTimings,
+) -> (CountingWriter<W>, Result<(), Report<TrustedServerError>>) {
+    let mut counting = CountingWriter::new(output);
+    let drive_started = Instant::now();
+    let result = futures::executor::block_on(stream_asset_body(body, &mut counting));
+    timings.record(Phase::Stream, drive_started.elapsed());
+    timings.set_resp_bytes(counting.bytes());
+    timings.mark_request_elapsed();
+    (counting, result)
+}
+
+/// Classifies a completed streaming drive into a [`DeliveryResult`].
+///
+/// A drive that failed after writing at least one byte delivered a truncated
+/// response rather than nothing at all, so it is [`DeliveryResult::Partial`],
+/// not [`DeliveryResult::Error`].
+///
+/// The `Ok(())` arm exists for the classifier's totality, not for the
+/// production caller: `send_edgezero_response` consumes this value only in
+/// its `Err` branch and re-derives the success outcome from
+/// `streaming_body.finish()`.
+fn classify_stream_delivery(
+    drive_result: &Result<(), Report<TrustedServerError>>,
+    bytes: u64,
+) -> DeliveryResult {
+    match drive_result {
+        Ok(()) => DeliveryResult::Complete,
+        Err(_) if bytes > 0 => DeliveryResult::Partial,
+        Err(_) => DeliveryResult::Error,
+    }
+}
+
+/// Stamps `resp_bytes`/`request_elapsed` for an already-materialized body,
+/// immediately before it is handed to the Fastly client transport, and
+/// returns its byte length.
+fn record_buffered_delivery(body: &EdgeBody, timings: &RequestTimings) -> u64 {
+    let bytes = u64::try_from(body.as_bytes().map(<[u8]>::len).unwrap_or(0)).unwrap_or(u64::MAX);
+    timings.set_resp_bytes(bytes);
+    timings.mark_request_elapsed();
+    bytes
+}
+
 /// Sends a finalized `EdgeZero` response to the client.
 ///
 /// Streaming `EdgeZero` bodies commit headers first, then pipe chunks to Fastly's
@@ -336,8 +675,24 @@ fn run_edgezero_pull_sync_after_send(
 fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
-) {
+    context: &SendContext,
+) -> DeliveryOutcome {
     apply_terminal_response_effects(&mut response, request_filter_effects);
+    apply_server_timing_header(
+        &mut response,
+        &context.timings,
+        context.server_timing_enabled,
+    );
+
+    // Built right after the freeze point and before `into_parts()`
+    // consumes `response`: nothing else survives to post-send on every
+    // path (the request was consumed by dispatch, and `EcFinalizeState`
+    // is absent on asset, admin, and error paths). Skipped entirely when
+    // access telemetry is disabled, so the default configuration pays no
+    // env reads or allocations here.
+    let snapshot = context
+        .access_telemetry_enabled
+        .then(|| build_access_telemetry_snapshot(&response, context));
 
     let (parts, body) = response.into_parts();
 
@@ -347,23 +702,131 @@ fn send_edgezero_response(
                 parts,
                 EdgeBody::empty(),
             ));
-            let mut streaming_body = skeleton.stream_to_client();
-            match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
-                Ok(()) => {
-                    if let Err(e) = streaming_body.finish() {
+            let (counting, drive_result) =
+                drive_streaming_body(body, skeleton.stream_to_client(), &context.timings);
+            let bytes = counting.bytes();
+            let streaming_body = counting.into_inner();
+            // Computed before `drive_result` is matched by value below, since
+            // the `Err` arm there moves its `Report` out.
+            let result = classify_stream_delivery(&drive_result, bytes);
+            match drive_result {
+                Ok(()) => match streaming_body.finish() {
+                    Ok(()) => DeliveryOutcome {
+                        bytes,
+                        result: DeliveryResult::Complete,
+                        snapshot,
+                    },
+                    Err(e) => {
+                        // Every byte was handed to the transport (the drive
+                        // above returned Ok), but the transport itself could
+                        // not close cleanly — the client may still see a
+                        // truncated response.
                         log::error!("failed to finish EdgeZero streaming body: {e}");
+                        DeliveryOutcome {
+                            bytes,
+                            result: DeliveryResult::Partial,
+                            snapshot,
+                        }
                     }
-                }
+                },
                 Err(e) => {
                     log::error!("EdgeZero streaming failed: {e:?}");
                     drop(streaming_body);
+                    DeliveryOutcome {
+                        bytes,
+                        result,
+                        snapshot,
+                    }
                 }
             }
         }
         once => {
+            let bytes = record_buffered_delivery(&once, &context.timings);
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
+            DeliveryOutcome {
+                bytes,
+                result: DeliveryResult::Complete,
+                snapshot,
+            }
         }
     }
+}
+
+/// Builds the [`AccessTelemetrySnapshot`] for `response` at the
+/// `Server-Timing` freeze point.
+///
+/// Reads route identity, geo country, and template-cache state from typed
+/// response extensions rather than the headers those extensions back —
+/// operator-configured response headers can override a managed header, so
+/// reading a header here could silently drift from what actually happened.
+/// Falls back to `"unknown"`/[`RouteClass::Other`] sentinels when an
+/// extension was never attached (router-generated, asset, and other
+/// responses that never passed through a `RouteMetadata`-attaching
+/// wrapper).
+fn build_access_telemetry_snapshot(
+    response: &HttpResponse,
+    context: &SendContext,
+) -> AccessTelemetrySnapshot {
+    let (route_class, route_template) = match response.extensions().get::<RouteMetadata>() {
+        Some(metadata) => (metadata.route_class, metadata.route_template.clone()),
+        None => (RouteClass::Other, "unknown".to_owned()),
+    };
+
+    let country = match response.extensions().get::<GeoLookupState>() {
+        Some(GeoLookupState::Resolved(info)) => info.country.clone(),
+        Some(GeoLookupState::Attempted | GeoLookupState::NotAttempted) | None => {
+            "unknown".to_owned()
+        }
+    };
+
+    let template_cache_state = response
+        .extensions()
+        .get::<TemplateCacheResponseState>()
+        .map_or_else(|| "unknown".to_owned(), |state| state.as_str().to_owned());
+
+    let body_mode = if matches!(response.body(), EdgeBody::Stream(_)) {
+        "streamed"
+    } else {
+        "buffered"
+    };
+
+    AccessTelemetrySnapshot {
+        method: context.method.clone(),
+        status: response.status().as_u16(),
+        route_class,
+        route_template,
+        publisher_domain: context.publisher_domain.clone(),
+        env: resolve_env_dimension(),
+        service_id: env_var_or_unknown(ENV_FASTLY_SERVICE_ID),
+        pop: env_var_or_unknown(ENV_FASTLY_POP),
+        ts_version: env_var_or_unknown(ENV_FASTLY_SERVICE_VERSION),
+        country,
+        template_cache_state,
+        body_mode,
+        sample_rate: context.access_sample_rate,
+    }
+}
+
+/// Derives the `env` access-telemetry dimension from the same
+/// `FASTLY_IS_STAGING` input that drives the `x-ts-env` response header
+/// (see [`apply_finalize_headers`]), never from [`Settings`] — `Settings`
+/// has no environment field and does not gain one for this.
+///
+/// `"unknown"` covers contexts where the variable is entirely absent (for
+/// example native unit tests run outside Fastly Compute); on the Fastly
+/// platform the variable is always present, as either `"1"` or not.
+fn resolve_env_dimension() -> String {
+    match std::env::var(ENV_FASTLY_IS_STAGING) {
+        Ok(value) if value == "1" => "staging".to_owned(),
+        Ok(_) => "production".to_owned(),
+        Err(_) => "unknown".to_owned(),
+    }
+}
+
+/// Reads a Fastly-provided environment variable, defaulting to `"unknown"`
+/// when unset.
+fn env_var_or_unknown(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| "unknown".to_owned())
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -437,12 +900,21 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    settings
-        .ec
-        .ec_store
-        .as_ref()
-        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+/// Constructs a `KvIdentityGraph` wrapped in the [`Phase::EcKv`] timing
+/// decorator, for request-path callers with a `RequestTimings` handle.
+///
+/// Returns `None` when `ec.ec_store` is not configured, matching
+/// [`require_identity_graph_with_timing`]'s contract on every other axis.
+pub(crate) fn identity_graph_with_timing(
+    settings: &Settings,
+    timings: &RequestTimings,
+) -> Option<KvIdentityGraph> {
+    settings.ec.ec_store.as_ref().map(|store_name| {
+        KvIdentityGraph::new(TimedKvStore::new(
+            FastlyEcKvStore::new(store_name),
+            timings.clone(),
+        ))
+    })
 }
 
 fn run_pull_sync_after_send(
@@ -465,6 +937,12 @@ fn run_pull_sync_after_send(
 
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
+///
+/// Deliberately untimed: pull-sync (this function's only caller) runs after
+/// `send_edgezero_response`'s Server-Timing freeze point, so a decorated
+/// store here would record into a handle nothing ever renders.
+/// Request-path callers with a `RequestTimings` handle use
+/// [`require_identity_graph_with_timing`] instead.
 pub(crate) fn require_identity_graph(
     settings: &Settings,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
@@ -475,6 +953,27 @@ pub(crate) fn require_identity_graph(
         })
     })?;
     Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+}
+
+/// Constructs a `KvIdentityGraph` wrapped in the [`Phase::EcKv`] timing
+/// decorator, or returns an error if the `ec_store` config is not set.
+///
+/// Request-path sibling of [`require_identity_graph`], which pull-sync uses
+/// unwrapped because pull-sync runs after the Server-Timing freeze point.
+pub(crate) fn require_identity_graph_with_timing(
+    settings: &Settings,
+    timings: &RequestTimings,
+) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
+    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.ec_store".to_owned(),
+            message: "ec.ec_store is not configured".to_owned(),
+        })
+    })?;
+    Ok(KvIdentityGraph::new(TimedKvStore::new(
+        FastlyEcKvStore::new(store_name),
+        timings.clone(),
+    )))
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
@@ -506,11 +1005,14 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
     use fastly::mime;
+    use std::time::Duration;
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::request_timing::AuctionWaitPlacement;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -536,6 +1038,26 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+    }
+
+    /// A minimal [`AccessTelemetrySnapshot`] fixture for tests that only
+    /// need a `DeliveryOutcome` to exist, not its telemetry content.
+    fn sample_access_snapshot() -> AccessTelemetrySnapshot {
+        AccessTelemetrySnapshot {
+            method: "GET".to_owned(),
+            status: 200,
+            route_class: RouteClass::Other,
+            route_template: "/other/*".to_owned(),
+            publisher_domain: "unknown".to_owned(),
+            env: "unknown".to_owned(),
+            service_id: "unknown".to_owned(),
+            pop: "unknown".to_owned(),
+            ts_version: "unknown".to_owned(),
+            country: "unknown".to_owned(),
+            template_cache_state: "unknown".to_owned(),
+            body_mode: "buffered",
+            sample_rate: 0.0,
+        }
     }
 
     #[test]
@@ -773,9 +1295,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        let geo_info = resolve_geo_for_response(&response, None, |_| {
-            panic!("should skip entry-point geo lookup for 401 responses");
-        });
+        let geo_info =
+            resolve_geo_for_response(&response, &GeoLookupState::NotAttempted, None, |_| {
+                panic!("should skip entry-point geo lookup for 401 responses");
+            });
         apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
 
         assert_eq!(
@@ -839,6 +1362,410 @@ mod tests {
         assert!(
             body.contains("ch-platform: not sent"),
             "should include sec-ch-ua-platform fallback"
+        );
+    }
+
+    fn ec_finalize_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            ec_store = "ec_identity_store"
+
+            [[ec.partners]]
+            name = "Example Partner"
+            source_domain = "example.com"
+            api_token = "test-vendor-token-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+            "#,
+        )
+        .expect("should parse EC finalize test settings")
+    }
+
+    /// Minimal `RuntimeServices` for `EcFinalizeState.services`. Real
+    /// `FastlyPlatform*` handles are used as inert placeholders: EC
+    /// finalization never calls through them, it only satisfies the field.
+    fn inert_runtime_services() -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore)
+                as Arc<dyn trusted_server_core::platform::PlatformKvStore>)
+            .backend(Arc::new(crate::platform::FastlyPlatformBackend))
+            .http_client(Arc::new(crate::platform::FastlyPlatformHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(trusted_server_core::platform::ClientInfo::default())
+            .build()
+    }
+
+    #[test]
+    fn ec_finalize_kv_lands_before_freeze() {
+        // A pre-seeded EC entry (see fastly.toml's ec_identity_store fixture)
+        // for a returning user carrying an eids cookie that matches the
+        // configured partner. This drives ec_finalize_response into
+        // ingest_eid_cookies, which reads and writes the KV identity graph.
+        let settings = ec_finalize_settings();
+        let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let request = edgezero_core::http::request_builder()
+            .method(fastly::http::Method::GET)
+            .uri("https://test-publisher.com/article")
+            .header("cookie", format!("ts-ec={ec_id}; ts-eids={eids_cookie}"))
+            .body(EdgeBody::empty())
+            .expect("should build EC finalize test request");
+
+        let services = inert_runtime_services();
+        let geo_info = trusted_server_core::platform::GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+            &settings,
+            &request,
+            &services,
+            Some(&geo_info),
+        )
+        .expect("should read EC context from a non-regulated request");
+        assert!(
+            ec_context.ec_was_present(),
+            "the pre-seeded ts-ec cookie should be recognized"
+        );
+
+        let mut ec_state = EcFinalizeState {
+            ec_context,
+            use_finalize_kv: true,
+            eids_cookie: Some(eids_cookie),
+            sharedid_cookie: None,
+            is_real_browser: true,
+            services,
+        };
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(EdgeBody::empty())
+            .expect("should build EC finalize response fixture");
+        let timings = RequestTimings::new();
+
+        // Mirrors edgezero_main's ordering: EC finalize runs, then the freeze
+        // point (apply_server_timing_header, called just before
+        // response.into_parts() inside send_edgezero_response) renders the
+        // header. Calling both directly exercises exactly this order without
+        // requiring a live Fastly client connection.
+        apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response, &timings)
+            .expect("should finalize EC response");
+        apply_server_timing_header(&mut response, &timings, true);
+
+        let header = response
+            .headers()
+            .get("server-timing")
+            .and_then(|v| v.to_str().ok())
+            .expect("should emit a Server-Timing header");
+        assert!(
+            header.contains("ts-kv"),
+            "the freeze point must run after EC finalization recorded KV time: {header}"
+        );
+    }
+
+    #[test]
+    fn delivery_outcome_reports_bytes_and_request_elapsed_set() {
+        let timings = RequestTimings::new();
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"hello "),
+            bytes::Bytes::from_static(b"world"),
+        ]));
+
+        let (counting, drive_result) = drive_streaming_body(body, Vec::new(), &timings);
+        drive_result.expect("streaming a well-formed body should not fail");
+        let bytes = counting.bytes();
+        let outcome = DeliveryOutcome {
+            bytes,
+            result: DeliveryResult::Complete,
+            snapshot: Some(sample_access_snapshot()),
+        };
+
+        assert_eq!(
+            counting.into_inner(),
+            b"hello world",
+            "should write every byte to the underlying transport"
+        );
+        assert_eq!(
+            outcome.bytes,
+            "hello world".len() as u64,
+            "DeliveryOutcome.bytes should equal the streamed body length"
+        );
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.resp_bytes,
+            Some("hello world".len() as u64),
+            "should stamp resp_bytes to the tallied byte count"
+        );
+        assert!(
+            snapshot.request_elapsed_ms.is_some(),
+            "should stamp request_elapsed once the drive returns"
+        );
+    }
+
+    #[test]
+    fn buffered_delivery_stamps_bytes_and_request_elapsed() {
+        let timings = RequestTimings::new();
+        let body = EdgeBody::from(b"a buffered body".to_vec());
+
+        let bytes = record_buffered_delivery(&body, &timings);
+
+        assert_eq!(
+            bytes,
+            "a buffered body".len() as u64,
+            "should report the buffered body length"
+        );
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.resp_bytes,
+            Some("a buffered body".len() as u64),
+            "should stamp resp_bytes for the buffered path too"
+        );
+        assert!(
+            snapshot.request_elapsed_ms.is_some(),
+            "should stamp request_elapsed for the buffered path too"
+        );
+    }
+
+    fn send_context_fixture() -> SendContext {
+        SendContext {
+            timings: RequestTimings::new(),
+            server_timing_enabled: false,
+            method: "GET".to_owned(),
+            publisher_domain: "test-publisher.com".to_owned(),
+            access_sample_rate: 0.25,
+            access_telemetry_enabled: true,
+        }
+    }
+
+    #[test]
+    fn access_snapshot_defaults_when_no_extensions_are_attached() {
+        // Router-generated 404/405 responses and other paths that never pass
+        // through a RouteMetadata-attaching wrapper must still produce a
+        // usable snapshot: RouteClass::Other and "unknown" sentinels, never
+        // a missing/panicking build.
+        let response = response_builder()
+            .status(404)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let context = send_context_fixture();
+
+        let snapshot = build_access_telemetry_snapshot(&response, &context);
+
+        assert_eq!(snapshot.status, 404);
+        assert_eq!(snapshot.method, "GET");
+        assert!(matches!(snapshot.route_class, RouteClass::Other));
+        assert_eq!(snapshot.route_template, "unknown");
+        assert_eq!(snapshot.country, "unknown");
+        assert_eq!(snapshot.template_cache_state, "unknown");
+        assert_eq!(snapshot.body_mode, "buffered");
+        assert_eq!(snapshot.publisher_domain, "test-publisher.com");
+        assert_eq!(snapshot.sample_rate, 0.25);
+    }
+
+    #[test]
+    fn access_snapshot_reads_route_geo_and_template_cache_extensions() {
+        let mut response = response_builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(RouteMetadata {
+            route_class: RouteClass::AuctionApi,
+            route_template: "/auction".to_owned(),
+        });
+        response.extensions_mut().insert(GeoLookupState::Resolved(
+            trusted_server_core::platform::GeoInfo {
+                city: String::new(),
+                country: "US".to_owned(),
+                continent: "NorthAmerica".to_owned(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                region: None,
+                asn: None,
+            },
+        ));
+        response
+            .extensions_mut()
+            .insert(TemplateCacheResponseState::Hit);
+        let context = send_context_fixture();
+
+        let snapshot = build_access_telemetry_snapshot(&response, &context);
+
+        assert!(matches!(snapshot.route_class, RouteClass::AuctionApi));
+        assert_eq!(snapshot.route_template, "/auction");
+        assert_eq!(snapshot.country, "US");
+        assert_eq!(snapshot.template_cache_state, "hit");
+    }
+
+    #[test]
+    fn access_snapshot_treats_attempted_geo_lookup_as_unknown_country() {
+        let mut response = response_builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(GeoLookupState::Attempted);
+        let context = send_context_fixture();
+
+        let snapshot = build_access_telemetry_snapshot(&response, &context);
+
+        assert_eq!(
+            snapshot.country, "unknown",
+            "an attempted-but-unresolved lookup must not surface a stale country"
+        );
+    }
+
+    #[test]
+    fn access_snapshot_body_mode_reflects_the_response_body_variant() {
+        let streamed = response_builder()
+            .status(200)
+            .body(EdgeBody::stream(futures::stream::empty()))
+            .expect("should build streaming response");
+        let buffered = response_builder()
+            .status(200)
+            .body(EdgeBody::from(b"hi".to_vec()))
+            .expect("should build buffered response");
+        let context = send_context_fixture();
+
+        assert_eq!(
+            build_access_telemetry_snapshot(&streamed, &context).body_mode,
+            "streamed"
+        );
+        assert_eq!(
+            build_access_telemetry_snapshot(&buffered, &context).body_mode,
+            "buffered"
+        );
+    }
+
+    #[test]
+    fn stream_drive_records_stream_ms_covering_the_in_stream_auction_wait() {
+        // A streaming seam wait (Task 6, publisher.rs) records into the same
+        // `RequestTimings` handle the adapter drives with. `Phase::Stream`
+        // wraps the entire drive, so it must cover — and therefore be at
+        // least as large as — any `AuctionWait` recorded while the body was
+        // being polled.
+        let timings = RequestTimings::new();
+        let wait_timings = timings.clone();
+        let stream = futures::stream::once(async move {
+            let waited = Duration::from_millis(5);
+            std::thread::sleep(waited);
+            wait_timings.record_auction_wait(AuctionWaitPlacement::InStream, waited);
+            bytes::Bytes::from_static(b"<html></html>")
+        });
+        let body = EdgeBody::stream(stream);
+
+        let (_counting, drive_result) = drive_streaming_body(body, Vec::new(), &timings);
+        drive_result.expect("streaming a well-formed body should not fail");
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::InStream),
+            "should preserve the placement recorded from inside the polled body"
+        );
+        let auction_wait_ms = snapshot
+            .auction_wait_ms
+            .expect("should record the auction wait");
+        let stream_ms = snapshot.stream_ms.expect("should record the stream drive");
+        assert!(
+            stream_ms >= auction_wait_ms,
+            "the drive's Phase::Stream span must cover the in-stream auction wait: \
+             stream_ms={stream_ms} auction_wait_ms={auction_wait_ms}"
+        );
+    }
+
+    #[test]
+    fn classify_stream_delivery_treats_bytes_written_before_an_error_as_partial() {
+        let err = Report::new(TrustedServerError::Proxy {
+            message: "boom".to_string(),
+        });
+        assert_eq!(
+            classify_stream_delivery(&Err(err), 42),
+            DeliveryResult::Partial,
+            "bytes already on the wire before a stream error is a truncated delivery"
+        );
+    }
+
+    #[test]
+    fn classify_stream_delivery_treats_an_error_with_no_bytes_as_error() {
+        let err = Report::new(TrustedServerError::Proxy {
+            message: "boom".to_string(),
+        });
+        assert_eq!(
+            classify_stream_delivery(&Err(err), 0),
+            DeliveryResult::Error,
+            "a failure before any byte reached the client is a clean failure, not a truncation"
+        );
+    }
+
+    #[test]
+    fn classify_stream_delivery_treats_ok_as_complete() {
+        assert_eq!(
+            classify_stream_delivery(&Ok(()), 123),
+            DeliveryResult::Complete
+        );
+    }
+
+    #[test]
+    fn request_elapsed_is_stamped_when_send_returns() {
+        // `edgezero_main`'s post-send ordering (pull-sync before telemetry)
+        // is a source-order invariant with no injectable seam, so this test
+        // deliberately proves only the leg that has one: by the time
+        // `send_edgezero_response` returns, `request_elapsed` is already
+        // stamped, so everything `edgezero_main` runs afterwards (pull-sync,
+        // telemetry emission) is excluded from `request_elapsed_ms`.
+        let timings = RequestTimings::new();
+        let response = response_builder()
+            .body(EdgeBody::from("ok"))
+            .expect("should build response");
+
+        let outcome = send_edgezero_response(
+            response,
+            None,
+            &SendContext {
+                timings: timings.clone(),
+                server_timing_enabled: false,
+                method: "GET".to_owned(),
+                publisher_domain: "test-publisher.com".to_owned(),
+                access_sample_rate: 1.0,
+                access_telemetry_enabled: true,
+            },
+        );
+
+        assert!(
+            timings.snapshot().request_elapsed_ms.is_some(),
+            "request_elapsed should be stamped by the time send returns"
+        );
+        assert!(
+            outcome.snapshot.is_some(),
+            "the access snapshot should exist for the enabled context"
         );
     }
 }

@@ -15,11 +15,12 @@ use fastly::{ConfigStore, Request, SecretStore};
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
-    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformKvStore,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
+    StoreName,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
 
@@ -150,6 +151,11 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
 /// timeout → unique name).
 pub struct FastlyPlatformBackend;
 
+#[cfg(test)]
+const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
+#[cfg(test)]
+const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
+
 fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
     BackendConfig::new(&spec.scheme, &spec.host)
         .port(spec.port)
@@ -160,83 +166,15 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
         .discriminator(spec.discriminator.as_deref())
 }
 
-/// Transport-timeout quantum for auction backends (see
-/// [`FastlyPlatformBackend::canonicalize_transport_timeout_ms`]).
-const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
-
-/// Upper bound of the fine-grained quantum range.
-///
-/// Budget-bound values below this ceiling are floored to a
-/// [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple (the issue #847 behavior for the
-/// default 2000 ms auction). At or above it, values snap to the coarse
-/// [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] instead so the total number of
-/// distinct budget-derived buckets stays globally bounded regardless of how
-/// large the configured ceiling is.
-const TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
-
-/// Coarse rungs for budget-bound transport timeouts below one quantum,
-/// ordered high to low.
-///
-/// Below one quantum, passing the exact wall-clock remainder through would mint
-/// a distinct backend name for every millisecond in `1..250`, so the
-/// near-exhausted tail alone could exceed Fastly's per-service dynamic backend
-/// limit. Snapping to this finite ladder instead bounds the number of
-/// budget-derived names an origin can produce. Budgets below the smallest rung
-/// round to zero, which callers treat as "budget exhausted — skip the launch".
-const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
-
-/// Coarse rungs for budget-bound transport timeouts at or above the quantum
-/// ceiling, ascending. Every rung is a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
-/// multiple.
-///
-/// Above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], flooring to a 250 ms multiple
-/// would let a large configured ceiling (e.g. 60,000 ms) mint hundreds of
-/// distinct backend names — recreating the per-service dynamic backend
-/// exhaustion this quantization exists to prevent. This fixed, globally finite
-/// ladder caps the number of high-budget buckets instead: values are floored to
-/// the greatest rung no larger than the remaining budget, and anything above
-/// the top rung clamps to it. Rounding down never extends a transport cap past
-/// the remaining budget.
-///
-/// The rung spacing trades transport window for cardinality: just below a rung
-/// the haircut approaches the gap to the rung beneath (worst case ~50%, e.g. a
-/// remaining budget of 9,999 ms snaps to 5,000 ms). This is accepted — on the
-/// mediator path this value is the effective bound, but a denser ladder would
-/// buy back at most half a bucket of transport time at the cost of
-/// proportionally more backend names.
-const TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
-    [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
-
-/// Round a budget-bound transport timeout down to a stable, globally bounded
-/// bucket.
-///
-/// - At or above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], floors to the
-///   greatest [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] rung no larger than
-///   `remaining_ms` (clamping to the top rung above it).
-/// - Within the quantum range, floors to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
-///   multiple.
-/// - Below one quantum, snaps down to the greatest [`SUB_QUANTUM_LADDER_MS`]
-///   rung no larger than `remaining_ms` (or zero).
-fn quantize_transport_timeout_ms(remaining_ms: u32) -> u32 {
-    if remaining_ms >= TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS {
-        return TRANSPORT_TIMEOUT_COARSE_LADDER_MS
-            .into_iter()
-            .rev()
-            .find(|&rung| rung <= remaining_ms)
-            .unwrap_or(TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS);
-    }
-    let floored = (remaining_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS;
-    if floored > 0 {
-        return floored;
-    }
-    SUB_QUANTUM_LADDER_MS
-        .into_iter()
-        .find(|&rung| rung <= remaining_ms)
-        .unwrap_or(0)
-}
-
 impl PlatformBackend for FastlyPlatformBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Fastly
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        // Use the same host normalization as registration. In particular,
+        // URL-derived IPv6 hosts arrive bracketed, but both forms must predict
+        // the backend that `ensure` actually registers.
         backend_config_from_spec(spec)
             .predict_name()
             .change_context(PlatformError::Backend)
@@ -246,28 +184,6 @@ impl PlatformBackend for FastlyPlatformBackend {
         backend_config_from_spec(spec)
             .ensure()
             .change_context(PlatformError::Backend)
-    }
-
-    /// Quantize the transport timeout so budget-derived values do not mint a
-    /// new dynamic backend name on every request.
-    ///
-    /// Fastly embeds the first-byte and between-bytes timeouts in the dynamic
-    /// backend name (see [`BackendConfig`]) and pools connections per backend
-    /// name. A per-request wall-clock budget would otherwise defeat that
-    /// pooling and accumulate registrations toward the per-service dynamic
-    /// backend limit.
-    ///
-    /// A provider's own configured timeout is a constant, so when it is the
-    /// binding constraint it is returned verbatim — including sub-quantum
-    /// configured values, which must not be rounded away or the provider could
-    /// never launch. Only the budget-bound value is snapped to a stable bucket
-    /// via [`quantize_transport_timeout_ms`]. Rounding down never extends a
-    /// transport cap past the remaining budget.
-    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
-        if remaining_ms >= configured_ms {
-            return configured_ms;
-        }
-        quantize_transport_timeout_ms(remaining_ms)
     }
 }
 
@@ -544,11 +460,23 @@ fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) 
 /// - [`select`](PlatformHttpClient::select) downcasts each
 ///   [`PlatformPendingRequest`] back to `fastly::PendingRequest` and calls
 ///   `fastly::http::request::select()`.
+///
+/// Fastly's Compute HTTP API sends one request to the named backend and returns
+/// the origin response; it has no client-side redirect-follow mode. Consequently
+/// each trait call below performs exactly one underlying `.send()` or
+/// `.send_async()`, and an original 3xx remains visible to core. The host test
+/// environment cannot register a real Fastly backend, so the common
+/// `StubHttpClient` driver test records the one-send 3xx behavior while adapter
+/// tests cover request conversion and the single-send boundary.
 pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for FastlyPlatformHttpClient {
     fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
+    fn supports_pending_streaming_responses(&self) -> bool {
         true
     }
 
@@ -581,17 +509,17 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("Image Optimizer is not supported with Fastly send_async"));
         }
-        if request.stream_response {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("streaming responses are not supported with Fastly send_async"));
-        }
+        let stream_response = request.stream_response;
+        let request_method = request.request.method().clone();
         let bypass_cache = request.bypass_cache;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
         let pending = fastly_req
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
+        Ok(PlatformPendingRequest::new(pending)
+            .with_backend_name(backend_name)
+            .with_response_handling(stream_response, request_method))
     }
 
     async fn select(
@@ -603,6 +531,14 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with an empty pending_requests list"));
+        }
+
+        if pending_requests
+            .iter()
+            .any(PlatformPendingRequest::stream_response)
+        {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("stream-marked pending request requires direct wait"));
         }
 
         let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
@@ -660,6 +596,33 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             remaining,
             failed_backend_name,
         })
+    }
+
+    async fn wait(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        use fastly::http::request::PendingRequest;
+
+        let backend_hint = pending.backend_name().map(str::to_owned);
+        let stream_response = pending.stream_response();
+        let request_is_head = pending.request_method() == Some(&edgezero_core::http::Method::HEAD);
+        let pending = pending.downcast::<PendingRequest>().map_err(|pending| {
+            let backend_name = pending.backend_name().unwrap_or("<unknown>");
+            Report::new(PlatformError::HttpClient).attach(format!(
+                "PlatformPendingRequest inner type is not fastly::PendingRequest for backend '{backend_name}'"
+            ))
+        })?;
+        let response = pending.wait().change_context(PlatformError::HttpClient)?;
+        let backend_name = response
+            .get_backend_name()
+            .map(str::to_owned)
+            .or(backend_hint)
+            .ok_or_else(|| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("wait: response has no backend name; correlation impossible")
+            })?;
+        fastly_response_to_platform(response, backend_name, stream_response, request_is_head)
     }
 }
 
@@ -1136,7 +1099,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bracketed_ipv6_predict_name_matches_bare_and_ensured_backend_name() {
+        let backend = FastlyPlatformBackend;
+        let bracketed = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "[2001:db8::9]".to_string(),
+            port: Some(8443),
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(750),
+            between_bytes_timeout: Duration::from_millis(750),
+            discriminator: Some("ipv6-provider".to_string()),
+        };
+        let mut bare = bracketed.clone();
+        bare.host = "2001:db8::9".to_string();
+
+        let predicted = backend
+            .predict_name(&bracketed)
+            .expect("should predict bracketed IPv6 backend name");
+        let bare_predicted = backend
+            .predict_name(&bare)
+            .expect("should predict bare IPv6 backend name");
+        let ensured = backend
+            .ensure(&bracketed)
+            .expect("should register bracketed IPv6 backend");
+
+        assert_eq!(predicted, bare_predicted);
+        assert_eq!(predicted, ensured);
+    }
+
     // --- FastlyPlatformHttpClient -------------------------------------------
+
+    #[test]
+    fn auction_http_capabilities_are_explicit() {
+        let client = FastlyPlatformHttpClient;
+        let capabilities = trusted_server_core::platform::AuctionTargetId::Fastly
+            .descriptor()
+            .capabilities();
+        assert!(client.supports_concurrent_fanout());
+        assert!(capabilities.supports_concurrent_provider_fanout());
+        assert!(!client.has_enforceable_total_request_deadline());
+        assert!(
+            !capabilities.has_enforceable_total_request_deadline(),
+            "first-byte and between-byte timers are not a hard total request deadline"
+        );
+    }
+
+    #[test]
+    fn response_conversion_preserves_original_redirect_at_single_send_boundary() {
+        let mut response = fastly::Response::from_status(fastly::http::StatusCode::FOUND);
+        response.set_header("location", "https://redirect.example/next");
+
+        let platform = fastly_response_to_platform(response, "origin", false, false)
+            .expect("should convert redirect response");
+
+        assert_eq!(platform.response.status().as_u16(), 302);
+        assert_eq!(
+            platform
+                .response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://redirect.example/next")
+        );
+    }
 
     #[test]
     fn apply_fastly_cache_bypass_sets_pass_when_enabled() {
@@ -1307,6 +1334,21 @@ mod tests {
     }
 
     #[test]
+    fn fastly_platform_http_client_rejects_stream_marked_pending_from_select() {
+        let client = FastlyPlatformHttpClient;
+        let pending = PlatformPendingRequest::new(42_u32)
+            .with_backend_name("origin-a")
+            .with_response_handling(true, edgezero_core::http::Method::GET);
+        let err = futures::executor::block_on(client.select(vec![pending]))
+            .expect_err("should reject stream-marked pending handles from select");
+
+        assert!(
+            format!("{err:?}").contains("stream-marked pending request"),
+            "should explain that streaming pendings require direct wait: {err:?}"
+        );
+    }
+
+    #[test]
     fn fastly_platform_http_client_send_returns_error_for_streaming_body() {
         let client = FastlyPlatformHttpClient;
         let request = request_builder()
@@ -1357,8 +1399,13 @@ mod tests {
     }
 
     #[test]
-    fn fastly_platform_http_client_send_async_rejects_stream_response() {
+    fn fastly_platform_http_client_supports_pending_streaming_responses() {
         let client = FastlyPlatformHttpClient;
+        assert!(
+            client.supports_pending_streaming_responses(),
+            "should advertise direct pending-response streaming"
+        );
+
         let request = request_builder()
             .method("GET")
             .uri("https://example.com/image.jpg")
@@ -1368,11 +1415,11 @@ mod tests {
             PlatformHttpRequest::new(request, "nonexistent-backend").with_stream_response();
 
         let err = futures::executor::block_on(client.send_async(platform_request))
-            .expect_err("should reject async streaming-response requests");
+            .expect_err("should fail only because the backend is unregistered");
 
         assert!(
-            format!("{err:?}").contains("streaming responses"),
-            "should explain unsupported async streaming-response path: {err:?}"
+            !format!("{err:?}").contains("streaming responses are not supported"),
+            "should accept streaming on the async path before backend dispatch: {err:?}"
         );
     }
 

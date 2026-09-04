@@ -11,9 +11,13 @@ use trusted_server_core::auction::telemetry::{
 };
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, StoreName,
+    PlatformBackend as _, PlatformBackendSpec, PlatformHttpClient, PlatformHttpRequest,
+    RuntimeServices,
 };
+use trusted_server_core::redacted::Redacted;
 use trusted_server_core::settings::{Settings, TinybirdSettings};
+
+use crate::platform::FastlyPlatformBackend;
 
 const TINYBIRD_EVENTS_PATH: &str = "/v0/events";
 const TINYBIRD_NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
@@ -22,9 +26,14 @@ const TINYBIRD_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(2);
 const TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH: usize = 512;
 
 /// Build the configured auction telemetry sink.
+///
+/// Auction emission requires both the Tinybird master toggle
+/// (`tinybird.enabled`) and the auction-specific toggle
+/// (`tinybird.auction_enabled`), so access-log telemetry can be enabled
+/// independently without also emitting auction events.
 #[must_use]
 pub(crate) fn auction_sink_from_settings(settings: &Settings) -> Arc<dyn AuctionTelemetrySink> {
-    if settings.tinybird.enabled {
+    if settings.tinybird.enabled && settings.tinybird.auction_enabled {
         Arc::new(FastlyTinybirdAuctionTelemetrySink::new(
             settings.tinybird.clone(),
         ))
@@ -40,11 +49,10 @@ struct FastlyTinybirdAuctionTelemetrySink {
 }
 
 #[derive(Debug, Clone)]
-struct TinybirdEventsTarget {
+pub(crate) struct TinybirdEventsTarget {
     api_host: String,
     dataset: String,
-    secret_store: StoreName,
-    token_secret: String,
+    append_token: Redacted<String>,
     uri: String,
     backend_spec: PlatformBackendSpec,
     max_body_bytes: usize,
@@ -57,8 +65,31 @@ impl TinybirdEventsTarget {
         Self {
             api_host: config.api_host,
             dataset: config.auction_dataset,
-            secret_store: StoreName::from(config.secret_store),
-            token_secret: config.auction_token_secret,
+            append_token: config
+                .auction_token_secret
+                .expect("should contain a resolved Tinybird auction token when enabled"),
+            uri,
+            backend_spec,
+            max_body_bytes: config.max_body_bytes,
+        }
+    }
+
+    /// Builds the Events API target for the access-log datasource.
+    ///
+    /// Shares [`from_config`](Self::from_config)'s host, resolved-token, and
+    /// body-size-limit derivation, but points at `access_dataset` and
+    /// `access_token_secret` instead of the auction pair, so access-log
+    /// emission never shares a datasource or token with auction telemetry
+    /// even though both configs come from the same [`TinybirdSettings`].
+    pub(crate) fn from_access_config(config: TinybirdSettings) -> Self {
+        let uri = tinybird_events_uri(&config.api_host, &config.access_dataset);
+        let backend_spec = tinybird_backend_spec(&config.api_host);
+        Self {
+            api_host: config.api_host,
+            dataset: config.access_dataset,
+            append_token: config
+                .access_token_secret
+                .expect("should contain a resolved Tinybird access token when enabled"),
             uri,
             backend_spec,
             max_body_bytes: config.max_body_bytes,
@@ -93,25 +124,6 @@ impl FastlyTinybirdAuctionTelemetrySink {
         batch: &AuctionEventBatch,
     ) -> Result<String, Report<TrustedServerError>> {
         batch.to_ndjson(self.target.max_body_bytes)
-    }
-
-    fn load_append_token(
-        &self,
-        services: &RuntimeServices,
-    ) -> Result<String, Report<TrustedServerError>> {
-        let token = services
-            .secret_store()
-            .get_string(&self.target.secret_store, &self.target.token_secret)
-            .change_context(TrustedServerError::Proxy {
-                message: "Tinybird auction append token unavailable".to_owned(),
-            })?;
-        let token = token.trim().to_owned();
-        if token.is_empty() {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "Tinybird auction append token is empty".to_owned(),
-            }));
-        }
-        Ok(token)
     }
 
     fn ensure_backend(
@@ -185,8 +197,7 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
         Self::validate_batch(&batch)?;
         let body = self.serialize_batch(&batch)?;
         let body_len = body.len();
-        let token = self.load_append_token(services)?;
-        let auth_header = Self::authorization_header(&token)?;
+        let auth_header = Self::authorization_header(self.target.append_token.expose())?;
         let backend_name = self.ensure_backend(services)?;
         let request = self.build_events_request(body, auth_header)?;
 
@@ -200,6 +211,124 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
         );
 
         Self::send_fire_and_forget(services, request, backend_name).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Access telemetry: confirmed-delivery emitter
+// ---------------------------------------------------------------------------
+
+/// Decides whether one request's access-telemetry row should be emitted.
+///
+/// `roll` is a uniform draw from `[0, 1)`; callers pass
+/// `rand::thread_rng().r#gen::<f64>()`, which the wasm32-wasip1 guest backs with
+/// real WASI randomness (the EC generation path already relies on this and
+/// the CI wasm release build verifies it). Comparing the draw directly
+/// against `rate` keeps the sampling probability exactly `rate` for every
+/// positive value: there is no bucket quantization, so rates below one in a
+/// million sample proportionally instead of never, and emitted rows'
+/// `sample_rate` matches the probability they were sampled at, which the
+/// `sum(1.0 / sample_rate)` volume estimator depends on.
+///
+/// `rate <= 0.0` never samples and `rate >= 1.0` always samples, for any
+/// `roll` in `[0, 1)`. `0.0` cannot actually occur while `access_enabled`
+/// is `true` (`Settings` validation requires `access_sample_rate > 0.0` in
+/// that case), but this function stays total rather than leaning on that
+/// invariant.
+#[must_use]
+pub(crate) fn sampled_in(rate: f64, roll: f64) -> bool {
+    roll < rate
+}
+
+/// Builds the Events API POST request for one access-log row.
+fn build_access_events_request(
+    target: &TinybirdEventsTarget,
+    body: String,
+    auth_header: HeaderValue,
+) -> Result<edgezero_core::http::Request, Report<TrustedServerError>> {
+    request_builder()
+        .method(Method::POST)
+        .uri(target.uri.as_str())
+        .header(header::AUTHORIZATION, auth_header)
+        .header(header::CONTENT_TYPE, TINYBIRD_NDJSON_CONTENT_TYPE)
+        .body(Body::from(body))
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to build Tinybird Events API request".to_owned(),
+        })
+}
+
+/// Sends one confirmed access-log row to the Tinybird Events API and waits
+/// for the response.
+///
+/// Unlike [`FastlyTinybirdAuctionTelemetrySink::emit_auction_events`] (fire-
+/// and-forget, dispatched mid-request so it never adds latency to the
+/// response), this runs post-delivery: the response has already reached the
+/// client, so there is no latency budget left to protect, and the send can
+/// afford to wait for — and validate — the reply. `client` is the adapter's
+/// stateless platform HTTP client in production
+/// ([`crate::platform::FastlyPlatformHttpClient`]); accepting it as `&dyn
+/// PlatformHttpClient` here (rather than that concrete type) is what lets
+/// tests substitute a recording double instead of performing a real network
+/// send, matching how [`RuntimeServices::http_client`] is consumed
+/// elsewhere. `target` is derived from settings once at the post-send call
+/// site rather than threaded through any per-route state.
+///
+/// A non-2xx status is reported as `Err` naming the status; there is no
+/// retry — the caller logs exactly one warning and moves on.
+///
+/// # Errors
+///
+/// Returns `Err` when the row exceeds the configured request-body limit, the
+/// resolved access-log APPEND token is invalid, the backend cannot be registered,
+/// the request cannot be built or sent, or the Tinybird Events API responds
+/// with a non-2xx status.
+pub(crate) async fn emit_access_event(
+    client: &dyn PlatformHttpClient,
+    target: &TinybirdEventsTarget,
+    row: String,
+) -> Result<(), Report<TrustedServerError>> {
+    let body_len = row.len();
+    if body_len > target.max_body_bytes {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: format!(
+                "Tinybird access telemetry request body has {body_len} bytes, exceeding {} byte limit",
+                target.max_body_bytes
+            ),
+        }));
+    }
+
+    let auth_header =
+        FastlyTinybirdAuctionTelemetrySink::authorization_header(target.append_token.expose())?;
+    let backend_name = FastlyPlatformBackend
+        .ensure(&target.backend_spec)
+        .change_context(TrustedServerError::Proxy {
+            message: "Tinybird backend registration failed".to_owned(),
+        })?;
+    let request = build_access_events_request(target, row, auth_header)?;
+
+    log::info!(
+        "sending access telemetry to Tinybird dataset={} host={} backend={}",
+        target.dataset,
+        target.api_host,
+        backend_name
+    );
+
+    let response = client
+        .send(PlatformHttpRequest::new(request, backend_name))
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to send Tinybird access telemetry request".to_owned(),
+        })?;
+
+    if response.response.status().is_success() {
+        Ok(())
+    } else {
+        Err(Report::new(TrustedServerError::Proxy {
+            message: format!(
+                "Tinybird access telemetry request failed with status {}",
+                response.response.status()
+            ),
+        }))
     }
 }
 
@@ -233,10 +362,13 @@ mod tests {
     use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformConfigStore, PlatformError, PlatformGeo,
         PlatformHttpClient, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-        PlatformSelectResult, RuntimeServices, StoreId,
+        PlatformSelectResult, RuntimeServices, StoreId, StoreName,
     };
 
     use super::*;
+
+    const TEST_USER_AGENT: &str =
+        "FictionalBrowser/123.4 (FictionalOS 10.2; FictionalDevice) ExampleRenderer/567.8";
 
     struct NoopConfigStore;
 
@@ -297,6 +429,10 @@ mod tests {
     }
 
     impl PlatformBackend for RecordingBackend {
+        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
+            trusted_server_core::platform::BackendNamingPolicy::Fastly
+        }
+
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,
@@ -322,25 +458,28 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// Records outbound requests and, for [`PlatformHttpClient::send`] (the
+    /// blocking variant `emit_access_event` uses), returns a synthetic
+    /// response carrying `respond_status` instead of performing a real
+    /// network send.
     #[derive(Default)]
     struct RecordingHttpClient {
         requests: Mutex<Vec<RecordedRequest>>,
         select_calls: Mutex<usize>,
+        respond_status: Mutex<u16>,
     }
 
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for RecordingHttpClient {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+    impl RecordingHttpClient {
+        /// Status [`PlatformHttpClient::send`] should reply with. Irrelevant
+        /// to auction-sink tests, which only exercise `send_async`.
+        fn respond_with(status: u16) -> Self {
+            Self {
+                respond_status: Mutex::new(status),
+                ..Self::default()
+            }
         }
 
-        async fn send_async(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        fn record(&self, request: PlatformHttpRequest) {
             let backend_name = request.backend_name;
             let (parts, body) = request.request.into_parts();
             let headers = parts
@@ -364,6 +503,35 @@ mod tests {
                 .lock()
                 .expect("should lock recorded requests")
                 .push(recorded);
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for RecordingHttpClient {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.record(request);
+            let status = *self
+                .respond_status
+                .lock()
+                .expect("should lock configured response status");
+            let response = edgezero_core::http::response_builder()
+                .status(
+                    edgezero_core::http::StatusCode::from_u16(status)
+                        .expect("should build a valid test status code"),
+                )
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build test response");
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            self.record(request);
             Ok(PlatformPendingRequest::new(()).with_backend_name("tinybird-backend"))
         }
 
@@ -399,6 +567,7 @@ mod tests {
             region: None,
             is_mobile: 0,
             is_known_browser: 1,
+            user_agent: Some(TEST_USER_AGENT.to_owned()),
             gdpr_applies: 0,
             consent_present: 0,
             terminal_status: Some("completed".to_owned()),
@@ -443,16 +612,50 @@ mod tests {
     fn enabled_config() -> TinybirdSettings {
         TinybirdSettings {
             enabled: true,
+            auction_enabled: true,
             api_host: "api.us-east.aws.tinybird.co".to_owned(),
-            secret_store: "ts_secrets".to_owned(),
+            secret_store: None,
             auction_dataset: "auction_events_raw".to_owned(),
-            auction_token_secret: "tinybird_auction_append_token".to_owned(),
+            auction_token_secret: Some(Redacted::new("append-token".to_owned())),
             access_enabled: false,
             access_dataset: "access_logs_raw".to_owned(),
-            access_token_secret: "tinybird_access_append_token".to_owned(),
+            access_token_secret: Some(Redacted::new("access-append-token".to_owned())),
             access_sample_rate: 0.0,
             max_body_bytes: 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn sink_from_settings_disables_when_auction_enabled_is_false() {
+        let settings = Settings {
+            tinybird: TinybirdSettings {
+                auction_enabled: false,
+                ..enabled_config()
+            },
+            ..Settings::default()
+        };
+
+        let sink = auction_sink_from_settings(&settings);
+
+        assert!(
+            !sink.is_enabled(),
+            "auction telemetry should stay off when auction_enabled is false, even if tinybird.enabled is true"
+        );
+    }
+
+    #[test]
+    fn sink_from_settings_enables_when_both_toggles_are_true() {
+        let settings = Settings {
+            tinybird: enabled_config(),
+            ..Settings::default()
+        };
+
+        let sink = auction_sink_from_settings(&settings);
+
+        assert!(
+            sink.is_enabled(),
+            "auction telemetry should be on when both tinybird.enabled and tinybird.auction_enabled are true"
+        );
     }
 
     #[test]
@@ -481,16 +684,13 @@ mod tests {
     }
 
     #[test]
-    fn sink_posts_ndjson_with_secret_token_and_does_not_wait() {
+    fn sink_posts_ndjson_with_resolved_token_and_does_not_wait() {
         let backend = Arc::new(RecordingBackend::default());
         let http_client = Arc::new(RecordingHttpClient::default());
         let services = services(
             Arc::clone(&backend),
             Arc::clone(&http_client),
-            HashMap::from([(
-                "tinybird_auction_append_token".to_owned(),
-                b" append-token\n".to_vec(),
-            )]),
+            HashMap::new(),
         );
         let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
 
@@ -523,11 +723,11 @@ mod tests {
             header_value(&requests[0].headers, header::AUTHORIZATION.as_str()),
             Some("Bearer append-token")
         );
+        let body = std::str::from_utf8(&requests[0].body).expect("should record utf8 ndjson body");
+        assert!(body.ends_with('\n'), "should send newline-delimited JSON");
         assert!(
-            std::str::from_utf8(&requests[0].body)
-                .expect("should record utf8 ndjson body")
-                .ends_with('\n'),
-            "should send newline-delimited JSON"
+            body.contains(TEST_USER_AGENT),
+            "should send the complete user agent to Tinybird"
         );
         assert_eq!(
             *http_client
@@ -602,31 +802,6 @@ mod tests {
     }
 
     #[test]
-    fn sink_drops_missing_secret_as_setup_error() {
-        let backend = Arc::new(RecordingBackend::default());
-        let http_client = Arc::new(RecordingHttpClient::default());
-        let services = services(backend, Arc::clone(&http_client), HashMap::new());
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
-
-        let result = futures::executor::block_on(
-            sink.emit_auction_events(&services, AuctionEventBatch::new(vec![test_row()])),
-        );
-
-        assert!(
-            result.is_err(),
-            "best-effort caller will suppress this error"
-        );
-        assert!(
-            http_client
-                .requests
-                .lock()
-                .expect("should lock recorded requests")
-                .is_empty(),
-            "should not send without a token"
-        );
-    }
-
-    #[test]
     fn sink_drops_row_count_oversize_before_sending() {
         let backend = Arc::new(RecordingBackend::default());
         let http_client = Arc::new(RecordingHttpClient::default());
@@ -656,6 +831,134 @@ mod tests {
                 .expect("should lock recorded requests")
                 .is_empty(),
             "should not send oversized row batches"
+        );
+    }
+
+    #[test]
+    fn access_emitter_rejects_oversized_row_before_sending() {
+        let mut config = enabled_config();
+        config.max_body_bytes = 1024;
+        let target = TinybirdEventsTarget::from_access_config(config);
+        let http_client = RecordingHttpClient::respond_with(202);
+        let row = "x".repeat(1025);
+
+        let result = futures::executor::block_on(emit_access_event(&http_client, &target, row));
+
+        let error = result.expect_err("should reject a row above the configured body limit");
+        assert!(
+            error.to_string().contains("1024"),
+            "error should name the configured body limit: {error}"
+        );
+        assert!(
+            http_client
+                .requests
+                .lock()
+                .expect("should lock recorded requests")
+                .is_empty(),
+            "should not send an oversized access row"
+        );
+    }
+
+    #[test]
+    fn access_emitter_posts_ndjson_and_validates_2xx() {
+        // Runtime settings carry the access APPEND token after startup secret
+        // resolution, so post-delivery emission does not reopen a secret store.
+        let target = TinybirdEventsTarget::from_access_config(enabled_config());
+        let http_client = RecordingHttpClient::respond_with(202);
+        let row = r#"{"status":200}"#.to_owned();
+
+        futures::executor::block_on(emit_access_event(&http_client, &target, row.clone()))
+            .expect("should accept a 202 response");
+
+        let requests = http_client
+            .requests
+            .lock()
+            .expect("should lock recorded requests");
+        assert_eq!(requests.len(), 1, "should send exactly one request");
+        assert_eq!(
+            requests[0].uri,
+            "https://api.us-east.aws.tinybird.co/v0/events?name=access_logs_raw"
+        );
+        assert_eq!(requests[0].method, Method::POST.to_string());
+        assert_eq!(
+            header_value(&requests[0].headers, header::AUTHORIZATION.as_str()),
+            Some("Bearer access-append-token")
+        );
+        assert_eq!(
+            std::str::from_utf8(&requests[0].body).expect("should record utf8 body"),
+            row,
+            "should send the row verbatim as the request body"
+        );
+    }
+
+    #[test]
+    fn access_emitter_warns_and_drops_on_non_2xx() {
+        let target = TinybirdEventsTarget::from_access_config(enabled_config());
+        let http_client = RecordingHttpClient::respond_with(422);
+
+        let result = futures::executor::block_on(emit_access_event(
+            &http_client,
+            &target,
+            r#"{"status":422}"#.to_owned(),
+        ));
+
+        let error = result.expect_err("a 422 response should be reported as an error");
+        assert!(
+            error.to_string().contains("422"),
+            "error should name the failing status: {error}"
+        );
+        assert_eq!(
+            http_client
+                .requests
+                .lock()
+                .expect("should lock recorded requests")
+                .len(),
+            1,
+            "should not retry after a non-2xx response"
+        );
+    }
+
+    #[test]
+    fn sampled_in_boundary_rates_are_unconditional() {
+        assert!(
+            sampled_in(1.0, 0.0),
+            "a 1.0 sample rate should always sample in"
+        );
+        assert!(
+            sampled_in(1.0, 0.999_999),
+            "a 1.0 sample rate should sample in for the largest roll"
+        );
+        assert!(
+            !sampled_in(0.0, 0.0),
+            "a 0.0 sample rate should never sample in, even on a zero roll"
+        );
+        assert!(
+            !sampled_in(-1.0, 0.0),
+            "a negative rate should never sample in"
+        );
+    }
+
+    #[test]
+    fn sampled_in_keeps_exact_probability_for_tiny_rates() {
+        // The previous bucket-quantized sampler truncated rates below one
+        // in a million to a zero threshold, silently emitting nothing.
+        // Direct comparison keeps every positive rate proportional.
+        let rate = 0.000_000_1;
+        assert!(
+            sampled_in(rate, rate / 2.0),
+            "a roll below a tiny positive rate should sample in"
+        );
+        assert!(
+            !sampled_in(rate, rate * 2.0),
+            "a roll above a tiny positive rate should sample out"
+        );
+        assert!(
+            !sampled_in(0.000_001_9, 0.000_001_95),
+            "no downward quantization: the boundary sits exactly at the rate"
+        );
+        assert!(
+            sampled_in(0.000_001_9, 0.000_001_85),
+            "rolls just under the rate should sample in"
         );
     }
 

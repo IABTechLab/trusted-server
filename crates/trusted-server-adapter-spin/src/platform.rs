@@ -5,20 +5,18 @@ use std::time::Duration;
 use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use http_body_util::BodyExt as _;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-    PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore, PlatformSecretStore,
-    RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
+    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 use trusted_server_core::platform::UnavailableHttpClient;
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use error_stack::ResultExt as _;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use std::io::Read as _;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -39,6 +37,7 @@ type HeaderPairs = Vec<(String, Vec<u8>)>;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type BufferedResponseParts = (HeaderPairs, Vec<u8>);
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
 
 // ---------------------------------------------------------------------------
@@ -82,27 +81,15 @@ impl PlatformSecretStore for NoopSecretStore {
 struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Spin
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        let port = spec
-            .port
-            .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
-        let timeout_ms = spec.first_byte_timeout.as_millis();
-        let cert_suffix = if spec.certificate_check {
-            ""
-        } else {
-            "_nocert"
-        };
-        // Keep two providers that share an origin on distinct names so auction
-        // response correlation cannot cross providers.
-        let discriminator = spec
-            .discriminator
-            .as_deref()
-            .map(|d| format!("_p_{d}"))
-            .unwrap_or_default();
-        Ok(format!(
-            "{}_{}_{}_{timeout_ms}ms{cert_suffix}{discriminator}",
-            spec.scheme, spec.host, port
-        ))
+        self.naming_policy()
+            .predict(spec)
+            .map(|prediction| prediction.name)
+            .change_context(PlatformError::Backend)
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -116,25 +103,22 @@ impl PlatformBackend for NoopBackend {
 
 /// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
 ///
-/// Reads delegate through the handle after mapping Trusted Server keys to Spin
-/// variable names. Writes are unsupported on current Spin runtime config and
-/// return typed errors.
-struct ConfigStoreHandleAdapter(ConfigStoreHandle);
+/// Spin config stores are KV-backed, so reads preserve the requested key
+/// verbatim. Writes are unsupported on current Spin runtime config and return
+/// typed errors.
+pub(crate) struct ConfigStoreHandleAdapter(pub(crate) ConfigStoreHandle);
 
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let variable_name = spin_variable_name(key, PlatformError::ConfigStore)?;
-        futures::executor::block_on(self.0.get(&variable_name))
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!(
-                        "config store lookup failed for key `{key}` as Spin variable `{variable_name}`: {e}"
-                    ))
+        futures::executor::block_on(self.0.get(key))
+            .map_err(|error| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "config store lookup failed for key `{key}`: {error}"
+                ))
             })?
             .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "key `{key}` not found as Spin variable `{variable_name}`"
-                ))
+                Report::new(PlatformError::ConfigStore)
+                    .attach(format!("key `{key}` not found in Spin config store"))
             })
     }
 
@@ -149,6 +133,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 }
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn spin_variable_name(
     key: &str,
     error_context: PlatformError,
@@ -187,6 +172,7 @@ fn spin_variable_name(
     Ok(out)
 }
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn push_spin_variable_escape(out: &mut String, byte: u8) {
     out.push('_');
     out.push('x');
@@ -462,6 +448,13 @@ struct SpinPendingResponse {
 /// request launches. `select` keeps a defense-in-depth rejection for more
 /// than one pending request, matching the Cloudflare adapter behavior.
 ///
+/// Spin's WASI HTTP API sends one request and returns the original response; it
+/// exposes no redirect-follow policy. Each trait call therefore reaches exactly
+/// one `spin_sdk::http::send` boundary and returns an original 3xx to core. Host
+/// tests cannot instantiate Spin's WASI transport, so the common
+/// `StubHttpClient` driver records the one-send 3xx behavior while adapter tests
+/// cover request/response policy around that single boundary.
+///
 /// # Known MVP limits
 ///
 /// **No configurable outbound timeout.** `spin_sdk::http::send` does not
@@ -676,7 +669,7 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 ///   with a real secret-provider source (e.g. Vault, Azure Key Vault) to avoid
 ///   storing signing keys in plaintext on disk.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-struct SpinSecretStoreAdapter;
+pub(crate) struct SpinSecretStoreAdapter;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl PlatformSecretStore for SpinSecretStoreAdapter {
@@ -794,12 +787,33 @@ mod tests {
     use super::*;
 
     use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;
     use edgezero_core::params::PathParams;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write as _;
+    use trusted_server_core::platform::AuctionTargetId;
+
+    #[test]
+    fn auction_http_capabilities_are_explicit() {
+        let capabilities = AuctionTargetId::Spin.descriptor().capabilities();
+        assert!(!capabilities.supports_concurrent_provider_fanout());
+        assert!(
+            !capabilities.has_enforceable_total_request_deadline(),
+            "Spin outbound HTTP does not expose an enforceable hard total request deadline"
+        );
+    }
+
+    struct InMemoryConfigStore(std::collections::BTreeMap<String, String>);
+
+    #[async_trait::async_trait(?Send)]
+    impl ConfigStore for InMemoryConfigStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(self.0.get(key).cloned())
+        }
+    }
 
     fn make_ctx_without_spin_context() -> RequestContext {
         let req = request_builder()
@@ -843,6 +857,29 @@ mod tests {
         body: Vec<u8>,
     ) -> Result<BufferedResponseParts, Report<PlatformError>> {
         apply_spin_response_policy(&edgezero_core::http::Method::GET, 200, headers, body)
+    }
+
+    #[test]
+    fn response_policy_preserves_original_redirect_at_single_send_boundary() {
+        let (headers, body) = apply_spin_response_policy(
+            &edgezero_core::http::Method::GET,
+            302,
+            vec![(
+                "location".to_string(),
+                b"https://redirect.example/next".to_vec(),
+            )],
+            Vec::new(),
+        )
+        .expect("should preserve redirect response");
+
+        assert_eq!(
+            headers,
+            vec![(
+                "location".to_string(),
+                b"https://redirect.example/next".to_vec(),
+            )]
+        );
+        assert!(body.is_empty());
     }
 
     #[test]
@@ -891,6 +928,29 @@ mod tests {
                 .expect("should not fail")
                 .is_none(),
             "should return None for any client IP"
+        );
+    }
+
+    #[test]
+    fn config_store_handle_adapter_reads_verbatim_kv_key() {
+        let handle = ConfigStoreHandle::new(Arc::new(InMemoryConfigStore(
+            std::collections::BTreeMap::from([(
+                "trusted_server_config".to_owned(),
+                "blob-envelope".to_owned(),
+            )]),
+        )));
+        let adapter = ConfigStoreHandleAdapter(handle);
+
+        let value = adapter
+            .get(
+                &StoreName::from("trusted_server_config"),
+                "trusted_server_config",
+            )
+            .expect("should read the verbatim config-store key");
+
+        assert_eq!(
+            value, "blob-envelope",
+            "should not translate a KV-backed config key into a Spin variable name"
         );
     }
 

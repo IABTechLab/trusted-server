@@ -1,16 +1,16 @@
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "integration-admin-password-32-bytes-ok"
+password = "integration_admin_password"
 
 [publisher]
 domain = "localhost"
 cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
-proxy_secret = "integration-test-proxy-secret"
+proxy_secret = "integration_proxy_secret"
 
 [ec]
-passphrase = "integration-test-ec-secret-padded-32"
+passphrase = "integration_ec_passphrase"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
 
@@ -18,13 +18,13 @@ pull_sync_concurrency = 3
 name = "Integration Test Partner"
 source_domain = "inttest.example.com"
 bidstream_enabled = true
-api_token = "integration-test-token-alpha-32-bytes-ok"
+api_token = "integration_partner_token_alpha"
 
 [[ec.partners]]
 name = "Integration Test Partner 2"
 source_domain = "inttest2.example.com"
 bidstream_enabled = true
-api_token = "integration-test-token-bravo-32-bytes-ok"
+api_token = "integration_partner_token_bravo"
 
 [request_signing]
 enabled = false
@@ -33,9 +33,7 @@ secret_store_id = "secrets"
 
 [integrations.prebid]
 enabled = false
-server_url = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1000
-bidders = []
 debug = false
 client_side_bidders = []
 
@@ -99,16 +97,37 @@ certificate_check = false
 
 [auction]
 enabled = false
-providers = []
 timeout_ms = 2000
 allowed_context_keys = []
 
-[integrations.aps]
-enabled = true
-account_id = "example-aps-account-id"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+test_mode = false
+consent_forwarding = "both"
+
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = []
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
 endpoint = "https://aps.example.com/e/pb/bid"
-timeout_ms = 1000
+routing = "all_eligible"
+
+[auction.providers.aps-main.profile_config]
+account_id = "example-aps-account-id"
+debug = false
 allow_script_creatives = false
+
+[auction.bidders.example-bidder]
+provider = "pbs-main"
 
 [integrations.google_tag_manager]
 enabled = false

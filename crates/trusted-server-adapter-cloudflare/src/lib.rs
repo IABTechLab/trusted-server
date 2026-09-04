@@ -27,6 +27,7 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if let Ok(config) = env.var("TRUSTED_SERVER_CONFIG") {
         app::set_cloudflare_config_json(config.to_string());
     }
+    app::set_cloudflare_env(env.clone());
 
     match edgezero_adapter_cloudflare::run_app::<app::TrustedServerApp>(req, env, ctx).await {
         Ok(resp) => Ok(resp),
