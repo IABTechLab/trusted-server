@@ -82,6 +82,7 @@ impl ScriptRewriteAction {
 #[derive(Debug)]
 pub struct IntegrationAttributeContext<'a> {
     pub attribute_name: &'a str,
+    pub element_name: &'a str,
     pub request_host: &'a str,
     pub request_scheme: &'a str,
     pub origin_host: &'a str,
