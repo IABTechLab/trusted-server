@@ -60,15 +60,15 @@ proxy = "disabled"
 
 ### Fields
 
-| Field                        | Required | Description                                                                                                            |
-| ---------------------------- | -------: | ---------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                    |      Yes | Enables or disables the integration.                                                                                   |
-| `cache_ttl_seconds`          |       No | Optional downstream cache TTL override for all assets. When unset, preserve the upstream cache policy.                 |
-| `assets`                     |      Yes | List of JavaScript assets the proxy may serve.                                                                         |
-| `assets[].path`              |      Yes | Stable identifier for logs, tests, and response diagnostics; exact first-party request path handled by Trusted Server. |
-| `assets[].origin_url`        |      Yes | Exact upstream JavaScript URL to fetch or match for page rewriting.                                                    |
-| `assets[].proxy`             |       No | Per-asset proxy behavior: `enabled`, `disabled`, or `blocked`. Defaults to `enabled`.                                  |
-| `assets[].cache_ttl_seconds` |       No | Per-asset downstream cache TTL override. Takes precedence over the integration-level value.                            |
+| Field                        | Required | Description                                                                                                                                                                                                                                           |
+| ---------------------------- | -------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                    |      Yes | Enables or disables the integration.                                                                                                                                                                                                                  |
+| `cache_ttl_seconds`          |       No | Optional downstream cache TTL override for all assets. When unset, preserve the upstream cache policy. An override replaces upstream directives, including `private` and `no-store`, and is safe only when the bytes are identical for every visitor. |
+| `assets`                     |      Yes | List of JavaScript assets the proxy may serve.                                                                                                                                                                                                        |
+| `assets[].path`              |      Yes | Stable identifier for logs, tests, and response diagnostics; exact first-party request path handled by Trusted Server.                                                                                                                                |
+| `assets[].origin_url`        |      Yes | Exact upstream JavaScript URL to fetch or match for page rewriting.                                                                                                                                                                                   |
+| `assets[].proxy`             |       No | Per-asset proxy behavior: `enabled`, `disabled`, or `blocked`. Defaults to `enabled`.                                                                                                                                                                 |
+| `assets[].cache_ttl_seconds` |       No | Per-asset downstream cache TTL override. Takes precedence over the integration-level value and has the same restrictions as the integration-level override.                                                                                           |
 
 ### Validation
 
@@ -137,9 +137,9 @@ The JS asset proxy should use the same shape as existing script proxy integratio
 let mut config = ProxyRequestConfig::new(origin_url)
     .with_streaming()
     .with_stream_response()
-    .without_forward_headers();
+    .without_forward_headers()
+    .without_ec_id();
 config.follow_redirects = false;
-config.forward_ec_id = false;
 ```
 
 The integration may forward this small request header allowlist from the browser request to the upstream request:
@@ -147,10 +147,12 @@ The integration may forward this small request header allowlist from the browser
 - `Accept`
 - `Accept-Language`
 - `Accept-Encoding`
+- `If-None-Match`
+- `If-Modified-Since`
 
 Do not forward user session or network context headers; examples: `Cookie`, `X-Forwarded-For`.
 
-It must set a fixed `User-Agent` such as `TrustedServer/1.0`.
+It must set a fixed `User-Agent` such as `TrustedServer/1.0`. The fixed value deliberately collapses user-agent variants. Operators must not proxy assets whose response bytes vary by browser user agent, including assets whose integrity metadata covers a user-agent-specific representation.
 
 TLS verification follows the existing Trusted Server proxy backend policy used by `proxy_request()`.
 
@@ -158,9 +160,9 @@ TLS verification follows the existing Trusted Server proxy backend policy used b
 
 ## Response Behavior
 
-### Successful upstream response
+### Successful or not-modified upstream response
 
-For upstream `2xx` responses, Trusted Server streams the upstream body to the browser and constructs a response with only the headers needed for JavaScript delivery and diagnostics.
+For upstream `2xx` responses, Trusted Server streams the upstream body to the browser and constructs a response with only the headers needed for JavaScript delivery and diagnostics. It also preserves upstream `304 Not Modified` responses for conditional requests, with no response body.
 
 Preserve these upstream response headers when present:
 
@@ -205,7 +207,7 @@ Log the request path and origin host at `warn` level.
 
 ### Upstream non-success response
 
-If the upstream responds with a non-`2xx` status, return:
+If the upstream responds with a status other than `2xx` or `304 Not Modified`, return:
 
 ```http
 502 Bad Gateway
