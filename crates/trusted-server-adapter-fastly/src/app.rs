@@ -90,8 +90,9 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -135,7 +136,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
+    config_key, config_store_name, get_settings_from_config_store,
 };
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
@@ -167,14 +168,16 @@ pub(crate) struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
-pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(load_settings_from_config_store()?)
+pub(crate) fn build_state(env: &EnvConfig) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_from_settings(load_settings_from_config_store(env)?)
 }
 
-pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
+pub(crate) fn load_settings_from_config_store(
+    env: &EnvConfig,
+) -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = config_store_name(env);
+    let key = config_key(env);
+    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &key)
 }
 
 pub(crate) fn build_state_from_settings(
@@ -1228,15 +1231,15 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
-    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
-        let (router, state) = Self::router_with_state();
+    pub(crate) fn build_app_with_state(env: &EnvConfig) -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state(env);
         let mut app = App::with_name(router, Self::name());
         Self::configure(&mut app);
         (app, state)
     }
 
-    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
-        let state = match build_state() {
+    fn router_with_state(env: &EnvConfig) -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state(env) {
             Ok(state) => state,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
@@ -1294,7 +1297,17 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        Self::router_with_state().0
+        Self::router_with_state(&EnvConfig::from_env()).0
+    }
+
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: "trusted_server_config",
+                ids: &["trusted_server_config"],
+            }),
+            ..StoresMetadata::default()
+        }
     }
 }
 
@@ -1313,6 +1326,7 @@ mod tests {
     };
     use base64::Engine as _;
     use bytes::Bytes;
+    use edgezero_core::app::{Hooks as _, StoreMetadata};
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
@@ -1451,6 +1465,21 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn trusted_server_app_declares_config_store_metadata() {
+        let stores = TrustedServerApp::stores();
+
+        assert_eq!(
+            stores.config,
+            Some(StoreMetadata {
+                default: "trusted_server_config",
+                ids: &["trusted_server_config"],
+            })
+        );
+        assert_eq!(stores.kv, None);
+        assert_eq!(stores.secrets, None);
     }
 
     #[test]
