@@ -7,8 +7,7 @@
 use error_stack::{Report, ResultExt};
 use fastly::kv_store::{InsertMode, KVStore};
 use trusted_server_core::ec::kv_backend::{
-    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome, ExactKeyMatch,
-    contains_exact_key,
+    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
 };
 use trusted_server_core::ec::log_id;
 use trusted_server_core::error::TrustedServerError;
@@ -43,18 +42,6 @@ impl FastlyEcKvStore {
             })
     }
 }
-
-/// Keys requested per page when checking for one exact key.
-const EXACT_MATCH_PAGE_SIZE: u32 = 100;
-/// Pages walked before giving up on an exact-key check.
-///
-/// A well-formed identifier is the whole key, so at most a handful of keys can
-/// carry it as a prefix and one page is the normal case. The cap stops a short
-/// prefix from walking the keyspace on the response path. Exceeding it is
-/// reported as an error rather than as absence, so the caller re-checks by
-/// lookup instead of discarding a withdrawal for an identity that may be held
-/// on a page this never read.
-const EXACT_MATCH_MAX_PAGES: usize = 4;
 
 impl EcKvStore for FastlyEcKvStore {
     fn store_name(&self) -> &str {
@@ -137,48 +124,6 @@ impl EcKvStore for FastlyEcKvStore {
         #[allow(clippy::cast_possible_truncation)]
         let count = page.keys().len() as u32;
         Ok(count)
-    }
-
-    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-        let store = self.open_store()?;
-        // The list is strongly consistent, unlike a lookup, but it matches by
-        // prefix, so the decision of what counts as a match belongs to
-        // `contains_exact_key` — which is where that behaviour is tested.
-        let pages = store
-            .build_list()
-            .prefix(key)
-            .limit(EXACT_MATCH_PAGE_SIZE)
-            .iter()
-            // Unbounded here on purpose: `contains_exact_key` stops reading at
-            // its budget, so the page count lives with the code that is tested
-            // against it rather than being recomputed at the call site.
-            .map(|page| match page {
-                // A store that reports nothing under the prefix is telling us
-                // the key is absent, which is what `lookup` already does for a
-                // missing key. Treating it as a failure would send every
-                // withdrawal naming an unissued identity down the error path.
-                Err(fastly::kv_store::KVStoreError::ItemNotFound) => Ok(Vec::new()),
-                other => other
-                    .map(fastly::kv_store::ListPage::into_keys)
-                    .change_context(TrustedServerError::KvStore {
-                        store_name: self.store_name.clone(),
-                        message: format!("Failed to check key '{}'", log_id(key)),
-                    }),
-            });
-
-        match contains_exact_key(pages, key, EXACT_MATCH_MAX_PAGES)? {
-            ExactKeyMatch::Found => Ok(true),
-            ExactKeyMatch::Absent => Ok(false),
-            // Not an answer, so it must not be returned as one. The caller
-            // falls back to a lookup on an error.
-            ExactKeyMatch::Undetermined => Err(Report::new(TrustedServerError::KvStore {
-                store_name: self.store_name.clone(),
-                message: format!(
-                    "Listing for key '{}' exceeded {EXACT_MATCH_MAX_PAGES} pages, so existence is undetermined",
-                    log_id(key)
-                ),
-            })),
-        }
     }
 
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {

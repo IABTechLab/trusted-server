@@ -123,13 +123,6 @@ impl fmt::Debug for KvIdentityGraph {
     }
 }
 
-/// Longest identifier this store will look for.
-///
-/// Bounds the work a caller-supplied cookie can ask for. It is not a format
-/// check: the existence check is exact, so it does not depend on the shape of
-/// an identifier.
-const MAX_EC_ID_LEN: usize = 256;
-
 /// Result of [`KvIdentityGraph::write_withdrawal_tombstone`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TombstoneOutcome {
@@ -650,24 +643,16 @@ impl KvIdentityGraph {
 
     /// Whether `ec_id` names a key this store actually holds.
     ///
-    /// Delegates to an exact, strongly consistent check. Counting keys by
-    /// prefix would not do: another key may carry this one as a prefix and
-    /// would answer for it, and a read that may lag would report a freshly
-    /// written identity as absent, discarding a genuine withdrawal.
-    ///
-    /// A value longer than any identifier this deployment could hold is
-    /// refused without a store round trip. That bound is about cost, not
-    /// correctness — the check is exact either way, so it does not care what
-    /// shape an identifier takes.
+    /// Reads the key itself, so the answer is about that identity and no
+    /// other: counting keys by prefix would let a longer key carrying this one
+    /// as a prefix answer in its place. One round trip, and no bound on the
+    /// identifier is needed because nothing is scanned.
     ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store error.
     fn key_exists_confirmed(&self, ec_id: &str) -> Result<bool, Report<TrustedServerError>> {
-        if ec_id.is_empty() || ec_id.len() > MAX_EC_ID_LEN {
-            return Ok(false);
-        }
-        self.store.key_exists(ec_id)
+        Ok(self.lookup_raw(ec_id)?.is_some())
     }
 
     /// Writes a withdrawal tombstone for consent enforcement.
@@ -684,8 +669,8 @@ impl KvIdentityGraph {
     /// was never issued enforces nothing while still consuming a write and a
     /// row; the identifier in a request is chosen by the client, so that write
     /// would be the client's to trigger at will. Existence is confirmed with
-    /// [`Self::key_exists_confirmed`] so a freshly issued identity is never
-    /// mistaken for an unknown one.
+    /// [`Self::key_exists_confirmed`], which reads the key itself, so no
+    /// neighbouring key can answer for it.
     ///
     /// The check and the write are not one atomic operation: an entry that
     /// expires between them is still tombstoned, briefly restoring a row that
@@ -694,13 +679,11 @@ impl KvIdentityGraph {
     /// create an identity, because the entry must have existed to pass the
     /// check at all.
     ///
-    /// When the exact check cannot answer, existence is re-checked with a
-    /// lookup. A lookup may lag, so it can miss a very recent write, and it can
-    /// return a row already deleted or expired at the primary — but it cannot
-    /// report an identifier this deployment never issued, which is what the
-    /// gate is for. If that cannot answer either, nothing is written and an
-    /// error is returned; the caller still expires the browser cookie, which is
-    /// the primary enforcement.
+    /// The read may lag the write that issued the identity, so an identity
+    /// created and withdrawn inside that window is reported as unknown and no
+    /// tombstone is written. The browser cookie is expired either way, which is
+    /// the primary enforcement; the residual exposure is a batch-sync client
+    /// that already holds an identifier issued that recently.
     ///
     /// # Errors
     ///
@@ -713,43 +696,12 @@ impl KvIdentityGraph {
         &self,
         ec_id: &str,
     ) -> Result<TombstoneOutcome, Report<TrustedServerError>> {
-        match self.key_exists_confirmed(ec_id) {
-            Ok(true) => {}
-            Ok(false) => return Ok(TombstoneOutcome::UnknownIdentity),
-            Err(list_error) => {
-                // The check could not answer. Fall back to a raw lookup rather
-                // than writing blind: a lookup may lag, so it can miss a very
-                // recent write, but no identifier this deployment never issued
-                // can appear in it. Writing blind would instead restore the
-                // unconditional write whenever the store can be made to fail.
-                //
-                // The raw form is deliberate: a row whose body no longer
-                // deserializes is still a row, and presence is all that matters.
-                //
-                // Failing to determine existence is an error, not a third
-                // outcome. A caller that only inspects the error case still
-                // reports it, where an extra `Ok` variant would be discarded in
-                // silence.
-                match self.lookup_raw(ec_id) {
-                    Ok(Some(_)) => {
-                        log::warn!(
-                            "Confirmed EC ID '{}' by lookup after a list failure",
-                            log_id(ec_id),
-                        );
-                    }
-                    Ok(None) => {
-                        return Err(list_error.attach(
-                            "a lookup found nothing, but it may lag behind a recent write",
-                        ));
-                    }
-                    Err(lookup_error) => {
-                        return Err(lookup_error.attach(format!(
-                            "the exact check also failed: {}",
-                            list_error.current_context()
-                        )));
-                    }
-                }
-            }
+        // A store failure is an error, not a third outcome: writing blind
+        // would restore the unconditional write whenever the store can be made
+        // to fail, and an extra `Ok` variant would be discarded in silence by a
+        // caller that only inspects the error case.
+        if !self.key_exists_confirmed(ec_id)? {
+            return Ok(TombstoneOutcome::UnknownIdentity);
         }
 
         let entry = KvEntry::tombstone(current_timestamp());
@@ -1114,10 +1066,6 @@ mod tests {
             limit: u32,
         ) -> Result<u32, Report<TrustedServerError>> {
             self.inner.count_keys_with_prefix(prefix, limit)
-        }
-
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key)
         }
 
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
@@ -1555,31 +1503,36 @@ mod tests {
     }
 
     #[test]
-    fn an_out_of_bounds_value_is_refused_without_reaching_the_store() {
-        let (store, checks) = CountingEcKv::new();
+    fn a_withdrawal_costs_one_read_whether_or_not_the_identity_is_held() {
+        // The gate sits on the withdrawal response path, so it must not double
+        // the reads a withdrawal already pays for.
+        let (store, reads) = CountingEcKv::new();
         let kv = KvIdentityGraph::new(store);
-        let count = || *checks.lock().expect("should lock the check counter");
+        let count = || *reads.lock().expect("should lock the read counter");
 
-        for value in ["", &"z".repeat(257)] {
-            assert!(
-                !kv.key_exists_confirmed(value)
-                    .expect("should resolve the check"),
-                "should not report `{value}` as held"
-            );
-        }
-        assert_eq!(
-            count(),
-            0,
-            "a value no key could be must not cost a store round trip"
-        );
-
-        // A value that is within bounds but simply absent does reach the store.
         let absent = format!("{}.ABC123", "e".repeat(64));
-        assert!(
-            !kv.key_exists_confirmed(&absent).expect("should check"),
+        assert_eq!(
+            kv.write_withdrawal_tombstone(&absent)
+                .expect("should resolve the withdrawal"),
+            TombstoneOutcome::UnknownIdentity,
             "an absent identity is not held"
         );
-        assert_eq!(count(), 1, "an in-bounds value is checked exactly once");
+        assert_eq!(count(), 1, "an unknown identity costs a single read");
+
+        let held = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&held, &live_entry()).expect("should create");
+        let before = count();
+        assert_eq!(
+            kv.write_withdrawal_tombstone(&held)
+                .expect("should resolve the withdrawal"),
+            TombstoneOutcome::Written,
+            "a held identity is tombstoned"
+        );
+        assert_eq!(
+            count() - before,
+            1,
+            "a held identity is checked once, then written"
+        );
     }
 
     #[test]
@@ -1604,10 +1557,10 @@ mod tests {
         );
     }
 
-    /// Store double that records how many existence checks reach it.
+    /// Store double that records how many reads reach it.
     struct CountingEcKv {
         inner: super::super::kv_backend::test_support::InMemoryEcKv,
-        existence_checks: std::sync::Arc<std::sync::Mutex<usize>>,
+        reads: std::sync::Arc<std::sync::Mutex<usize>>,
     }
 
     impl CountingEcKv {
@@ -1618,7 +1571,7 @@ mod tests {
             (
                 Self {
                     inner: super::super::kv_backend::test_support::InMemoryEcKv::new("test_store"),
-                    existence_checks: std::sync::Arc::clone(&counter),
+                    reads: std::sync::Arc::clone(&counter),
                 },
                 counter,
             )
@@ -1631,6 +1584,7 @@ mod tests {
         }
 
         fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            *self.reads.lock().expect("should lock the read counter") += 1;
             self.inner.lookup(key)
         }
 
@@ -1650,25 +1604,17 @@ mod tests {
             self.inner.count_keys_with_prefix(prefix, limit)
         }
 
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            *self
-                .existence_checks
-                .lock()
-                .expect("should lock the check counter") += 1;
-            self.inner.key_exists(key)
-        }
-
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
         }
     }
 
-    /// Store double whose list API always fails while writes still work.
-    struct ListFailingEcKv {
+    /// Store double whose reads always fail while writes still work.
+    struct ReadFailingEcKv {
         inner: super::super::kv_backend::test_support::InMemoryEcKv,
     }
 
-    impl ListFailingEcKv {
+    impl ReadFailingEcKv {
         fn new() -> Self {
             Self {
                 inner: super::super::kv_backend::test_support::InMemoryEcKv::new("test_store"),
@@ -1676,13 +1622,16 @@ mod tests {
         }
     }
 
-    impl EcKvStore for ListFailingEcKv {
+    impl EcKvStore for ReadFailingEcKv {
         fn store_name(&self) -> &str {
             self.inner.store_name()
         }
 
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.inner.lookup(key)
+        fn lookup(&self, _key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: "test_store".to_owned(),
+                message: "reads unavailable".to_owned(),
+            }))
         }
 
         fn insert(
@@ -1693,22 +1642,14 @@ mod tests {
             self.inner.insert(key, write)
         }
 
+        // Left working so a test can prove no row was created without going
+        // through the read path it just made fail.
         fn count_keys_with_prefix(
             &self,
-            _prefix: &str,
-            _limit: u32,
+            prefix: &str,
+            limit: u32,
         ) -> Result<u32, Report<TrustedServerError>> {
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "test_store".to_owned(),
-                message: "list unavailable".to_owned(),
-            }))
-        }
-
-        fn key_exists(&self, _key: &str) -> Result<bool, Report<TrustedServerError>> {
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "test_store".to_owned(),
-                message: "list unavailable".to_owned(),
-            }))
+            self.inner.count_keys_with_prefix(prefix, limit)
         }
 
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
@@ -1717,53 +1658,34 @@ mod tests {
     }
 
     #[test]
-    fn write_withdrawal_tombstone_falls_back_to_lookup_when_the_list_fails() {
-        // A store outage must not discard a genuine withdrawal, so a failed
-        // list is re-checked with a lookup, which can still see the row.
-        let kv = KvIdentityGraph::new(ListFailingEcKv::new());
-        let ec_id = format!("{}.ABC123", "9".repeat(64));
-        kv.create(&ec_id, &live_entry()).expect("should create");
-
-        assert_eq!(
-            kv.write_withdrawal_tombstone(&ec_id)
-                .expect("should still resolve the withdrawal"),
-            TombstoneOutcome::Written,
-            "a held identity should still be tombstoned when only the list fails"
-        );
-        let (loaded, _) = kv
-            .get(&ec_id)
-            .expect("should read entry back")
-            .expect("should find the tombstone");
-        assert!(!loaded.consent.ok, "should be withdrawn");
-    }
-
-    #[test]
-    fn a_failing_list_is_not_a_way_to_write_for_an_identity_that_was_never_issued() {
+    fn a_failing_check_is_not_a_way_to_write_for_an_identity_that_was_never_issued() {
         // The caller controls the identifier and can drive load, so a store
         // failure must not become a route to the write this gate exists to
-        // prevent. A lagging lookup may return a row already deleted, but it
-        // cannot return one for an identifier this deployment never issued.
-        let kv = KvIdentityGraph::new(ListFailingEcKv::new());
-        let ec_id = format!("{}.ABC123", "8".repeat(64));
+        // prevent.
+        let kv = KvIdentityGraph::new(ReadFailingEcKv::new());
+        let hash = "8".repeat(64);
+        let ec_id = format!("{hash}.ABC123");
 
         assert!(
             kv.write_withdrawal_tombstone(&ec_id).is_err(),
-            "an undetermined check is a fault, so a caller inspecting only the \
-             error case still reports it"
+            "a check that cannot answer is a fault, so a caller inspecting only \
+             the error case still reports it"
         );
-        assert!(
-            kv.get(&ec_id).expect("should read back").is_none(),
+        assert_eq!(
+            kv.count_hash_prefix_keys(&hash)
+                .expect("should count the prefix"),
+            0,
             "should not create a row while the store is degraded"
         );
     }
 
     #[test]
-    fn a_caller_that_only_inspects_the_error_case_still_sees_an_undetermined_check() {
+    fn a_caller_that_only_inspects_the_error_case_still_sees_a_failed_check() {
         // The withdrawal call site is edited by more than one branch. Reporting
-        // an undetermined check through `Err` means the common
+        // a failed check through `Err` means the common
         // `if let Err(..) = ...` shape cannot discard it, where a third `Ok`
         // variant would be dropped without a compiler complaint.
-        let kv = KvIdentityGraph::new(ListFailingEcKv::new());
+        let kv = KvIdentityGraph::new(ReadFailingEcKv::new());
         let ec_id = format!("{}.ABC123", "6".repeat(64));
 
         let mut reported = false;
@@ -1771,10 +1693,7 @@ mod tests {
             reported = true;
         }
 
-        assert!(
-            reported,
-            "an undetermined check must reach an error-only caller"
-        );
+        assert!(reported, "a failed check must reach an error-only caller");
     }
 
     #[test]

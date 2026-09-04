@@ -499,6 +499,9 @@ pub(crate) fn current_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::create_test_settings;
 
     #[test]
     fn log_id_never_emits_more_than_the_redacted_prefix() {
@@ -523,9 +526,6 @@ mod tests {
         // A value shorter than the prefix is emitted whole, which is all there is.
         assert_eq!(log_id("abc"), "abc\u{2026}");
     }
-    use super::*;
-    use crate::platform::test_support::noop_services;
-    use crate::test_support::tests::create_test_settings;
 
     fn create_test_request(headers: &[(&str, &str)]) -> Request<EdgeBody> {
         let mut builder = Request::builder().method("GET").uri("http://example.com");
