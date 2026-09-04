@@ -97,7 +97,13 @@ const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 11] = [
     header::IF_RANGE,
 ];
 
-const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
+/// Response headers an upstream must not be able to set on a body that is
+/// passed through and served from the publisher's own origin.
+///
+/// All three take effect against the serving origin, so leaving them in place
+/// would let an upstream write first-party cookies, pin HSTS, or clear the
+/// publisher's site data.
+pub(crate) const FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS: [&str; 3] =
     ["set-cookie", "strict-transport-security", "clear-site-data"];
 
 /// Cache-control value used when asset proxy responses must not be stored.
@@ -1043,7 +1049,7 @@ async fn send_asset_origin_request(
 fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
     // Asset origins must not be able to mutate publisher-domain browser state
     // or security policy through this proxy path.
-    for header_name in ASSET_PROXY_STRIP_RESPONSE_HEADERS {
+    for header_name in FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS {
         response.headers_mut().remove(header_name);
     }
 }
