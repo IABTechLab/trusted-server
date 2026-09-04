@@ -275,16 +275,18 @@ ts provision --adapter fastly
 ```
 
 Provisioning creates or reuses the physical store and persists this runtime
-mapping in Fastly Config Store `edgezero_runtime_env`:
+mapping in Fastly Config Store `edgezero_runtime_env`, scoped to the current
+Fastly service:
 
 ```text
-EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
+EDGEZERO__SERVICES__<SERVICE_ID>__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ```
 
-The Fastly service must link both `ts_secrets` and `edgezero_runtime_env` to the
-active service version. The custom streaming entry point reads the mapping
-before loading app config, so every startup and reload resolves static
-credentials from `ts_secrets` while the portable manifest continues to declare
+The runtime ignores legacy unscoped entries. The Fastly service must link both
+`ts_secrets` and `edgezero_runtime_env` to the active service version. The
+custom streaming entry point reads the service-scoped mapping before loading
+app config, so every startup and reload resolves static credentials from
+`ts_secrets` while the portable manifest continues to declare
 `trusted_server_secrets`.
 
 Create the separate request-signing store when that feature is enabled:
