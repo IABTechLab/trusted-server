@@ -23,6 +23,7 @@ cloudflare = ["edgezero-adapter-cloudflare/cloudflare", "dep:worker"]
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
+derive_more = { workspace = true }
 edgezero-adapter-cloudflare = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }

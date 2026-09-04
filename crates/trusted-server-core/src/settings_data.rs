@@ -3,12 +3,11 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::config_payload::settings_from_config_blob;
+use crate::config_payload::{DEFAULT_CONFIG_STORE_ID, settings_from_config_blob};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, StoreName};
 use crate::settings::Settings;
 
-const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 
@@ -41,12 +40,21 @@ pub fn config_key(env: &EnvConfig) -> String {
 }
 
 /// Returns the default `EdgeZero` app-config store name.
+///
+/// Process-environment overrides apply to native adapters such as Axum. Fastly
+/// has no process environment, so it uses the manifest default as the logical
+/// name and resolves the physical store through a resource link.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
     config_store_name(&EnvConfig::from_env())
 }
 
 /// Returns the default config-store key containing the app-config blob.
+///
+/// Process-environment overrides apply to native adapters such as Axum. When
+/// using a key override, pass the same value to `ts config push --key`; the CLI
+/// otherwise writes at the logical store ID. Fastly has no process environment,
+/// so its custom entry point uses the manifest default key.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
@@ -188,7 +196,7 @@ fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_payload::CONFIG_BLOB_KEY;
+    use crate::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
     use crate::platform::PlatformError;
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
@@ -229,6 +237,34 @@ mod tests {
         let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
         serde_json::to_string(&envelope).expect("should serialize envelope")
+    }
+
+    #[test]
+    fn config_defaults_match_edgezero_manifest() {
+        let manifest = edgezero_core::manifest::ManifestLoader::try_load_from_str(include_str!(
+            "../../../edgezero.toml"
+        ))
+        .expect("should load the repository EdgeZero manifest");
+        let manifest_default = manifest
+            .manifest()
+            .stores
+            .config
+            .as_ref()
+            .expect("should declare [stores.config]")
+            .default_id();
+
+        assert_eq!(
+            DEFAULT_CONFIG_STORE_ID, manifest_default,
+            "compiled default should match edgezero.toml"
+        );
+        assert_eq!(
+            CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID,
+            "default blob key should match the default config store id"
+        );
+        assert_eq!(
+            manifest_default, "trusted_server_config",
+            "Trusted Server should retain its expected default config store"
+        );
     }
 
     #[test]

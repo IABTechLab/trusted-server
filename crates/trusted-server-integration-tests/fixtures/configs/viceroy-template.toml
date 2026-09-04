@@ -67,7 +67,7 @@
             data = "test-api-key"
 
     [local_server.config_stores]
-        # Generated integration configs inject the trusted_server_config blob
+        # Generated integration configs inject the manifest-default app-config blob
         # into the store required by the Fastly entry point.
         # GENERATED_TRUSTED_SERVER_CONFIG_STORES
 
