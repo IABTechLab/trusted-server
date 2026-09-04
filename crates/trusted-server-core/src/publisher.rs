@@ -2942,6 +2942,55 @@ fn mediator_placeholder_request() -> Request<EdgeBody> {
         .expect("MEDIATOR_PLACEHOLDER_URL should be a valid URI")
 }
 
+/// Copies the downstream request head while leaving its body available to the caller.
+fn request_head_snapshot(req: &Request<EdgeBody>) -> Request<EdgeBody> {
+    let mut snapshot = Request::new(EdgeBody::empty());
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.version_mut() = req.version();
+    *snapshot.headers_mut() = req.headers().clone();
+    snapshot
+}
+
+fn should_preload_ec_snapshot(
+    is_navigation: bool,
+    is_get: bool,
+    has_ec_id: bool,
+    has_kv: bool,
+) -> bool {
+    is_navigation && is_get && has_ec_id && has_kv
+}
+
+/// Rewrites a downstream request into an outbound publisher-origin request.
+///
+/// Restricts advertised encodings to those the rewrite pipeline can handle,
+/// strips the internal `fastly-ssl` scheme signal so it never leaks to the
+/// backend, and retargets the URI and `Host` header at the origin.
+fn rewrite_origin_request(
+    req: &mut Request<EdgeBody>,
+    target_uri: Uri,
+    origin_host_header: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    restrict_accept_encoding(req);
+    // Layering wart: `fastly-ssl` is a vendor-specific header name. Core only
+    // knows it because the Fastly adapter re-injects it from trusted TLS
+    // metadata and `detect_scheme` (see `http_util`) still reads it as a
+    // fallback scheme signal. The neutral signal (`ClientInfo::tls_protocol`)
+    // is already the primary path, so this strip — and the whole `fastly-ssl`
+    // coupling in core — should move behind a platform-neutral header in a
+    // separate change. Until then we strip it here so the edge signal never
+    // reaches publisher backends.
+    req.headers_mut().remove("fastly-ssl");
+    *req.uri_mut() = target_uri;
+    req.headers_mut().insert(
+        header::HOST,
+        HeaderValue::from_str(origin_host_header).change_context(TrustedServerError::Proxy {
+            message: "invalid publisher origin host header".to_string(),
+        })?,
+    );
+    Ok(())
+}
+
 /// Build a minimal [`AuctionContext`] for the collect phase.
 ///
 /// See [`AuctionContext::request`]: the orchestrator's collect path runs
@@ -4083,7 +4132,16 @@ pub async fn handle_publisher_request(
     );
 
     let consent_context = ec_context.consent().clone();
-    let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
+    // The active EC ID drives the internal snapshot preload and finalization —
+    // including consent-withdrawal tombstoning — so it must NOT be filtered by
+    // consent. The auction/EID identity is the consent-filtered view: under an
+    // explicit withdrawal `ec_allowed` is false, so auction dispatch forwards no
+    // EC while the origin-overlapped snapshot read still happens for the active
+    // ID, keeping the withdrawal CAS off the post-origin latency path.
+    let active_ec_id_owned = ec_context.ec_value().map(str::to_owned);
+    let active_ec_id = active_ec_id_owned.as_deref();
+    let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
+    let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
 
@@ -4198,148 +4256,17 @@ pub async fn handle_publisher_request(
         .map(|co| co.price_granularity)
         .unwrap_or_default();
 
-    // Dispatch SSP bid requests while req still has the original client headers
-    // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
-    // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
-    // can be mutated and sent to origin immediately after.
-    let mut auction_observation: Option<AuctionObservationContext> = None;
+    // Resolved before the origin request is prepared: the template cache gate below
+    // keys on it, and that gate now runs while the request is still in hand.
     let assembly_mode = configured_assembly_mode(settings);
 
-    let mut auction_request_for_telemetry: Option<AuctionRequest> = None;
-    let mut dispatched_auction = if matched_slots.is_empty() {
-        None
-    } else {
-        // Telemetry attribution must use the same publisher identity as the
-        // outbound bid request. On the navigation path `request_host` is the
-        // trusted-server edge host, so using it here would attribute navigation
-        // rows to the edge/staging domain while `/auction` rows (built from
-        // `AuctionRequest::publisher.domain`) use the configured domain.
-        let observation = AuctionObservationContext::from_parts(
-            AuctionSource::InitialNavigation,
-            &settings.publisher.domain,
-            &request_path,
-            matched_slots.len(),
-            ec_context,
-        );
+    let auction_client_request = request_head_snapshot(&req);
 
-        if should_run_auction {
-            let slots_ctx = MatchedSlotsContext {
-                matched_slots: &matched_slots,
-                request_path: &request_path,
-            };
-            let mut auction_request = build_auction_request(
-                &slots_ctx,
-                ec_id,
-                &consent_context,
-                &request_info,
-                &settings.publisher.domain,
-                req.headers()
-                    .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
-            );
-            apply_auction_eids_and_device(
-                &mut auction_request,
-                &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
-                    ec_id,
-                    kv,
-                    partner_registry: auction.registry,
-                    ec_context,
-                    services,
-                    geo: geo.as_ref(),
-                    path_label: "Server-side",
-                },
-            );
-            let auction_context = AuctionContext {
-                settings,
-                request: &req,
-                timeout_ms: auction_timeout_ms,
-                provider_responses: None,
-                services,
-            };
-            match auction
-                .orchestrator
-                .dispatch_auction(&auction_request, &auction_context)
-                .await
-            {
-                DispatchAuctionOutcome::Dispatched(dispatched) => {
-                    auction_request_for_telemetry = Some(auction_request);
-                    auction_observation = Some(observation);
-                    Some(dispatched)
-                }
-                DispatchAuctionOutcome::DispatchFailed {
-                    request,
-                    provider_responses,
-                    elapsed_ms,
-                } => {
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::DispatchFailed {
-                                request: &request,
-                                provider_responses: &provider_responses,
-                                reason: "dispatch_failed",
-                                elapsed_ms,
-                            },
-                        )
-                    })
-                    .await;
-                    None
-                }
-                DispatchAuctionOutcome::NotStarted => {
-                    let elapsed_ms = observation.elapsed_ms();
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::DispatchFailed {
-                                request: &auction_request,
-                                provider_responses: &[],
-                                reason: "no_provider_dispatched",
-                                elapsed_ms,
-                            },
-                        )
-                    })
-                    .await;
-                    None
-                }
-            }
-        } else {
-            let skip_reason = if ad_templates_disabled {
-                "ad_templates_disabled"
-            } else if !auction.orchestrator.is_enabled() {
-                "auction_disabled"
-            } else if !consent_allows_auction {
-                "consent_denied"
-            } else if is_bot {
-                "bot"
-            } else if is_prefetch {
-                "prefetch"
-            } else {
-                "not_ad_stack_eligible"
-            };
-            let elapsed_ms = observation.elapsed_ms();
-            emit_auction_events_best_effort_lazy(services, || {
-                build_auction_events(
-                    observation,
-                    AuctionTerminalOutcome::Skipped {
-                        reason: skip_reason,
-                        elapsed_ms,
-                    },
-                )
-            })
-            .await;
-            None
-        }
-    };
-    log::info!(
-        "dispatch_auction: {}",
-        if dispatched_auction.is_some() {
-            "Some — auction running async"
-        } else {
-            "None — not dispatched or skipped"
-        }
-    );
-
+    // Everything request-derived is computed here, in one place, because this is
+    // the last point where the request is still in hand: the origin send below
+    // may start before the auction is dispatched, so nothing downstream can read
+    // these headers any more.
+    //
     // Capture cache eligibility before the origin send consumes the request. One
     // unchanged marked Authorization value passed edge auth; unmarked, replaced,
     // or repeated values remain pass-through and bypass sharing.
@@ -4457,12 +4384,200 @@ pub async fn handle_publisher_request(
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
-    *req.uri_mut() = target_uri;
-    req.headers_mut().insert(
-        header::HOST,
-        HeaderValue::from_str(&origin_host_header).change_context(TrustedServerError::Proxy {
-            message: "invalid publisher origin host header".to_string(),
-        })?,
+    rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
+
+    let request_method = req.method().clone();
+    let mut origin_request = Some(req);
+    let should_preload_ec =
+        should_preload_ec_snapshot(is_navigation, is_get, active_ec_id.is_some(), kv.is_some());
+    let mut pending_origin = None;
+    // A shared-template hit skips the origin entirely, and an in-flight request
+    // cannot be recalled — so when this request is eligible for one, the origin
+    // waits for the lookup below. Starting it here would make every hit pay for
+    // a fetch whose response is discarded. Requests with no template cache key —
+    // every request in the default `Inline` assembly mode — keep the overlap.
+    if should_preload_ec
+        && template_cache_key.is_none()
+        && services.http_client().supports_concurrent_fanout()
+        && services
+            .http_client()
+            .supports_pending_streaming_responses()
+    {
+        let origin_req = origin_request.take().ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "publisher origin request was already consumed".to_owned(),
+            })
+        })?;
+        let mut platform_request =
+            PlatformHttpRequest::new(origin_req, backend_name.clone()).with_stream_response();
+        if should_run_ad_stack {
+            platform_request = platform_request.with_cache_bypass();
+        }
+        pending_origin = Some(
+            services
+                .http_client()
+                .send_async(platform_request)
+                .await
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to start publisher origin request".to_string(),
+                })?,
+        );
+    }
+    if should_preload_ec && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
+        let refreshed = graph.load_snapshot(active_ec_id);
+        // Never downgrade an in-request Add-confirmed Present snapshot: a
+        // freshly created row can read back Missing/Failed on an
+        // eventually-consistent store, and rotating or suppressing that
+        // just-generated identity would fragment it. Adopt the refresh only
+        // when it keeps or upgrades to a Present row (the intended
+        // generation-refresh) — otherwise retain the confirmed entry.
+        let keep_present = ec_context.kv_snapshot().entry_for(active_ec_id).is_some()
+            && refreshed.entry_for(active_ec_id).is_none();
+        if !keep_present {
+            ec_context.set_kv_snapshot(refreshed);
+        }
+    }
+
+    // Dispatch SSP bid requests while req still has the original client headers
+    // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
+    // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
+    // can be mutated and sent to origin immediately after.
+    let mut auction_observation: Option<AuctionObservationContext> = None;
+
+    let mut auction_request_for_telemetry: Option<AuctionRequest> = None;
+    let mut dispatched_auction = if matched_slots.is_empty() {
+        None
+    } else {
+        // Telemetry attribution must use the same publisher identity as the
+        // outbound bid request. On the navigation path `request_host` is the
+        // trusted-server edge host, so using it here would attribute navigation
+        // rows to the edge/staging domain while `/auction` rows (built from
+        // `AuctionRequest::publisher.domain`) use the configured domain.
+        let observation = AuctionObservationContext::from_parts(
+            AuctionSource::InitialNavigation,
+            &settings.publisher.domain,
+            &request_path,
+            matched_slots.len(),
+            ec_context,
+        );
+
+        if should_run_auction {
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &matched_slots,
+                request_path: &request_path,
+            };
+            let mut auction_request = build_auction_request(
+                &slots_ctx,
+                ec_id,
+                &consent_context,
+                &request_info,
+                &settings.publisher.domain,
+                auction_client_request
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok()),
+            );
+            apply_auction_eids_and_device(
+                &mut auction_request,
+                &AuctionEidTargeting {
+                    cookie_jar: cookie_jar.as_ref(),
+                    ec_id,
+                    kv_snapshot: ec_context.kv_snapshot(),
+                    partner_registry: auction.registry,
+                    ec_context,
+                    services,
+                    geo: geo.as_ref(),
+                    path_label: "Server-side",
+                },
+            );
+            let auction_context = AuctionContext {
+                settings,
+                request: &auction_client_request,
+                timeout_ms: auction_timeout_ms,
+                provider_responses: None,
+                services,
+            };
+            match auction
+                .orchestrator
+                .dispatch_auction(&auction_request, &auction_context)
+                .await
+            {
+                DispatchAuctionOutcome::Dispatched(dispatched) => {
+                    auction_request_for_telemetry = Some(auction_request);
+                    auction_observation = Some(observation);
+                    Some(dispatched)
+                }
+                DispatchAuctionOutcome::DispatchFailed {
+                    request,
+                    provider_responses,
+                    elapsed_ms,
+                } => {
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::DispatchFailed {
+                                request: &request,
+                                provider_responses: &provider_responses,
+                                reason: "dispatch_failed",
+                                elapsed_ms,
+                            },
+                        )
+                    })
+                    .await;
+                    None
+                }
+                DispatchAuctionOutcome::NotStarted => {
+                    let elapsed_ms = observation.elapsed_ms();
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::DispatchFailed {
+                                request: &auction_request,
+                                provider_responses: &[],
+                                reason: "no_provider_dispatched",
+                                elapsed_ms,
+                            },
+                        )
+                    })
+                    .await;
+                    None
+                }
+            }
+        } else {
+            let skip_reason = if ad_templates_disabled {
+                "ad_templates_disabled"
+            } else if !auction.orchestrator.is_enabled() {
+                "auction_disabled"
+            } else if !consent_allows_auction {
+                "consent_denied"
+            } else if is_bot {
+                "bot"
+            } else if is_prefetch {
+                "prefetch"
+            } else {
+                "not_ad_stack_eligible"
+            };
+            let elapsed_ms = observation.elapsed_ms();
+            emit_auction_events_best_effort_lazy(services, || {
+                build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::Skipped {
+                        reason: skip_reason,
+                        elapsed_ms,
+                    },
+                )
+            })
+            .await;
+            None
+        }
+    };
+    log::info!(
+        "dispatch_auction: {}",
+        if dispatched_auction.is_some() {
+            "Some — auction running async"
+        } else {
+            "None — not dispatched or skipped"
+        }
     );
 
     // The slots the head seam deliberately withheld, routed to the `</body>` seam so they
@@ -4571,21 +4686,24 @@ pub async fn handle_publisher_request(
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    //
-    // Streaming is gated on the capability (unlike the asset-proxy path, which
-    // sets the flag unconditionally and tolerates buffered fallback): adapters
-    // without streaming support may reject the flag outright rather than
-    // silently buffering, which would fail every publisher fetch.
-    let request_method = req.method().clone();
-    let mut platform_request = PlatformHttpRequest::new(req, backend_name);
-    if services.http_client().supports_streaming_responses() {
-        platform_request = platform_request.with_stream_response();
-    }
-    if should_run_ad_stack {
-        platform_request = platform_request.with_cache_bypass();
-    }
-
-    let mut response = match services.http_client().send(platform_request).await {
+    let origin_result = if let Some(pending) = pending_origin {
+        services.http_client().wait(pending).await
+    } else {
+        let origin_req = origin_request.take().ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "publisher origin request was already consumed".to_owned(),
+            })
+        })?;
+        let mut platform_request = PlatformHttpRequest::new(origin_req, backend_name);
+        if services.http_client().supports_streaming_responses() {
+            platform_request = platform_request.with_stream_response();
+        }
+        if should_run_ad_stack {
+            platform_request = platform_request.with_cache_bypass();
+        }
+        services.http_client().send(platform_request).await
+    };
+    let mut response = match origin_result {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
@@ -4925,7 +5043,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 struct AuctionEidTargeting<'a> {
     cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
-    kv: Option<&'a KvIdentityGraph>,
+    kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
     services: &'a RuntimeServices,
@@ -4954,7 +5072,7 @@ fn apply_auction_eids_and_device(
         None
     };
     let kv_eids = resolve_auction_eids(
-        targeting.kv,
+        targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
     );
@@ -6303,7 +6421,7 @@ pub async fn handle_page_bids(
     services: &RuntimeServices,
     kv: Option<&KvIdentityGraph>,
     auction: AuctionDispatch<'_>,
-    ec_context: &EcContext,
+    ec_context: &mut EcContext,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // CSRF-style gate: refuse cross-site invocations before any other work —
@@ -6404,14 +6522,19 @@ pub async fn handle_page_bids(
     };
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
-    let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
-    let consent_context = ec_context.consent();
+    // Owned so the identity-graph snapshot can be stored back on `ec_context`
+    // below without holding a borrow of it across the mutation.
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| ec_context.ec_allowed())
+        .map(str::to_owned);
+    let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
 
     // Same fail-closed jurisdiction-aware gate the publisher navigation path
     // uses — relies on the adapter's geo-aware EC context.
-    let consent_allows_auction = consent_allows_server_side_auction(consent_context);
+    let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
 
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
@@ -6465,10 +6588,26 @@ pub async fn handle_page_bids(
                 matched_slots: &matched_slots,
                 request_path: &path_param,
             };
+            // Load the identity-graph snapshot only now that a live auction is
+            // actually running (enabled, consent-granted, slots matched, not a
+            // bot/prefetch) and a partner registry exists to consume server-side
+            // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
+            // never reach here, so they incur no billable KV read.
+            let page_bids_kv_snapshot = match (kv, ec_id.as_deref(), auction.registry) {
+                (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+                _ => crate::ec::EcKvSnapshot::NotRead,
+            };
+            // Hand the loaded row to the request context so response
+            // finalization — which runs on an EC context the adapter owns,
+            // after this handler returns — ingests `ts-eids`/`sharedId` updates
+            // from this read instead of paying for a second lookup.
+            if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
+                ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
+            }
             let mut auction_request = build_auction_request(
                 &slots_ctx,
-                ec_id,
-                consent_context,
+                ec_id.as_deref(),
+                &consent_context,
                 &request_info,
                 &settings.publisher.domain,
                 req.headers()
@@ -6479,8 +6618,8 @@ pub async fn handle_page_bids(
                 &mut auction_request,
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
-                    ec_id,
-                    kv,
+                    ec_id: ec_id.as_deref(),
+                    kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
                     services,
@@ -6654,8 +6793,44 @@ mod tests {
 
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::types::AuctionResponse;
+    use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+
+    #[test]
+    fn request_head_snapshot_preserves_downstream_shape_without_body() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article?x=1")
+            .header(header::HOST, "publisher.example")
+            .header("fastly-ssl", "1")
+            .header(header::USER_AGENT, "test-browser")
+            .body(EdgeBody::from("ignored-body"))
+            .expect("should build request");
+
+        let snapshot = request_head_snapshot(&request);
+
+        assert_eq!(snapshot.method(), Method::GET);
+        assert_eq!(snapshot.uri(), request.uri());
+        assert_eq!(snapshot.headers(), request.headers());
+        assert!(
+            matches!(snapshot.body(), EdgeBody::Once(bytes) if bytes.is_empty()),
+            "snapshot should never duplicate the request body"
+        );
+    }
+
+    #[test]
+    fn ec_snapshot_preload_requires_navigation_get_ec_and_kv() {
+        assert!(should_preload_ec_snapshot(true, true, true, true));
+        assert!(!should_preload_ec_snapshot(false, true, true, true));
+        assert!(!should_preload_ec_snapshot(true, false, true, true));
+        assert!(!should_preload_ec_snapshot(true, true, false, true));
+        assert!(!should_preload_ec_snapshot(true, true, true, false));
+    }
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
+    use crate::consent::ConsentContext;
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteOutcome};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
@@ -6666,6 +6841,458 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
+
+    /// [`EcKvStore`] that records how many HTTP calls the shared stub client had
+    /// made at the moment of each identity-graph lookup. This exposes the
+    /// interleaving between origin dispatch and the EC KV read so scheduling
+    /// tests can prove origin starts before the lookup only for concurrent
+    /// clients.
+    struct OrderRecordingKv {
+        inner: InMemoryEcKv,
+        http: Arc<StubHttpClient>,
+        http_calls_at_lookup: Arc<AtomicUsize>,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    const SCHEDULING_PROVIDER: &str = "scheduling-capture";
+
+    #[derive(Debug)]
+    struct CapturedSchedulingAuction {
+        request: AuctionRequest,
+        client_uri: String,
+        client_host: Option<String>,
+        client_fastly_ssl: Option<String>,
+        client_user_agent: Option<String>,
+        http_calls_at_dispatch: usize,
+        lookups_at_dispatch: usize,
+    }
+
+    struct SchedulingCaptureProvider {
+        captured: Arc<Mutex<Option<CapturedSchedulingAuction>>>,
+        http: Arc<StubHttpClient>,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for SchedulingCaptureProvider {
+        fn provider_name(&self) -> &'static str {
+            SCHEDULING_PROVIDER
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            let header_value = |name: &str| {
+                context
+                    .request
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            };
+            *self.captured.lock().expect("should lock captured auction") =
+                Some(CapturedSchedulingAuction {
+                    request: request.clone(),
+                    client_uri: context.request.uri().to_string(),
+                    client_host: header_value(header::HOST.as_str()),
+                    client_fastly_ssl: header_value("fastly-ssl"),
+                    client_user_agent: header_value(header::USER_AGENT.as_str()),
+                    http_calls_at_dispatch: self.http.recorded_backend_names().len(),
+                    lookups_at_dispatch: self.lookups.load(Ordering::SeqCst),
+                });
+            Err(Report::new(TrustedServerError::Auction {
+                message: "scheduling capture only".to_owned(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: crate::platform::PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when scheduling capture fails")
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("scheduling-capture-backend".to_owned())
+        }
+    }
+
+    struct SchedulingProbeOutcome {
+        lookups: usize,
+        http_calls_at_lookup: usize,
+        stream_flags: Vec<bool>,
+        cache_bypass_flags: Vec<bool>,
+        body_is_stream: bool,
+        request_rewritten: bool,
+        response_is_private: bool,
+        auction_preserved_client_snapshot: bool,
+        origin_kv_auction_order: bool,
+        datadome_tag_suppressed: bool,
+        ok: bool,
+    }
+
+    impl EcKvStore for OrderRecordingKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, _key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            self.http_calls_at_lookup
+                .store(self.http.recorded_backend_names().len(), Ordering::SeqCst);
+            // Report a miss: the scheduling assertions only care about ordering.
+            Ok(None)
+        }
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn scheduling_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..Default::default()
+        }
+    }
+
+    fn navigation_request() -> Request<EdgeBody> {
+        let mut request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .header("fastly-ssl", "1")
+            .header(header::IF_NONE_MATCH, "\"cached-page\"")
+            .header(header::RANGE, "bytes=0-18")
+            .header(header::USER_AGENT, "scheduling-browser")
+            .body(EdgeBody::empty())
+            .expect("should build navigation request");
+        request
+            .extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        request
+    }
+
+    fn scheduling_settings() -> Settings {
+        let toml = format!(
+            "{}\n[auction]\nenabled = true\nproviders = [\"{SCHEDULING_PROVIDER}\"]\n\n\
+             [creative_opportunities]\ngam_network_id = \"12345\"\n",
+            crate_test_settings_str()
+        );
+        let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "client_side_key": "scheduling-test-key",
+                }),
+            )
+            .expect("should configure DataDome integration");
+        settings
+    }
+
+    fn scheduling_slot() -> CreativeOpportunitySlot {
+        CreativeOpportunitySlot {
+            id: "scheduling-slot".to_owned(),
+            gam_unit_path: None,
+            div_id: None,
+            page_patterns: vec!["/article".to_owned()],
+            formats: vec![CreativeOpportunityFormat {
+                width: 300,
+                height: 250,
+                media_type: MediaType::Banner,
+            }],
+            floor_price: None,
+            targeting: Default::default(),
+            providers: Default::default(),
+            compiled_patterns: Vec::new(),
+            compiled_unit: None,
+        }
+    }
+
+    /// Drives one EC-capable navigation and captures the complete pending-origin
+    /// ordering plus the origin and auction views of the request.
+    async fn run_scheduling_probe(
+        concurrent_fanout: bool,
+        streaming_responses: bool,
+        pending_streaming_responses: bool,
+        queue_origin: bool,
+    ) -> SchedulingProbeOutcome {
+        let settings = scheduling_settings();
+        let http = Arc::new(StubHttpClient::new());
+        http.set_concurrent_fanout(concurrent_fanout);
+        http.set_streaming_responses_supported(streaming_responses);
+        http.set_pending_streaming_responses_supported(pending_streaming_responses);
+        if queue_origin {
+            http.push_response_with_headers(
+                200,
+                b"<html><body>ok</body></html>".to_vec(),
+                vec![("content-type", "text/html; charset=utf-8")],
+            );
+        }
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let http_calls_at_lookup = Arc::new(AtomicUsize::new(0));
+        let graph = KvIdentityGraph::new(OrderRecordingKv {
+            inner: InMemoryEcKv::new("order-store"),
+            http: Arc::clone(&http),
+            http_calls_at_lookup: Arc::clone(&http_calls_at_lookup),
+            lookups: Arc::clone(&lookups),
+        });
+        let services = build_services_with_http_client(
+            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let ec_id = format!("{}.CkId01", "b".repeat(64));
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(ec_id),
+            scheduling_consent(),
+            Some("203.0.113.7".to_owned()),
+        );
+        assert!(
+            ec_context.ec_allowed() && ec_context.ec_value().is_some(),
+            "test precondition: an active, consent-allowed EC must exist"
+        );
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let captured_auction = Arc::new(Mutex::new(None));
+        let mut orchestrator = orchestrator;
+        orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
+            captured: Arc::clone(&captured_auction),
+            http: Arc::clone(&http),
+            lookups: Arc::clone(&lookups),
+        }));
+        let slots = [scheduling_slot()];
+
+        let result = handle_publisher_request(
+            &settings,
+            &services,
+            Some(&graph),
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &slots,
+                registry: None,
+            },
+            navigation_request(),
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await;
+
+        let ok = result.is_ok();
+        let body_is_stream = result.as_ref().ok().is_some_and(|response| match response {
+            PublisherResponse::PassThrough { body, .. } => body.is_stream(),
+            PublisherResponse::Buffered(response) => response.body().is_stream(),
+            PublisherResponse::Stream { body, .. } => body.is_stream(),
+            PublisherResponse::AssembleTemplate { response, .. } => response.body().is_stream(),
+        });
+        let response_is_private = result.as_ref().ok().is_some_and(|response| {
+            let headers = match response {
+                PublisherResponse::PassThrough { response, .. }
+                | PublisherResponse::Stream { response, .. }
+                | PublisherResponse::AssembleTemplate { response, .. }
+                | PublisherResponse::Buffered(response) => response.headers(),
+            };
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                == Some(crate::cache_policy::NO_STORE_PRIVATE_CACHE_CONTROL)
+        });
+        let recorded_headers = http.recorded_request_headers();
+        let request_rewritten = http.recorded_request_uris()
+            == vec!["https://origin.test-publisher.com/article"]
+            && recorded_headers.first().is_some_and(|headers| {
+                let header_value = |name: &str| {
+                    headers
+                        .iter()
+                        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.as_str())
+                };
+                header_value(header::HOST.as_str()) == Some("origin.test-publisher.com")
+                    && header_value("fastly-ssl").is_none()
+                    && header_value(header::IF_NONE_MATCH.as_str()).is_none()
+                    && header_value(header::RANGE.as_str()).is_none()
+            });
+
+        let captured_auction = captured_auction
+            .lock()
+            .expect("should lock captured auction")
+            .take();
+        let auction_preserved_client_snapshot = captured_auction.as_ref().is_some_and(|captured| {
+            captured.client_uri == "https://publisher.example/article"
+                && captured.client_host.as_deref() == Some("publisher.example")
+                && captured.client_fastly_ssl.as_deref() == Some("1")
+                && captured.client_user_agent.as_deref() == Some("scheduling-browser")
+                && captured
+                    .request
+                    .device
+                    .as_ref()
+                    .and_then(|device| device.user_agent.as_deref())
+                    == Some("scheduling-browser")
+        });
+        let origin_kv_auction_order = captured_auction.as_ref().is_some_and(|captured| {
+            captured.http_calls_at_dispatch == 1 && captured.lookups_at_dispatch == 1
+        });
+        let datadome_tag_suppressed = if let Ok(response) = result {
+            let registry = IntegrationRegistry::new(&settings)
+                .expect("should create integration registry with DataDome");
+            buffer_publisher_response_async(
+                response,
+                &Method::GET,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .ok()
+            .and_then(|response| response.into_body().into_bytes())
+            .and_then(|body| String::from_utf8(body.to_vec()).ok())
+            .is_some_and(|html| {
+                !html.contains("window.ddjskey") && !html.contains("/integrations/datadome/tags.js")
+            })
+        } else {
+            false
+        };
+
+        SchedulingProbeOutcome {
+            lookups: lookups.load(Ordering::SeqCst),
+            http_calls_at_lookup: http_calls_at_lookup.load(Ordering::SeqCst),
+            stream_flags: http.recorded_stream_response_flags(),
+            cache_bypass_flags: http.recorded_cache_bypass_flags(),
+            body_is_stream,
+            request_rewritten,
+            response_is_private,
+            auction_preserved_client_snapshot,
+            origin_kv_auction_order,
+            datadome_tag_suppressed,
+            ok,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_client_starts_origin_before_ec_lookup() {
+        let outcome = run_scheduling_probe(true, true, true, true).await;
+
+        assert!(outcome.ok, "should proxy the origin response");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
+        assert_eq!(
+            outcome.http_calls_at_lookup, 1,
+            "a concurrent client must start the origin before its EC KV lookup"
+        );
+        assert_eq!(outcome.stream_flags, vec![true]);
+        assert_eq!(
+            outcome.cache_bypass_flags,
+            vec![true],
+            "pending publisher origin request should bypass platform caching"
+        );
+        assert!(
+            outcome.body_is_stream,
+            "pending origin wait should preserve the publisher body stream"
+        );
+        assert!(
+            outcome.request_rewritten,
+            "pending origin path should preserve rewriting and header filtering"
+        );
+        assert!(
+            outcome.response_is_private,
+            "DataDome-suppressed pending HTML should remain private"
+        );
+        assert!(
+            outcome.origin_kv_auction_order,
+            "pending origin should start before KV lookup and auction dispatch"
+        );
+        assert!(
+            outcome.auction_preserved_client_snapshot,
+            "auction dispatch should retain the original client URI and headers"
+        );
+        assert!(
+            outcome.datadome_tag_suppressed,
+            "configured DataDome client injection should remain suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn eager_client_reads_ec_before_starting_origin() {
+        let outcome = run_scheduling_probe(false, false, false, true).await;
+
+        assert!(outcome.ok, "should proxy the origin response");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
+        assert_eq!(
+            outcome.http_calls_at_lookup, 0,
+            "an eager client must not start the origin before its EC KV lookup"
+        );
+        assert_eq!(outcome.stream_flags, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_send_streaming_without_pending_streaming_uses_eager_fallback() {
+        let outcome = run_scheduling_probe(true, true, false, true).await;
+
+        assert!(outcome.ok, "should proxy through the eager send fallback");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
+        assert_eq!(
+            outcome.http_calls_at_lookup, 0,
+            "client without pending streaming must preload EC before eager send"
+        );
+        assert_eq!(outcome.stream_flags, vec![true]);
+        assert!(
+            outcome.body_is_stream,
+            "eager fallback should retain streamed body"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_streaming_does_not_require_eager_send_streaming() {
+        let outcome = run_scheduling_probe(true, false, true, true).await;
+
+        assert!(outcome.ok, "should proxy through the pending origin path");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
+        assert_eq!(
+            outcome.http_calls_at_lookup, 1,
+            "pending-stream support should start origin before the EC lookup"
+        );
+        assert_eq!(outcome.stream_flags, vec![true]);
+        assert!(
+            outcome.body_is_stream,
+            "pending-stream support should retain the streamed body independently of eager send"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_origin_start_failure_skips_ec_and_auction_work() {
+        // No origin response is queued, so the concurrent `send_async` fails.
+        let outcome = run_scheduling_probe(true, true, true, false).await;
+
+        assert!(
+            !outcome.ok,
+            "origin-start failure should surface as an error"
+        );
+        assert_eq!(
+            outcome.lookups, 0,
+            "origin-start failure must occur before any EC KV work"
+        );
+    }
 
     fn make_test_bid_with_creative(creative: &str) -> Bid {
         Bid {
@@ -13114,6 +13741,137 @@ mod tests {
                 .map(|(_, value)| value.as_str())
         }
 
+        fn active_ec_context() -> EcContext {
+            EcContext::new_for_test_with_ip(
+                Some(format!("{}.CkId01", "b".repeat(64))),
+                scheduling_consent(),
+                Some("203.0.113.7".to_owned()),
+            )
+        }
+
+        #[tokio::test]
+        async fn pending_origin_wait_failure_abandons_dispatched_auction_once() {
+            let settings = settings_with_dispatching_provider();
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
+            stub.set_pending_streaming_responses_supported(true);
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
+            stub.push_response(200, b"unused provider response".to_vec());
+            stub.push_wait_error();
+            let services = services_with_telemetry(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::clone(&telemetry_sink),
+            );
+            let graph = KvIdentityGraph::new(InMemoryEcKv::new("wait-error-store"));
+            let mut ec_context = active_ec_context();
+            let slots = [article_slot()];
+
+            let error = match handle_publisher_request(
+                &settings,
+                &services,
+                Some(&graph),
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                conditional_navigation_request(),
+                EdgeCacheHeader::SurrogateControl,
+            )
+            .await
+            {
+                Ok(_) => panic!("pending origin wait failure should surface as a proxy error"),
+                Err(error) => error,
+            };
+
+            assert!(
+                format!("{error:?}").contains("Failed to proxy request to origin"),
+                "should preserve the existing proxy error context: {error:?}"
+            );
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            let summaries: Vec<_> = batches
+                .iter()
+                .flat_map(AuctionEventBatch::rows)
+                .filter(|row| row.event_kind == "summary")
+                .collect();
+            assert_eq!(
+                summaries.len(),
+                1,
+                "should emit exactly one terminal summary"
+            );
+            assert_eq!(summaries[0].terminal_status.as_deref(), Some("abandoned"));
+            assert_eq!(
+                summaries[0].terminal_reason.as_deref(),
+                Some("origin_proxy_error")
+            );
+            assert_eq!(
+                summaries[0].publisher_domain, settings.publisher.domain,
+                "reordered path should retain configured publisher attribution"
+            );
+        }
+
+        #[tokio::test]
+        async fn pending_origin_start_failure_skips_kv_auction_and_telemetry() {
+            let settings = settings_with_dispatching_provider();
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
+            stub.set_pending_streaming_responses_supported(true);
+            let services = services_with_telemetry(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::clone(&telemetry_sink),
+            );
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let graph = KvIdentityGraph::new(OrderRecordingKv {
+                inner: InMemoryEcKv::new("start-error-store"),
+                http: Arc::clone(&stub),
+                http_calls_at_lookup: Arc::new(AtomicUsize::new(0)),
+                lookups: Arc::clone(&lookups),
+            });
+            let mut ec_context = active_ec_context();
+            let slots = [article_slot()];
+
+            let result = handle_publisher_request(
+                &settings,
+                &services,
+                Some(&graph),
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                conditional_navigation_request(),
+                EdgeCacheHeader::SurrogateControl,
+            )
+            .await;
+
+            assert!(result.is_err(), "origin start failure should be returned");
+            assert_eq!(lookups.load(Ordering::SeqCst), 0, "should skip KV lookup");
+            assert_eq!(
+                stub.recorded_backend_names(),
+                vec!["stub-backend"],
+                "should not dispatch the auction provider after origin start fails"
+            );
+            assert!(
+                telemetry_sink
+                    .batches
+                    .lock()
+                    .expect("should lock telemetry batches")
+                    .is_empty(),
+                "should not emit abandonment for an auction that never dispatched"
+            );
+        }
+
         #[tokio::test]
         async fn eligible_navigation_bypasses_cache_and_returns_non_storable_html() {
             // Arrange
@@ -19305,9 +20063,9 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> serde_json::Value {
-            let ec_context = consent_allowing_ec_context();
+            let mut ec_context = consent_allowing_ec_context();
             let response =
-                run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req)
+                run_page_bids_response_with_ec(settings, orchestrator, slots, &mut ec_context, req)
                     .await;
             serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
                 .expect("should be json")
@@ -19425,16 +20183,17 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
-            let ec_context = EcContext::read_from_request(settings, &req, &noop_services())
+            let mut ec_context = EcContext::read_from_request(settings, &req, &noop_services())
                 .expect("should read EC context");
-            run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req).await
+            run_page_bids_response_with_ec(settings, orchestrator, slots, &mut ec_context, req)
+                .await
         }
 
         async fn run_page_bids_response_with_ec(
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
             slots: &[CreativeOpportunitySlot],
-            ec_context: &EcContext,
+            ec_context: &mut EcContext,
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
             let services = noop_services();
@@ -19484,7 +20243,7 @@ mod tests {
             let winning_request = Arc::new(Mutex::new(None));
             let winning_orchestrator =
                 auction_id_test_orchestrator(&settings, Arc::clone(&winning_request), true);
-            let ec_context = EcContext::new_for_test(
+            let mut ec_context = EcContext::new_for_test(
                 Some("page-auction-example-123".to_string()),
                 crate::consent::ConsentContext {
                     jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -19501,7 +20260,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 make_page_bids_request("/2024/01/my-article/"),
             )
             .await
@@ -19556,7 +20315,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 make_page_bids_request("/2024/01/my-article/"),
             )
             .await
@@ -19592,7 +20351,7 @@ mod tests {
                 );
                 let orchestrator =
                     auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), true);
-                let ec_context = EcContext::new_for_test(
+                let mut ec_context = EcContext::new_for_test(
                     Some("page-auction-example-123".to_string()),
                     crate::consent::ConsentContext {
                         jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -19608,7 +20367,7 @@ mod tests {
                         slots: &slots,
                         registry: None,
                     },
-                    &ec_context,
+                    &mut ec_context,
                     make_page_bids_request("/2024/01/my-article/"),
                 )
                 .await
@@ -20482,7 +21241,7 @@ mod tests {
                 Arc::new(crate::platform::test_support::NoopHttpClient),
                 Arc::clone(&telemetry_sink),
             );
-            let ec_context = consent_allowing_ec_context();
+            let mut ec_context = consent_allowing_ec_context();
             let mut req = HttpRequest::builder()
                 .method(Method::GET)
                 .uri(format!(
@@ -20505,7 +21264,7 @@ mod tests {
                     slots: &article_slot(),
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 req,
             )
             .await
@@ -20566,7 +21325,7 @@ mod tests {
                 Arc::new(crate::platform::test_support::NoopHttpClient),
                 telemetry_sink,
             );
-            let ec_context = consent_allowing_ec_context();
+            let mut ec_context = consent_allowing_ec_context();
             let request_path = format!("/{}", "a".repeat(60));
             let mut req = HttpRequest::builder()
                 .method(Method::GET)
@@ -20591,7 +21350,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 req,
             )
             .await
