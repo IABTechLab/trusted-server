@@ -31,8 +31,8 @@
 //! - `split_srcset_candidates(&str) -> Vec<&str>`: Robust splitting that supports
 //!   commas with or without spaces and avoids splitting the mediatype/data comma
 //!   in a leading `data:` URL.
-//! - `rewrite_css_body(&Settings, &str) -> String`: Rewrites url(...) occurrences
-//!   inside CSS bodies.
+//! - `rewrite_css_body(&Settings, &str) -> Result<String, CssRewriteError>`:
+//!   Rewrites url(...) occurrences inside CSS bodies.
 //!
 //! See the tests in this module for comprehensive cases, including irregular
 //! spacing, no-space commas, and `data:` handling.
@@ -90,6 +90,14 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
 /// block through a closure, so each nested slice would be re-read from its
 /// start — quadratic in the input, which [`MAX_REWRITABLE_BODY_SIZE`] allows
 /// to be 10 MB. Recursing stays linear and bounds the stack instead.
+///
+/// A scope is anything whose contents the walk reads by recursing: a block, a
+/// function that may hold a value of its own (`image-set()`, `var()`), an
+/// `@import` prelude. Reading the single string argument of a `url()` or
+/// `src()` is not one — that grammar is terminal, so it costs no recursion and
+/// is not charged a level. Without that exemption the bound would depend on
+/// how a URL is spelled, admitting `url(https://…)` where it rejects the
+/// identical `url("https://…")`, and rejection discards the whole stylesheet.
 const MAX_CSS_NESTING_DEPTH: usize = 64;
 
 /// Rewrites URL references inside a CSS string to the first-party proxy.
@@ -128,21 +136,44 @@ const MAX_CSS_NESTING_DEPTH: usize = 64;
 /// cap is never inspected and reaches the browser untouched, which is the leak
 /// this exists to close. Rejecting costs the styling of CSS no real page
 /// produces; passing through would cost the guarantee.
+///
+/// This entry point serves markup, where the stylesheet is one part of a
+/// document the rest of which is still rewritten, so a rejection drops that
+/// part and is reported in the log. A whole CSS response has no such
+/// remainder — see [`rewrite_css_body`], which reports the rejection to its
+/// caller so the response carries it.
 pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: &str) -> String {
-    rewrite_style_urls_in_context(settings, style, base_origin, true)
+    drop_if_rejected(
+        rewrite_style_urls_in_context(settings, style, base_origin, true),
+        "<style> block",
+    )
 }
 
 /// Rewrites a style attribute, where `@import` is ordinary declaration data.
 fn rewrite_style_attribute_urls(settings: &Settings, style: &str, base_origin: &str) -> String {
-    rewrite_style_urls_in_context(settings, style, base_origin, false)
+    drop_if_rejected(
+        rewrite_style_urls_in_context(settings, style, base_origin, false),
+        "style attribute",
+    )
 }
 
+/// Turns a rejected rewrite into an empty stylesheet, naming what was dropped
+/// so the log says which part of the document lost its styling.
+fn drop_if_rejected(rewritten: Option<String>, dropped: &str) -> String {
+    rewritten.unwrap_or_else(|| {
+        log::warn!("Dropping a {dropped} nested past the supported depth");
+        String::new()
+    })
+}
+
+/// Returns the rewritten CSS, or `None` when it nested past
+/// [`MAX_CSS_NESTING_DEPTH`].
 fn rewrite_style_urls_in_context(
     settings: &Settings,
     style: &str,
     base_origin: &str,
     allows_import_rules: bool,
-) -> String {
+) -> Option<String> {
     let mut rewriter = CssUrlRewriter {
         settings,
         style,
@@ -156,11 +187,10 @@ fn rewrite_style_urls_in_context(
     let mut parser = cssparser::Parser::new(&mut input);
     rewriter.walk(&mut parser, 0, BareStringUrls::Never);
     if rewriter.depth_exceeded {
-        log::warn!("Rejecting a stylesheet nested past the supported depth");
-        return String::new();
+        return None;
     }
     rewriter.out.push_str(&style[rewriter.write_pos..]);
-    rewriter.out
+    Some(rewriter.out)
 }
 
 /// Splices rewritten `url()` values into a copy of the original CSS.
@@ -203,6 +233,11 @@ impl CssUrlRewriter<'_> {
         let is_stylesheet_root = depth == 0 && self.allows_import_rules;
         let mut rule_may_start = is_stylesheet_root;
         loop {
+            // The output is already void once a scope was refused, so stop
+            // rather than scan the siblings of the one that went too deep.
+            if self.depth_exceeded {
+                return;
+            }
             let token_start = parser.position().byte_index();
             // Owned so the token stops borrowing the parser before the body of
             // a block or function is read.
@@ -261,38 +296,26 @@ impl CssUrlRewriter<'_> {
             match found {
                 CssToken::Url(value, shape) => self.rewrite(&value, token_start, parser, shape),
                 CssToken::UrlFunction(function) => {
-                    if depth >= MAX_CSS_NESTING_DEPTH {
-                        self.depth_exceeded = true;
-                        return;
-                    }
                     self.rewrite_url_function(parser, token_start, function, depth);
                 }
                 CssToken::ImportPrelude => {
-                    if depth >= MAX_CSS_NESTING_DEPTH {
-                        self.depth_exceeded = true;
-                        return;
-                    }
                     // Ends at the `;` or `{` that ends the at-rule, and the
                     // delimiter itself is left for this loop to read, so the
                     // prelude cannot reach a later declaration.
                     let _ = parser.parse_until_before(
                         cssparser::Delimiter::Semicolon | cssparser::Delimiter::CurlyBracketBlock,
                         |prelude| -> Result<(), cssparser::ParseError<'_, ()>> {
-                            self.walk(prelude, depth + 1, BareStringUrls::FirstValue);
+                            self.descend(prelude, depth, BareStringUrls::FirstValue);
                             Ok(())
                         },
                     );
                 }
                 CssToken::Block(nested_strings_are_urls, _) => {
-                    if depth >= MAX_CSS_NESTING_DEPTH {
-                        self.depth_exceeded = true;
-                        return;
-                    }
                     // `parse_nested_block` must be called to consume the body;
                     // skipping it would leave the block unvisited.
                     let _ = parser.parse_nested_block(
                         |inner| -> Result<(), cssparser::ParseError<'_, ()>> {
-                            self.walk(inner, depth + 1, nested_strings_are_urls);
+                            self.descend(inner, depth, nested_strings_are_urls);
                             Ok(())
                         },
                     );
@@ -311,6 +334,25 @@ impl CssUrlRewriter<'_> {
                 rule_may_start = false;
             }
         }
+    }
+
+    /// Reads a nested scope one level down, or refuses it.
+    ///
+    /// Every recursion the walk makes goes through here, so one bound covers
+    /// blocks, functions and `@import` preludes alike and no scope can be
+    /// entered on a path that forgot to check. `depth` is the depth of the
+    /// scope being descended *from*.
+    fn descend(
+        &mut self,
+        parser: &mut cssparser::Parser<'_, '_>,
+        depth: usize,
+        strings_are_urls: BareStringUrls,
+    ) {
+        if depth >= MAX_CSS_NESTING_DEPTH {
+            self.depth_exceeded = true;
+            return;
+        }
+        self.walk(parser, depth + 1, strings_are_urls);
     }
 
     /// Replaces the span just consumed with a proxied reference in `shape`, or
@@ -348,6 +390,10 @@ impl CssUrlRewriter<'_> {
     /// alone, since a substituted `src()` argument has to stay a string. A
     /// `url()` argument is not walked: an engine does not substitute inside
     /// it, so a fallback there is never the URL that gets requested.
+    ///
+    /// Reading the argument costs no recursion unless it is walked, so only
+    /// that walk is charged against [`MAX_CSS_NESTING_DEPTH`] — a quoted URL
+    /// is admitted at the same depth as an unquoted one.
     fn rewrite_url_function(
         &mut self,
         parser: &mut cssparser::Parser<'_, '_>,
@@ -368,7 +414,7 @@ impl CssUrlRewriter<'_> {
             }
             inner.reset(&start);
             if substitutes {
-                self.walk(inner, depth + 1, BareStringUrls::Every);
+                self.descend(inner, depth, BareStringUrls::Every);
             }
             Ok(())
         });
@@ -662,11 +708,33 @@ pub(super) fn proxied_attr_value(
     }
 }
 
+/// Why a CSS body could not be rewritten.
+#[derive(Debug, derive_more::Display)]
+pub enum CssRewriteError {
+    /// The stylesheet nested past [`MAX_CSS_NESTING_DEPTH`], so the rewrite was
+    /// refused rather than left partly applied.
+    #[display("CSS nested past the maximum supported depth of {MAX_CSS_NESTING_DEPTH}")]
+    NestingTooDeep,
+}
+
+impl core::error::Error for CssRewriteError {}
+
 /// Rewrite a full CSS stylesheet body by normalizing url(...) references to the
 /// unified first-party proxy. Relative URLs are left unchanged.
-#[must_use]
-pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
-    rewrite_style_urls(settings, css, "")
+///
+/// Unlike [`rewrite_style_urls`], which serves markup and can drop one
+/// stylesheet out of a document that is otherwise still rewritten, this is the
+/// whole response body. A refused rewrite leaves nothing to serve, and an
+/// empty `200` is indistinguishable on the wire from a stylesheet the origin
+/// legitimately served empty — so the refusal is reported to the caller, which
+/// answers with a status the way the oversized-body path does.
+///
+/// # Errors
+///
+/// Returns [`CssRewriteError::NestingTooDeep`] when the stylesheet nests past
+/// [`MAX_CSS_NESTING_DEPTH`].
+pub fn rewrite_css_body(settings: &Settings, css: &str) -> Result<String, CssRewriteError> {
+    rewrite_style_urls_in_context(settings, css, "", true).ok_or(CssRewriteError::NestingTooDeep)
 }
 
 /// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
@@ -1367,7 +1435,7 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
             let css = String::from_utf8(std::mem::take(&mut self.buffer))
                 .map_err(|e| io::Error::other(format!("Invalid UTF-8 in CSS: {e}")))?;
 
-            let rewritten = rewrite_css_body(self.settings, &css);
+            let rewritten = rewrite_css_body(self.settings, &css).map_err(io::Error::other)?;
             Ok(rewritten.into_bytes())
         } else {
             Ok(Vec::new())
@@ -1382,8 +1450,9 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_auction_creative, rewrite_creative_html, rewrite_inline_creative_html,
-        rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
+        CreativeCssProcessor, StreamProcessor as _, process_auction_creative,
+        rewrite_creative_html, rewrite_inline_creative_html, rewrite_srcset, rewrite_style_urls,
+        sanitize_creative_html, to_abs,
     };
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
@@ -2160,20 +2229,34 @@ b{background:url(\"https://cdn.example/c.png\")}";
     }
 
     #[test]
-    fn rewrite_style_urls_rejects_a_quoted_url_past_the_supported_depth() {
+    fn rewrite_style_urls_admits_a_scope_opening_reference_one_level_shallower() {
         let settings = crate::test_support::tests::create_test_settings();
-        let css = format!(
-            "{}background:url(\"https://cdn.example/a.png\"){}",
-            "a{".repeat(super::MAX_CSS_NESTING_DEPTH),
-            "}".repeat(super::MAX_CSS_NESTING_DEPTH)
-        );
+        // `image-set()` holds a value list the walk has to read, so it is a
+        // scope and its contents sit one level below the block it is in. That
+        // is the bound the constant describes, and it is a property of the
+        // grammar rather than of how the URL is spelled.
+        for (blocks, admitted) in [
+            (super::MAX_CSS_NESTING_DEPTH - 1, true),
+            (super::MAX_CSS_NESTING_DEPTH, false),
+        ] {
+            let css = format!(
+                "{}background:image-set(\"https://cdn.example/a.png\" 1x){}",
+                "a{".repeat(blocks),
+                "}".repeat(blocks)
+            );
 
-        let out = rewrite_style_urls(&settings, &css, "");
+            let out = rewrite_style_urls(&settings, &css, "");
 
-        assert!(
-            out.is_empty(),
-            "should count the quoted url() parser frame against the depth bound"
-        );
+            assert_eq!(
+                out.contains(&super::build_proxy_url(
+                    &settings,
+                    "https://cdn.example/a.png",
+                    ""
+                )),
+                admitted,
+                "image-set() at {blocks} nested blocks should be admitted: {admitted}"
+            );
+        }
     }
 
     #[test]
@@ -2427,24 +2510,33 @@ b{background:url(\"https://cdn.example/c.png\")}";
     #[test]
     fn rewrite_style_urls_rewrites_at_the_deepest_supported_nesting() {
         let settings = crate::test_support::tests::create_test_settings();
-        // One url() at exactly the cap, to pin that the bound admits the depth
-        // it advertises rather than stopping one level short.
-        let css = format!(
-            "{}background:url(https://cdn.example/a.png){}",
-            "a{".repeat(super::MAX_CSS_NESTING_DEPTH),
-            "}".repeat(super::MAX_CSS_NESTING_DEPTH)
-        );
+        // One reference at exactly the cap, to pin that the bound admits the
+        // depth it advertises rather than stopping one level short — and that
+        // it admits the same depth however the reference is spelled, since
+        // quoting a URL must not decide whether the stylesheet survives.
+        for reference in [
+            "url(https://cdn.example/a.png)",
+            "url(\"https://cdn.example/a.png\")",
+            "url('https://cdn.example/a.png')",
+            "src(\"https://cdn.example/a.png\")",
+        ] {
+            let css = format!(
+                "{}background:{reference}{}",
+                "a{".repeat(super::MAX_CSS_NESTING_DEPTH),
+                "}".repeat(super::MAX_CSS_NESTING_DEPTH)
+            );
 
-        let out = rewrite_style_urls(&settings, &css, "");
+            let out = rewrite_style_urls(&settings, &css, "");
 
-        assert!(
-            out.contains(&super::build_proxy_url(
-                &settings,
-                "https://cdn.example/a.png",
-                ""
-            )),
-            "should still rewrite at the deepest supported level: {out}"
-        );
+            assert!(
+                out.contains(&super::build_proxy_url(
+                    &settings,
+                    "https://cdn.example/a.png",
+                    ""
+                )),
+                "should still rewrite {reference} at the deepest supported level: {out}"
+            );
+        }
     }
 
     #[test]
@@ -2841,13 +2933,32 @@ b{background:url(\"https://cdn.example/c.png\")}";
     fn rewrite_css_body_direct_smoke() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = ".x{background:url(https://cdn.example/a.png)} .y{mask:url('//cdn.example/b.svg')} .z{background:url(/local.png)}";
-        let out = super::rewrite_css_body(&settings, css);
+        let out = super::rewrite_css_body(&settings, css).expect("should rewrite ordinary CSS");
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
             "{}",
             out
         );
         assert!(out.contains("url(/local.png)"));
+    }
+
+    #[test]
+    fn css_processor_reports_a_stylesheet_nested_past_the_supported_depth() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // An empty `200` would be indistinguishable from a stylesheet the
+        // origin served empty, so the rejection has to reach the caller that
+        // sets the status.
+        let css = "{".repeat(super::MAX_CSS_NESTING_DEPTH * 40);
+        let mut processor = CreativeCssProcessor::new(&settings);
+
+        let error = processor
+            .process_chunk(css.as_bytes(), true)
+            .expect_err("should report the rejection rather than serve an empty body");
+
+        assert!(
+            error.to_string().contains("nested past"),
+            "should say why the stylesheet was rejected: {error}"
+        );
     }
 
     #[test]
