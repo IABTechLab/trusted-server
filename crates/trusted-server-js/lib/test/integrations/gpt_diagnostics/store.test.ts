@@ -712,6 +712,31 @@ describe('GptDiagnosticsStore', () => {
     });
   });
 
+  it('retains the SPA timing origin when direct and Prebid auctions compete', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('competing-spa-auction');
+
+    store.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot',
+      'renderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        serverTimings: { auctionDispatchedMs: 0, auctionResolvedMs: 84 },
+      }
+    );
+    store.recordPrebidRefresh([slot]);
+    store.recordSlotRequested(slot);
+
+    expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+      auctionType: 'competing',
+      serverAuctionTimingOrigin: 'spa_auction',
+      serverAuctionTimings: { auctionDispatchedMs: 0, auctionResolvedMs: 84 },
+    });
+  });
+
   it('drops malformed winner and auction timing fields at the diagnostics boundary', () => {
     const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
     const slot = fakeSlot('invalid-auction-facts');

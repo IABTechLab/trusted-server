@@ -16,6 +16,7 @@ import type {
   GptDiagnosticsRequestCycle,
   GptDiagnosticsRequestPath,
   GptDiagnosticsResponseClass,
+  GptDiagnosticsServerAuctionTimingOrigin,
   GptDiagnosticsSlotHandle,
   GptDiagnosticsTrustedServerOpportunity,
   Size,
@@ -675,6 +676,12 @@ export class GptDiagnosticsStore {
     const trustedServerEvidence = intent?.sources.get('trusted_server_direct');
     const requestPath = this.requestPath(intent);
     const auctionType = this.auctionType(intent, trustedServerEvidence);
+    const serverAuctionTimingOrigin: GptDiagnosticsServerAuctionTimingOrigin | undefined =
+      trustedServerEvidence?.serverAuctionTimings === undefined
+        ? undefined
+        : trustedServerEvidence.auctionType === 'trusted_server'
+          ? 'spa_auction'
+          : 'navigation';
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
@@ -695,6 +702,7 @@ export class GptDiagnosticsStore {
       ...(trustedServerEvidence?.serverAuctionTimings !== undefined
         ? { serverAuctionTimings: trustedServerEvidence.serverAuctionTimings }
         : {}),
+      ...(serverAuctionTimingOrigin !== undefined ? { serverAuctionTimingOrigin } : {}),
       ...(trustedServerEvidence?.requestedSlotSizes !== undefined
         ? { requestedSlotSizes: trustedServerEvidence.requestedSlotSizes }
         : {}),
@@ -1022,10 +1030,7 @@ export class GptDiagnosticsStore {
   private recordRequestIntentSource(
     slot: object,
     source: RequestIntentSource,
-    facts: Pick<
-      PendingSourceEvidence,
-      'trustedServerOpportunity' | 'trustedServerAuctionId' | 'requestedSlotSizes'
-    > = {}
+    facts: Omit<PendingSourceEvidence, 'observedAtMs'> = {}
   ): void {
     const observedAtMs = this.now();
     let intent = this.pendingRequestIntents.get(slot);

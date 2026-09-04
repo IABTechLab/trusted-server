@@ -155,8 +155,10 @@ establish an auction implementation.
 Server auction timing and browser GPT timing use separate clocks and are never
 subtracted from each other. Initial SSAT offsets use navigation-request T0. SPA TS
 auction offsets use a local server clock started immediately before auction dispatch,
-not the browser's navigation clock or the edge's request-receipt time. The server facts
-are:
+not the browser's navigation clock or the edge's request-receipt time. Diagnostics
+retain that timing origin separately from the aggregate auction classification, so a
+request marked `competing` still labels SPA offsets from SPA auction T0. The server
+facts are:
 
 - `auctionDispatchedMs`: bid dispatch offset from that timing origin.
 - `auctionResolvedMs`: final bid or timeout offset from the same timing origin.
@@ -166,9 +168,10 @@ are:
   the document response was streaming.
 
 The SPA page-bids response includes these server timings only for an activated
-console session. The activation cookie is still removed before auction and publisher
-processing; the server retains only the request-scoped activation decision needed to
-gate this diagnostics field.
+console session and a successfully dispatched auction. Failures before any provider
+dispatch do not emit timing evidence. The activation cookie is still removed before
+auction and publisher processing; the server retains only the request-scoped activation
+decision needed to gate this diagnostics field.
 
 Browser timings have different boundaries. **GAM request → response** starts at GPT's
 `slotRequested` callback and ends at `slotResponseReceived`. **GAM response → render**
@@ -482,8 +485,8 @@ The allowlisted export contains:
   request, plus GPT-reported fill `size` and an optional observed outer `observedSlotSize`.
 - Request path, auction type, request intent ID, opportunity, creative-progress
   timestamps, and safe failure enums.
-- The bounded winning bidder and bucketed price plus server auction timing fields when
-  direct auction evidence was observed.
+- The bounded winning bidder and bucketed price plus server auction timing fields and
+  their `navigation` or `spa_auction` origin when direct auction evidence was observed.
 - The per-auction diagnostics token (`trustedServerAuctionId`) and the
   opportunity-to-request duration, when a direct opportunity was observed.
 - Replacement facts for a re-rendered slot: `replacedRequestNumber`,

@@ -240,8 +240,10 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
     facts.push(`Winning bid price bucket: ${cycle.auctionWinner.priceBucket}`);
   }
   if (cycle.serverAuctionTimings) {
-    const timingAnchor =
-      cycle.auctionType === 'trusted_server' ? 'SPA auction T0' : 'Navigation T0';
+    const timingOrigin =
+      cycle.serverAuctionTimingOrigin ??
+      (cycle.auctionType === 'trusted_server' ? 'spa_auction' : 'navigation');
+    const timingAnchor = timingOrigin === 'spa_auction' ? 'SPA auction T0' : 'Navigation T0';
     const serverTimings = [
       [`${timingAnchor} → auction dispatched`, cycle.serverAuctionTimings.auctionDispatchedMs],
       [`${timingAnchor} → auction resolved`, cycle.serverAuctionTimings.auctionResolvedMs],

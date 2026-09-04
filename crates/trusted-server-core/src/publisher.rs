@@ -6751,19 +6751,22 @@ pub async fn handle_page_bids(
                 .run_auction(&auction_request, &auction_context)
                 .await;
             let auction_resolved_ms = elapsed_millis(&timing_started);
-            if gpt_diagnostics.browser_session_active() {
-                auction_diagnostics = Some(BrowserAuctionDiagnostics {
-                    auction_dispatched_ms: Some(auction_dispatched_ms),
-                    auction_resolved_ms: Some(auction_resolved_ms),
-                    auction_committed_ms: None,
-                    auction_wait_ms: Some(
-                        auction_resolved_ms.saturating_sub(auction_dispatched_ms),
-                    ),
-                    auction_wait_placement: Some("pre_header"),
-                });
-            }
             match result {
                 Ok(result) => {
+                    // A successful result proves at least one pending or immediate
+                    // provider outcome. Failures can occur before any request leaves
+                    // the edge, so they must not fabricate dispatch timing evidence.
+                    if gpt_diagnostics.browser_session_active() {
+                        auction_diagnostics = Some(BrowserAuctionDiagnostics {
+                            auction_dispatched_ms: Some(auction_dispatched_ms),
+                            auction_resolved_ms: Some(auction_resolved_ms),
+                            auction_committed_ms: None,
+                            auction_wait_ms: Some(
+                                auction_resolved_ms.saturating_sub(auction_dispatched_ms),
+                            ),
+                            auction_wait_placement: Some("pre_header"),
+                        });
+                    }
                     let winning_bids = result.winning_bids.clone();
                     let auction_id = diagnostics_auction_id(settings);
                     let bid_map = build_bid_map_with_auction_id(
@@ -20137,6 +20140,30 @@ mod tests {
                 winning_bid,
             }));
             orchestrator
+        }
+
+        #[tokio::test]
+        async fn active_page_bids_omits_timings_when_no_provider_dispatches() {
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec!["missing-provider".to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+            let body = run_page_bids_consent_allowed(
+                &settings,
+                &orchestrator,
+                &article_slot(),
+                make_active_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert!(
+                body.get("auctionDiagnostics").is_none(),
+                "a failed launch must not fabricate auction dispatch timings"
+            );
         }
 
         #[tokio::test]

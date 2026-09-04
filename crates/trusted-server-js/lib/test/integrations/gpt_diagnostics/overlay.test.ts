@@ -174,7 +174,19 @@ describe('GptDiagnosticsOverlay', () => {
     store.recordTrustedServerOpportunity(
       selectedSlot,
       'auction-selected',
-      'unrenderable_candidate'
+      'unrenderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        serverTimings: {
+          auctionDispatchedMs: 0,
+          auctionResolvedMs: 40,
+          auctionCommittedMs: 41,
+          auctionWaitMs: 40,
+          auctionWaitPlacement: 'pre_header',
+        },
+      }
     );
     store.recordPrebidRefresh([selectedSlot]);
     store.recordSlotRequested(selectedSlot);
@@ -290,6 +302,9 @@ describe('GptDiagnosticsOverlay', () => {
 
     const selectedArticle = slotArticle(root!, 'selected-slot').textContent ?? '';
     expect(selectedArticle).toContain('Request path: Competing paths');
+    expect(selectedArticle).toContain('Auction type: Competing auctions');
+    expect(selectedArticle).toContain('SPA auction T0 → auction dispatched 0 ms');
+    expect(selectedArticle).toContain('SPA auction T0 → auction resolved 40 ms');
     expect(selectedArticle).toContain('Direct opportunity: Unrenderable candidate');
     expect(selectedArticle).toContain('Trusted Server creative request observed at 23 ms');
     expect(selectedArticle).not.toContain('Trusted Server markup response sent');

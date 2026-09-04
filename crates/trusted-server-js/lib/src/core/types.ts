@@ -120,6 +120,9 @@ export interface AuctionDiagnosticsData {
 /** Auction path presented by GPT diagnostics. */
 export type GptDiagnosticsAuctionType = 'ssat' | 'trusted_server' | 'client_side' | 'competing';
 
+/** Clock origin for server auction timings, independent of aggregate auction classification. */
+export type GptDiagnosticsServerAuctionTimingOrigin = 'navigation' | 'spa_auction';
+
 /** Sanitized winning-bid facts already exposed in GPT targeting. */
 export interface GptDiagnosticsAuctionWinner {
   bidder: string;
@@ -252,6 +255,8 @@ export interface GptDiagnosticsRequestCycle {
   auctionType?: GptDiagnosticsAuctionType;
   auctionWinner?: GptDiagnosticsAuctionWinner;
   serverAuctionTimings?: AuctionDiagnosticsData;
+  /** Retained separately because `auctionType` can become `competing`. */
+  serverAuctionTimingOrigin?: GptDiagnosticsServerAuctionTimingOrigin;
   opportunityToRequestMs?: number;
   replacedRequestNumber?: number;
   previousRenderToRequestMs?: number;
