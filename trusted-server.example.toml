@@ -422,10 +422,14 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # when.zone = "header"
 # set = { placementId = "_abc" }
 #
-# Bundle build inputs consumed by the `ts prebid bundle` CLI (not the runtime):
-# [integrations.prebid.bundle]
-# adapters = ["rubicon"]
-# user_id_modules = ["sharedIdSystem"]
+# Bundle build inputs consumed by `ts prebid bundle`, not by the edge runtime.
+# Values are exact upstream module stems without `.js`.
+# [integrations.prebid.bundle.modules]
+# bidder = ["rubiconBidAdapter"]
+# Omit user_id for the curated default preset; use [] to select none.
+# user_id = ["sharedIdSystem"]
+# Omitted or empty analytics selects no analytics adapters.
+# analytics = ["atsAnalyticsAdapter"]
 
 # Next.js first-party rewriting for App Router / RSC payloads.
 # [integrations.nextjs]

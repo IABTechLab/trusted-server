@@ -24,7 +24,7 @@ debug = false
 # test_mode = false
 
 # Generated external Prebid bundle served through /integrations/prebid/bundle.js.
-external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 # external_bundle_sha256 = "..."
 # external_bundle_sri = "sha384-..."
 
@@ -42,12 +42,14 @@ script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.mi
 # Required when external_bundle_url is configured. Include the bundle host and
 # any HTTPS redirect targets used by that host.
 [proxy]
-allowed_domains = ["assets.example"]
+allowed_domains = ["assets.example.com"]
 
 # External bundle generation inputs used by `ts prebid bundle`.
-[integrations.prebid.bundle]
-adapters = ["rubicon"]
-user_id_modules = ["sharedIdSystem"]
+# Values are exact Prebid module stems without `.js`.
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["atsAnalyticsAdapter"]
 
 # Optional static per-bidder param overrides (shallow merge)
 [integrations.prebid.bid_param_overrides.criteo]
@@ -88,13 +90,14 @@ set = { placementId = "_s2sHeaderPlacement" }
 | `client_side_bidders`                | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders)                               |
 | `excluded_gam_ad_unit_path_suffixes` | Array[String] | `[]`                                                                   | Exact, case-sensitive GAM ad-unit-path suffixes excluded from Trusted Server's Prebid refresh auction; matching slots still refresh through GAM                  |
 | `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                                      |
-| `bundle.adapters`                    | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                                             |
-| `bundle.user_id_modules`             | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                                       |
+| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact Prebid bidder module stems imported into the external bundle, such as `rubiconBidAdapter`                                                                  |
+| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Curated User ID module stems; an empty array selects none                                                                                                        |
+| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Analytics adapter module stems; omission or an empty array selects none                                                                                          |
 
 ## External Bundle Generation
 
 Use `ts prebid bundle` to build the publisher-specific browser bundle from
-`[integrations.prebid.bundle]` selections:
+`[integrations.prebid.bundle.modules]` selections:
 
 ```bash
 ts prebid bundle
@@ -107,16 +110,33 @@ the generated manifest. Upload the generated JavaScript file manually, set
 any redirect targets) in `proxy.allowed_domains` before running
 `ts config validate` or `ts config push`.
 
-The generated bundle is pure Prebid.js — core, consent modules, User ID
-modules, and the selected bid adapters. The Trusted Server shim
-(`tsjs-prebid`) is served separately by the server as a deferred script and
-installs itself onto the `window.pbjs` global the bundle populates. The two
-artifacts ship in lockstep: a bundle generated before the shim was split out
-still carries a baked-in copy of the shim, so upgrading the server requires
-regenerating and re-uploading the bundle (and pushing the updated
-`external_bundle_sha256`/`external_bundle_sri` config) as part of the same
-rollout. The shim refuses to install twice on one page via the
-`window.__tsjsPrebidShimInstalled` sentinel.
+Each configured value is the exact filename stem from the pinned Prebid.js
+package. Do not add `.js`. Trusted Server checks the package lock, installed
+version, exact-case metadata type, and resolved package export before Vite runs.
+Local paths, URLs, package specifiers, and modules that are absent from the
+pinned package are rejected.
+
+Module stems are build-time names. Runtime APIs use the codes registered by
+those modules:
+
+| Module stem           | Runtime setting                                           |
+| --------------------- | --------------------------------------------------------- |
+| `rubiconBidAdapter`   | `client_side_bidders = ["rubicon"]`                       |
+| `atsAnalyticsAdapter` | `pbjs.enableAnalytics({ provider: "atsAnalytics", ... })` |
+
+Omitting `user_id` selects the curated default preset. Set `user_id = []` to
+exclude all User ID modules. Omitted and empty `analytics` lists both select no
+analytics adapters. The generated schema-versioned manifest records the
+effective module lists and the bidder and analytics runtime codes. Regenerating
+a bundle changes its content-addressed filename, SHA-256, and SRI when its
+contents change.
+
+The external artifact contains Prebid core, consent modules, and the selected
+modules. The separate deferred `tsjs-prebid` shim installs the `trustedServer`
+adapter on the same `window.pbjs` object and processes the publisher queue. A
+bundle generated before the shim split still carries a baked-in shim, so upgrade
+that bundle with the server and push its new hash and SRI. The sentinel
+`window.__tsjsPrebidShimInstalled` prevents duplicate shim installation.
 
 ## Debug Mode
 
@@ -374,7 +394,7 @@ suffix list into the same page. Deploy the updated Trusted Server application an
 configuration together; this option does not require regenerating the external Prebid
 bundle. Follow the [External Bundle Generation](#external-bundle-generation) migration
 note only when upgrading a bundle generated before the shim split, or when changing
-external Prebid adapters or User ID modules.
+external Prebid bidder, User ID, or analytics modules.
 
 ## Client-Side Bidders
 
@@ -400,20 +420,28 @@ The two lists are independent — the operator manages both explicitly. If a bid
 
 ### External bundle adapter selection
 
-Client-side bidders need their Prebid.js adapter modules included in the generated external bundle:
+Client-side bidders need their exact Prebid.js module stems in the generated
+bundle:
 
-```bash
-cd crates/trusted-server-js/lib
-npm run build:prebid-external -- \
-  --adapters=rubicon,appnexus,openx \
-  --user-id-modules=sharedIdSystem,uid2IdSystem \
-  --out=dist/prebid
+```toml
+[integrations.prebid]
+client_side_bidders = ["rubicon", "appnexus", "openx"]
+
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter", "appnexusBidAdapter", "openxBidAdapter"]
+user_id = ["sharedIdSystem", "uid2IdSystem"]
 ```
 
-The generator validates that each adapter exists in `prebid.js/modules/{name}BidAdapter.js`, writes a content-addressed bundle plus `manifest.json`, and reports the SHA-256 and SRI values to copy into `integrations.prebid` config. At runtime, TSJS validates that every bidder in `client_side_bidders` has a registered adapter and logs an error if one is missing.
+Run `ts prebid bundle` after changing the module list. The generator resolves
+`prebid.js/modules/<stem>.js` through the pinned package and records both stems
+and registered bidder codes in `manifest.json`. At runtime, TSJS checks each
+`client_side_bidders` runtime code against that manifest.
 
 ::: warning
-Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a regenerated external bundle with the adapter included in `--adapters`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.
+A new client-side bidder requires its runtime code in `client_side_bidders` and
+its exact module stem in `bundle.modules.bidder`. Rebuild and upload the bundle
+after either change. Without the module, the bidder is dropped from both auction
+paths.
 :::
 
 ## User ID Modules
@@ -422,11 +450,11 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
-User ID submodule inclusion is selected by the external bundle generator. The
-available modules and default preset are checked in at
-`crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`. Pass
-`--user-id-modules` to `build-prebid-external.mjs` when a publisher needs a
-specific subset; omit it to use the default preset.
+User ID submodule inclusion comes from `bundle.modules.user_id`. The available
+modules and default preset are checked in at
+`crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`.
+Omit `user_id` to use that preset, provide an explicit list for a publisher
+subset, or use `user_id = []` to include none.
 
 This is deliberate: the external bundle is pure Prebid.js (core, consent and
 User ID modules, and client-side bid adapters) while the server-served TSJS
@@ -455,8 +483,38 @@ Example EID source mapping:
 | `id5-sync.com`                                                    | `id5IdSystem`          |
 | `liveramp.com`                                                    | `identityLinkIdSystem` |
 
-User ID module selection is separate from `--adapters`, which controls
-client-side bidder adapter modules.
+User ID and bidder selections are separate typed lists in the same `modules`
+table.
+
+## Analytics adapters
+
+Add analytics modules by exact stem. For the pinned Prebid.js 10.26.0 package,
+ATS uses this build selection:
+
+```toml
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter"]
+analytics = ["atsAnalyticsAdapter"]
+```
+
+Publisher JavaScript still owns provider options and enablement:
+
+```js
+pbjs.que.push(() => {
+  pbjs.enableAnalytics({
+    provider: 'atsAnalytics',
+    options: { pid: 'example-publisher-id' },
+  })
+})
+```
+
+`atsAnalyticsAdapter` is the module stem, while `atsAnalytics` is the registered
+runtime provider. Trusted Server imports the module but does not call
+`pbjs.enableAnalytics`.
+
+Only analytics modules shipped by the pinned Prebid package can be selected.
+Prebid.js 10.26.0 does not include `mavenDistributionAnalyticsAdapter`. Custom
+files, local paths, URLs, and automatic downloads are not supported.
 
 ## Identity Forwarding
 

@@ -47,38 +47,58 @@ const pbjs: PbjsGlobal = (
 
 /**
  * Manifest stamped on `window.__tsjs_prebid_bundle` by the external Prebid.js
- * bundle (see build-prebid-external.mjs): which client-side bid adapters and
- * user ID modules were compiled into it.
+ * bundle. Module stems and runtime codes remain separate because values such as
+ * `rubiconBidAdapter` and `rubicon` are not interchangeable.
  */
 interface ExternalPrebidBundleManifest {
-  adapters?: string[];
-  bidderCodes?: string[];
-  userIdModules?: string[];
+  schemaVersion: 1;
+  modules: {
+    bidder?: string[];
+    userId?: string[];
+    analytics?: string[];
+  };
+  runtimeCodes: {
+    bidder?: string[];
+    analytics?: string[];
+  };
 }
 
-function sanitizeManifestList(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
+function parseManifestList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
     return undefined;
   }
-  return value.filter((entry): entry is string => typeof entry === 'string');
+  return [...value];
+}
+
+function isManifestContainer(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
   if (typeof window === 'undefined') {
     return undefined;
   }
-  // The manifest is a plain window global any page script can overwrite, so
-  // validate its shape instead of trusting the declared type: a non-array
-  // field must degrade to "not stamped" diagnostics, not a TypeError.
+
+  // Page code can replace this global. Validate each nested list instead of
+  // trusting the generated TypeScript shape.
   const raw = (window as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle;
-  if (raw === null || typeof raw !== 'object') {
+  if (!isManifestContainer(raw) || raw.schemaVersion !== 1) {
     return undefined;
   }
-  const manifest = raw as Record<string, unknown>;
+
+  const modules = isManifestContainer(raw.modules) ? raw.modules : {};
+  const runtimeCodes = isManifestContainer(raw.runtimeCodes) ? raw.runtimeCodes : {};
   return {
-    adapters: sanitizeManifestList(manifest.adapters),
-    bidderCodes: sanitizeManifestList(manifest.bidderCodes),
-    userIdModules: sanitizeManifestList(manifest.userIdModules),
+    schemaVersion: 1,
+    modules: {
+      bidder: parseManifestList(modules.bidder),
+      userId: parseManifestList(modules.userId),
+      analytics: parseManifestList(modules.analytics),
+    },
+    runtimeCodes: {
+      bidder: parseManifestList(runtimeCodes.bidder),
+      analytics: parseManifestList(runtimeCodes.analytics),
+    },
   };
 }
 
@@ -227,7 +247,7 @@ function readConfiguredUserIdNames(): string[] {
 let warnedMissingUserIdManifest = false;
 
 function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
-  const manifestUserIdModules = getExternalBundleManifest()?.userIdModules;
+  const manifestUserIdModules = getExternalBundleManifest()?.modules.userId;
   const includedUserIdModules = manifestUserIdModules ?? [];
   const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
   const coveredConfigNames = new Set(
@@ -235,9 +255,8 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
       includedUserIdModules.includes(entry.moduleName)
     ).flatMap((entry) => entry.configNames)
   );
-  // An older or unstamped bundle must not make every configured module look
-  // absent: warn once about the missing manifest instead of once per module,
-  // mirroring the client-side adapter validation in installPrebidNpm.
+  // An absent, unsupported, or malformed manifest must not make every
+  // configured module look absent. Warn once instead of once per module.
   const missingConfiguredUserIdNames =
     manifestUserIdModules === undefined
       ? []
@@ -1312,19 +1331,14 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pbjs.processQueue();
   recordUserIdModuleDiagnostics();
 
-  // Validate that every client-side bidder has its adapter compiled into the
-  // external Prebid.js bundle. The bundle stamps the registered bidder codes
-  // (including aliases such as adform/adformOpenRTB for the adf module) on
-  // window.__tsjs_prebid_bundle; a missing code means the bidder was listed
-  // in client_side_bidders but not included in the generated bundle, so it is
-  // silently dropped from both server-side and client-side auctions. Fall
-  // back to the module-name list for bundles stamped before bidderCodes.
-  const manifest = getExternalBundleManifest();
-  const bundledBidderCodes = manifest?.bidderCodes ?? manifest?.adapters;
+  // Validate runtime bidder codes, including aliases such as adform and
+  // adformOpenRTB for the adf module. Module stems are retained separately and
+  // must never be used as bidder codes.
+  const bundledBidderCodes = getExternalBundleManifest()?.runtimeCodes.bidder;
   if (bundledBidderCodes === undefined) {
     if (clientSideBidders.size > 0) {
       log.warn(
-        '[tsjs-prebid] external Prebid bundle did not stamp an adapter manifest; ' +
+        '[tsjs-prebid] external Prebid bundle did not stamp a supported bidder runtime-code manifest; ' +
           'cannot verify client_side_bidders adapters'
       );
     }
@@ -1333,8 +1347,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       if (!bundledBidderCodes.includes(bidder)) {
         log.error(
           `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
-            'Prebid bundle. Add its adapter to [integrations.prebid.bundle].adapters in ' +
-            'trusted-server.toml and rebuild it with `ts prebid bundle`.'
+            'Prebid bundle. Add its exact Prebid module stem to ' +
+            '[integrations.prebid.bundle.modules].bidder in trusted-server.toml and ' +
+            'rebuild it with `ts prebid bundle`.'
         );
       }
     }
