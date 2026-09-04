@@ -248,6 +248,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
+    validate_js_asset_proxy_config(settings)?;
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
