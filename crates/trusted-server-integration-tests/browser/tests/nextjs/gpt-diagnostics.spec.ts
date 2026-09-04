@@ -220,7 +220,7 @@ test.describe("GPT runtime diagnostics", () => {
         );
         await emit(page, "slotRenderEnded", "gpt-diagnostics-slot-primary", {
             isEmpty: false,
-            size: [300, 250],
+            size: [1, 1],
             isBackfill: true,
             slotContentChanged: true,
         });
@@ -271,12 +271,15 @@ test.describe("GPT runtime diagnostics", () => {
                 slot.slotElementId === "gpt-diagnostics-slot-secondary",
         );
         expect(primary.binding).toEqual({ status: "bound" });
+        expect(snapshot.slots.map((slot: any) => slot.runtimeSlotNumber)).toEqual([
+            1, 2,
+        ]);
         expect(
             primary.requests.map((cycle: any) => cycle.requestNumber),
         ).toEqual([1, 2, 3]);
         expect(primary.requests[0]).toMatchObject({
             isEmpty: false,
-            size: [300, 250],
+            size: [1, 1],
             isBackfill: true,
             slotContentChanged: true,
         });

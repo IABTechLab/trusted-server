@@ -9,9 +9,9 @@
 
 GPT Runtime Diagnostics is an opt-in browser console for documented Google
 Publisher Tag (GPT) lifecycle callbacks and Trusted Server integration evidence.
-It groups observations into per-slot request cycles, shows timings and source-neutral
-GAM facts, binds slots to exact DOM elements, and downloads the same allowlisted data
-as versioned JSON.
+It groups observations into per-slot request cycles, shows auction and GPT timings,
+links each page badge to the same stable `Ad #N` in the side panel, binds slots to exact
+DOM elements, and downloads the same allowlisted data as versioned JSON.
 
 The console reports positive observations, not inferred ownership. A filled result
 means only that GPT emitted `slotRenderEnded` with `isEmpty === false`. A Trusted
@@ -109,8 +109,12 @@ Visible, Filled, Empty, Pending/Incomplete, and Unbound/Ambiguous slots.
 
 Each request cycle can show:
 
+- The same stable `Ad #N` used by the creative's page badge.
 - The observed request path, request-intent ID, and direct Trusted Server opportunity.
+- Auction classification: SSAT, TS auction, client-side auction, or competing auctions.
 - Opaque Trusted Server auction-ID correlation and opportunity-to-request latency when available.
+- The winning bidder and bucketed bid price from the existing `hb_bidder` and `hb_pb` bid fields.
+- Server-measured auction dispatch, resolution, commit, and wait timing when available.
 - Observed replacement of an earlier retained filled render, including GPT creative-ID transitions.
 - Requesting, Response received, Filled, Empty, or Rendered (fill unknown) GPT
   lifecycle state.
@@ -118,9 +122,11 @@ Each request cycle can show:
 - Safe, deduplicated creative-bridge failure categories.
 - Source-neutral GAM response class and identifiers reported by GPT.
 - GPT slot-onload, impression-viewable, and visibility observations.
-- Non-negative request-to-response, response-to-render, render-to-load, and
+- Non-negative GAM request-to-response, GAM response-to-render, render-to-load, and
   render-to-viewable durations.
-- GPT-reported rendered size, a separately labelled observed outer slot box when safely bound, backfill, and slot-content-change facts.
+- GPT-reported rendered size, a separately labelled `Size filled` outer-slot measurement
+  when safely bound, backfill, and slot-content-change facts. GPT's ubiquitous `1×1`
+  placeholder stays in the JSON evidence but is hidden from the panel and badge.
 - Current DOM binding status and viewport intersection.
 
 Elapsed time alone never changes a pending GPT request to Incomplete. Incomplete
@@ -128,6 +134,57 @@ sequence appears only when an observed callback proves a missing or invalid earl
 step. When `slotRenderEnded` omits `isEmpty`, the result stays Rendered (fill unknown),
 and `responseClass` remains absent. `unclassified_non_empty` requires an explicit
 `isEmpty === false` observation.
+
+## Auction Classification and Timing
+
+Auction labels describe the path observed for that GPT request cycle:
+
+| Label               | Meaning                                                                                                    |
+| ------------------- | ---------------------------------------------------------------------------------------------------------- |
+| SSAT                | The initial document's server-side auction populated the direct request.                                   |
+| TS auction          | The SPA `/_ts/page-bids` server auction populated the direct request.                                      |
+| Client-side auction | The installed Prebid refresh path was the only auction path observed.                                      |
+| Competing auctions  | Trusted Server direct and client-side Prebid auction evidence were both observed for the same GPT request. |
+
+Publisher refresh evidence does not by itself establish another auction. It remains
+visible in the request-path classification but does not turn an SSAT, TS auction, or
+client-side auction label into “Competing auctions.” Publisher-only refreshes and
+unattributed requests have no auction label because the available evidence does not
+establish an auction implementation.
+
+Server auction timing and browser GPT timing use separate clocks and are never
+subtracted from each other. Initial SSAT offsets use navigation-request T0. SPA TS
+auction offsets use a local server clock started immediately before auction dispatch,
+not the browser's navigation clock or the edge's request-receipt time. The server facts
+are:
+
+- `auctionDispatchedMs`: bid dispatch offset from that timing origin.
+- `auctionResolvedMs`: final bid or timeout offset from the same timing origin.
+- `auctionCommittedMs`: offset when winning bids were available to page state.
+- `auctionWaitMs`: time spent awaiting the auction.
+- `auctionWaitPlacement`: whether that wait occurred before response headers or while
+  the document response was streaming.
+
+The SPA page-bids response includes these server timings only for an activated
+console session. The activation cookie is still removed before auction and publisher
+processing; the server retains only the request-scoped activation decision needed to
+gate this diagnostics field.
+
+Browser timings have different boundaries. **GAM request → response** starts at GPT's
+`slotRequested` callback and ends at `slotResponseReceived`. **GAM response → render**
+starts at `slotResponseReceived` and ends at `slotRenderEnded`. “Render” therefore
+means that GPT emitted its render-ended callback; it does not prove inner-iframe pixels
+executed or became visible.
+
+```mermaid
+flowchart TB
+    A[Server timing origin] --> B[Auction dispatched]
+    B --> C[Auction resolved]
+    C --> D[Bids committed to page state]
+    E[GPT slotRequested] --> F[GPT slotResponseReceived]
+    F --> G[GPT slotRenderEnded]
+    G --> H[GPT slotOnload / impressionViewable]
+```
 
 ## Request Paths
 
@@ -162,8 +219,10 @@ context even when the delegated refresh throws, and the Prebid wrapper restores 
 exact prior value. Diagnostics never suppresses or changes a GPT request.
 
 For a direct observation, the optional opaque auction ID is retained only after
-trimming to a non-empty value no longer than 256 UTF-8 bytes. No auction payload,
-targeting map, bid price, markup, network body, or stack trace is exported. The
+trimming to a non-empty value no longer than 256 UTF-8 bytes. Winning bidder names are
+limited to 128 UTF-8 bytes, and numeric price-bucket strings to 64 bytes. The console
+exports only those winning-bid fields and the bounded timing object—not a raw auction
+payload, targeting map, exact unbucketed CPM, markup, network body, or stack trace. The
 reported opportunity-to-request duration is browser-observed only and is omitted for
 invalid or negative timing.
 
@@ -309,11 +368,12 @@ A concise viewport badge appears only when a slot:
 - Has a unique, connected exact binding.
 - Has a non-zero rectangle intersecting the viewport.
 
-A badge summarizes the slot's most recent request cycle: the GPT result (Filled, Empty,
-Rendered (fill unknown), or Pending), a short delivery label, a `Competing paths`
-marker when the request path is `competing`, the rendered size, and the request-to-
-response, response-to-render, and render-to-viewable durations that are available. It
-adds `Incomplete sequence` when a callback proved a missing or invalid earlier step.
+A badge starts with the slot's stable `Ad #N`, matching the side-panel heading. It then
+summarizes the most recent request cycle: the GPT result (Filled, Empty, Rendered (fill
+unknown), or Pending), auction type, a short delivery label, a `Competing paths` marker
+when the request path is `competing`, sizes, and the GAM request-to-response, GAM
+response-to-render, and render-to-viewable durations that are available. It adds
+`Incomplete sequence` when a callback proved a missing or invalid earlier step.
 
 Badge delivery labels are the same derived states the panel and export report, shortened
 to fit:
@@ -354,10 +414,11 @@ becomes unbound or ambiguous, the last successful sample remains as request-cycl
 evidence while the binding status reports the current DOM state. It is displayed
 separately from `size`, which remains the exact GPT-reported `slotRenderEnded.size`
 fill-size fact. The panel labels the three separate facts as requested slot sizes,
-GPT-reported fill size, and observed outer slot box; the badge abbreviates them as
-`Req`, `Fill`, and `Box`. The observed box may differ from GPT's reported size (for
-example, a flexible APS creative can report `1×1` while its allocated outer slot box
-is larger). The measurement describes publisher-page layout, not universal internal
+GPT-reported fill size, and `Size filled`; the badge abbreviates the first two as `Req`
+and `Fill` and uses `Size filled` for the observed outer box. The observed box may
+differ from GPT's reported size. A flexible APS creative, for example, can report GPT's
+uninformative `1×1` placeholder while its allocated outer slot box is larger; the UI
+suppresses that `1×1` text but the export retains the original `size: [1, 1]` evidence. The measurement describes publisher-page layout, not universal internal
 creative-pixel dimensions. A collapsed or hidden bound element can report `0×0`, which records the
 page layout state rather than an invalid measurement. Empty, unbound, missing, or
 ambiguous slots do not report an observed box; delayed measurements from an older cycle
@@ -419,8 +480,10 @@ The allowlisted export contains:
 - Retained slots, binding facts, visibility, and request cycles.
 - `requestedSlotSizes` when Trusted Server supplied configured formats for that exact
   request, plus GPT-reported fill `size` and an optional observed outer `observedSlotSize`.
-- Request path, request intent ID, opportunity, creative-progress timestamps, and
-  safe failure enums.
+- Request path, auction type, request intent ID, opportunity, creative-progress
+  timestamps, and safe failure enums.
+- The bounded winning bidder and bucketed price plus server auction timing fields when
+  direct auction evidence was observed.
 - The per-auction diagnostics token (`trustedServerAuctionId`) and the
   opportunity-to-request duration, when a direct opportunity was observed.
 - Replacement facts for a re-rendered slot: `replacedRequestNumber`,
@@ -431,9 +494,10 @@ The allowlisted export contains:
 - Separate callback issues, attribution issues, coverage counters, and retention
   counters.
 
-It does not contain raw targeting, bid IDs, bid prices, bidder identity, creative
-markup, cache URLs, cache payloads, cache or bridge error details, cookies, user
-identifiers, query strings, or URL fragments. The exported `trustedServerAuctionId`
+It does not contain raw targeting, bid IDs, exact unbucketed bid prices, losing bidder
+identity, creative markup, cache URLs, cache payloads, cache or bridge error details,
+cookies, user identifiers, query strings, or URL fragments. It does contain the winning
+bidder and bucketed `hb_pb` value described above. The exported `trustedServerAuctionId`
 is the `hb_auction_id` value described in
 [Auction correlation token](#auction-correlation-token): minted fresh for each
 server-side auction, not derived from the Edge Cookie ID or any other visitor
@@ -463,8 +527,9 @@ inaccessible to JavaScript.
 - Retained attribution issues: 128.
 
 The least-recently-active slot is evicted when the slot bound is exceeded. An evicted
-GPT slot can re-enter retention only after a future `slotRequested`; request numbers
-remain monotonic. The oldest request cycle or issue is removed at its own bound.
+GPT slot can re-enter retention only after a future `slotRequested`; its `Ad #N` identity
+and request numbers remain stable and monotonic for the console lifetime. The oldest
+request cycle or issue is removed at its own bound.
 Export metadata reports `evictedSlots`, `evictedRequestCycles`, `droppedCallbacks`,
 and `droppedAttributionIssues`.
 
