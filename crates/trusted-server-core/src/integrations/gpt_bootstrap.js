@@ -290,7 +290,7 @@
   // and deliberately identical to the bundle scheduler — the impression is
   // spent on a viewed tab, and the post-hydration guarantee holds whenever
   // the request is actually issued.
-  ts.scheduleInitialAdInit = function (initialBids, initialSlots) {
+  ts.scheduleInitialAdInit = function (initialBids, initialSlots, initialAuctionDiagnostics) {
     // The bundle may replace this scheduler after the fallback claims the initial
     // pass. Keep the latch on the shared document API so replacement cannot reset it.
     if ((ts.navGeneration || 0) !== 0 || ts.initialAdInitScheduled) return;
@@ -300,6 +300,9 @@
     // would overwrite a committed SPA navigation's slots.
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    if (initialAuctionDiagnostics !== undefined) {
+      ts.auctionDiagnostics = initialAuctionDiagnostics;
+    }
     var fire = function () {
       if ((ts.navGeneration || 0) !== 0) return;
       if (typeof ts.adInit === "function") ts.adInit();

@@ -462,7 +462,67 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'unrenderable_candidate',
       'auction-123',
-      undefined
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+      }
+    );
+  });
+
+  it('snapshots auction timing with the bids before queued GPT work runs', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      { hb_pb: '1.00', hb_bidder: 'example', hb_adid: 'creative-1' },
+      recordTrustedServerOpportunity
+    );
+    const ts = (window as TestWindow).tsjs!;
+    ts.auctionDiagnostics = { auctionResolvedMs: 84 };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    let queued: (() => void) | undefined;
+    const googletag = (window as TestWindow).googletag as {
+      cmd: { push(callback: () => void): void };
+    };
+    googletag.cmd.push = (callback) => {
+      queued = callback;
+    };
+
+    ts.adInit!();
+    ts.auctionDiagnostics.auctionResolvedMs = 99;
+    queued?.();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+        serverTimings: { auctionResolvedMs: 84 },
+      }
+    );
+  });
+
+  it('forwards SPA auction classification without inventing a winner', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
+    (window as TestWindow).tsjs!.navGeneration = 1;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate',
+      undefined,
+      undefined,
+      { auctionType: 'trusted_server' }
     );
   });
 
