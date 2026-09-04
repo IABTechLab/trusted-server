@@ -39,6 +39,7 @@ type HeaderPairs = Vec<(String, Vec<u8>)>;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type BufferedResponseParts = (HeaderPairs, Vec<u8>);
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
 
 // ---------------------------------------------------------------------------
@@ -116,25 +117,22 @@ impl PlatformBackend for NoopBackend {
 
 /// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
 ///
-/// Reads delegate through the handle after mapping Trusted Server keys to Spin
-/// variable names. Writes are unsupported on current Spin runtime config and
-/// return typed errors.
-struct ConfigStoreHandleAdapter(ConfigStoreHandle);
+/// Spin config stores are KV-backed, so reads preserve the requested key
+/// verbatim. Writes are unsupported on current Spin runtime config and return
+/// typed errors.
+pub(crate) struct ConfigStoreHandleAdapter(pub(crate) ConfigStoreHandle);
 
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let variable_name = spin_variable_name(key, PlatformError::ConfigStore)?;
-        futures::executor::block_on(self.0.get(&variable_name))
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!(
-                        "config store lookup failed for key `{key}` as Spin variable `{variable_name}`: {e}"
-                    ))
+        futures::executor::block_on(self.0.get(key))
+            .map_err(|error| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "config store lookup failed for key `{key}`: {error}"
+                ))
             })?
             .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "key `{key}` not found as Spin variable `{variable_name}`"
-                ))
+                Report::new(PlatformError::ConfigStore)
+                    .attach(format!("key `{key}` not found in Spin config store"))
             })
     }
 
@@ -149,6 +147,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 }
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn spin_variable_name(
     key: &str,
     error_context: PlatformError,
@@ -187,6 +186,7 @@ fn spin_variable_name(
     Ok(out)
 }
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn push_spin_variable_escape(out: &mut String, byte: u8) {
     out.push('_');
     out.push('x');
@@ -676,7 +676,7 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 ///   with a real secret-provider source (e.g. Vault, Azure Key Vault) to avoid
 ///   storing signing keys in plaintext on disk.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-struct SpinSecretStoreAdapter;
+pub(crate) struct SpinSecretStoreAdapter;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl PlatformSecretStore for SpinSecretStoreAdapter {
@@ -794,12 +794,22 @@ mod tests {
     use super::*;
 
     use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;
     use edgezero_core::params::PathParams;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write as _;
+
+    struct InMemoryConfigStore(std::collections::BTreeMap<String, String>);
+
+    #[async_trait::async_trait(?Send)]
+    impl ConfigStore for InMemoryConfigStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(self.0.get(key).cloned())
+        }
+    }
 
     fn make_ctx_without_spin_context() -> RequestContext {
         let req = request_builder()
@@ -895,25 +905,38 @@ mod tests {
     }
 
     #[test]
-    fn spin_variable_name_encodes_trusted_server_keys() {
+    fn config_store_handle_adapter_reads_verbatim_kv_key() {
+        let handle = ConfigStoreHandle::new(Arc::new(InMemoryConfigStore(
+            std::collections::BTreeMap::from([(
+                "trusted_server_config".to_owned(),
+                "blob-envelope".to_owned(),
+            )]),
+        )));
+        let adapter = ConfigStoreHandleAdapter(handle);
+
+        let value = adapter
+            .get(
+                &StoreName::from("trusted_server_config"),
+                "trusted_server_config",
+            )
+            .expect("should read the verbatim config-store key");
+
         assert_eq!(
-            spin_variable_name("current-kid", PlatformError::ConfigStore)
-                .expect("should encode current kid key"),
-            "v_current_x2dkid"
+            value, "blob-envelope",
+            "should not translate a KV-backed config key into a Spin variable name"
         );
+    }
+
+    #[test]
+    fn spin_variable_name_encodes_secret_key_components() {
         assert_eq!(
-            spin_variable_name("active-kids", PlatformError::ConfigStore)
-                .expect("should encode active kids key"),
-            "v_active_x2dkids"
-        );
-        assert_eq!(
-            spin_variable_name("ts-2026-05-25", PlatformError::ConfigStore)
+            spin_variable_name("ts-2026-05-25", PlatformError::SecretStore)
                 .expect("should encode generated kid"),
             "v_ts_x2d2026_x2d05_x2d25"
         );
         // Digit-leading keys are rejected at the encoder boundary.
         assert!(
-            spin_variable_name("2026-key", PlatformError::ConfigStore).is_err(),
+            spin_variable_name("2026-key", PlatformError::SecretStore).is_err(),
             "should reject digit-leading key"
         );
     }
@@ -921,8 +944,8 @@ mod tests {
     #[test]
     fn spin_encoder_accepts_every_creatable_kid() {
         // Portability contract: core's create/rotate validation (kid_is_creatable)
-        // must never admit a kid the Spin variable encoder rejects — otherwise such
-        // a kid would 400 on create across every adapter yet 5xx at storage on Spin.
+        // must never admit a kid the Spin secret-variable encoder rejects — otherwise
+        // that kid could be created but its private signing key could not be stored.
         // This pins core >= encoder strictness so the duplicated lowercase-leading
         // rule in validate_kid and spin_variable_name cannot silently drift.
         use trusted_server_core::request_signing::kid_is_creatable;
@@ -948,7 +971,7 @@ mod tests {
         for kid in samples {
             if kid_is_creatable(kid) {
                 assert!(
-                    spin_variable_name(kid, PlatformError::ConfigStore).is_ok(),
+                    spin_variable_name(kid, PlatformError::SecretStore).is_ok(),
                     "core accepts kid `{kid}` but the Spin encoder rejects it \
                      (portability contract broken)"
                 );
@@ -968,7 +991,7 @@ mod tests {
     #[test]
     fn spin_variable_name_rejects_unsupported_characters() {
         assert!(
-            spin_variable_name("kid/name", PlatformError::ConfigStore).is_err(),
+            spin_variable_name("kid/name", PlatformError::SecretStore).is_err(),
             "should reject characters outside the supported Spin variable mapping"
         );
     }

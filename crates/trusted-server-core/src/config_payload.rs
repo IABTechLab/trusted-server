@@ -8,20 +8,32 @@
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
 
+use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
+use crate::platform::{PlatformSecretStore, StoreName};
+use crate::secret_resolution::resolve_secret_references;
 use crate::settings::Settings;
+
+/// Canonical logical secret store used by Trusted Server app-config secrets.
+pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 
 /// Default config-store key containing the Trusted Server app-config blob.
 pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
 
-/// Reconstruct validated [`Settings`] from a serialized config blob envelope.
+/// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
+///
+/// Secret references are resolved after envelope verification and before
+/// deserialization. The envelope data itself is never mutated or rewritten.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the envelope cannot be
-/// parsed, fails integrity verification, or contains invalid settings data.
+/// parsed, fails integrity verification, secret resolution fails, or resolved
+/// settings are invalid.
 pub fn settings_from_config_blob(
     envelope_json: &str,
+    secret_store: &dyn PlatformSecretStore,
+    default_secret_store_name: &StoreName,
 ) -> Result<Settings, Report<TrustedServerError>> {
     let envelope: BlobEnvelope = serde_json::from_str(envelope_json).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -36,15 +48,91 @@ pub fn settings_from_config_blob(
         .attach(error.to_string())
     })?;
 
-    let settings = Settings::from_json_value(envelope.into_data())?;
-    settings.reject_placeholder_secrets()?;
+    let mut data = envelope.into_data();
+    remove_inactive_secret_references(&mut data);
+    resolve_secret_references::<TrustedServerAppConfig>(
+        &mut data,
+        secret_store,
+        default_secret_store_name,
+    )?;
+    let settings = Settings::from_json_value(data)?;
+    crate::config::validate_settings_for_runtime(&settings)?;
     Ok(settings)
+}
+
+fn remove_inactive_secret_references(data: &mut serde_json::Value) {
+    if data
+        .pointer("/tinybird/enabled")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        && let Some(tinybird) = data
+            .get_mut("tinybird")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        tinybird.remove("auction_token_secret");
+        tinybird.remove("access_token_secret");
+    }
+
+    if let Some(partners) = data
+        .pointer_mut("/ec/partners")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for partner in partners {
+            let Some(partner) = partner.as_object_mut() else {
+                continue;
+            };
+            if !json_bool_or_string_is_true(partner.get("pull_sync_enabled")) {
+                partner.remove("ts_pull_token");
+            }
+        }
+    }
+
+    let Some(datadome) = data
+        .pointer_mut("/integrations/datadome")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let integration_enabled =
+        datadome.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+    let protection_enabled = integration_enabled
+        && datadome
+            .get("enable_protection")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if !protection_enabled {
+        datadome.remove("server_side_key_secret_name");
+    }
+
+    let bypass_enabled = protection_enabled
+        && datadome
+            .get("protection_test_bypass")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|bypass| bypass.get("enabled"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if !bypass_enabled
+        && let Some(bypass) = datadome
+            .get_mut("protection_test_bypass")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        bypass.remove("credential_secret_name");
+    }
+}
+
+fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
+    matches!(value, Some(serde_json::Value::Bool(true)))
+        || matches!(value, Some(serde_json::Value::String(value)) if value == "true")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
+    use crate::settings::{
+        AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
+    };
     use crate::test_support::tests::crate_test_settings_str;
     use serde::Deserialize;
 
@@ -69,7 +157,97 @@ mod tests {
     }
 
     fn test_settings() -> Settings {
-        Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings")
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings
+    }
+
+    struct EchoSecretStore;
+
+    impl PlatformSecretStore for EchoSecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            let value = match key {
+                "placeholder_proxy" => "change-me-proxy-secret",
+                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
+                _ => key,
+            };
+            Ok(value.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    struct UnifiedSecretStore;
+
+    impl PlatformSecretStore for UnifiedSecretStore {
+        fn get_bytes(
+            &self,
+            store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            if store_name.as_ref() != "ts_secrets" || key.starts_with("unused-") {
+                return Err(Report::new(PlatformError::SecretStore));
+            }
+            let value = match key {
+                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
+                "tinybird-token-key" => "resolved-tinybird-token",
+                "datadome-server-key" => "resolved-datadome-server-key",
+                "datadome-bypass-key" => "resolved-datadome-bypass-credential-32-bytes",
+                "access_key_id" | "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
+                "secret_access_key" | "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "s3-session-key" => "resolved-session-token",
+                "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
+                "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
+                "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
+                _ => key,
+            };
+            Ok(value.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    fn partner_with_pull_sync(enabled: bool, token_key: &str) -> EcPartner {
+        let mut value = serde_json::json!({
+            "name": "Example Partner",
+            "source_domain": "partner.example.com",
+            "api_token": "partner-api-token-key",
+            "pull_sync_enabled": enabled,
+            "ts_pull_token": token_key,
+        });
+        if enabled {
+            value["pull_sync_url"] =
+                serde_json::Value::String("https://partner.example.com/sync".to_string());
+            value["pull_sync_allowed_domains"] = serde_json::json!(["partner.example.com"]);
+        }
+        serde_json::from_value(value).expect("should build pull-sync partner")
     }
 
     fn envelope_json(settings: &Settings) -> String {
@@ -78,11 +256,19 @@ mod tests {
         serde_json::to_string(&envelope).expect("should serialize envelope")
     }
 
+    fn load_settings(envelope_json: &str) -> Result<Settings, Report<TrustedServerError>> {
+        settings_from_config_blob(
+            envelope_json,
+            &EchoSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+        )
+    }
+
     #[test]
     fn payload_round_trips_through_blob_envelope() {
         let original = test_settings();
-        let reconstructed = settings_from_config_blob(&envelope_json(&original))
-            .expect("should reconstruct settings");
+        let reconstructed =
+            load_settings(&envelope_json(&original)).expect("should reconstruct settings");
 
         assert_eq!(
             reconstructed.publisher.domain, original.publisher.domain,
@@ -96,6 +282,386 @@ mod tests {
             reconstructed.handlers.len(),
             original.handlers.len(),
             "should preserve arrays"
+        );
+    }
+
+    #[test]
+    fn resolves_all_static_credentials_from_the_mapped_default_store() {
+        let mut original = test_settings();
+        original.tinybird.enabled = true;
+        original.tinybird.api_host = "api.example.com".to_string();
+        original.tinybird.auction_token_secret =
+            Some(Redacted::new("tinybird-token-key".to_string()));
+        original
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "enable_protection": true,
+                    "server_side_key_secret_name": "datadome-server-key",
+                    "protection_test_bypass": {
+                        "enabled": true,
+                        "credential_secret_name": "datadome-bypass-key",
+                    },
+                }),
+            )
+            .expect("should configure DataDome references");
+        let mut route = ProxyAssetRoute::new(
+            "/assets/",
+            "https://examplebucket.s3.us-east-1.amazonaws.com",
+        );
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: Some("legacy-s3-store".to_string()),
+            access_key_id: Redacted::new("s3-access-key".to_string()),
+            secret_access_key: Redacted::new("s3-secret-key".to_string()),
+            session_token: Some(Redacted::new("s3-session-key".to_string())),
+            origin_query: None,
+        }));
+        original.proxy.asset_routes.push(route);
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(true, "partner-pull-token-key"));
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve every static credential from the mapped store");
+
+        assert_eq!(
+            reconstructed
+                .tinybird
+                .auction_token_secret
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-tinybird-token")
+        );
+        let datadome = reconstructed
+            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+            .expect("should parse DataDome config")
+            .expect("should enable DataDome");
+        assert_eq!(
+            datadome
+                .server_side_key_secret_name
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-datadome-server-key")
+        );
+        let bypass = datadome
+            .protection_test_bypass
+            .as_ref()
+            .expect("should configure bypass");
+        assert_eq!(
+            bypass
+                .credential_secret_name
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-datadome-bypass-credential-32-bytes")
+        );
+        let auth = reconstructed.proxy.asset_routes[0]
+            .auth
+            .as_ref()
+            .expect("should preserve S3 auth");
+        let AssetOriginAuth::S3SigV4(auth) = auth;
+        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            auth.secret_access_key.expose(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        );
+        assert_eq!(
+            auth.session_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-session-token")
+        );
+        assert!(auth.secret_store.is_none());
+        assert_eq!(
+            reconstructed.ec.partners[0]
+                .api_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-partner-api-token-32-bytes-ok")
+        );
+        assert_eq!(
+            reconstructed.ec.partners[0]
+                .ts_pull_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-partner-pull-token-32-bytes-ok")
+        );
+    }
+
+    #[test]
+    fn resolves_trusted_client_ip_shared_secret_from_default_store() {
+        let mut original = test_settings();
+        original.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-ts-client-ip".to_owned(),
+            auth_header: "x-ts-client-ip-auth".to_owned(),
+            shared_secret: Redacted::new("trusted-client-ip-key".to_owned()),
+        });
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the trusted client IP shared secret");
+
+        assert_eq!(
+            reconstructed
+                .trusted_client_ip
+                .as_ref()
+                .expect("should retain trusted client IP configuration")
+                .shared_secret
+                .expose(),
+            "resolved-trusted-client-ip-secret-32-bytes",
+            "should replace the key reference with the resolved shared secret"
+        );
+    }
+
+    #[test]
+    fn missing_trusted_client_ip_shared_secret_fails_resolution() {
+        let mut original = test_settings();
+        original.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-ts-client-ip".to_owned(),
+            auth_header: "x-ts-client-ip-auth".to_owned(),
+            shared_secret: Redacted::new("unused-trusted-client-ip-key".to_owned()),
+        });
+
+        let error = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect_err("should reject a missing trusted client IP shared secret");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("trusted_client_ip.shared_secret"),
+            "should identify the unresolved secret field: {error:?}"
+        );
+        assert!(
+            !message.contains("unused-trusted-client-ip-key"),
+            "should not expose the secret key reference: {error:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_s3_secret_references_resolve_default_store_keys() {
+        let mut original = test_settings();
+        let mut route = ProxyAssetRoute::new(
+            "/default-s3/",
+            "https://examplebucket.s3.us-east-1.amazonaws.com",
+        );
+        route.auth = Some(AssetOriginAuth::S3SigV4(
+            toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults"),
+        ));
+        original.proxy.asset_routes.push(route);
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve default S3 secret keys");
+
+        let AssetOriginAuth::S3SigV4(auth) = reconstructed.proxy.asset_routes[0]
+            .auth
+            .as_ref()
+            .expect("should preserve S3 auth");
+        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            auth.secret_access_key.expose(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        );
+    }
+
+    #[test]
+    fn partner_without_api_token_loads_without_secret_resolution() {
+        let mut original = test_settings();
+        let partner = serde_json::from_value(serde_json::json!({
+            "name": "Example Partner",
+            "source_domain": "partner.example.com",
+            "bidstream_enabled": true,
+        }))
+        .expect("should build partner without API token");
+        original.ec.partners.push(partner);
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should load partner without resolving an API token");
+
+        assert!(
+            reconstructed.ec.partners[0].api_token.is_none(),
+            "should preserve omitted API token"
+        );
+    }
+
+    #[test]
+    fn string_true_pull_sync_flag_retains_and_resolves_its_token() {
+        let mut original = test_settings();
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(true, "partner-pull-token-key"));
+        let mut data = serde_json::to_value(original).expect("should serialize settings");
+        data["ec"]["partners"][0]["pull_sync_enabled"] =
+            serde_json::Value::String("true".to_owned());
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve a pull token enabled by a string boolean");
+
+        assert_eq!(
+            reconstructed.ec.partners[0]
+                .ts_pull_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-partner-pull-token-32-bytes-ok"),
+            "should retain and resolve the active pull token"
+        );
+    }
+
+    #[test]
+    fn string_false_pull_sync_flag_removes_a_stale_token() {
+        let mut original = test_settings();
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
+        let mut data = serde_json::to_value(original).expect("should serialize settings");
+        data["ec"]["partners"][0]["pull_sync_enabled"] =
+            serde_json::Value::String("false".to_owned());
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should skip a pull token disabled by a string boolean");
+
+        assert!(
+            reconstructed.ec.partners[0].ts_pull_token.is_none(),
+            "should remove the inactive pull token"
+        );
+    }
+
+    #[test]
+    fn active_partner_pull_sync_fails_when_its_token_is_missing() {
+        let mut original = test_settings();
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(true, "unused-partner-pull-token"));
+
+        let error = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect_err("should reject a missing active pull-sync token");
+
+        assert!(error.to_string().contains("ec.partners[0].ts_pull_token"));
+    }
+
+    #[test]
+    fn inactive_optional_features_do_not_resolve_stale_secret_references() {
+        let mut original = test_settings();
+        original.tinybird.auction_token_secret =
+            Some(Redacted::new("unused-tinybird-key".to_string()));
+        original
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "enable_protection": false,
+                    "server_side_key_secret_name": "unused-datadome-key",
+                    "protection_test_bypass": {
+                        "enabled": false,
+                        "credential_secret_name": "unused-bypass-key",
+                    },
+                }),
+            )
+            .expect("should configure inactive references");
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should skip inactive optional feature references");
+
+        assert!(reconstructed.tinybird.auction_token_secret.is_none());
+        assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
+        let datadome = reconstructed
+            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+            .expect("should parse inactive DataDome config")
+            .expect("client-side DataDome remains enabled");
+        assert!(datadome.server_side_key_secret_name.is_none());
+        assert!(
+            datadome
+                .protection_test_bypass
+                .as_ref()
+                .is_some_and(|bypass| bypass.credential_secret_name.is_none())
+        );
+    }
+
+    #[test]
+    fn omitted_datadome_enabled_does_not_resolve_stale_protection_references() {
+        let mut original = test_settings();
+        original
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enable_protection": true,
+                    "server_side_key_secret_name": "unused-datadome-key",
+                    "protection_test_bypass": {
+                        "enabled": true,
+                        "credential_secret_name": "unused-bypass-key",
+                    },
+                }),
+            )
+            .expect("should configure disabled DataDome references");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should skip stale DataDome protection references");
+
+        assert!(
+            reconstructed
+                .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+                .expect("should parse disabled DataDome config")
+                .is_none()
         );
     }
 
@@ -115,7 +681,7 @@ mod tests {
         let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
 
         let reconstructed =
-            settings_from_config_blob(&envelope_json).expect("should reconstruct legacy settings");
+            load_settings(&envelope_json).expect("should reconstruct legacy settings");
 
         assert!(
             reconstructed.auction.rewrite_creatives,
@@ -141,7 +707,7 @@ mod tests {
         let mut original = test_settings();
         original.auction.rewrite_creatives = false;
 
-        let reconstructed = settings_from_config_blob(&envelope_json(&original))
+        let reconstructed = load_settings(&envelope_json(&original))
             .expect("should reconstruct disabled rewriting");
 
         assert!(
@@ -153,12 +719,13 @@ mod tests {
     #[test]
     fn strings_that_look_like_json_scalars_round_trip_as_strings() {
         let mut original = test_settings();
-        original.publisher.proxy_secret = Redacted::new("1234567890".to_string());
+        original.publisher.proxy_secret =
+            Redacted::new("12345678901234567890123456789012".to_string());
         original.ec.passphrase = Redacted::new("12345678901234567890123456789012".to_string());
         original.handlers[0].password = Redacted::new("true".to_string());
 
-        let reconstructed = settings_from_config_blob(&envelope_json(&original))
-            .expect("should reconstruct settings");
+        let reconstructed =
+            load_settings(&envelope_json(&original)).expect("should reconstruct settings");
 
         assert_eq!(
             reconstructed.publisher.proxy_secret.expose(),
@@ -178,6 +745,57 @@ mod tests {
     }
 
     #[test]
+    fn runtime_validation_accepts_short_resolved_proxy_secret() {
+        let mut settings = test_settings();
+        settings.publisher.proxy_secret = Redacted::new("short_proxy".to_owned());
+
+        let reconstructed = load_settings(&envelope_json(&settings))
+            .expect("should accept an existing short proxy secret");
+
+        assert_eq!(
+            reconstructed.publisher.proxy_secret.expose(),
+            "short_proxy",
+            "should preserve the resolved proxy secret"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_short_resolved_passphrase() {
+        let mut settings = test_settings();
+        settings.ec.passphrase = Redacted::new("short_key".to_owned());
+
+        let err = load_settings(&envelope_json(&settings))
+            .expect_err("should reject a short resolved passphrase");
+
+        assert!(
+            err.to_string().contains("short_passphrase") || err.to_string().contains("validation"),
+            "error should indicate runtime validation: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("short_key"),
+            "error should not expose the secret value"
+        );
+    }
+
+    #[test]
+    fn placeholder_rejection_happens_after_secret_resolution() {
+        let mut settings = test_settings();
+        settings.publisher.proxy_secret = Redacted::new("placeholder_proxy".to_owned());
+
+        let err = load_settings(&envelope_json(&settings))
+            .expect_err("should reject a placeholder resolved from the secret store");
+
+        assert!(
+            err.to_string().contains("Insecure default"),
+            "error should identify the insecure default: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("change-me-proxy-secret"),
+            "error should not expose the resolved secret value"
+        );
+    }
+
+    #[test]
     fn tampered_blob_hash_is_rejected() {
         let mut envelope: BlobEnvelope =
             serde_json::from_str(&envelope_json(&test_settings())).expect("should parse envelope");
@@ -185,7 +803,7 @@ mod tests {
         let tampered =
             serde_json::to_string(&envelope).expect("should serialize tampered envelope");
 
-        let err = settings_from_config_blob(&tampered).expect_err("should reject hash mismatch");
+        let err = load_settings(&tampered).expect_err("should reject hash mismatch");
 
         assert!(
             err.to_string().contains("integrity verification"),
