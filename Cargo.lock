@@ -5477,6 +5477,7 @@ dependencies = [
  "config",
  "cookie",
  "criterion",
+ "cssparser 0.36.0",
  "derive_more",
  "ed25519-dalek",
  "edgezero-core",
