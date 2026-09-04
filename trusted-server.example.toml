@@ -162,6 +162,20 @@ pull_sync_concurrency = 3
 # mode = "restrictive"            # "restrictive" | "newest" | "permissive"
 # freshness_threshold_days = 30
 
+[integrations.js_asset_proxy]
+enabled = false
+# Uncomment to override upstream cache headers for every asset below.
+# This replaces upstream directives, including private and no-store.
+# Use only when each asset's bytes are identical for every visitor.
+# cache_ttl_seconds = 3600
+# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets
+# that vary by browser User-Agent or use integrity hashes for UA-specific bytes.
+
+[[integrations.js_asset_proxy.assets]]
+path = "/assets/example-vendor-loader.js"
+origin_url = "https://cdn.example.com/vendor-loader.js"
+proxy = "enabled"
+
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
 # Verify TLS certs when proxying to HTTPS origins (default true; false only for
