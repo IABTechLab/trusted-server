@@ -199,8 +199,11 @@ s = s.replace('[integrations.prebid]\nenabled = false\nserver_url = "https://pre
 s = s.replace('providers = []', 'providers = ["prebid"]', 1)
 s = s.replace('\n[proxy]\n', '\n[proxy]\nallowed_domains = ["assets.example.com", "127.0.0.1"]\n', 1)
 s = s.replace('[auction]\nenabled = false', '[auction]\nenabled = true', 1)
-s = s.replace('auction_timeout_ms = 500', 'auction_timeout_ms = 3000', 1)
-s = s.replace('timeout_ms = 2000', 'timeout_ms = 3000', 1)
+s = s.replace('auction_timeout_ms = 500', 'auction_timeout_ms = 5000', 1)
+# Both the overall auction and provider transport budgets must exceed the
+# harness's deliberate three-second bid delay.
+s = s.replace('timeout_ms = 2000', 'timeout_ms = 5000', 1)
+s = s.replace('timeout_ms = 1000', 'timeout_ms = 5000', 1)
 
 # The template-cache keys go directly under the table header. The slot is a table of its own
 # and must go at the end: inserted here it would swallow every scalar key that
