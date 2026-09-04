@@ -57,7 +57,10 @@ use crate::cache_policy::{
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
-use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
+use crate::creative_opportunities::{
+    AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
+    evaluate_ad_stack_gate,
+};
 use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
@@ -3002,15 +3005,12 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     header("sec-purpose") || header("purpose")
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ServerSideAdStackConfig {
-    /// Dedicated `[creative_opportunities].enabled` switch.
-    ad_templates_enabled: bool,
-    /// Global `[auction].enabled` gate used by publisher/page-bids flows.
-    auction_enabled: bool,
-}
-
 /// Returns whether request-scoped signals permit an ad-eligible navigation.
+///
+/// This is the request half of the shared ad-stack gate: the configuration
+/// halves (`matched_slots`, the kill switches) are deliberately absent, because
+/// the cache policy for a structurally inactive template must distinguish a
+/// page that no request could activate from one this particular request skipped.
 fn is_server_side_ad_eligible_navigation(
     is_get: bool,
     is_navigation: bool,
@@ -3019,29 +3019,6 @@ fn is_server_side_ad_eligible_navigation(
     consent_allows_auction: bool,
 ) -> bool {
     is_get && is_navigation && !is_prefetch && !is_bot && consent_allows_auction
-}
-
-/// Returns true only when the publisher should inject and run server-side ad templates.
-///
-/// This includes auction dispatch plus initial ad-slot injection.
-fn should_run_server_side_ad_stack(
-    is_get: bool,
-    is_navigation: bool,
-    is_prefetch: bool,
-    is_bot: bool,
-    has_matched_slots: bool,
-    consent_allows_auction: bool,
-    config: ServerSideAdStackConfig,
-) -> bool {
-    is_server_side_ad_eligible_navigation(
-        is_get,
-        is_navigation,
-        is_prefetch,
-        is_bot,
-        consent_allows_auction,
-    ) && config.ad_templates_enabled
-        && has_matched_slots
-        && config.auction_enabled
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
@@ -4150,18 +4127,18 @@ pub async fn handle_publisher_request(
     // (storage/access) before firing. Known non-GDPR jurisdictions are free.
     let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
 
-    let should_run_ad_stack = should_run_server_side_ad_stack(
-        is_get,
-        is_navigation,
-        is_prefetch,
-        is_bot,
-        !matched_slots.is_empty(),
-        consent_allows_auction,
-        ServerSideAdStackConfig {
-            ad_templates_enabled,
-            auction_enabled: auction.orchestrator.is_enabled(),
-        },
-    );
+    let should_run_ad_stack = evaluate_ad_stack_gate(AdStackGateInput {
+        method_get: is_get,
+        navigation: is_navigation,
+        prefetch: is_prefetch,
+        bot: is_bot,
+        matched_slots: !matched_slots.is_empty(),
+        consent_allows_auction: Some(consent_allows_auction),
+        auction_enabled: auction.orchestrator.is_enabled(),
+        ad_templates_enabled,
+    })
+    .expected
+        == RuntimeAdStackExpected::Yes;
     let should_run_auction = should_run_ad_stack;
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
     // the `EC context: ... jurisdiction=...` line from EC-context construction
@@ -14574,73 +14551,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
-        let enabled_config = ServerSideAdStackConfig {
-            ad_templates_enabled: true,
-            auction_enabled: true,
-        };
-        assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, enabled_config,),
-            "GET, real navigation, enabled templates, matched slots, and consent should run TS ad stack"
-        );
-
-        assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, enabled_config,),
-            "non-GET requests should skip TS ad stack"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, enabled_config,),
-            "non-document requests should skip TS ad stack"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, enabled_config,),
-            "prefetch requests should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, enabled_config,),
-            "bot requests should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, enabled_config,),
-            "requests with no matching slots should skip TS ad stack"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, enabled_config,),
-            "requests without required consent should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(
-                true,
-                true,
-                false,
-                false,
-                true,
-                true,
-                ServerSideAdStackConfig {
-                    ad_templates_enabled: true,
-                    auction_enabled: false,
-                },
-            ),
-            "disabled [auction].enabled kill switch should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(
-                true,
-                true,
-                false,
-                false,
-                true,
-                true,
-                ServerSideAdStackConfig {
-                    ad_templates_enabled: false,
-                    auction_enabled: true,
-                },
-            ),
-            "disabled [creative_opportunities].enabled switch should skip TS ad stack and injection"
-        );
-    }
-
     #[tokio::test]
     async fn body_close_hold_loop_processes_close_tail_before_reading_post_body_chunks() {
         let settings = create_test_settings();
@@ -20118,7 +20028,7 @@ mod tests {
             // When consent denies the server-side auction (here: Jurisdiction
             // Unknown fails closed), the endpoint must return no slots so the SPA
             // hook does not create GPT slots client-side — matching the publisher
-            // navigation path's `should_run_server_side_ad_stack` gate.
+            // navigation path's shared `evaluate_ad_stack_gate` gate.
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let slots = article_slot();
