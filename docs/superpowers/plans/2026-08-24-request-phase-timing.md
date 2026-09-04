@@ -928,10 +928,11 @@ git commit -m "Emit confirmed access telemetry rows after pull-sync post-send"
 
 - [ ] **Step 1: Rewrite the schema** per spec section 9: keep
       `event_ts DateTime64(3)`, `method`, `status UInt16`, `time_elapsed_ms UInt32`,
-      `sample_rate Float64`, `event_date` + 30-day TTL; add the columns from spec 9 with
+      `sample_rate Float64` + 30-day TTL; add the columns from spec 9 with
       dimension columns non-nullable `LowCardinality(String)` and phase columns
       `Nullable(UInt32)`; drop `path` and `cache_state`; set
-      `ENGINE_SORTING_KEY "event_date, service_id, publisher_domain, env, route_class, pop, status"`.
+      `ENGINE_SORTING_KEY "toDate(event_ts), service_id, publisher_domain, env, route_class, pop, status"`
+      (`event_date` was dropped for the sorting-key expression; see spec section 9).
 
 - [ ] **Step 2: Validate** with the tinybird toolchain if available locally
       (`tb check` / project tests under `tinybird/tests`); otherwise assert the file

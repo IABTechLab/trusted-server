@@ -4431,10 +4431,18 @@ pub async fn handle_publisher_request(
         }
     );
 
-    // Recorded before the request is consumed by the origin send: the template cache gate
-    // below needs it, and an authorized response must never become a shared
-    // template.
-    let request_had_authorization = req.headers().contains_key(header::AUTHORIZATION);
+    // Capture cache eligibility before the origin send consumes the request. One
+    // unchanged marked Authorization value passed edge auth; unmarked, replaced,
+    // or repeated values remain pass-through and bypass sharing.
+    let authorization_value_count = req.headers().get_all(header::AUTHORIZATION).iter().count();
+    let authorization_disqualifies = match authorization_value_count {
+        0 => false,
+        1 => req
+            .extensions()
+            .get::<crate::auth::EdgeTerminatedAuthorization>()
+            .is_none_or(|marker| !marker.matches(req.headers())),
+        _ => true,
+    };
     let request_had_cookie = req.headers().contains_key(header::COOKIE);
     // Whether carrying a cookie is itself disqualifying. Computed once and used for both
     // the lookup and the store, so the two cannot drift apart.
@@ -4480,7 +4488,7 @@ pub async fn handle_publisher_request(
     let request_can_use_shared_template = method_is_cacheable
         && matches!(assembly_mode, AssemblyMode::Esi)
         && !request_host.is_empty()
-        && !request_had_authorization
+        && !authorization_disqualifies
         && !cookie_disqualifies
         && !request_requires_origin
         && reader_supports_assembly;
@@ -4672,8 +4680,13 @@ pub async fn handle_publisher_request(
         platform_request = platform_request.with_cache_bypass();
     }
 
+    // The span must end when the origin responds (or fails), before any
+    // abandonment-telemetry await below — otherwise `ts-origin` would
+    // absorb Tinybird emission time on the error path.
     let origin_span = timings.span(Phase::Origin);
-    let mut response = match services.http_client().send(platform_request).await {
+    let origin_send_result = services.http_client().send(platform_request).await;
+    drop(origin_span);
+    let mut response = match origin_send_result {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
@@ -4690,7 +4703,6 @@ pub async fn handle_publisher_request(
             }));
         }
     };
-    drop(origin_span);
 
     log::debug!(
         "Publisher origin response received: status={}, header_count={}",
@@ -4732,7 +4744,7 @@ pub async fn handle_publisher_request(
     let mut template_cache_key = template_cache_reservation.and_then(|reservation| {
         match template_cache_ttl(
             assembly_mode,
-            request_had_authorization,
+            authorization_disqualifies,
             cookie_disqualifies,
             response.status(),
             &gate_content_type,
@@ -5820,7 +5832,7 @@ impl TemplateCachePolicy {
 #[cfg(test)]
 pub(crate) fn template_cache_bypass_reason(
     mode: AssemblyMode,
-    request_had_authorization: bool,
+    authorization_disqualifies: bool,
     cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
@@ -5830,7 +5842,7 @@ pub(crate) fn template_cache_bypass_reason(
     let policy = TemplateCachePolicy::for_test(key_vary, Duration::from_secs(60));
     template_cache_ttl(
         mode,
-        request_had_authorization,
+        authorization_disqualifies,
         cookie_disqualifies,
         status,
         content_type,
@@ -6086,7 +6098,7 @@ fn replayable_policy_headers(
 
 fn template_cache_ttl(
     mode: AssemblyMode,
-    request_had_authorization: bool,
+    authorization_disqualifies: bool,
     cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
@@ -6096,7 +6108,7 @@ fn template_cache_ttl(
     if matches!(mode, AssemblyMode::Inline) {
         return Err(TemplateCacheBypassReason::InlineMode);
     }
-    if request_had_authorization {
+    if authorization_disqualifies {
         return Err(TemplateCacheBypassReason::AuthorizedRequest);
     }
     if cookie_disqualifies {
@@ -7865,6 +7877,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn origin_span_is_recorded_when_the_origin_send_fails() {
+        // Regression guard for the review finding that the origin span
+        // guard stayed alive through the error branch (and its
+        // abandonment-telemetry await): the span must close when the send
+        // resolves, so a failed fetch still records `origin_ms` and the
+        // error branch's own work is excluded from it.
+        let settings = create_test_settings();
+        // No queued response: the stub client fails the origin send.
+        let stub = Arc::new(StubHttpClient::new());
+        let services =
+            build_services_with_http_client(stub as Arc<dyn crate::platform::PlatformHttpClient>);
+        let mut request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/some-page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let timings = RequestTimings::new();
+        request.extensions_mut().insert(timings.clone());
+
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut ec_context = EcContext::read_from_request(&settings, &request, &services)
+            .expect("should read EC context");
+        let result = handle_publisher_request(
+            &settings,
+            &services,
+            None,
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            request,
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await;
+
+        assert!(result.is_err(), "should surface the origin failure");
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().origin_ms.is_some(),
+            "should record the Origin span even when the origin send fails"
+        );
+    }
+
     mod rendered_template_identity_tests {
         //! The gate the plan's Task 3 Step 2 actually asks for.
         //!
@@ -9200,6 +9259,178 @@ mod tests {
             assert!(
                 timings.snapshot().template_cache_ms.is_some(),
                 "a shared-cache-eligible request should record the TemplateCacheLookup span"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_pass_through_authorization_never_reaches_the_shared_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+            );
+
+            let response = run(&settings, &services, request).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request"),
+                "a credential TS did not terminate is bound for the origin, so its response must never be shared"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                0,
+                "an unterminated authorization must bypass before the lookup, not after it"
+            );
+        }
+
+        #[tokio::test]
+        async fn repeated_authorization_never_reaches_the_shared_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+            );
+            request.headers_mut().append(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer publisher-origin-credential"),
+            );
+            request
+                .extensions_mut()
+                .insert(crate::auth::EdgeTerminatedAuthorization::for_test(
+                    "Basic dXNlcjpwYXNz",
+                ));
+
+            let response = run(&settings, &services, request).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request"),
+                "an ambiguous authorization must remain bound for the origin even if a marker is present"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                0,
+                "repeated authorization must bypass before the shared template lookup"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_replaced_edge_terminated_authorization_bypasses_the_shared_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut settings = settings_with_mode("esi");
+            settings.handlers[0] = toml::from_str(
+                r#"
+                    path = "^/article"
+                    username = "user"
+                    password = "pass"
+                "#,
+            )
+            .expect("should parse article auth handler");
+            let settings = Arc::new(settings);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+            );
+            assert!(
+                crate::auth::enforce_basic_auth(&settings, &mut request)
+                    .expect("should evaluate auth")
+                    .is_none(),
+                "the original credential should pass edge auth"
+            );
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer publisher-origin-credential"),
+            );
+
+            let response = run(&settings, &services, request).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request"),
+                "a replacement credential was not validated at the edge and must bypass sharing"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                0,
+                "a replaced authorization must bypass before the shared template lookup"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_edge_terminated_authorization_still_shares_its_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            // One origin response for two requests: the warm read is asserted by the
+            // fixture running dry, exactly as in the unauthenticated case.
+            queue_shareable_html(&stub);
+
+            let authorized_navigation = || {
+                let mut request = navigation_request();
+                request.headers_mut().insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+                );
+                request.extensions_mut().insert(
+                    crate::auth::EdgeTerminatedAuthorization::for_test("Basic dXNlcjpwYXNz"),
+                );
+                request
+            };
+
+            let cold = run(&settings, &services, authorized_navigation()).await;
+            assert_eq!(
+                cold.headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("miss-stored"),
+                "a credential this edge terminated must be allowed to fill the shared template"
+            );
+            let first = body_of(cold).await;
+
+            let warm = run(&settings, &services, authorized_navigation()).await;
+            assert_eq!(
+                warm.headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("hit"),
+                "the second gated request must read the template the first one stored"
+            );
+            let second = body_of(warm).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the warm gated request must not fetch the origin"
+            );
+            assert_eq!(
+                second, first,
+                "the gated warm response must be byte-identical to the stored template"
             );
         }
 

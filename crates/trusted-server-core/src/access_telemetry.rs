@@ -130,27 +130,27 @@ pub struct RouteMetadata {
 /// content-free route template.
 ///
 /// Returns `/` plus the first path segment, lowercased and restricted to
-/// `[a-z0-9_-]`, with a trailing `/*` appended when the path has
-/// additional segments beyond the first. The root path `/` maps to itself.
-/// A first segment is rejected to `/other/*` — outright, never filtered or
-/// truncated, so no fragment of it ever reaches the row — when it:
+/// `[a-z0-9_-]`, plus `/*`, only when the path has at least two segments:
+/// depth is what makes the first segment a section name (`/news/*`) rather
+/// than the document itself. The root path `/` maps to itself. Everything
+/// else is rejected to `/other/*` — outright, never filtered or truncated,
+/// so no fragment of a rejected path ever reaches the row:
 ///
-/// - is empty, or contains any character outside the allowlist after
-///   lowercasing (an email address, a search phrase);
-/// - is longer than [`MAX_SEGMENT_LEN`] characters (UUIDs, long hex
-///   tokens, and full article slugs all exceed it — a truncated prefix of
-///   any of these would still be identifying); or
-/// - contains more than [`MAX_SEGMENT_DIGITS`] ASCII digits. Opaque
-///   identifiers (hex ids, base36 ids, reset tokens) are digit-heavy;
-///   publisher section names are words, at most a year or a version
-///   number.
+/// - single-segment paths (`/my-post-title` under a `/%postname%/`
+///   permalink structure is a per-article slug that no shape heuristic
+///   can separate from a section name);
+/// - an empty first segment, or one containing any character outside the
+///   allowlist after lowercasing (an email address, a search phrase);
+/// - a first segment longer than [`MAX_SEGMENT_LEN`] characters (a
+///   truncated prefix of a UUID or token would still be identifying); or
+/// - a first segment with more than [`MAX_SEGMENT_DIGITS`] ASCII digits
+///   (hex ids, base36 ids, and reset tokens are digit-heavy; section
+///   names carry at most a year or a version number).
 ///
 /// This is deliberately coarser than the auction-telemetry path
 /// normalizer, which redacts long tokens but preserves short identifiers
 /// and arbitrary slugs; that normalizer is not sufficient for a dataset
-/// this broad. Short all-alpha slugs on single-segment paths are
-/// indistinguishable from section names and still pass; the bound here is
-/// shape-based, not semantic.
+/// this broad.
 ///
 /// # Examples
 ///
@@ -193,7 +193,11 @@ pub fn publisher_route_template(path: &str) -> String {
     if has_more_depth {
         format!("/{lowered}/*")
     } else {
-        format!("/{lowered}")
+        // A single-segment path's first segment is the document, not a
+        // section: `/my-post-title` under WordPress `/%postname%/` is a
+        // per-article slug, and no shape heuristic can separate it from a
+        // section name. Only depth >= 2 makes the first segment a section.
+        "/other/*".to_owned()
     }
 }
 
@@ -440,11 +444,37 @@ mod tests {
     }
 
     #[test]
-    fn publisher_route_template_uppercases_lowercase_before_allowlisting() {
+    fn publisher_route_template_rejects_single_segment_paths() {
+        // A single-segment path's first segment is the document itself
+        // (WordPress `/%postname%/` puts every article at depth 1), so no
+        // shape heuristic can separate a slug from a section name; depth
+        // is the only safe signal. Root-level landing pages pay for this
+        // deliberately.
+        assert_eq!(publisher_route_template("/my-post-title"), "/other/*");
+        assert_eq!(
+            publisher_route_template("/my-post-title/"),
+            "/other/*",
+            "a trailing slash should not count as depth"
+        );
+        assert_eq!(
+            publisher_route_template("/1234567"),
+            "/other/*",
+            "a numeric post id at the digit boundary should still reject"
+        );
+        assert_eq!(publisher_route_template("/user-8f3a9c2b"), "/other/*");
+        assert_eq!(
+            publisher_route_template("/about"),
+            "/other/*",
+            "root-level landing pages reject too; only depth makes a section"
+        );
+    }
+
+    #[test]
+    fn publisher_route_template_lowercases_before_allowlisting() {
         assert_eq!(
             publisher_route_template("/News/Article"),
             "/news/*",
-            "should lowercase before validating and truncating"
+            "should lowercase before validating"
         );
     }
 
@@ -543,6 +573,7 @@ mod tests {
         assert_eq!(RouteClass::IntegrationProxy.as_str(), "integration_proxy");
         assert_eq!(RouteClass::Ec.as_str(), "ec");
         assert_eq!(RouteClass::AuctionApi.as_str(), "auction_api");
+        assert_eq!(RouteClass::Asset.as_str(), "asset");
         assert_eq!(RouteClass::Other.as_str(), "other");
     }
 

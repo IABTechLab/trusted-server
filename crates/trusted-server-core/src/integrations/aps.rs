@@ -23,8 +23,8 @@ use crate::auction::types::{
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 use crate::openrtb::{
@@ -50,6 +50,7 @@ const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-po
 
 const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
 <meta charset="utf-8">
+<style>html,body{margin:0;padding:0}body>iframe{display:block}</style>
 <script>
 (function(){
 'use strict';
@@ -114,6 +115,17 @@ addEventListener('message',receive);
 </script>
 "#;
 
+/// Rendering owner for selected APS bids.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApsRenderingMode {
+    /// Render through Trusted Server's opaque static renderer route.
+    #[default]
+    TrustedServer,
+    /// Render through the injected APS runner in a publisher-origin friendly frame.
+    PublisherNative,
+}
+
 /// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[validate(schema(function = "validate_inventory_identity_override"))]
@@ -130,6 +142,7 @@ pub struct ApsConfig {
     pub endpoint: String,
     /// Timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
     /// Whether to include the APS HTTP exchange in auction response metadata.
     ///
@@ -141,6 +154,9 @@ pub struct ApsConfig {
     /// Whether APS script creatives are eligible before winner selection.
     #[serde(default)]
     pub allow_script_creatives: bool,
+    /// Rendering owner for selected APS bids.
+    #[serde(default)]
+    pub rendering_mode: ApsRenderingMode,
     /// APS-authorized inventory domain used instead of the deployment hostname.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(custom(function = "validate_inventory_domain"))]
@@ -314,6 +330,7 @@ impl Default for ApsConfig {
             timeout_ms: default_timeout_ms(),
             debug: false,
             allow_script_creatives: false,
+            rendering_mode: ApsRenderingMode::TrustedServer,
             inventory_domain: None,
             inventory_page_origin: None,
         }
@@ -1184,7 +1201,9 @@ impl AuctionProvider for ApsAuctionProvider {
 }
 
 #[derive(Debug)]
-struct ApsRendererIntegration;
+struct ApsRendererIntegration {
+    rendering_mode: ApsRenderingMode,
+}
 
 #[async_trait(?Send)]
 impl IntegrationProxy for ApsRendererIntegration {
@@ -1193,7 +1212,10 @@ impl IntegrationProxy for ApsRendererIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![IntegrationEndpoint::get(APS_RENDERER_ROUTE)]
+        (self.rendering_mode == ApsRenderingMode::TrustedServer)
+            .then(|| IntegrationEndpoint::get(APS_RENDERER_ROUTE))
+            .into_iter()
+            .collect()
     }
 
     async fn handle(
@@ -1225,6 +1247,23 @@ impl IntegrationProxy for ApsRendererIntegration {
     }
 }
 
+impl IntegrationHeadInjector for ApsRendererIntegration {
+    fn integration_id(&self) -> &'static str {
+        APS_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+        (self.rendering_mode == ApsRenderingMode::PublisherNative)
+            .then_some(("data-ts-aps-rendering-mode", "publisher_native"))
+            .into_iter()
+            .collect()
+    }
+}
+
 /// Register the APS static renderer endpoint when APS is enabled.
 ///
 /// # Errors
@@ -1233,16 +1272,21 @@ impl IntegrationProxy for ApsRendererIntegration {
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    let Some(_config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
+    let Some(config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
         return Ok(None);
     };
-    let integration = Arc::new(ApsRendererIntegration);
-    Ok(Some(
-        IntegrationRegistration::builder(APS_INTEGRATION_ID)
-            .with_proxy(integration)
-            .without_js()
-            .build(),
-    ))
+    let integration = Arc::new(ApsRendererIntegration {
+        rendering_mode: config.rendering_mode,
+    });
+    let registration = IntegrationRegistration::builder(APS_INTEGRATION_ID)
+        .without_js()
+        .with_head_injector(integration.clone());
+    let registration = if config.rendering_mode == ApsRenderingMode::TrustedServer {
+        registration.with_proxy(integration)
+    } else {
+        registration
+    };
+    Ok(Some(registration.build()))
 }
 
 /// Register the APS auction provider when enabled.
@@ -1262,6 +1306,11 @@ pub fn register_providers(
             "APS debug mode is ON — raw request and response data, including creative markup, will be included in client-visible /auction responses"
         );
     }
+    if config.rendering_mode == ApsRenderingMode::PublisherNative && config.allow_script_creatives {
+        log::warn!(
+            "APS publisher-native rendering with script creatives is ON; selected bidder scripts execute with publisher-origin privileges"
+        );
+    }
     Ok(vec![Arc::new(ApsAuctionProvider::new(config))])
 }
 
@@ -1273,6 +1322,7 @@ mod tests {
         UserInfo,
     };
     use crate::consent::ConsentContext;
+    use crate::integrations::IntegrationDocumentState;
     use crate::openrtb::{Eid, Uid};
     use crate::platform::GeoInfo;
     use crate::platform::test_support::{
@@ -1289,6 +1339,7 @@ mod tests {
             timeout_ms: 800,
             debug: false,
             allow_script_creatives: false,
+            rendering_mode: ApsRenderingMode::TrustedServer,
             inventory_domain: None,
             inventory_page_origin: None,
         }
@@ -1405,6 +1456,7 @@ mod tests {
         assert!(!canonical.debug);
         assert!(debug.debug);
         assert!(!canonical.allow_script_creatives);
+        assert_eq!(canonical.rendering_mode, ApsRenderingMode::TrustedServer);
         assert!(canonical.endpoint.ends_with("/e/pb/bid"));
     }
 
@@ -1465,6 +1517,14 @@ mod tests {
                 "pub_id": "two"
             }))
             .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ApsConfig>(json!({
+                "account_id": "example-account",
+                "rendering_mode": "unsupported"
+            }))
+            .is_err(),
+            "should reject an unknown APS rendering mode"
         );
         for endpoint in [
             "http://aps.example/e/pb/bid",
@@ -2319,7 +2379,9 @@ mod tests {
 
     #[test]
     fn registers_and_serves_only_static_renderer_route() {
-        let integration = ApsRendererIntegration;
+        let integration = ApsRendererIntegration {
+            rendering_mode: ApsRenderingMode::TrustedServer,
+        };
         let routes = integration.routes();
         assert_eq!(routes.len(), 1, "should register one route");
         assert_eq!(routes[0].method, Method::GET);
@@ -2374,7 +2436,101 @@ mod tests {
 
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
         assert_eq!(registration.proxies.len(), 1);
+        assert_eq!(registration.head_injectors.len(), 1);
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "publisher.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+        assert!(
+            registration.head_injectors[0]
+                .head_inserts(&context)
+                .is_empty(),
+            "should not inject a native-mode head marker by default"
+        );
+        assert!(
+            registration.head_injectors[0]
+                .tsjs_script_tag_attributes()
+                .is_empty(),
+            "should not authorize native rendering by default"
+        );
         assert!(registration.js_disabled);
+    }
+
+    #[test]
+    fn publisher_native_config_registers_runner_mode_without_renderer_route() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "account_id": "example-account",
+                    "rendering_mode": "publisher_native"
+                }),
+            )
+            .expect("should insert native APS config");
+
+        let registration = register(&settings)
+            .expect("should register APS")
+            .expect("should return enabled registration");
+        assert!(
+            registration.proxies.is_empty(),
+            "should not register the static renderer"
+        );
+        assert_eq!(registration.head_injectors.len(), 1);
+
+        let integration = ApsRendererIntegration {
+            rendering_mode: ApsRenderingMode::PublisherNative,
+        };
+        assert!(
+            integration.routes().is_empty(),
+            "should expose no renderer route"
+        );
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "publisher.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+        assert!(
+            integration.head_inserts(&context).is_empty(),
+            "should not inject a forgeable native-mode marker"
+        );
+        assert_eq!(
+            integration.tsjs_script_tag_attributes(),
+            vec![("data-ts-aps-rendering-mode", "publisher_native")],
+            "should authorize native mode on the publisher bundle tag"
+        );
+    }
+
+    #[test]
+    fn publisher_native_script_creatives_remain_available_for_controlled_validation() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "account_id": "example-account",
+                    "allow_script_creatives": true,
+                    "rendering_mode": "publisher_native"
+                }),
+            )
+            .expect("should insert native APS script config");
+
+        let providers = register_providers(&settings).expect("should register APS provider");
+
+        assert_eq!(
+            providers.len(),
+            1,
+            "should retain the controlled experiment"
+        );
     }
 
     #[test]
@@ -2429,6 +2585,10 @@ mod tests {
         assert!(APS_RENDERER_DOCUMENT.contains("message.nonce!==expected"));
         assert!(APS_RENDERER_DOCUMENT.contains("prebid/creative/render"));
         assert!(APS_RENDERER_DOCUMENT.contains("window._aps instanceof Map"));
+        assert!(
+            APS_RENDERER_DOCUMENT
+                .contains("html,body{margin:0;padding:0}body>iframe{display:block}")
+        );
         assert!(APS_RENDERER_DOCUMENT.contains("store:new Map([['listeners',new Map()]])"));
         assert!(APS_RENDERER_DOCUMENT.contains("account.queue.push(new CustomEvent"));
         assert!(

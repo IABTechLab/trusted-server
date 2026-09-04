@@ -1,6 +1,7 @@
 use core::future::Future;
 use std::sync::Arc;
 
+use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -37,7 +38,7 @@ use trusted_server_core::settings_data::{
 
 use trusted_server_core::platform::RuntimeServices;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
@@ -587,6 +588,22 @@ impl TrustedServerApp {
         Ok(build_router(&state))
     }
 
+    /// The dev server's fully configured tower service: the application
+    /// router wrapped in the terminal timing layer
+    /// ([`crate::timing::TimingService`]), with `server_timing_enabled`
+    /// read from the same settings snapshot that built the router.
+    ///
+    /// This is the standard construction path for serving this adapter.
+    /// [`Hooks::routes`] satisfies the `Hooks` trait contract and returns
+    /// the bare router without the timing layer; callers who serve traffic
+    /// should use this instead so `server_timing_enabled` is never
+    /// silently discarded.
+    #[must_use]
+    pub fn dev_server_service() -> crate::timing::TimingService<EdgeZeroAxumService> {
+        let (router, server_timing_enabled) = Self::routes_with_server_timing_flag();
+        crate::timing::TimingService::new(EdgeZeroAxumService::new(router), server_timing_enabled)
+    }
+
     /// Build the router alongside whether `Server-Timing` emission is
     /// enabled, read from the same settings snapshot used to build the
     /// router.
@@ -596,7 +613,7 @@ impl TrustedServerApp {
     /// `Settings` per request, the Axum dev server builds its application
     /// state once and reuses the same [`RouterService`] for every request.
     #[must_use]
-    pub fn routes_with_server_timing_flag() -> (RouterService, bool) {
+    fn routes_with_server_timing_flag() -> (RouterService, bool) {
         let state = match build_state() {
             Ok(s) => s,
             Err(ref e) => {
@@ -614,6 +631,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     let fallback = fallback_handler(Arc::clone(state));
 
     let mut router = RouterService::builder()
+        // Outermost middleware: strips the configured trusted-client-IP
+        // headers before anything else sees the request. Must stay first —
+        // any middleware registered ahead of it would observe the
+        // shared-secret authentication header.
+        .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
         .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
         .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
