@@ -49,14 +49,20 @@ pub mod pull_sync;
 pub mod rate_limiter;
 pub mod registry;
 
+/// Characters of an identifier kept when redacting it for a log.
+const LOG_ID_PREFIX_CHARS: usize = 8;
+
 /// Truncates an EC ID for safe inclusion in log messages.
 ///
-/// Returns the first 8 characters followed by `…` to aid debugging without
-/// writing the full user identifier to logs (satisfies the `CodeQL`
-/// "cleartext logging of sensitive information" rule).
+/// Returns the first [`LOG_ID_PREFIX_CHARS`] characters followed by `…` to aid
+/// debugging without writing the full user identifier to logs (satisfies the
+/// `CodeQL` "cleartext logging of sensitive information" rule).
 #[must_use]
 pub fn log_id(ec_id: &str) -> String {
-    let prefix = ec_id.get(..8).unwrap_or(ec_id);
+    // Truncated by character, not by byte. A byte index that lands inside a
+    // multi-byte character makes `get` return `None`, and falling back to the
+    // whole value would print in full the identifier this exists to redact.
+    let prefix: String = ec_id.chars().take(LOG_ID_PREFIX_CHARS).collect();
     format!("{prefix}\u{2026}")
 }
 
@@ -496,6 +502,30 @@ mod tests {
     use super::*;
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn log_id_never_emits_more_than_the_redacted_prefix() {
+        // A byte index inside a multi-byte character used to make the
+        // truncation fall back to the whole value, printing in full the
+        // identifier this redacts.
+        let boundary_splitting = "abcdefg\u{e9}-tail-that-must-not-be-logged";
+        let redacted = log_id(boundary_splitting);
+
+        assert!(
+            !redacted.contains("must-not-be-logged"),
+            "should not disclose the rest of the identifier: {redacted}"
+        );
+        assert_eq!(
+            redacted.chars().count(),
+            9,
+            "should be eight characters plus the ellipsis: {redacted}"
+        );
+
+        // The ordinary case is unchanged.
+        assert_eq!(log_id("0123456789abcdef.ABC123"), "01234567\u{2026}");
+        // A value shorter than the prefix is emitted whole, which is all there is.
+        assert_eq!(log_id("abc"), "abc\u{2026}");
+    }
 
     fn create_test_request(headers: &[(&str, &str)]) -> Request<EdgeBody> {
         let mut builder = Request::builder().method("GET").uri("http://example.com");

@@ -677,6 +677,8 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
+    use crate::ec::kv::TombstoneOutcome;
+
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
@@ -1114,9 +1116,18 @@ mod tests {
     #[test]
     fn reports_tombstone_entries() {
         let ec_id = test_ec_id();
-        let kv = KvIdentityGraph::in_memory("test-store");
-        kv.write_withdrawal_tombstone(&ec_id)
-            .expect("should write tombstone");
+        // Only an identity the store already holds can be tombstoned, so seed
+        // the live entry the withdrawal replaces.
+        let kv = kv_with_entry(
+            &ec_id,
+            &KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000),
+        );
+        assert_eq!(
+            kv.write_withdrawal_tombstone(&ec_id)
+                .expect("should write tombstone"),
+            TombstoneOutcome::Written,
+            "should tombstone the seeded identity"
+        );
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
