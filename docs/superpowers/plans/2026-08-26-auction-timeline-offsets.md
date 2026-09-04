@@ -23,9 +23,11 @@
 ### Task 1: RequestTimings marks and snapshot fields
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/request_timing.rs`
 
 **Interfaces:**
+
 - Produces: `mark_auction_dispatched(&self, auction_id: String)`, `mark_auction_resolved(&self)`, `mark_auction_committed(&self)`; `TimingSnapshot { auction_dispatched_ms, auction_resolved_ms, auction_committed_ms: Option<u32>, auction_id: Option<String>, .. }`
 
 - [ ] Add `auction_dispatched`, `auction_resolved`, `auction_committed: Option<Duration>` and `auction_id: Option<String>` to `Inner`; initialize `None`.
@@ -37,9 +39,11 @@
 ### Task 2: Publisher call sites
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 
 **Interfaces:**
+
 - Consumes: Task 1 methods; `observation.auction_id` (`AuctionObservationContext`), in scope at the dispatch site.
 
 - [ ] In the `DispatchAuctionOutcome::Dispatched` arm (~line 4341): `timings.mark_auction_dispatched(observation.auction_id.to_string());`
@@ -50,6 +54,7 @@
 ### Task 3: Row columns and datasource
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/access_telemetry.rs`
 - Modify: `tinybird/datasources/access_logs_raw.datasource`
 
