@@ -108,6 +108,31 @@ export interface AuctionBidData {
   debug_bid?: AuctionDebugBidData;
 }
 
+/** Server-measured auction timings relative to their documented server-side origin. */
+export interface AuctionDiagnosticsData {
+  auctionDispatchedMs?: number;
+  auctionResolvedMs?: number;
+  auctionCommittedMs?: number;
+  auctionWaitMs?: number;
+  auctionWaitPlacement?: 'pre_header' | 'in_stream';
+}
+
+/** Auction path presented by GPT diagnostics. */
+export type GptDiagnosticsAuctionType = 'ssat' | 'trusted_server' | 'client_side' | 'competing';
+
+/** Sanitized winning-bid facts already exposed in GPT targeting. */
+export interface GptDiagnosticsAuctionWinner {
+  bidder: string;
+  priceBucket: string;
+}
+
+/** Internal Trusted Server auction evidence attached to the next GPT request. */
+export interface GptDiagnosticsAuctionFacts {
+  auctionType?: Extract<GptDiagnosticsAuctionType, 'ssat' | 'trusted_server'>;
+  winner?: GptDiagnosticsAuctionWinner;
+  serverTimings?: AuctionDiagnosticsData;
+}
+
 export type GptDiagnosticsCallbackKind =
   | 'slotRequested'
   | 'slotResponseReceived'
@@ -224,6 +249,9 @@ export interface GptDiagnosticsRequestCycle {
   requestPath?: GptDiagnosticsRequestPath;
   requestIntentId?: number;
   trustedServerAuctionId?: string;
+  auctionType?: GptDiagnosticsAuctionType;
+  auctionWinner?: GptDiagnosticsAuctionWinner;
+  serverAuctionTimings?: AuctionDiagnosticsData;
   opportunityToRequestMs?: number;
   replacedRequestNumber?: number;
   previousRenderToRequestMs?: number;
@@ -332,7 +360,8 @@ export interface GptDiagnosticsRecorder {
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
-    requestedSlotSizes?: ReadonlyArray<Size>
+    requestedSlotSizes?: ReadonlyArray<Size>,
+    auctionFacts?: GptDiagnosticsAuctionFacts
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
@@ -392,6 +421,8 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /** Server-measured timing evidence for the auction that populated `bids`. */
+  auctionDiagnostics?: AuctionDiagnosticsData;
   /**
    * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
    * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
@@ -473,7 +504,8 @@ export interface TsjsApi {
    */
   scheduleInitialAdInit?: (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    initialAuctionDiagnostics?: AuctionDiagnosticsData
   ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;

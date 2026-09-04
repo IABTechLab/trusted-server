@@ -112,6 +112,7 @@ describe('GptDiagnosticsBadgeManager', () => {
 
     expect(layer.querySelectorAll('.tsgd-badge')).toHaveLength(1);
     expect(layer.querySelector<HTMLElement>('.tsgd-badge')?.dataset.runtimeSlot).toBe('1');
+    expect(layer.querySelector<HTMLElement>('.tsgd-badge')?.textContent).toContain('Ad #1');
     manager.destroy();
   });
 
@@ -266,7 +267,7 @@ describe('GptDiagnosticsBadgeManager', () => {
         },
       })
     ).toBe(
-      'Filled · Req 728×90, 970×250 · Fill 728×90 · Box 980×270\nResponse 276 ms · Render 42 ms\nViewable after 1 s'
+      'Filled · Req 728×90, 970×250 · Fill 728×90 · Size filled 980×270\nGAM request → response 276 ms · GAM response → render 42 ms\nViewable after 1 s'
     );
     expect(
       gptDiagnosticsBadgeTextForTest({
@@ -282,6 +283,17 @@ describe('GptDiagnosticsBadgeManager', () => {
         durations: {},
       })
     ).toBe('Filled · Req 300×250, 320×50, 728×90 +1');
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        size: [1, 1],
+        observedSlotSize: [728, 90],
+        auctionType: 'ssat',
+        incompleteSequence: false,
+        durations: {},
+      })
+    ).toBe('Filled · SSAT · Size filled 728×90');
     expect(
       gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,

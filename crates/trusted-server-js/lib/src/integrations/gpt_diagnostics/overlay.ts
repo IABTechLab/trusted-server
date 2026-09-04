@@ -3,7 +3,12 @@ import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { unhandledCase } from './exhaustive';
-import { formatSizes, scheduleFrame } from './presentation_helpers';
+import {
+  auctionTypeLabel,
+  displayableGptFillSize,
+  formatSizes,
+  scheduleFrame,
+} from './presentation_helpers';
 import type { GptDiagnosticsStoreSlotSnapshot, GptDiagnosticsStoreSnapshot } from './store';
 
 export const GPT_DIAGNOSTICS_HOST_ID = 'trusted-server-gpt-diagnostics';
@@ -229,6 +234,34 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   if (typeof cycle.trustedServerAuctionId === 'string' && cycle.trustedServerAuctionId.length > 0) {
     facts.push(`Trusted Server auction: ${cycle.trustedServerAuctionId}`);
   }
+  if (cycle.auctionType) facts.push(`Auction type: ${auctionTypeLabel(cycle.auctionType)}`);
+  if (cycle.auctionWinner) {
+    facts.push(`Winning bidder: ${cycle.auctionWinner.bidder}`);
+    facts.push(`Winning bid price bucket: ${cycle.auctionWinner.priceBucket}`);
+  }
+  if (cycle.serverAuctionTimings) {
+    const timingAnchor =
+      cycle.auctionType === 'trusted_server' ? 'SPA auction T0' : 'Navigation T0';
+    const serverTimings = [
+      [`${timingAnchor} → auction dispatched`, cycle.serverAuctionTimings.auctionDispatchedMs],
+      [`${timingAnchor} → auction resolved`, cycle.serverAuctionTimings.auctionResolvedMs],
+      [`${timingAnchor} → bids committed`, cycle.serverAuctionTimings.auctionCommittedMs],
+    ] as const;
+    for (const [label, timing] of serverTimings) {
+      const formatted = formatMilliseconds(timing);
+      if (formatted) facts.push(`${label} ${formatted}`);
+    }
+    const wait = formatMilliseconds(cycle.serverAuctionTimings.auctionWaitMs);
+    if (wait) {
+      const placement =
+        cycle.serverAuctionTimings.auctionWaitPlacement === 'pre_header'
+          ? 'pre-header'
+          : cycle.serverAuctionTimings.auctionWaitPlacement === 'in_stream'
+            ? 'in stream'
+            : 'placement unknown';
+      facts.push(`Auction wait (${placement}) ${wait}`);
+    }
+  }
   const opportunityToRequest = formatMilliseconds(cycle.opportunityToRequestMs);
   if (opportunityToRequest) facts.push(`Opportunity → request ${opportunityToRequest}`);
   const previousRenderToRequest = formatMilliseconds(cycle.previousRenderToRequestMs);
@@ -273,9 +306,10 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   if (cycle.requestedSlotSizes) {
     facts.push(`Requested slot sizes ${formatSizes(cycle.requestedSlotSizes)}`);
   }
-  if (cycle.size) facts.push(`GPT-reported fill size ${cycle.size[0]}×${cycle.size[1]}`);
+  const fillSize = displayableGptFillSize(cycle.size);
+  if (fillSize) facts.push(`GPT-reported fill size ${fillSize[0]}×${fillSize[1]}`);
   if (cycle.observedSlotSize) {
-    facts.push(`Observed outer slot box ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
+    facts.push(`Size filled ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
   }
   if (cycle.isBackfill !== undefined) facts.push(`Backfill ${cycle.isBackfill ? 'yes' : 'no'}`);
   if (cycle.slotContentChanged !== undefined) {
@@ -283,9 +317,9 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   }
 
   const durations = [
-    ['Request → response', cycle.durations.requestToResponseMs],
-    ['Response → render', cycle.durations.responseToRenderMs],
-    ['Request → render', cycle.durations.requestToRenderMs],
+    ['GAM request → response', cycle.durations.requestToResponseMs],
+    ['GAM response → render', cycle.durations.responseToRenderMs],
+    ['GAM request → render', cycle.durations.requestToRenderMs],
     ['Render → load', cycle.durations.renderToLoadMs],
     ['Render → viewable', cycle.durations.renderToViewableMs],
   ] as const;
@@ -599,7 +633,7 @@ export class GptDiagnosticsOverlay {
     const title = this.document.createElement('div');
     title.className = 'tsgd-slot-title';
     const name = this.document.createElement('strong');
-    name.textContent = slot.slotElementId ?? `Unbound GPT slot ${slot.runtimeSlotNumber}`;
+    name.textContent = `Ad #${slot.runtimeSlotNumber} · ${slot.slotElementId ?? 'Unbound GPT slot'}`;
     const latest = latestCycle(slot);
     const state = this.document.createElement('span');
     state.className = 'tsgd-state';
