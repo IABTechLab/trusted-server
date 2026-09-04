@@ -474,6 +474,15 @@ host-only, root-path cookies; HTTPS targets also mark them Secure. Verification
 refuses cookies when URLs span multiple origins. The quiet settle window must
 not exceed the maximum.
 
+The settle window bounds each wait phase rather than the whole page, so
+`--settle-max-ms` is paid once for the initial settle, again for the optional
+post-scroll settle, and again in generation for a final wait that lets the GPT
+slot registry stop changing before it is read. Verification performs no such
+GPT wait: its evidence collector is injected ahead of publisher scripts and
+records each slot as it is defined, so it has nothing to wait for. Lowering
+`--settle-max-ms` shortens every phase; raising it is what to reach for when
+generation warns that slot registration was still changing.
+
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform
 APIs.

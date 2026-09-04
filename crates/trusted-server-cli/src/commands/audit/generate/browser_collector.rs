@@ -701,7 +701,20 @@ async fn collect_open_page(
     // GPT can finish registering slots after the document and resource stream
     // are otherwise quiet. Wait for a non-empty registry to stabilize instead
     // of treating the first empty read as authoritative.
-    let gpt_slots = collect_stable_gpt_slots(page, &mut warnings).await;
+    //
+    // Verification needs no counterpart wait, so do not port this into
+    // `audit::browser`: its evidence collector is injected before publisher
+    // scripts run and wraps `googletag.defineSlot`, so every slot defined at
+    // any point before the read is already accumulated in its store. This
+    // command has no such hook and reads a `getSlots()` snapshot instead, which
+    // is why only this side can observe a half-registered registry.
+    let gpt_slots = collect_stable_gpt_slots(
+        page,
+        settings.settle_quiet,
+        settings.settle_max,
+        &mut warnings,
+    )
+    .await;
 
     // Links come from the hydrated DOM, not the served markup: an app-router
     // page keeps its link graph in the framework payload, so parsing the raw
@@ -959,26 +972,70 @@ const GPT_SLOTS_SCRIPT: &str = r#"() => {
     }
 }"#;
 
-/// Reads GPT until a non-empty registry repeats or the page-operation bound
-/// expires. The latest non-empty snapshot is retained if registration keeps
-/// changing through the bound; an empty result remains best-effort so the
-/// caller can report the more useful GPT state diagnostic.
+/// How one GPT registry reading relates to the previous non-empty reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GptRegistryReading {
+    /// GPT reported no slots, so any stability streak so far is void.
+    Empty,
+    /// The registry differs from the last non-empty reading.
+    Changed,
+    /// The registry matches the last non-empty reading, element for element.
+    Repeated,
+}
+
+/// Classifies one GPT registry reading against the previous non-empty reading.
+///
+/// The comparison is element-wise and order-sensitive because registry order is
+/// load-bearing downstream: slot discovery takes the GAM network id from the
+/// first usable entry and emits slots in registry order, so a reading whose
+/// order still churns has not stabilized even when its slot set has.
+fn gpt_registry_reading(
+    previous_nonempty: Option<&[CollectedGptSlot]>,
+    current: &[CollectedGptSlot],
+) -> GptRegistryReading {
+    if current.is_empty() {
+        GptRegistryReading::Empty
+    } else if previous_nonempty == Some(current) {
+        GptRegistryReading::Repeated
+    } else {
+        GptRegistryReading::Changed
+    }
+}
+
+/// Reads GPT until a non-empty registry holds still for `dwell_target`, or
+/// until `budget` expires.
+///
+/// A single pair of matching reads is not enough: GPT registers in bursts (SRA
+/// batching, consent-gated definitions, lazy slots), so two consecutive reads
+/// can both observe the same burst and miss the next. Requiring the reading to
+/// repeat for a dwell window mirrors [`wait_for_page_settle`], and taking both
+/// the dwell and the budget from the operator's settle flags puts this phase
+/// under the same `--settle-max-ms` control as that loop — including the same
+/// tolerance, since an in-flight read may overrun the budget by its own bound.
+///
+/// The latest non-empty snapshot is retained, with a warning, if registration
+/// keeps changing through the budget. An empty result stays silent and
+/// best-effort so the caller can report the more useful GPT state diagnostic.
 async fn collect_stable_gpt_slots(
     page: &chromiumoxide::Page,
+    dwell_target: Duration,
+    budget: Duration,
     warnings: &mut Vec<String>,
 ) -> Vec<CollectedGptSlot> {
     let start = std::time::Instant::now();
-    let mut previous_nonempty = None;
+    let mut previous_nonempty: Option<Vec<CollectedGptSlot>> = None;
     let mut latest_nonempty = Vec::new();
+    let mut stable_since = None;
 
     loop {
-        let remaining = PAGE_OPERATION_TIMEOUT.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            return latest_nonempty;
+        if start.elapsed() >= budget {
+            return expired_gpt_registry(latest_nonempty, dwell_target, budget, warnings);
         }
 
+        // Bound each read on its own so a wedged CDP connection is reported as
+        // a hung evaluate rather than as budget exhaustion, and vice versa.
         let slots: Vec<CollectedGptSlot> =
-            match timeout(remaining, page.evaluate(GPT_SLOTS_SCRIPT)).await {
+            match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(GPT_SLOTS_SCRIPT)).await {
                 Ok(Ok(result)) => match result.into_value() {
                     Ok(slots) => slots,
                     Err(error) => {
@@ -991,27 +1048,77 @@ async fn collect_stable_gpt_slots(
                     return latest_nonempty;
                 }
                 Err(_) => {
-                    warnings.push("timed out evaluating live GPT slots".to_string());
+                    warnings.push(format!(
+                        "timed out evaluating live GPT slots after {}s; results may be partial",
+                        PAGE_OPERATION_TIMEOUT.as_secs()
+                    ));
                     return latest_nonempty;
                 }
             };
 
-        if slots.is_empty() {
-            previous_nonempty = None;
-        } else {
-            if previous_nonempty.as_ref() == Some(&slots) {
-                return slots;
+        match gpt_registry_reading(previous_nonempty.as_deref(), &slots) {
+            GptRegistryReading::Empty => {
+                previous_nonempty = None;
+                stable_since = None;
             }
-            latest_nonempty.clone_from(&slots);
-            previous_nonempty = Some(slots);
+            GptRegistryReading::Changed => {
+                latest_nonempty.clone_from(&slots);
+                previous_nonempty = Some(slots);
+                stable_since = None;
+            }
+            GptRegistryReading::Repeated => {
+                let stable_start = stable_since.get_or_insert_with(std::time::Instant::now);
+                if stable_start.elapsed() >= dwell_target {
+                    return slots;
+                }
+            }
         }
 
-        let remaining = PAGE_OPERATION_TIMEOUT.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            return latest_nonempty;
+        let remaining_budget = budget.saturating_sub(start.elapsed());
+        if remaining_budget.is_zero() {
+            return expired_gpt_registry(latest_nonempty, dwell_target, budget, warnings);
         }
-        sleep(SETTLE_POLL_INTERVAL.min(remaining)).await;
+        let remaining_dwell = stable_since
+            .map(|stable_start| dwell_target.saturating_sub(stable_start.elapsed()))
+            .unwrap_or(dwell_target);
+        sleep(
+            SETTLE_POLL_INTERVAL
+                .min(remaining_budget)
+                .min(remaining_dwell.max(Duration::from_millis(1))),
+        )
+        .await;
     }
+}
+
+/// Reports a stability budget that expired before the registry held still, and
+/// hands back the latest snapshot.
+///
+/// The message names both the dwell and the budget rather than asserting that
+/// registration churned: a registry that stopped changing late can also run out
+/// of budget mid-dwell, and the operator's next move — raising the cap — is the
+/// same either way.
+///
+/// An empty registry is left to the caller's GPT state diagnostic, which names
+/// the actual cause; only a partial non-empty snapshot needs its own warning,
+/// because otherwise it is indistinguishable in the output from a cleanly
+/// stabilized read.
+fn expired_gpt_registry(
+    latest_nonempty: Vec<CollectedGptSlot>,
+    dwell_target: Duration,
+    budget: Duration,
+    warnings: &mut Vec<String>,
+) -> Vec<CollectedGptSlot> {
+    if !latest_nonempty.is_empty() {
+        warnings.push(format!(
+            "GPT slot registration did not hold still for {}ms within the {}ms budget; using the \
+             latest snapshot of {} slot(s), so results may be partial; raise `--settle-max-ms` \
+             to wait longer",
+            dwell_target.as_millis(),
+            budget.as_millis(),
+            latest_nonempty.len()
+        ));
+    }
+    latest_nonempty
 }
 
 async fn wait_for_page_settle(
@@ -1210,6 +1317,60 @@ mod tests {
   </body>
 </html>"#;
 
+    /// A registry whose second burst lands on a real timer rather than on
+    /// observation, so two consecutive identical reads can straddle the gap.
+    ///
+    /// The first burst is gated on the first `getSlots()` call — otherwise it
+    /// would complete during the settle wait, long before polling starts — but
+    /// the gap that follows is genuine wall-clock time, which is what makes
+    /// this fixture able to detect a criterion that exits on a single matching
+    /// pair.
+    const BATCHED_GPT_FIXTURE: &str = r#"<!doctype html>
+<html>
+  <body>
+    <div id="ad-first-batch-0"></div>
+    <div id="ad-second-batch-0"></div>
+    <script>
+      var firstSlot = {
+        getAdUnitPath: function () { return '/123/first-batch' },
+        getSlotElementId: function () { return 'ad-first-batch-0' },
+        getSizes: function () {
+          return [{
+            getWidth: function () { return 300 },
+            getHeight: function () { return 250 },
+          }]
+        },
+      }
+      var secondSlot = {
+        getAdUnitPath: function () { return '/123/second-batch' },
+        getSlotElementId: function () { return 'ad-second-batch-0' },
+        getSizes: function () {
+          return [{
+            getWidth: function () { return 728 },
+            getHeight: function () { return 90 },
+          }]
+        },
+      }
+      var slots = []
+      var armed = false
+      window.googletag = {
+        pubads: function () {
+          return {
+            getSlots: function () {
+              if (!armed) {
+                armed = true
+                slots = [firstSlot]
+                setTimeout(function () { slots = [firstSlot, secondSlot] }, 400)
+              }
+              return slots
+            },
+          }
+        },
+      }
+    </script>
+  </body>
+</html>"#;
+
     fn gpt_fixture_url(html: &'static str) -> Url {
         let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
         let address = listener.local_addr().expect("should read fixture address");
@@ -1238,6 +1399,110 @@ mod tests {
             .expect("should write fixture response");
         });
         Url::parse(&format!("http://{address}/")).expect("should parse fixture URL")
+    }
+
+    fn gpt_slot(unit_path: &str, div_id: &str) -> CollectedGptSlot {
+        CollectedGptSlot {
+            gam_unit_path: unit_path.to_string(),
+            div_id: div_id.to_string(),
+            sizes: vec![(300, 250)],
+        }
+    }
+
+    #[test]
+    fn empty_gpt_reading_voids_the_stability_streak() {
+        let previous = vec![gpt_slot("/123/a", "ad-a-0")];
+
+        assert_eq!(
+            gpt_registry_reading(Some(&previous), &[]),
+            GptRegistryReading::Empty,
+            "an empty read should discard the earlier non-empty reading"
+        );
+        assert_eq!(
+            gpt_registry_reading(None, &[]),
+            GptRegistryReading::Empty,
+            "an empty read with no history should still classify as empty"
+        );
+    }
+
+    #[test]
+    fn first_nonempty_gpt_reading_is_a_change() {
+        let current = vec![gpt_slot("/123/a", "ad-a-0")];
+
+        assert_eq!(
+            gpt_registry_reading(None, &current),
+            GptRegistryReading::Changed,
+            "the first non-empty read has nothing to repeat"
+        );
+    }
+
+    #[test]
+    fn identical_gpt_reading_repeats() {
+        let slots = vec![gpt_slot("/123/a", "ad-a-0"), gpt_slot("/123/b", "ad-b-0")];
+
+        assert_eq!(
+            gpt_registry_reading(Some(&slots), &slots),
+            GptRegistryReading::Repeated,
+            "an unchanged registry should classify as repeated"
+        );
+    }
+
+    #[test]
+    fn gpt_reading_stability_is_order_sensitive() {
+        let previous = vec![gpt_slot("/123/a", "ad-a-0"), gpt_slot("/123/b", "ad-b-0")];
+        let reordered = vec![gpt_slot("/123/b", "ad-b-0"), gpt_slot("/123/a", "ad-a-0")];
+        let grown = vec![
+            gpt_slot("/123/a", "ad-a-0"),
+            gpt_slot("/123/b", "ad-b-0"),
+            gpt_slot("/123/c", "ad-c-0"),
+        ];
+
+        assert_eq!(
+            gpt_registry_reading(Some(&previous), &reordered),
+            GptRegistryReading::Changed,
+            "the same slot set in a different order is not yet stable"
+        );
+        assert_eq!(
+            gpt_registry_reading(Some(&previous), &grown),
+            GptRegistryReading::Changed,
+            "a later registration burst should reset the streak"
+        );
+    }
+
+    #[test]
+    fn expired_stability_budget_warns_only_for_partial_evidence() {
+        let mut partial_warnings = Vec::new();
+        let partial = expired_gpt_registry(
+            vec![gpt_slot("/123/a", "ad-a-0")],
+            Duration::from_millis(750),
+            Duration::from_millis(12_000),
+            &mut partial_warnings,
+        );
+
+        assert_eq!(partial.len(), 1, "the latest snapshot should be returned");
+        assert_eq!(
+            partial_warnings,
+            [
+                "GPT slot registration did not hold still for 750ms within the 12000ms budget; \
+                 using the latest snapshot of 1 slot(s), so results may be partial; raise \
+                 `--settle-max-ms` to wait longer"
+            ],
+            "a partial snapshot should name the slot count, the dwell, and the budget"
+        );
+
+        let mut empty_warnings = Vec::new();
+        let empty = expired_gpt_registry(
+            Vec::new(),
+            Duration::from_millis(750),
+            Duration::from_millis(12_000),
+            &mut empty_warnings,
+        );
+
+        assert!(empty.is_empty(), "an empty registry should stay empty");
+        assert!(
+            empty_warnings.is_empty(),
+            "an empty registry is reported by the GPT state diagnostic instead"
+        );
     }
 
     #[test]
@@ -1458,6 +1723,35 @@ mod tests {
                 },
             ],
             "collector should wait for stable registration without reordering slots"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn waits_through_a_timer_driven_gpt_registration_gap() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let collected = BrowserAuditCollector::default()
+            .collect_page(&gpt_fixture_url(BATCHED_GPT_FIXTURE), &[])
+            .expect("should collect batched GPT registry");
+
+        assert_eq!(
+            collected.gpt_slots,
+            vec![
+                CollectedGptSlot {
+                    gam_unit_path: "/123/first-batch".to_string(),
+                    div_id: "ad-first-batch-0".to_string(),
+                    sizes: vec![(300, 250)],
+                },
+                CollectedGptSlot {
+                    gam_unit_path: "/123/second-batch".to_string(),
+                    div_id: "ad-second-batch-0".to_string(),
+                    sizes: vec![(728, 90)],
+                },
+            ],
+            "the dwell window should outlast a gap between registration bursts"
         );
     }
 
