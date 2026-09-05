@@ -1,22 +1,27 @@
 //! Deterministic generated regions and semantic Markdown link validation.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::Read as _;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use error_stack::{Report, ResultExt as _};
 use github_slugger::Slugger as GithubSlugger;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use scraper::{Html, Selector};
 use serde::Deserialize;
+use serde_yaml::Value as YamlValue;
+use sha2::{Digest as _, Sha256};
 use unicode_normalization::UnicodeNormalization as _;
 use url::Url;
 
 use crate::repository::{NormalizedRelativePath, Repository};
 
 const MAXIMUM_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAXIMUM_FRONTMATTER_BYTES: usize = 64 * 1024;
 const MAXIMUM_LINK_BYTES: usize = 8 * 1024;
 const MAXIMUM_REDIRECTS: usize = 5;
 const MAXIMUM_RETRY_ATTEMPTS: usize = 3;
@@ -28,6 +33,8 @@ const MAXIMUM_HEADER_VALUE_BYTES: usize = 8 * 1024;
 const MAXIMUM_HEADER_LINE_BYTES: usize = 8 * 1024;
 const CURL_TRAILER_BYTES: usize = 128;
 const CURL_WRITE_OUT: &str = "\nDOCS_PARITY_COUNTS:%{size_header}:%{size_download}\n";
+const CURL_EXECUTABLE: &str = "/usr/bin/curl";
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PAGES_MANIFEST: &str = "tools/docs-parity/manifests/pages.toml";
 const ORPHANS_MANIFEST: &str = "tools/docs-parity/manifests/orphans.toml";
 const DIAGRAMS_MANIFEST: &str = "tools/docs-parity/manifests/diagrams.toml";
@@ -174,6 +181,7 @@ struct DiagramsManifest {
 struct DiagramRecord {
     path: String,
     selector: String,
+    fingerprint: String,
     prose_anchor: String,
     owner: String,
 }
@@ -318,14 +326,14 @@ pub(crate) fn generate(
                 .unwrap_or(&empty_ownership),
         )?;
         if rendered != original {
-            updates.push((path, rendered));
+            updates.push((path, original, rendered));
         }
     }
     let drift = !updates.is_empty();
     if update {
-        for (path, contents) in updates {
+        for (path, original, contents) in updates {
             repository
-                .write_atomically(&path, &contents)
+                .write_atomically(&path, Some(&original), &contents)
                 .change_context(MarkdownError::GeneratedRecord {
                     detail: format!(
                         "cannot atomically update generated target: {}",
@@ -690,7 +698,13 @@ struct ParsedMarkdown {
     anchors: BTreeSet<String>,
     heading_anchors: BTreeSet<String>,
     links: Vec<ParsedLink>,
-    mermaid_selectors: Vec<String>,
+    mermaid_diagrams: Vec<ParsedDiagram>,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedDiagram {
+    selector: String,
+    fingerprint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -707,6 +721,8 @@ struct LinkIndex<'a> {
     tombstones: &'a BTreeSet<String>,
     known_excluded_paths: &'a BTreeSet<String>,
     known_paths: &'a BTreeSet<String>,
+    public_directory: Option<&'a str>,
+    safe_public_assets: &'a BTreeSet<String>,
 }
 
 /// Validate local Markdown links and intended public-page membership.
@@ -731,6 +747,8 @@ pub fn check_local_links(
         tombstone_routes,
         &BTreeSet::new(),
         &known_paths,
+        None,
+        &BTreeSet::new(),
     )
 }
 
@@ -740,6 +758,8 @@ fn check_local_links_with_known(
     tombstone_routes: &[String],
     known_excluded_paths: &BTreeSet<String>,
     known_paths: &BTreeSet<String>,
+    public_directory: Option<&str>,
+    safe_public_assets: &BTreeSet<String>,
 ) -> Result<(), Report<MarkdownError>> {
     let mut source_by_path = BTreeMap::new();
     let mut parsed_by_path = BTreeMap::new();
@@ -798,6 +818,8 @@ fn check_local_links_with_known(
         tombstones: &tombstones,
         known_excluded_paths,
         known_paths,
+        public_directory,
+        safe_public_assets,
     };
     for source in sources {
         let parsed = parsed_by_path
@@ -877,12 +899,27 @@ fn check_local_destination(
                     source.path
                 )));
             }
-            let target = index.route_to_path.get(&route).cloned().ok_or_else(|| {
-                local_error(format!(
-                    "{} has missing VitePress route {route}",
+            let Some(target) = index.route_to_path.get(&route).cloned() else {
+                if fragment.is_none()
+                    && let Some(public_directory) = index.public_directory
+                {
+                    let asset = format!("{public_directory}/{}", path.trim_start_matches('/'));
+                    validate_repo_path(&asset)?;
+                    if index.safe_public_assets.contains(&asset) {
+                        return Ok(());
+                    }
+                    if index.known_paths.contains(&asset) {
+                        return Err(local_error(format!(
+                            "{} links to unsafe public asset {asset}",
+                            source.path
+                        )));
+                    }
+                }
+                return Err(local_error(format!(
+                    "{} has missing VitePress route or public asset {route}",
                     source.path
-                ))
-            })?;
+                )));
+            };
             (target, Some(route))
         } else {
             let route = normalize_route(&path)?;
@@ -1031,6 +1068,14 @@ fn parse_markdown(
     set: LinkSourceSet,
     markdown: &str,
 ) -> Result<ParsedMarkdown, Report<MarkdownError>> {
+    let frontmatter = if set == LinkSourceSet::Public {
+        parse_public_frontmatter(path, markdown)?
+    } else {
+        ParsedFrontmatter::default()
+    };
+    let markdown_body = markdown
+        .get(frontmatter.body_start..)
+        .ok_or_else(|| local_error(format!("{path} has invalid frontmatter offsets")))?;
     let mut options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -1038,16 +1083,17 @@ fn parse_markdown(
     if set == LinkSourceSet::Public {
         options |= Options::ENABLE_HEADING_ATTRIBUTES;
     }
-    let parser = Parser::new_ext(markdown, options).into_offset_iter();
+    let parser = Parser::new_ext(markdown_body, options).into_offset_iter();
     let mut anchors = BTreeSet::new();
     let mut heading_anchors = BTreeSet::new();
-    let mut links = Vec::new();
-    let mut mermaid_selectors = Vec::new();
+    let mut links = frontmatter.links;
+    let mut mermaid_diagrams = Vec::new();
     let mut heading: Option<HeadingState> = None;
     let mut slugs = HeadingSlugs::new(set);
     let mut fence: Option<FenceState> = None;
 
     for (event, range) in parser {
+        let range = (range.start + frontmatter.body_start)..(range.end + frontmatter.body_start);
         match event {
             Event::Start(Tag::Heading {
                 id, classes, attrs, ..
@@ -1137,9 +1183,9 @@ fn parse_markdown(
                 )?;
             }
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
-                let opening = parse_opening_fence(path, markdown, range.start, &info)?;
+                let mut opening = parse_opening_fence(path, markdown, range.start, &info)?;
                 if opening.mermaid {
-                    mermaid_selectors.push(format!("mermaid:{}", mermaid_selectors.len() + 1));
+                    opening.selector = Some(format!("mermaid:{}", mermaid_diagrams.len() + 1));
                 }
                 fence = Some(opening);
             }
@@ -1149,7 +1195,20 @@ fn parse_markdown(
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(opening) = fence.take() {
                     validate_closing_fence(path, markdown, &opening, range.start, range.end)?;
+                    if let Some(selector) = opening.selector {
+                        mermaid_diagrams.push(ParsedDiagram {
+                            selector,
+                            fingerprint: content_fingerprint(&opening.contents),
+                        });
+                    }
                 }
+            }
+            Event::Text(value) if fence.as_ref().is_some_and(|opening| opening.mermaid) => {
+                fence
+                    .as_mut()
+                    .expect("fenced block should be open")
+                    .contents
+                    .extend_from_slice(value.as_bytes());
             }
             Event::Text(_)
             | Event::Code(_)
@@ -1173,8 +1232,188 @@ fn parse_markdown(
         anchors,
         heading_anchors,
         links,
-        mermaid_selectors,
+        mermaid_diagrams,
     })
+}
+
+#[derive(Default)]
+struct ParsedFrontmatter {
+    body_start: usize,
+    links: Vec<ParsedLink>,
+}
+
+fn parse_public_frontmatter(
+    path: &str,
+    markdown: &str,
+) -> Result<ParsedFrontmatter, Report<MarkdownError>> {
+    let opening_bytes = if markdown.starts_with("---\r\n") {
+        5
+    } else if markdown.starts_with("---\n") {
+        4
+    } else {
+        return Ok(ParsedFrontmatter::default());
+    };
+    let bytes = markdown.as_bytes();
+    let mut line_start = opening_bytes;
+    let (frontmatter_end, body_start) = loop {
+        if line_start > MAXIMUM_FRONTMATTER_BYTES {
+            return Err(local_error(format!(
+                "{path} frontmatter exceeds {MAXIMUM_FRONTMATTER_BYTES} bytes"
+            )));
+        }
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let line = markdown[line_start..line_end].trim_end_matches('\r');
+        if line == "---" {
+            let body_start = if line_end < bytes.len() {
+                line_end + 1
+            } else {
+                line_end
+            };
+            break (line_start, body_start);
+        }
+        if line_end == bytes.len() {
+            return Err(local_error(format!("{path} has unclosed frontmatter")));
+        }
+        line_start = line_end + 1;
+    };
+    if frontmatter_end > MAXIMUM_FRONTMATTER_BYTES {
+        return Err(local_error(format!(
+            "{path} frontmatter exceeds {MAXIMUM_FRONTMATTER_BYTES} bytes"
+        )));
+    }
+    let source = &markdown[opening_bytes..frontmatter_end];
+    let yaml: YamlValue = serde_yaml::from_str(source)
+        .map_err(|error| local_error(format!("{path} has malformed frontmatter: {error}")))?;
+    let mut links = Vec::new();
+    extract_frontmatter_links(path, &yaml, body_start, &mut links)?;
+    Ok(ParsedFrontmatter { body_start, links })
+}
+
+fn extract_frontmatter_links(
+    path: &str,
+    yaml: &YamlValue,
+    end: usize,
+    links: &mut Vec<ParsedLink>,
+) -> Result<(), Report<MarkdownError>> {
+    let mapping = yaml
+        .as_mapping()
+        .ok_or_else(|| local_error(format!("{path} frontmatter must be a YAML mapping")))?;
+    if let Some(hero) = yaml_field(mapping, "hero") {
+        if hero == &YamlValue::Bool(false) {
+            return extract_feature_links(path, mapping, end, links);
+        }
+        let hero = hero.as_mapping().ok_or_else(|| {
+            local_error(format!(
+                "{path} frontmatter hero must be a mapping or false"
+            ))
+        })?;
+        if let Some(image) = yaml_field(hero, "image") {
+            match image {
+                YamlValue::String(destination) => {
+                    push_frontmatter_link(path, destination, end, links)?;
+                }
+                YamlValue::Mapping(image) => {
+                    if let Some(source) = yaml_field(image, "src") {
+                        let source = source.as_str().ok_or_else(|| {
+                            local_error(format!(
+                                "{path} frontmatter hero.image.src must be a string"
+                            ))
+                        })?;
+                        push_frontmatter_link(path, source, end, links)?;
+                    }
+                }
+                _ => {
+                    return Err(local_error(format!(
+                        "{path} frontmatter hero.image must be a string or mapping"
+                    )));
+                }
+            }
+        }
+        if let Some(actions) = yaml_field(hero, "actions") {
+            let actions = actions.as_sequence().ok_or_else(|| {
+                local_error(format!(
+                    "{path} frontmatter hero.actions must be a sequence"
+                ))
+            })?;
+            for action in actions {
+                let action = action.as_mapping().ok_or_else(|| {
+                    local_error(format!("{path} frontmatter hero action must be a mapping"))
+                })?;
+                let destination = yaml_field(action, "link")
+                    .and_then(YamlValue::as_str)
+                    .ok_or_else(|| {
+                        local_error(format!(
+                            "{path} frontmatter hero action link must be a string"
+                        ))
+                    })?;
+                push_frontmatter_link(path, destination, end, links)?;
+            }
+        }
+    }
+    extract_feature_links(path, mapping, end, links)
+}
+
+fn extract_feature_links(
+    path: &str,
+    mapping: &serde_yaml::Mapping,
+    end: usize,
+    links: &mut Vec<ParsedLink>,
+) -> Result<(), Report<MarkdownError>> {
+    let Some(features) = yaml_field(mapping, "features") else {
+        return Ok(());
+    };
+    let features = features
+        .as_sequence()
+        .ok_or_else(|| local_error(format!("{path} frontmatter features must be a sequence")))?;
+    for feature in features {
+        let feature = feature
+            .as_mapping()
+            .ok_or_else(|| local_error(format!("{path} frontmatter feature must be a mapping")))?;
+        if let Some(destination) = yaml_field(feature, "link") {
+            let destination = destination.as_str().ok_or_else(|| {
+                local_error(format!("{path} frontmatter feature link must be a string"))
+            })?;
+            push_frontmatter_link(path, destination, end, links)?;
+        }
+        if let Some(icon) = yaml_field(feature, "icon")
+            && let YamlValue::Mapping(icon) = icon
+            && let Some(source) = yaml_field(icon, "src")
+        {
+            let source = source.as_str().ok_or_else(|| {
+                local_error(format!(
+                    "{path} frontmatter feature icon src must be a string"
+                ))
+            })?;
+            push_frontmatter_link(path, source, end, links)?;
+        }
+    }
+    Ok(())
+}
+
+fn yaml_field<'a>(mapping: &'a serde_yaml::Mapping, name: &str) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(name.to_owned()))
+}
+
+fn push_frontmatter_link(
+    path: &str,
+    destination: &str,
+    end: usize,
+    links: &mut Vec<ParsedLink>,
+) -> Result<(), Report<MarkdownError>> {
+    if destination.is_empty() || destination.len() > MAXIMUM_LINK_BYTES {
+        return Err(local_error(format!(
+            "{path} frontmatter contains an empty or oversized link"
+        )));
+    }
+    links.push(ParsedLink {
+        destination: destination.to_owned(),
+        start: 0,
+        end,
+    });
+    Ok(())
 }
 
 struct HeadingState {
@@ -1382,6 +1621,8 @@ struct FenceState {
     character: u8,
     count: usize,
     mermaid: bool,
+    selector: Option<String>,
+    contents: Vec<u8>,
 }
 
 fn parse_opening_fence(
@@ -1415,6 +1656,8 @@ fn parse_opening_fence(
         character,
         count,
         mermaid,
+        selector: None,
+        contents: Vec::new(),
     })
 }
 
@@ -1721,6 +1964,9 @@ pub(crate) fn check_local_repository(repository: &Repository) -> Result<(), Repo
     let config_text = core::str::from_utf8(&config_bytes)
         .map_err(|_error| local_error("VitePress configuration is not UTF-8"))?;
     let vitepress = parse_vitepress_config(config_text)?;
+    let public_directory = vitepress_public_directory(&pages.site_root, &vitepress)?;
+    let safe_public_assets =
+        safe_public_assets(repository, &loaded.known_paths, &public_directory)?;
     let page_inventory = validate_page_inventory(repository, &pages, &vitepress)?;
     let orphan_inventory = validate_orphan_records(&orphans)?;
     if page_inventory.tombstones != orphan_inventory.tombstones {
@@ -1751,6 +1997,8 @@ pub(crate) fn check_local_repository(repository: &Repository) -> Result<(), Repo
             .collect::<Vec<_>>(),
         &loaded.excluded_paths,
         &loaded.known_paths,
+        Some(&public_directory),
+        &safe_public_assets,
     )?;
     validate_reachability(
         &loaded.sources,
@@ -1837,6 +2085,7 @@ fn validate_manifest_attestation(
 struct VitepressRecords {
     src_excludes: BTreeSet<String>,
     navigation_routes: BTreeSet<String>,
+    public_directory: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1882,6 +2131,7 @@ fn parse_vitepress_config(source: &str) -> Result<VitepressRecords, Report<Markd
     let tokens = lex_typescript(source)?;
     let mut src_excludes = None;
     let mut navigation_routes = BTreeSet::new();
+    let mut public_directory = None;
     let mut index = 0;
     while index < tokens.len() {
         match tokens.get(index) {
@@ -1930,6 +2180,18 @@ fn parse_vitepress_config(source: &str) -> Result<VitepressRecords, Report<Markd
                     navigation_routes.insert(normalize_route(value)?);
                 }
             }
+            Some(TypeScriptToken::Identifier(name)) if name == "publicDir" => {
+                if public_directory.is_some() {
+                    return Err(local_error("VitePress publicDir is declared twice"));
+                }
+                if tokens.get(index + 1) != Some(&TypeScriptToken::Punctuation(':')) {
+                    return Err(local_error("VitePress publicDir has an unknown shape"));
+                }
+                let Some(TypeScriptToken::String(value)) = tokens.get(index + 2) else {
+                    return Err(local_error("VitePress publicDir has a nonliteral value"));
+                };
+                public_directory = Some(value.clone());
+            }
             _ => {}
         }
         index += 1;
@@ -1937,7 +2199,42 @@ fn parse_vitepress_config(source: &str) -> Result<VitepressRecords, Report<Markd
     Ok(VitepressRecords {
         src_excludes: src_excludes.ok_or_else(|| local_error("VitePress srcExclude is missing"))?,
         navigation_routes,
+        public_directory,
     })
+}
+
+fn vitepress_public_directory(
+    site_root: &str,
+    vitepress: &VitepressRecords,
+) -> Result<String, Report<MarkdownError>> {
+    let relative = vitepress.public_directory.as_deref().unwrap_or("public");
+    validate_repo_path(relative)?;
+    let directory = format!("{site_root}/{relative}");
+    validate_repo_path(&directory)?;
+    Ok(directory)
+}
+
+fn safe_public_assets(
+    repository: &Repository,
+    known_paths: &BTreeSet<String>,
+    public_directory: &str,
+) -> Result<BTreeSet<String>, Report<MarkdownError>> {
+    let prefix = format!("{public_directory}/");
+    let mut assets = BTreeSet::new();
+    for path in known_paths.iter().filter(|path| path.starts_with(&prefix)) {
+        let normalized = NormalizedRelativePath::new(Path::new(path)).change_context(
+            MarkdownError::LocalLink {
+                detail: format!("unsafe public asset path: {path}"),
+            },
+        )?;
+        repository
+            .validate_regular_file(&normalized)
+            .change_context(MarkdownError::LocalLink {
+                detail: format!("unsafe public asset: {path}"),
+            })?;
+        assets.insert(path.clone());
+    }
+    Ok(assets)
 }
 
 fn lex_typescript(source: &str) -> Result<Vec<TypeScriptToken>, Report<MarkdownError>> {
@@ -2303,13 +2600,15 @@ fn validate_diagrams(
     let mut actual = BTreeSet::new();
     for source in public.values() {
         let parsed = parse_markdown(&source.path, source.set, &source.markdown)?;
-        for selector in parsed.mermaid_selectors {
-            actual.insert((source.path.clone(), selector));
+        for diagram in parsed.mermaid_diagrams {
+            actual.insert((source.path.clone(), diagram.selector, diagram.fingerprint));
         }
     }
     let mut recorded = BTreeSet::new();
+    let mut recorded_selectors = BTreeSet::new();
     for record in &manifest.diagrams {
         validate_repo_path(&record.path)?;
+        validate_content_fingerprint(&record.fingerprint)?;
         if record.owner.trim().is_empty() || record.prose_anchor.trim().is_empty() {
             return Err(local_error(format!(
                 "diagram {} {} requires prose anchor and owner",
@@ -2326,12 +2625,28 @@ fn validate_diagrams(
                 record.path, record.selector, record.prose_anchor
             )));
         }
-        if !recorded.insert((record.path.clone(), record.selector.clone())) {
+        if let Some(diagram) = parsed
+            .mermaid_diagrams
+            .iter()
+            .find(|diagram| diagram.selector == record.selector)
+            && diagram.fingerprint != record.fingerprint
+        {
+            return Err(local_error(format!(
+                "diagram fingerprint mismatch: {} {}",
+                record.path, record.selector
+            )));
+        }
+        if !recorded_selectors.insert((record.path.clone(), record.selector.clone())) {
             return Err(local_error(format!(
                 "duplicate diagram record: {} {}",
                 record.path, record.selector
             )));
         }
+        recorded.insert((
+            record.path.clone(),
+            record.selector.clone(),
+            record.fingerprint.clone(),
+        ));
     }
     if actual != recorded {
         return Err(local_error(format!(
@@ -2339,6 +2654,24 @@ fn validate_diagrams(
             actual.difference(&recorded).next(),
             recorded.difference(&actual).next()
         )));
+    }
+    Ok(())
+}
+
+fn content_fingerprint(contents: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(contents))
+}
+
+fn validate_content_fingerprint(value: &str) -> Result<(), Report<MarkdownError>> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(local_error(format!("invalid diagram fingerprint: {value}")));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(local_error(format!("invalid diagram fingerprint: {value}")));
     }
     Ok(())
 }
@@ -2374,13 +2707,21 @@ pub struct ExternalRequest {
 pub struct ExternalResponse {
     /// HTTP status code.
     pub status: u16,
-    /// Lowercase response headers. Transport implementations must reject
-    /// duplicate security-relevant headers and oversized header sections.
-    pub headers: BTreeMap<String, String>,
+    /// Raw response fields in wire order, retaining legal repeated fields.
+    pub headers: Vec<ExternalHeader>,
     /// Exact number of header bytes read by the transport.
     pub header_bytes: usize,
     /// Exact number of body bytes read by the transport.
     pub body_bytes: usize,
+}
+
+/// One raw HTTP response field retained for validation and policy lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalHeader {
+    /// Exact field name supplied by the transport.
+    pub name: String,
+    /// Exact field value after transport whitespace normalization.
+    pub value: String,
 }
 
 /// Injected external HTTP transport.
@@ -2473,6 +2814,7 @@ pub trait CommandRunner {
         program: &str,
         arguments: &[String],
         maximum_output_bytes: usize,
+        timeout: Duration,
     ) -> Result<CommandOutput, String>;
 }
 
@@ -2485,38 +2827,172 @@ impl CommandRunner for ProcessCommandRunner {
         program: &str,
         arguments: &[String],
         maximum_output_bytes: usize,
+        timeout: Duration,
     ) -> Result<CommandOutput, String> {
-        let mut child = Command::new(program)
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("cannot start {program}: {error}"))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("{program} stdout pipe is unavailable"))?;
-        let mut bytes = Vec::new();
-        stdout
-            .by_ref()
-            .take((maximum_output_bytes + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("cannot read {program} stdout: {error}"))?;
-        if bytes.len() > maximum_output_bytes {
-            let _kill_result = child.kill();
-            let _wait_result = child.wait();
+        if program != CURL_EXECUTABLE {
             return Err(format!(
-                "{program} stdout exceeds {maximum_output_bytes} bytes"
+                "production executable must be the fixed path {CURL_EXECUTABLE}"
             ));
         }
-        let status = child
-            .wait()
-            .map_err(|error| format!("cannot wait for {program}: {error}"))?;
-        Ok(CommandOutput {
-            success: status.success(),
-            status_code: status.code(),
-            stdout: bytes,
-        })
+        run_bounded_process(program, arguments, maximum_output_bytes, timeout)
+    }
+}
+
+fn run_bounded_process(
+    executable: &str,
+    arguments: &[String],
+    maximum_output_bytes: usize,
+    timeout: Duration,
+) -> Result<CommandOutput, String> {
+    run_bounded_process_with_environment(executable, arguments, maximum_output_bytes, timeout, &[])
+}
+
+fn run_bounded_process_with_environment(
+    executable: &str,
+    arguments: &[String],
+    maximum_output_bytes: usize,
+    timeout: Duration,
+    initial_environment: &[(&str, &str)],
+) -> Result<CommandOutput, String> {
+    if timeout.is_zero() {
+        return Err("process timeout must be positive".to_owned());
+    }
+    let mut child = Command::new(executable)
+        .args(arguments)
+        .envs(initial_environment.iter().copied())
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot start {executable}: {error}"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return Err(cleanup_process_error(
+                &mut child,
+                format!("{executable} stdout pipe is unavailable"),
+            ));
+        }
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = match thread::Builder::new()
+        .name("docs-parity-stdout".to_owned())
+        .spawn(move || {
+            let result = read_bounded_stdout(stdout, maximum_output_bytes);
+            let _send_result = sender.send(result);
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            return Err(cleanup_process_error(
+                &mut child,
+                format!("cannot start bounded stdout reader: {error}"),
+            ));
+        }
+    };
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        cleanup_process_error(&mut child, "process timeout overflowed".to_owned())
+    })?;
+    let mut status = None;
+    let mut output = None;
+    loop {
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) => output = Some(bytes),
+                Ok(Err(error)) => {
+                    let cleanup = cleanup_process_error(&mut child, error);
+                    let _reader_result = reader.join();
+                    return Err(cleanup);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    let cleanup = cleanup_process_error(
+                        &mut child,
+                        "bounded stdout reader disconnected".to_owned(),
+                    );
+                    let _reader_result = reader.join();
+                    return Err(cleanup);
+                }
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exited)) => status = Some(exited),
+                Ok(None) => {}
+                Err(error) => {
+                    let cleanup = cleanup_process_error(
+                        &mut child,
+                        format!("cannot inspect {executable} process: {error}"),
+                    );
+                    let _reader_result = reader.join();
+                    return Err(cleanup);
+                }
+            }
+        }
+        if let Some(status) = status
+            && let Some(stdout) = output.take()
+        {
+            reader
+                .join()
+                .map_err(|_panic| "bounded stdout reader panicked".to_owned())?;
+            return Ok(CommandOutput {
+                success: status.success(),
+                status_code: status.code(),
+                stdout,
+            });
+        }
+        if Instant::now() >= deadline {
+            let cleanup = cleanup_process_error(
+                &mut child,
+                format!("{executable} exceeded wall-clock timeout"),
+            );
+            let _reader_result = reader.join();
+            return Err(cleanup);
+        }
+        thread::sleep(
+            PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn read_bounded_stdout(
+    mut stdout: impl Read,
+    maximum_output_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let limit = maximum_output_bytes
+        .checked_add(1)
+        .ok_or_else(|| "stdout byte bound overflowed".to_owned())?;
+    let mut bytes = Vec::new();
+    stdout
+        .by_ref()
+        .take(limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read process stdout: {error}"))?;
+    if bytes.len() > maximum_output_bytes {
+        return Err(format!(
+            "process stdout exceeds {maximum_output_bytes} bytes"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn cleanup_process_error(child: &mut std::process::Child, error: String) -> String {
+    let cleanup = match child.try_wait() {
+        Ok(Some(_status)) => Ok(()),
+        Ok(None) => child.kill().and_then(|()| child.wait().map(|_status| ())),
+        Err(try_error) => child
+            .kill()
+            .and_then(|()| child.wait().map(|_status| ()))
+            .map_err(|cleanup_error| {
+                std::io::Error::other(format!(
+                    "try_wait failed: {try_error}; kill/wait failed: {cleanup_error}"
+                ))
+            }),
+    };
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; process cleanup failed: {cleanup_error}"),
     }
 }
 
@@ -2591,7 +3067,12 @@ impl<R: CommandRunner> ExternalTransport for CurlTransport<R> {
         arguments.extend(["--url".to_owned(), request.url.clone()]);
         let maximum_output =
             MAXIMUM_RESPONSE_HEADER_BYTES + request.maximum_body_bytes + CURL_TRAILER_BYTES;
-        let output = self.runner.run("curl", &arguments, maximum_output)?;
+        let output = self.runner.run(
+            CURL_EXECUTABLE,
+            &arguments,
+            maximum_output,
+            Duration::from_secs(request.timeout_seconds),
+        )?;
         if !output.success {
             return Err(format!(
                 "curl exited unsuccessfully with status {:?}",
@@ -2669,7 +3150,7 @@ fn parse_curl_output(bytes: &[u8], maximum_body_bytes: usize) -> Result<External
     })
 }
 
-fn parse_curl_headers(bytes: &[u8]) -> Result<(u16, BTreeMap<String, String>), String> {
+fn parse_curl_headers(bytes: &[u8]) -> Result<(u16, Vec<ExternalHeader>), String> {
     let text = core::str::from_utf8(bytes)
         .map_err(|_error| "curl response headers are not UTF-8".to_owned())?;
     let blocks = text
@@ -2678,13 +3159,21 @@ fn parse_curl_headers(bytes: &[u8]) -> Result<(u16, BTreeMap<String, String>), S
         .split("\r\n\r\n")
         .collect::<Vec<_>>();
     let mut final_response = None;
+    let mut total_fields = 0usize;
     for block in blocks {
-        final_response = Some(parse_curl_header_block(block)?);
+        let response = parse_curl_header_block(block)?;
+        total_fields = total_fields
+            .checked_add(response.1.len())
+            .ok_or_else(|| "curl response header count overflowed".to_owned())?;
+        if total_fields > MAXIMUM_RESPONSE_HEADERS {
+            return Err("curl response has too many headers".to_owned());
+        }
+        final_response = Some(response);
     }
     final_response.ok_or_else(|| "curl response has no HTTP header block".to_owned())
 }
 
-fn parse_curl_header_block(block: &str) -> Result<(u16, BTreeMap<String, String>), String> {
+fn parse_curl_header_block(block: &str) -> Result<(u16, Vec<ExternalHeader>), String> {
     let mut lines = block.split("\r\n");
     let status_line = lines
         .next()
@@ -2702,7 +3191,8 @@ fn parse_curl_header_block(block: &str) -> Result<(u16, BTreeMap<String, String>
     if !protocol.starts_with("HTTP/") || status_text.len() != 3 || !(100..=599).contains(&status) {
         return Err("curl status line is malformed".to_owned());
     }
-    let mut headers = BTreeMap::new();
+    let mut headers = Vec::new();
+    let mut singleton_fields = BTreeSet::new();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -2721,10 +3211,13 @@ fn parse_curl_header_block(block: &str) -> Result<(u16, BTreeMap<String, String>
         if value.len() > MAXIMUM_HEADER_VALUE_BYTES || value.chars().any(char::is_control) {
             return Err("curl header value exceeds bounds".to_owned());
         }
-        let value = value.to_owned();
-        if headers.insert(name.clone(), value).is_some() {
+        if singleton_header_name(&name) && !singleton_fields.insert(name.clone()) {
             return Err(format!("duplicate curl response header: {name}"));
         }
+        headers.push(ExternalHeader {
+            name,
+            value: value.to_owned(),
+        });
         if headers.len() > MAXIMUM_RESPONSE_HEADERS {
             return Err("curl response has too many headers".to_owned());
         }
@@ -2850,8 +3343,7 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
             }
             let local_delay = if retry_attempts == 1 { 1 } else { 2 };
             let delay = response
-                .headers
-                .get("retry-after")
+                .header("retry-after")
                 .and_then(|value| retry_after_seconds(value, now_seconds))
                 .filter(|delay| *delay <= 30)
                 .unwrap_or(local_delay);
@@ -2865,7 +3357,7 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
                     "redirect depth exceeds {MAXIMUM_REDIRECTS}"
                 )));
             }
-            let location = response.headers.get("location").ok_or_else(|| {
+            let location = response.header("location").ok_or_else(|| {
                 external_error(format!("redirect {canonical} has no Location header"))
             })?;
             let next = current.join(location).map_err(|_error| {
@@ -2930,16 +3422,19 @@ fn validate_response_headers(
     let total = response
         .headers
         .iter()
-        .map(|(name, value)| name.len() + value.len() + 4)
+        .map(|field| field.name.len() + field.value.len() + 4)
         .sum::<usize>();
+    let mut singleton_fields = BTreeSet::new();
     if response.header_bytes > MAXIMUM_RESPONSE_HEADER_BYTES
         || total > MAXIMUM_RESPONSE_HEADER_BYTES
-        || response.headers.iter().any(|(name, value)| {
-            name.len() > MAXIMUM_HEADER_NAME_BYTES
-                || value.len() > MAXIMUM_HEADER_VALUE_BYTES
-                || name.len() + value.len() + 4 > MAXIMUM_HEADER_LINE_BYTES
-                || !valid_header_name(name)
-                || value.chars().any(char::is_control)
+        || response.headers.iter().any(|field| {
+            field.name.len() > MAXIMUM_HEADER_NAME_BYTES
+                || field.value.len() > MAXIMUM_HEADER_VALUE_BYTES
+                || field.name.len() + field.value.len() + 4 > MAXIMUM_HEADER_LINE_BYTES
+                || !valid_header_name(&field.name)
+                || field.value.chars().any(char::is_control)
+                || (singleton_header_name(&field.name.to_ascii_lowercase())
+                    && !singleton_fields.insert(field.name.to_ascii_lowercase()))
         })
     {
         return Err(external_error("response headers exceed bounds"));
@@ -2948,6 +3443,22 @@ fn validate_response_headers(
         return Err(external_error("response body exceeds bound"));
     }
     Ok(())
+}
+
+impl ExternalResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|field| field.name.eq_ignore_ascii_case(name))
+            .map(|field| field.value.as_str())
+    }
+}
+
+fn singleton_header_name(name: &str) -> bool {
+    matches!(
+        name,
+        "location" | "retry-after" | "content-length" | "transfer-encoding" | "content-encoding"
+    )
 }
 
 fn valid_header_name(name: &str) -> bool {
@@ -3121,4 +3632,102 @@ fn external_error(detail: impl Into<String>) -> Report<MarkdownError> {
     Report::new(MarkdownError::ExternalLink {
         detail: detail.into(),
     })
+}
+
+#[cfg(test)]
+mod process_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+
+    use super::*;
+
+    #[test]
+    fn bounded_process_clears_path_proxy_and_curl_environment_to_the_fixed_locale() {
+        let output = run_bounded_process_with_environment(
+            "/usr/bin/env",
+            &[],
+            4096,
+            Duration::from_secs(1),
+            &[
+                ("PATH", "/tmp/substituted-curl"),
+                ("HTTPS_PROXY", "https://proxy.example.invalid"),
+                ("ALL_PROXY", "https://proxy.example.invalid"),
+                ("CURL_HOME", "/tmp/poisoned-curl-home"),
+                ("SSL_CERT_FILE", "/tmp/poisoned-certificates"),
+            ],
+        )
+        .expect("should execute environment fixture");
+        let environment =
+            String::from_utf8(output.stdout).expect("should return UTF-8 environment");
+        let variables = environment.lines().collect::<BTreeSet<_>>();
+
+        assert_eq!(variables, BTreeSet::from(["LANG=C", "LC_ALL=C"]));
+    }
+
+    #[test]
+    fn bounded_process_times_out_kills_and_reaps_a_silent_child() {
+        let fixture = process_fixture("exec /bin/sleep 60\n");
+        let pid_path = fixture.path().join("pid");
+
+        let error = run_bounded_process(
+            fixture
+                .path()
+                .join("process.sh")
+                .to_str()
+                .expect("should have UTF-8 fixture path"),
+            &[pid_path.display().to_string()],
+            32,
+            Duration::from_millis(500),
+        )
+        .expect_err("silent child should time out");
+
+        assert!(error.contains("wall-clock timeout"));
+        assert_reaped(&pid_path);
+    }
+
+    #[test]
+    fn bounded_process_overflow_kills_and_reaps_the_child() {
+        let fixture = process_fixture("exec /usr/bin/yes x\n");
+        let pid_path = fixture.path().join("pid");
+
+        let error = run_bounded_process(
+            fixture
+                .path()
+                .join("process.sh")
+                .to_str()
+                .expect("should have UTF-8 fixture path"),
+            &[pid_path.display().to_string()],
+            32,
+            Duration::from_secs(1),
+        )
+        .expect_err("overflowing child should be terminated");
+
+        assert!(error.contains("stdout exceeds 32 bytes"));
+        assert_reaped(&pid_path);
+    }
+
+    fn process_fixture(command: &str) -> tempfile::TempDir {
+        let fixture = tempfile::tempdir().expect("should create process fixture");
+        let executable = fixture.path().join("process.sh");
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\n{command}"),
+        )
+        .expect("should write process fixture");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("should make process fixture executable");
+        fixture
+    }
+
+    fn assert_reaped(pid_path: &Path) {
+        let pid = fs::read_to_string(pid_path).expect("should read child PID");
+        let status = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("should inspect child process");
+        assert!(!status.success(), "child process should be reaped");
+    }
 }

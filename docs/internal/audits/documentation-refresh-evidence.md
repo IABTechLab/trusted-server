@@ -2539,14 +2539,52 @@ PY
   runner, observes one emitted header copy, normalizes the file-protocol status
   for the HTTP parser, and verifies the byte-count trailer and
   `parse_curl_output` path without network access.
+- The quality re-review began with 42 passing and five failing link fixtures
+  plus nine passing and two failing generated-Markdown fixtures. Public YAML
+  frontmatter links were absent from both local and external inventories;
+  legal repeated response fields were rejected; the production runner accepted
+  a PATH-resolved executable; diagram fingerprints were not part of the
+  schema; stale stages remained; and atomic replacement changed a `0644`
+  target to `0600`. Each failure was observed before its implementation.
+- Public pages now parse only an exact, closed YAML frontmatter block bounded
+  to 64 KiB. Known hero image/action and feature link/icon-src shapes are type
+  checked, while non-link prose is ignored. Their targets enter the same local
+  and external link model as CommonMark events. Public root assets resolve
+  through a literal configured `publicDir` or the checked `docs/public`
+  default, with single percent decoding, normalized containment, tracked-file
+  membership, and regular non-symlink identity. The real `docs/index.md`
+  contributes three checked targets: its hero image, Get Started route, and
+  external project action.
+- Atomic writers now receive the expected original bytes, preserve the
+  original safe mode, fsync the staged file and parent directory, and compare
+  target contents, type, device, inode, and mode immediately before rename.
+  Focused fixtures prove rejection without overwrite for same-inode content
+  edits, same-byte inode replacement, concurrent creation, injected
+  interruption, and rename failure; each failed newly created stage is
+  removed. The pre-existing stale-stage fixture now also proves cleanup.
+- Response fields remain in wire order rather than being collapsed into a
+  map. All proxy CONNECT and informational blocks are parsed and bounded, and
+  only the final response drives redirects/retries. Legal repeated Set-Cookie,
+  Link, and Warning fields pass; duplicate Location, Retry-After,
+  Content-Length, transfer-encoding, and content-encoding fields fail in both
+  parsed and injected responses. The production runner requires
+  `/usr/bin/curl`, clears PATH/proxy/TLS/curl variables to a fixed C locale,
+  reads stdout concurrently under the request timeout, discards stderr, and
+  kills and reaps on overflow or timeout. Local process fixtures prove silent
+  timeout, overflow cleanup, environment isolation, PATH rejection, and child
+  reaping without network access.
+- All 13 real Mermaid records now bind an exact SHA-256 of semantic fence
+  content in addition to path, selector, prose heading, and owner. Content
+  edits and content swaps between selector positions fail with a fingerprint
+  mismatch.
 - Task 6's Files list and staging command were reconciled against the sorted
   union of `git diff --name-only BASE..HEAD` (with `BASE` equal to
   `53a5a9e1d42d4dc78e4583d1b5d40ebdcc9c242a`) and the final framing worktree
-  diff. The resulting 17-path set is exact: it adds the changed
-  classification implementation and removes unchanged main, model, and
-  repository implementation files. A direct planned-versus-actual diff exited
-  0. The generated-region RED step now correctly requires the second update to
-  produce no diff.
+  diff. The resulting 19-path set is exact: it adds the changed
+  classification, repository, and scanner implementations and removes
+  unchanged main and model implementation files. A direct
+  planned-versus-actual diff exited 0. The generated-region RED step now
+  correctly requires the second update to produce no diff.
 - Generated-region fixtures cover duplicate, missing, mismatched, nested,
   unknown, and non-standalone markers; unknown records; duplicate row keys;
   wrong cell counts; deterministic row sorting; hand drift; exact CRLF and
@@ -2554,7 +2592,7 @@ PY
   same-directory stale-stage interruption; symlink, unsafe-mode, traversal,
   and oversized-target rejection; and byte-identical second update. Input
   manifests, source documents, and rendered output are each bounded to 4 MiB.
-  The final focused Markdown target contains 10 passing tests.
+  The final focused Markdown target contains 11 passing tests.
 - Semantic Markdown fixtures use event offsets and cover one dead relative link
   in each active source set; multiline inline/reference/HTML destinations;
   uppercase and non-anchor HTML tags; `href`, `id`, and `name`; autolinks and
@@ -2582,7 +2620,8 @@ PY
   `docs/guide/integrations/google_tag_manager.md`, owned by
   `documentation-maintainers` and expiring 2027-03-01. `diagrams.toml` is exact
   for 13 public Mermaid blocks; every record names an existing prose heading
-  anchor and owner. Page records are explicitly typed as live or tombstone;
+  anchor and owner and binds the exact semantic fence-content fingerprint.
+  Page records are explicitly typed as live or tombstone;
   the page and orphan tombstone `(route, replacement)` sets must be equal,
   tombstone routes cannot collide with live routes, and replacements must name
   live routes. Manual-orphan equality is checked separately. The real inventory
@@ -2596,10 +2635,11 @@ PY
   exhaustion, exact owned/reasoned expiry at the boundary, final non-success,
   relative redirects, exact non-redirecting HTTPS-only curl arguments,
   with `--disable` as the first argument, malformed command output/status,
-  bounded headers and bodies, nonempty RFC field-name tokens, header
-  count/name/value/line/total limits, and production stdout termination on
-  overflow. The injected and production transports share the header validator
-  and enter the same redirect/retry/final-status state machine. HEAD and GET
+  bounded headers and bodies, nonempty RFC field-name tokens, raw repeated
+  header count/name/value/line/total limits, proxy and informational response
+  blocks, and production stdout termination/reaping on overflow and timeout.
+  The injected and production transports share the header validator and enter
+  the same redirect/retry/final-status state machine. HEAD and GET
   use method-specific output framing so headers are emitted exactly once;
   parsed HEAD 405 and 501 responses enter the normal GET fallback. IMF-fixdate
   parsing requires the
@@ -2607,22 +2647,24 @@ PY
   transport is reachable only through explicit
   `links --external --check`; no external network check was run or represented
   as a pull-request gate.
-- The final focused links target contains 40 passing tests. A fresh standalone
-  full suite contained 177 passing tests: 2 library unit, 35 classification,
-  19 CLI, 40 links, 10 Markdown, and 71 scanner tests. Fresh local
+- The final focused links target contains 52 passing tests. A fresh standalone
+  full suite contained 198 passing tests: 10 library unit, 35 classification,
+  19 CLI, 52 links, 11 Markdown, and 71 scanner tests. Fresh local
   `links --local --check`, `generate --check`, `classify --check`, and
   `scan --check` commands exited 0. Formatting and all-target clippy with
   warnings denied also exited 0.
 - Only the standalone dependency graph changed. Direct dependencies add the
-  CommonMark event parser, HTML fragment parser, GitHub slugger, and Unicode
-  normalization support; their resolved graph adds 45 packages to
+  CommonMark event parser, HTML fragment parser, GitHub slugger, Unicode
+  normalization support, and bounded YAML frontmatter parser; their resolved
+  graph adds 48 packages to
   `tools/docs-parity/Cargo.lock`, whose SHA-256 is
-  `9c071a95ca2abeff79d198296b698ae19b85e27c794d63184e748b01f6a309c0`.
+  `04d0d834183d87740af87bbfb74aaae2c19bbf362cc98b0f18d872ee84b7d303`.
   Root `Cargo.lock`
   remained byte-identical with SHA-256
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
-- The reviewed sensitive inventory contains 5,388 exact occurrences, 45 more
-  than the pre-review Task 6 inventory. All 45 additions are the exact registry
+- The reviewed sensitive inventory contains 5,391 exact
+  occurrences, 48 more than the pre-review Task 6
+  inventory. The additions are the exact registry
   host in source fields introduced by the standalone parser dependency graph;
   every one is classed `vendor_url`. Five unchanged vendor references in the
   corrected public page moved back one byte, and pre-existing standalone-lock
@@ -2632,7 +2674,7 @@ PY
   Two classification updates retained identical tracked/source hashes
   (`9d907be9...` and `d30a510e...`), and repeated scanner bootstraps retained
   sensitive-manifest SHA-256
-  `1aa5de36eb9457be69873d1a060a18f2926b5241482d4638cbee752b2c7e6e08`
+  `265ae6ec59a26220134bdaa1e8e7a1b8bc8d109ac663bb2cb7283a4a5349e414`
   with `reviewed = true`. Two generated updates were byte-stable; subsequent
   generated, scanner, classification, and local-link check commands all
   exited 0.

@@ -88,13 +88,20 @@ returns exit code `1` when a named Markdown region differs. Check mode performs
 no writes. `generate --update` validates every target first, then atomically
 replaces only drifted region bodies; exact bytes outside the paired markers are
 preserved. Region names, rows, ownership markers, paths, file modes, sizes, and
-marker placement all fail closed. A second update is byte-identical.
+marker placement all fail closed. Atomic replacement preserves the original
+safe mode, fsyncs the staged file and parent directory, and compares the
+expected bytes, file identity, type, and mode immediately before rename. A
+concurrent edit or replacement aborts without overwriting it, and failed stages
+are removed. A second update is byte-identical.
 
 `links --local --check` parses CommonMark events with source offsets over all
 maintained public, internal, and repository source sets. It checks relative
 files, images, references, autolinks, HTML `href`/`id`/`name` attributes,
 VitePress routes, queries, strict single-pass path/query/fragment percent
-decoding, and anchors.
+decoding, and anchors. Public-page YAML frontmatter is bounded to 64 KiB and
+checked for typed hero image/action and feature link/icon targets. Root assets
+resolve only through the configured literal `publicDir` or VitePress's
+`docs/public` default and must be regular, non-symlink repository files.
 Public headings use the VitePress 1.6.4 `@mdit-vue/shared` slug contract;
 their title extraction ignores image alt text, and colliding explicit IDs fail
 instead of receiving an automatic suffix. Repository and maintained-internal
@@ -103,23 +110,32 @@ create destinations. The check also rejects links to excluded
 sources, validates the exact live-page and typed-tombstone inventories against
 navigation and orphan records, proves live-page reachability, and requires an
 owned prose heading for every exact semantic Mermaid fence. All three
-publication manifests and every Markdown input are bounded to 4 MiB. The
+publication manifests and every Markdown input are bounded to 4 MiB. Each
+diagram record binds its path, selector, prose anchor, owner, and exact semantic
+fence-content SHA-256, so edits or order swaps require renewed review. The
 command is offline and is suitable for pull-request validation.
 
 `links --external --check` is the only command that performs network I/O. It is
 reserved for scheduled or explicit manual execution. Requests require HTTPS,
 reject URL credentials, follow at most five redirects, use HEAD with GET only
 for unsupported HEAD responses, and make at most three attempts for 429/5xx.
-The production curl process starts with `--disable`, so ambient curl
-configuration cannot change its behavior, and cannot follow redirects itself;
-the shared checker validates each relative or absolute redirect before issuing
-the next request.
+The production curl process uses the fixed `/usr/bin/curl` executable and
+starts with `--disable`, so `PATH`, proxy, TLS, curl-home, and ambient curl
+configuration cannot change its behavior. Its environment is cleared except
+for a deterministic C locale, and curl cannot follow redirects itself; the
+shared checker validates each relative or absolute redirect before issuing the
+next request.
 Transport arguments allow only credential-free HTTPS and HEAD/GET with bounded
 connect and total time. GET writes headers once through `--dump-header`; HEAD
 omits that option because `--head --output -` already writes its header block.
-Stdout is bounded while read, then independently validated for status, header
-count, header line/name/value/total bytes, and body bytes. Exact exceptions
-require an owner, reason, and unexpired timestamp.
+Stdout is read concurrently under the same wall-clock bound as the request,
+then independently validated for status, raw header count,
+line/name/value/total bytes, and body bytes. Every intermediate proxy or 1xx
+HTTP block is validated and only the final response drives policy. Legal
+repeated fields remain distinct; duplicate Location, Retry-After,
+Content-Length, transfer-encoding, and content-encoding fields fail closed.
+Overflow, timeout, read, and wait failures terminate and reap the child. Exact
+exceptions require an owner, reason, and unexpired timestamp.
 
 ## Repository boundary
 

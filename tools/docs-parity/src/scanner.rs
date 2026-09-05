@@ -2080,8 +2080,11 @@ where
     }
     let normalized =
         NormalizedRelativePath::new(Path::new(path)).change_context(ScannerError::Bootstrap)?;
+    let original = repository
+        .read_optional(&normalized)
+        .change_context(ScannerError::Bootstrap)?;
     repository
-        .write_atomically(&normalized, &contents)
+        .write_atomically(&normalized, original.as_deref(), &contents)
         .change_context(ScannerError::Bootstrap)
 }
 

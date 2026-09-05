@@ -341,6 +341,8 @@ git commit -m "Enforce documentation source classification"
 - Modify: `tools/docs-parity/src/classification.rs`
 - Modify: `tools/docs-parity/src/lib.rs`
 - Create: `tools/docs-parity/src/markdown.rs`
+- Modify for atomic compare-and-swap: `tools/docs-parity/src/repository.rs`
+- Modify for atomic manifest writes: `tools/docs-parity/src/scanner.rs`
 - Create/Test: `tools/docs-parity/tests/links.rs`
 - Create/Test: `tools/docs-parity/tests/markdown.rs`
 
@@ -348,15 +350,24 @@ git commit -m "Enforce documentation source classification"
 
 Cover duplicate/missing markers, unknown record names, hand-edited output,
 unstable ordering, update mode changing bytes outside markers, interrupted
-writes, and a second update producing no diff.
+writes and renames, concurrent content/identity replacement, safe-mode
+preservation, stage cleanup, and a second update producing no diff.
 
 - [ ] **Step 2: Implement deterministic region updates**
 
-Require named start/end markers, render from typed records, update atomically, and make `generate --check` fail on any byte drift. Manual endpoint prose must carry ownership markers that are separately checked.
+Require named start/end markers, render from typed records, update with an
+expected-byte and file-identity compare-and-swap, and make `generate --check`
+fail on any byte drift. Preserve safe modes, fsync the staged file and parent,
+clean failed stages, and never overwrite a concurrent edit. Manual endpoint
+prose must carry ownership markers that are separately checked.
 
 - [ ] **Step 3: Write set-specific Markdown tests**
 
-Add one dead-link fixture for each active set; include missing relative files, missing anchors, duplicate headings, percent-encoded fragments, tombstone routes, an unlisted orphan, and a built page that links to an excluded source.
+Add one dead-link fixture for each active set; include missing relative files,
+missing anchors, duplicate headings, percent-encoded fragments, tombstone
+routes, an unlisted orphan, a built page that links to an excluded source, and
+bounded typed VitePress frontmatter with hero/action/feature targets and
+configured/default public-asset resolution.
 
 - [ ] **Step 4: Implement local and external link contracts**
 
@@ -368,10 +379,18 @@ seconds; otherwise use the bounded local delay. Exact-URL exceptions require
 owner/reason/expiry. Add fixtures for allowlisted URL, expiry, redirect loop,
 redirect-depth overflow, malformed/oversized `Retry-After`, retry exhaustion,
 and credentials accidentally embedded in a URL.
+The production runner uses fixed `/usr/bin/curl`, clears ambient environment,
+bounds stdout concurrently under the request timeout, terminates and reaps on
+every post-spawn failure, retains legal repeated response fields, rejects
+duplicate policy/security singletons, validates every proxy/1xx header block,
+and selects only the final response for policy.
 
 - [ ] **Step 5: Check page/nav/orphan/diagram records**
 
-Make `pages.toml` the intended VitePress publication/nav inventory, `orphans.toml` carry only typed tombstone/manual exceptions, and `diagrams.toml` require a prose equivalent plus owner for every diagram.
+Make `pages.toml` the intended VitePress publication/nav inventory,
+`orphans.toml` carry only typed tombstone/manual exceptions, and
+`diagrams.toml` require a prose equivalent, owner, and exact semantic-content
+SHA-256 for every diagram. Content edits and selector-order swaps reopen review.
 
 - [ ] **Step 6: Verify**
 
@@ -401,8 +420,8 @@ checks remain scheduled/manual, not a required per-PR network gate.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add docs/guide/error-reference.md docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/Cargo.lock tools/docs-parity/Cargo.toml tools/docs-parity/README.md tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/classification.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/tests/links.rs tools/docs-parity/tests/markdown.rs
-git commit -m "Correct documentation link transport framing"
+git add docs/guide/error-reference.md docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/Cargo.lock tools/docs-parity/Cargo.toml tools/docs-parity/README.md tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/classification.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/src/repository.rs tools/docs-parity/src/scanner.rs tools/docs-parity/tests/links.rs tools/docs-parity/tests/markdown.rs
+git commit -m "Harden documentation update and link execution"
 ```
 
 ### Task 7: Extract settings semantics and execute the example harness

@@ -1,14 +1,16 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use docs_parity::markdown::{
-    CommandOutput, CommandRunner, CurlTransport, ExternalException, ExternalRequest,
-    ExternalResponse, ExternalTransport, LinkSource, LinkSourceSet, ProcessCommandRunner, Sleeper,
-    check_external_links, check_local_links,
+    CommandOutput, CommandRunner, CurlTransport, ExternalException, ExternalHeader,
+    ExternalRequest, ExternalResponse, ExternalTransport, LinkSource, LinkSourceSet,
+    ProcessCommandRunner, Sleeper, check_external_links, check_local_links,
 };
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 const SUCCESS: i32 = 0;
@@ -28,7 +30,16 @@ impl PublicationRepository {
                 "docs/.vitepress/config.mts",
                 "export default { srcExclude: ['internal/**', 'private.md'], themeConfig: { nav: [{ link: '/' }] } }\n",
             ),
-            ("docs/index.md", "# Home\n[guide](/guide/)\n"),
+            (
+                "docs/index.md",
+                concat!(
+                    "---\nlayout: home\nhero:\n  image:\n",
+                    "    src: /images/hero.jpeg\n",
+                    "  actions:\n    - text: Guide\n      link: /guide/\n",
+                    "---\n# Home\n[guide](/guide/)\n",
+                ),
+            ),
+            ("docs/public/images/hero.jpeg", "binary hero fixture"),
             ("docs/private.md", "# Private\n"),
             (
                 "docs/guide/index.md",
@@ -54,6 +65,7 @@ impl PublicationRepository {
                 concat!(
                     "version = 1\nreviewed = true\n\n",
                     "[[diagrams]]\npath = \"docs/guide/index.md\"\nselector = \"mermaid:1\"\n",
+                    "fingerprint = \"sha256:228e1f41f3c2674cf342c6df608dd87f63c034682c6575017585c9eec08ceb37\"\n",
                     "prose_anchor = \"flow\"\nowner = \"docs-team\"\n",
                 ),
             ),
@@ -72,6 +84,7 @@ impl PublicationRepository {
             "docs/index.md",
             "docs/internal/note.md",
             "docs/private.md",
+            "docs/public/images/hero.jpeg",
             "notes/included.md",
             "static/logo.png",
             "tools/docs-parity/manifests/diagrams.toml",
@@ -85,13 +98,13 @@ impl PublicationRepository {
         for path in all_paths {
             tracked.push_str(&format!(
                 "\n[[files]]\npath = \"{path}\"\nkind = \"{}\"\n",
-                if path.ends_with(".png") {
+                if path.ends_with(".png") || path.ends_with(".jpeg") {
                     "binary"
                 } else {
                     "text"
                 }
             ));
-            if path.ends_with(".png") {
+            if path.ends_with(".png") || path.ends_with(".jpeg") {
                 continue;
             }
             let include = path.ends_with(".md") && path != "docs/private.md";
@@ -160,6 +173,10 @@ fn diagnostic(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("diagnostic should be UTF-8")
 }
 
+fn fingerprint(contents: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(contents))
+}
+
 fn source(path: &str, set: LinkSourceSet, markdown: &str) -> LinkSource {
     LinkSource {
         path: path.to_owned(),
@@ -201,6 +218,163 @@ fn semantic_image_destinations_are_checked() {
     )];
 
     assert!(local_error(&sources).contains("missing.png"));
+}
+
+#[test]
+fn public_frontmatter_missing_hero_asset_uses_the_link_checker() {
+    let repository = PublicationRepository::new();
+    let index = repository.path().join("docs/index.md");
+    fs::write(
+        &index,
+        concat!(
+            "---\n",
+            "layout: home\n",
+            "hero:\n",
+            "  image:\n",
+            "    src: /images/missing-hero.jpeg\n",
+            "  actions:\n",
+            "    - text: Guide\n",
+            "      link: /guide/\n",
+            "---\n",
+            "# Home\n[guide](/guide/)\n",
+        ),
+    )
+    .expect("should write real-shaped frontmatter");
+
+    let result = repository.check();
+
+    assert_eq!(status_code(&result), ERROR);
+    let error = diagnostic(&result);
+    assert!(error.contains("missing-hero.jpeg"));
+}
+
+#[test]
+fn public_frontmatter_broken_internal_action_uses_the_link_checker() {
+    let repository = PublicationRepository::new();
+    let index = repository.path().join("docs/index.md");
+    let markdown = fs::read_to_string(&index).expect("should read home fixture");
+    fs::write(
+        &index,
+        markdown.replace("link: /guide/", "link: /missing-action"),
+    )
+    .expect("should break frontmatter action");
+
+    let result = repository.check();
+
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("missing-action"));
+}
+
+#[test]
+fn public_frontmatter_external_actions_are_in_external_inventory() {
+    let sources = [source(
+        "docs/index.md",
+        LinkSourceSet::Public,
+        concat!(
+            "---\nhero:\n  actions:\n    - text: Project\n",
+            "      link: https://docs.example.invalid/project\n---\n# Home\n",
+        ),
+    )];
+    let mut transport = FakeTransport {
+        responses: vec![response(200, None, None)].into(),
+        requests: Vec::new(),
+    };
+    let mut sleeper = FakeSleeper::default();
+
+    check_external_links(&sources, &[], 0, &mut transport, &mut sleeper)
+        .expect("frontmatter external action should be checked");
+
+    assert_eq!(transport.requests.len(), 1);
+    assert_eq!(
+        transport.requests[0].url,
+        "https://docs.example.invalid/project"
+    );
+}
+
+#[test]
+fn public_frontmatter_is_bounded_typed_closed_and_strictly_decoded() {
+    let cases = [
+        "---\nhero:\n  image:\n    src: /../secret.png\n---\n# Home\n".to_owned(),
+        "---\nhero:\n  image:\n    src: /images/%252e%252e/secret.png\n---\n# Home\n".to_owned(),
+        "---\nhero:\n  image:\n    src: [wrong]\n---\n# Home\n".to_owned(),
+        "---\nhero:\n  actions:\n    - text: Wrong\n      link: 42\n---\n# Home\n".to_owned(),
+        "---\nfeatures:\n  - title: Wrong\n    link: [wrong]\n---\n# Home\n".to_owned(),
+        "---\nfeatures:\n  - title: Wrong\n    icon:\n      src: 42\n---\n# Home\n".to_owned(),
+        "---\nhero:\n  image:\n    src: /images/hero.png\n# Home\n".to_owned(),
+        format!("---\nsummary: {}\n---\n# Home\n", "x".repeat(64 * 1024)),
+    ];
+    for markdown in cases {
+        let repository = PublicationRepository::new();
+        fs::write(repository.path().join("docs/index.md"), markdown)
+            .expect("should write invalid frontmatter");
+
+        let result = repository.check();
+
+        assert_eq!(status_code(&result), ERROR, "frontmatter must fail closed");
+        assert!(
+            !diagnostic(&result).contains("orphan inventory"),
+            "frontmatter must fail before unrelated reachability: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn public_frontmatter_assets_reject_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let repository = PublicationRepository::new();
+    let asset = repository.path().join("docs/public/images/hero.jpeg");
+    fs::remove_file(&asset).expect("should remove regular hero asset");
+    symlink("../../index.md", &asset).expect("should replace hero with internal symlink");
+
+    let result = repository.check();
+
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("hero.jpeg"));
+}
+
+#[test]
+fn public_frontmatter_assets_honor_a_literal_configured_public_directory() {
+    let repository = PublicationRepository::new();
+    let old_asset = repository.path().join("docs/public/images/hero.jpeg");
+    let new_asset = repository.path().join("docs/assets/images/hero.jpeg");
+    fs::create_dir_all(new_asset.parent().expect("asset should have parent"))
+        .expect("should create configured public directory");
+    fs::rename(&old_asset, &new_asset).expect("should move public asset");
+    let config_path = repository.path().join("docs/.vitepress/config.mts");
+    let config = fs::read_to_string(&config_path).expect("should read config");
+    fs::write(
+        &config_path,
+        config.replace("export default {", "export default { publicDir: 'assets',"),
+    )
+    .expect("should configure public directory");
+    for manifest in [
+        "tools/docs-parity/manifests/tracked-files.toml",
+        "tools/docs-parity/manifests/maintained-sources.toml",
+    ] {
+        let path = repository.path().join(manifest);
+        let contents = fs::read_to_string(&path).expect("should read classification manifest");
+        fs::write(
+            path,
+            contents.replace(
+                "docs/public/images/hero.jpeg",
+                "docs/assets/images/hero.jpeg",
+            ),
+        )
+        .expect("should update classification manifest");
+    }
+    run_git(repository.path(), &["add", "--all"]);
+
+    let result = repository.check();
+
+    assert_eq!(
+        status_code(&result),
+        SUCCESS,
+        "configured public directory should pass: {}",
+        diagnostic(&result)
+    );
 }
 
 #[test]
@@ -598,12 +772,12 @@ impl Sleeper for FakeSleeper {
 }
 
 fn response(status: u16, location: Option<&str>, retry_after: Option<&str>) -> ExternalResponse {
-    let mut headers = BTreeMap::new();
+    let mut headers = Vec::new();
     if let Some(location) = location {
-        headers.insert("location".to_owned(), location.to_owned());
+        headers.push(header("location", location));
     }
     if let Some(retry_after) = retry_after {
-        headers.insert("retry-after".to_owned(), retry_after.to_owned());
+        headers.push(header("retry-after", retry_after));
     }
     ExternalResponse {
         status,
@@ -613,10 +787,17 @@ fn response(status: u16, location: Option<&str>, retry_after: Option<&str>) -> E
     }
 }
 
+fn header(name: &str, value: &str) -> ExternalHeader {
+    ExternalHeader {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    }
+}
+
 #[derive(Default)]
 struct FakeCommandRunner {
     outputs: VecDeque<Result<CommandOutput, String>>,
-    invocations: Vec<(String, Vec<String>, usize)>,
+    invocations: Vec<(String, Vec<String>, usize, Duration)>,
 }
 
 struct FileHeadCommandRunner {
@@ -630,8 +811,9 @@ impl CommandRunner for FileHeadCommandRunner {
         program: &str,
         arguments: &[String],
         maximum_output_bytes: usize,
+        timeout: Duration,
     ) -> Result<CommandOutput, String> {
-        if program != "curl"
+        if program != "/usr/bin/curl"
             || arguments.first().map(String::as_str) != Some("--disable")
             || arguments.iter().any(|argument| argument == "--dump-header")
             || !arguments.iter().any(|argument| argument == "--head")
@@ -653,7 +835,7 @@ impl CommandRunner for FileHeadCommandRunner {
         local[url_index + 1] = self.file_url.clone();
 
         let mut runner = ProcessCommandRunner;
-        let actual = runner.run("curl", &local, maximum_output_bytes)?;
+        let actual = runner.run(program, &local, maximum_output_bytes, timeout)?;
         let marker = b"\nDOCS_PARITY_COUNTS:";
         let marker_start = actual
             .stdout
@@ -690,9 +872,14 @@ impl CommandRunner for FakeCommandRunner {
         program: &str,
         arguments: &[String],
         maximum_output_bytes: usize,
+        timeout: Duration,
     ) -> Result<CommandOutput, String> {
-        self.invocations
-            .push((program.to_owned(), arguments.to_vec(), maximum_output_bytes));
+        self.invocations.push((
+            program.to_owned(),
+            arguments.to_vec(),
+            maximum_output_bytes,
+            timeout,
+        ));
         self.outputs
             .pop_front()
             .ok_or_else(|| "no scripted command output".to_owned())?
@@ -705,6 +892,27 @@ fn curl_output(status: &str, headers: &[(&str, &str)], body: &[u8]) -> CommandOu
         header.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
     header.extend_from_slice(b"\r\n");
+    let mut stdout = header.clone();
+    stdout.extend_from_slice(body);
+    stdout.extend_from_slice(
+        format!("\nDOCS_PARITY_COUNTS:{}:{}\n", header.len(), body.len()).as_bytes(),
+    );
+    CommandOutput {
+        success: true,
+        status_code: Some(0),
+        stdout,
+    }
+}
+
+fn curl_output_blocks(blocks: &[(&str, &[(&str, &str)])], body: &[u8]) -> CommandOutput {
+    let mut header = Vec::new();
+    for (status, headers) in blocks {
+        header.extend_from_slice(format!("HTTP/1.1 {status}\r\n").as_bytes());
+        for (name, value) in *headers {
+            header.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        header.extend_from_slice(b"\r\n");
+    }
     let mut stdout = header.clone();
     stdout.extend_from_slice(body);
     stdout.extend_from_slice(
@@ -939,8 +1147,8 @@ fn curl_transport_get_uses_exact_bounded_nonredirecting_arguments_and_counts_byt
     assert!(response.header_bytes > 0);
     assert_eq!(response.body_bytes, 4);
     assert_eq!(runner.invocations.len(), 1);
-    let (program, arguments, maximum_output_bytes) = &runner.invocations[0];
-    assert_eq!(program, "curl");
+    let (program, arguments, maximum_output_bytes, timeout) = &runner.invocations[0];
+    assert_eq!(program, "/usr/bin/curl");
     assert_eq!(
         arguments,
         &[
@@ -972,6 +1180,7 @@ fn curl_transport_get_uses_exact_bounded_nonredirecting_arguments_and_counts_byt
         ]
     );
     assert_eq!(*maximum_output_bytes, 64 * 1024 + 64 * 1024 + 128);
+    assert_eq!(*timeout, Duration::from_secs(15));
 }
 
 #[test]
@@ -1025,6 +1234,125 @@ fn curl_transport_head_emits_headers_exactly_once() {
             "https://docs.example.com/path",
         ]
     );
+}
+
+#[test]
+fn curl_transport_accepts_legal_repeated_headers_and_selects_the_final_http_block() {
+    let repeated = [
+        ("Set-Cookie", "first=1"),
+        ("Set-Cookie", "second=2"),
+        ("Link", "</one>; rel=preload"),
+        ("Link", "</two>; rel=preload"),
+        ("Warning", "199 example.invalid stale"),
+        ("Warning", "299 example.invalid transformed"),
+    ];
+    let runner = FakeCommandRunner {
+        outputs: vec![Ok(curl_output_blocks(
+            &[
+                ("200 Connection established", &[("Proxy-Agent", "fixture")]),
+                ("100 Continue", &[("X-Interim", "accepted")]),
+                ("204 No Content", &repeated),
+            ],
+            b"",
+        ))]
+        .into(),
+        invocations: Vec::new(),
+    };
+    let mut transport = CurlTransport::new(runner);
+
+    let response = transport
+        .send(&ExternalRequest {
+            method: "HEAD".to_owned(),
+            url: "https://docs.example.invalid/".to_owned(),
+            timeout_seconds: 15,
+            maximum_body_bytes: 64 * 1024,
+        })
+        .expect("legal repeats and intermediate blocks should parse");
+
+    assert_eq!(response.status, 204);
+}
+
+#[test]
+fn curl_transport_rejects_duplicate_security_headers_and_malformed_intermediate_blocks() {
+    for headers in [
+        [("Location", "/one"), ("Location", "/two")],
+        [("Retry-After", "1"), ("Retry-After", "2")],
+        [("Content-Length", "0"), ("Content-Length", "0")],
+    ] {
+        let runner = FakeCommandRunner {
+            outputs: vec![Ok(curl_output("200 OK", &headers, b""))].into(),
+            invocations: Vec::new(),
+        };
+        let mut transport = CurlTransport::new(runner);
+        assert!(
+            transport
+                .send(&ExternalRequest {
+                    method: "HEAD".to_owned(),
+                    url: "https://docs.example.invalid/".to_owned(),
+                    timeout_seconds: 15,
+                    maximum_body_bytes: 64 * 1024,
+                })
+                .is_err(),
+            "duplicate singleton must fail: {headers:?}"
+        );
+    }
+
+    let malformed = curl_output_blocks(
+        &[
+            ("100 Continue", &[("Bad Header", "value")]),
+            ("200 OK", &[]),
+        ],
+        b"",
+    );
+    let runner = FakeCommandRunner {
+        outputs: vec![Ok(malformed)].into(),
+        invocations: Vec::new(),
+    };
+    let mut transport = CurlTransport::new(runner);
+    assert!(
+        transport
+            .send(&ExternalRequest {
+                method: "HEAD".to_owned(),
+                url: "https://docs.example.invalid/".to_owned(),
+                timeout_seconds: 15,
+                maximum_body_bytes: 64 * 1024,
+            })
+            .is_err(),
+        "malformed intermediate headers must fail"
+    );
+}
+
+#[test]
+fn injected_responses_apply_the_same_repeated_header_policy() {
+    let source = "[site](https://docs.example.invalid/)\n";
+    let legal = ExternalResponse {
+        status: 200,
+        headers: vec![
+            header("Set-Cookie", "first=1"),
+            header("Set-Cookie", "second=2"),
+            header("Link", "</one>; rel=preload"),
+            header("Link", "</two>; rel=preload"),
+        ],
+        header_bytes: 128,
+        body_bytes: 0,
+    };
+    let sources = [self::source("README.md", LinkSourceSet::Repository, source)];
+    let mut transport = FakeTransport {
+        responses: vec![legal].into(),
+        requests: Vec::new(),
+    };
+    let mut sleeper = FakeSleeper::default();
+    check_external_links(&sources, &[], 0, &mut transport, &mut sleeper)
+        .expect("legal repeats should pass through an injected response");
+
+    let duplicate = ExternalResponse {
+        status: 200,
+        headers: vec![header("Content-Length", "0"), header("content-length", "0")],
+        header_bytes: 64,
+        body_bytes: 0,
+    };
+    let (error, _, _) = external_error(source, vec![duplicate]);
+    assert!(error.contains("header"));
 }
 
 #[test]
@@ -1157,16 +1485,33 @@ fn curl_transport_rejects_unsafe_requests_and_malformed_command_output() {
 #[test]
 fn production_command_runner_stops_reading_at_the_stdout_bound() {
     let mut runner = ProcessCommandRunner;
-    let arguments = [
-        "-c".to_owned(),
-        "while :; do printf 1234567890; done".to_owned(),
-    ];
 
     let error = runner
-        .run("sh", &arguments, 32)
-        .expect_err("unbounded stdout must be terminated");
+        .run(
+            "/usr/bin/curl",
+            &["--version".to_owned()],
+            32,
+            Duration::from_secs(1),
+        )
+        .expect_err("oversized stdout must be terminated");
 
     assert!(error.contains("stdout exceeds 32 bytes"));
+}
+
+#[test]
+fn production_command_runner_rejects_path_substitution() {
+    let mut runner = ProcessCommandRunner;
+
+    let error = runner
+        .run(
+            "curl",
+            &["--version".to_owned()],
+            4096,
+            Duration::from_secs(1),
+        )
+        .expect_err("production execution must require the fixed curl path");
+
+    assert!(error.contains("executable"));
 }
 
 #[test]
@@ -1210,7 +1555,7 @@ fn response_header_names_use_the_complete_nonempty_rfc_token_grammar() {
     let valid_name = "x!#$%&'*+-.^_`|~";
     let valid = ExternalResponse {
         status: 200,
-        headers: BTreeMap::from([(valid_name.to_owned(), "ok".to_owned())]),
+        headers: vec![header(valid_name, "ok")],
         header_bytes: 64,
         body_bytes: 0,
     };
@@ -1226,7 +1571,7 @@ fn response_header_names_use_the_complete_nonempty_rfc_token_grammar() {
     for name in ["", "bad name", "bad\u{0001}name", "tést"] {
         let response = ExternalResponse {
             status: 200,
-            headers: BTreeMap::from([(name.to_owned(), "ok".to_owned())]),
+            headers: vec![header(name, "ok")],
             header_bytes: 64,
             body_bytes: 0,
         };
@@ -1270,9 +1615,12 @@ fn external_response_header_and_body_bounds_fail_closed() {
     let source = "[site](https://docs.example.com/)\n";
     let mut cases = Vec::new();
 
-    let mut too_many = BTreeMap::new();
+    let mut too_many = Vec::new();
     for index in 0..129 {
-        too_many.insert(format!("x-{index}"), "ok".to_owned());
+        too_many.push(ExternalHeader {
+            name: format!("x-{index}"),
+            value: "ok".to_owned(),
+        });
     }
     cases.push(ExternalResponse {
         status: 200,
@@ -1282,37 +1630,46 @@ fn external_response_header_and_body_bounds_fail_closed() {
     });
     cases.push(ExternalResponse {
         status: 200,
-        headers: BTreeMap::from([("x".repeat(257), "ok".to_owned())]),
+        headers: vec![ExternalHeader {
+            name: "x".repeat(257),
+            value: "ok".to_owned(),
+        }],
         header_bytes: 1024,
         body_bytes: 0,
     });
     cases.push(ExternalResponse {
         status: 200,
-        headers: BTreeMap::from([("x-test".to_owned(), "x".repeat(8 * 1024 + 1))]),
+        headers: vec![ExternalHeader {
+            name: "x-test".to_owned(),
+            value: "x".repeat(8 * 1024 + 1),
+        }],
         header_bytes: 16 * 1024,
         body_bytes: 0,
     });
     cases.push(ExternalResponse {
         status: 200,
-        headers: BTreeMap::new(),
+        headers: Vec::new(),
         header_bytes: 64 * 1024 + 1,
         body_bytes: 0,
     });
     cases.push(ExternalResponse {
         status: 200,
-        headers: BTreeMap::new(),
+        headers: Vec::new(),
         header_bytes: 32,
         body_bytes: 64 * 1024 + 1,
     });
     cases.push(ExternalResponse {
         status: 200,
-        headers: BTreeMap::from([("bad name".to_owned(), "ok".to_owned())]),
+        headers: vec![header("bad name", "ok")],
         header_bytes: 32,
         body_bytes: 0,
     });
     cases.push(ExternalResponse {
         status: 200,
-        headers: BTreeMap::from([("x".repeat(256), "v".repeat(8 * 1024 - 255))]),
+        headers: vec![ExternalHeader {
+            name: "x".repeat(256),
+            value: "v".repeat(8 * 1024 - 255),
+        }],
         header_bytes: 16 * 1024,
         body_bytes: 0,
     });
@@ -1412,6 +1769,85 @@ fn unlisted_orphan_and_missing_diagram_prose_fail_closed() {
     let diagram = repository.check();
     assert_eq!(status_code(&diagram), ERROR);
     assert!(diagnostic(&diagram).contains("missing prose heading"));
+}
+
+#[test]
+fn diagram_records_bind_the_exact_semantic_mermaid_content() {
+    let repository = PublicationRepository::new();
+    let diagram_path = repository
+        .path()
+        .join("tools/docs-parity/manifests/diagrams.toml");
+    let diagrams = fs::read_to_string(&diagram_path).expect("should read diagram manifest");
+    assert!(
+        diagrams.contains(&format!("fingerprint = \"{}\"", fingerprint(b"graph TD\n"))),
+        "fixture fingerprint should bind semantic content"
+    );
+
+    let clean = repository.check();
+    assert_eq!(
+        status_code(&clean),
+        SUCCESS,
+        "matching diagram fingerprint should pass: {}",
+        diagnostic(&clean)
+    );
+
+    let guide_path = repository.path().join("docs/guide/index.md");
+    let guide = fs::read_to_string(&guide_path).expect("should read guide");
+    fs::write(&guide_path, guide.replace("graph TD", "graph LR"))
+        .expect("should change semantic diagram content");
+    let stale = repository.check();
+    assert_eq!(status_code(&stale), ERROR);
+    assert!(
+        diagnostic(&stale).contains("fingerprint"),
+        "stale diagram must report fingerprint mismatch: {}",
+        diagnostic(&stale)
+    );
+}
+
+#[test]
+fn swapping_mermaid_content_between_selectors_reopens_review() {
+    let repository = PublicationRepository::new();
+    let guide_path = repository.path().join("docs/guide/index.md");
+    let first = "graph TD\n";
+    let second = "graph LR\n";
+    fs::write(
+        &guide_path,
+        format!(
+            "# Guide\n## Flow One\n```mermaid\n{first}```\n## Flow Two\n```mermaid\n{second}```\n"
+        ),
+    )
+    .expect("should write two diagrams");
+    let diagram_path = repository
+        .path()
+        .join("tools/docs-parity/manifests/diagrams.toml");
+    fs::write(
+        &diagram_path,
+        format!(
+            concat!(
+                "version = 1\nreviewed = true\n\n",
+                "[[diagrams]]\npath = \"docs/guide/index.md\"\nselector = \"mermaid:1\"\n",
+                "fingerprint = \"{}\"\nprose_anchor = \"flow-one\"\nowner = \"docs-team\"\n\n",
+                "[[diagrams]]\npath = \"docs/guide/index.md\"\nselector = \"mermaid:2\"\n",
+                "fingerprint = \"{}\"\nprose_anchor = \"flow-two\"\nowner = \"docs-team\"\n",
+            ),
+            fingerprint(first.as_bytes()),
+            fingerprint(second.as_bytes()),
+        ),
+    )
+    .expect("should bind both diagram selectors");
+    let clean = repository.check();
+    assert_eq!(status_code(&clean), SUCCESS, "{}", diagnostic(&clean));
+
+    fs::write(
+        &guide_path,
+        format!(
+            "# Guide\n## Flow One\n```mermaid\n{second}```\n## Flow Two\n```mermaid\n{first}```\n"
+        ),
+    )
+    .expect("should swap diagram content");
+    let swapped = repository.check();
+    assert_eq!(status_code(&swapped), ERROR);
+    assert!(diagnostic(&swapped).contains("fingerprint mismatch"));
 }
 
 #[test]

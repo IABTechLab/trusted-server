@@ -1588,8 +1588,11 @@ where
     }
     let path =
         NormalizedRelativePath::new(Path::new(path)).change_context(ClassificationError::Update)?;
+    let original = repository
+        .read_optional(&path)
+        .change_context(ClassificationError::Update)?;
     repository
-        .write_atomically(&path, &contents)
+        .write_atomically(&path, original.as_deref(), &contents)
         .change_context(ClassificationError::Update)
 }
 

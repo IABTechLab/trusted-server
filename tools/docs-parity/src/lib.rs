@@ -278,11 +278,14 @@ fn update(
 ) -> Result<Outcome, Report<DocsParityError>> {
     let record = NormalizedRelativePath::new(&arguments.tracked_paths_record)
         .change_context(DocsParityError::Repository)?;
+    let original = repository
+        .read_optional(&record)
+        .change_context(DocsParityError::Repository)?;
     let expected = repository
         .tracked_paths_record()
         .change_context(DocsParityError::Repository)?;
     repository
-        .write_atomically(&record, &expected)
+        .write_atomically(&record, original.as_deref(), &expected)
         .change_context(DocsParityError::Repository)?;
     Ok(Outcome::Updated)
 }

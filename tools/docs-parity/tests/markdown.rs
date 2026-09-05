@@ -296,6 +296,36 @@ fn interrupted_generated_write_preserves_the_complete_original() {
         "stale stage should fail closed"
     );
     assert_eq!(fs::read(target).expect("should reread original"), before);
+    assert!(
+        !staged.exists(),
+        "failed atomic update should clean its stale stage"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_atomic_update_preserves_the_original_safe_mode() {
+    let document = concat!(
+        "<!-- docs-parity:start adapter-support -->\n",
+        "old\n",
+        "<!-- docs-parity:end adapter-support -->\n",
+    );
+    let repository = TestRepository::new(document, "docs/generated.md");
+    let target = repository.path().join("docs/generated.md");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+        .expect("should set safe original mode");
+
+    let result = output(repository.command().args(["generate", "--update"]));
+
+    assert_eq!(status_code(&result), SUCCESS);
+    assert_eq!(
+        fs::metadata(target)
+            .expect("should inspect updated target")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
 }
 
 #[cfg(unix)]
