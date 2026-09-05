@@ -9221,4 +9221,44 @@ set = { networkId = 42 }
             "should preserve the complete enabled PBS wire shape"
         );
     }
+
+    #[test]
+    fn task7_prebid_companion_positive() {
+        assert_eq!(default_bidders(), vec!["mocktioneer".to_owned()]);
+        assert!(
+            !default_script_patterns().is_empty(),
+            "script-pattern default should remain nonempty"
+        );
+        validate_external_bundle_url("https://assets.example/prebid.js")
+            .expect("HTTPS bundle URL should validate");
+        validate_external_bundle_sri(&test_sri("sha384", &[0; 48]))
+            .expect("algorithm-sized SRI should validate");
+        validate_excluded_gam_ad_unit_path_suffixes(&["/excluded".to_owned()])
+            .expect("non-root suffix should validate");
+
+        let parsed: LegacyPrebidServerConfig = toml::from_str(
+            r#"
+            server_url = "https://prebid.example/openrtb2/auction"
+            bidders = { 0 = "first", 1 = "second" }
+            "#,
+        )
+        .expect("map-shaped bidders should use the custom sequence-or-map deserializer");
+        assert_eq!(parsed.bidders, ["first", "second"]);
+    }
+
+    #[test]
+    fn task7_prebid_companion_negative() {
+        validate_external_bundle_url("http://assets.example/prebid.js")
+            .expect_err("insecure bundle URL should fail");
+        validate_external_bundle_sri("sha384-AAAA").expect_err("wrong-size SRI digest should fail");
+        validate_excluded_gam_ad_unit_path_suffixes(&["/".to_owned()])
+            .expect_err("root suffix should fail");
+        toml::from_str::<LegacyPrebidServerConfig>(
+            r#"
+            server_url = "https://prebid.example/openrtb2/auction"
+            bidders = 42
+            "#,
+        )
+        .expect_err("scalar bidders should fail the custom deserializer");
+    }
 }

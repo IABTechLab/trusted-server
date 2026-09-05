@@ -1578,13 +1578,18 @@ fn retired_record(kind: &str, value: &str) -> String {
 }
 
 #[test]
-fn all_five_exception_classes_are_supported_with_narrow_detector_pairings() {
+fn all_six_exception_classes_are_supported_with_narrow_detector_pairings() {
     let fixtures = [
         ("vendor_url", "domain", "notes.txt"),
         (
             "hash_pinned_fake_credential_fixture",
             "credential_shape",
             "tests/fixture.rs",
+        ),
+        (
+            "settings_schema_identifier",
+            "credential_shape",
+            "tools/docs-parity/manifests/settings-companions.toml",
         ),
         ("historical_example", "email", "tests/archive.txt"),
         ("project_owned_public_domain", "domain", "notes.txt"),
@@ -1598,6 +1603,7 @@ fn all_five_exception_classes_are_supported_with_narrow_detector_pairings() {
                 )
             }
             (_, "domain") => format!("https://owned.{}", ["private-corp", ".internal"].concat()),
+            ("settings_schema_identifier", "credential_shape") => "store_resolved".to_owned(),
             (_, "credential_shape") => "fake-credential-value-123".to_owned(),
             (_, "email") => format!("archived@{}", ["private-corp", ".internal"].concat()),
             (_, "service_id") => "AbCdEf1234567890GhIj".to_owned(),
@@ -2162,6 +2168,50 @@ fn fake_credential_class_requires_exact_synthetic_evidence() {
             "credential_shape",
             value,
             "hash_pinned_fake_credential_fixture",
+        );
+    }
+}
+
+#[test]
+fn settings_schema_dispositions_use_only_the_exact_schema_identifier_class() {
+    let path = "tools/docs-parity/manifests/settings-companions.toml";
+    for value in [
+        "store_resolved",
+        "deliberately_inline",
+        "accepted_discarded",
+    ] {
+        let contents = format!("secret = \"{value}\"\n");
+        assert_allowlisted(
+            path,
+            contents.as_bytes(),
+            "text",
+            "credential_shape",
+            value,
+            "settings_schema_identifier",
+        );
+    }
+
+    for (path, value) in [
+        ("notes.txt", "store_resolved"),
+        (
+            "tools/docs-parity/manifests/settings-companions.toml",
+            "production_secret",
+        ),
+    ] {
+        let contents = format!("secret = \"{value}\"\n");
+        let repository = TestRepository::new(path, contents.as_bytes(), "text");
+        repository.write_allowlist(&exception_for_contents(
+            "settings_schema_identifier",
+            path,
+            "credential_shape",
+            contents.as_bytes(),
+            value,
+            "2099-01-01T00:00:00Z",
+        ));
+        assert_eq!(
+            status_code(&repository.scan()),
+            ERROR,
+            "schema identifier class must reject {value} in {path}"
         );
     }
 }

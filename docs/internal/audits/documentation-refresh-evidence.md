@@ -2745,8 +2745,115 @@ PY
 
 #### Task 7 — Extract settings semantics and execute the example harness
 
-Pending. Record generated reference equality, compiled probes, and template
-round-trip proof.
+- Task 7 started from the clean, pushed Task 6 head
+  `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c` in the existing
+  `spec-docs-refresh` worktree and PR #1049. The initial extractor fixtures
+  failed to compile because `docs_parity::settings` and its schema and harness
+  types did not exist. Subsequent RED leaves failed for the absent companion
+  manifest, unresolved probe declarations, and the missing `settings --check`
+  subcommand. The eight negative harness fixtures separately rejected a
+  placeholder typo, an unknown disabled integration, an invalid profile,
+  an unresolved secret, a stranded literal, an inactive-block shortcut, a
+  missing profile-compiler probe, and the wrong failure diagnostic before the
+  complete valid observation passed.
+- `settings --check` parses four bounded, strict-UTF-8 production sources with
+  `syn`: the root settings model, standard auction profile, APS profile, and
+  Prebid settings. Its closed grammar covers Serde container, variant, and
+  field semantics for `rename`, `rename_all`, `alias`, `tag`, `content`,
+  `untagged`, `flatten`, `skip`, and `skip_serializing`; literal and
+  nonliteral defaults; custom deserializers; `Option`; and validator ranges
+  and functions. Unknown shape-changing attributes fail closed. The checked
+  schema requires exact equality with the 17-field `Settings` root rather than
+  accepting a subset.
+- `settings-companions.toml` is a versioned, explicitly reviewed record with 46
+  exact nonliteral-default, deserializer, and validator companions. Each
+  companion names its owning source plus compiled positive and negative test
+  probes; missing, blank, duplicate, stale, or source-mismatched declarations
+  fail closed. Production-module tests exercise the actual functions and
+  types, including map-or-sequence decoding, the APS endpoint/default rules,
+  Prebid URL/SRI rules, settings defaults and validators, and all three
+  profile compiler IDs. The tool added no public production API and changed no
+  production behavior.
+- The same manifest contains 19 directional field records whose five axes are
+  checked independently: lifecycle, key identity, serialization, runtime,
+  and secret handling. Exact equality requires 11 active store-resolved
+  secret-key paths, one active deliberately-inline shared secret, one
+  deprecated accepted-and-discarded selector, four deprecated
+  normalized-away store selectors, and two deserialization-only aliases with
+  their canonical targets. An axis cannot substitute for or erase another
+  disposition.
+- The production-API harness parses `trusted-server.example.toml`, proves that
+  its unmodified form reports exactly the three publisher placeholders, and
+  applies three non-secret publisher customizations in memory. It then
+  preserves secret key names through deploy validation, settings
+  serialization, and `BlobEnvelope`; resolves them through the module-local
+  fake platform secret store; and runs runtime validation over the resolved
+  values. Every one of the 14 deploy-validated optional integration/provider
+  IDs is forced enabled and checked in isolation. Module-local set-equality
+  assertions bind those 14 IDs and the three profile IDs to the reviewed
+  record. The record also checks three exact secret-key literals and all six
+  literal-substitution or include-only template consumers.
+- The standalone settings target contains 17 passing tests, including the
+  closed grammar, companion chain, five-axis dispositions, all eight negative
+  phases, real repository extraction, and CLI execution. The complete
+  standalone suite contains 228 passing tests: 17 library unit, 35
+  classification, 19 CLI, 57 links, 11 Markdown, 72 scanner, and 17 settings
+  tests. `cargo fmt --all -- --check` and standalone all-target clippy with
+  warnings denied exited 0.
+- A final default-parallel repetition exposed one existing Task 6 process
+  fixture race: its overflow child could be starved before writing any bytes,
+  so the valid production timeout won over an overflow the fixture had not yet
+  produced. The overflow fixture now writes its bytes and then a readiness
+  sentinel; the existing post-spawn observer waits for that sentinel before
+  returning, and the production deadline is computed only afterward. This is
+  test-only synchronization, does not lengthen the runner policy timeout, and
+  changes no production behavior. The exact overflow test passed ten
+  consecutive focused repetitions before the full suite was repeated.
+- The target-matched Fastly commands used the repository-pinned Viceroy 0.17.0
+  from an isolated host installation. On macOS it required the readable system
+  certificate file via `SSL_CERT_FILE=/etc/ssl/cert.pem`; no repository file
+  changed for that host setup. `cargo test-fastly settings` passed 177 core
+  tests, `cargo test-fastly config` passed 12 adapter and 197 core tests, and
+  `cargo test-fastly profile` passed 20 core tests. The named Task 7 production
+  probes were included in those target-matched runs.
+- The three secret-disposition words in the companion schema are identifiers,
+  not credential examples. The credential-shape detector therefore gained one
+  narrow `settings_schema_identifier` exception class that accepts only the
+  exact companion-manifest path and exact `store_resolved`,
+  `deliberately_inline`, or `accepted_discarded` token. Wrong paths, other
+  values, and detector cross-use fail. This is the only scanner behavior
+  expansion; using the fake-credential class for schema identifiers would
+  make its semantic claim false.
+- The reviewed sensitive inventory contains 5,406 exact occurrences, a net 15
+  over Task 6: 13 settings-schema identifiers, the exact APS vendor endpoint
+  recorded as a companion value, and one synthetic credential-shaped test
+  literal. Classification added only the three new standalone text paths;
+  their reviewed dispositions are one non-documentation manifest and two
+  source-code files. Repeated classification updates retained tracked/source
+  SHA-256 values
+  `c0747847b67394a370255388dd2955bd595216acb31def101f2a386ac557332c`
+  and
+  `108c4769bca7aa7709b88da1560b6879702b33e7111d46e46b346132570fd506`.
+  The reviewed companion manifest SHA-256 is
+  `d1a9baa7aa95ac1f8724be3947687d8a30080689b1cfc526c4a528e18e4bad78`.
+  Repeated sensitive bootstraps retained reviewed-manifest SHA-256
+  `eaabfc0d1bea32bcffa58d95a3aa4889a6de133aa37876ba1790239d52169acd`.
+  Fresh `settings --check`, local-link, generated-region, classification, and
+  sensitive-scan checks all exited 0.
+- Only the standalone lock gained the direct `syn` dependency already present
+  in its resolved graph; its final SHA-256 is
+  `8d12168733c63ecce2566f3267fde5741155a87cf767b8415fc845d496bbf3ca`.
+  Root `Cargo.lock` remained byte-identical at
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
+  The Task 7 Files list and staging command are exact for its 20-path diff,
+  including the scanner class/test required by the new manifest vocabulary
+  and the process-fixture synchronization required by the repeated default
+  suite, while excluding all unchanged files: the five checked core sources;
+  this evidence file and the execution plan; the standalone manifest,
+  lockfile, and README; the tracked, maintained, sensitive, and
+  settings-companion manifests; the standalone library, Markdown, scanner,
+  and settings implementations; and the scanner and settings integration-test
+  files.
 
 #### Task 8 — Check integration capabilities and adapter routes
 

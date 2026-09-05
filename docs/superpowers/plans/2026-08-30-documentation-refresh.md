@@ -445,41 +445,45 @@ git commit -m "Close documentation execution quality gaps"
 - Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
 - Modify as dependencies are introduced: `tools/docs-parity/Cargo.lock`
 - Create: `tools/docs-parity/src/settings.rs`
-- Modify: `tools/docs-parity/src/main.rs`
 - Modify: `tools/docs-parity/src/lib.rs`
-- Modify: `tools/docs-parity/src/model.rs`
-- Modify: `tools/docs-parity/src/repository.rs`
+- Modify/Test for deterministic process-gate readiness: `tools/docs-parity/src/markdown.rs`
+- Modify: `tools/docs-parity/src/scanner.rs`
+- Modify: `tools/docs-parity/README.md`
 - Create: `tools/docs-parity/manifests/settings-companions.toml`
 - Modify: `tools/docs-parity/manifests/tracked-files.toml`
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
+- Modify: `tools/docs-parity/manifests/sensitive-allowlist.toml`
 - Create/Test: `tools/docs-parity/tests/settings.rs`
+- Modify/Test: `tools/docs-parity/tests/scanner.rs`
 - Modify/Test: `crates/trusted-server-core/src/config.rs`
 - Modify/Test: `crates/trusted-server-core/src/settings.rs`
 - Modify/Test: `crates/trusted-server-core/src/auction/profile.rs`
 - Modify/Test: `crates/trusted-server-core/src/integrations/aps.rs`
 - Modify/Test: `crates/trusted-server-core/src/integrations/prebid.rs`
+- Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [ ] **Step 1: Write extractor grammar fixtures**
+- [x] **Step 1: Write extractor grammar fixtures**
 
 Cover Serde field/container/variant attributes (`rename`, `rename_all`, `alias`, `tag`, `content`, `untagged`, `flatten`, `skip`, `skip_serializing`), literal/nonliteral defaults, custom deserializers, `Option`, validation ranges, and an unknown shape-changing attribute. Expected: unclassified custom behavior fails closed.
 
-- [ ] **Step 2: Implement the AST plus companion chain**
+- [x] **Step 2: Implement the AST plus companion chain**
 
 Resolve literal defaults from AST, require companion entries for custom deserializers/nonliteral defaults/validator functions, and verify companion claims with compiled positive and negative probes. Emit independent lifecycle, key identity, serialization, runtime, and secret-handling axes; never collapse overlapping dispositions.
 
-- [ ] **Step 3: Write the eight-phase template harness failures**
+- [x] **Step 3: Write the eight-phase template harness failures**
 
 Prove the unmodified template fails for the exact placeholder set; prove a typo, unknown disabled integration key, bad profile config, unresolved secret, stranded literal substitution, inactive-block shortcut, missing profile compiler probe, and wrong failure diagnostic do not pass.
 
-- [ ] **Step 4: Implement the harness through production APIs**
+- [x] **Step 4: Implement the harness through production APIs**
 
 Parse the source template, customize non-secret values in memory, preserve secret key names through deploy validation/blob serialization, resolve with a fake store, run runtime validation, and probe every optional integration/provider block in isolation with it forced enabled. Enumerate exact-string consumers in a checked record.
 
-- [ ] **Step 5: Add visibility-local set-equality seams**
+- [x] **Step 5: Add visibility-local set-equality seams**
 
 Replace the one-directional deploy-ID assertion with equality against the checked record. Keep production behavior unchanged and expose no new public API solely for the tool; put private-registry assertions in module-local `#[cfg(test)]` tests.
 
-- [ ] **Step 6: Run focused and target-matched tests**
+- [x] **Step 6: Run focused and target-matched tests**
 
 Add each AST/settings dependency only in the standalone manifest, regenerate
 its lockfile, and require `git diff --quiet -- Cargo.lock` before the commands
@@ -494,10 +498,10 @@ cargo test-fastly profile
 
 Expected: extractor/harness tests pass and core behavior is unchanged.
 
-- [ ] **Step 7: Commit the extractor checkpoint**
+- [x] **Step 7: Commit the extractor checkpoint**
 
 ```bash
-git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/src/settings.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/settings-companions.toml tools/docs-parity/tests/settings.rs crates/trusted-server-core/src/config.rs crates/trusted-server-core/src/settings.rs crates/trusted-server-core/src/auction/profile.rs crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/integrations/prebid.rs docs/internal/audits/documentation-refresh-evidence.md
+git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/settings.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/src/scanner.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/settings-companions.toml tools/docs-parity/tests/settings.rs tools/docs-parity/tests/scanner.rs crates/trusted-server-core/src/config.rs crates/trusted-server-core/src/settings.rs crates/trusted-server-core/src/auction/profile.rs crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/integrations/prebid.rs docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Check configuration documentation semantics"
 ```
 

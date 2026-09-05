@@ -435,10 +435,12 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
+    use edgezero_core::blob_envelope::BlobEnvelope;
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -451,6 +453,25 @@ mod tests {
         price_granularity: serde_json::Value,
         #[serde(default)]
         slot: Vec<serde_json::Value>,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CheckedManifest {
+        template: Task7CheckedTemplate,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CheckedTemplate {
+        integration_ids: HashSet<String>,
+    }
+
+    fn task7_checked_integration_ids() -> HashSet<String> {
+        let checked: Task7CheckedManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/settings-companions.toml"
+        )))
+        .expect("checked Task 7 settings manifest should parse");
+        checked.template.integration_ids
     }
 
     fn app_config_with_creative_opportunities(
@@ -493,6 +514,40 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    struct Task7SecretStore;
+
+    impl PlatformSecretStore for Task7SecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            let resolved = match key {
+                "publisher_proxy_secret" => "fictional-proxy-secret-32-bytes-ok",
+                "ec_passphrase" => "fictional-ec-passphrase-32-bytes-ok",
+                "handler_password" => "fictional-admin-password-32-bytes-ok",
+                _ => {
+                    return Err(Report::new(PlatformError::SecretStore)
+                        .attach(format!("unexpected Task 7 secret key: {key}")));
+                }
+            };
+            Ok(resolved.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
     }
 
     /// Source-controlled operator-facing config template.
@@ -1140,17 +1195,84 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
-    fn deploy_validation_covers_registered_integration_builders() {
-        let validated_ids: HashSet<&'static str> =
-            DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
-        let missing_ids = crate::integrations::registered_builder_ids()
-            .filter(|id| !validated_ids.contains(id))
-            .collect::<Vec<_>>();
+    fn deploy_validation_ids_match_checked_settings_record() {
+        let validated_ids: HashSet<String> = DEPLOY_VALIDATED_INTEGRATION_IDS
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        let registered_ids: HashSet<String> = crate::integrations::registered_builder_ids()
+            .map(str::to_owned)
+            .collect();
 
         assert!(
-            missing_ids.is_empty(),
-            "deploy validation should cover all registered integration builders: {missing_ids:?}"
+            registered_ids.is_subset(&validated_ids),
+            "deploy validation IDs should cover every registered integration builder"
         );
+
+        assert_eq!(
+            validated_ids,
+            task7_checked_integration_ids(),
+            "deploy validation IDs and the checked documentation record should be equal"
+        );
+    }
+
+    #[test]
+    fn task7_enables_every_deploy_validated_integration_in_isolation() {
+        for (id, raw) in [
+            (
+                "prebid",
+                serde_json::json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example.com/prebid.js"
+                }),
+            ),
+            ("aps", serde_json::json!({"enabled": true})),
+            (
+                "adserver_mock",
+                serde_json::json!({
+                    "enabled": true,
+                    "endpoint": "https://adserver.example/mediate"
+                }),
+            ),
+            (
+                "testlight",
+                serde_json::json!({
+                    "enabled": true,
+                    "endpoint": "https://testlight.example/openrtb2/auction"
+                }),
+            ),
+            ("nextjs", serde_json::json!({"enabled": true})),
+            (
+                "permutive",
+                serde_json::json!({
+                    "enabled": true,
+                    "organization_id": "fictional-organization",
+                    "workspace_id": "fictional-workspace"
+                }),
+            ),
+            (
+                "lockr",
+                serde_json::json!({"enabled": true, "app_id": "fictional-app"}),
+            ),
+            ("didomi", serde_json::json!({"enabled": true})),
+            ("sourcepoint", serde_json::json!({"enabled": true})),
+            ("osano", serde_json::json!({"enabled": true})),
+            (
+                "google_tag_manager",
+                serde_json::json!({"enabled": true, "container_id": "GTM-ABC123"}),
+            ),
+            ("datadome", serde_json::json!({"enabled": true})),
+            ("gpt", serde_json::json!({"enabled": true})),
+            ("gpt_diagnostics", serde_json::json!({"enabled": true})),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config(id, &raw)
+                .unwrap_or_else(|error| panic!("{id} should serialize: {error:?}"));
+            validate_settings_for_deploy(&settings)
+                .unwrap_or_else(|error| panic!("{id} should validate while enabled: {error:?}"));
+        }
     }
 
     #[test]
@@ -1229,5 +1351,88 @@ password = "production-admin-password-32-bytes"
             err.to_string().contains("missing-provider"),
             "validation error should mention invalid provider"
         );
+    }
+
+    #[test]
+    fn task7_source_template_round_trips_through_production_apis() {
+        run_task7_template_harness()
+            .expect("source template should pass every production harness phase");
+    }
+
+    fn run_task7_template_harness() -> Result<(), String> {
+        let source: TrustedServerAppConfig = toml::from_str(EXAMPLE_TEMPLATE)
+            .map_err(|error| format!("source template parse failed: {error}"))?;
+        let placeholder_error = validate_settings_for_deploy(source.settings())
+            .expect_err("unmodified source template should fail its exact placeholders");
+        let placeholder_diagnostic = format!("{placeholder_error:?}");
+        let placeholder_paths = [
+            "publisher.domain",
+            "publisher.cookie_domain",
+            "publisher.origin_url",
+        ];
+        for path in placeholder_paths {
+            assert!(
+                placeholder_diagnostic.contains(path),
+                "unmodified template diagnostic should contain {path}: {placeholder_diagnostic}"
+            );
+        }
+        for unexpected in [
+            "publisher.proxy_secret",
+            "ec.passphrase",
+            "handlers[",
+            "request_signing.",
+        ] {
+            assert!(
+                !placeholder_diagnostic.contains(unexpected),
+                "unmodified template should not report {unexpected}: {placeholder_diagnostic}"
+            );
+        }
+
+        let mut settings = source.into_settings();
+        settings.publisher.domain = "publisher.example".to_owned();
+        settings.publisher.cookie_domain = ".publisher.example".to_owned();
+        settings.publisher.origin_url = "https://origin.publisher.example".to_owned();
+        validate_settings_for_deploy(&settings)
+            .map_err(|error| format!("deploy validation failed: {error:?}"))?;
+
+        let app_config = TrustedServerAppConfig::new(settings)
+            .map_err(|error| format!("typed app config failed: {error:?}"))?;
+        let data = serde_json::to_value(&app_config)
+            .map_err(|error| format!("app config serialization failed: {error}"))?;
+        for (pointer, expected_key) in [
+            ("/publisher/proxy_secret", "publisher_proxy_secret"),
+            ("/ec/passphrase", "ec_passphrase"),
+            ("/handlers/0/password", "handler_password"),
+        ] {
+            assert_eq!(
+                data.pointer(pointer).and_then(serde_json::Value::as_str),
+                Some(expected_key),
+                "deploy blob should preserve the secret key name at {pointer}"
+            );
+        }
+
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope)
+            .map_err(|error| format!("blob envelope serialization failed: {error}"))?;
+        let runtime = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &Task7SecretStore,
+            &StoreName::from("trusted_server_secrets"),
+        )
+        .map_err(|error| format!("runtime settings resolution failed: {error:?}"))?;
+
+        assert_eq!(
+            runtime.publisher.proxy_secret.expose(),
+            "fictional-proxy-secret-32-bytes-ok"
+        );
+        assert_eq!(
+            runtime.ec.passphrase.expose(),
+            "fictional-ec-passphrase-32-bytes-ok"
+        );
+        assert_eq!(
+            runtime.handlers[0].password.expose(),
+            "fictional-admin-password-32-bytes-ok"
+        );
+        Ok(())
     }
 }

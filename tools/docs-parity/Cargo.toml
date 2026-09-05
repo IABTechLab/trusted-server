@@ -58,6 +58,10 @@ path = "tests/markdown.rs"
 name = "links"
 path = "tests/links.rs"
 
+[[test]]
+name = "settings"
+path = "tests/settings.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 derive_more = { version = "2.0", features = ["display"] }
@@ -71,6 +75,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = { package = "yaml_serde", version = "0.10" }
 sha2 = "0.10"
+syn = { version = "2", features = ["full", "parsing"] }
 tempfile = "3.24"
 toml = "0.9"
 toml_edit = "0.23"

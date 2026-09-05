@@ -3248,4 +3248,47 @@ mod tests {
         assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
         assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
     }
+
+    #[test]
+    fn task7_aps_companion_positive() {
+        assert!(default_endpoint().starts_with("https://"));
+        assert_eq!(default_timeout_ms(), 800);
+        let numeric: LegacyApsProviderConfig = serde_json::from_value(json!({
+            "enabled": true,
+            "account_id": 12345
+        }))
+        .expect("numeric account ID should use the custom deserializer");
+        assert_eq!(numeric.account_id, "12345");
+        validate_aps_endpoint("https://ads.example/openrtb2/auction")
+            .expect("HTTPS endpoint should validate");
+        validate_inventory_domain("publisher.example")
+            .expect("plain inventory domain should validate");
+        validate_inventory_page_origin("https://publisher.example")
+            .expect("HTTPS inventory origin should validate");
+        validate_inventory_identity_override_values(
+            Some("publisher.example"),
+            Some("https://publisher.example"),
+        )
+        .expect("matching inventory overrides should validate");
+    }
+
+    #[test]
+    fn task7_aps_companion_negative() {
+        serde_json::from_value::<LegacyApsProviderConfig>(json!({
+            "enabled": true,
+            "account_id": []
+        }))
+        .expect_err("array account ID should fail custom deserialization");
+        validate_aps_endpoint("http://ads.example/openrtb2/auction")
+            .expect_err("insecure endpoint should fail");
+        validate_inventory_domain("https://publisher.example")
+            .expect_err("domain with a scheme should fail");
+        validate_inventory_page_origin("http://publisher.example")
+            .expect_err("insecure inventory origin should fail");
+        validate_inventory_identity_override_values(
+            Some("publisher.example"),
+            Some("https://other.example"),
+        )
+        .expect_err("mismatched inventory overrides should fail");
+    }
 }

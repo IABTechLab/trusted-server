@@ -20,6 +20,7 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --bootstrap
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --update
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --local --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- settings --check
 # Scheduled or manual only; this command performs bounded network requests.
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external --check
 ```
@@ -77,9 +78,11 @@ byte selector, content fingerprint, owner, rationale, and expiry. Check mode
 fails at the expiry instant, on stale/moved records, on unsupported structured
 data, or on findings without an exact exception. `scan --bootstrap` regenerates
 candidates, preserves only exact reviewed matches, and reopens the complete set
-for review when findings change. It never approves candidates. The five allowed
-exception classes do not assert that mechanical detection is complete for
-human semantic sensitivity.
+for review when findings change. It never approves candidates. Six narrow
+exception classes are supported; the settings-schema class applies only to the
+three non-value secret-disposition identifiers in the checked companion
+manifest. These classes do not assert that mechanical detection is complete
+for human semantic sensitivity.
 
 ## Generated regions and links
 
@@ -149,6 +152,23 @@ of a kill failure, and joins the reader; primary, kill, wait, and join
 diagnostics are retained. Exact exceptions require an owner, reason, and
 unexpired timestamp.
 
+## Settings semantics
+
+`settings --check` parses the four checked Rust settings/profile sources with
+`syn` and a closed Serde/validator attribute grammar. Shape-changing attributes
+outside that grammar fail closed. Nonliteral defaults, custom deserializers,
+and custom validators require reviewed companion records whose named positive
+and negative probes compile in the owning production module's test target.
+
+The command checks the exact 17-field `Settings` root, independent lifecycle,
+key-identity, serialization, runtime, and secret-handling dispositions, the 11
+store-resolved paths, the deliberately-inline and accepted-discarded paths,
+deprecated normalized-away selectors, and aliases. It also validates the
+source template's three placeholder paths, 14 deploy-validated integration
+IDs, three profile IDs, three secret-key literals, and all six literal or
+include-only consumers. The source template and every checked source are
+bounded to 4 MiB and decoded as strict UTF-8.
+
 ## Repository boundary
 
 Generated paths must be normalized, non-empty relative paths. Absolute paths,
@@ -179,6 +199,7 @@ cargo test --manifest-path tools/docs-parity/Cargo.toml --test classification
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test scanner
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test markdown
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test links
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test settings
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
 cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings

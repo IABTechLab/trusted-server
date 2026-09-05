@@ -4063,6 +4063,12 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "tools/docs-parity/manifests/settings-companions.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = "tools/docs-parity/manifests/tracked-files.toml"
 mode = "whole"
 disposition = "exclude"
@@ -4111,6 +4117,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/src/settings.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "tools/docs-parity/tests/classification.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4136,6 +4148,12 @@ exclude_kind = "source_code"
 
 [[sources]]
 path = "tools/docs-parity/tests/scanner.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/settings.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"

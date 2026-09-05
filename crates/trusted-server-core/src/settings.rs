@@ -3693,6 +3693,118 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
+    #[derive(Debug, Deserialize)]
+    struct Task7DeserializerProbe {
+        #[serde(deserialize_with = "from_value_or_str")]
+        number: u32,
+        #[serde(deserialize_with = "bool_from_bool_or_str")]
+        enabled: bool,
+        #[serde(deserialize_with = "vec_from_seq_or_map")]
+        values: Vec<String>,
+        #[serde(deserialize_with = "map_from_obj_or_str")]
+        headers: HashMap<String, String>,
+    }
+
+    #[test]
+    fn task7_settings_companion_positive() {
+        assert_eq!(default_max_buffered_body_bytes(), 16 * 1024 * 1024);
+        assert_eq!(EcPartner::default_openrtb_atype(), 3);
+        assert_eq!(EcPartner::default_batch_rate_limit(), 60);
+        assert_eq!(EcPartner::default_pull_sync_ttl_sec(), 86_400);
+        assert_eq!(EcPartner::default_pull_sync_rate_limit(), 10);
+        assert_eq!(Ec::default_pull_sync_concurrency(), 3);
+        assert_eq!(Ec::default_cluster_trust_threshold(), 10);
+        assert_eq!(Ec::default_cluster_recheck_secs(), 3_600);
+        assert_eq!(default_s3_access_key_id().expose(), "access_key_id");
+        assert_eq!(default_s3_secret_access_key().expose(), "secret_access_key");
+        assert_eq!(default_profile_param(), "profile");
+        assert_eq!(default_aspect_ratio_param(), "ar");
+        assert_eq!(default_debug_param(), "_io_debug");
+        assert_eq!(default_default_profile(), "default");
+        assert_eq!(default_crop_offset_x_param(), "x");
+        assert_eq!(default_crop_offset_y_param(), "y");
+        assert_eq!(default_crop_offset_buckets(), [10, 30, 50, 70, 90]);
+        assert_eq!(default_tinybird_auction_dataset(), "auction_events_raw");
+        assert_eq!(default_tinybird_access_dataset(), "access_logs_raw");
+        assert_eq!(default_tinybird_max_body_bytes(), 1024 * 1024);
+        assert_eq!(
+            default_auction_debug_metadata_keys(),
+            ["error_type", "http_status", "message"]
+        );
+
+        let deserialized: Task7DeserializerProbe = serde_json::from_value(json!({
+            "number": "7",
+            "enabled": "true",
+            "values": {"1": "second", "0": "first"},
+            "headers": "{\"X-Probe\":\"present\"}"
+        }))
+        .expect("supported alternate settings shapes should deserialize");
+        assert_eq!(deserialized.number, 7);
+        assert!(deserialized.enabled);
+        assert_eq!(deserialized.values, ["first", "second"]);
+        assert_eq!(
+            deserialized.headers.get("X-Probe").map(String::as_str),
+            Some("present")
+        );
+
+        validate_publisher_domain("publisher.example")
+            .expect("plain publisher domain should validate");
+        validate_cookie_domain(".publisher.example").expect("plain cookie domain should validate");
+        validate_no_trailing_slash("https://origin.example")
+            .expect("origin without trailing slash should validate");
+        validate_host_header_override("origin.example:443").expect("host override should validate");
+        validate_redacted_not_empty(&Redacted::new("value".to_owned()))
+            .expect("nonempty redacted value should validate");
+        EcPartner::validate_source_domain("identity.example")
+            .expect("plain partner source domain should validate");
+        Ec::validate_passphrase(&Redacted::new(
+            "fictional-ec-passphrase-32-bytes-ok".to_owned(),
+        ))
+        .expect("strong EC passphrase should validate");
+        validate_path("^/articles/[a-z]+$").expect("valid regex should validate");
+        validate_trusted_client_ip(&TrustedClientIpConfig {
+            ip_header: "fastly-client-ip".to_owned(),
+            auth_header: "x-trusted-client-auth".to_owned(),
+            shared_secret: Redacted::new("fictional-shared-secret-32-bytes-ok".to_owned()),
+        })
+        .expect("distinct safe headers and strong secret should validate");
+    }
+
+    #[test]
+    fn task7_settings_companion_negative() {
+        for invalid in [
+            json!({"number": [], "enabled": true, "values": [], "headers": {}}),
+            json!({"number": 7, "enabled": 1, "values": [], "headers": {}}),
+            json!({"number": 7, "enabled": true, "values": false, "headers": {}}),
+            json!({"number": 7, "enabled": true, "values": [], "headers": []}),
+        ] {
+            serde_json::from_value::<Task7DeserializerProbe>(invalid)
+                .expect_err("each unsupported custom-deserializer shape should fail");
+        }
+
+        validate_publisher_domain("https://publisher.example")
+            .expect_err("publisher domain with scheme should fail");
+        validate_cookie_domain("publisher.example; Secure")
+            .expect_err("cookie metacharacter should fail");
+        validate_no_trailing_slash("https://origin.example/")
+            .expect_err("trailing slash should fail");
+        validate_host_header_override("https://origin.example")
+            .expect_err("host override with scheme should fail");
+        validate_redacted_not_empty(&Redacted::new(String::new()))
+            .expect_err("empty redacted value should fail");
+        EcPartner::validate_source_domain("https://identity.example")
+            .expect_err("partner source domain with scheme should fail");
+        Ec::validate_passphrase(&Redacted::new("short".to_owned()))
+            .expect_err("short EC passphrase should fail");
+        validate_path("[").expect_err("invalid regex should fail");
+        validate_trusted_client_ip(&TrustedClientIpConfig {
+            ip_header: "x-same".to_owned(),
+            auth_header: "x-same".to_owned(),
+            shared_secret: Redacted::new("short".to_owned()),
+        })
+        .expect_err("identical headers and a short secret should fail");
+    }
+
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
             "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",

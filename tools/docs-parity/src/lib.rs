@@ -16,6 +16,7 @@ pub mod markdown;
 pub mod model;
 mod repository;
 pub mod scanner;
+pub mod settings;
 
 /// Process exit code for a successful check or update.
 pub const EXIT_SUCCESS: i32 = 0;
@@ -38,6 +39,8 @@ pub enum DocsParityError {
     Scanner,
     #[display("documentation generation or link validation failed")]
     Markdown,
+    #[display("configuration documentation semantics failed")]
+    Settings,
 }
 
 impl core::error::Error for DocsParityError {}
@@ -67,6 +70,15 @@ enum Command {
     Generate(GenerateArguments),
     /// Check local or explicitly requested external Markdown links.
     Links(LinksArguments),
+    /// Check extracted settings semantics and the source-template contract.
+    Settings(SettingsArguments),
+}
+
+#[derive(Args, Debug)]
+struct SettingsArguments {
+    /// Validate settings records without changing repository bytes.
+    #[arg(long, required = true)]
+    check: bool,
 }
 
 #[derive(Args, Debug)]
@@ -179,7 +191,17 @@ pub fn run_from_env() -> Result<Outcome, Report<DocsParityError>> {
         Command::Scan(arguments) => scan(&repository, &arguments),
         Command::Generate(arguments) => generate(&repository, &arguments),
         Command::Links(arguments) => links(&repository, &arguments),
+        Command::Settings(arguments) => settings(&repository, &arguments),
     }
+}
+
+fn settings(
+    repository: &Repository,
+    arguments: &SettingsArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    debug_assert!(arguments.check, "clap should require settings check mode");
+    settings::check_repository(repository).change_context(DocsParityError::Settings)?;
+    Ok(Outcome::Clean)
 }
 
 fn links(

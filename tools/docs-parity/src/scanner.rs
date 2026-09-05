@@ -84,6 +84,7 @@ struct ExceptionRecord {
 enum ExceptionClass {
     VendorUrl,
     HashPinnedFakeCredentialFixture,
+    SettingsSchemaIdentifier,
     HistoricalExample,
     ServiceId,
     ProjectOwnedPublicDomain,
@@ -1783,6 +1784,7 @@ fn validate_class_pair(record: &ExceptionRecord) -> Result<(), Report<ScannerErr
                 | Detector::BinaryString
                 | Detector::MediaMetadata
         ),
+        ExceptionClass::SettingsSchemaIdentifier => record.detector == Detector::CredentialShape,
         ExceptionClass::HistoricalExample => matches!(
             record.detector,
             Detector::Domain
@@ -1822,6 +1824,13 @@ fn validate_class_semantics(
         }
         ExceptionClass::HashPinnedFakeCredentialFixture => {
             fake_credential_evidence(&finding.path, &finding.matched)
+        }
+        ExceptionClass::SettingsSchemaIdentifier => {
+            finding.path == "tools/docs-parity/manifests/settings-companions.toml"
+                && matches!(
+                    finding.matched.as_str(),
+                    "store_resolved" | "deliberately_inline" | "accepted_discarded"
+                )
         }
         ExceptionClass::HistoricalExample => historical_example_evidence(record, finding),
         ExceptionClass::ProjectOwnedPublicDomain => project_owned_host(&finding.matched),
@@ -2089,6 +2098,15 @@ where
 }
 
 fn candidate_class(finding: &Finding) -> ExceptionClass {
+    if finding.detector == Detector::CredentialShape
+        && finding.path == "tools/docs-parity/manifests/settings-companions.toml"
+        && matches!(
+            finding.matched.as_str(),
+            "store_resolved" | "deliberately_inline" | "accepted_discarded"
+        )
+    {
+        return ExceptionClass::SettingsSchemaIdentifier;
+    }
     if fingerprint(finding.matched.to_ascii_lowercase().as_bytes()) == HISTORICAL_CNAME_FINGERPRINT
     {
         return ExceptionClass::HistoricalExample;
@@ -2191,6 +2209,9 @@ fn candidate_rationale(class: ExceptionClass, detector: Detector) -> &'static st
         }
         ExceptionClass::HashPinnedFakeCredentialFixture => {
             "Reviewed exact hash-pinned synthetic credential fixture."
+        }
+        ExceptionClass::SettingsSchemaIdentifier => {
+            "Reviewed exact non-value settings disposition identifier."
         }
         ExceptionClass::VendorUrl => match detector {
             Detector::Domain | Detector::BinaryString | Detector::LockfileField => {

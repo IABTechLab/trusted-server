@@ -323,3 +323,84 @@ fn reject_reserved_fields(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use serde::Deserialize;
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Task7CheckedManifest {
+        template: Task7CheckedTemplate,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CheckedTemplate {
+        profile_ids: BTreeSet<String>,
+    }
+
+    fn task7_checked_profile_ids() -> BTreeSet<String> {
+        let checked: Task7CheckedManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/settings-companions.toml"
+        )))
+        .expect("checked Task 7 settings manifest should parse");
+        checked.template.profile_ids
+    }
+
+    #[test]
+    fn task7_profile_registry_and_compiler_probes_are_exact() {
+        let registrations = profile_registrations()
+            .iter()
+            .map(|registration| registration.id.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            registrations,
+            BTreeSet::from([
+                APS_PROFILE_ID.to_owned(),
+                PREBID_PROFILE_ID.to_owned(),
+                STANDARD_PROFILE_ID.to_owned(),
+            ])
+        );
+        assert_eq!(
+            registrations,
+            task7_checked_profile_ids(),
+            "profile registry and checked documentation record should be equal"
+        );
+
+        for (id, positive, negative) in [
+            (
+                STANDARD_PROFILE_ID,
+                json!({"request_ext": {"fictional": true}}),
+                json!({"unknown": true}),
+            ),
+            (
+                PREBID_PROFILE_ID,
+                json!({"debug": true}),
+                json!({"unknown": true}),
+            ),
+            (
+                APS_PROFILE_ID,
+                json!({"account_id": "fictional-account"}),
+                json!({}),
+            ),
+        ] {
+            let registration = find_profile(id).expect("registered profile should resolve");
+            let compiled = registration
+                .compile(&positive)
+                .unwrap_or_else(|error| panic!("{id} positive probe should compile: {error:?}"));
+            assert_eq!(compiled.id(), id);
+            let error = registration
+                .compile(&negative)
+                .expect_err("negative profile probe should fail");
+            assert!(
+                error.to_string().contains("profile_config"),
+                "{id} negative probe should identify profile_config: {error:?}"
+            );
+        }
+    }
+}

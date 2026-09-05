@@ -2791,6 +2791,10 @@ path = "tools/docs-parity/manifests/sensitive-allowlist.toml"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/manifests/settings-companions.toml"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/manifests/tracked-files.toml"
 kind = "text"
 
@@ -2823,6 +2827,10 @@ path = "tools/docs-parity/src/scanner.rs"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/src/settings.rs"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/tests/classification.rs"
 kind = "text"
 
@@ -2840,6 +2848,10 @@ kind = "text"
 
 [[files]]
 path = "tools/docs-parity/tests/scanner.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/settings.rs"
 kind = "text"
 
 [[files]]

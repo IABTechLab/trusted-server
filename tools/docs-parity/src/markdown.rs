@@ -3906,8 +3906,14 @@ mod process_tests {
     fn bounded_process_overflow_kills_and_reaps_the_child() {
         let fixture = process_fixture(concat!(
             "printf '0123456789012345678901234567890123456789012345678901234567890123'\n",
+            ": > \"$1\"\n",
             "exec /bin/sleep 60\n",
         ));
+        let ready = fixture.path().join("stdout-ready");
+        let arguments = [ready
+            .to_str()
+            .expect("should have UTF-8 readiness path")
+            .to_owned()];
         let mut observed_pid = None;
 
         let error = run_bounded_process_with_observer(
@@ -3916,12 +3922,12 @@ mod process_tests {
                 .join("process.sh")
                 .to_str()
                 .expect("should have UTF-8 fixture path"),
-            &[],
+            &arguments,
             32,
             Duration::from_secs(5),
             |pid| {
                 observed_pid = Some(pid);
-                Ok(())
+                wait_for_fixture_readiness(&ready)
             },
         )
         .expect_err("overflowing child should be terminated");
@@ -4014,6 +4020,31 @@ mod process_tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("should make process fixture executable");
         fixture
+    }
+
+    fn wait_for_fixture_readiness(path: &std::path::Path) -> Result<(), String> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("fixture readiness timeout should fit");
+        loop {
+            match path.try_exists() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect process-fixture readiness {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "process fixture did not report readiness at {}",
+                    path.display()
+                ));
+            }
+            thread::yield_now();
+        }
     }
 
     fn assert_reaped(pid: u32) {
