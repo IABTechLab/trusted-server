@@ -230,8 +230,7 @@ fn public_frontmatter_missing_hero_asset_uses_the_link_checker() {
             "---\n",
             "layout: home\n",
             "hero:\n",
-            "  image:\n",
-            "    src: /images/missing-hero.jpeg\n",
+            "  image: /images/missing-hero.jpeg\n",
             "  actions:\n",
             "    - text: Guide\n",
             "      link: /guide/\n",
@@ -289,6 +288,85 @@ fn public_frontmatter_external_actions_are_in_external_inventory() {
         transport.requests[0].url,
         "https://docs.example.invalid/project"
     );
+}
+
+#[test]
+fn public_frontmatter_themeable_images_check_both_variants() {
+    let markdown = concat!(
+        "---\nlayout: home\nhero:\n  image:\n",
+        "    light: /images/hero.jpeg\n",
+        "    dark: https://dark.example.invalid/hero.jpeg\n",
+        "  actions:\n    - text: Guide\n      link: /guide/\n",
+        "features:\n  - title: Themeable\n    icon:\n",
+        "      light: https://light.example.invalid/icon.svg\n",
+        "      dark: /images/hero.jpeg\n",
+        "  - title: Source object\n    icon:\n",
+        "      src: https://source.example.invalid/icon.svg\n",
+        "  - title: Inline icon\n    icon: '🛡️'\n",
+        "---\n# Home\n[guide](/guide/)\n",
+    );
+    let repository = PublicationRepository::new();
+    fs::write(repository.path().join("docs/index.md"), markdown)
+        .expect("should write themeable frontmatter");
+
+    let local = repository.check();
+    assert_eq!(
+        status_code(&local),
+        SUCCESS,
+        "local theme variants should resolve: {}",
+        diagnostic(&local)
+    );
+
+    let sources = [source("docs/index.md", LinkSourceSet::Public, markdown)];
+    let mut transport = FakeTransport {
+        responses: vec![
+            response(200, None, None),
+            response(200, None, None),
+            response(200, None, None),
+        ]
+        .into(),
+        requests: Vec::new(),
+    };
+    let mut sleeper = FakeSleeper::default();
+    check_external_links(&sources, &[], 0, &mut transport, &mut sleeper)
+        .expect("external theme variants should be checked");
+    assert_eq!(
+        transport
+            .requests
+            .iter()
+            .map(|request| request.url.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "https://dark.example.invalid/hero.jpeg",
+            "https://light.example.invalid/icon.svg",
+            "https://source.example.invalid/icon.svg",
+        ]
+    );
+}
+
+#[test]
+fn public_frontmatter_themeable_images_require_complete_string_pairs() {
+    let cases = [
+        "---\nhero:\n  image:\n    light: /images/hero.jpeg\n---\n# Home\n[guide](/guide/)\n",
+        "---\nhero:\n  image:\n    light: /images/hero.jpeg\n    dark: 42\n---\n# Home\n[guide](/guide/)\n",
+        "---\nhero:\n  image:\n    light: /images/hero.jpeg\n    dark: /../secret.png\n---\n# Home\n[guide](/guide/)\n",
+        "---\nfeatures:\n  - title: Missing\n    icon:\n      dark: /images/hero.jpeg\n---\n# Home\n[guide](/guide/)\n",
+        "---\nfeatures:\n  - title: Wrong\n    icon:\n      light: false\n      dark: /images/hero.jpeg\n---\n# Home\n[guide](/guide/)\n",
+    ];
+    for markdown in cases {
+        let repository = PublicationRepository::new();
+        fs::write(repository.path().join("docs/index.md"), markdown)
+            .expect("should write invalid themeable frontmatter");
+
+        let result = repository.check();
+
+        assert_eq!(
+            status_code(&result),
+            ERROR,
+            "invalid theme pair must fail: {markdown}"
+        );
+        assert!(!diagnostic(&result).contains("orphan inventory"));
+    }
 }
 
 #[test]
@@ -544,6 +622,26 @@ fn public_and_repository_heading_slugs_follow_their_renderers() {
     );
     check_local_links(&[repository_source, repository_target], &[], &[])
         .expect("GitHub heading slugs should resolve");
+}
+
+#[test]
+fn vitepress_unicode_lowercase_uses_contextual_final_sigma() {
+    let target_name = format!("target.{}", "md");
+    let target = source(
+        "docs/guide/target.md",
+        LinkSourceSet::Public,
+        "# ΟΣ\n# ΟΣΑ\n# ΌΣ\n# ΟΣ́\n",
+    );
+    let links = source(
+        "docs/guide/source.md",
+        LinkSourceSet::Public,
+        &format!(
+            "[final]({target_name}#ος)\n[medial]({target_name}#οσα)\n[decomposed before]({target_name}#ος-1)\n[decomposed after]({target_name}#ος-2)\n"
+        ),
+    );
+
+    check_local_links(&[links, target], &[], &[])
+        .expect("VitePress lowercase should apply the Unicode Final_Sigma context");
 }
 
 #[test]
@@ -1278,6 +1376,11 @@ fn curl_transport_rejects_duplicate_security_headers_and_malformed_intermediate_
         [("Location", "/one"), ("Location", "/two")],
         [("Retry-After", "1"), ("Retry-After", "2")],
         [("Content-Length", "0"), ("Content-Length", "0")],
+        [
+            ("Transfer-Encoding", "chunked"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        [("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")],
     ] {
         let runner = FakeCommandRunner {
             outputs: vec![Ok(curl_output("200 OK", &headers, b""))].into(),

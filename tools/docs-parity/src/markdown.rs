@@ -4,13 +4,17 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{
+    LazyLock,
+    mpsc::{self, TryRecvError},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use error_stack::{Report, ResultExt as _};
 use github_slugger::Slugger as GithubSlugger;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use regex::Regex;
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde_yaml::Value as YamlValue;
@@ -333,7 +337,7 @@ pub(crate) fn generate(
     if update {
         for (path, original, contents) in updates {
             repository
-                .write_atomically(&path, Some(&original), &contents)
+                .replace_atomically_after_precommit_validation(&path, Some(&original), &contents)
                 .change_context(MarkdownError::GeneratedRecord {
                     detail: format!(
                         "cannot atomically update generated target: {}",
@@ -1316,14 +1320,7 @@ fn extract_frontmatter_links(
                     push_frontmatter_link(path, destination, end, links)?;
                 }
                 YamlValue::Mapping(image) => {
-                    if let Some(source) = yaml_field(image, "src") {
-                        let source = source.as_str().ok_or_else(|| {
-                            local_error(format!(
-                                "{path} frontmatter hero.image.src must be a string"
-                            ))
-                        })?;
-                        push_frontmatter_link(path, source, end, links)?;
-                    }
+                    extract_themeable_image_links(path, "hero.image", image, end, links)?
                 }
                 _ => {
                     return Err(local_error(format!(
@@ -1378,19 +1375,44 @@ fn extract_feature_links(
             })?;
             push_frontmatter_link(path, destination, end, links)?;
         }
-        if let Some(icon) = yaml_field(feature, "icon")
-            && let YamlValue::Mapping(icon) = icon
-            && let Some(source) = yaml_field(icon, "src")
-        {
-            let source = source.as_str().ok_or_else(|| {
-                local_error(format!(
-                    "{path} frontmatter feature icon src must be a string"
-                ))
-            })?;
-            push_frontmatter_link(path, source, end, links)?;
+        if let Some(icon) = yaml_field(feature, "icon") {
+            match icon {
+                YamlValue::String(_) => {}
+                YamlValue::Mapping(icon) => {
+                    extract_themeable_image_links(path, "feature icon", icon, end, links)?;
+                }
+                _ => {
+                    return Err(local_error(format!(
+                        "{path} frontmatter feature icon must be a string or mapping"
+                    )));
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn extract_themeable_image_links(
+    path: &str,
+    field: &str,
+    image: &serde_yaml::Mapping,
+    end: usize,
+    links: &mut Vec<ParsedLink>,
+) -> Result<(), Report<MarkdownError>> {
+    if let Some(source) = yaml_field(image, "src") {
+        let source = source.as_str().ok_or_else(|| {
+            local_error(format!("{path} frontmatter {field}.src must be a string"))
+        })?;
+        return push_frontmatter_link(path, source, end, links);
+    }
+    let light = yaml_field(image, "light")
+        .and_then(YamlValue::as_str)
+        .ok_or_else(|| local_error(format!("{path} frontmatter {field}.light must be a string")))?;
+    let dark = yaml_field(image, "dark")
+        .and_then(YamlValue::as_str)
+        .ok_or_else(|| local_error(format!("{path} frontmatter {field}.dark must be a string")))?;
+    push_frontmatter_link(path, light, end, links)?;
+    push_frontmatter_link(path, dark, end, links)
 }
 
 fn yaml_field<'a>(mapping: &'a serde_yaml::Mapping, name: &str) -> Option<&'a YamlValue> {
@@ -1527,9 +1549,7 @@ fn vitepress_slugify(value: &str) -> String {
             output.push('-');
             pending_separator = false;
         }
-        for lowercase in character.to_lowercase() {
-            output.push(lowercase);
-        }
+        output.push(character);
     }
     while output.ends_with('-') {
         output.pop();
@@ -1537,7 +1557,55 @@ fn vitepress_slugify(value: &str) -> String {
     if output.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         output.insert(0, '_');
     }
+    unicode_default_lowercase(&output)
+}
+
+fn unicode_default_lowercase(value: &str) -> String {
+    static CASED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\p{Cased}$").expect("should compile the Unicode Cased property")
+    });
+    static CASE_IGNORABLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\p{Case_Ignorable}$")
+            .expect("should compile the Unicode Case_Ignorable property")
+    });
+
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    for (index, character) in characters.iter().copied().enumerate() {
+        if character == '\u{03a3}'
+            && final_sigma_context(&characters, index, &CASED, &CASE_IGNORABLE)
+        {
+            output.push('\u{03c2}');
+        } else {
+            output.extend(character.to_lowercase());
+        }
+    }
     output
+}
+
+fn final_sigma_context(
+    characters: &[char],
+    index: usize,
+    cased: &Regex,
+    case_ignorable: &Regex,
+) -> bool {
+    let preceded_by_cased = characters[..index]
+        .iter()
+        .rev()
+        .copied()
+        .find(|character| !unicode_property(case_ignorable, *character))
+        .is_some_and(|character| unicode_property(cased, character));
+    let followed_by_cased = characters[index + 1..]
+        .iter()
+        .copied()
+        .find(|character| !unicode_property(case_ignorable, *character))
+        .is_some_and(|character| unicode_property(cased, character));
+    preceded_by_cased && !followed_by_cased
+}
+
+fn unicode_property(property: &Regex, character: char) -> bool {
+    let mut buffer = [0_u8; 4];
+    property.is_match(character.encode_utf8(&mut buffer))
 }
 
 fn vitepress_special(character: char) -> bool {
@@ -2844,9 +2912,38 @@ fn run_bounded_process(
     maximum_output_bytes: usize,
     timeout: Duration,
 ) -> Result<CommandOutput, String> {
-    run_bounded_process_with_environment(executable, arguments, maximum_output_bytes, timeout, &[])
+    run_bounded_process_with_environment_and_observer(
+        executable,
+        arguments,
+        maximum_output_bytes,
+        timeout,
+        &[],
+        |_pid| Ok(()),
+    )
 }
 
+#[cfg(test)]
+fn run_bounded_process_with_observer<F>(
+    executable: &str,
+    arguments: &[String],
+    maximum_output_bytes: usize,
+    timeout: Duration,
+    observer: F,
+) -> Result<CommandOutput, String>
+where
+    F: FnOnce(u32) -> Result<(), String>,
+{
+    run_bounded_process_with_environment_and_observer(
+        executable,
+        arguments,
+        maximum_output_bytes,
+        timeout,
+        &[],
+        observer,
+    )
+}
+
+#[cfg(test)]
 fn run_bounded_process_with_environment(
     executable: &str,
     arguments: &[String],
@@ -2854,6 +2951,27 @@ fn run_bounded_process_with_environment(
     timeout: Duration,
     initial_environment: &[(&str, &str)],
 ) -> Result<CommandOutput, String> {
+    run_bounded_process_with_environment_and_observer(
+        executable,
+        arguments,
+        maximum_output_bytes,
+        timeout,
+        initial_environment,
+        |_pid| Ok(()),
+    )
+}
+
+fn run_bounded_process_with_environment_and_observer<F>(
+    executable: &str,
+    arguments: &[String],
+    maximum_output_bytes: usize,
+    timeout: Duration,
+    initial_environment: &[(&str, &str)],
+    observer: F,
+) -> Result<CommandOutput, String>
+where
+    F: FnOnce(u32) -> Result<(), String>,
+{
     if timeout.is_zero() {
         return Err("process timeout must be positive".to_owned());
     }
@@ -2867,52 +2985,80 @@ fn run_bounded_process_with_environment(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("cannot start {executable}: {error}"))?;
+    if let Err(error) = observer(child.id()) {
+        return Err(cleanup_spawned_process(&mut child, error));
+    }
+    let deadline = match Instant::now().checked_add(timeout) {
+        Some(deadline) => deadline,
+        None => {
+            return Err(cleanup_spawned_process(
+                &mut child,
+                "process timeout overflowed".to_owned(),
+            ));
+        }
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            return Err(cleanup_process_error(
+            return Err(cleanup_spawned_process(
                 &mut child,
                 format!("{executable} stdout pipe is unavailable"),
             ));
         }
     };
+    let (ready_sender, ready_receiver) = mpsc::channel();
     let (sender, receiver) = mpsc::sync_channel(1);
     let reader = match thread::Builder::new()
         .name("docs-parity-stdout".to_owned())
         .spawn(move || {
+            let _send_result = ready_sender.send(());
             let result = read_bounded_stdout(stdout, maximum_output_bytes);
-            let _send_result = sender.send(result);
+            let _send_result = sender.send(());
+            result
         }) {
         Ok(reader) => reader,
         Err(error) => {
-            return Err(cleanup_process_error(
+            return Err(cleanup_spawned_process(
                 &mut child,
                 format!("cannot start bounded stdout reader: {error}"),
             ));
         }
     };
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        cleanup_process_error(&mut child, "process timeout overflowed".to_owned())
-    })?;
+    let mut reader = Some(reader);
+    let reader_ready = deadline.saturating_duration_since(Instant::now());
+    match ready_receiver.recv_timeout(reader_ready) {
+        Ok(()) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(finish_process_failure(
+                &mut child,
+                reader.take(),
+                format!("{executable} exceeded wall-clock timeout before stdout reader readiness"),
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(finish_process_failure(
+                &mut child,
+                reader.take(),
+                "bounded stdout reader disconnected before readiness".to_owned(),
+            ));
+        }
+    }
     let mut status = None;
     let mut output = None;
     loop {
         if output.is_none() {
             match receiver.try_recv() {
-                Ok(Ok(bytes)) => output = Some(bytes),
-                Ok(Err(error)) => {
-                    let cleanup = cleanup_process_error(&mut child, error);
-                    let _reader_result = reader.join();
-                    return Err(cleanup);
-                }
+                Ok(()) => match join_stdout_reader(reader.take()) {
+                    Ok(bytes) => output = Some(bytes),
+                    Err(error) => return Err(cleanup_spawned_process(&mut child, error)),
+                },
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    let cleanup = cleanup_process_error(
+                    return Err(finish_process_failure(
                         &mut child,
+                        reader.take(),
                         "bounded stdout reader disconnected".to_owned(),
-                    );
-                    let _reader_result = reader.join();
-                    return Err(cleanup);
+                    ));
                 }
             }
         }
@@ -2921,21 +3067,17 @@ fn run_bounded_process_with_environment(
                 Ok(Some(exited)) => status = Some(exited),
                 Ok(None) => {}
                 Err(error) => {
-                    let cleanup = cleanup_process_error(
+                    return Err(finish_process_failure(
                         &mut child,
+                        reader.take(),
                         format!("cannot inspect {executable} process: {error}"),
-                    );
-                    let _reader_result = reader.join();
-                    return Err(cleanup);
+                    ));
                 }
             }
         }
         if let Some(status) = status
             && let Some(stdout) = output.take()
         {
-            reader
-                .join()
-                .map_err(|_panic| "bounded stdout reader panicked".to_owned())?;
             return Ok(CommandOutput {
                 success: status.success(),
                 status_code: status.code(),
@@ -2943,17 +3085,34 @@ fn run_bounded_process_with_environment(
             });
         }
         if Instant::now() >= deadline {
-            let cleanup = cleanup_process_error(
+            if let Ok(()) = receiver.try_recv() {
+                match join_stdout_reader(reader.take()) {
+                    Ok(bytes) => {
+                        output = Some(bytes);
+                        continue;
+                    }
+                    Err(error) => return Err(cleanup_spawned_process(&mut child, error)),
+                }
+            }
+            return Err(finish_process_failure(
                 &mut child,
+                reader.take(),
                 format!("{executable} exceeded wall-clock timeout"),
-            );
-            let _reader_result = reader.join();
-            return Err(cleanup);
+            ));
         }
         thread::sleep(
             PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
         );
     }
+}
+
+fn join_stdout_reader(
+    reader: Option<thread::JoinHandle<Result<Vec<u8>, String>>>,
+) -> Result<Vec<u8>, String> {
+    reader
+        .expect("reader should exist until it signals completion")
+        .join()
+        .map_err(|_panic| "bounded stdout reader panicked".to_owned())?
 }
 
 fn read_bounded_stdout(
@@ -2977,23 +3136,58 @@ fn read_bounded_stdout(
     Ok(bytes)
 }
 
-fn cleanup_process_error(child: &mut std::process::Child, error: String) -> String {
-    let cleanup = match child.try_wait() {
-        Ok(Some(_status)) => Ok(()),
-        Ok(None) => child.kill().and_then(|()| child.wait().map(|_status| ())),
-        Err(try_error) => child
-            .kill()
-            .and_then(|()| child.wait().map(|_status| ()))
-            .map_err(|cleanup_error| {
-                std::io::Error::other(format!(
-                    "try_wait failed: {try_error}; kill/wait failed: {cleanup_error}"
-                ))
-            }),
-    };
-    match cleanup {
-        Ok(()) => error,
-        Err(cleanup_error) => format!("{error}; process cleanup failed: {cleanup_error}"),
+trait ProcessCleanup {
+    fn poll_exited(&mut self) -> std::io::Result<bool>;
+    fn kill_owned(&mut self) -> std::io::Result<()>;
+    fn wait_owned(&mut self) -> std::io::Result<()>;
+}
+
+impl ProcessCleanup for std::process::Child {
+    fn poll_exited(&mut self) -> std::io::Result<bool> {
+        self.try_wait().map(|status| status.is_some())
     }
+
+    fn kill_owned(&mut self) -> std::io::Result<()> {
+        self.kill()
+    }
+
+    fn wait_owned(&mut self) -> std::io::Result<()> {
+        self.wait().map(|_status| ())
+    }
+}
+
+fn cleanup_spawned_process(process: &mut impl ProcessCleanup, primary: String) -> String {
+    let mut diagnostics = vec![primary];
+    let exited = match process.poll_exited() {
+        Ok(exited) => exited,
+        Err(error) => {
+            diagnostics.push(format!("process poll failed during cleanup: {error}"));
+            false
+        }
+    };
+    if !exited && let Err(error) = process.kill_owned() {
+        diagnostics.push(format!("process kill failed during cleanup: {error}"));
+    }
+    if let Err(error) = process.wait_owned() {
+        diagnostics.push(format!("process wait failed during cleanup: {error}"));
+    }
+    diagnostics.join("; ")
+}
+
+fn finish_process_failure(
+    process: &mut impl ProcessCleanup,
+    reader: Option<thread::JoinHandle<Result<Vec<u8>, String>>>,
+    primary: String,
+) -> String {
+    let mut diagnostic = cleanup_spawned_process(process, primary);
+    if let Some(reader) = reader {
+        match reader.join() {
+            Ok(Ok(_bytes)) => {}
+            Ok(Err(error)) => diagnostic.push_str(&format!("; stdout reader failed: {error}")),
+            Err(_panic) => diagnostic.push_str("; stdout reader panicked"),
+        }
+    }
+    diagnostic
 }
 
 /// HTTPS-only, non-redirecting curl transport with an injectable command seam.
@@ -3192,7 +3386,7 @@ fn parse_curl_header_block(block: &str) -> Result<(u16, Vec<ExternalHeader>), St
         return Err("curl status line is malformed".to_owned());
     }
     let mut headers = Vec::new();
-    let mut singleton_fields = BTreeSet::new();
+    let mut duplicate_forbidden_fields = BTreeSet::new();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -3211,7 +3405,9 @@ fn parse_curl_header_block(block: &str) -> Result<(u16, Vec<ExternalHeader>), St
         if value.len() > MAXIMUM_HEADER_VALUE_BYTES || value.chars().any(char::is_control) {
             return Err("curl header value exceeds bounds".to_owned());
         }
-        if singleton_header_name(&name) && !singleton_fields.insert(name.clone()) {
+        if duplicate_forbidden_header_name(&name)
+            && !duplicate_forbidden_fields.insert(name.clone())
+        {
             return Err(format!("duplicate curl response header: {name}"));
         }
         headers.push(ExternalHeader {
@@ -3424,7 +3620,7 @@ fn validate_response_headers(
         .iter()
         .map(|field| field.name.len() + field.value.len() + 4)
         .sum::<usize>();
-    let mut singleton_fields = BTreeSet::new();
+    let mut duplicate_forbidden_fields = BTreeSet::new();
     if response.header_bytes > MAXIMUM_RESPONSE_HEADER_BYTES
         || total > MAXIMUM_RESPONSE_HEADER_BYTES
         || response.headers.iter().any(|field| {
@@ -3433,8 +3629,8 @@ fn validate_response_headers(
                 || field.name.len() + field.value.len() + 4 > MAXIMUM_HEADER_LINE_BYTES
                 || !valid_header_name(&field.name)
                 || field.value.chars().any(char::is_control)
-                || (singleton_header_name(&field.name.to_ascii_lowercase())
-                    && !singleton_fields.insert(field.name.to_ascii_lowercase()))
+                || (duplicate_forbidden_header_name(&field.name.to_ascii_lowercase())
+                    && !duplicate_forbidden_fields.insert(field.name.to_ascii_lowercase()))
         })
     {
         return Err(external_error("response headers exceed bounds"));
@@ -3454,7 +3650,7 @@ impl ExternalResponse {
     }
 }
 
-fn singleton_header_name(name: &str) -> bool {
+fn duplicate_forbidden_header_name(name: &str) -> bool {
     matches!(
         name,
         "location" | "retry-after" | "content-length" | "transfer-encoding" | "content-encoding"
@@ -3637,6 +3833,7 @@ fn external_error(detail: impl Into<String>) -> Report<MarkdownError> {
 #[cfg(test)]
 mod process_tests {
     use std::fs;
+    use std::io;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
 
@@ -3668,66 +3865,210 @@ mod process_tests {
     #[test]
     fn bounded_process_times_out_kills_and_reaps_a_silent_child() {
         let fixture = process_fixture("exec /bin/sleep 60\n");
-        let pid_path = fixture.path().join("pid");
+        let mut observed_pid = None;
 
-        let error = run_bounded_process(
+        let error = run_bounded_process_with_observer(
             fixture
                 .path()
                 .join("process.sh")
                 .to_str()
                 .expect("should have UTF-8 fixture path"),
-            &[pid_path.display().to_string()],
+            &[],
             32,
             Duration::from_millis(500),
+            |pid| {
+                observed_pid = Some(pid);
+                Ok(())
+            },
         )
         .expect_err("silent child should time out");
 
         assert!(error.contains("wall-clock timeout"));
-        assert_reaped(&pid_path);
+        assert_reaped(observed_pid.expect("should observe the child synchronously"));
     }
 
     #[test]
     fn bounded_process_overflow_kills_and_reaps_the_child() {
-        let fixture = process_fixture("exec /usr/bin/yes x\n");
-        let pid_path = fixture.path().join("pid");
+        let fixture = process_fixture(concat!(
+            "printf '0123456789012345678901234567890123456789012345678901234567890123'\n",
+            "exec /bin/sleep 60\n",
+        ));
+        let mut observed_pid = None;
 
-        let error = run_bounded_process(
+        let error = run_bounded_process_with_observer(
             fixture
                 .path()
                 .join("process.sh")
                 .to_str()
                 .expect("should have UTF-8 fixture path"),
-            &[pid_path.display().to_string()],
+            &[],
             32,
-            Duration::from_secs(1),
+            Duration::from_secs(5),
+            |pid| {
+                observed_pid = Some(pid);
+                Ok(())
+            },
         )
         .expect_err("overflowing child should be terminated");
 
-        assert!(error.contains("stdout exceeds 32 bytes"));
-        assert_reaped(&pid_path);
+        assert!(
+            error.contains("stdout exceeds 32 bytes"),
+            "overflow should take precedence over timeout: {error}"
+        );
+        assert_reaped(observed_pid.expect("should observe the child synchronously"));
+    }
+
+    #[test]
+    fn deadline_overflow_kills_waits_and_reaps_the_observed_child() {
+        let fixture = process_fixture("exec /bin/sleep 60\n");
+        let mut observed_pid = None;
+
+        let error = run_bounded_process_with_observer(
+            fixture
+                .path()
+                .join("process.sh")
+                .to_str()
+                .expect("should have UTF-8 fixture path"),
+            &[],
+            32,
+            Duration::MAX,
+            |pid| {
+                observed_pid = Some(pid);
+                Ok(())
+            },
+        )
+        .expect_err("overflowed deadline should terminate the spawned child");
+
+        assert!(error.contains("timeout overflowed"));
+        assert_reaped(observed_pid.expect("should observe the child synchronously"));
+    }
+
+    #[test]
+    fn cleanup_waits_after_kill_failure_and_retains_every_diagnostic() {
+        let mut process = FakeCleanupProcess::running_with_failures();
+
+        let error = cleanup_spawned_process(&mut process, "primary failure".to_owned());
+
+        assert_eq!(process.calls, ["poll", "kill", "wait"]);
+        assert!(error.contains("primary failure"));
+        assert!(error.contains("injected kill failure"));
+        assert!(error.contains("injected wait failure"));
+    }
+
+    #[test]
+    fn cleanup_waits_without_killing_an_already_exited_child() {
+        let mut process = FakeCleanupProcess::exited();
+
+        let error = cleanup_spawned_process(&mut process, "primary failure".to_owned());
+
+        assert_eq!(process.calls, ["poll", "wait"]);
+        assert_eq!(error, "primary failure");
+    }
+
+    #[test]
+    fn cleanup_retains_reader_error_while_reaping_the_process() {
+        let mut process = FakeCleanupProcess::running();
+        let reader = thread::spawn(|| -> Result<Vec<u8>, String> {
+            Err("injected concurrent reader failure".to_owned())
+        });
+
+        let error =
+            finish_process_failure(&mut process, Some(reader), "primary failure".to_owned());
+
+        assert_eq!(process.calls, ["poll", "kill", "wait"]);
+        assert!(error.contains("primary failure"));
+        assert!(error.contains("injected concurrent reader failure"));
+    }
+
+    #[test]
+    fn bounded_reader_reports_read_errors_and_overflow() {
+        let read_error =
+            read_bounded_stdout(FailingReader, 32).expect_err("reader failure should be retained");
+        let overflow = read_bounded_stdout(&b"overflow"[..], 4)
+            .expect_err("reader overflow should be retained");
+
+        assert!(read_error.contains("injected reader failure"));
+        assert!(overflow.contains("stdout exceeds 4 bytes"));
     }
 
     fn process_fixture(command: &str) -> tempfile::TempDir {
         let fixture = tempfile::tempdir().expect("should create process fixture");
         let executable = fixture.path().join("process.sh");
-        fs::write(
-            &executable,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\n{command}"),
-        )
-        .expect("should write process fixture");
+        fs::write(&executable, format!("#!/bin/sh\n{command}"))
+            .expect("should write process fixture");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("should make process fixture executable");
         fixture
     }
 
-    fn assert_reaped(pid_path: &Path) {
-        let pid = fs::read_to_string(pid_path).expect("should read child PID");
+    fn assert_reaped(pid: u32) {
         let status = Command::new("/bin/kill")
-            .args(["-0", pid.trim()])
+            .args(["-0", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .expect("should inspect child process");
         assert!(!status.success(), "child process should be reaped");
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected reader failure"))
+        }
+    }
+
+    struct FakeCleanupProcess {
+        exited: bool,
+        kill_error: Option<io::Error>,
+        wait_error: Option<io::Error>,
+        calls: Vec<&'static str>,
+    }
+
+    impl FakeCleanupProcess {
+        fn running() -> Self {
+            Self {
+                exited: false,
+                kill_error: None,
+                wait_error: None,
+                calls: Vec::new(),
+            }
+        }
+
+        fn running_with_failures() -> Self {
+            Self {
+                exited: false,
+                kill_error: Some(io::Error::other("injected kill failure")),
+                wait_error: Some(io::Error::other("injected wait failure")),
+                calls: Vec::new(),
+            }
+        }
+
+        fn exited() -> Self {
+            Self {
+                exited: true,
+                kill_error: None,
+                wait_error: None,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl ProcessCleanup for FakeCleanupProcess {
+        fn poll_exited(&mut self) -> io::Result<bool> {
+            self.calls.push("poll");
+            Ok(self.exited)
+        }
+
+        fn kill_owned(&mut self) -> io::Result<()> {
+            self.calls.push("kill");
+            self.kill_error.take().map_or(Ok(()), Err)
+        }
+
+        fn wait_owned(&mut self) -> io::Result<()> {
+            self.calls.push("wait");
+            self.wait_error.take().map_or(Ok(()), Err)
+        }
     }
 }

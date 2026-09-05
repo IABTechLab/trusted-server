@@ -285,7 +285,7 @@ fn update(
         .tracked_paths_record()
         .change_context(DocsParityError::Repository)?;
     repository
-        .write_atomically(&record, original.as_deref(), &expected)
+        .replace_atomically_after_precommit_validation(&record, original.as_deref(), &expected)
         .change_context(DocsParityError::Repository)?;
     Ok(Outcome::Updated)
 }

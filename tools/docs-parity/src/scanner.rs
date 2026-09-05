@@ -2084,7 +2084,7 @@ where
         .read_optional(&normalized)
         .change_context(ScannerError::Bootstrap)?;
     repository
-        .write_atomically(&normalized, original.as_deref(), &contents)
+        .replace_atomically_after_precommit_validation(&normalized, original.as_deref(), &contents)
         .change_context(ScannerError::Bootstrap)
 }
 

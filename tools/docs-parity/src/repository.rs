@@ -1,8 +1,8 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{ErrorKind, Write as _};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -223,35 +223,22 @@ impl Repository {
         self.validate_existing(path, false)
     }
 
-    pub(crate) fn write_atomically(
+    pub(crate) fn replace_atomically_after_precommit_validation(
         &self,
         path: &NormalizedRelativePath,
         expected_original: Option<&[u8]>,
         contents: &[u8],
     ) -> Result<(), Report<RepositoryError>> {
-        self.write_atomically_after_stage(path, expected_original, contents, || Ok(()))
-    }
-
-    fn write_atomically_after_stage<F>(
-        &self,
-        path: &NormalizedRelativePath,
-        expected_original: Option<&[u8]>,
-        contents: &[u8],
-        after_stage: F,
-    ) -> Result<(), Report<RepositoryError>>
-    where
-        F: FnOnce() -> Result<(), std::io::Error>,
-    {
-        self.write_atomically_with_commit(
+        self.replace_atomically_with_hooks(
             path,
             expected_original,
             contents,
-            after_stage,
+            |_stage| Ok(()),
             |staged, target| fs::rename(staged, target),
         )
     }
 
-    fn write_atomically_with_commit<F, C>(
+    fn replace_atomically_with_hooks<F, C>(
         &self,
         path: &NormalizedRelativePath,
         expected_original: Option<&[u8]>,
@@ -260,7 +247,7 @@ impl Repository {
         commit: C,
     ) -> Result<(), Report<RepositoryError>>
     where
-        F: FnOnce() -> Result<(), std::io::Error>,
+        F: FnOnce(&Path) -> Result<(), std::io::Error>,
         C: FnOnce(&Path, &Path) -> Result<(), std::io::Error>,
     {
         let absolute = self.root.join(path.as_path());
@@ -271,43 +258,35 @@ impl Repository {
         })?;
         self.create_safe_parent(path, parent)?;
 
-        let temporary = temporary_path(&absolute)?;
-        if final_entry_metadata(&temporary)?.is_some() {
-            fs::remove_file(&temporary)
-                .change_context(RepositoryError::FileOperation)
-                .attach_with(|| format!("remove stale atomic stage: {}", temporary.display()))?;
-            return Err(Report::new(RepositoryError::FileOperation).attach(format!(
-                "removed stale atomic stage: {}",
-                temporary.display()
-            )));
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        let prefix = temporary_prefix(&absolute)?;
+        let mut stage = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempfile_in(parent)
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("create owned atomic stage in: {}", parent.display()))?;
+        let stage_mode = identity.as_ref().map_or(0o644, |value| value.mode & 0o777);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        options.mode(identity.as_ref().map_or(0o644, |value| value.mode & 0o777));
-        let mut file = options
-            .open(&temporary)
+        stage
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(stage_mode))
             .change_context(RepositoryError::FileOperation)
-            .attach_with(|| format!("atomic stage: {}", temporary.display()))?;
-        let mut stage = AtomicStage::new(temporary.clone());
+            .attach_with(|| format!("set atomic stage mode: {}", stage.path().display()))?;
 
-        let write_result = file
+        let write_result = stage
             .write_all(contents)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| stage.as_file().sync_all())
             .change_context(RepositoryError::FileOperation)
-            .attach_with(|| format!("atomic stage: {}", temporary.display()));
+            .attach_with(|| format!("atomic stage: {}", stage.path().display()));
         write_result?;
-        drop(file);
 
-        after_stage()
+        after_stage(stage.path())
             .change_context(RepositoryError::FileOperation)
             .attach("atomic update interrupted after staging")?;
         self.verify_expected_target(path, expected_original, identity.as_ref())?;
 
-        commit(&temporary, &absolute)
+        commit(stage.path(), &absolute)
             .change_context(RepositoryError::FileOperation)
             .attach_with(|| format!("atomic target: {}", absolute.display()))?;
-        stage.disarm();
 
         File::open(parent)
             .and_then(|directory| directory.sync_all())
@@ -519,28 +498,6 @@ impl FileIdentity {
     }
 }
 
-struct AtomicStage {
-    path: Option<PathBuf>,
-}
-
-impl AtomicStage {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for AtomicStage {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 fn final_entry_metadata(path: &Path) -> Result<Option<fs::Metadata>, Report<RepositoryError>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
@@ -551,15 +508,15 @@ fn final_entry_metadata(path: &Path) -> Result<Option<fs::Metadata>, Report<Repo
     }
 }
 
-fn temporary_path(target: &Path) -> Result<PathBuf, Report<RepositoryError>> {
+fn temporary_prefix(target: &Path) -> Result<OsString, Report<RepositoryError>> {
     let file_name = target.file_name().ok_or_else(|| {
         Report::new(RepositoryError::UnsafeRelativePath)
             .attach(format!("target: {}", target.display()))
     })?;
-    let mut temporary_name = OsString::from(".");
-    temporary_name.push(file_name);
-    temporary_name.push(".docs-parity.tmp");
-    Ok(target.with_file_name(temporary_name))
+    let mut prefix = OsString::from(".");
+    prefix.push(file_name);
+    prefix.push(".docs-parity.");
+    Ok(prefix)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -574,6 +531,8 @@ fn unsafe_mode(_metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     fn repository() -> (tempfile::TempDir, Repository, NormalizedRelativePath) {
@@ -586,87 +545,100 @@ mod tests {
     }
 
     #[test]
-    fn atomic_writer_rejects_stale_content_and_cleans_the_stage() {
+    fn atomic_replacement_rejects_stale_content_and_cleans_its_owned_stage() {
         let (directory, repository, path) = repository();
         let target = directory.path().join("record.txt");
         fs::write(&target, b"original").expect("should write original");
 
-        let result =
-            repository.write_atomically_after_stage(&path, Some(b"original"), b"generated", || {
+        let stage = RefCell::new(None);
+        let result = repository.replace_atomically_with_hooks(
+            &path,
+            Some(b"original"),
+            b"generated",
+            |staged| {
+                stage.replace(Some(staged.to_owned()));
                 fs::write(&target, b"concurrent")
-            });
+            },
+            |staged, target| fs::rename(staged, target),
+        );
 
         assert!(result.is_err());
         assert_eq!(
             fs::read(&target).expect("should read concurrent edit"),
             b"concurrent"
         );
-        assert!(
-            !temporary_path(&target)
-                .expect("should derive stage")
-                .exists()
-        );
+        assert_owned_stage_removed(stage);
     }
 
     #[test]
-    fn atomic_writer_rejects_replacement_identity_even_with_equal_bytes() {
+    fn atomic_replacement_rejects_replacement_identity_even_with_equal_bytes() {
         let (directory, repository, path) = repository();
         let target = directory.path().join("record.txt");
         let replacement = directory.path().join("replacement.txt");
         fs::write(&target, b"original").expect("should write original");
 
-        let result =
-            repository.write_atomically_after_stage(&path, Some(b"original"), b"generated", || {
+        let stage = RefCell::new(None);
+        let result = repository.replace_atomically_with_hooks(
+            &path,
+            Some(b"original"),
+            b"generated",
+            |staged| {
+                stage.replace(Some(staged.to_owned()));
                 fs::write(&replacement, b"original")?;
                 fs::rename(&replacement, &target)
-            });
+            },
+            |staged, target| fs::rename(staged, target),
+        );
 
         assert!(result.is_err());
         assert_eq!(
             fs::read(&target).expect("should read replacement"),
             b"original"
         );
-        assert!(
-            !temporary_path(&target)
-                .expect("should derive stage")
-                .exists()
-        );
+        assert_owned_stage_removed(stage);
     }
 
     #[test]
-    fn interrupted_atomic_writer_reaps_its_stage_without_touching_target() {
+    fn interrupted_atomic_replacement_reaps_its_stage_without_touching_target() {
         let (directory, repository, path) = repository();
         let target = directory.path().join("record.txt");
         fs::write(&target, b"original").expect("should write original");
 
-        let result =
-            repository.write_atomically_after_stage(&path, Some(b"original"), b"generated", || {
+        let stage = RefCell::new(None);
+        let result = repository.replace_atomically_with_hooks(
+            &path,
+            Some(b"original"),
+            b"generated",
+            |staged| {
+                stage.replace(Some(staged.to_owned()));
                 Err(std::io::Error::other("injected interruption"))
-            });
+            },
+            |staged, target| fs::rename(staged, target),
+        );
 
         assert!(result.is_err());
         assert_eq!(
             fs::read(&target).expect("should read original"),
             b"original"
         );
-        assert!(
-            !temporary_path(&target)
-                .expect("should derive stage")
-                .exists()
-        );
+        assert_owned_stage_removed(stage);
     }
 
     #[test]
-    fn failed_atomic_rename_cleans_the_stage_and_preserves_the_target() {
+    fn failed_atomic_rename_cleans_its_owned_stage_and_preserves_the_target() {
         let (directory, repository, path) = repository();
         let target = directory.path().join("record.txt");
         fs::write(&target, b"original").expect("should write original");
 
-        let result = repository.write_atomically_with_commit(
+        let stage = RefCell::new(None);
+        let result = repository.replace_atomically_with_hooks(
             &path,
             Some(b"original"),
             b"generated",
-            || Ok(()),
+            |staged| {
+                stage.replace(Some(staged.to_owned()));
+                Ok(())
+            },
             |_stage, _target| Err(std::io::Error::other("injected rename failure")),
         );
 
@@ -675,31 +647,63 @@ mod tests {
             fs::read(&target).expect("should read original"),
             b"original"
         );
-        assert!(
-            !temporary_path(&target)
-                .expect("should derive stage")
-                .exists()
-        );
+        assert_owned_stage_removed(stage);
     }
 
     #[test]
-    fn atomic_writer_rejects_a_concurrently_created_target() {
+    fn atomic_replacement_rejects_a_target_created_before_precommit_validation() {
         let (directory, repository, path) = repository();
         let target = directory.path().join("record.txt");
 
-        let result = repository.write_atomically_after_stage(&path, None, b"generated", || {
-            fs::write(&target, b"concurrent")
-        });
+        let stage = RefCell::new(None);
+        let result = repository.replace_atomically_with_hooks(
+            &path,
+            None,
+            b"generated",
+            |staged| {
+                stage.replace(Some(staged.to_owned()));
+                fs::write(&target, b"concurrent")
+            },
+            |staged, target| fs::rename(staged, target),
+        );
 
         assert!(result.is_err());
         assert_eq!(
             fs::read(&target).expect("should read concurrent creation"),
             b"concurrent"
         );
-        assert!(
-            !temporary_path(&target)
-                .expect("should derive stage")
-                .exists()
+        assert_owned_stage_removed(stage);
+    }
+
+    #[test]
+    fn commit_hook_demonstrates_the_documented_final_syscall_window() {
+        let (directory, repository, path) = repository();
+        let target = directory.path().join("record.txt");
+        fs::write(&target, b"original").expect("should write original");
+
+        repository
+            .replace_atomically_with_hooks(
+                &path,
+                Some(b"original"),
+                b"generated",
+                |_staged| Ok(()),
+                |staged, target| {
+                    fs::write(target, b"change after the precommit check")?;
+                    fs::rename(staged, target)
+                },
+            )
+            .expect("portable rename should replace after the documented check boundary");
+
+        assert_eq!(
+            fs::read(target).expect("should read committed target"),
+            b"generated"
         );
+    }
+
+    fn assert_owned_stage_removed(stage: RefCell<Option<PathBuf>>) {
+        let stage = stage
+            .into_inner()
+            .expect("should observe the unique owned stage path");
+        assert!(!stage.exists(), "owned stage should be removed on failure");
     }
 }

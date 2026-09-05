@@ -2546,33 +2546,69 @@ PY
   a PATH-resolved executable; diagram fingerprints were not part of the
   schema; stale stages remained; and atomic replacement changed a `0644`
   target to `0600`. Each failure was observed before its implementation.
+- The execution-quality re-review established six further RED results before
+  implementation. A child process launched under `umask 077` changed a `0644`
+  generated target to `0600`; a deterministic stage name blocked updates and
+  was deleted as if owned; the public heading `ΟΣ` produced `οσ` instead of
+  VitePress's contextual `ος`; themeable `light`/`dark` images were omitted
+  and incomplete pairs passed; and process inspection found that the deadline
+  began after reader startup, `kill().and_then(wait)` skipped wait on a kill
+  error, cleanup diagnostics were discarded, and PID-file fixtures raced
+  startup. The full-suite RED also retained one obsolete CLI assertion that an
+  unrelated deterministic stage must block an update. Focused implementation
+  runs then passed 6 repository, 8 process, 11 Markdown, and 55 link tests; the
+  corrected CLI target passed all 19 tests.
 - Public pages now parse only an exact, closed YAML frontmatter block bounded
-  to 64 KiB. Known hero image/action and feature link/icon-src shapes are type
-  checked, while non-link prose is ignored. Their targets enter the same local
-  and external link model as CommonMark events. Public root assets resolve
+  to 64 KiB through the maintained YAML-org `yaml_serde` 0.10 compatibility
+  package. Known hero image/action and feature link/icon shapes are type
+  checked, while non-link prose is ignored. Hero images and feature icons
+  support the pinned VitePress 1.6.4 string, `src`, or complete string-valued
+  `light`/`dark` shapes, and both theme targets enter the same local and
+  external link model as CommonMark events. Missing members, wrong types,
+  traversal, and mixed invalid shapes fail closed. Public root assets resolve
   through a literal configured `publicDir` or the checked `docs/public`
   default, with single percent decoding, normalized containment, tracked-file
   membership, and regular non-symlink identity. The real `docs/index.md`
   contributes three checked targets: its hero image, Get Started route, and
   external project action.
-- Atomic writers now receive the expected original bytes, preserve the
-  original safe mode, fsync the staged file and parent directory, and compare
-  target contents, type, device, inode, and mode immediately before rename.
-  Focused fixtures prove rejection without overwrite for same-inode content
-  edits, same-byte inode replacement, concurrent creation, injected
-  interruption, and rename failure; each failed newly created stage is
-  removed. The pre-existing stale-stage fixture now also proves cleanup.
+- Atomic writers now receive the expected original bytes and use a unique,
+  exclusively created, owned sibling stage. Immediately after creation they
+  explicitly restore the captured safe original mode, then fsync the staged
+  file and parent directory and compare target contents, type, device, inode,
+  and mode immediately before rename. A restrictive-umask integration fixture
+  invokes the updater in a child shell, so the `077` mask cannot leak to other
+  parallel tests or survive a fixture panic; its `0644` target remains `0644`.
+  Focused fixtures prove rejection without replacement for same-inode content
+  edits, same-byte inode replacement, concurrent creation observed before the
+  immediate precommit check, injected interruption, and rename failure. Every
+  failure cleans only the owned unique stage, and unrelated peer stages remain
+  untouched. A deterministic commit-hook fixture also proves the documented
+  portability boundary: the immediate precommit check detects preceding
+  changes, but portable rename cannot condition that observation on the final
+  syscall and can replace a noncooperating write made inside that window. The
+  implementation and records therefore do not claim compare-and-swap or
+  protection beyond the observed precommit boundary.
 - Response fields remain in wire order rather than being collapsed into a
   map. All proxy CONNECT and informational blocks are parsed and bounded, and
   only the final response drives redirects/retries. Legal repeated Set-Cookie,
-  Link, and Warning fields pass; duplicate Location, Retry-After,
-  Content-Length, transfer-encoding, and content-encoding fields fail in both
-  parsed and injected responses. The production runner requires
+  Link, and Warning fields pass; duplicate Location, Retry-After, and
+  Content-Length policy singletons fail in both parsed and injected responses.
+  A documented stricter security policy separately rejects repeated
+  Transfer-Encoding and Content-Encoding rather than coalescing their
+  list-shaped values. The production runner requires
   `/usr/bin/curl`, clears PATH/proxy/TLS/curl variables to a fixed C locale,
-  reads stdout concurrently under the request timeout, discards stderr, and
-  kills and reaps on overflow or timeout. Local process fixtures prove silent
-  timeout, overflow cleanup, environment isolation, PATH rejection, and child
-  reaping without network access.
+  fixes the deadline before starting its concurrently bounded stdout reader,
+  and discards stderr. Every post-spawn outcome polls the child, attempts kill
+  only when it is alive, waits regardless of kill failure, and joins the
+  reader. Primary, kill, wait, and join diagnostics are retained together.
+  The runner handshakes reader readiness before polling and prioritizes a
+  received reader completion at the deadline. Local process fixtures use a
+  synchronous post-spawn PID observer rather than a child-written file; the
+  overflow fixture writes more than the cap into the pipe before remaining
+  alive, rather than depending on producer throughput. They prove silent
+  timeout, deadline overflow, reader error, output overflow,
+  kill-error-plus-wait behavior, environment isolation, PATH rejection, and
+  child reaping without network access.
 - All 13 real Mermaid records now bind an exact SHA-256 of semantic fence
   content in addition to path, selector, prose heading, and owner. Content
   edits and content swaps between selector positions fail with a fingerprint
@@ -2589,8 +2625,10 @@ PY
   unknown, and non-standalone markers; unknown records; duplicate row keys;
   wrong cell counts; deterministic row sorting; hand drift; exact CRLF and
   outside-byte preservation; exact owner identity; check-mode no-write;
-  same-directory stale-stage interruption; symlink, unsafe-mode, traversal,
-  and oversized-target rejection; and byte-identical second update. Input
+  unique-stage interruption and cleanup; unrelated peer-stage preservation;
+  restrictive-umask mode preservation; the explicit final-syscall window;
+  symlink, unsafe-mode, traversal, and oversized-target rejection; and
+  byte-identical second update. Input
   manifests, source documents, and rendered output are each bounded to 4 MiB.
   The final focused Markdown target contains 11 passing tests.
 - Semantic Markdown fixtures use event offsets and cover one dead relative link
@@ -2603,7 +2641,10 @@ PY
   explicit IDs. Public headings implement the pinned VitePress 1.6.4 shared
   title/slug contract, including omitted image alt text and hard failure when
   an explicit ID repeats an auto or explicit ID. Auto headings still receive
-  duplicate suffixes. Repository and maintained-internal headings use GitHub
+  duplicate suffixes. Whole-string Unicode default lowercase conversion
+  includes the Final_Sigma cased/case-ignorable context: `ΟΣ`, mixed sigma,
+  and combining-mark fixtures match the pinned renderer. Repository and
+  maintained-internal headings use GitHub
   title/slug semantics, including image alt text, without VitePress IDs.
   Query strings receive the same strict single decoding as paths and fragments,
   even though they do not participate in path resolution. Classified
@@ -2647,18 +2688,25 @@ PY
   transport is reachable only through explicit
   `links --external --check`; no external network check was run or represented
   as a pull-request gate.
-- The final focused links target contains 52 passing tests. A fresh standalone
-  full suite contained 198 passing tests: 10 library unit, 35 classification,
-  19 CLI, 52 links, 11 Markdown, and 71 scanner tests. Fresh local
+- The final focused links target contains 55 passing tests. Repeated default-
+  parallel standalone full suites each contained 207 passing tests: 16 library
+  unit, 35 classification, 19 CLI, 55 links, 11 Markdown, and 71 scanner
+  tests. Fresh local
   `links --local --check`, `generate --check`, `classify --check`, and
   `scan --check` commands exited 0. Formatting and all-target clippy with
   warnings denied also exited 0.
 - Only the standalone dependency graph changed. Direct dependencies add the
   CommonMark event parser, HTML fragment parser, GitHub slugger, Unicode
-  normalization support, and bounded YAML frontmatter parser; their resolved
-  graph adds 48 packages to
+  normalization support, and bounded YAML frontmatter parser. The deprecated
+  `serde_yaml` package and its `unsafe-libyaml` dependency were replaced by
+  YAML-org's maintained drop-in `yaml_serde` 0.10 package and its resolved
+  parser dependency; the 64 KiB frontmatter bound and closed typed extraction
+  remain unchanged. This maintained-parser swap removes `serde_yaml` and
+  `unsafe-libyaml`, adds `yaml_serde` and `libyaml-rs`, and does not change the
+  resolved package count. The resolved graph remains 48 packages larger than
+  the pre-review Task 6 graph in
   `tools/docs-parity/Cargo.lock`, whose SHA-256 is
-  `04d0d834183d87740af87bbfb74aaae2c19bbf362cc98b0f18d872ee84b7d303`.
+  `6d37f997368c92062d1297679e10d3c1f79ebac5ffa5641056318f1dca5e7f92`.
   Root `Cargo.lock`
   remained byte-identical with SHA-256
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
@@ -2671,10 +2719,14 @@ PY
   records moved to their regenerated exact offsets. Synthetic plain `.md` link
   inputs are assembled from split literals, so repository filenames are not
   misclassified as vendor domains. No prior semantic finding was removed.
-  Two classification updates retained identical tracked/source hashes
+  The maintained-parser lock swap preserved the exact 5,391-entry sensitive
+  inventory, classes, paths, and fingerprints; it moved 94 Cargo.lock registry
+  selectors, while the atomic-writer rename moved three scanner source
+  selectors. Two
+  classification updates retained identical tracked/source hashes
   (`9d907be9...` and `d30a510e...`), and repeated scanner bootstraps retained
   sensitive-manifest SHA-256
-  `265ae6ec59a26220134bdaa1e8e7a1b8bc8d109ac663bb2cb7283a4a5349e414`
+  `323fbbd6fa3a3d2336342a1c415195967169ff0680f108d1490cac3c22af009c`
   with `reviewed = true`. Two generated updates were byte-stable; subsequent
   generated, scanner, classification, and local-link check commands all
   exited 0.

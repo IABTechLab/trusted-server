@@ -1592,7 +1592,7 @@ where
         .read_optional(&path)
         .change_context(ClassificationError::Update)?;
     repository
-        .write_atomically(&path, original.as_deref(), &contents)
+        .replace_atomically_after_precommit_validation(&path, original.as_deref(), &contents)
         .change_context(ClassificationError::Update)
 }
 

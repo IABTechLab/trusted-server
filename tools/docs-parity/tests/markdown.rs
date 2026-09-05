@@ -276,7 +276,7 @@ fn generate_check_never_writes_and_update_is_atomic_and_idempotent() {
 }
 
 #[test]
-fn interrupted_generated_write_preserves_the_complete_original() {
+fn generated_update_never_deletes_an_unknown_peer_stage() {
     let document = concat!(
         "<!-- docs-parity:start adapter-support -->\n",
         "old\n",
@@ -286,19 +286,21 @@ fn interrupted_generated_write_preserves_the_complete_original() {
     let target = repository.path().join("docs/generated.md");
     let staged = repository.path().join("docs/.generated.md.docs-parity.tmp");
     fs::write(&staged, "interrupted stage\n").expect("should create stale stage");
-    let before = fs::read(&target).expect("should read original");
-
     let result = output(repository.command().args(["generate", "--update"]));
 
     assert_eq!(
         status_code(&result),
-        ERROR,
-        "stale stage should fail closed"
+        SUCCESS,
+        "an unrelated stage name must not block the owned update: {}",
+        String::from_utf8_lossy(&result.stderr)
     );
-    assert_eq!(fs::read(target).expect("should reread original"), before);
-    assert!(
-        !staged.exists(),
-        "failed atomic update should clean its stale stage"
+    assert_eq!(
+        fs::read_to_string(&staged).expect("should retain unknown peer stage"),
+        "interrupted stage\n"
+    );
+    assert_ne!(
+        fs::read(target).expect("should read generated target"),
+        b"<!-- docs-parity:start adapter-support -->\nold\n<!-- docs-parity:end adapter-support -->\n"
     );
 }
 
@@ -315,7 +317,16 @@ fn generated_atomic_update_preserves_the_original_safe_mode() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
         .expect("should set safe original mode");
 
-    let result = output(repository.command().args(["generate", "--update"]));
+    let result = output(
+        Command::new("/bin/sh")
+            .current_dir(repository.path())
+            .args([
+                "-c",
+                "umask 077; exec \"$1\" generate --update",
+                "docs-parity-umask-fixture",
+            ])
+            .arg(binary()),
+    );
 
     assert_eq!(status_code(&result), SUCCESS);
     assert_eq!(

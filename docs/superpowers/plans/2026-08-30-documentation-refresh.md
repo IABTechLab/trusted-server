@@ -341,8 +341,9 @@ git commit -m "Enforce documentation source classification"
 - Modify: `tools/docs-parity/src/classification.rs`
 - Modify: `tools/docs-parity/src/lib.rs`
 - Create: `tools/docs-parity/src/markdown.rs`
-- Modify for atomic compare-and-swap: `tools/docs-parity/src/repository.rs`
+- Modify for atomic replacement with immediate precommit validation: `tools/docs-parity/src/repository.rs`
 - Modify for atomic manifest writes: `tools/docs-parity/src/scanner.rs`
+- Modify/Test: `tools/docs-parity/tests/cli.rs`
 - Create/Test: `tools/docs-parity/tests/links.rs`
 - Create/Test: `tools/docs-parity/tests/markdown.rs`
 
@@ -350,23 +351,29 @@ git commit -m "Enforce documentation source classification"
 
 Cover duplicate/missing markers, unknown record names, hand-edited output,
 unstable ordering, update mode changing bytes outside markers, interrupted
-writes and renames, concurrent content/identity replacement, safe-mode
-preservation, stage cleanup, and a second update producing no diff.
+writes and renames, content/identity changes before the precommit check, the
+documented final-syscall window, restrictive-umask mode preservation, unique
+owned-stage cleanup, untouched peer stages, and a second update producing no
+diff.
 
 - [ ] **Step 2: Implement deterministic region updates**
 
-Require named start/end markers, render from typed records, update with an
-expected-byte and file-identity compare-and-swap, and make `generate --check`
-fail on any byte drift. Preserve safe modes, fsync the staged file and parent,
-clean failed stages, and never overwrite a concurrent edit. Manual endpoint
-prose must carry ownership markers that are separately checked.
+Require named start/end markers, render from typed records, compare expected
+bytes and file identity immediately before a portable atomic rename, and make
+`generate --check` fail on any byte drift. Abort changes observed by that
+precommit validation while documenting that portable rename cannot protect the
+final syscall window from noncooperating writers. Explicitly restore safe modes
+after unique-stage creation, fsync the staged file and parent, and clean only
+owned stages. Manual endpoint prose must carry ownership markers that are
+separately checked.
 
 - [ ] **Step 3: Write set-specific Markdown tests**
 
 Add one dead-link fixture for each active set; include missing relative files,
-missing anchors, duplicate headings, percent-encoded fragments, tombstone
-routes, an unlisted orphan, a built page that links to an excluded source, and
-bounded typed VitePress frontmatter with hero/action/feature targets and
+missing anchors, duplicate headings, contextual Unicode lowercasing,
+percent-encoded fragments, tombstone routes, an unlisted orphan, a built page
+that links to an excluded source, and bounded typed VitePress frontmatter with
+hero/action/feature targets, string/src/light-and-dark image variants, and
 configured/default public-asset resolution.
 
 - [ ] **Step 4: Implement local and external link contracts**
@@ -380,10 +387,16 @@ owner/reason/expiry. Add fixtures for allowlisted URL, expiry, redirect loop,
 redirect-depth overflow, malformed/oversized `Retry-After`, retry exhaustion,
 and credentials accidentally embedded in a URL.
 The production runner uses fixed `/usr/bin/curl`, clears ambient environment,
-bounds stdout concurrently under the request timeout, terminates and reaps on
-every post-spawn failure, retains legal repeated response fields, rejects
-duplicate policy/security singletons, validates every proxy/1xx header block,
-and selects only the final response for policy.
+computes its deadline before starting the bounded stdout reader, and on every
+post-spawn result or failure polls, kills if still alive, waits regardless of
+kill failure, and joins the reader while retaining all diagnostics. A
+synchronous post-spawn observer and reader-readiness handshake make process
+tests deterministic; received reader results take precedence at the deadline.
+It retains legal repeated response fields, rejects
+duplicate Location, Retry-After, and Content-Length policy singletons, applies
+an explicit stricter security policy against repeated Transfer-Encoding or
+Content-Encoding, validates every proxy/1xx header block, and selects only the
+final response for policy.
 
 - [ ] **Step 5: Check page/nav/orphan/diagram records**
 
@@ -420,8 +433,8 @@ checks remain scheduled/manual, not a required per-PR network gate.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add docs/guide/error-reference.md docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/Cargo.lock tools/docs-parity/Cargo.toml tools/docs-parity/README.md tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/classification.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/src/repository.rs tools/docs-parity/src/scanner.rs tools/docs-parity/tests/links.rs tools/docs-parity/tests/markdown.rs
-git commit -m "Harden documentation update and link execution"
+git add docs/guide/error-reference.md docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/Cargo.lock tools/docs-parity/Cargo.toml tools/docs-parity/README.md tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/classification.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/src/repository.rs tools/docs-parity/src/scanner.rs tools/docs-parity/tests/cli.rs tools/docs-parity/tests/links.rs tools/docs-parity/tests/markdown.rs
+git commit -m "Close documentation execution quality gaps"
 ```
 
 ### Task 7: Extract settings semantics and execute the example harness

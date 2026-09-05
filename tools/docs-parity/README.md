@@ -38,10 +38,10 @@ repository-relative file with the deterministic, lexically sorted path record.
 It never creates directories, creates files, or changes existing bytes.
 
 `update` requires `--tracked-paths-record` and replaces that file atomically.
-It writes and syncs a sibling stage file before a same-directory rename, then
-syncs the containing directory. A failed or interrupted stage leaves the last
-complete target unchanged. A stale stage file causes the update to fail closed
-instead of overwriting an uncertain concurrent or interrupted update.
+It owns a unique sibling stage file, writes and syncs it before a
+same-directory rename, then syncs the containing directory. A failed or
+interrupted operation cleans only its owned stage and leaves the last complete
+target unchanged; an unrelated peer stage is never deleted.
 
 The exit-code contract is stable:
 
@@ -88,21 +88,28 @@ returns exit code `1` when a named Markdown region differs. Check mode performs
 no writes. `generate --update` validates every target first, then atomically
 replaces only drifted region bodies; exact bytes outside the paired markers are
 preserved. Region names, rows, ownership markers, paths, file modes, sizes, and
-marker placement all fail closed. Atomic replacement preserves the original
-safe mode, fsyncs the staged file and parent directory, and compares the
-expected bytes, file identity, type, and mode immediately before rename. A
-concurrent edit or replacement aborts without overwriting it, and failed stages
-are removed. A second update is byte-identical.
+marker placement all fail closed. Atomic replacement explicitly restores the
+original safe mode on the staged inode, fsyncs the staged file and parent
+directory, and compares the expected bytes, file identity, type, and mode
+immediately before rename. A change observed by that precommit validation
+aborts without replacing the target. Portable rename cannot conditionally bind
+that observation to the rename syscall, so a noncooperating write in the final
+syscall window can still be replaced. Failed operations clean only their unique
+owned stages. A second update is byte-identical.
 
 `links --local --check` parses CommonMark events with source offsets over all
 maintained public, internal, and repository source sets. It checks relative
 files, images, references, autolinks, HTML `href`/`id`/`name` attributes,
 VitePress routes, queries, strict single-pass path/query/fragment percent
-decoding, and anchors. Public-page YAML frontmatter is bounded to 64 KiB and
-checked for typed hero image/action and feature link/icon targets. Root assets
-resolve only through the configured literal `publicDir` or VitePress's
-`docs/public` default and must be regular, non-symlink repository files.
-Public headings use the VitePress 1.6.4 `@mdit-vue/shared` slug contract;
+decoding, and anchors. Public-page YAML frontmatter is bounded to 64 KiB,
+decoded by the maintained `yaml_serde` compatibility package, and checked for
+typed hero image/action and feature link/icon targets. Hero images and feature
+icons accept the pinned VitePress string, `src`, or complete `light`/`dark`
+shapes; both theme targets enter the same checker. Root assets resolve only
+through the configured literal `publicDir` or VitePress's `docs/public`
+default and must be regular, non-symlink repository files. Public headings use
+the VitePress 1.6.4 `@mdit-vue/shared` slug contract, including contextual
+Unicode lowercase conversion;
 their title extraction ignores image alt text, and colliding explicit IDs fail
 instead of receiving an automatic suffix. Repository and maintained-internal
 headings use GitHub title and slug behavior. Code and HTML comments do not
@@ -132,10 +139,15 @@ Stdout is read concurrently under the same wall-clock bound as the request,
 then independently validated for status, raw header count,
 line/name/value/total bytes, and body bytes. Every intermediate proxy or 1xx
 HTTP block is validated and only the final response drives policy. Legal
-repeated fields remain distinct; duplicate Location, Retry-After,
-Content-Length, transfer-encoding, and content-encoding fields fail closed.
-Overflow, timeout, read, and wait failures terminate and reap the child. Exact
-exceptions require an owner, reason, and unexpired timestamp.
+repeated fields remain distinct; duplicate Location, Retry-After, and
+Content-Length fields fail closed as policy singletons. The stricter security
+policy also rejects repeated Transfer-Encoding and Content-Encoding rather
+than coalescing their otherwise list-shaped field values.
+The wall-clock deadline is fixed before the stdout reader starts. Every
+post-spawn outcome polls the child, kills it when still alive, waits regardless
+of a kill failure, and joins the reader; primary, kill, wait, and join
+diagnostics are retained. Exact exceptions require an owner, reason, and
+unexpired timestamp.
 
 ## Repository boundary
 

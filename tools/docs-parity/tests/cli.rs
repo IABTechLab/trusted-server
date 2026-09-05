@@ -464,7 +464,7 @@ fn portable_regular_lookalikes_are_allowed() {
 }
 
 #[test]
-fn interrupted_atomic_update_preserves_the_existing_record() {
+fn tracked_path_update_never_deletes_an_unknown_peer_stage() {
     let repository = TestRepository::new(&["source.txt"]);
     let record = repository.path().join("tracked-paths.txt");
     let staged = repository.path().join(".tracked-paths.txt.docs-parity.tmp");
@@ -479,13 +479,18 @@ fn interrupted_atomic_update_preserves_the_existing_record() {
 
     assert_eq!(
         status_code(&result),
-        ERROR,
-        "stale atomic stage should fail closed"
+        SUCCESS,
+        "an unrelated stage name must not block the owned update: {}",
+        String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(
-        fs::read_to_string(&record).expect("should read existing record"),
+        fs::read_to_string(&staged).expect("should retain unknown peer stage"),
+        "interrupted partial record\n"
+    );
+    assert_ne!(
+        fs::read_to_string(&record).expect("should read updated record"),
         "previous complete record\n",
-        "failed atomic update should preserve the previous complete record"
+        "the owned unique stage should replace the target"
     );
 }
 
