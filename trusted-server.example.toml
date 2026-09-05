@@ -303,6 +303,17 @@ suppress_seats = []
 [auction.bidders.example-bidder]
 provider = "pbs-main"
 
+# Generic OpenRTB profile example. Static request extensions are bounded and
+# cannot replace Trusted Server's reserved request metadata.
+# [auction.providers.standard-main]
+# protocol = "openrtb-2.6"
+# profile = "standard"
+# endpoint = "https://bidder.example.com/openrtb2/auction"
+# routing = "explicit"
+#
+# [auction.providers.standard-main.profile_config]
+# request_ext = { inventory_source = "publisher-example" }
+
 # APS server behavior is also provider/profile-owned. Use routing = "all_eligible"
 # when every banner-compatible slot should be eligible. The APS profile timeout
 # defaults to 800 ms; debug and script creatives default to false.

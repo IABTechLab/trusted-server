@@ -1428,6 +1428,24 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn task7_standard_profile_probe_is_derived_from_the_source_template() {
+        let cases = task7_source_profile_cases().expect("source profile cases should parse");
+        let (positive, negative) = cases
+            .get("standard")
+            .expect("source profile cases should contain standard");
+        let registration = crate::auction::profile::find_profile("standard")
+            .expect("standard profile should be registered");
+        let compiled = registration
+            .compile(positive)
+            .expect("source standard profile config should compile");
+        assert_eq!(compiled.id(), "standard");
+        let error = registration
+            .compile(negative)
+            .expect_err("malformed source-derived request_ext should fail");
+        assert!(error.to_string().contains("request_ext"));
+    }
+
+    #[test]
     fn task7_production_harness_rejects_all_eight_contract_mutations() {
         let typo_source = EXAMPLE_TEMPLATE.replacen(
             "origin_url = \"https://origin.example.com\"",
@@ -1691,51 +1709,7 @@ password = "production-admin-password-32-bytes"
     }
 
     fn task7_probe_source_profiles(omitted: Option<&str>) -> Result<BTreeSet<String>, String> {
-        let source = toml::from_str::<TrustedServerAppConfig>(EXAMPLE_TEMPLATE)
-            .map_err(|error| format!("source template profile parse failed: {error}"))?
-            .into_settings();
-        let pbs = source
-            .auction
-            .providers
-            .values()
-            .find(|provider| provider.profile == "prebid-server")
-            .ok_or_else(|| "source template has no prebid-server provider".to_owned())?;
-        let aps_source = uncomment_block(
-            &uncomment_block(EXAMPLE_TEMPLATE, "[auction.providers.aps-main]"),
-            "[auction.providers.aps-main.profile_config]",
-        );
-        let aps_settings = toml::from_str::<TrustedServerAppConfig>(&aps_source)
-            .map_err(|error| format!("source APS provider parse failed: {error}"))?
-            .into_settings();
-        let aps = aps_settings
-            .auction
-            .providers
-            .values()
-            .find(|provider| provider.profile == "aps")
-            .ok_or_else(|| "source template has no APS provider".to_owned())?;
-        let cases = BTreeMap::from([
-            (
-                "aps",
-                (
-                    aps.profile_config.clone(),
-                    serde_json::json!({"debug": false}),
-                ),
-            ),
-            (
-                "prebid-server",
-                (
-                    pbs.profile_config.clone(),
-                    serde_json::json!({"unknown": true}),
-                ),
-            ),
-            (
-                "standard",
-                (
-                    serde_json::json!({"request_ext": {"fictional": true}}),
-                    serde_json::json!({"unknown": true}),
-                ),
-            ),
-        ]);
+        let cases = task7_source_profile_cases()?;
         let mut observed = BTreeSet::new();
         for (id, (positive, negative)) in cases {
             if omitted == Some(id) {
@@ -1758,5 +1732,71 @@ password = "production-admin-password-32-bytes"
             observed.insert(id.to_owned());
         }
         Ok(observed)
+    }
+
+    fn task7_source_profile_cases()
+    -> Result<BTreeMap<&'static str, (serde_json::Value, serde_json::Value)>, String> {
+        let source = toml::from_str::<TrustedServerAppConfig>(EXAMPLE_TEMPLATE)
+            .map_err(|error| format!("source template profile parse failed: {error}"))?
+            .into_settings();
+        let pbs = source
+            .auction
+            .providers
+            .values()
+            .find(|provider| provider.profile == "prebid-server")
+            .ok_or_else(|| "source template has no prebid-server provider".to_owned())?;
+        let aps_source = uncomment_block(
+            &uncomment_block(EXAMPLE_TEMPLATE, "[auction.providers.aps-main]"),
+            "[auction.providers.aps-main.profile_config]",
+        );
+        let aps_settings = toml::from_str::<TrustedServerAppConfig>(&aps_source)
+            .map_err(|error| format!("source APS provider parse failed: {error}"))?
+            .into_settings();
+        let aps = aps_settings
+            .auction
+            .providers
+            .values()
+            .find(|provider| provider.profile == "aps")
+            .ok_or_else(|| "source template has no APS provider".to_owned())?;
+        let standard_source = uncomment_block(
+            &uncomment_block(EXAMPLE_TEMPLATE, "[auction.providers.standard-main]"),
+            "[auction.providers.standard-main.profile_config]",
+        );
+        let standard_settings = toml::from_str::<TrustedServerAppConfig>(&standard_source)
+            .map_err(|error| format!("source standard provider parse failed: {error}"))?
+            .into_settings();
+        let standard = standard_settings
+            .auction
+            .providers
+            .values()
+            .find(|provider| provider.profile == "standard")
+            .ok_or_else(|| "source template has no standard provider".to_owned())?;
+        let mut malformed_standard = standard.profile_config.clone();
+        let request_ext = malformed_standard
+            .as_object_mut()
+            .and_then(|object| object.get_mut("request_ext"))
+            .ok_or_else(|| "source standard profile does not exercise request_ext".to_owned())?;
+        *request_ext = serde_json::Value::String("not-an-object".to_owned());
+
+        Ok(BTreeMap::from([
+            (
+                "aps",
+                (
+                    aps.profile_config.clone(),
+                    serde_json::json!({"debug": false}),
+                ),
+            ),
+            (
+                "prebid-server",
+                (
+                    pbs.profile_config.clone(),
+                    serde_json::json!({"unknown": true}),
+                ),
+            ),
+            (
+                "standard",
+                (standard.profile_config.clone(), malformed_standard),
+            ),
+        ]))
     }
 }

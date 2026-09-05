@@ -2763,9 +2763,17 @@ PY
   `skip_deserializing`, `skip_serializing_if`, and container/field `default`;
   literal and nonliteral defaults; custom deserializers; `Option`; and
   validator ranges and functions. The exact eight Serde rename rules use
-  distinct field and variant transforms. Invalid rules, accepted attributes
-  on invalid sites, and unknown shape-changing attributes fail closed. The
-  checked schema requires exact equality with the 17-field `Settings` root.
+  distinct field and variant transforms. Named and unnamed tuple fields are
+  parsed before classification and retain zero-based field identities, so
+  supported skip/default/custom semantics cannot disappear and `with` still
+  fails closed; named-field-only `flatten` fails on tuple shapes exactly as it
+  does in the compiled derive. Serde function-path attributes require quoted
+  strings whose contents parse as paths; offline Serde 1.0.228 compile fixtures
+  prove both accepted and rejected forms. Literal unary expressions accept
+  only direct negative integers and floats; `!true` requires a checked
+  companion. Invalid rules, accepted attributes on invalid sites, and unknown
+  shape-changing attributes fail closed. The checked schema requires exact
+  equality with the 17-field `Settings` root.
 - `settings-companions.toml` is a versioned, explicitly reviewed record with 46
   exact nonliteral-default, deserializer, and validator companions. Each names
   its exact source, symbol, kind, value when applicable, and unique
@@ -2791,11 +2799,13 @@ PY
   module-local fake platform secret store; and runs runtime validation. Every
   one of the 14 deploy-validated optional integration IDs is derived from its
   exact active or commented source block, forced enabled, and checked with
-  paired positive/negative deploy probes. APS and Prebid provider profiles are
-  likewise source-derived; all three registered profiles run paired compile
-  probes. Module-local assertions compare the 14 integration IDs, three
-  profile IDs, three secret-key literals, exact placeholder paths, and
-  normalized diagnostic with the reviewed record.
+  paired positive/negative deploy probes. APS, Prebid, and standard provider
+  profiles are likewise derived from their exact source blocks; the standard
+  positive uses the commented `request_ext` example and its negative changes
+  that recognized field to a non-object. All three registered profiles run
+  paired compile probes. Module-local assertions compare the 14 integration
+  IDs, three profile IDs, three secret-key literals, exact placeholder paths,
+  and normalized diagnostic with the reviewed record.
 - The eight negative cases now mutate production inputs at their real
   boundaries: typed source parsing rejects `orgin_url`; deploy validation
   rejects an unknown disabled-integration key and bad profile; envelope
@@ -2806,11 +2816,13 @@ PY
   `publisher.cookie_domain, publisher.domain` and its exact normalized
   diagnostic, not the checked three-path result. The manual-observation model
   and its self-reported negative tests were removed.
-- The standalone settings target contains 15 passing tests. The complete
-  standalone suite contains 226 passing tests: 17 library unit, 35
-  classification, 19 CLI, 57 links, 11 Markdown, 72 scanner, and 15 settings
-  tests. Root and standalone fmt checks, standalone all-target clippy with
-  warnings denied, and all three root target clippy aliases exited 0.
+- The standalone settings target contains 20 passing tests. The complete
+  standalone suite contains 231 passing tests: 17 library unit, 35
+  classification, 19 CLI, 57 links, 11 Markdown, 72 scanner, and 20 settings
+  tests. It passed two fresh, consecutive default-parallel runs after the
+  second extractor correction. Root and standalone fmt checks, standalone
+  all-target clippy with warnings denied, and all three root target clippy
+  aliases exited 0.
 - A final default-parallel repetition exposed one existing Task 6 process
   fixture race: its overflow child could be starved before writing any bytes,
   so the valid production timeout won over an overflow the fixture had not yet
@@ -2819,14 +2831,14 @@ PY
   returning, and the production deadline is computed only afterward. This is
   test-only synchronization, does not lengthen the runner policy timeout, and
   changes no production behavior. The exact overflow test passed ten
-  consecutive focused repetitions before the 226-test suite passed two fresh,
-  consecutive default-parallel repetitions.
+  consecutive focused repetitions before the then-current 226-test suite
+  passed two fresh, consecutive default-parallel repetitions.
 - The target-matched Fastly commands used the repository-pinned Viceroy 0.17.0
   from an isolated host installation. On macOS it required the readable system
   certificate file via `SSL_CERT_FILE=/etc/ssl/cert.pem`; no repository file
   changed for that host setup. `cargo test-fastly settings` passed 176 core
-  tests, `cargo test-fastly config` passed 12 adapter and 198 core tests, and
-  `cargo test-fastly profile` passed 20 core tests. The named Task 7 production
+  tests, `cargo test-fastly config` passed 12 adapter and 199 core tests, and
+  `cargo test-fastly profile` passed 21 core tests. The named Task 7 production
   probes were included in those target-matched runs.
 - The three secret-disposition words in the companion schema are identifiers,
   not credential examples. The credential-shape detector therefore gained one
@@ -2855,6 +2867,11 @@ PY
   moved with the four formatted core test modules. Two final bootstraps
   retained reviewed-manifest SHA-256
   `f45ae49a3b66a4cca63e68b6942f03065b9fdc94bc8919bb994016e73bf5150b`
+  byte-for-byte. The second correction retains the exact 5,406-record
+  class/path/detector/fingerprint multiset and moves only one selector for the
+  existing synthetic credential fixture in the expanded standalone settings
+  test. Two final bootstraps retained reviewed-manifest SHA-256
+  `e09dc7859e133e7001e4b71d2ba66a5835a7aacf01c6477a58730c48ec5a0b03`
   byte-for-byte.
   Fresh `settings --check`, local-link, generated-region, classification, and
   sensitive-scan checks all exited 0.
@@ -2864,18 +2881,21 @@ PY
   Root `Cargo.lock` remained byte-identical at
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
   The Task 7 Files list and original staging command remain exact for its
-  20-path diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`,
+  21-path diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`,
   including the scanner class/test required by the new manifest vocabulary
   and the process-fixture synchronization required by the repeated default
   suite, while excluding all unchanged files: the five checked core sources;
-  this evidence file and the execution plan; the standalone manifest,
-  lockfile, and README; the tracked, maintained, sensitive, and
-  settings-companion manifests; the standalone library, Markdown, scanner,
-  and settings implementations; and the scanner and settings integration-test
-  files. The review correction is exactly the 10 paths in Task 7 Step 8: four
-  core sources, this evidence file and the plan, the sensitive and
-  settings-companion manifests, and the standalone settings implementation and
-  test.
+  the checked source template; this evidence file and the execution plan; the
+  standalone manifest, lockfile, and README; the tracked, maintained,
+  sensitive, and settings-companion manifests; the standalone library,
+  Markdown, scanner, and settings implementations; and the scanner and
+  settings integration-test files. The review correction is exactly the 10
+  paths in Task 7 Step 8: four core sources, this evidence file and the plan,
+  the sensitive and settings-companion manifests, and the standalone settings
+  implementation and test. The second correction is exactly the seven paths
+  in Task 7 Step 9: the source-derived profile harness and template, this
+  evidence file and the plan, the sensitive manifest, and the standalone
+  settings implementation and test.
 
 #### Task 8 — Check integration capabilities and adapter routes
 

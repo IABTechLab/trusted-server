@@ -5,7 +5,7 @@ use std::path::Path as FsPath;
 
 use error_stack::{Report, ResultExt as _};
 use serde::Deserialize;
-use syn::{Attribute, Expr, ExprLit, Fields, Item, Lit, Path, Stmt, Type};
+use syn::{Attribute, Expr, ExprLit, Fields, Item, Lit, Path, Stmt, Type, UnOp};
 
 use crate::repository::{NormalizedRelativePath, Repository};
 
@@ -203,7 +203,7 @@ pub struct ValidationRange {
 /// One deserializable field and its serialization semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractedField {
-    /// Rust identifier before Serde renaming.
+    /// Rust identifier before Serde renaming, or the zero-based tuple index.
     pub rust_name: String,
     /// Canonical serialized key.
     pub name: String,
@@ -1142,13 +1142,20 @@ fn extract_fields(
     container_default: Option<&ContainerDefault>,
 ) -> Result<Vec<ExtractedField>, Report<SettingsError>> {
     let mut extracted = Vec::new();
-    for field in fields {
-        let Some(identifier) = &field.ident else {
-            continue;
-        };
-        let rust_name = identifier.to_string();
+    for (index, field) in fields.iter().enumerate() {
+        let rust_name = field
+            .ident
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| index.to_string());
         let field_context = format!("{container}.{rust_name}");
-        let serde = parse_serde_attributes(&field.attrs, &field_context, AttributeSite::Field)?;
+        let serde = parse_serde_attributes(
+            &field.attrs,
+            &field_context,
+            AttributeSite::Field {
+                named: field.ident.is_some(),
+            },
+        )?;
         if serde.skip {
             continue;
         }
@@ -1230,7 +1237,9 @@ enum AttributeSite {
         named_fields: bool,
     },
     EnumContainer,
-    Field,
+    Field {
+        named: bool,
+    },
     Variant,
 }
 
@@ -1241,6 +1250,7 @@ fn parse_serde_attributes(
 ) -> Result<SerdeAttributes, Report<SettingsError>> {
     let mut parsed = SerdeAttributes::default();
     let mut invalid_site = false;
+    let mut invalid_form = false;
     for attribute in attributes
         .iter()
         .filter(|value| value.path().is_ident("serde"))
@@ -1257,30 +1267,50 @@ fn parse_serde_attributes(
                     invalid_site = true;
                     return Err(meta.error(format!("invalid serde attribute {name} for this site")));
                 }
+                invalid_form = false;
                 match name.as_str() {
-                    "rename" => parsed.rename = Some(parse_string_value(&meta)?),
-                    "rename_all" => parsed.rename_all = Some(parse_string_value(&meta)?),
+                    "rename" => {
+                        invalid_form = true;
+                        parsed.rename = Some(parse_string_value(&meta)?);
+                    }
+                    "rename_all" => {
+                        invalid_form = true;
+                        parsed.rename_all = Some(parse_string_value(&meta)?);
+                    }
                     "rename_all_fields" => {
+                        invalid_form = true;
                         parsed.rename_all_fields = Some(parse_string_value(&meta)?);
                     }
-                    "alias" => parsed.aliases.push(parse_string_value(&meta)?),
+                    "alias" => {
+                        invalid_form = true;
+                        parsed.aliases.push(parse_string_value(&meta)?);
+                    }
                     "deny_unknown_fields" => parsed.deny_unknown_fields = true,
-                    "tag" => parsed.tag = Some(parse_string_value(&meta)?),
-                    "content" => parsed.content = Some(parse_string_value(&meta)?),
+                    "tag" => {
+                        invalid_form = true;
+                        parsed.tag = Some(parse_string_value(&meta)?);
+                    }
+                    "content" => {
+                        invalid_form = true;
+                        parsed.content = Some(parse_string_value(&meta)?);
+                    }
                     "untagged" => parsed.untagged = true,
                     "flatten" => parsed.flatten = true,
                     "skip" => parsed.skip = true,
                     "skip_serializing" => parsed.skip_serializing = true,
                     "skip_deserializing" => parsed.skip_deserializing = true,
                     "skip_serializing_if" => {
-                        parsed.skip_serializing_if = Some(parse_path_string_value(&meta)?);
+                        invalid_form = true;
+                        parsed.skip_serializing_if = Some(parse_serde_path_string_value(&meta)?);
                     }
                     "default" if meta.input.peek(syn::Token![=]) => {
-                        parsed.default = Some(Some(parse_path_string_value(&meta)?));
+                        invalid_form = true;
+                        parsed.default = Some(Some(parse_serde_path_string_value(&meta)?));
                     }
                     "default" => parsed.default = Some(None),
                     "deserialize_with" => {
-                        parsed.deserialize_with = Some(parse_path_string_value(&meta)?);
+                        invalid_form = true;
+                        parsed.deserialize_with = Some(parse_serde_path_string_value(&meta)?);
                     }
                     "serialize_with" | "bound" | "borrow" | "crate" | "expecting" | "other"
                     | "from" | "try_from" | "into" | "remote" | "transparent" | "with"
@@ -1289,10 +1319,11 @@ fn parse_serde_attributes(
                     }
                     _ => return Err(meta.error(format!("unsupported serde attribute {name}"))),
                 }
+                invalid_form = false;
                 Ok(())
             })
             .map_err(|error| {
-                if invalid_site {
+                if invalid_site || invalid_form {
                     Report::new(SettingsError::InvalidAttribute {
                         attribute: "serde",
                         item: item.to_owned(),
@@ -1352,18 +1383,19 @@ fn serde_attribute_allowed(name: &str, site: AttributeSite) -> bool {
                 | "content"
                 | "untagged"
         ),
-        AttributeSite::Field => matches!(
-            name,
-            "rename"
-                | "alias"
-                | "default"
-                | "flatten"
-                | "skip"
-                | "skip_serializing"
-                | "skip_deserializing"
-                | "skip_serializing_if"
-                | "deserialize_with"
-        ),
+        AttributeSite::Field { named } => {
+            matches!(
+                name,
+                "rename"
+                    | "alias"
+                    | "default"
+                    | "skip"
+                    | "skip_serializing"
+                    | "skip_deserializing"
+                    | "skip_serializing_if"
+                    | "deserialize_with"
+            ) || name == "flatten" && named
+        }
         AttributeSite::Variant => matches!(
             name,
             "rename"
@@ -1416,7 +1448,14 @@ fn parse_string_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<Stri
     Ok(meta.value()?.parse::<syn::LitStr>()?.value())
 }
 
-fn parse_path_string_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<String> {
+fn parse_serde_path_string_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<String> {
+    let value = meta.value()?.parse::<syn::LitStr>()?.value();
+    syn::parse_str::<syn::ExprPath>(&value)
+        .map_err(|_| meta.error("expected a string containing a function path"))?;
+    Ok(value)
+}
+
+fn parse_validation_path_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<String> {
     let expression = meta.value()?.parse::<Expr>()?;
     match expression {
         Expr::Lit(ExprLit {
@@ -1442,7 +1481,9 @@ fn parse_validation_attributes(
                 if meta.path.is_ident("custom") || meta.path.is_ident("schema") {
                     meta.parse_nested_meta(|nested| {
                         if nested.path.is_ident("function") {
-                            parsed.validators.insert(parse_path_string_value(&nested)?);
+                            parsed
+                                .validators
+                                .insert(parse_validation_path_value(&nested)?);
                         } else {
                             consume_optional_value(&nested)?;
                         }
@@ -1519,7 +1560,17 @@ fn literal_expression(expression: &Expr) -> Option<String> {
             Lit::Bool(value) => Some(value.value.to_string()),
             _ => None,
         },
-        Expr::Unary(unary) => literal_expression(&unary.expr).map(|value| format!("-{value}")),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_)) => match unary.expr.as_ref() {
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(value),
+                ..
+            }) => Some(format!("-{}", value.base10_digits())),
+            Expr::Lit(ExprLit {
+                lit: Lit::Float(value),
+                ..
+            }) => Some(format!("-{}", value.base10_digits())),
+            _ => None,
+        },
         _ => None,
     }
 }

@@ -460,6 +460,7 @@ git commit -m "Close documentation execution quality gaps"
 - Modify/Test: `crates/trusted-server-core/src/auction/profile.rs`
 - Modify/Test: `crates/trusted-server-core/src/integrations/aps.rs`
 - Modify/Test: `crates/trusted-server-core/src/integrations/prebid.rs`
+- Modify/Test: `trusted-server.example.toml`
 - Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
@@ -471,8 +472,12 @@ Cover the exact Serde field/container/variant sites for `rename`,
 `skip_serializing_if`, and container/field `default`; cover all eight legal
 rename rules, literal/nonliteral defaults, custom deserializers, `Option`,
 validation ranges, invalid attribute sites, invalid rename rules, and unknown
-shape-changing attributes. Expected: unclassified or site-invalid behavior
-fails closed.
+shape-changing attributes. Parse every named and indexed tuple field before
+classifying its attributes. Function-path values must be quoted `LitStr`
+values that parse as paths, matching the compiled Serde grammar; only direct
+numeric negation counts as a literal default, and named-field-only `flatten`
+must fail on tuple shapes. Expected: unclassified, site-invalid,
+malformed-path, and unsupported tuple-field behavior fails closed.
 
 - [x] **Step 2: Implement the AST plus companion chain**
 
@@ -499,10 +504,11 @@ Parse the source template, customize non-secret values in memory, preserve
 secret key names through deploy validation and `BlobEnvelope` serialization,
 resolve with a fake store, and run runtime validation. Derive every optional
 integration and provider-profile probe from its exact active or commented
-source-template block; run paired positive/negative probes with integrations
-forced enabled; and compare the 14 integration IDs, three profile IDs, three
-secret-key literals, placeholder paths, and normalized diagnostic exactly with
-the reviewed record. Enumerate every exact-string consumer in that record.
+source-template block, including the commented `standard` profile example;
+run paired positive/negative probes with integrations forced enabled; and
+compare the 14 integration IDs, three profile IDs, three secret-key literals,
+placeholder paths, and normalized diagnostic exactly with the reviewed
+record. Enumerate every exact-string consumer in that record.
 
 - [x] **Step 5: Add visibility-local set-equality seams**
 
@@ -540,6 +546,18 @@ git commit -m "Close settings semantics review gaps"
 Expected: the correction diff contains exactly these 10 paths, the complete
 Task 7 diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c` remains the exact
 20-path **Files** set above, and Task 8 has not started.
+
+- [x] **Step 9: Close the Task 7 extractor review**
+
+```bash
+git add crates/trusted-server-core/src/config.rs docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/src/settings.rs tools/docs-parity/tests/settings.rs trusted-server.example.toml
+git commit -m "Close settings extractor review gaps"
+```
+
+Expected: the second correction diff contains exactly these seven paths. The
+complete Task 7 diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`
+contains the exact 21-path **Files** set above, including the newly checked
+source-template profile block, and Task 8 has not started.
 
 ### Task 8: Check integration capabilities and adapter routes
 
