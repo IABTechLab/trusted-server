@@ -135,9 +135,9 @@ struct RawRouteManifest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRoute {
-    adapters: BTreeSet<String>,
+    adapters: Vec<String>,
     path: String,
-    methods: BTreeSet<String>,
+    methods: Vec<String>,
     shape: RouteShape,
     predicate: String,
     status: RouteStatus,
@@ -162,21 +162,40 @@ impl RouteManifest {
             return Err(invalid("route manifest reviewed must be true"));
         }
         let mut routes = BTreeSet::new();
+        let mut expanded_semantics = BTreeSet::new();
         for row in manifest.routes {
-            if row.adapters.is_empty() {
+            let adapters = unique_route_values(row.adapters, "adapter")?;
+            let methods = unique_route_values(row.methods, "method")?;
+            if adapters.is_empty() {
                 return Err(invalid("route row adapters must not be empty"));
             }
-            if row.methods.is_empty() {
+            if methods.is_empty() {
                 return Err(invalid("route row methods must not be empty"));
             }
-            for adapter in row.adapters {
+            for adapter in adapters {
                 if !matches!(adapter.as_str(), "fastly" | "axum" | "cloudflare" | "spin") {
                     return Err(invalid(format!("unknown route adapter: {adapter}")));
+                }
+                for method in &methods {
+                    if !expanded_semantics.insert((
+                        adapter.clone(),
+                        row.path.clone(),
+                        method.clone(),
+                        row.shape,
+                        row.predicate.clone(),
+                        row.status,
+                        row.startup_router,
+                    )) {
+                        return Err(invalid(format!(
+                            "duplicate expanded route semantic: {adapter} {method} {}",
+                            row.path
+                        )));
+                    }
                 }
                 let record = RouteRecord::new(
                     &adapter,
                     &row.path,
-                    &row.methods,
+                    &methods,
                     row.shape,
                     &row.predicate,
                     row.status,
@@ -625,7 +644,7 @@ pub fn extract_named_routes(
     }
     .ok_or_else(|| invalid(format!("missing {adapter} named route collection")))?;
 
-    let mut records = BTreeMap::new();
+    let mut records: BTreeMap<RouteKey, RouteRecord> = BTreeMap::new();
     for entry in &array.elems {
         let (path_expression, method_expression) = if adapter == "spin" {
             let Expr::Tuple(tuple) = entry else {
@@ -656,14 +675,18 @@ pub fn extract_named_routes(
         for method in route_methods {
             let (predicate, status) = named_semantics(adapter, &path, &method);
             let key = (path.clone(), shape, predicate.to_owned(), status, false);
-            records
-                .entry(key)
-                .and_modify(|record: &mut RouteRecord| {
-                    record.methods.insert(method.clone());
-                })
-                .or_insert_with(|| {
-                    RouteRecord::new(adapter, &path, [&method], shape, predicate, status, false)
-                });
+            if let Some(record) = records.get_mut(&key) {
+                if !record.methods.insert(method.clone()) {
+                    return Err(invalid(format!(
+                        "duplicate {adapter} named semantic route: {method} {path}"
+                    )));
+                }
+            } else {
+                records.insert(
+                    key,
+                    RouteRecord::new(adapter, &path, [&method], shape, predicate, status, false),
+                );
+            }
         }
     }
     Ok(records.into_values().collect())
@@ -750,7 +773,7 @@ fn method_array_constants(
 }
 
 fn parse_method_array(array: &syn::ExprArray) -> Result<Vec<String>, Report<RouteError>> {
-    array
+    let methods = array
         .elems
         .iter()
         .map(|expression| {
@@ -763,7 +786,12 @@ fn parse_method_array(array: &syn::ExprArray) -> Result<Vec<String>, Report<Rout
             }
             Ok(segments[1].ident.to_string())
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let count = methods.len();
+    if methods.iter().collect::<BTreeSet<_>>().len() != count {
+        return Err(invalid("duplicate named route method"));
+    }
+    Ok(methods)
 }
 
 fn named_semantics(adapter: &str, path: &str, method: &str) -> (&'static str, RouteStatus) {
@@ -951,7 +979,7 @@ impl CloudflareParser<'_> {
                     .args
                     .first()
                     .ok_or_else(|| invalid("Cloudflare route helper is missing its path"))?;
-                self.add(&self.resolve_path(path)?, method.to_ascii_uppercase());
+                self.add(&self.resolve_path(path)?, method.to_ascii_uppercase())?;
                 Ok(())
             }
             "route" => {
@@ -962,7 +990,7 @@ impl CloudflareParser<'_> {
                 let method = args
                     .next()
                     .ok_or_else(|| invalid("Cloudflare route call is missing its method"))?;
-                self.add(&self.resolve_path(path)?, self.resolve_method(method)?);
+                self.add(&self.resolve_path(path)?, self.resolve_method(method)?)?;
                 Ok(())
             }
             "build" | "builder" => Ok(()),
@@ -1016,7 +1044,7 @@ impl CloudflareParser<'_> {
         }
     }
 
-    fn add(&mut self, path: &str, method: String) {
+    fn add(&mut self, path: &str, method: String) -> Result<(), Report<RouteError>> {
         let shape = if path.contains('{') {
             RouteShape::Template
         } else {
@@ -1024,12 +1052,15 @@ impl CloudflareParser<'_> {
         };
         let (predicate, status) = cloudflare_semantics(path, &method);
         let key = (path.to_owned(), shape, predicate.to_owned(), status, false);
-        self.routes
-            .entry(key)
-            .and_modify(|record| {
-                record.methods.insert(method.clone());
-            })
-            .or_insert_with(|| {
+        if let Some(record) = self.routes.get_mut(&key) {
+            if !record.methods.insert(method.clone()) {
+                return Err(invalid(format!(
+                    "duplicate Cloudflare semantic route: {method} {path}"
+                )));
+            }
+        } else {
+            self.routes.insert(
+                key,
                 RouteRecord::new(
                     "cloudflare",
                     path,
@@ -1038,8 +1069,10 @@ impl CloudflareParser<'_> {
                     predicate,
                     status,
                     false,
-                )
-            });
+                ),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1153,4 +1186,17 @@ fn invalid(detail: impl Into<String>) -> Report<RouteError> {
     Report::new(RouteError::Invalid {
         detail: detail.into(),
     })
+}
+
+fn unique_route_values(
+    values: Vec<String>,
+    axis: &'static str,
+) -> Result<BTreeSet<String>, Report<RouteError>> {
+    let count = values.len();
+    let unique = values.into_iter().collect::<BTreeSet<_>>();
+    if unique.len() != count {
+        Err(invalid(format!("duplicate route {axis}")))
+    } else {
+        Ok(unique)
+    }
 }

@@ -3041,6 +3041,66 @@ PY
   standalone manifest, README, and library; two new implementation/test pairs; and
   the six integration, route, adapter-support, tracked, maintained, and
   sensitive manifests. Both directional set differences are empty.
+- Post-implementation review at `5e0d9ab7f16eddf9bf6feb8f6abb20299273c854`
+  identified set canonicalization before duplicate validation. RED fixtures
+  produced nine failures in the 17-test integration target: all seven static
+  manifest arrays, nested capability members, and duplicate Rust source
+  registrations. The 11-test route target produced two failures for duplicate
+  row adapters/methods and duplicate named/Cloudflare semantics; a subsequent
+  overlapping-method fixture also failed before correction. The compiled core
+  receipt separately failed on duplicate raw route/hook/provider observations
+  and duplicate capability rows.
+- The corrected parsers retain vector cardinality until validation. They reject
+  duplicates across deploy, builder, plan, profile, mediator, JavaScript source,
+  JavaScript bundle, loading, capability-key, every nested capability,
+  operational, route-adapter, route-method, expanded-route-semantic, and
+  adapter-support axes. Deploy, plan, and mediator visitors now treat a failed
+  source insertion as an error; the existing builder/profile checks remain
+  exact. Named adapter and Cloudflare extraction reject duplicate methods or
+  semantic routes. The module-local compiled receipt performs the same raw
+  cardinality check before constructing its comparison sets, so production
+  registrations cannot hide duplicate proxy routes, hook identities, providers,
+  or complete capability observations.
+- The settings appendix now records exactly one production struct-level schema
+  companion, `validate_trusted_client_ip`. The test-only APS schema annotation
+  is excluded, while APS account and inventory validation remains in the
+  imperative profile-compiler inventory. This is an inventory correction only;
+  no runtime behavior or public API changed.
+- After the correction, the focused standalone targets pass 17 integration and
+  12 route tests, and the pinned Viceroy Task 8 filter passes all three compiled
+  receipt/predicate tests. Two fresh default-parallel standalone suites each
+  pass all 267 tests. The full pinned Viceroy 0.17.0 matrix passes 175 Fastly
+  adapter tests, 2,425 core tests with six ignored, two JavaScript tests, 21
+  OpenRTB tests, and four core doctests with four ignored. Axum passes 15
+  library, one binary, and 27 route tests after the expected repository-scoped
+  loopback rerun; Cloudflare passes 23 library and 23 route tests; Spin passes
+  50 library and 38 route tests; cross-adapter parity passes all 13 tests.
+- The integration, route, and adapter-support manifests remain unchanged at
+  SHA-256
+  `2f2b7585326639ccc7056c13c5673e3b7f0ae56f70f853341ba2b47bb5ab4dd2`,
+  `52df1bfb5bfc6a27b04648a95e2a724502e558759a8399995d9a2201f2f04005`,
+  and
+  `14abdc67bc7ddf836ba72e0d4a00108286dee6a76435824ab21e1922b80f19e3`.
+  The tracked and maintained manifests remain unchanged at
+  `cb4c9da3a4b539376fbeb415a09d3d1b2dd8edc11babbf227a49d41545efba86`
+  and
+  `53b794afa17af803d0cb6a9f7fa1f718ae15f9c2e6ff4b30d64059b1068fbe56`.
+  Two sensitive bootstraps and the final check preserve all 5,405 records and
+  SHA-256
+  `4295fe81312737d20941cca5b88fd54bebd972a9535398d3a6653a5e3c9950f0`,
+  with no semantic or selector changes.
+  Both lockfiles remain byte-identical at the hashes recorded above.
+- Fresh root and standalone formatting, standalone all-target clippy with
+  warnings denied, all six root clippy aliases, Prettier, settings, integration,
+  route, local-link, generated-region, classification, and sensitive-scan
+  checks exit 0. Two generated updates preserve the page, diagram, and orphan
+  hashes; two classification updates and two sensitive bootstraps are
+  byte-stable.
+- Step 7 is the exact eight-path correction: the compiled core receipt; this
+  evidence, plan, and design specification; and the two standalone
+  implementation/test pairs. The aggregate from the approved Task 7 head is the
+  current 24-path Task 8 **Files** set. The correction, aggregate, and
+  plan/staging directional set differences are empty.
 
 #### Task 9 — Check CLI help, snippets, gates, and workflow foundations
 

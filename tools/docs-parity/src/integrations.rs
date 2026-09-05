@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use error_stack::Report;
 use serde::Deserialize;
+use serde::de::Error as _;
 use syn::visit::{self, Visit as _};
 use syn::{Expr, ExprCall, ExprLit, ImplItem, Item, Lit, Member};
 
@@ -49,25 +50,25 @@ pub struct CapabilityRecord {
     /// Exact configuration predicate for this observation.
     pub predicate: String,
     /// Observed method-and-route entries.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_proxy_routes")]
     pub proxy_routes: BTreeSet<String>,
     /// Observed attribute rewriter identities.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_attribute_rewriters")]
     pub attribute_rewriters: BTreeSet<String>,
     /// Observed script rewriter selectors.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_script_rewriters")]
     pub script_rewriters: BTreeSet<String>,
     /// Observed head injector identities.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_head_injectors")]
     pub head_injectors: BTreeSet<String>,
     /// Observed HTML post-processor identities.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_post_processors")]
     pub post_processors: BTreeSet<String>,
     /// Observed request filter identities.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_request_filters")]
     pub request_filters: BTreeSet<String>,
     /// Observed auction-provider identities for mediator-only integrations.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_providers")]
     pub providers: BTreeSet<String>,
     /// Exact JS loading disposition.
     pub js_mode: String,
@@ -199,13 +200,13 @@ pub struct SourceInventory {
 struct Manifest {
     version: u32,
     reviewed: bool,
-    deploy_ids: BTreeSet<String>,
-    builder_ids: BTreeSet<String>,
-    plan_registration_ids: BTreeSet<String>,
-    profile_ids: BTreeSet<String>,
-    mediator_ids: BTreeSet<String>,
-    js_source_module_ids: BTreeSet<String>,
-    js_bundle_ids: BTreeSet<String>,
+    deploy_ids: Vec<String>,
+    builder_ids: Vec<String>,
+    plan_registration_ids: Vec<String>,
+    profile_ids: Vec<String>,
+    mediator_ids: Vec<String>,
+    js_source_module_ids: Vec<String>,
+    js_bundle_ids: Vec<String>,
     #[serde(default)]
     loading_modes: Vec<LoadingRecord>,
     #[serde(default)]
@@ -220,6 +221,34 @@ struct LoadingRecord {
     id: String,
     mode: LoadingMode,
 }
+
+macro_rules! unique_set_deserializer {
+    ($function:ident, $axis:literal) => {
+        fn $function<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let values = Vec::<String>::deserialize(deserializer)?;
+            let count = values.len();
+            let unique = values.into_iter().collect::<BTreeSet<_>>();
+            if unique.len() != count {
+                return Err(D::Error::custom(concat!("duplicate capability ", $axis)));
+            }
+            Ok(unique)
+        }
+    };
+}
+
+unique_set_deserializer!(deserialize_unique_proxy_routes, "proxy_routes");
+unique_set_deserializer!(
+    deserialize_unique_attribute_rewriters,
+    "attribute_rewriters"
+);
+unique_set_deserializer!(deserialize_unique_script_rewriters, "script_rewriters");
+unique_set_deserializer!(deserialize_unique_head_injectors, "head_injectors");
+unique_set_deserializer!(deserialize_unique_post_processors, "post_processors");
+unique_set_deserializer!(deserialize_unique_request_filters, "request_filters");
+unique_set_deserializer!(deserialize_unique_providers, "providers");
 
 impl IntegrationInventory {
     /// Parse a reviewed closed-schema inventory.
@@ -238,6 +267,15 @@ impl IntegrationInventory {
         if !manifest.reviewed {
             return Err(invalid_manifest("reviewed must be true"));
         }
+        let deploy_ids = unique_values(manifest.deploy_ids, "deploy_ids")?;
+        let builder_ids = unique_values(manifest.builder_ids, "builder_ids")?;
+        let plan_registration_ids =
+            unique_values(manifest.plan_registration_ids, "plan_registration_ids")?;
+        let profile_ids = unique_values(manifest.profile_ids, "profile_ids")?;
+        let mediator_ids = unique_values(manifest.mediator_ids, "mediator_ids")?;
+        let js_source_module_ids =
+            unique_values(manifest.js_source_module_ids, "js_source_module_ids")?;
+        let js_bundle_ids = unique_values(manifest.js_bundle_ids, "js_bundle_ids")?;
         let mut loading_modes = BTreeMap::new();
         for record in manifest.loading_modes {
             if loading_modes
@@ -250,10 +288,18 @@ impl IntegrationInventory {
                 )));
             }
         }
-        let capability_count = manifest.capabilities.len();
-        let capabilities = manifest.capabilities.into_iter().collect::<BTreeSet<_>>();
-        if capabilities.len() != capability_count {
-            return Err(invalid_manifest("duplicate capability row"));
+        let mut capability_keys = BTreeSet::new();
+        let mut capabilities = BTreeSet::new();
+        for record in manifest.capabilities {
+            if !capability_keys.insert((record.id.clone(), record.predicate.clone())) {
+                return Err(invalid_manifest(format!(
+                    "duplicate capability key: {}/{}",
+                    record.id, record.predicate
+                )));
+            }
+            if !capabilities.insert(record) {
+                return Err(invalid_manifest("duplicate capability row"));
+            }
         }
         let operational_count = manifest.operational.len();
         let operational = manifest.operational.into_iter().collect::<BTreeSet<_>>();
@@ -279,13 +325,13 @@ impl IntegrationInventory {
             }
         }
         Ok(Self {
-            deploy_ids: manifest.deploy_ids,
-            builder_ids: manifest.builder_ids,
-            plan_registration_ids: manifest.plan_registration_ids,
-            profile_ids: manifest.profile_ids,
-            mediator_ids: manifest.mediator_ids,
-            js_source_module_ids: manifest.js_source_module_ids,
-            js_bundle_ids: manifest.js_bundle_ids,
+            deploy_ids,
+            builder_ids,
+            plan_registration_ids,
+            profile_ids,
+            mediator_ids,
+            js_source_module_ids,
+            js_bundle_ids,
             loading_modes,
             capabilities,
             operational,
@@ -321,20 +367,35 @@ pub fn extract_source_inventory(
         .ok_or_else(|| invalid_manifest("missing plan registration function"))?;
     let mut plan_visitor = PlanRegistrationVisitor::default();
     plan_visitor.visit_block(plan);
+    if let Some(detail) = plan_visitor.error {
+        return Err(invalid_manifest(detail));
+    }
 
     let profile_ids = extract_profile_ids(&profiles_file.items)?;
     let mediator = find_function_block(&mediator_file.items, "build_orchestrator_with_plan")
         .ok_or_else(|| invalid_manifest("missing mediator registration function"))?;
     let mut mediator_visitor = MediatorVisitor::default();
     mediator_visitor.visit_block(mediator);
+    if let Some(detail) = mediator_visitor.error {
+        return Err(invalid_manifest(detail));
+    }
 
-    let js_source_module_ids = sources
+    let mut js_source_module_ids = BTreeSet::new();
+    for id in sources
         .tracked_paths
         .iter()
         .filter_map(|path| js_module_id(path))
-        .collect::<BTreeSet<_>>();
+    {
+        if !js_source_module_ids.insert(id.clone()) {
+            return Err(invalid_manifest(format!(
+                "duplicate JavaScript source module ID: {id}"
+            )));
+        }
+    }
     let mut js_bundle_ids = js_source_module_ids.clone();
-    js_bundle_ids.insert("core".to_owned());
+    if !js_bundle_ids.insert("core".to_owned()) {
+        return Err(invalid_manifest("duplicate JavaScript bundle ID: core"));
+    }
 
     Ok(SourceInventory {
         deploy_ids: deploy_visitor.ids,
@@ -517,12 +578,10 @@ impl<'ast> syn::visit::Visit<'ast> for DeployVisitor {
             return;
         };
         if name == "validate_prebid" {
-            self.ids.insert("prebid".to_owned());
+            self.insert("prebid");
         } else if name == "validate_integration" {
             match call.args.iter().nth(1).and_then(literal_string) {
-                Some(id) => {
-                    self.ids.insert(id);
-                }
+                Some(id) => self.insert(&id),
                 None => {
                     self.error = Some("deploy validator ID must be a string literal".to_owned())
                 }
@@ -541,9 +600,7 @@ impl<'ast> syn::visit::Visit<'ast> for DeployVisitor {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         if call.method == "integration_config" {
             match call.args.first().and_then(literal_string) {
-                Some(id) => {
-                    self.ids.insert(id);
-                }
+                Some(id) => self.insert(&id),
                 None => {
                     self.error =
                         Some("deploy integration_config ID must be a string literal".to_owned());
@@ -554,9 +611,18 @@ impl<'ast> syn::visit::Visit<'ast> for DeployVisitor {
     }
 }
 
+impl DeployVisitor {
+    fn insert(&mut self, id: &str) {
+        if !self.ids.insert(id.to_owned()) && self.error.is_none() {
+            self.error = Some(format!("duplicate deploy integration ID: {id}"));
+        }
+    }
+}
+
 #[derive(Default)]
 struct PlanRegistrationVisitor {
     ids: BTreeSet<String>,
+    error: Option<String>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for PlanRegistrationVisitor {
@@ -567,8 +633,9 @@ impl<'ast> syn::visit::Visit<'ast> for PlanRegistrationVisitor {
                 .last()
                 .is_some_and(|segment| segment.ident == "register_for_plan")
                 && let Some(module) = segments.iter().rev().nth(1)
+                && !self.ids.insert(module.ident.to_string())
             {
-                self.ids.insert(module.ident.to_string());
+                self.error = Some(format!("duplicate plan registration ID: {}", module.ident));
             }
         }
         visit::visit_expr_call(self, call);
@@ -578,6 +645,7 @@ impl<'ast> syn::visit::Visit<'ast> for PlanRegistrationVisitor {
 #[derive(Default)]
 struct MediatorVisitor {
     ids: BTreeSet<String>,
+    error: Option<String>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for MediatorVisitor {
@@ -588,8 +656,9 @@ impl<'ast> syn::visit::Visit<'ast> for MediatorVisitor {
                 .last()
                 .is_some_and(|segment| segment.ident == "register_providers")
                 && let Some(module) = segments.iter().rev().nth(1)
+                && !self.ids.insert(module.ident.to_string())
             {
-                self.ids.insert(module.ident.to_string());
+                self.error = Some(format!("duplicate mediator ID: {}", module.ident));
             }
         }
         visit::visit_expr_call(self, call);
@@ -793,6 +862,19 @@ fn compare<T: PartialEq>(
         Ok(())
     } else {
         Err(Report::new(IntegrationError::InventoryDrift { axis }))
+    }
+}
+
+fn unique_values(
+    values: Vec<String>,
+    axis: &'static str,
+) -> Result<BTreeSet<String>, Report<IntegrationError>> {
+    let count = values.len();
+    let unique = values.into_iter().collect::<BTreeSet<_>>();
+    if unique.len() != count {
+        Err(invalid_manifest(format!("duplicate {axis} value")))
+    } else {
+        Ok(unique)
     }
 }
 

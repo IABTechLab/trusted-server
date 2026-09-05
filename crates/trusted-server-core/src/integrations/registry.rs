@@ -2523,7 +2523,45 @@ mod tests {
         );
     }
 
-    #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+    #[test]
+    fn task8_compiled_receipts_reject_duplicate_capabilities_routes_and_hooks() {
+        for axis in [
+            "proxy_routes",
+            "attribute_rewriters",
+            "script_rewriters",
+            "head_injectors",
+            "post_processors",
+            "request_filters",
+            "providers",
+        ] {
+            assert!(
+                task8_unique_receipt_values(axis, ["same", "same"]).is_err(),
+                "compiled {axis} observations must retain and reject duplicate cardinality"
+            );
+        }
+
+        let capability = Task8Capability {
+            id: "fixture".to_owned(),
+            predicate: "enabled=true".to_owned(),
+            proxy_routes: BTreeSet::new(),
+            attribute_rewriters: BTreeSet::new(),
+            script_rewriters: BTreeSet::new(),
+            head_injectors: BTreeSet::new(),
+            post_processors: BTreeSet::new(),
+            request_filters: BTreeSet::new(),
+            providers: BTreeSet::new(),
+            js_mode: "none".to_owned(),
+        };
+        let mut capabilities = BTreeSet::new();
+        task8_insert_capability(&mut capabilities, capability.clone())
+            .expect("should insert the first compiled capability observation");
+        assert!(
+            task8_insert_capability(&mut capabilities, capability).is_err(),
+            "compiled capability observations must reject duplicate rows"
+        );
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
     #[serde(deny_unknown_fields)]
     struct Task8Capability {
         id: String,
@@ -2567,42 +2605,84 @@ mod tests {
         .expect("should parse checked Task 8 integration manifest")
     }
 
+    fn task8_unique_receipt_values<I, S>(axis: &str, values: I) -> Result<BTreeSet<String>, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let values = values
+            .into_iter()
+            .map(|value| value.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        let count = values.len();
+        let unique = values.into_iter().collect::<BTreeSet<_>>();
+        if unique.len() != count {
+            Err(format!("duplicate compiled {axis} observation"))
+        } else {
+            Ok(unique)
+        }
+    }
+
+    fn task8_insert_capability(
+        observations: &mut BTreeSet<Task8Capability>,
+        capability: Task8Capability,
+    ) -> Result<(), String> {
+        if observations.insert(capability) {
+            Ok(())
+        } else {
+            Err("duplicate compiled capability observation".to_owned())
+        }
+    }
+
     fn task8_observed_capabilities() -> BTreeSet<Task8Capability> {
         let mut observations = BTreeSet::new();
-        observations.insert(Task8Capability {
-            id: "creative".to_owned(),
-            predicate: "always".to_owned(),
-            proxy_routes: BTreeSet::new(),
-            attribute_rewriters: BTreeSet::new(),
-            script_rewriters: BTreeSet::new(),
-            head_injectors: BTreeSet::new(),
-            post_processors: BTreeSet::new(),
-            request_filters: BTreeSet::new(),
-            providers: BTreeSet::new(),
-            js_mode: "bundled".to_owned(),
-        });
+        task8_insert_capability(
+            &mut observations,
+            Task8Capability {
+                id: "creative".to_owned(),
+                predicate: "always".to_owned(),
+                proxy_routes: BTreeSet::new(),
+                attribute_rewriters: BTreeSet::new(),
+                script_rewriters: BTreeSet::new(),
+                head_injectors: BTreeSet::new(),
+                post_processors: BTreeSet::new(),
+                request_filters: BTreeSet::new(),
+                providers: BTreeSet::new(),
+                js_mode: "bundled".to_owned(),
+            },
+        )
+        .expect("should insert the creative capability observation");
 
         for (id, config) in task8_builder_fixtures() {
-            observations.insert(task8_builder_capability(id, &config, "enabled=true"));
+            task8_insert_capability(
+                &mut observations,
+                task8_builder_capability(id, &config, "enabled=true"),
+            )
+            .expect("should insert a unique settings-builder capability observation");
         }
-        observations.insert(task8_builder_capability(
-            "datadome",
-            &serde_json::json!({"enabled": true, "enable_protection": false}),
-            "enabled=true;enable_protection=false",
-        ));
-        observations.insert(task8_builder_capability(
-            "datadome",
-            &serde_json::json!({
-                "enabled": true,
-                "enable_protection": true,
-                "server_side_key_secret_name": "example-key-name"
-            }),
-            "enabled=true;enable_protection=true",
-        ));
-        observations.insert(task8_prebid_capability());
-        observations.insert(task8_aps_capability(ApsRenderingMode::TrustedServer));
-        observations.insert(task8_aps_capability(ApsRenderingMode::PublisherNative));
-        observations.insert(task8_mediator_capability());
+        for capability in [
+            task8_builder_capability(
+                "datadome",
+                &serde_json::json!({"enabled": true, "enable_protection": false}),
+                "enabled=true;enable_protection=false",
+            ),
+            task8_builder_capability(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "enable_protection": true,
+                    "server_side_key_secret_name": "example-key-name"
+                }),
+                "enabled=true;enable_protection=true",
+            ),
+            task8_prebid_capability(),
+            task8_aps_capability(ApsRenderingMode::TrustedServer),
+            task8_aps_capability(ApsRenderingMode::PublisherNative),
+            task8_mediator_capability(),
+        ] {
+            task8_insert_capability(&mut observations, capability)
+                .expect("should insert a unique compiled capability observation");
+        }
         observations
     }
 
@@ -2737,11 +2817,14 @@ mod tests {
                 }),
             )
             .expect("should insert Task 8 mediator config");
-        let providers = crate::integrations::adserver_mock::register_providers(&settings)
-            .expect("should register Task 8 mediator")
-            .into_iter()
-            .map(|provider| provider.provider_name().to_owned())
-            .collect();
+        let providers = task8_unique_receipt_values(
+            "providers",
+            crate::integrations::adserver_mock::register_providers(&settings)
+                .expect("should register Task 8 mediator")
+                .into_iter()
+                .map(|provider| provider.provider_name().to_owned()),
+        )
+        .expect("should observe unique mediator providers");
         Task8Capability {
             id: "adserver_mock".to_owned(),
             predicate: "auction.mediator=adserver_mock;enabled=true".to_owned(),
@@ -2761,37 +2844,55 @@ mod tests {
         predicate: &str,
     ) -> Task8Capability {
         let id = registration.integration_id;
-        let proxy_routes = registration
-            .proxies
-            .iter()
-            .flat_map(|proxy| proxy.routes())
-            .map(|route| format!("{} {}", route.method, route.path))
-            .collect();
-        let attribute_rewriters = registration
-            .attribute_rewriters
-            .iter()
-            .map(|rewriter| rewriter.integration_id().to_owned())
-            .collect();
-        let script_rewriters = registration
-            .script_rewriters
-            .iter()
-            .map(|rewriter| format!("{}:{}", rewriter.integration_id(), rewriter.selector()))
-            .collect();
-        let head_injectors = registration
-            .head_injectors
-            .iter()
-            .map(|injector| injector.integration_id().to_owned())
-            .collect();
-        let post_processors = registration
-            .html_post_processors
-            .iter()
-            .map(|processor| processor.integration_id().to_owned())
-            .collect();
-        let request_filters = registration
-            .request_filters
-            .iter()
-            .map(|filter| filter.integration_id().to_owned())
-            .collect();
+        let proxy_routes = task8_unique_receipt_values(
+            "proxy_routes",
+            registration
+                .proxies
+                .iter()
+                .flat_map(|proxy| proxy.routes())
+                .map(|route| format!("{} {}", route.method, route.path)),
+        )
+        .expect("should observe unique integration proxy routes");
+        let attribute_rewriters = task8_unique_receipt_values(
+            "attribute_rewriters",
+            registration
+                .attribute_rewriters
+                .iter()
+                .map(|rewriter| rewriter.integration_id()),
+        )
+        .expect("should observe unique integration attribute rewriters");
+        let script_rewriters = task8_unique_receipt_values(
+            "script_rewriters",
+            registration
+                .script_rewriters
+                .iter()
+                .map(|rewriter| format!("{}:{}", rewriter.integration_id(), rewriter.selector())),
+        )
+        .expect("should observe unique integration script rewriters");
+        let head_injectors = task8_unique_receipt_values(
+            "head_injectors",
+            registration
+                .head_injectors
+                .iter()
+                .map(|injector| injector.integration_id()),
+        )
+        .expect("should observe unique integration head injectors");
+        let post_processors = task8_unique_receipt_values(
+            "post_processors",
+            registration
+                .html_post_processors
+                .iter()
+                .map(|processor| processor.integration_id()),
+        )
+        .expect("should observe unique integration post-processors");
+        let request_filters = task8_unique_receipt_values(
+            "request_filters",
+            registration
+                .request_filters
+                .iter()
+                .map(|filter| filter.integration_id()),
+        )
+        .expect("should observe unique integration request filters");
         let js_mode = if registration.js_disabled {
             if id == "gpt_diagnostics" {
                 "standalone"

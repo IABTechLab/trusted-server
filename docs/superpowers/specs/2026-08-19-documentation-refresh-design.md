@@ -1229,8 +1229,10 @@ distinguishes literal-substitution consumers - config.rs template tests,
 CLI ad_templates and audit generate/validate substitutions, the
 template-cache script - from include-only consumers such as
 `config init`), and this appendix does not restate its count. Validator inventory for
-companion entries: 2 struct-level schema validators
-(`validate_trusted_client_ip`, APS inventory-identity override), the
+companion entries: exactly one production struct-level schema validator
+(`validate_trusted_client_ip`); the test-only APS schema annotation is excluded.
+APS account and inventory validators belong only to the imperative profile
+compiler inventory. The
 field-level custom-validator sites (enumerated canonically by the WP8a
 companion manifest, which fails closed on unclassified validators,
 rather than by a count here), the imperative
@@ -1240,8 +1242,8 @@ family (`ProviderId`/`BidderId` grammars, `canonicalize_endpoint`,
 notification caps, mediator match, signing gate,
 `validate_for_target`), the profile compilers (standard: 16KiB /
 depth-8 / 256-key extension limits, `request_ext`-only reserved fields;
-prebid-server: override-rule engine; aps: account and inventory
-validators), and the integration deploy/startup pairs (DataDome split,
+prebid-server: override-rule engine; aps: account and inventory validators),
+and the integration deploy/startup pairs (DataDome split,
 prebid browser-ownership cross-check against the plan, PartnerRegistry
 deploy/runtime).
 

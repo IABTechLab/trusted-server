@@ -9,6 +9,67 @@ fn set(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
+fn minimal_manifest() -> String {
+    r#"
+        version = 1
+        reviewed = true
+        deploy_ids = ["deploy"]
+        builder_ids = ["builder"]
+        plan_registration_ids = ["plan"]
+        profile_ids = ["profile"]
+        mediator_ids = ["mediator"]
+        js_source_module_ids = ["source"]
+        js_bundle_ids = ["bundle"]
+    "#
+    .to_owned()
+}
+
+macro_rules! duplicate_static_axis_test {
+    ($name:ident, $axis:literal, $value:literal) => {
+        #[test]
+        fn $name() {
+            let source = minimal_manifest().replace(
+                concat!($axis, " = [\"", $value, "\"]"),
+                concat!($axis, " = [\"", $value, "\", \"", $value, "\"]"),
+            );
+            let error = IntegrationInventory::parse(&source).expect_err(concat!(
+                "duplicate ",
+                $axis,
+                " values must fail"
+            ));
+            assert!(
+                error.to_string().contains(concat!("duplicate ", $axis)),
+                "duplicate {} should identify its static axis: {error:?}",
+                $axis
+            );
+        }
+    };
+}
+
+duplicate_static_axis_test!(duplicate_deploy_ids_fail_closed, "deploy_ids", "deploy");
+duplicate_static_axis_test!(duplicate_builder_ids_fail_closed, "builder_ids", "builder");
+duplicate_static_axis_test!(
+    duplicate_plan_registration_ids_fail_closed,
+    "plan_registration_ids",
+    "plan"
+);
+duplicate_static_axis_test!(duplicate_profile_ids_fail_closed, "profile_ids", "profile");
+duplicate_static_axis_test!(
+    duplicate_mediator_ids_fail_closed,
+    "mediator_ids",
+    "mediator"
+);
+duplicate_static_axis_test!(
+    duplicate_js_source_module_ids_fail_closed,
+    "js_source_module_ids",
+    "source"
+);
+duplicate_static_axis_test!(
+    duplicate_js_bundle_ids_fail_closed,
+    "js_bundle_ids",
+    "bundle"
+);
+
 #[test]
 fn source_inventory_extracts_each_authoritative_registration_surface() {
     let sources = InventorySources {
@@ -113,6 +174,90 @@ fn source_inventory_rejects_an_unclassified_deploy_validator() {
             .to_string()
             .contains("deploy validator")
     );
+}
+
+#[test]
+fn source_inventory_rejects_duplicate_registrations_on_every_rust_axis() {
+    let cases = [
+        InventorySources {
+            deploy_validation: r#"
+                fn validate_enabled_integrations() {
+                    validate_integration::<A>(settings, "same")?;
+                    validate_integration::<B>(settings, "same")?;
+                }
+            "#,
+            builders: "fn builders() -> &'static [IntegrationBuilder] { &[] }",
+            plan_registrations: "impl Registry { fn with_plan() {} }",
+            profiles: "const PROFILE_REGISTRATIONS: [Registration; 0] = [];",
+            mediator: "fn build_orchestrator_with_plan() {}",
+            tracked_paths: &[],
+        },
+        InventorySources {
+            deploy_validation: "fn validate_enabled_integrations() {}",
+            builders: r#"
+                fn builders() -> &'static [IntegrationBuilder] {
+                    &[
+                        IntegrationBuilder { id: "same", build: a::register },
+                        IntegrationBuilder { id: "same", build: b::register },
+                    ]
+                }
+            "#,
+            plan_registrations: "impl Registry { fn with_plan() {} }",
+            profiles: "const PROFILE_REGISTRATIONS: [Registration; 0] = [];",
+            mediator: "fn build_orchestrator_with_plan() {}",
+            tracked_paths: &[],
+        },
+        InventorySources {
+            deploy_validation: "fn validate_enabled_integrations() {}",
+            builders: "fn builders() -> &'static [IntegrationBuilder] { &[] }",
+            plan_registrations: r#"
+                impl Registry {
+                    fn with_plan() {
+                        same::register_for_plan()?;
+                        same::register_for_plan()?;
+                    }
+                }
+            "#,
+            profiles: "const PROFILE_REGISTRATIONS: [Registration; 0] = [];",
+            mediator: "fn build_orchestrator_with_plan() {}",
+            tracked_paths: &[],
+        },
+        InventorySources {
+            deploy_validation: "fn validate_enabled_integrations() {}",
+            builders: "fn builders() -> &'static [IntegrationBuilder] { &[] }",
+            plan_registrations: "impl Registry { fn with_plan() {} }",
+            profiles: r#"
+                const PROFILE_REGISTRATIONS: [Registration; 2] = [
+                    Registration { id: "same", compile: compile_a },
+                    Registration { id: "same", compile: compile_b },
+                ];
+            "#,
+            mediator: "fn build_orchestrator_with_plan() {}",
+            tracked_paths: &[],
+        },
+        InventorySources {
+            deploy_validation: "fn validate_enabled_integrations() {}",
+            builders: "fn builders() -> &'static [IntegrationBuilder] { &[] }",
+            plan_registrations: "impl Registry { fn with_plan() {} }",
+            profiles: "const PROFILE_REGISTRATIONS: [Registration; 0] = [];",
+            mediator: r#"
+                fn build_orchestrator_with_plan() {
+                    same::register_providers()?;
+                    same::register_providers()?;
+                }
+            "#,
+            tracked_paths: &[],
+        },
+    ];
+
+    for sources in cases {
+        assert!(
+            extract_source_inventory(&sources)
+                .expect_err("duplicate Rust registrations must fail")
+                .to_string()
+                .contains("duplicate")
+        );
+    }
 }
 
 #[test]
@@ -305,6 +450,69 @@ fn duplicate_manifest_rows_and_unknown_shapes_fail_closed() {
             .expect_err("unknown manifest fields must fail")
             .to_string()
             .contains("unknown")
+    );
+}
+
+#[test]
+fn duplicate_capability_members_and_keyed_rows_fail_closed() {
+    let base = format!(
+        "{}\n[[capabilities]]\nid = \"integration\"\npredicate = \"enabled\"\nproxy_routes = [\"route\"]\nattribute_rewriters = [\"attribute\"]\nscript_rewriters = [\"script\"]\nhead_injectors = [\"head\"]\npost_processors = [\"post\"]\nrequest_filters = [\"filter\"]\nproviders = [\"provider\"]\njs_mode = \"bundled\"\n",
+        minimal_manifest()
+    );
+    for (field, value) in [
+        ("proxy_routes", "route"),
+        ("attribute_rewriters", "attribute"),
+        ("script_rewriters", "script"),
+        ("head_injectors", "head"),
+        ("post_processors", "post"),
+        ("request_filters", "filter"),
+        ("providers", "provider"),
+    ] {
+        let source = base.replace(
+            &format!("{field} = [\"{value}\"]"),
+            &format!("{field} = [\"{value}\", \"{value}\"]"),
+        );
+        let error = IntegrationInventory::parse(&source)
+            .expect_err("duplicate capability members must fail");
+        assert!(
+            error.to_string().contains(field),
+            "duplicate {field} should identify its capability axis: {error:?}"
+        );
+    }
+
+    let duplicate_key = format!(
+        "{base}\n[[capabilities]]\nid = \"integration\"\npredicate = \"enabled\"\njs_mode = \"none\"\n"
+    );
+    assert!(
+        IntegrationInventory::parse(&duplicate_key)
+            .expect_err("duplicate capability id/predicate keys must fail")
+            .to_string()
+            .contains("duplicate capability key")
+    );
+}
+
+#[test]
+fn duplicate_loading_and_operational_assignments_fail_closed() {
+    let duplicate_loading = format!(
+        "{}\n[[loading_modes]]\nid = \"source\"\nmode = \"bundled\"\n[[loading_modes]]\nid = \"source\"\nmode = \"bundled\"\n",
+        minimal_manifest()
+    );
+    assert!(
+        IntegrationInventory::parse(&duplicate_loading)
+            .expect_err("duplicate loading assignments must fail")
+            .to_string()
+            .contains("duplicate loading")
+    );
+
+    let duplicate_operational = format!(
+        "{}\n[[operational]]\nid = \"integration\"\nstatus = \"production\"\nowner = \"reviewer\"\nreviewed_at = \"2026-09-05\"\n[[operational]]\nid = \"integration\"\nstatus = \"development\"\nowner = \"reviewer\"\nreviewed_at = \"2026-09-05\"\n",
+        minimal_manifest()
+    );
+    assert!(
+        IntegrationInventory::parse(&duplicate_operational)
+            .expect_err("duplicate operational assignments must fail")
+            .to_string()
+            .contains("duplicate operational integration ID")
     );
 }
 

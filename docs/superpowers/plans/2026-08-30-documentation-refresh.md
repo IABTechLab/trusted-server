@@ -620,6 +620,7 @@ Step 11 staging commands equals that set, and Task 8 has not started.
 - Modify/Test: `crates/trusted-server-adapter-spin/tests/routes.rs`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 - Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
+- Modify: `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md`
 
 - [x] **Step 1: Write inventory equality failures**
 
@@ -674,7 +675,32 @@ git add crates/trusted-server-adapter-axum/src/app.rs crates/trusted-server-adap
 git commit -m "Check integration and adapter inventories"
 ```
 
-Expected: the Task 8 commit contains exactly the 23 paths in **Files** above.
+Expected: the original Task 8 commit contains the historical 23-path set from
+this staging command. The post-review correction in Step 7 adds the design
+specification to the current 24-path Task 8 **Files** set above.
+
+- [x] **Step 7: Close duplicate cardinality and validator-inventory review gaps**
+
+Retain raw manifest and compiled-observation cardinality until duplicate
+validation completes. Reject duplicate values on every static integration
+axis; loading, capability, nested capability, and operational rows; route
+adapters, methods, expanded semantics, named and Cloudflare source routes; and
+adapter-support records. Make deploy, plan, and mediator source visitors reject
+duplicate insertions, retaining the builder and profile checks. Correct the
+settings validator statement to one production struct-level companion and keep
+APS account/inventory validators in the imperative profile-compiler inventory.
+
+```bash
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test integrations
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test routes
+PATH=/private/tmp/task7-viceroy/bin:$PATH SSL_CERT_FILE=/etc/ssl/cert.pem cargo test-fastly task8_
+git add crates/trusted-server-core/src/integrations/registry.rs docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/superpowers/specs/2026-08-19-documentation-refresh-design.md tools/docs-parity/src/integrations.rs tools/docs-parity/src/routes.rs tools/docs-parity/tests/integrations.rs tools/docs-parity/tests/routes.rs
+git commit -m "Close integration inventory review gaps"
+```
+
+Expected: the correction commit contains exactly these eight paths, the
+standalone suite contains 267 tests, and the full Task 8 aggregate contains
+exactly the 24 paths in **Files** above.
 
 ### Task 9: Check CLI help, snippets, gates, and final workflow foundations
 

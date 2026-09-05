@@ -452,3 +452,126 @@ fn route_and_support_manifests_reject_duplicates_unknown_fields_and_bad_ownershi
             .contains("ownership")
     );
 }
+
+#[test]
+fn route_manifest_rejects_duplicate_adapters_and_methods_before_expansion() {
+    let source = r#"
+        version = 1
+        reviewed = true
+        [[routes]]
+        adapters = ["fastly", "fastly"]
+        path = "/health"
+        methods = ["GET"]
+        shape = "literal"
+        predicate = "always"
+        status = "real"
+    "#;
+    assert!(
+        RouteManifest::parse(source)
+            .expect_err("duplicate adapters must fail before set conversion")
+            .to_string()
+            .contains("duplicate route adapter")
+    );
+
+    let source = source
+        .replace("[\"fastly\", \"fastly\"]", "[\"fastly\"]")
+        .replace("[\"GET\"]", "[\"GET\", \"GET\"]");
+    assert!(
+        RouteManifest::parse(&source)
+            .expect_err("duplicate methods must fail before set conversion")
+            .to_string()
+            .contains("duplicate route method")
+    );
+}
+
+#[test]
+fn route_manifest_rejects_overlapping_expanded_method_semantics() {
+    let source = r#"
+        version = 1
+        reviewed = true
+        [[routes]]
+        adapters = ["fastly"]
+        path = "/health"
+        methods = ["GET"]
+        shape = "literal"
+        predicate = "always"
+        status = "real"
+        [[routes]]
+        adapters = ["fastly"]
+        path = "/health"
+        methods = ["GET", "HEAD"]
+        shape = "literal"
+        predicate = "always"
+        status = "real"
+    "#;
+    assert!(
+        RouteManifest::parse(source)
+            .expect_err("overlapping expanded method semantics must fail")
+            .to_string()
+            .contains("duplicate expanded route semantic")
+    );
+}
+
+#[test]
+fn named_and_cloudflare_sources_reject_duplicate_semantic_routes() {
+    let named = r#"
+        const NAMED_ROUTES: &[NamedRoute] = &[
+            NamedRoute { path: "/health", primary_methods: &[Method::GET] },
+            NamedRoute { path: "/health", primary_methods: &[Method::GET] },
+        ];
+    "#;
+    assert!(
+        extract_named_routes("fastly", named)
+            .expect_err("duplicate named routes must fail")
+            .to_string()
+            .contains("duplicate")
+    );
+
+    let duplicate_method = r#"
+        const NAMED_ROUTES: &[NamedRoute] = &[
+            NamedRoute { path: "/health", primary_methods: &[Method::GET, Method::GET] },
+        ];
+    "#;
+    assert!(
+        extract_named_routes("fastly", duplicate_method)
+            .expect_err("duplicate source methods must fail")
+            .to_string()
+            .contains("duplicate")
+    );
+
+    let cloudflare = r#"
+        fn build_router() {
+            let mut router = RouterService::builder().get("/health", handler);
+            router = router.get("/health", handler);
+            router.build()
+        }
+    "#;
+    assert!(
+        extract_cloudflare_routes(cloudflare)
+            .expect_err("duplicate Cloudflare routes must fail")
+            .to_string()
+            .contains("duplicate")
+    );
+}
+
+#[test]
+fn adapter_support_rejects_duplicate_operational_rows() {
+    let row = r#"
+        [[adapters]]
+        id = "fastly"
+        release_status = "production"
+        owner = "reviewer"
+        reviewed_at = "2026-09-05"
+        health = "pre_router"
+        startup_status = 500
+        startup_health = true
+        provider_fanout = "multiple"
+    "#;
+    let source = format!("version = 1\nreviewed = true\n{row}\n{row}");
+    assert!(
+        AdapterSupportManifest::parse(&source)
+            .expect_err("duplicate adapter operational rows must fail")
+            .to_string()
+            .contains("duplicate adapter support row")
+    );
+}
