@@ -1,0 +1,265 @@
+version = 1
+reviewed = true
+deploy_ids = ["adserver_mock", "aps", "datadome", "didomi", "google_tag_manager", "gpt", "gpt_diagnostics", "lockr", "nextjs", "osano", "permutive", "prebid", "sourcepoint", "testlight"]
+builder_ids = ["datadome", "didomi", "google_tag_manager", "gpt", "gpt_diagnostics", "lockr", "nextjs", "osano", "permutive", "sourcepoint", "testlight"]
+plan_registration_ids = ["aps", "prebid"]
+profile_ids = ["aps", "prebid-server", "standard"]
+mediator_ids = ["adserver_mock"]
+js_source_module_ids = ["creative", "datadome", "didomi", "google_tag_manager", "gpt", "gpt_diagnostics", "lockr", "osano", "permutive", "prebid", "sourcepoint", "testlight"]
+js_bundle_ids = ["core", "creative", "datadome", "didomi", "google_tag_manager", "gpt", "gpt_diagnostics", "lockr", "osano", "permutive", "prebid", "sourcepoint", "testlight"]
+
+[[loading_modes]]
+id = "creative"
+mode = "bundled"
+
+[[loading_modes]]
+id = "datadome"
+mode = "bundled"
+
+[[loading_modes]]
+id = "didomi"
+mode = "bundled"
+
+[[loading_modes]]
+id = "google_tag_manager"
+mode = "bundled"
+
+[[loading_modes]]
+id = "gpt"
+mode = "bundled"
+
+[[loading_modes]]
+id = "gpt_diagnostics"
+mode = "standalone"
+
+[[loading_modes]]
+id = "lockr"
+mode = "bundled"
+
+[[loading_modes]]
+id = "osano"
+mode = "bundled"
+
+[[loading_modes]]
+id = "permutive"
+mode = "bundled"
+
+[[loading_modes]]
+id = "prebid"
+mode = "deferred"
+
+[[loading_modes]]
+id = "sourcepoint"
+mode = "bundled"
+
+[[loading_modes]]
+id = "testlight"
+mode = "bundled"
+
+[[capabilities]]
+id = "adserver_mock"
+predicate = "auction.mediator=adserver_mock;enabled=true"
+providers = ["adserver_mock"]
+js_mode = "none"
+
+[[capabilities]]
+id = "aps"
+predicate = "plan.has_profile(aps);rendering_mode=publisher_native"
+head_injectors = ["aps"]
+js_mode = "none"
+
+[[capabilities]]
+id = "aps"
+predicate = "plan.has_profile(aps);rendering_mode=trusted_server"
+proxy_routes = ["GET /integrations/aps/renderer"]
+head_injectors = ["aps"]
+js_mode = "none"
+
+[[capabilities]]
+id = "creative"
+predicate = "always"
+js_mode = "bundled"
+
+[[capabilities]]
+id = "datadome"
+predicate = "enabled=true;enable_protection=false"
+proxy_routes = ["GET /integrations/datadome/js/", "GET /integrations/datadome/js/*", "GET /integrations/datadome/tags.js", "POST /integrations/datadome/js/", "POST /integrations/datadome/js/*"]
+attribute_rewriters = ["datadome"]
+head_injectors = ["datadome"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "datadome"
+predicate = "enabled=true;enable_protection=true"
+proxy_routes = ["GET /integrations/datadome/js/", "GET /integrations/datadome/js/*", "GET /integrations/datadome/tags.js", "POST /integrations/datadome/js/", "POST /integrations/datadome/js/*"]
+attribute_rewriters = ["datadome"]
+head_injectors = ["datadome"]
+request_filters = ["datadome"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "didomi"
+predicate = "enabled=true"
+proxy_routes = ["GET /integrations/didomi/consent/*", "POST /integrations/didomi/consent/*"]
+head_injectors = ["didomi"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "google_tag_manager"
+predicate = "enabled=true"
+proxy_routes = ["GET /integrations/google_tag_manager/collect", "GET /integrations/google_tag_manager/g/collect", "GET /integrations/google_tag_manager/gtag.js", "GET /integrations/google_tag_manager/gtag/js", "GET /integrations/google_tag_manager/gtm.js", "POST /integrations/google_tag_manager/collect", "POST /integrations/google_tag_manager/g/collect"]
+attribute_rewriters = ["google_tag_manager"]
+script_rewriters = ["google_tag_manager:script"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "gpt"
+predicate = "enabled=true"
+proxy_routes = ["GET /integrations/gpt/pagead/*", "GET /integrations/gpt/script", "GET /integrations/gpt/tag/*"]
+attribute_rewriters = ["gpt"]
+head_injectors = ["gpt"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "gpt_diagnostics"
+predicate = "enabled=true"
+js_mode = "standalone"
+
+[[capabilities]]
+id = "lockr"
+predicate = "enabled=true"
+proxy_routes = ["GET /integrations/lockr/api/*", "GET /integrations/lockr/sdk", "POST /integrations/lockr/api/*"]
+attribute_rewriters = ["lockr"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "nextjs"
+predicate = "enabled=true"
+script_rewriters = ["nextjs:script", "nextjs:script#__NEXT_DATA__"]
+post_processors = ["nextjs"]
+js_mode = "none"
+
+[[capabilities]]
+id = "osano"
+predicate = "enabled=true"
+js_mode = "bundled"
+
+[[capabilities]]
+id = "permutive"
+predicate = "enabled=true"
+proxy_routes = ["GET /integrations/permutive/api/*", "GET /integrations/permutive/cdn/*", "GET /integrations/permutive/events/*", "GET /integrations/permutive/sdk", "GET /integrations/permutive/secure-signal/*", "GET /integrations/permutive/sync/*", "POST /integrations/permutive/api/*", "POST /integrations/permutive/events/*", "POST /integrations/permutive/secure-signal/*", "POST /integrations/permutive/sync/*"]
+attribute_rewriters = ["permutive"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "prebid"
+predicate = "enabled=true"
+proxy_routes = ["GET /integrations/prebid/bundle.js", "GET /prebid.js", "GET /prebid.min.js", "GET /prebidjs.js", "GET /prebidjs.min.js"]
+attribute_rewriters = ["prebid"]
+head_injectors = ["prebid"]
+js_mode = "deferred"
+
+[[capabilities]]
+id = "sourcepoint"
+predicate = "enabled=true"
+proxy_routes = ["GET /integrations/sourcepoint/cdn/*", "HEAD /integrations/sourcepoint/cdn/*", "OPTIONS /integrations/sourcepoint/cdn/*", "POST /integrations/sourcepoint/cdn/*"]
+attribute_rewriters = ["sourcepoint"]
+head_injectors = ["sourcepoint"]
+js_mode = "bundled"
+
+[[capabilities]]
+id = "testlight"
+predicate = "enabled=true"
+proxy_routes = ["POST /integrations/testlight/auction"]
+attribute_rewriters = ["testlight"]
+js_mode = "bundled"
+
+[[operational]]
+id = "adserver_mock"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "aps"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "creative"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "datadome"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "didomi"
+status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "google_tag_manager"
+status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "gpt"
+status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "gpt_diagnostics"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "lockr"
+status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "nextjs"
+status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "osano"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "permutive"
+status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "prebid"
+status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "sourcepoint"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+
+[[operational]]
+id = "testlight"
+status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"

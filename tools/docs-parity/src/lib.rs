@@ -12,9 +12,11 @@ use error_stack::{Report, ResultExt as _};
 use crate::repository::{NormalizedRelativePath, Repository};
 
 pub mod classification;
+pub mod integrations;
 pub mod markdown;
 pub mod model;
 mod repository;
+pub mod routes;
 pub mod scanner;
 pub mod settings;
 
@@ -41,6 +43,10 @@ pub enum DocsParityError {
     Markdown,
     #[display("configuration documentation semantics failed")]
     Settings,
+    #[display("integration documentation semantics failed")]
+    Integrations,
+    #[display("adapter route documentation semantics failed")]
+    Routes,
 }
 
 impl core::error::Error for DocsParityError {}
@@ -72,11 +78,29 @@ enum Command {
     Links(LinksArguments),
     /// Check extracted settings semantics and the source-template contract.
     Settings(SettingsArguments),
+    /// Check integration inventories and behavioral receipt domains.
+    Integrations(IntegrationsArguments),
+    /// Check adapter route and support inventories.
+    Routes(RoutesArguments),
 }
 
 #[derive(Args, Debug)]
 struct SettingsArguments {
     /// Validate settings records without changing repository bytes.
+    #[arg(long, required = true)]
+    check: bool,
+}
+
+#[derive(Args, Debug)]
+struct IntegrationsArguments {
+    /// Validate integration records without changing repository bytes.
+    #[arg(long, required = true)]
+    check: bool,
+}
+
+#[derive(Args, Debug)]
+struct RoutesArguments {
+    /// Validate route records without changing repository bytes.
     #[arg(long, required = true)]
     check: bool,
 }
@@ -192,7 +216,30 @@ pub fn run_from_env() -> Result<Outcome, Report<DocsParityError>> {
         Command::Generate(arguments) => generate(&repository, &arguments),
         Command::Links(arguments) => links(&repository, &arguments),
         Command::Settings(arguments) => settings(&repository, &arguments),
+        Command::Integrations(arguments) => integrations(&repository, &arguments),
+        Command::Routes(arguments) => routes(&repository, &arguments),
     }
+}
+
+fn integrations(
+    repository: &Repository,
+    arguments: &IntegrationsArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    debug_assert!(
+        arguments.check,
+        "clap should require integration check mode"
+    );
+    integrations::check_repository(repository).change_context(DocsParityError::Integrations)?;
+    Ok(Outcome::Clean)
+}
+
+fn routes(
+    repository: &Repository,
+    arguments: &RoutesArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    debug_assert!(arguments.check, "clap should require route check mode");
+    routes::check_repository(repository).change_context(DocsParityError::Routes)?;
+    Ok(Outcome::Clean)
 }
 
 fn settings(

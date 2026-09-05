@@ -4027,7 +4027,19 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "tools/docs-parity/manifests/adapter-support.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = "tools/docs-parity/manifests/diagrams.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
+path = "tools/docs-parity/manifests/integrations.toml"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "non_documentation"
@@ -4057,6 +4069,12 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "tools/docs-parity/manifests/routes.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = "tools/docs-parity/manifests/sensitive-allowlist.toml"
 mode = "whole"
 disposition = "exclude"
@@ -4076,6 +4094,12 @@ exclude_kind = "non_documentation"
 
 [[sources]]
 path = "tools/docs-parity/src/classification.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/src/integrations.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"
@@ -4111,6 +4135,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/src/routes.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "tools/docs-parity/src/scanner.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4135,6 +4165,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/tests/integrations.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "tools/docs-parity/tests/links.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4142,6 +4178,12 @@ exclude_kind = "source_code"
 
 [[sources]]
 path = "tools/docs-parity/tests/markdown.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/routes.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"

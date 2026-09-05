@@ -597,28 +597,20 @@ Step 11 staging commands equals that set, and Task 8 has not started.
 
 **Files:**
 
-- Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
-- Modify as dependencies are introduced: `tools/docs-parity/Cargo.lock`
+- Modify: `tools/docs-parity/Cargo.toml`
+- Modify: `tools/docs-parity/README.md`
 - Create: `tools/docs-parity/src/integrations.rs`
 - Create: `tools/docs-parity/src/routes.rs`
-- Modify: `tools/docs-parity/src/main.rs`
 - Modify: `tools/docs-parity/src/lib.rs`
-- Modify: `tools/docs-parity/src/model.rs`
-- Modify: `tools/docs-parity/src/repository.rs`
 - Create: `tools/docs-parity/manifests/integrations.toml`
 - Create: `tools/docs-parity/manifests/routes.toml`
 - Create: `tools/docs-parity/manifests/adapter-support.toml`
 - Modify: `tools/docs-parity/manifests/tracked-files.toml`
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
+- Modify: `tools/docs-parity/manifests/sensitive-allowlist.toml`
 - Create/Test: `tools/docs-parity/tests/integrations.rs`
 - Create/Test: `tools/docs-parity/tests/routes.rs`
-- Modify/Test: `crates/trusted-server-core/src/integrations/mod.rs`
 - Modify/Test: `crates/trusted-server-core/src/integrations/registry.rs`
-- Modify/Test: `crates/trusted-server-core/src/integrations/aps.rs`
-- Modify/Test: `crates/trusted-server-core/src/integrations/datadome.rs`
-- Modify/Test: `crates/trusted-server-core/src/integrations/prebid.rs`
-- Modify/Test: `crates/trusted-server-core/src/auction/mod.rs`
-- Modify/Test: `crates/trusted-server-core/src/auction/profile.rs`
 - Modify/Test: `crates/trusted-server-adapter-fastly/src/app.rs`
 - Modify/Test: `crates/trusted-server-adapter-axum/src/app.rs`
 - Modify/Test: `crates/trusted-server-adapter-cloudflare/src/app.rs`
@@ -626,16 +618,18 @@ Step 11 staging commands equals that set, and Task 8 has not started.
 - Modify/Test: `crates/trusted-server-adapter-axum/tests/routes.rs`
 - Modify/Test: `crates/trusted-server-adapter-cloudflare/tests/routes.rs`
 - Modify/Test: `crates/trusted-server-adapter-spin/tests/routes.rs`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
+- Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
 
-- [ ] **Step 1: Write inventory equality failures**
+- [x] **Step 1: Write inventory equality failures**
 
 Prove missing and extra deploy IDs, builders, plan registrations, profiles, mediator, JS module/bundle/loading-mode entries, route/method/predicate rows, and startup-router semantics all fail.
 
-- [ ] **Step 2: Add behavioral capability probes**
+- [x] **Step 2: Add behavioral capability probes**
 
 Instantiate every integration across its predicate matrix and compare observed proxy routes, rewriters, injectors, post-processors, filters, and JS modes. Exercise APS rendering and DataDome protection in both states. Keep operational/release status manual with owner/review date.
 
-- [ ] **Step 3: Add complete adapter route seams**
+- [x] **Step 3: Add complete adapter route seams**
 
 Snapshot Fastly, Axum, and Spin through named private test-only route
 collections. Parse Cloudflare's builder with a closed grammar that expands only
@@ -646,18 +640,18 @@ behavior-preserving: capture the pre-change route/method/predicate/status and
 startup-router sets, then require exact equality after the extraction. Add no
 public API.
 
-- [ ] **Step 4: Compare checked records as sets**
+- [x] **Step 4: Compare checked records as sets**
 
 Assert methods, literal/template/config-derived/conditional predicates,
 unsupported/guarded semantics, fan-out capability, and degraded startup
 routers. Every adapter regression suite plus the before/after equality proof
 must pass; do not change routing behavior to make the records convenient.
 
-- [ ] **Step 5: Verify every affected target**
+- [x] **Step 5: Verify every affected target**
 
-Add each integration/route dependency only in the standalone manifest,
-regenerate its lockfile, and require `git diff --quiet -- Cargo.lock` before the
-commands below.
+Enable the already-resolved `syn` visitor feature only in the standalone
+manifest. Neither lockfile changes. Require `git diff --quiet -- Cargo.lock`
+before the commands below.
 
 ```bash
 cargo test --manifest-path tools/docs-parity/Cargo.toml integrations
@@ -669,14 +663,18 @@ cargo test-spin
 cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
 ```
 
-Expected: all pass and a generated route/capability update followed by `generate --check` is clean.
+Expected: all pass; the standalone suite contains 253 tests, the expanded route
+manifest contains 103 exact records, and a generated route/capability update
+followed by `generate --check` is clean.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
-git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/src/integrations.rs tools/docs-parity/src/routes.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/integrations.toml tools/docs-parity/manifests/routes.toml tools/docs-parity/manifests/adapter-support.toml tools/docs-parity/tests/integrations.rs tools/docs-parity/tests/routes.rs crates/trusted-server-core/src/integrations/mod.rs crates/trusted-server-core/src/integrations/registry.rs crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/integrations/datadome.rs crates/trusted-server-core/src/integrations/prebid.rs crates/trusted-server-core/src/auction/mod.rs crates/trusted-server-core/src/auction/profile.rs crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-axum/src/app.rs crates/trusted-server-adapter-axum/tests/routes.rs crates/trusted-server-adapter-cloudflare/src/app.rs crates/trusted-server-adapter-cloudflare/tests/routes.rs crates/trusted-server-adapter-spin/src/app.rs crates/trusted-server-adapter-spin/tests/routes.rs docs/internal/audits/documentation-refresh-evidence.md
+git add crates/trusted-server-adapter-axum/src/app.rs crates/trusted-server-adapter-axum/tests/routes.rs crates/trusted-server-adapter-cloudflare/src/app.rs crates/trusted-server-adapter-cloudflare/tests/routes.rs crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-spin/src/app.rs crates/trusted-server-adapter-spin/tests/routes.rs crates/trusted-server-core/src/integrations/registry.rs docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/Cargo.toml tools/docs-parity/README.md tools/docs-parity/manifests/adapter-support.toml tools/docs-parity/manifests/integrations.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/routes.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/integrations.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/routes.rs tools/docs-parity/tests/integrations.rs tools/docs-parity/tests/routes.rs
 git commit -m "Check integration and adapter inventories"
 ```
+
+Expected: the Task 8 commit contains exactly the 23 paths in **Files** above.
 
 ### Task 9: Check CLI help, snippets, gates, and final workflow foundations
 

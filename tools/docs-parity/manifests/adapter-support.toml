@@ -1,0 +1,42 @@
+version = 1
+reviewed = true
+
+[[adapters]]
+id = "fastly"
+release_status = "production"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+health = "pre_router"
+startup_status = 500
+startup_health = true
+provider_fanout = "multiple"
+
+[[adapters]]
+id = "axum"
+release_status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+health = "real"
+startup_status = 500
+startup_health = false
+provider_fanout = "multiple"
+
+[[adapters]]
+id = "cloudflare"
+release_status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+health = "absent"
+startup_status = 500
+startup_health = false
+provider_fanout = "single"
+
+[[adapters]]
+id = "spin"
+release_status = "development"
+owner = "aram356"
+reviewed_at = "2026-09-05"
+health = "real"
+startup_status = 503
+startup_health = true
+provider_fanout = "single"

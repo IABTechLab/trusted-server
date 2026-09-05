@@ -21,6 +21,8 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --update
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --local --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- settings --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- integrations --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- routes --check
 # Scheduled or manual only; this command performs bounded network requests.
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external --check
 ```
@@ -169,6 +171,24 @@ IDs, three profile IDs, three secret-key literals, and all six literal or
 include-only consumers. The source template and every checked source are
 bounded to 4 MiB and decoded as strict UTF-8.
 
+## Integration and route inventories
+
+`integrations --check` extracts the exact deploy validator, settings-builder,
+plan-registration, profile, mediator, JavaScript source, and emitted-bundle
+sets from their authoritative repository surfaces. It compares them with the
+reviewed inventory and validates the loading, capability, and manually owned
+operational domains. Compiled core tests independently instantiate every
+capability predicate and compare the real registration receipts with that same
+manifest.
+
+`routes --check` parses the private Fastly, Axum, and Spin named-route
+collections plus Cloudflare's inline builder using a closed AST grammar. It
+compares the exact per-adapter methods, path shapes, predicates, handler
+dispositions, publisher fallback, and degraded startup routers with the
+reviewed 103-record inventory. Adapter regression tests bind the source seams
+to the unchanged production routers; the support manifest keeps release status
+manual and records the reviewed health, startup, and provider-fan-out facts.
+
 ## Repository boundary
 
 Generated paths must be normalized, non-empty relative paths. Absolute paths,
@@ -200,6 +220,8 @@ cargo test --manifest-path tools/docs-parity/Cargo.toml --test scanner
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test markdown
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test links
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test settings
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test integrations
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test routes
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
 cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings

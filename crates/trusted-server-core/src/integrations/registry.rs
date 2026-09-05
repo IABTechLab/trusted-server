@@ -1383,10 +1383,16 @@ impl IntegrationRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::auction::plan::AuctionPlanConfig;
+    use crate::auction::{AuctionPlan, NotificationConfig, ProviderConfig, RoutingMode};
     use crate::constants::COOKIE_TS_EC;
+    use crate::integrations::aps::{ApsConfig, ApsRenderingMode};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
+    use serde::Deserialize;
 
     struct DefaultMetadataHeadInjector;
 
@@ -2363,5 +2369,453 @@ mod tests {
             recombined, all_sorted,
             "should reconstruct full module list from immediate + deferred"
         );
+    }
+
+    #[test]
+    fn task8_behavioral_capability_matrix_matches_checked_records_exactly() {
+        let manifest = task8_checked_manifest();
+        let observed = task8_observed_capabilities();
+        assert_eq!(
+            observed,
+            manifest.capabilities.into_iter().collect(),
+            "real integration registrations across every checked predicate must equal the reviewed capability records"
+        );
+        let mut observed_loading = BTreeMap::new();
+        for capability in &observed {
+            if capability.js_mode != "none" {
+                let previous =
+                    observed_loading.insert(capability.id.clone(), capability.js_mode.clone());
+                assert!(
+                    previous
+                        .as_ref()
+                        .is_none_or(|mode| mode == &capability.js_mode),
+                    "one integration must not report conflicting JS loading modes"
+                );
+            }
+        }
+        assert_eq!(
+            observed_loading,
+            manifest
+                .loading_modes
+                .into_iter()
+                .map(|row| (row.id, row.mode))
+                .collect(),
+            "real registration loading modes must equal the reviewed loading records"
+        );
+    }
+
+    #[test]
+    fn task8_predicate_negative_matrix_matches_registration_contracts() {
+        for (id, mut config) in task8_builder_fixtures() {
+            config["enabled"] = serde_json::Value::Bool(false);
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings
+                .integrations
+                .insert_config(id, &config)
+                .expect("should insert disabled Task 8 integration config");
+            let registration = crate::integrations::builders()
+                .iter()
+                .find(|builder| builder.id == id)
+                .and_then(|builder| {
+                    (builder.build)(&settings).expect("should evaluate disabled integration")
+                });
+            assert!(
+                registration.is_none(),
+                "disabled {id} must not register routes or hooks"
+            );
+        }
+        let mut datadome_settings = crate::test_support::tests::create_test_settings();
+        datadome_settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({"enabled": false, "enable_protection": true}),
+            )
+            .expect("should insert disabled DataDome config");
+        assert!(
+            crate::integrations::builders()
+                .iter()
+                .find(|builder| builder.id == "datadome")
+                .and_then(|builder| {
+                    (builder.build)(&datadome_settings).expect("should evaluate disabled DataDome")
+                })
+                .is_none(),
+            "disabled DataDome must register neither proxy hooks nor protection filters"
+        );
+
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": false,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                }),
+            )
+            .expect("should insert disabled Prebid config");
+        let plan = crate::auction::compile_auction_plan(&settings)
+            .expect("should compile plan with disabled Prebid");
+        assert!(
+            crate::integrations::prebid::register_for_plan(&settings, &plan)
+                .expect("should evaluate disabled Prebid")
+                .is_none(),
+            "disabled Prebid must not register"
+        );
+
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &ApsConfig {
+                    enabled: false,
+                    rendering_mode: ApsRenderingMode::TrustedServer,
+                },
+            )
+            .expect("should insert disabled APS config");
+        assert!(
+            crate::integrations::aps::register_for_plan(&settings, &plan)
+                .expect("should evaluate APS without an APS plan profile")
+                .is_none(),
+            "APS browser config alone must not register without an APS plan profile"
+        );
+        let aps_plan = AuctionPlan::compile(AuctionPlanConfig {
+            timeout_ms: 1_000,
+            providers: BTreeMap::from([(
+                "aps-disabled-fixture"
+                    .parse()
+                    .expect("should parse disabled APS provider ID"),
+                ProviderConfig {
+                    protocol: "openrtb-2.6".to_owned(),
+                    profile: "aps".to_owned(),
+                    endpoint: "https://aps.example/openrtb".to_owned(),
+                    timeout_ms: None,
+                    routing: RoutingMode::AllEligible,
+                    notifications: NotificationConfig::default(),
+                    profile_config: serde_json::json!({"account_id": "example-account"}),
+                },
+            )]),
+            ..AuctionPlanConfig::default()
+        })
+        .expect("should compile a plan containing an APS profile");
+        assert!(
+            crate::integrations::aps::register_for_plan(&settings, &aps_plan)
+                .expect("should evaluate APS with a plan profile")
+                .is_some(),
+            "APS registration is plan-backed; an APS profile registers even when the independent browser config is disabled"
+        );
+
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &serde_json::json!({
+                    "enabled": false,
+                    "endpoint": "https://adserver.example/mediate"
+                }),
+            )
+            .expect("should insert disabled mediator config");
+        assert!(
+            crate::integrations::adserver_mock::register_providers(&settings)
+                .expect("should evaluate disabled mediator")
+                .is_empty(),
+            "disabled mediator must not register providers"
+        );
+    }
+
+    #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+    #[serde(deny_unknown_fields)]
+    struct Task8Capability {
+        id: String,
+        predicate: String,
+        #[serde(default)]
+        proxy_routes: BTreeSet<String>,
+        #[serde(default)]
+        attribute_rewriters: BTreeSet<String>,
+        #[serde(default)]
+        script_rewriters: BTreeSet<String>,
+        #[serde(default)]
+        head_injectors: BTreeSet<String>,
+        #[serde(default)]
+        post_processors: BTreeSet<String>,
+        #[serde(default)]
+        request_filters: BTreeSet<String>,
+        #[serde(default)]
+        providers: BTreeSet<String>,
+        js_mode: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Task8Manifest {
+        #[serde(default)]
+        capabilities: Vec<Task8Capability>,
+        #[serde(default)]
+        loading_modes: Vec<Task8Loading>,
+    }
+
+    #[derive(Deserialize)]
+    struct Task8Loading {
+        id: String,
+        mode: String,
+    }
+
+    fn task8_checked_manifest() -> Task8Manifest {
+        toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/integrations.toml"
+        )))
+        .expect("should parse checked Task 8 integration manifest")
+    }
+
+    fn task8_observed_capabilities() -> BTreeSet<Task8Capability> {
+        let mut observations = BTreeSet::new();
+        observations.insert(Task8Capability {
+            id: "creative".to_owned(),
+            predicate: "always".to_owned(),
+            proxy_routes: BTreeSet::new(),
+            attribute_rewriters: BTreeSet::new(),
+            script_rewriters: BTreeSet::new(),
+            head_injectors: BTreeSet::new(),
+            post_processors: BTreeSet::new(),
+            request_filters: BTreeSet::new(),
+            providers: BTreeSet::new(),
+            js_mode: "bundled".to_owned(),
+        });
+
+        for (id, config) in task8_builder_fixtures() {
+            observations.insert(task8_builder_capability(id, &config, "enabled=true"));
+        }
+        observations.insert(task8_builder_capability(
+            "datadome",
+            &serde_json::json!({"enabled": true, "enable_protection": false}),
+            "enabled=true;enable_protection=false",
+        ));
+        observations.insert(task8_builder_capability(
+            "datadome",
+            &serde_json::json!({
+                "enabled": true,
+                "enable_protection": true,
+                "server_side_key_secret_name": "example-key-name"
+            }),
+            "enabled=true;enable_protection=true",
+        ));
+        observations.insert(task8_prebid_capability());
+        observations.insert(task8_aps_capability(ApsRenderingMode::TrustedServer));
+        observations.insert(task8_aps_capability(ApsRenderingMode::PublisherNative));
+        observations.insert(task8_mediator_capability());
+        observations
+    }
+
+    fn task8_builder_fixtures() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "testlight",
+                serde_json::json!({
+                    "enabled": true,
+                    "endpoint": "https://testlight.example/auction"
+                }),
+            ),
+            ("nextjs", serde_json::json!({"enabled": true})),
+            (
+                "permutive",
+                serde_json::json!({
+                    "enabled": true,
+                    "organization_id": "example-organization",
+                    "workspace_id": "example-workspace"
+                }),
+            ),
+            (
+                "lockr",
+                serde_json::json!({"enabled": true, "app_id": "example-app"}),
+            ),
+            ("didomi", serde_json::json!({"enabled": true})),
+            ("sourcepoint", serde_json::json!({"enabled": true})),
+            ("osano", serde_json::json!({"enabled": true})),
+            (
+                "google_tag_manager",
+                serde_json::json!({"enabled": true, "container_id": "GTM-EXAMPLE"}),
+            ),
+            ("gpt", serde_json::json!({"enabled": true})),
+            ("gpt_diagnostics", serde_json::json!({"enabled": true})),
+        ]
+    }
+
+    fn task8_builder_capability(
+        id: &'static str,
+        config: &serde_json::Value,
+        predicate: &str,
+    ) -> Task8Capability {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(id, config)
+            .expect("should insert Task 8 integration config");
+        let registration = crate::integrations::builders()
+            .iter()
+            .find(|builder| builder.id == id)
+            .and_then(|builder| (builder.build)(&settings).expect("should run integration builder"))
+            .expect("enabled Task 8 integration should register");
+        task8_capability(&registration, predicate)
+    }
+
+    fn task8_prebid_capability() -> Task8Capability {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                }),
+            )
+            .expect("should insert Task 8 Prebid config");
+        let plan = crate::auction::compile_auction_plan(&settings)
+            .expect("should compile Task 8 Prebid plan");
+        let registration = crate::integrations::prebid::register_for_plan(&settings, &plan)
+            .expect("should run plan-backed Prebid registration")
+            .expect("enabled Prebid should register");
+        task8_capability(&registration, "enabled=true")
+    }
+
+    fn task8_aps_capability(rendering_mode: ApsRenderingMode) -> Task8Capability {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &ApsConfig {
+                    enabled: true,
+                    rendering_mode,
+                },
+            )
+            .expect("should insert Task 8 APS config");
+        let plan = AuctionPlan::compile(AuctionPlanConfig {
+            timeout_ms: 1_000,
+            providers: BTreeMap::from([(
+                "aps-fixture"
+                    .parse()
+                    .expect("should parse Task 8 APS provider ID"),
+                ProviderConfig {
+                    protocol: "openrtb-2.6".to_owned(),
+                    profile: "aps".to_owned(),
+                    endpoint: "https://aps.example/openrtb".to_owned(),
+                    timeout_ms: None,
+                    routing: RoutingMode::AllEligible,
+                    notifications: NotificationConfig::default(),
+                    profile_config: serde_json::json!({"account_id": "example-account"}),
+                },
+            )]),
+            ..AuctionPlanConfig::default()
+        })
+        .expect("should compile Task 8 APS plan");
+        let registration = crate::integrations::aps::register_for_plan(&settings, &plan)
+            .expect("should run plan-backed APS registration")
+            .expect("APS profile should register the renderer integration");
+        task8_capability(
+            &registration,
+            match rendering_mode {
+                ApsRenderingMode::TrustedServer => {
+                    "plan.has_profile(aps);rendering_mode=trusted_server"
+                }
+                ApsRenderingMode::PublisherNative => {
+                    "plan.has_profile(aps);rendering_mode=publisher_native"
+                }
+            },
+        )
+    }
+
+    fn task8_mediator_capability() -> Task8Capability {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &serde_json::json!({
+                    "enabled": true,
+                    "endpoint": "https://adserver.example/mediate"
+                }),
+            )
+            .expect("should insert Task 8 mediator config");
+        let providers = crate::integrations::adserver_mock::register_providers(&settings)
+            .expect("should register Task 8 mediator")
+            .into_iter()
+            .map(|provider| provider.provider_name().to_owned())
+            .collect();
+        Task8Capability {
+            id: "adserver_mock".to_owned(),
+            predicate: "auction.mediator=adserver_mock;enabled=true".to_owned(),
+            proxy_routes: BTreeSet::new(),
+            attribute_rewriters: BTreeSet::new(),
+            script_rewriters: BTreeSet::new(),
+            head_injectors: BTreeSet::new(),
+            post_processors: BTreeSet::new(),
+            request_filters: BTreeSet::new(),
+            providers,
+            js_mode: "none".to_owned(),
+        }
+    }
+
+    fn task8_capability(
+        registration: &IntegrationRegistration,
+        predicate: &str,
+    ) -> Task8Capability {
+        let id = registration.integration_id;
+        let proxy_routes = registration
+            .proxies
+            .iter()
+            .flat_map(|proxy| proxy.routes())
+            .map(|route| format!("{} {}", route.method, route.path))
+            .collect();
+        let attribute_rewriters = registration
+            .attribute_rewriters
+            .iter()
+            .map(|rewriter| rewriter.integration_id().to_owned())
+            .collect();
+        let script_rewriters = registration
+            .script_rewriters
+            .iter()
+            .map(|rewriter| format!("{}:{}", rewriter.integration_id(), rewriter.selector()))
+            .collect();
+        let head_injectors = registration
+            .head_injectors
+            .iter()
+            .map(|injector| injector.integration_id().to_owned())
+            .collect();
+        let post_processors = registration
+            .html_post_processors
+            .iter()
+            .map(|processor| processor.integration_id().to_owned())
+            .collect();
+        let request_filters = registration
+            .request_filters
+            .iter()
+            .map(|filter| filter.integration_id().to_owned())
+            .collect();
+        let js_mode = if registration.js_disabled {
+            if id == "gpt_diagnostics" {
+                "standalone"
+            } else {
+                "none"
+            }
+        } else if registration.js_deferred {
+            "deferred"
+        } else if trusted_server_js::module_bundle(id).is_some() {
+            "bundled"
+        } else {
+            "none"
+        };
+        Task8Capability {
+            id: id.to_owned(),
+            predicate: predicate.to_owned(),
+            proxy_routes,
+            attribute_rewriters,
+            script_rewriters,
+            head_injectors,
+            post_processors,
+            request_filters,
+            providers: BTreeSet::new(),
+            js_mode: js_mode.to_owned(),
+        }
     }
 }

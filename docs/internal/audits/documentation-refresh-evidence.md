@@ -2933,8 +2933,114 @@ PY
 
 #### Task 8 — Check integration capabilities and adapter routes
 
-Pending. Record each atomic fixture cycle and any behavior-preserving private
-route seam.
+- Task 8 started from the clean, pushed Task 7 head
+  `9366d6e890c19b68ac4f224886f0f7299ef66550` in the existing
+  `spec-docs-refresh` worktree and PR #1049. The initial inventory fixtures
+  failed to compile because neither checked module existed. Subsequent RED
+  leaves reproduced missing and extra values on every static and behavioral
+  axis, an unclassified builder expression, route method/predicate/status and
+  startup-router drift, an unsupported Cloudflare builder call, and
+  unreviewed/duplicate/unknown manifest records. Exact page-bids fixtures then
+  exposed that GET and OPTIONS had been collapsed under one guarded status;
+  three route tests failed until GET was recorded as real and only OPTIONS as
+  guarded. Additional closed-grammar fixtures proved that a route-affecting
+  Cloudflare local initializer and statement macro had previously been
+  ignored, and that an unknown deploy `validate_*` call could previously
+  undercount the inventory. Both shapes now fail closed.
+- `integrations.toml` is a versioned, explicitly reviewed inventory of the 14
+  deploy-validated IDs, 11 settings-only builders, two plan registrations,
+  three auction profiles, one mediator, 12 integration `index.ts` modules, 13
+  emitted bundles including core, 12 loading-mode rows, 17 behavioral
+  capability records, and 15 manually owned operational records. Static Rust
+  extraction is closed over `validate_enabled_integrations`, the exact
+  `IntegrationBuilder` array, `with_plan`, `PROFILE_REGISTRATIONS`, and
+  `register_providers`; JavaScript source discovery uses the same one-level
+  `integrations/<id>/index.ts` contract as the build. Missing, extra,
+  duplicate, malformed, and unclassified registrations fail exact set
+  equality. Release status remains manual and every row has an owner and real
+  review date.
+- The module-local compiled capability receipt instantiates every enabled
+  settings builder, Prebid, both APS rendering modes, the ad-server mediator,
+  creative's always-loaded module, and both DataDome protection states. It
+  reads the checked manifest and compares the exact observed proxy routes,
+  attribute and script rewriters, head injectors, post-processors, request
+  filters, providers, and JavaScript mode. The negative predicate receipt
+  proves all 11 settings builders plus DataDome register nothing when
+  disabled, disabled Prebid registers nothing, and a disabled mediator emits
+  no providers. It also pins APS's independent axes: browser configuration
+  alone does not register without an APS plan profile, while a compiled APS
+  profile does register the renderer integration even when the browser flag
+  is false. Existing APS renderer response tests and the capability receipt
+  jointly bind the trusted-server route and publisher-native no-route modes.
+- `routes.toml` expands to exactly 103 records across Fastly, Axum,
+  Cloudflare, and Spin. Each record binds methods, literal/template/
+  config-derived/conditional shape, predicate, real/unsupported/guarded/
+  publisher-fallback/startup-error status, and production versus startup
+  router. The private named-route source collections contain 22 Fastly, 18
+  Axum, and 18 Spin semantic records after method-specific page-bids splitting;
+  the closed Cloudflare AST grammar extracts 20 records. It recognizes only
+  the production builder chain, known path constants, path and method loops,
+  method arrays, middleware, and publisher fallback helper. Unknown router
+  methods, calls, control flow, local initializers, macros, paths, and methods
+  fail instead of undercounting. Dynamic integration route families remain
+  single-sourced in the 17 compiled capability records rather than duplicated
+  in the adapter registration manifest.
+- Direct adapter regression tests compare the unchanged production routers as
+  exact method/path sets: 154 pairs for Fastly, 127 for Axum, 46 for
+  Cloudflare, and 127 for Spin. Startup-router tests compare 14 root/rest
+  method pairs for Fastly, Axum, and Cloudflare and 15 for Spin, whose extra
+  entry is live `GET /health`. Existing endpoint assertions retain the
+  handler-level 404/501, denied preflight, publisher-fallback, and health
+  semantics. The source seams and tests are private or `cfg(test)`; no public
+  API, route registration, or production behavior changed.
+- The focused standalone targets contain seven integration and eight route
+  tests. Two fresh default-parallel standalone suites each contained 253
+  passing tests: 21 library unit, 35 classification, 19 CLI, seven
+  integrations, 57 links, 11 Markdown, eight routes, 72 scanner, and 23
+  settings tests. Pinned Viceroy 0.17.0 with
+  `SSL_CERT_FILE=/etc/ssl/cert.pem` ran the full Fastly matrix: 175 adapter
+  tests, 2,424 core tests with six ignored, two JavaScript tests, 21 OpenRTB
+  tests, and four core doctests with four ignored all passed. The full Axum
+  matrix passed 15 library, one binary, and 27 route tests; Cloudflare passed
+  23 library and 23 route tests; Spin passed 50 library and 38 route tests;
+  cross-adapter parity passed all 13 tests. The first sandboxed Axum attempt
+  could not bind three loopback fixtures; the repository-scoped rerun with
+  loopback permission passed without a code change.
+- Task 8 enables only `syn`'s already-resolved visitor feature in the
+  standalone manifest. Neither lockfile changed: the standalone lock remains
+  SHA-256
+  `8d12168733c63ecce2566f3267fde5741155a87cf767b8415fc845d496bbf3ca`
+  and root `Cargo.lock` remains
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
+  The final reviewed integration, route, and adapter-support manifest hashes
+  are respectively
+  `2f2b7585326639ccc7056c13c5673e3b7f0ae56f70f853341ba2b47bb5ab4dd2`,
+  `52df1bfb5bfc6a27b04648a95e2a724502e558759a8399995d9a2201f2f04005`,
+  and
+  `14abdc67bc7ddf836ba72e0d4a00108286dee6a76435824ab21e1922b80f19e3`.
+- Classification adds exactly seven tracked text paths: three
+  non-documentation manifests, two source modules, and two test modules. The
+  sensitive inventory retains the exact 5,405-record class/path/detector/
+  fingerprint multiset; no finding is added or removed. Twenty-five selectors
+  move only because behavior-preserving tests shifted existing synthetic
+  credential and vendor references in touched adapter/core sources. Repeated
+  classification updates and sensitive bootstraps are byte-stable after
+  explicit review. Fresh formatting, standalone and root clippy, Prettier,
+  settings, local-link, generated-region, integration, route,
+  classification, and sensitive-scan checks all exit 0. The generated update
+  is byte-stable and both lockfiles remain unchanged. Repeated classification
+  updates retain tracked/source manifest SHA-256 values
+  `cb4c9da3a4b539376fbeb415a09d3d1b2dd8edc11babbf227a49d41545efba86`
+  and
+  `53b794afa17af803d0cb6a9f7fa1f718ae15f9c2e6ff4b30d64059b1068fbe56`;
+  repeated sensitive bootstraps retain
+  `4295fe81312737d20941cca5b88fd54bebd972a9535398d3a6653a5e3c9950f0`.
+- The Task 8 **Files** list and Step 6 staging command are the exact 23-path
+  diff from the approved Task 7 head: eight adapter source/test paths; the
+  compiled core capability receipt; this evidence and the execution plan; the
+  standalone manifest, README, and library; two new implementation/test pairs; and
+  the six integration, route, adapter-support, tracked, maintained, and
+  sensitive manifests. Both directional set differences are empty.
 
 #### Task 9 — Check CLI help, snippets, gates, and workflow foundations
 

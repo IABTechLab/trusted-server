@@ -661,6 +661,25 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 mod tests {
     use super::*;
 
+    #[test]
+    fn startup_error_route_set_matches_the_prechange_contract() {
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "startup failure".to_owned(),
+        });
+        let observed = startup_error_router(&report)
+            .routes()
+            .into_iter()
+            .map(|route| (route.method().to_string(), route.path().to_owned()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected = std::collections::BTreeSet::new();
+        for path in ["/", "/{*rest}"] {
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                expected.insert((method.to_owned(), path.to_owned()));
+            }
+        }
+        assert_eq!(observed, expected);
+    }
+
     fn aps_profile_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
