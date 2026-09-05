@@ -1,12 +1,10 @@
-use std::collections::BTreeSet;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 use docs_parity::settings::{
-    CompanionManifest, DefaultValue, HarnessObservation, KeyIdentity, Lifecycle,
-    RuntimeDisposition, SecretDisposition, SerializationDisposition, TemplateContract,
-    extract_schema, validate_harness_observation,
+    CompanionManifest, CompanionReceipt, ContainerDefault, DefaultValue, KeyIdentity, Lifecycle,
+    RuntimeDisposition, SecretDisposition, SerializationDisposition, extract_schema,
 };
 
 fn empty_companions() -> CompanionManifest {
@@ -103,6 +101,142 @@ fn extracts_variant_tag_content_untagged_and_rename_semantics() {
 }
 
 #[test]
+fn models_container_defaults_skip_deserializing_and_variant_field_rename_rules() {
+    let source = r#"
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "defaulted", default, rename_all = "camelCase")]
+        struct Defaulted {
+            first_value: String,
+            #[serde(skip_deserializing)]
+            output_only: String,
+            #[serde(skip_serializing_if = "String::is_empty")]
+            conditional_output: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE", rename_all_fields = "kebab-case")]
+        enum Choice {
+            StructValue { field_name: String },
+            #[serde(rename_all = "camelCase", skip_serializing, skip_deserializing, untagged)]
+            OverrideValue { other_field: String },
+        }
+    "#;
+
+    let schema = extract_schema("fixture.rs", source, &empty_companions())
+        .expect("supported site-specific attributes should extract");
+    let defaulted = schema
+        .type_named("Defaulted")
+        .expect("should extract struct");
+    assert_eq!(defaulted.serialized_name, "defaulted");
+    assert_eq!(defaulted.container_default, Some(ContainerDefault::Trait));
+    assert!(defaulted.field_named("firstValue").is_some());
+    assert!(
+        defaulted
+            .field_named("outputOnly")
+            .expect("should retain output-only field semantics")
+            .skip_deserializing
+    );
+    assert_eq!(
+        defaulted
+            .field_named("conditionalOutput")
+            .expect("should retain conditional serialization")
+            .skip_serializing_if
+            .as_deref(),
+        Some("String::is_empty")
+    );
+
+    let choice = schema.type_named("Choice").expect("should extract enum");
+    assert_eq!(choice.rename_all_fields.as_deref(), Some("kebab-case"));
+    let inherited = choice
+        .variant_named("STRUCT_VALUE")
+        .expect("container variant rename should apply");
+    assert!(inherited.field_named("field-name").is_some());
+    let overridden = choice
+        .variant_named("OVERRIDE_VALUE")
+        .expect("container variant rename should apply");
+    assert_eq!(overridden.rename_all.as_deref(), Some("camelCase"));
+    assert!(overridden.skip_serializing);
+    assert!(overridden.skip_deserializing);
+    assert!(overridden.untagged);
+    assert!(overridden.field_named("otherField").is_some());
+}
+
+#[test]
+fn applies_only_the_complete_serde_rename_rule_set() {
+    for (rule, field, variant) in [
+        ("lowercase", "sample_value", "samplevalue"),
+        ("UPPERCASE", "SAMPLE_VALUE", "SAMPLEVALUE"),
+        ("PascalCase", "SampleValue", "SampleValue"),
+        ("camelCase", "sampleValue", "sampleValue"),
+        ("snake_case", "sample_value", "sample_value"),
+        ("SCREAMING_SNAKE_CASE", "SAMPLE_VALUE", "SAMPLE_VALUE"),
+        ("kebab-case", "sample-value", "sample-value"),
+        ("SCREAMING-KEBAB-CASE", "SAMPLE-VALUE", "SAMPLE-VALUE"),
+    ] {
+        let source = format!(
+            "#[serde(rename_all = \"{rule}\")] struct Fields {{ sample_value: String }}\n\
+             #[serde(rename_all = \"{rule}\")] enum Variants {{ SampleValue }}"
+        );
+        let schema = extract_schema("fixture.rs", &source, &empty_companions())
+            .unwrap_or_else(|error| panic!("{rule} should extract: {error:?}"));
+        assert!(
+            schema
+                .type_named("Fields")
+                .expect("should extract struct")
+                .field_named(field)
+                .is_some(),
+            "field rule {rule} should produce {field}"
+        );
+        assert!(
+            schema
+                .type_named("Variants")
+                .expect("should extract enum")
+                .variant_named(variant)
+                .is_some(),
+            "variant rule {rule} should produce {variant}"
+        );
+    }
+
+    for rule in ["snake", "SnakeCase", "", "SCREAMING_KEBAB_CASE"] {
+        for source in [
+            format!("#[serde(rename_all = \"{rule}\")] struct Fixture {{ value: String }}"),
+            format!(
+                "#[serde(rename_all_fields = \"{rule}\")] enum Fixture {{ Value {{ field: String }} }}"
+            ),
+            format!(
+                "enum Fixture {{ #[serde(rename_all = \"{rule}\")] Value {{ field: String }} }}"
+            ),
+        ] {
+            let error = extract_schema("fixture.rs", &source, &empty_companions())
+                .expect_err("invalid Serde rename rules should fail closed");
+            assert!(error.to_string().contains("invalid rename_all"));
+        }
+    }
+}
+
+#[test]
+fn rejects_supported_serde_attributes_at_unsupported_sites() {
+    for source in [
+        "#[serde(rename_all = \"snake_case\")] struct Fixture { #[serde(rename_all = \"camelCase\")] value: String }",
+        "#[serde(rename_all_fields = \"snake_case\")] struct Fixture { value: String }",
+        "#[serde(content = \"value\")] struct Fixture { value: String }",
+        "#[serde(untagged)] struct Fixture { value: String }",
+        "#[serde(alias = \"Old\")] struct Fixture { value: String }",
+        "enum Fixture { #[serde(default)] Value }",
+        "enum Fixture { #[serde(tag = \"kind\")] Value }",
+        "enum Fixture { #[serde(flatten)] Value }",
+        "#[serde(skip_deserializing)] struct Fixture { value: String }",
+    ] {
+        let error = extract_schema("fixture.rs", source, &empty_companions())
+            .expect_err("site-invalid Serde attributes should fail closed");
+        assert!(
+            error.to_string().contains("invalid serde"),
+            "site diagnostic should identify Serde misuse: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn resolves_literal_defaults_and_requires_companions_for_nonliteral_defaults() {
     let source = r#"
         #[derive(serde::Deserialize)]
@@ -130,8 +264,8 @@ fn resolves_literal_defaults_and_requires_companions_for_nonliteral_defaults() {
         symbol = "computed_default"
         kind = "default"
         value = "16"
-        positive_probe = "assert_eq!(computed_default(), 16);"
-        negative_probe = "assert_ne!(computed_default(), 15);"
+        positive_probe = "task7_fixture_rs_computed_default_default_positive"
+        negative_probe = "task7_fixture_rs_computed_default_default_negative"
         "#,
     )
     .expect("should parse companion");
@@ -180,15 +314,15 @@ fn custom_deserializers_and_validators_require_exact_companions() {
         source = "fixture.rs"
         symbol = "parse_value"
         kind = "deserializer"
-        positive_probe = "assert!(parse_value(true).is_ok());"
-        negative_probe = "assert!(parse_value([]).is_err());"
+        positive_probe = "task7_fixture_rs_parse_value_deserializer_positive"
+        negative_probe = "task7_fixture_rs_parse_value_deserializer_negative"
 
         [[companions]]
         source = "fixture.rs"
         symbol = "validate_value"
         kind = "validator"
-        positive_probe = "assert!(validate_value(\"ok\").is_ok());"
-        negative_probe = "assert!(validate_value(\"\").is_err());"
+        positive_probe = "task7_fixture_rs_validate_value_validator_positive"
+        negative_probe = "task7_fixture_rs_validate_value_validator_negative"
         "#,
     )
     .expect("should parse companions");
@@ -201,6 +335,101 @@ fn custom_deserializers_and_validators_require_exact_companions() {
         .expect("should extract value");
     assert_eq!(value.deserializer.as_deref(), Some("parse_value"));
     assert_eq!(value.validators, ["validate_value"]);
+}
+
+#[test]
+fn companion_manifest_must_equal_the_exact_ast_discovery_set() {
+    let companions = CompanionManifest::parse(
+        r#"
+        version = 1
+        reviewed = true
+
+        [[companions]]
+        source = "fixture.rs"
+        symbol = "stale_validator"
+        kind = "validator"
+        positive_probe = "task7_fixture_rs_stale_validator_validator_positive"
+        negative_probe = "task7_fixture_rs_stale_validator_validator_negative"
+        "#,
+    )
+    .expect("should parse stale companion fixture");
+    let error = extract_schema(
+        "fixture.rs",
+        "struct Fixture { value: String }",
+        &companions,
+    )
+    .expect_err("stale companion entries should fail exact AST equality");
+    assert!(error.to_string().contains("companion set"));
+}
+
+#[test]
+fn compiled_receipts_bind_exact_values_and_probe_names_to_each_symbol() {
+    let source = r#"
+        struct Fixture {
+            #[serde(default = "computed_default")]
+            value: usize,
+        }
+        fn computed_default() -> usize { 1 << 4 }
+    "#;
+    let manifest = r#"
+        version = 1
+        reviewed = true
+
+        [[companions]]
+        source = "fixture.rs"
+        symbol = "computed_default"
+        kind = "default"
+        value = "16"
+        positive_probe = "task7_fixture_rs_computed_default_default_positive"
+        negative_probe = "task7_fixture_rs_computed_default_default_negative"
+    "#;
+    let companions = CompanionManifest::parse(manifest).expect("should parse companion fixture");
+    extract_schema("fixture.rs", source, &companions)
+        .expect("exact discovered companion should extract");
+
+    let wrong_value = [CompanionReceipt {
+        symbol: "computed_default".to_owned(),
+        kind: "default".to_owned(),
+        value: Some("15".to_owned()),
+        positive_probe: "task7_fixture_rs_computed_default_default_positive".to_owned(),
+        negative_probe: "task7_fixture_rs_computed_default_default_negative".to_owned(),
+        positive_passed: true,
+        negative_passed: true,
+    }];
+    let error = companions
+        .verify_compiled_receipts("fixture.rs", &wrong_value)
+        .expect_err("wrong compiled default value should fail");
+    assert!(error.to_string().contains("compiled companion receipt"));
+
+    let wrong_probe = [CompanionReceipt {
+        value: Some("16".to_owned()),
+        positive_probe: "task7_default_other_symbol_positive".to_owned(),
+        ..wrong_value[0].clone()
+    }];
+    let error = companions
+        .verify_compiled_receipts("fixture.rs", &wrong_probe)
+        .expect_err("probe-symbol mismatch should fail");
+    assert!(error.to_string().contains("compiled companion receipt"));
+}
+
+#[test]
+fn manifest_probe_names_are_unique_per_source_symbol_and_kind() {
+    let error = CompanionManifest::parse(
+        r#"
+        version = 1
+        reviewed = true
+
+        [[companions]]
+        source = "fixture.rs"
+        symbol = "computed_default"
+        kind = "default"
+        value = "16"
+        positive_probe = "task7_settings_companion_positive"
+        negative_probe = "task7_settings_companion_negative"
+        "#,
+    )
+    .expect_err("broad reusable probe names should fail closed");
+    assert!(error.to_string().contains("probe names"));
 }
 
 #[test]
@@ -290,129 +519,6 @@ fn aliases_require_an_exact_canonical_target() {
     )
     .expect_err("canonical field with alias_of should fail closed");
     assert!(canonical_with_target.to_string().contains("alias_of"));
-}
-
-fn harness_contract() -> TemplateContract {
-    TemplateContract {
-        placeholder_paths: set(&[
-            "publisher.domain",
-            "publisher.cookie_domain",
-            "publisher.origin_url",
-        ]),
-        integration_ids: set(&["alpha", "beta"]),
-        profile_ids: set(&["standard", "special"]),
-        consumer_literals: set(&[
-            "handler_password",
-            "ec_passphrase",
-            "publisher_proxy_secret",
-        ]),
-        expected_failure_diagnostic: "template placeholders remain".to_owned(),
-    }
-}
-
-fn valid_observation() -> HarnessObservation {
-    HarnessObservation {
-        placeholder_paths: harness_contract().placeholder_paths,
-        known_integration_ids: set(&["alpha", "beta"]),
-        enabled_integration_probes: set(&["alpha", "beta"]),
-        profile_compiler_probes: set(&["standard", "special"]),
-        consumed_literals: set(&[
-            "handler_password",
-            "ec_passphrase",
-            "publisher_proxy_secret",
-        ]),
-        unknown_keys: BTreeSet::new(),
-        invalid_profiles: BTreeSet::new(),
-        unresolved_secrets: BTreeSet::new(),
-        inactive_shortcuts: BTreeSet::new(),
-        failure_diagnostic: "template placeholders remain".to_owned(),
-    }
-}
-
-fn set(values: &[&str]) -> BTreeSet<String> {
-    values.iter().map(ToString::to_string).collect()
-}
-
-#[test]
-fn unmodified_template_requires_the_exact_placeholder_set() {
-    validate_harness_observation(&harness_contract(), &valid_observation())
-        .expect("exact placeholder failure should be accepted");
-
-    let mut typo = valid_observation();
-    typo.placeholder_paths.remove("publisher.origin_url");
-    typo.placeholder_paths
-        .insert("publisher.orgin_url".to_owned());
-    let error = validate_harness_observation(&harness_contract(), &typo)
-        .expect_err("placeholder typo should not pass");
-    assert!(error.to_string().contains("placeholder"));
-}
-
-#[test]
-fn unknown_disabled_integration_key_does_not_pass() {
-    let mut observation = valid_observation();
-    observation
-        .unknown_keys
-        .insert("integrations.typo".to_owned());
-    let error = validate_harness_observation(&harness_contract(), &observation)
-        .expect_err("unknown key should fail even in a disabled block");
-    assert!(error.to_string().contains("unknown"));
-}
-
-#[test]
-fn bad_profile_config_does_not_pass() {
-    let mut observation = valid_observation();
-    observation.invalid_profiles.insert("special".to_owned());
-    let error = validate_harness_observation(&harness_contract(), &observation)
-        .expect_err("bad profile should fail");
-    assert!(error.to_string().contains("profile"));
-}
-
-#[test]
-fn unresolved_secret_does_not_pass() {
-    let mut observation = valid_observation();
-    observation
-        .unresolved_secrets
-        .insert("publisher.proxy_secret".to_owned());
-    let error = validate_harness_observation(&harness_contract(), &observation)
-        .expect_err("unresolved secret should fail");
-    assert!(error.to_string().contains("secret"));
-}
-
-#[test]
-fn stranded_literal_substitution_does_not_pass() {
-    let mut observation = valid_observation();
-    observation.consumed_literals.remove("handler_password");
-    let error = validate_harness_observation(&harness_contract(), &observation)
-        .expect_err("stranded literal should fail");
-    assert!(error.to_string().contains("literal"));
-}
-
-#[test]
-fn inactive_block_shortcut_does_not_pass() {
-    let mut observation = valid_observation();
-    observation.enabled_integration_probes.remove("beta");
-    observation.inactive_shortcuts.insert("beta".to_owned());
-    let error = validate_harness_observation(&harness_contract(), &observation)
-        .expect_err("inactive shortcut should fail");
-    assert!(error.to_string().contains("enabled"));
-}
-
-#[test]
-fn missing_profile_compiler_probe_does_not_pass() {
-    let mut observation = valid_observation();
-    observation.profile_compiler_probes.remove("special");
-    let error = validate_harness_observation(&harness_contract(), &observation)
-        .expect_err("missing compiler probe should fail");
-    assert!(error.to_string().contains("profile"));
-}
-
-#[test]
-fn wrong_failure_diagnostic_does_not_pass() {
-    let mut observation = valid_observation();
-    observation.failure_diagnostic = "some other error".to_owned();
-    let error = validate_harness_observation(&harness_contract(), &observation)
-        .expect_err("wrong diagnostic should fail");
-    assert!(error.to_string().contains("diagnostic"));
 }
 
 #[test]

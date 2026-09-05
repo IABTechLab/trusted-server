@@ -3425,9 +3425,42 @@ mod tests {
     use bytes::Bytes;
     use http::Method;
     use serde_json::json;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::io::Cursor;
     use std::str::FromStr as _;
+
+    #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+    struct Task7CompanionReceipt {
+        source: String,
+        symbol: String,
+        kind: String,
+        value: Option<String>,
+        positive_probe: String,
+        negative_probe: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CompanionManifest {
+        companions: Vec<Task7CompanionReceipt>,
+    }
+
+    macro_rules! task7_companion_receipt {
+        ($positive:ident, $negative:ident, $symbol:literal, $kind:literal, $value:expr, $positive_body:block, $negative_body:block) => {{
+            fn $positive() $positive_body
+            fn $negative() $negative_body
+            $positive();
+            $negative();
+            let value: Option<&str> = $value;
+            Task7CompanionReceipt {
+                source: "crates/trusted-server-core/src/integrations/prebid.rs".to_owned(),
+                symbol: $symbol.to_owned(),
+                kind: $kind.to_owned(),
+                value: value.map(str::to_owned),
+                positive_probe: stringify!($positive).to_owned(),
+                negative_probe: stringify!($negative).to_owned(),
+            }
+        }};
+    }
 
     #[test]
     fn external_bundle_sha256_validation_matches_hex_pattern() {
@@ -9223,42 +9256,66 @@ set = { networkId = 42 }
     }
 
     #[test]
-    fn task7_prebid_companion_positive() {
-        assert_eq!(default_bidders(), vec!["mocktioneer".to_owned()]);
-        assert!(
-            !default_script_patterns().is_empty(),
-            "script-pattern default should remain nonempty"
-        );
-        validate_external_bundle_url("https://assets.example/prebid.js")
-            .expect("HTTPS bundle URL should validate");
-        validate_external_bundle_sri(&test_sri("sha384", &[0; 48]))
-            .expect("algorithm-sized SRI should validate");
-        validate_excluded_gam_ad_unit_path_suffixes(&["/excluded".to_owned()])
-            .expect("non-root suffix should validate");
-
-        let parsed: LegacyPrebidServerConfig = toml::from_str(
-            r#"
-            server_url = "https://prebid.example/openrtb2/auction"
-            bidders = { 0 = "first", 1 = "second" }
-            "#,
-        )
-        .expect("map-shaped bidders should use the custom sequence-or-map deserializer");
-        assert_eq!(parsed.bidders, ["first", "second"]);
-    }
-
-    #[test]
-    fn task7_prebid_companion_negative() {
-        validate_external_bundle_url("http://assets.example/prebid.js")
-            .expect_err("insecure bundle URL should fail");
-        validate_external_bundle_sri("sha384-AAAA").expect_err("wrong-size SRI digest should fail");
-        validate_excluded_gam_ad_unit_path_suffixes(&["/".to_owned()])
-            .expect_err("root suffix should fail");
-        toml::from_str::<LegacyPrebidServerConfig>(
-            r#"
-            server_url = "https://prebid.example/openrtb2/auction"
-            bidders = 42
-            "#,
-        )
-        .expect_err("scalar bidders should fail the custom deserializer");
+    fn task7_prebid_companions_are_exact_and_compiled_per_record() {
+        let actual = BTreeSet::from([
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_bidders_default_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_bidders_default_negative,
+                "default_bidders", "default", Some("[mocktioneer]"),
+                { assert_eq!(default_bidders(), vec!["mocktioneer".to_owned()]); },
+                { assert_ne!(default_bidders(), vec!["other".to_owned()]); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_negative,
+                "default_script_patterns", "default", Some("[/prebid.js,/prebid.min.js,/prebidjs.js,/prebidjs.min.js]"),
+                { assert_eq!(default_script_patterns(), ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]); },
+                { assert_ne!(default_script_patterns(), ["/prebid.js"]); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_crate_settings_vec_from_seq_or_map_deserializer_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_crate_settings_vec_from_seq_or_map_deserializer_negative,
+                "crate::settings::vec_from_seq_or_map", "deserializer", None,
+                {
+                    let parsed: LegacyPrebidServerConfig = toml::from_str("server_url = \"https://prebid.example/openrtb2/auction\"\nbidders = { 0 = \"first\", 1 = \"second\" }").expect("map bidders should deserialize");
+                    assert_eq!(parsed.bidders, ["first", "second"]);
+                },
+                { toml::from_str::<LegacyPrebidServerConfig>("server_url = \"https://prebid.example/openrtb2/auction\"\nbidders = 42").expect_err("scalar bidders should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_url_validator_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_url_validator_negative,
+                "validate_external_bundle_url", "validator", None,
+                { validate_external_bundle_url("https://assets.example/prebid.js").expect("HTTPS URL should validate"); },
+                { validate_external_bundle_url("http://assets.example/prebid.js").expect_err("insecure URL should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_sri_validator_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_sri_validator_negative,
+                "validate_external_bundle_sri", "validator", None,
+                { validate_external_bundle_sri(&test_sri("sha384", &[0; 48])).expect("algorithm-sized SRI should validate"); },
+                { validate_external_bundle_sri("sha384-AAAA").expect_err("wrong-size SRI should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_excluded_gam_ad_unit_path_suffixes_validator_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_excluded_gam_ad_unit_path_suffixes_validator_negative,
+                "validate_excluded_gam_ad_unit_path_suffixes", "validator", None,
+                { validate_excluded_gam_ad_unit_path_suffixes(&["/excluded".to_owned()]).expect("non-root suffix should validate"); },
+                { validate_excluded_gam_ad_unit_path_suffixes(&["/".to_owned()]).expect_err("root suffix should fail"); }
+            ),
+        ]);
+        let checked: Task7CompanionManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/settings-companions.toml"
+        )))
+        .expect("checked Task 7 companion manifest should parse");
+        let expected = checked
+            .companions
+            .into_iter()
+            .filter(|record| {
+                record.source == "crates/trusted-server-core/src/integrations/prebid.rs"
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "compiled Prebid receipts must be exact");
     }
 }

@@ -465,19 +465,44 @@ git commit -m "Close documentation execution quality gaps"
 
 - [x] **Step 1: Write extractor grammar fixtures**
 
-Cover Serde field/container/variant attributes (`rename`, `rename_all`, `alias`, `tag`, `content`, `untagged`, `flatten`, `skip`, `skip_serializing`), literal/nonliteral defaults, custom deserializers, `Option`, validation ranges, and an unknown shape-changing attribute. Expected: unclassified custom behavior fails closed.
+Cover the exact Serde field/container/variant sites for `rename`,
+`rename_all`, `rename_all_fields`, `alias`, `tag`, `content`, `untagged`,
+`flatten`, `skip`, `skip_serializing`, `skip_deserializing`,
+`skip_serializing_if`, and container/field `default`; cover all eight legal
+rename rules, literal/nonliteral defaults, custom deserializers, `Option`,
+validation ranges, invalid attribute sites, invalid rename rules, and unknown
+shape-changing attributes. Expected: unclassified or site-invalid behavior
+fails closed.
 
 - [x] **Step 2: Implement the AST plus companion chain**
 
-Resolve literal defaults from AST, require companion entries for custom deserializers/nonliteral defaults/validator functions, and verify companion claims with compiled positive and negative probes. Emit independent lifecycle, key identity, serialization, runtime, and secret-handling axes; never collapse overlapping dispositions.
+Resolve literal defaults from AST; require exact source/symbol/kind companion
+entries for custom deserializers, nonliteral defaults, and validator functions;
+and require equality between the AST-discovered and reviewed companion sets.
+Bind every reviewed value and unique probe name to a module-local compiled
+positive/negative receipt, with exact receipt-set equality per source. Emit
+independent lifecycle, key identity, serialization, runtime, and
+secret-handling axes; never collapse overlapping dispositions.
 
 - [x] **Step 3: Write the eight-phase template harness failures**
 
-Prove the unmodified template fails for the exact placeholder set; prove a typo, unknown disabled integration key, bad profile config, unresolved secret, stranded literal substitution, inactive-block shortcut, missing profile compiler probe, and wrong failure diagnostic do not pass.
+Use the production-API harness, not a manually constructed observation, to
+prove that a typo, unknown disabled integration key, bad profile config,
+unresolved secret, stranded literal substitution, inactive-block shortcut,
+missing profile compiler probe, and wrong failure diagnostic do not pass.
+Compare the complete placeholder-path and normalized-diagnostic values, never
+substring presence or absence.
 
 - [x] **Step 4: Implement the harness through production APIs**
 
-Parse the source template, customize non-secret values in memory, preserve secret key names through deploy validation/blob serialization, resolve with a fake store, run runtime validation, and probe every optional integration/provider block in isolation with it forced enabled. Enumerate exact-string consumers in a checked record.
+Parse the source template, customize non-secret values in memory, preserve
+secret key names through deploy validation and `BlobEnvelope` serialization,
+resolve with a fake store, and run runtime validation. Derive every optional
+integration and provider-profile probe from its exact active or commented
+source-template block; run paired positive/negative probes with integrations
+forced enabled; and compare the 14 integration IDs, three profile IDs, three
+secret-key literals, placeholder paths, and normalized diagnostic exactly with
+the reviewed record. Enumerate every exact-string consumer in that record.
 
 - [x] **Step 5: Add visibility-local set-equality seams**
 
@@ -504,6 +529,17 @@ Expected: extractor/harness tests pass and core behavior is unchanged.
 git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/settings.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/src/scanner.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/settings-companions.toml tools/docs-parity/tests/settings.rs tools/docs-parity/tests/scanner.rs crates/trusted-server-core/src/config.rs crates/trusted-server-core/src/settings.rs crates/trusted-server-core/src/auction/profile.rs crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/integrations/prebid.rs docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Check configuration documentation semantics"
 ```
+
+- [x] **Step 8: Close the Task 7 semantics review**
+
+```bash
+git add crates/trusted-server-core/src/config.rs crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/integrations/prebid.rs crates/trusted-server-core/src/settings.rs docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/settings-companions.toml tools/docs-parity/src/settings.rs tools/docs-parity/tests/settings.rs
+git commit -m "Close settings semantics review gaps"
+```
+
+Expected: the correction diff contains exactly these 10 paths, the complete
+Task 7 diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c` remains the exact
+20-path **Files** set above, and Task 8 has not started.
 
 ### Task 8: Check integration capabilities and adapter routes
 

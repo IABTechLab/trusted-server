@@ -78,12 +78,6 @@ pub enum SettingsError {
         /// Affected item.
         item: String,
     },
-    /// A template-harness phase did not match its checked contract.
-    #[display("settings template harness failed {phase}")]
-    HarnessMismatch {
-        /// Stable phase name.
-        phase: &'static str,
-    },
     /// Repository input could not be read safely.
     #[display("cannot read checked settings repository input")]
     Repository,
@@ -106,6 +100,17 @@ pub enum DefaultValue {
     Literal(String),
     /// A checked companion value for a nonliteral default function.
     Companion(String),
+    /// Uses the enclosing struct's container-level default.
+    Container,
+}
+
+/// Default applied when a struct is absent during deserialization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContainerDefault {
+    /// Uses the struct type's `Default` implementation.
+    Trait,
+    /// Uses the exact named function.
+    Function(String),
 }
 
 /// Field lifecycle independent from its other dispositions.
@@ -186,103 +191,6 @@ pub struct FieldDisposition {
     pub secret: SecretDisposition,
 }
 
-/// Exact checked sets that define the template harness.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TemplateContract {
-    /// Placeholder paths rejected by the unmodified source template.
-    pub placeholder_paths: BTreeSet<String>,
-    /// Integration IDs exercised in isolation.
-    pub integration_ids: BTreeSet<String>,
-    /// Provider profile IDs compiled in isolation.
-    pub profile_ids: BTreeSet<String>,
-    /// Load-bearing exact-string substitutions.
-    pub consumer_literals: BTreeSet<String>,
-    /// Stable diagnostic required from the unmodified template.
-    pub expected_failure_diagnostic: String,
-}
-
-/// Observed results from the eight-phase production template harness.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HarnessObservation {
-    /// Placeholder paths reported for the source template.
-    pub placeholder_paths: BTreeSet<String>,
-    /// Integration IDs present in the checked production registry.
-    pub known_integration_ids: BTreeSet<String>,
-    /// Integration IDs forced enabled and validated in isolation.
-    pub enabled_integration_probes: BTreeSet<String>,
-    /// Provider profiles compiled by positive and negative probes.
-    pub profile_compiler_probes: BTreeSet<String>,
-    /// Exact source-template literals observed at every checked consumer.
-    pub consumed_literals: BTreeSet<String>,
-    /// Unknown keys accepted by a disabled block, which must remain empty.
-    pub unknown_keys: BTreeSet<String>,
-    /// Profile IDs whose invalid-config negative probe passed unexpectedly.
-    pub invalid_profiles: BTreeSet<String>,
-    /// Secret paths that were not resolved through the fake store.
-    pub unresolved_secrets: BTreeSet<String>,
-    /// Optional blocks that were validated only while inactive.
-    pub inactive_shortcuts: BTreeSet<String>,
-    /// Stable diagnostic observed for the unmodified template.
-    pub failure_diagnostic: String,
-}
-
-/// Validate exact sets from a completed production template-harness run.
-///
-/// # Errors
-///
-/// Returns an error when any phase is missing, contains extras, or reports a
-/// different stable diagnostic.
-pub fn validate_harness_observation(
-    contract: &TemplateContract,
-    observation: &HarnessObservation,
-) -> Result<(), Report<SettingsError>> {
-    if observation.placeholder_paths != contract.placeholder_paths {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "placeholder set",
-        }));
-    }
-    if observation.known_integration_ids != contract.integration_ids
-        || !observation.unknown_keys.is_empty()
-    {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "unknown integration keys",
-        }));
-    }
-    if !observation.invalid_profiles.is_empty() {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "profile rejection",
-        }));
-    }
-    if !observation.unresolved_secrets.is_empty() {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "secret resolution",
-        }));
-    }
-    if observation.consumed_literals != contract.consumer_literals {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "literal consumer equality",
-        }));
-    }
-    if observation.enabled_integration_probes != contract.integration_ids
-        || !observation.inactive_shortcuts.is_empty()
-    {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "enabled integration probes",
-        }));
-    }
-    if observation.profile_compiler_probes != contract.profile_ids {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "profile compiler probes",
-        }));
-    }
-    if observation.failure_diagnostic != contract.expected_failure_diagnostic {
-        return Err(Report::new(SettingsError::HarnessMismatch {
-            phase: "diagnostic equality",
-        }));
-    }
-    Ok(())
-}
-
 /// Inclusive numeric validation bounds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidationRange {
@@ -307,6 +215,10 @@ pub struct ExtractedField {
     pub flatten: bool,
     /// Whether the field is accepted but omitted from serialization.
     pub skip_serializing: bool,
+    /// Whether the field is output-only and ignored during deserialization.
+    pub skip_deserializing: bool,
+    /// Conditional serialization predicate, when declared.
+    pub skip_serializing_if: Option<String>,
     /// Resolved default semantics.
     pub default: Option<DefaultValue>,
     /// Custom deserializer path, when present.
@@ -326,6 +238,24 @@ pub struct ExtractedVariant {
     pub name: String,
     /// Accepted deserialization-only aliases.
     pub aliases: Vec<String>,
+    /// Rename rule for fields of this struct variant.
+    pub rename_all: Option<String>,
+    /// Whether this variant is omitted from serialization.
+    pub skip_serializing: bool,
+    /// Whether this variant is ignored during deserialization.
+    pub skip_deserializing: bool,
+    /// Whether this variant is untagged inside an otherwise tagged enum.
+    pub untagged: bool,
+    /// Fields carried by this variant.
+    pub fields: Vec<ExtractedField>,
+}
+
+impl ExtractedVariant {
+    /// Find a canonical field carried by this variant.
+    #[must_use]
+    pub fn field_named(&self, name: &str) -> Option<&ExtractedField> {
+        self.fields.iter().find(|field| field.name == name)
+    }
 }
 
 /// Extracted struct or enum semantics.
@@ -333,8 +263,14 @@ pub struct ExtractedVariant {
 pub struct ExtractedType {
     /// Rust type name.
     pub name: String,
+    /// Serialized container name after an explicit rename.
+    pub serialized_name: String,
     /// Container rename rule.
     pub rename_all: Option<String>,
+    /// Default rename rule for fields of enum struct variants.
+    pub rename_all_fields: Option<String>,
+    /// Struct-level default applied to missing fields.
+    pub container_default: Option<ContainerDefault>,
     /// Whether unknown object keys are rejected.
     pub deny_unknown_fields: bool,
     /// Adjacent or internal tag field.
@@ -396,6 +332,19 @@ impl CompanionKind {
     }
 }
 
+fn companion_probe_name(source: &str, symbol: &str, kind: CompanionKind, polarity: &str) -> String {
+    let mut identity = String::new();
+    for character in format!("{source}_{symbol}").chars() {
+        if character.is_ascii_alphanumeric() {
+            identity.push(character.to_ascii_lowercase());
+        } else if !identity.ends_with('_') {
+            identity.push('_');
+        }
+    }
+    let identity = identity.trim_matches('_');
+    format!("task7_{identity}_{}_{}", kind.label(), polarity)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCompanionManifest {
@@ -444,6 +393,25 @@ struct Companion {
     value: Option<String>,
     positive_probe: String,
     negative_probe: String,
+}
+
+/// Compiled evidence for one exact companion record.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CompanionReceipt {
+    /// Exact source-local symbol.
+    pub symbol: String,
+    /// Companion kind (`default`, `deserializer`, or `validator`).
+    pub kind: String,
+    /// Runtime-observed default value, when applicable.
+    pub value: Option<String>,
+    /// Unique positive probe bound to source, symbol, and kind.
+    pub positive_probe: String,
+    /// Unique negative probe bound to source, symbol, and kind.
+    pub negative_probe: String,
+    /// Whether the compiled positive behavior passed.
+    pub positive_passed: bool,
+    /// Whether the compiled negative behavior rejected its input.
+    pub negative_passed: bool,
 }
 
 /// Reviewed custom-semantics record used by the extractor.
@@ -496,6 +464,26 @@ impl CompanionManifest {
                 return Err(Report::new(SettingsError::InvalidCompanion {
                     symbol: companion.symbol,
                     reason: "default companion requires a value",
+                }));
+            }
+            let expected_positive = companion_probe_name(
+                &companion.source,
+                &companion.symbol,
+                companion.kind,
+                "positive",
+            );
+            let expected_negative = companion_probe_name(
+                &companion.source,
+                &companion.symbol,
+                companion.kind,
+                "negative",
+            );
+            if companion.positive_probe != expected_positive
+                || companion.negative_probe != expected_negative
+            {
+                return Err(Report::new(SettingsError::InvalidCompanion {
+                    symbol: companion.symbol,
+                    reason: "probe names must bind the exact source, symbol, kind, and polarity",
                 }));
             }
             let key = (
@@ -576,30 +564,60 @@ impl CompanionManifest {
         self.fields.get(path)
     }
 
-    fn verify_probe_declarations(
+    /// Compare compiled companion evidence with one source's reviewed records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, stale, duplicated, failed, or mismatched
+    /// source/symbol/kind/value/probe evidence.
+    pub fn verify_compiled_receipts(
         &self,
-        source_path: &str,
         source: &str,
+        receipts: &[CompanionReceipt],
     ) -> Result<(), Report<SettingsError>> {
-        for companion in self
+        if receipts
+            .iter()
+            .any(|receipt| !receipt.positive_passed || !receipt.negative_passed)
+        {
+            return invalid_contract(format!(
+                "compiled companion receipt failed positive/negative behavior for {source}"
+            ));
+        }
+        let actual = receipts.iter().cloned().collect::<BTreeSet<_>>();
+        if actual.len() != receipts.len() {
+            return invalid_contract(format!(
+                "compiled companion receipt set contains duplicates for {source}"
+            ));
+        }
+        let expected = self
             .entries
             .values()
-            .filter(|companion| companion.source == source_path)
-        {
-            for probe in [&companion.positive_probe, &companion.negative_probe] {
-                if !source.contains(&format!("fn {probe}()")) {
-                    return Err(Report::new(SettingsError::InvalidContract {
-                        reason: format!(
-                            "{} companion {} has no compiled probe {}",
-                            companion.kind.label(),
-                            companion.symbol,
-                            probe
-                        ),
-                    }));
-                }
-            }
-        }
-        Ok(())
+            .filter(|companion| companion.source == source)
+            .map(|companion| CompanionReceipt {
+                symbol: companion.symbol.clone(),
+                kind: companion.kind.label().to_owned(),
+                value: companion.value.clone(),
+                positive_probe: companion.positive_probe.clone(),
+                negative_probe: companion.negative_probe.clone(),
+                positive_passed: true,
+                negative_passed: true,
+            })
+            .collect::<BTreeSet<_>>();
+        require_equal("compiled companion receipt set", &actual, &expected)
+    }
+
+    fn verify_discovered_companions(
+        &self,
+        source: &str,
+        discovered: &BTreeSet<(String, CompanionKind)>,
+    ) -> Result<(), Report<SettingsError>> {
+        let expected = self
+            .entries
+            .keys()
+            .filter(|(entry_source, _symbol, _kind)| entry_source == source)
+            .map(|(_source, symbol, kind)| (symbol.clone(), *kind))
+            .collect::<BTreeSet<_>>();
+        require_equal("AST companion set", discovered, &expected)
     }
 }
 
@@ -622,7 +640,6 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Set
 
     for (source_path, required_type) in SOURCE_TYPES {
         let source = read_repository_text(repository, source_path, true)?;
-        companions.verify_probe_declarations(source_path, &source)?;
         let schema = extract_schema(source_path, &source, &companions)?;
         if schema.type_named(required_type).is_none() {
             return invalid_contract(format!(
@@ -950,6 +967,7 @@ fn invalid_contract<T>(reason: String) -> Result<T, Report<SettingsError>> {
 struct SerdeAttributes {
     rename: Option<String>,
     rename_all: Option<String>,
+    rename_all_fields: Option<String>,
     aliases: Vec<String>,
     deny_unknown_fields: bool,
     tag: Option<String>,
@@ -958,6 +976,8 @@ struct SerdeAttributes {
     flatten: bool,
     skip: bool,
     skip_serializing: bool,
+    skip_deserializing: bool,
+    skip_serializing_if: Option<String>,
     default: Option<Option<String>>,
     deserialize_with: Option<String>,
 }
@@ -983,25 +1003,53 @@ pub fn extract_schema(
     let file = syn::parse_file(source).change_context(SettingsError::RustSyntax)?;
     let literal_defaults = literal_default_functions(&file.items);
     let mut types = Vec::new();
+    let mut discovered_companions = BTreeSet::new();
 
     for item in &file.items {
         match item {
             Item::Struct(item) => {
                 let name = item.ident.to_string();
-                let serde = parse_serde_attributes(&item.attrs, &name, AttributeSite::Container)?;
+                let serde = parse_serde_attributes(
+                    &item.attrs,
+                    &name,
+                    AttributeSite::StructContainer {
+                        has_fields: !matches!(&item.fields, Fields::Unit),
+                        named_fields: matches!(&item.fields, Fields::Named(_)),
+                    },
+                )?;
                 let validation = parse_validation_attributes(&item.attrs, &name)?;
-                require_validators(source_path, companions, &validation.validators)?;
-                let fields = extract_fields(
+                require_validators(
                     source_path,
+                    companions,
+                    &validation.validators,
+                    &mut discovered_companions,
+                )?;
+                let container_default = serde.default.as_ref().map(|symbol| match symbol {
+                    None => ContainerDefault::Trait,
+                    Some(symbol) => ContainerDefault::Function(symbol.clone()),
+                });
+                if let Some(ContainerDefault::Function(symbol)) = &container_default {
+                    discovered_companions.insert((symbol.clone(), CompanionKind::Default));
+                    companions.require(source_path, symbol, CompanionKind::Default)?;
+                }
+                let fields = extract_fields(
+                    &mut FieldExtractionContext {
+                        source_path,
+                        literal_defaults: &literal_defaults,
+                        companions,
+                        discovered_companions: &mut discovered_companions,
+                    },
                     &name,
                     &item.fields,
                     serde.rename_all.as_deref(),
-                    &literal_defaults,
-                    companions,
+                    container_default.as_ref(),
                 )?;
                 types.push(ExtractedType {
+                    serialized_name: serde.rename.clone().unwrap_or_else(|| name.clone()),
                     name,
                     rename_all: serde.rename_all,
+                    rename_all_fields: serde.rename_all_fields,
+                    container_default,
                     deny_unknown_fields: serde.deny_unknown_fields,
                     tag: serde.tag,
                     content: serde.content,
@@ -1012,7 +1060,8 @@ pub fn extract_schema(
             }
             Item::Enum(item) => {
                 let name = item.ident.to_string();
-                let serde = parse_serde_attributes(&item.attrs, &name, AttributeSite::Container)?;
+                let serde =
+                    parse_serde_attributes(&item.attrs, &name, AttributeSite::EnumContainer)?;
                 let mut variants = Vec::new();
                 for variant in &item.variants {
                     let rust_name = variant.ident.to_string();
@@ -1023,17 +1072,45 @@ pub fn extract_schema(
                         continue;
                     }
                     let variant_name = attributes.rename.unwrap_or_else(|| {
-                        apply_rename_rule(&rust_name, serde.rename_all.as_deref())
+                        apply_rename_rule(
+                            &rust_name,
+                            serde.rename_all.as_deref(),
+                            RenameTarget::Variant,
+                        )
                     });
+                    let field_rename = attributes
+                        .rename_all
+                        .as_deref()
+                        .or(serde.rename_all_fields.as_deref());
+                    let fields = extract_fields(
+                        &mut FieldExtractionContext {
+                            source_path,
+                            literal_defaults: &literal_defaults,
+                            companions,
+                            discovered_companions: &mut discovered_companions,
+                        },
+                        &format!("{name}::{rust_name}"),
+                        &variant.fields,
+                        field_rename,
+                        None,
+                    )?;
                     variants.push(ExtractedVariant {
                         rust_name,
                         name: variant_name,
                         aliases: attributes.aliases,
+                        rename_all: attributes.rename_all,
+                        skip_serializing: attributes.skip_serializing,
+                        skip_deserializing: attributes.skip_deserializing,
+                        untagged: attributes.untagged,
+                        fields,
                     });
                 }
                 types.push(ExtractedType {
+                    serialized_name: serde.rename.clone().unwrap_or_else(|| name.clone()),
                     name,
                     rename_all: serde.rename_all,
+                    rename_all_fields: serde.rename_all_fields,
+                    container_default: None,
                     deny_unknown_fields: serde.deny_unknown_fields,
                     tag: serde.tag,
                     content: serde.content,
@@ -1046,16 +1123,23 @@ pub fn extract_schema(
         }
     }
 
+    companions.verify_discovered_companions(source_path, &discovered_companions)?;
     Ok(ExtractedSchema { types })
 }
 
+struct FieldExtractionContext<'a> {
+    source_path: &'a str,
+    literal_defaults: &'a BTreeMap<String, String>,
+    companions: &'a CompanionManifest,
+    discovered_companions: &'a mut BTreeSet<(String, CompanionKind)>,
+}
+
 fn extract_fields(
-    source_path: &str,
+    context: &mut FieldExtractionContext<'_>,
     container: &str,
     fields: &Fields,
     rename_all: Option<&str>,
-    literal_defaults: &BTreeMap<String, String>,
-    companions: &CompanionManifest,
+    container_default: Option<&ContainerDefault>,
 ) -> Result<Vec<ExtractedField>, Report<SettingsError>> {
     let mut extracted = Vec::new();
     for field in fields {
@@ -1063,39 +1147,60 @@ fn extract_fields(
             continue;
         };
         let rust_name = identifier.to_string();
-        let context = format!("{container}.{rust_name}");
-        let serde = parse_serde_attributes(&field.attrs, &context, AttributeSite::Field)?;
+        let field_context = format!("{container}.{rust_name}");
+        let serde = parse_serde_attributes(&field.attrs, &field_context, AttributeSite::Field)?;
         if serde.skip {
             continue;
         }
-        let validation = parse_validation_attributes(&field.attrs, &context)?;
-        require_validators(source_path, companions, &validation.validators)?;
+        let validation = parse_validation_attributes(&field.attrs, &field_context)?;
+        require_validators(
+            context.source_path,
+            context.companions,
+            &validation.validators,
+            context.discovered_companions,
+        )?;
         if let Some(symbol) = &serde.deserialize_with {
-            companions.require(source_path, symbol, CompanionKind::Deserializer)?;
+            context
+                .discovered_companions
+                .insert((symbol.clone(), CompanionKind::Deserializer));
+            context
+                .companions
+                .require(context.source_path, symbol, CompanionKind::Deserializer)?;
         }
         let default = match serde.default {
             None => None,
             Some(None) => Some(DefaultValue::Trait),
-            Some(Some(symbol)) => match literal_defaults.get(&symbol) {
+            Some(Some(symbol)) => match context.literal_defaults.get(&symbol) {
                 Some(value) => Some(DefaultValue::Literal(value.clone())),
                 None => {
-                    let companion =
-                        companions.require(source_path, &symbol, CompanionKind::Default)?;
+                    context
+                        .discovered_companions
+                        .insert((symbol.clone(), CompanionKind::Default));
+                    let companion = context.companions.require(
+                        context.source_path,
+                        &symbol,
+                        CompanionKind::Default,
+                    )?;
                     Some(DefaultValue::Companion(
                         companion.value.clone().expect("validated default value"),
                     ))
                 }
             },
         };
+        let default = default
+            .or_else(|| container_default.map(|_default| DefaultValue::Container))
+            .or_else(|| serde.skip_deserializing.then_some(DefaultValue::Trait));
         extracted.push(ExtractedField {
             rust_name: rust_name.clone(),
             name: serde
                 .rename
-                .unwrap_or_else(|| apply_rename_rule(&rust_name, rename_all)),
+                .unwrap_or_else(|| apply_rename_rule(&rust_name, rename_all, RenameTarget::Field)),
             aliases: serde.aliases,
             optional: option_inner(&field.ty),
             flatten: serde.flatten,
             skip_serializing: serde.skip_serializing,
+            skip_deserializing: serde.skip_deserializing,
+            skip_serializing_if: serde.skip_serializing_if,
             default,
             deserializer: serde.deserialize_with,
             validators: validation.validators.into_iter().collect(),
@@ -1109,8 +1214,10 @@ fn require_validators(
     source_path: &str,
     companions: &CompanionManifest,
     validators: &BTreeSet<String>,
+    discovered_companions: &mut BTreeSet<(String, CompanionKind)>,
 ) -> Result<(), Report<SettingsError>> {
     for validator in validators {
+        discovered_companions.insert((validator.clone(), CompanionKind::Validator));
         companions.require(source_path, validator, CompanionKind::Validator)?;
     }
     Ok(())
@@ -1118,7 +1225,11 @@ fn require_validators(
 
 #[derive(Clone, Copy)]
 enum AttributeSite {
-    Container,
+    StructContainer {
+        has_fields: bool,
+        named_fields: bool,
+    },
+    EnumContainer,
     Field,
     Variant,
 }
@@ -1129,6 +1240,7 @@ fn parse_serde_attributes(
     site: AttributeSite,
 ) -> Result<SerdeAttributes, Report<SettingsError>> {
     let mut parsed = SerdeAttributes::default();
+    let mut invalid_site = false;
     for attribute in attributes
         .iter()
         .filter(|value| value.path().is_ident("serde"))
@@ -1138,9 +1250,19 @@ fn parse_serde_attributes(
                 let Some(name) = meta.path.get_ident().map(ToString::to_string) else {
                     return Err(meta.error("unsupported serde attribute path"));
                 };
+                if serde_attribute_intentionally_unsupported(&name) {
+                    return Err(meta.error(format!("unsupported serde attribute {name}")));
+                }
+                if !serde_attribute_allowed(&name, site) {
+                    invalid_site = true;
+                    return Err(meta.error(format!("invalid serde attribute {name} for this site")));
+                }
                 match name.as_str() {
                     "rename" => parsed.rename = Some(parse_string_value(&meta)?),
                     "rename_all" => parsed.rename_all = Some(parse_string_value(&meta)?),
+                    "rename_all_fields" => {
+                        parsed.rename_all_fields = Some(parse_string_value(&meta)?);
+                    }
                     "alias" => parsed.aliases.push(parse_string_value(&meta)?),
                     "deny_unknown_fields" => parsed.deny_unknown_fields = true,
                     "tag" => parsed.tag = Some(parse_string_value(&meta)?),
@@ -1149,6 +1271,10 @@ fn parse_serde_attributes(
                     "flatten" => parsed.flatten = true,
                     "skip" => parsed.skip = true,
                     "skip_serializing" => parsed.skip_serializing = true,
+                    "skip_deserializing" => parsed.skip_deserializing = true,
+                    "skip_serializing_if" => {
+                        parsed.skip_serializing_if = Some(parse_path_string_value(&meta)?);
+                    }
                     "default" if meta.input.peek(syn::Token![=]) => {
                         parsed.default = Some(Some(parse_path_string_value(&meta)?));
                     }
@@ -1156,18 +1282,9 @@ fn parse_serde_attributes(
                     "deserialize_with" => {
                         parsed.deserialize_with = Some(parse_path_string_value(&meta)?);
                     }
-                    "skip_serializing_if"
-                    | "serialize_with"
-                    | "bound"
-                    | "borrow"
-                    | "crate"
-                    | "expecting"
-                    | "other"
-                    | "skip_deserializing"
-                    | "rename_all_fields" => {
-                        consume_optional_value(&meta)?;
-                    }
-                    "from" | "try_from" | "into" | "remote" | "transparent" | "with" | "getter" => {
+                    "serialize_with" | "bound" | "borrow" | "crate" | "expecting" | "other"
+                    | "from" | "try_from" | "into" | "remote" | "transparent" | "with"
+                    | "getter" => {
                         return Err(meta.error(format!("unsupported serde attribute {name}")));
                     }
                     _ => return Err(meta.error(format!("unsupported serde attribute {name}"))),
@@ -1175,21 +1292,108 @@ fn parse_serde_attributes(
                 Ok(())
             })
             .map_err(|error| {
-                let attribute = unsupported_attribute_name(&error.to_string());
-                Report::new(SettingsError::UnsupportedSerdeAttribute {
-                    attribute,
-                    item: item.to_owned(),
-                })
+                if invalid_site {
+                    Report::new(SettingsError::InvalidAttribute {
+                        attribute: "serde",
+                        item: item.to_owned(),
+                    })
+                } else {
+                    let attribute = unsupported_attribute_name(&error.to_string());
+                    Report::new(SettingsError::UnsupportedSerdeAttribute {
+                        attribute,
+                        item: item.to_owned(),
+                    })
+                }
             })?;
     }
 
-    if matches!(site, AttributeSite::Field) && (parsed.tag.is_some() || parsed.untagged) {
+    for (attribute, rule) in [
+        ("rename_all", parsed.rename_all.as_deref()),
+        ("rename_all_fields", parsed.rename_all_fields.as_deref()),
+    ] {
+        if let Some(rule) = rule
+            && !valid_rename_rule(rule)
+        {
+            return Err(Report::new(SettingsError::InvalidAttribute {
+                attribute,
+                item: item.to_owned(),
+            }));
+        }
+    }
+    if parsed.content.is_some() && parsed.tag.is_none()
+        || parsed.untagged && (parsed.tag.is_some() || parsed.content.is_some())
+    {
         return Err(Report::new(SettingsError::InvalidAttribute {
             attribute: "serde",
             item: item.to_owned(),
         }));
     }
     Ok(parsed)
+}
+
+fn serde_attribute_allowed(name: &str, site: AttributeSite) -> bool {
+    match site {
+        AttributeSite::StructContainer {
+            has_fields,
+            named_fields,
+        } => match name {
+            "rename" | "rename_all" | "deny_unknown_fields" => true,
+            "default" => has_fields,
+            "tag" => named_fields,
+            _ => false,
+        },
+        AttributeSite::EnumContainer => matches!(
+            name,
+            "rename"
+                | "rename_all"
+                | "rename_all_fields"
+                | "deny_unknown_fields"
+                | "tag"
+                | "content"
+                | "untagged"
+        ),
+        AttributeSite::Field => matches!(
+            name,
+            "rename"
+                | "alias"
+                | "default"
+                | "flatten"
+                | "skip"
+                | "skip_serializing"
+                | "skip_deserializing"
+                | "skip_serializing_if"
+                | "deserialize_with"
+        ),
+        AttributeSite::Variant => matches!(
+            name,
+            "rename"
+                | "alias"
+                | "rename_all"
+                | "skip"
+                | "skip_serializing"
+                | "skip_deserializing"
+                | "untagged"
+        ),
+    }
+}
+
+fn serde_attribute_intentionally_unsupported(name: &str) -> bool {
+    matches!(
+        name,
+        "serialize_with"
+            | "bound"
+            | "borrow"
+            | "crate"
+            | "expecting"
+            | "other"
+            | "from"
+            | "try_from"
+            | "into"
+            | "remote"
+            | "transparent"
+            | "with"
+            | "getter"
+    )
 }
 
 fn unsupported_attribute_name(message: &str) -> String {
@@ -1338,65 +1542,100 @@ fn path_text(path: &Path) -> String {
         .join("::")
 }
 
-fn apply_rename_rule(name: &str, rule: Option<&str>) -> String {
-    match rule {
-        None => name.to_owned(),
-        Some("lowercase") => name.to_ascii_lowercase(),
-        Some("UPPERCASE") => name.to_ascii_uppercase(),
-        Some("snake_case") => words(name).join("_"),
-        Some("SCREAMING_SNAKE_CASE") => words(name).join("_").to_ascii_uppercase(),
-        Some("kebab-case") => words(name).join("-"),
-        Some("SCREAMING-KEBAB-CASE") => words(name).join("-").to_ascii_uppercase(),
-        Some("camelCase") => {
-            let pieces = words(name);
-            let Some((first, rest)) = pieces.split_first() else {
-                return String::new();
-            };
-            let mut result = first.clone();
-            for piece in rest {
-                result.push_str(&capitalize(piece));
-            }
-            result
-        }
-        Some("PascalCase") => words(name).iter().map(|word| capitalize(word)).collect(),
-        Some(_) => name.to_owned(),
-    }
+#[derive(Clone, Copy)]
+enum RenameTarget {
+    Field,
+    Variant,
 }
 
-fn words(name: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let characters = name.chars().collect::<Vec<_>>();
-    for (index, character) in characters.iter().copied().enumerate() {
-        if character == '_' || character == '-' {
-            if !current.is_empty() {
-                words.push(current.to_ascii_lowercase());
-                current.clear();
-            }
-            continue;
-        }
-        let prior_lower = index > 0 && characters[index - 1].is_ascii_lowercase();
-        let next_lower = characters
-            .get(index + 1)
-            .is_some_and(char::is_ascii_lowercase);
-        if character.is_ascii_uppercase() && !current.is_empty() && (prior_lower || next_lower) {
-            words.push(current.to_ascii_lowercase());
-            current.clear();
-        }
-        current.push(character);
-    }
-    if !current.is_empty() {
-        words.push(current.to_ascii_lowercase());
-    }
-    words
+fn valid_rename_rule(rule: &str) -> bool {
+    matches!(
+        rule,
+        "lowercase"
+            | "UPPERCASE"
+            | "PascalCase"
+            | "camelCase"
+            | "snake_case"
+            | "SCREAMING_SNAKE_CASE"
+            | "kebab-case"
+            | "SCREAMING-KEBAB-CASE"
+    )
 }
 
-fn capitalize(value: &str) -> String {
-    let mut characters = value.chars();
-    let Some(first) = characters.next() else {
-        return String::new();
+fn apply_rename_rule(name: &str, rule: Option<&str>, target: RenameTarget) -> String {
+    let Some(rule) = rule else {
+        return name.to_owned();
     };
-    let mut result = first.to_ascii_uppercase().to_string();
-    result.extend(characters);
-    result
+    debug_assert!(valid_rename_rule(rule), "rename rules should be validated");
+    match target {
+        RenameTarget::Field => apply_field_rename_rule(name, rule),
+        RenameTarget::Variant => apply_variant_rename_rule(name, rule),
+    }
+}
+
+fn apply_field_rename_rule(name: &str, rule: &str) -> String {
+    match rule {
+        "lowercase" | "snake_case" => name.to_owned(),
+        "UPPERCASE" => name.to_ascii_uppercase(),
+        "PascalCase" => {
+            let mut output = String::new();
+            let mut capitalize = true;
+            for character in name.chars() {
+                if character == '_' {
+                    capitalize = true;
+                } else if capitalize {
+                    output.push(character.to_ascii_uppercase());
+                    capitalize = false;
+                } else {
+                    output.push(character);
+                }
+            }
+            output
+        }
+        "camelCase" => {
+            let pascal = apply_field_rename_rule(name, "PascalCase");
+            let mut characters = pascal.chars();
+            match characters.next() {
+                Some(first) => first.to_ascii_lowercase().to_string() + characters.as_str(),
+                None => String::new(),
+            }
+        }
+        "SCREAMING_SNAKE_CASE" => name.to_ascii_uppercase(),
+        "kebab-case" => name.replace('_', "-"),
+        "SCREAMING-KEBAB-CASE" => name.to_ascii_uppercase().replace('_', "-"),
+        _ => unreachable!("validated rename rule should be complete"),
+    }
+}
+
+fn apply_variant_rename_rule(name: &str, rule: &str) -> String {
+    match rule {
+        "PascalCase" => name.to_owned(),
+        "lowercase" => name.to_ascii_lowercase(),
+        "UPPERCASE" => name.to_ascii_uppercase(),
+        "camelCase" => {
+            let mut characters = name.chars();
+            match characters.next() {
+                Some(first) => first.to_ascii_lowercase().to_string() + characters.as_str(),
+                None => String::new(),
+            }
+        }
+        "snake_case" => {
+            let mut output = String::new();
+            for (index, character) in name.char_indices() {
+                if index > 0 && character.is_uppercase() {
+                    output.push('_');
+                }
+                output.push(character.to_ascii_lowercase());
+            }
+            output
+        }
+        "SCREAMING_SNAKE_CASE" => {
+            apply_variant_rename_rule(name, "snake_case").to_ascii_uppercase()
+        }
+        "kebab-case" => apply_variant_rename_rule(name, "snake_case").replace('_', "-"),
+        "SCREAMING-KEBAB-CASE" => {
+            apply_variant_rename_rule(name, "SCREAMING_SNAKE_CASE").replace('_', "-")
+        }
+        _ => unreachable!("validated rename rule should be complete"),
+    }
 }

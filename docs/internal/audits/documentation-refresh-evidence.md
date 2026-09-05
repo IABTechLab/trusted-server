@@ -2751,29 +2751,30 @@ PY
   failed to compile because `docs_parity::settings` and its schema and harness
   types did not exist. Subsequent RED leaves failed for the absent companion
   manifest, unresolved probe declarations, and the missing `settings --check`
-  subcommand. The eight negative harness fixtures separately rejected a
-  placeholder typo, an unknown disabled integration, an invalid profile,
-  an unresolved secret, a stranded literal, an inactive-block shortcut, a
-  missing profile-compiler probe, and the wrong failure diagnostic before the
-  complete valid observation passed.
+  subcommand. Review of `e2b48415e` then reproduced three fail-closed gaps:
+  accepted Serde attributes were not a closed site-aware grammar, stale
+  companions and broad probe names could pass, and the eight negative harness
+  cases mutated a manually supplied observation instead of production state.
 - `settings --check` parses four bounded, strict-UTF-8 production sources with
   `syn`: the root settings model, standard auction profile, APS profile, and
   Prebid settings. Its closed grammar covers Serde container, variant, and
-  field semantics for `rename`, `rename_all`, `alias`, `tag`, `content`,
-  `untagged`, `flatten`, `skip`, and `skip_serializing`; literal and
-  nonliteral defaults; custom deserializers; `Option`; and validator ranges
-  and functions. Unknown shape-changing attributes fail closed. The checked
-  schema requires exact equality with the 17-field `Settings` root rather than
-  accepting a subset.
+  field semantics for `rename`, `rename_all`, `rename_all_fields`, `alias`,
+  `tag`, `content`, `untagged`, `flatten`, `skip`, `skip_serializing`,
+  `skip_deserializing`, `skip_serializing_if`, and container/field `default`;
+  literal and nonliteral defaults; custom deserializers; `Option`; and
+  validator ranges and functions. The exact eight Serde rename rules use
+  distinct field and variant transforms. Invalid rules, accepted attributes
+  on invalid sites, and unknown shape-changing attributes fail closed. The
+  checked schema requires exact equality with the 17-field `Settings` root.
 - `settings-companions.toml` is a versioned, explicitly reviewed record with 46
-  exact nonliteral-default, deserializer, and validator companions. Each
-  companion names its owning source plus compiled positive and negative test
-  probes; missing, blank, duplicate, stale, or source-mismatched declarations
-  fail closed. Production-module tests exercise the actual functions and
-  types, including map-or-sequence decoding, the APS endpoint/default rules,
-  Prebid URL/SRI rules, settings defaults and validators, and all three
-  profile compiler IDs. The tool added no public production API and changed no
-  production behavior.
+  exact nonliteral-default, deserializer, and validator companions. Each names
+  its exact source, symbol, kind, value when applicable, and unique
+  source/symbol/kind-bound positive and negative probe functions. The
+  AST-discovered and reviewed sets must be equal, so missing and stale entries
+  both fail. Module-local compiled receipt producers execute and bind all 46
+  records: 34 in settings, six in APS, and six in Prebid. Wrong values,
+  probe-symbol mismatches, duplicate receipts, and reusable broad probe names
+  fail exact equality. No public production API or behavior changed.
 - The same manifest contains 19 directional field records whose five axes are
   checked independently: lifecycle, key identity, serialization, runtime,
   and secret handling. Exact equality requires 11 active store-resolved
@@ -2785,21 +2786,31 @@ PY
 - The production-API harness parses `trusted-server.example.toml`, proves that
   its unmodified form reports exactly the three publisher placeholders, and
   applies three non-secret publisher customizations in memory. It then
-  preserves secret key names through deploy validation, settings
-  serialization, and `BlobEnvelope`; resolves them through the module-local
-  fake platform secret store; and runs runtime validation over the resolved
-  values. Every one of the 14 deploy-validated optional integration/provider
-  IDs is forced enabled and checked in isolation. Module-local set-equality
-  assertions bind those 14 IDs and the three profile IDs to the reviewed
-  record. The record also checks three exact secret-key literals and all six
-  literal-substitution or include-only template consumers.
-- The standalone settings target contains 17 passing tests, including the
-  closed grammar, companion chain, five-axis dispositions, all eight negative
-  phases, real repository extraction, and CLI execution. The complete
-  standalone suite contains 228 passing tests: 17 library unit, 35
-  classification, 19 CLI, 57 links, 11 Markdown, 72 scanner, and 17 settings
-  tests. `cargo fmt --all -- --check` and standalone all-target clippy with
-  warnings denied exited 0.
+  preserves the exact three secret key names through deploy validation,
+  settings serialization, and `BlobEnvelope`; resolves them through the
+  module-local fake platform secret store; and runs runtime validation. Every
+  one of the 14 deploy-validated optional integration IDs is derived from its
+  exact active or commented source block, forced enabled, and checked with
+  paired positive/negative deploy probes. APS and Prebid provider profiles are
+  likewise source-derived; all three registered profiles run paired compile
+  probes. Module-local assertions compare the 14 integration IDs, three
+  profile IDs, three secret-key literals, exact placeholder paths, and
+  normalized diagnostic with the reviewed record.
+- The eight negative cases now mutate production inputs at their real
+  boundaries: typed source parsing rejects `orgin_url`; deploy validation
+  rejects an unknown disabled-integration key and bad profile; envelope
+  resolution rejects a missing secret and a stranded literal; the same invalid
+  Permutive source block demonstrates the inactive shortcut and then fails
+  when forced enabled; an omitted APS compile yields the exact two-profile
+  mismatch; and a partially corrected template yields exactly
+  `publisher.cookie_domain, publisher.domain` and its exact normalized
+  diagnostic, not the checked three-path result. The manual-observation model
+  and its self-reported negative tests were removed.
+- The standalone settings target contains 15 passing tests. The complete
+  standalone suite contains 226 passing tests: 17 library unit, 35
+  classification, 19 CLI, 57 links, 11 Markdown, 72 scanner, and 15 settings
+  tests. Root and standalone fmt checks, standalone all-target clippy with
+  warnings denied, and all three root target clippy aliases exited 0.
 - A final default-parallel repetition exposed one existing Task 6 process
   fixture race: its overflow child could be starved before writing any bytes,
   so the valid production timeout won over an overflow the fixture had not yet
@@ -2808,12 +2819,13 @@ PY
   returning, and the production deadline is computed only afterward. This is
   test-only synchronization, does not lengthen the runner policy timeout, and
   changes no production behavior. The exact overflow test passed ten
-  consecutive focused repetitions before the full suite was repeated.
+  consecutive focused repetitions before the 226-test suite passed two fresh,
+  consecutive default-parallel repetitions.
 - The target-matched Fastly commands used the repository-pinned Viceroy 0.17.0
   from an isolated host installation. On macOS it required the readable system
   certificate file via `SSL_CERT_FILE=/etc/ssl/cert.pem`; no repository file
-  changed for that host setup. `cargo test-fastly settings` passed 177 core
-  tests, `cargo test-fastly config` passed 12 adapter and 197 core tests, and
+  changed for that host setup. `cargo test-fastly settings` passed 176 core
+  tests, `cargo test-fastly config` passed 12 adapter and 198 core tests, and
   `cargo test-fastly profile` passed 20 core tests. The named Task 7 production
   probes were included in those target-matched runs.
 - The three secret-disposition words in the companion schema are identifiers,
@@ -2835,9 +2847,15 @@ PY
   and
   `108c4769bca7aa7709b88da1560b6879702b33e7111d46e46b346132570fd506`.
   The reviewed companion manifest SHA-256 is
-  `d1a9baa7aa95ac1f8724be3947687d8a30080689b1cfc526c4a528e18e4bad78`.
+  `28fa989f91f04618e762d6647e3e16d153eb724bb0c1b8b63bc94acb66515c0a`.
   Repeated sensitive bootstraps retained reviewed-manifest SHA-256
-  `eaabfc0d1bea32bcffa58d95a3aa4889a6de133aa37876ba1790239d52169acd`.
+  `eaabfc0d1bea32bcffa58d95a3aa4889a6de133aa37876ba1790239d52169acd`
+  for the original Task 7 checkpoint. The review correction preserves the
+  exact 5,406-record class/path/detector/fingerprint multiset; only selectors
+  moved with the four formatted core test modules. Two final bootstraps
+  retained reviewed-manifest SHA-256
+  `f45ae49a3b66a4cca63e68b6942f03065b9fdc94bc8919bb994016e73bf5150b`
+  byte-for-byte.
   Fresh `settings --check`, local-link, generated-region, classification, and
   sensitive-scan checks all exited 0.
 - Only the standalone lock gained the direct `syn` dependency already present
@@ -2845,7 +2863,8 @@ PY
   `8d12168733c63ecce2566f3267fde5741155a87cf767b8415fc845d496bbf3ca`.
   Root `Cargo.lock` remained byte-identical at
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
-  The Task 7 Files list and staging command are exact for its 20-path diff,
+  The Task 7 Files list and original staging command remain exact for its
+  20-path diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`,
   including the scanner class/test required by the new manifest vocabulary
   and the process-fixture synchronization required by the repeated default
   suite, while excluding all unchanged files: the five checked core sources;
@@ -2853,7 +2872,10 @@ PY
   lockfile, and README; the tracked, maintained, sensitive, and
   settings-companion manifests; the standalone library, Markdown, scanner,
   and settings implementations; and the scanner and settings integration-test
-  files.
+  files. The review correction is exactly the 10 paths in Task 7 Step 8: four
+  core sources, this evidence file and the plan, the sensitive and
+  settings-companion manifests, and the standalone settings implementation and
+  test.
 
 #### Task 8 — Check integration capabilities and adapter routes
 

@@ -3682,7 +3682,7 @@ mod tests {
     use super::*;
     use regex::Regex;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::sync::Arc;
 
     use crate::auction::build_orchestrator;
@@ -3705,104 +3705,192 @@ mod tests {
         headers: HashMap<String, String>,
     }
 
-    #[test]
-    fn task7_settings_companion_positive() {
-        assert_eq!(default_max_buffered_body_bytes(), 16 * 1024 * 1024);
-        assert_eq!(EcPartner::default_openrtb_atype(), 3);
-        assert_eq!(EcPartner::default_batch_rate_limit(), 60);
-        assert_eq!(EcPartner::default_pull_sync_ttl_sec(), 86_400);
-        assert_eq!(EcPartner::default_pull_sync_rate_limit(), 10);
-        assert_eq!(Ec::default_pull_sync_concurrency(), 3);
-        assert_eq!(Ec::default_cluster_trust_threshold(), 10);
-        assert_eq!(Ec::default_cluster_recheck_secs(), 3_600);
-        assert_eq!(default_s3_access_key_id().expose(), "access_key_id");
-        assert_eq!(default_s3_secret_access_key().expose(), "secret_access_key");
-        assert_eq!(default_profile_param(), "profile");
-        assert_eq!(default_aspect_ratio_param(), "ar");
-        assert_eq!(default_debug_param(), "_io_debug");
-        assert_eq!(default_default_profile(), "default");
-        assert_eq!(default_crop_offset_x_param(), "x");
-        assert_eq!(default_crop_offset_y_param(), "y");
-        assert_eq!(default_crop_offset_buckets(), [10, 30, 50, 70, 90]);
-        assert_eq!(default_tinybird_auction_dataset(), "auction_events_raw");
-        assert_eq!(default_tinybird_access_dataset(), "access_logs_raw");
-        assert_eq!(default_tinybird_max_body_bytes(), 1024 * 1024);
-        assert_eq!(
-            default_auction_debug_metadata_keys(),
-            ["error_type", "http_status", "message"]
-        );
+    #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+    struct Task7CompanionReceipt {
+        source: String,
+        symbol: String,
+        kind: String,
+        value: Option<String>,
+        positive_probe: String,
+        negative_probe: String,
+    }
 
-        let deserialized: Task7DeserializerProbe = serde_json::from_value(json!({
-            "number": "7",
-            "enabled": "true",
-            "values": {"1": "second", "0": "first"},
-            "headers": "{\"X-Probe\":\"present\"}"
-        }))
-        .expect("supported alternate settings shapes should deserialize");
-        assert_eq!(deserialized.number, 7);
-        assert!(deserialized.enabled);
-        assert_eq!(deserialized.values, ["first", "second"]);
-        assert_eq!(
-            deserialized.headers.get("X-Probe").map(String::as_str),
-            Some("present")
-        );
+    #[derive(Deserialize)]
+    struct Task7CompanionManifest {
+        companions: Vec<Task7CompanionReceipt>,
+    }
 
-        validate_publisher_domain("publisher.example")
-            .expect("plain publisher domain should validate");
-        validate_cookie_domain(".publisher.example").expect("plain cookie domain should validate");
-        validate_no_trailing_slash("https://origin.example")
-            .expect("origin without trailing slash should validate");
-        validate_host_header_override("origin.example:443").expect("host override should validate");
-        validate_redacted_not_empty(&Redacted::new("value".to_owned()))
-            .expect("nonempty redacted value should validate");
-        EcPartner::validate_source_domain("identity.example")
-            .expect("plain partner source domain should validate");
-        Ec::validate_passphrase(&Redacted::new(
-            "fictional-ec-passphrase-32-bytes-ok".to_owned(),
-        ))
-        .expect("strong EC passphrase should validate");
-        validate_path("^/articles/[a-z]+$").expect("valid regex should validate");
-        validate_trusted_client_ip(&TrustedClientIpConfig {
-            ip_header: "fastly-client-ip".to_owned(),
-            auth_header: "x-trusted-client-auth".to_owned(),
-            shared_secret: Redacted::new("fictional-shared-secret-32-bytes-ok".to_owned()),
-        })
-        .expect("distinct safe headers and strong secret should validate");
+    macro_rules! task7_companion_receipt {
+        (
+            $positive:ident,
+            $negative:ident,
+            $symbol:literal,
+            $kind:literal,
+            $value:expr,
+            $positive_body:block,
+            $negative_body:block
+        ) => {{
+            fn $positive() $positive_body
+            fn $negative() $negative_body
+            $positive();
+            $negative();
+            let value: Option<&str> = $value;
+            Task7CompanionReceipt {
+                source: "crates/trusted-server-core/src/settings.rs".to_owned(),
+                symbol: $symbol.to_owned(),
+                kind: $kind.to_owned(),
+                value: value.map(str::to_owned),
+                positive_probe: stringify!($positive).to_owned(),
+                negative_probe: stringify!($negative).to_owned(),
+            }
+        }};
     }
 
     #[test]
-    fn task7_settings_companion_negative() {
-        for invalid in [
-            json!({"number": [], "enabled": true, "values": [], "headers": {}}),
-            json!({"number": 7, "enabled": 1, "values": [], "headers": {}}),
-            json!({"number": 7, "enabled": true, "values": false, "headers": {}}),
-            json!({"number": 7, "enabled": true, "values": [], "headers": []}),
-        ] {
-            serde_json::from_value::<Task7DeserializerProbe>(invalid)
-                .expect_err("each unsupported custom-deserializer shape should fail");
-        }
-
-        validate_publisher_domain("https://publisher.example")
-            .expect_err("publisher domain with scheme should fail");
-        validate_cookie_domain("publisher.example; Secure")
-            .expect_err("cookie metacharacter should fail");
-        validate_no_trailing_slash("https://origin.example/")
-            .expect_err("trailing slash should fail");
-        validate_host_header_override("https://origin.example")
-            .expect_err("host override with scheme should fail");
-        validate_redacted_not_empty(&Redacted::new(String::new()))
-            .expect_err("empty redacted value should fail");
-        EcPartner::validate_source_domain("https://identity.example")
-            .expect_err("partner source domain with scheme should fail");
-        Ec::validate_passphrase(&Redacted::new("short".to_owned()))
-            .expect_err("short EC passphrase should fail");
-        validate_path("[").expect_err("invalid regex should fail");
-        validate_trusted_client_ip(&TrustedClientIpConfig {
-            ip_header: "x-same".to_owned(),
-            auth_header: "x-same".to_owned(),
-            shared_secret: Redacted::new("short".to_owned()),
-        })
-        .expect_err("identical headers and a short secret should fail");
+    fn task7_settings_companions_are_exact_and_compiled_per_record() {
+        let actual = BTreeSet::from([
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_default_max_buffered_body_bytes_default_positive,
+                task7_crates_trusted_server_core_src_settings_rs_default_max_buffered_body_bytes_default_negative,
+                "default_max_buffered_body_bytes", "default", Some("16777216"),
+                { assert_eq!(default_max_buffered_body_bytes(), 16 * 1024 * 1024); },
+                { assert_ne!(default_max_buffered_body_bytes(), 16 * 1024 * 1024 - 1); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_from_value_or_str_deserializer_positive,
+                task7_crates_trusted_server_core_src_settings_rs_from_value_or_str_deserializer_negative,
+                "from_value_or_str", "deserializer", None,
+                {
+                    let value: Task7DeserializerProbe = serde_json::from_value(json!({"number":"7","enabled":true,"values":[],"headers":{}})).expect("string number should deserialize");
+                    assert_eq!(value.number, 7);
+                },
+                { serde_json::from_value::<Task7DeserializerProbe>(json!({"number":[],"enabled":true,"values":[],"headers":{}})).expect_err("array number should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_vec_from_seq_or_map_deserializer_positive,
+                task7_crates_trusted_server_core_src_settings_rs_vec_from_seq_or_map_deserializer_negative,
+                "vec_from_seq_or_map", "deserializer", None,
+                {
+                    let value: Task7DeserializerProbe = serde_json::from_value(json!({"number":7,"enabled":true,"values":{"1":"second","0":"first"},"headers":{}})).expect("indexed map should deserialize");
+                    assert_eq!(value.values, ["first", "second"]);
+                },
+                { serde_json::from_value::<Task7DeserializerProbe>(json!({"number":7,"enabled":true,"values":false,"headers":{}})).expect_err("boolean sequence should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_map_from_obj_or_str_deserializer_positive,
+                task7_crates_trusted_server_core_src_settings_rs_map_from_obj_or_str_deserializer_negative,
+                "map_from_obj_or_str", "deserializer", None,
+                {
+                    let value: Task7DeserializerProbe = serde_json::from_value(json!({"number":7,"enabled":true,"values":[],"headers":"{\"X-Probe\":\"present\"}"})).expect("JSON string map should deserialize");
+                    assert_eq!(value.headers.get("X-Probe").map(String::as_str), Some("present"));
+                },
+                { serde_json::from_value::<Task7DeserializerProbe>(json!({"number":7,"enabled":true,"values":[],"headers":[]})).expect_err("array map should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_bool_from_bool_or_str_deserializer_positive,
+                task7_crates_trusted_server_core_src_settings_rs_bool_from_bool_or_str_deserializer_negative,
+                "bool_from_bool_or_str", "deserializer", None,
+                {
+                    let value: Task7DeserializerProbe = serde_json::from_value(json!({"number":7,"enabled":"true","values":[],"headers":{}})).expect("string bool should deserialize");
+                    assert!(value.enabled);
+                },
+                { serde_json::from_value::<Task7DeserializerProbe>(json!({"number":7,"enabled":1,"values":[],"headers":{}})).expect_err("numeric bool should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_validate_publisher_domain_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_validate_publisher_domain_validator_negative,
+                "validate_publisher_domain", "validator", None,
+                { validate_publisher_domain("publisher.example").expect("plain publisher domain should validate"); },
+                { validate_publisher_domain("https://publisher.example").expect_err("publisher scheme should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_validate_cookie_domain_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_validate_cookie_domain_validator_negative,
+                "validate_cookie_domain", "validator", None,
+                { validate_cookie_domain(".publisher.example").expect("plain cookie domain should validate"); },
+                { validate_cookie_domain("publisher.example; Secure").expect_err("cookie metacharacter should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_validate_no_trailing_slash_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_validate_no_trailing_slash_validator_negative,
+                "validate_no_trailing_slash", "validator", None,
+                { validate_no_trailing_slash("https://origin.example").expect("origin should validate"); },
+                { validate_no_trailing_slash("https://origin.example/").expect_err("trailing slash should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_validate_host_header_override_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_validate_host_header_override_validator_negative,
+                "validate_host_header_override", "validator", None,
+                { validate_host_header_override("origin.example:443").expect("host override should validate"); },
+                { validate_host_header_override("https://origin.example").expect_err("host scheme should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_validate_redacted_not_empty_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_validate_redacted_not_empty_validator_negative,
+                "validate_redacted_not_empty", "validator", None,
+                { validate_redacted_not_empty(&Redacted::new("value".to_owned())).expect("value should validate"); },
+                { validate_redacted_not_empty(&Redacted::new(String::new())).expect_err("empty value should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_ecpartner_validate_source_domain_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_ecpartner_validate_source_domain_validator_negative,
+                "EcPartner::validate_source_domain", "validator", None,
+                { EcPartner::validate_source_domain("identity.example").expect("source domain should validate"); },
+                { EcPartner::validate_source_domain("https://identity.example").expect_err("source scheme should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_ec_validate_passphrase_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_ec_validate_passphrase_validator_negative,
+                "Ec::validate_passphrase", "validator", None,
+                { Ec::validate_passphrase(&Redacted::new("fictional-ec-passphrase-32-bytes-ok".to_owned())).expect("strong passphrase should validate"); },
+                { Ec::validate_passphrase(&Redacted::new("short".to_owned())).expect_err("short passphrase should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_validate_path_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_validate_path_validator_negative,
+                "validate_path", "validator", None,
+                { validate_path("^/articles/[a-z]+$").expect("valid regex should validate"); },
+                { validate_path("[").expect_err("invalid regex should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_settings_rs_validate_trusted_client_ip_validator_positive,
+                task7_crates_trusted_server_core_src_settings_rs_validate_trusted_client_ip_validator_negative,
+                "validate_trusted_client_ip", "validator", None,
+                { validate_trusted_client_ip(&TrustedClientIpConfig { ip_header: "fastly-client-ip".to_owned(), auth_header: "x-trusted-client-auth".to_owned(), shared_secret: Redacted::new("fictional-shared-secret-32-bytes-ok".to_owned()) }).expect("trusted client config should validate"); },
+                { validate_trusted_client_ip(&TrustedClientIpConfig { ip_header: "x-same".to_owned(), auth_header: "x-same".to_owned(), shared_secret: Redacted::new("short".to_owned()) }).expect_err("unsafe trusted client config should fail"); }
+            ),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_openrtb_atype_default_positive, task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_openrtb_atype_default_negative, "EcPartner::default_openrtb_atype", "default", Some("3"), { assert_eq!(EcPartner::default_openrtb_atype(), 3); }, { assert_ne!(EcPartner::default_openrtb_atype(), 2); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_batch_rate_limit_default_positive, task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_batch_rate_limit_default_negative, "EcPartner::default_batch_rate_limit", "default", Some("60"), { assert_eq!(EcPartner::default_batch_rate_limit(), 60); }, { assert_ne!(EcPartner::default_batch_rate_limit(), 59); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_ttl_sec_default_positive, task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_ttl_sec_default_negative, "EcPartner::default_pull_sync_ttl_sec", "default", Some("86400"), { assert_eq!(EcPartner::default_pull_sync_ttl_sec(), 86_400); }, { assert_ne!(EcPartner::default_pull_sync_ttl_sec(), 86_399); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_rate_limit_default_positive, task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_rate_limit_default_negative, "EcPartner::default_pull_sync_rate_limit", "default", Some("10"), { assert_eq!(EcPartner::default_pull_sync_rate_limit(), 10); }, { assert_ne!(EcPartner::default_pull_sync_rate_limit(), 9); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_ec_default_pull_sync_concurrency_default_positive, task7_crates_trusted_server_core_src_settings_rs_ec_default_pull_sync_concurrency_default_negative, "Ec::default_pull_sync_concurrency", "default", Some("3"), { assert_eq!(Ec::default_pull_sync_concurrency(), 3); }, { assert_ne!(Ec::default_pull_sync_concurrency(), 2); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_trust_threshold_default_positive, task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_trust_threshold_default_negative, "Ec::default_cluster_trust_threshold", "default", Some("10"), { assert_eq!(Ec::default_cluster_trust_threshold(), 10); }, { assert_ne!(Ec::default_cluster_trust_threshold(), 9); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_recheck_secs_default_positive, task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_recheck_secs_default_negative, "Ec::default_cluster_recheck_secs", "default", Some("3600"), { assert_eq!(Ec::default_cluster_recheck_secs(), 3_600); }, { assert_ne!(Ec::default_cluster_recheck_secs(), 3_599); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_s3_access_key_id_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_s3_access_key_id_default_negative, "default_s3_access_key_id", "default", Some("access_key_id"), { assert_eq!(default_s3_access_key_id().expose(), "access_key_id"); }, { assert_ne!(default_s3_access_key_id().expose(), "secret_access_key"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_s3_secret_access_key_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_s3_secret_access_key_default_negative, "default_s3_secret_access_key", "default", Some("secret_access_key"), { assert_eq!(default_s3_secret_access_key().expose(), "secret_access_key"); }, { assert_ne!(default_s3_secret_access_key().expose(), "access_key_id"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_profile_param_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_profile_param_default_negative, "default_profile_param", "default", Some("profile"), { assert_eq!(default_profile_param(), "profile"); }, { assert_ne!(default_profile_param(), "ar"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_aspect_ratio_param_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_aspect_ratio_param_default_negative, "default_aspect_ratio_param", "default", Some("ar"), { assert_eq!(default_aspect_ratio_param(), "ar"); }, { assert_ne!(default_aspect_ratio_param(), "profile"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_debug_param_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_debug_param_default_negative, "default_debug_param", "default", Some("_io_debug"), { assert_eq!(default_debug_param(), "_io_debug"); }, { assert_ne!(default_debug_param(), "debug"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_default_profile_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_default_profile_default_negative, "default_default_profile", "default", Some("default"), { assert_eq!(default_default_profile(), "default"); }, { assert_ne!(default_default_profile(), "standard"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_x_param_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_x_param_default_negative, "default_crop_offset_x_param", "default", Some("x"), { assert_eq!(default_crop_offset_x_param(), "x"); }, { assert_ne!(default_crop_offset_x_param(), "y"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_y_param_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_y_param_default_negative, "default_crop_offset_y_param", "default", Some("y"), { assert_eq!(default_crop_offset_y_param(), "y"); }, { assert_ne!(default_crop_offset_y_param(), "x"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_buckets_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_buckets_default_negative, "default_crop_offset_buckets", "default", Some("[10,30,50,70,90]"), { assert_eq!(default_crop_offset_buckets(), [10,30,50,70,90]); }, { assert_ne!(default_crop_offset_buckets(), [10,30,50,70]); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_tinybird_auction_dataset_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_tinybird_auction_dataset_default_negative, "default_tinybird_auction_dataset", "default", Some("auction_events_raw"), { assert_eq!(default_tinybird_auction_dataset(), "auction_events_raw"); }, { assert_ne!(default_tinybird_auction_dataset(), "access_logs_raw"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_tinybird_access_dataset_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_tinybird_access_dataset_default_negative, "default_tinybird_access_dataset", "default", Some("access_logs_raw"), { assert_eq!(default_tinybird_access_dataset(), "access_logs_raw"); }, { assert_ne!(default_tinybird_access_dataset(), "auction_events_raw"); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_tinybird_max_body_bytes_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_tinybird_max_body_bytes_default_negative, "default_tinybird_max_body_bytes", "default", Some("1048576"), { assert_eq!(default_tinybird_max_body_bytes(), 1024*1024); }, { assert_ne!(default_tinybird_max_body_bytes(), 1024*1024-1); }),
+            task7_companion_receipt!(task7_crates_trusted_server_core_src_settings_rs_default_auction_debug_metadata_keys_default_positive, task7_crates_trusted_server_core_src_settings_rs_default_auction_debug_metadata_keys_default_negative, "default_auction_debug_metadata_keys", "default", Some("[error_type,http_status,message]"), { assert_eq!(default_auction_debug_metadata_keys(), ["error_type","http_status","message"]); }, { assert_ne!(default_auction_debug_metadata_keys(), ["error_type","message"]); }),
+        ]);
+        let checked: Task7CompanionManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/settings-companions.toml"
+        )))
+        .expect("checked Task 7 companion manifest should parse");
+        let expected = checked
+            .companions
+            .into_iter()
+            .filter(|record| record.source == "crates/trusted-server-core/src/settings.rs")
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "compiled settings receipts must be exact");
     }
 
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
