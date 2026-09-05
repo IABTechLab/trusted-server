@@ -112,12 +112,14 @@ reject URL credentials, follow at most five redirects, use HEAD with GET only
 for unsupported HEAD responses, and make at most three attempts for 429/5xx.
 The production curl process starts with `--disable`, so ambient curl
 configuration cannot change its behavior, and cannot follow redirects itself;
-the shared checker
-validates each relative or absolute redirect before issuing the next request.
+the shared checker validates each relative or absolute redirect before issuing
+the next request.
 Transport arguments allow only credential-free HTTPS and HEAD/GET with bounded
-connect and total time. Stdout is bounded while read, then independently
-validated for status, header count, header line/name/value/total bytes, and
-body bytes. Exact exceptions require an owner, reason, and unexpired timestamp.
+connect and total time. GET writes headers once through `--dump-header`; HEAD
+omits that option because `--head --output -` already writes its header block.
+Stdout is bounded while read, then independently validated for status, header
+count, header line/name/value/total bytes, and body bytes. Exact exceptions
+require an owner, reason, and unexpired timestamp.
 
 ## Repository boundary
 

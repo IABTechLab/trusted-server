@@ -262,8 +262,8 @@ git commit -m "Add documentation parity tool foundation"
 
 **Files:**
 
-- Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
 - Modify as dependencies are introduced: `tools/docs-parity/Cargo.lock`
+- Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
 - Create: `tools/docs-parity/src/classification.rs`
 - Create: `tools/docs-parity/src/scanner.rs`
 - Modify: `tools/docs-parity/src/main.rs`
@@ -326,29 +326,29 @@ git commit -m "Enforce documentation source classification"
 
 **Files:**
 
-- Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
-- Modify as dependencies are introduced: `tools/docs-parity/Cargo.lock`
-- Modify: `tools/docs-parity/README.md`
-- Create: `tools/docs-parity/src/markdown.rs`
-- Modify: `tools/docs-parity/src/main.rs`
-- Modify: `tools/docs-parity/src/lib.rs`
-- Modify: `tools/docs-parity/src/model.rs`
-- Modify: `tools/docs-parity/src/repository.rs`
-- Create: `tools/docs-parity/manifests/pages.toml`
-- Create: `tools/docs-parity/manifests/diagrams.toml`
-- Create: `tools/docs-parity/manifests/orphans.toml`
-- Modify: `tools/docs-parity/manifests/tracked-files.toml`
-- Modify: `tools/docs-parity/manifests/maintained-sources.toml`
-- Create/Test: `tools/docs-parity/tests/markdown.rs`
-- Create/Test: `tools/docs-parity/tests/links.rs`
 - Modify for renderer-accurate public anchor: `docs/guide/error-reference.md`
-- Modify for exact verification/staging scope: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
 - Modify for package receipts: `docs/internal/audits/documentation-refresh-evidence.md`
-- Modify if scanner offsets change: `tools/docs-parity/manifests/sensitive-allowlist.toml`
+- Modify for exact verification/staging scope: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
+- Modify as dependencies are introduced: `tools/docs-parity/Cargo.lock`
+- Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
+- Modify: `tools/docs-parity/README.md`
+- Create: `tools/docs-parity/manifests/diagrams.toml`
+- Modify: `tools/docs-parity/manifests/maintained-sources.toml`
+- Create: `tools/docs-parity/manifests/orphans.toml`
+- Create: `tools/docs-parity/manifests/pages.toml`
+- Modify for scanner offsets: `tools/docs-parity/manifests/sensitive-allowlist.toml`
+- Modify: `tools/docs-parity/manifests/tracked-files.toml`
+- Modify: `tools/docs-parity/src/classification.rs`
+- Modify: `tools/docs-parity/src/lib.rs`
+- Create: `tools/docs-parity/src/markdown.rs`
+- Create/Test: `tools/docs-parity/tests/links.rs`
+- Create/Test: `tools/docs-parity/tests/markdown.rs`
 
 - [ ] **Step 1: Write generated-region failure tests**
 
-Cover duplicate/missing markers, unknown record names, hand-edited output, unstable ordering, update mode changing bytes outside markers, interrupted writes, and a second update producing a diff.
+Cover duplicate/missing markers, unknown record names, hand-edited output,
+unstable ordering, update mode changing bytes outside markers, interrupted
+writes, and a second update producing no diff.
 
 - [ ] **Step 2: Implement deterministic region updates**
 
@@ -391,15 +391,18 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
 git diff --quiet -- Cargo.lock
 git diff --check
+git diff --name-only 53a5a9e1d42d4dc78e4583d1b5d40ebdcc9c242a..HEAD
 ```
 
-Expected: focused tests and current local repository checks pass; external network checks remain scheduled/manual, not a required per-PR network gate.
+Expected: focused tests and current local repository checks pass; the final
+name-only output equals the Task 6 **Files** list exactly. External network
+checks remain scheduled/manual, not a required per-PR network gate.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/markdown.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/tests/markdown.rs tools/docs-parity/tests/links.rs docs/guide/error-reference.md docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/internal/audits/documentation-refresh-evidence.md
-git commit -m "Close Markdown transport review gaps"
+git add docs/guide/error-reference.md docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/Cargo.lock tools/docs-parity/Cargo.toml tools/docs-parity/README.md tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/classification.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/tests/links.rs tools/docs-parity/tests/markdown.rs
+git commit -m "Correct documentation link transport framing"
 ```
 
 ### Task 7: Extract settings semantics and execute the example harness

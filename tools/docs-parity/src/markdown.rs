@@ -2566,18 +2566,27 @@ impl<R: CommandRunner> ExternalTransport for CurlTransport<R> {
             request.timeout_seconds.to_string(),
             "--max-filesize".to_owned(),
             request.maximum_body_bytes.to_string(),
-            "--dump-header".to_owned(),
-            "-".to_owned(),
-            "--output".to_owned(),
-            "-".to_owned(),
-            "--write-out".to_owned(),
-            CURL_WRITE_OUT.to_owned(),
         ]
         .to_vec();
         if request.method == "HEAD" {
-            arguments.push("--head".to_owned());
+            arguments.extend([
+                "--output".to_owned(),
+                "-".to_owned(),
+                "--write-out".to_owned(),
+                CURL_WRITE_OUT.to_owned(),
+                "--head".to_owned(),
+            ]);
         } else {
-            arguments.extend(["--request".to_owned(), "GET".to_owned()]);
+            arguments.extend([
+                "--dump-header".to_owned(),
+                "-".to_owned(),
+                "--output".to_owned(),
+                "-".to_owned(),
+                "--write-out".to_owned(),
+                CURL_WRITE_OUT.to_owned(),
+                "--request".to_owned(),
+                "GET".to_owned(),
+            ]);
         }
         arguments.extend(["--url".to_owned(), request.url.clone()]);
         let maximum_output =

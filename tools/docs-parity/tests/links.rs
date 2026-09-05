@@ -619,6 +619,71 @@ struct FakeCommandRunner {
     invocations: Vec<(String, Vec<String>, usize)>,
 }
 
+struct FileHeadCommandRunner {
+    file_url: String,
+    observed_header_copies: usize,
+}
+
+impl CommandRunner for FileHeadCommandRunner {
+    fn run(
+        &mut self,
+        program: &str,
+        arguments: &[String],
+        maximum_output_bytes: usize,
+    ) -> Result<CommandOutput, String> {
+        if program != "curl"
+            || arguments.first().map(String::as_str) != Some("--disable")
+            || arguments.iter().any(|argument| argument == "--dump-header")
+            || !arguments.iter().any(|argument| argument == "--head")
+        {
+            return Err("HEAD command framing is not isolated and singular".to_owned());
+        }
+        let mut local = arguments.to_vec();
+        for option in ["--proto", "--proto-redir"] {
+            let index = local
+                .iter()
+                .position(|argument| argument == option)
+                .ok_or_else(|| format!("missing {option}"))?;
+            local[index + 1] = "=file".to_owned();
+        }
+        let url_index = local
+            .iter()
+            .position(|argument| argument == "--url")
+            .ok_or_else(|| "missing --url".to_owned())?;
+        local[url_index + 1] = self.file_url.clone();
+
+        let mut runner = ProcessCommandRunner;
+        let actual = runner.run("curl", &local, maximum_output_bytes)?;
+        let marker = b"\nDOCS_PARITY_COUNTS:";
+        let marker_start = actual
+            .stdout
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+            .ok_or_else(|| "file HEAD output has no count trailer".to_owned())?;
+        if actual.stdout.get(marker_start + marker.len()..) != Some(b"0:0\n") {
+            return Err("file HEAD output has unexpected write-out counts".to_owned());
+        }
+        let file_headers = &actual.stdout[..marker_start];
+        self.observed_header_copies = file_headers
+            .windows(b"Content-Length:".len())
+            .filter(|window| *window == b"Content-Length:")
+            .count();
+
+        let mut headers = b"HTTP/1.1 200 OK\r\n".to_vec();
+        headers.extend_from_slice(file_headers);
+        if !headers.ends_with(b"\r\n\r\n") {
+            headers.extend_from_slice(b"\r\n");
+        }
+        let mut stdout = headers.clone();
+        stdout.extend_from_slice(format!("\nDOCS_PARITY_COUNTS:{}:0\n", headers.len()).as_bytes());
+        Ok(CommandOutput {
+            success: actual.success,
+            status_code: actual.status_code,
+            stdout,
+        })
+    }
+}
+
 impl CommandRunner for FakeCommandRunner {
     fn run(
         &mut self,
@@ -849,7 +914,7 @@ fn external_checker_accepts_relative_redirects_and_rejects_final_errors() {
 }
 
 #[test]
-fn curl_transport_uses_exact_bounded_nonredirecting_arguments_and_counts_bytes() {
+fn curl_transport_get_uses_exact_bounded_nonredirecting_arguments_and_counts_bytes() {
     let runner = FakeCommandRunner {
         outputs: vec![Ok(curl_output(
             "200 OK",
@@ -907,6 +972,131 @@ fn curl_transport_uses_exact_bounded_nonredirecting_arguments_and_counts_bytes()
         ]
     );
     assert_eq!(*maximum_output_bytes, 64 * 1024 + 64 * 1024 + 128);
+}
+
+#[test]
+fn curl_transport_head_emits_headers_exactly_once() {
+    let runner = FakeCommandRunner {
+        outputs: vec![Ok(curl_output(
+            "204 No Content",
+            &[("Content-Length", "0")],
+            b"",
+        ))]
+        .into(),
+        invocations: Vec::new(),
+    };
+    let mut transport = CurlTransport::new(runner);
+    let request = ExternalRequest {
+        method: "HEAD".to_owned(),
+        url: "https://docs.example.com/path".to_owned(),
+        timeout_seconds: 15,
+        maximum_body_bytes: 64 * 1024,
+    };
+
+    let response = transport.send(&request).expect("HEAD output should parse");
+    let runner = transport.into_runner();
+
+    assert_eq!(response.status, 204);
+    assert_eq!(response.body_bytes, 0);
+    assert_eq!(
+        runner.invocations[0].1,
+        [
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            "65536",
+            "--output",
+            "-",
+            "--write-out",
+            "\nDOCS_PARITY_COUNTS:%{size_header}:%{size_download}\n",
+            "--head",
+            "--url",
+            "https://docs.example.com/path",
+        ]
+    );
+}
+
+#[test]
+fn curl_transport_parses_head_fallback_statuses_through_the_shared_state_machine() {
+    for unsupported in ["405 Method Not Allowed", "501 Not Implemented"] {
+        let runner = FakeCommandRunner {
+            outputs: vec![
+                Ok(curl_output(unsupported, &[], b"")),
+                Ok(curl_output("200 OK", &[], b"body")),
+            ]
+            .into(),
+            invocations: Vec::new(),
+        };
+        let mut transport = CurlTransport::new(runner);
+        let sources = [source(
+            "README.md",
+            LinkSourceSet::Repository,
+            "[site](https://docs.example.invalid/)\n",
+        )];
+        let mut sleeper = FakeSleeper::default();
+
+        check_external_links(&sources, &[], 0, &mut transport, &mut sleeper)
+            .expect("parsed unsupported HEAD should fall back to GET");
+        let runner = transport.into_runner();
+        assert!(
+            runner.invocations[0]
+                .1
+                .iter()
+                .any(|value| value == "--head")
+        );
+        assert!(
+            !runner.invocations[0]
+                .1
+                .iter()
+                .any(|value| value == "--dump-header")
+        );
+        assert!(runner.invocations[1].1.iter().any(|value| value == "GET"));
+        assert!(
+            runner.invocations[1]
+                .1
+                .iter()
+                .any(|value| value == "--dump-header")
+        );
+    }
+}
+
+#[test]
+fn actual_file_curl_head_uses_one_header_frame_and_the_production_parser_path() {
+    let directory = tempfile::tempdir().expect("should create file HEAD fixture");
+    let payload = directory.path().join("payload.bin");
+    fs::write(&payload, b"bounded local payload").expect("should write file HEAD payload");
+    let runner = FileHeadCommandRunner {
+        file_url: format!("file://{}", payload.display()),
+        observed_header_copies: 0,
+    };
+    let mut transport = CurlTransport::new(runner);
+    let request = ExternalRequest {
+        method: "HEAD".to_owned(),
+        url: "https://file-head.example.invalid/".to_owned(),
+        timeout_seconds: 15,
+        maximum_body_bytes: 64 * 1024,
+    };
+
+    let response = transport
+        .send(&request)
+        .expect("actual file HEAD framing should pass the production parser");
+    let runner = transport.into_runner();
+
+    assert_eq!(response.status, 200);
+    assert!(response.header_bytes > 0);
+    assert_eq!(response.body_bytes, 0);
+    assert_eq!(runner.observed_header_copies, 1);
 }
 
 #[test]

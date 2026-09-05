@@ -2531,6 +2531,22 @@ PY
   punctuation. Each fixture passed after its isolated correction. The curl
   isolation fixture uses a temporary `CURL_HOME`, a visible `.curlrc` control
   side effect, and a local file URL; it performs no network request.
+- The HEAD-framing re-review began with 37 passing and three failing link
+  fixtures. Exact HEAD arguments, parsed 405/501 fallback, and an actual local
+  file curl process all exposed the duplicated `--dump-header` plus `--head`
+  output shape. HEAD now omits `--dump-header`, while GET retains it. The local
+  process fixture rewrites only protocol and target inside its test command
+  runner, observes one emitted header copy, normalizes the file-protocol status
+  for the HTTP parser, and verifies the byte-count trailer and
+  `parse_curl_output` path without network access.
+- Task 6's Files list and staging command were reconciled against the sorted
+  union of `git diff --name-only BASE..HEAD` (with `BASE` equal to
+  `53a5a9e1d42d4dc78e4583d1b5d40ebdcc9c242a`) and the final framing worktree
+  diff. The resulting 17-path set is exact: it adds the changed
+  classification implementation and removes unchanged main, model, and
+  repository implementation files. A direct planned-versus-actual diff exited
+  0. The generated-region RED step now correctly requires the second update to
+  produce no diff.
 - Generated-region fixtures cover duplicate, missing, mismatched, nested,
   unknown, and non-standalone markers; unknown records; duplicate row keys;
   wrong cell counts; deterministic row sorting; hand drift; exact CRLF and
@@ -2583,15 +2599,17 @@ PY
   bounded headers and bodies, nonempty RFC field-name tokens, header
   count/name/value/line/total limits, and production stdout termination on
   overflow. The injected and production transports share the header validator
-  and enter the same
-  redirect/retry/final-status state machine. IMF-fixdate parsing requires the
+  and enter the same redirect/retry/final-status state machine. HEAD and GET
+  use method-specific output framing so headers are emitted exactly once;
+  parsed HEAD 405 and 501 responses enter the normal GET fallback. IMF-fixdate
+  parsing requires the
   exact grammar plus a calendar-consistent weekday. The production curl
   transport is reachable only through explicit
   `links --external --check`; no external network check was run or represented
   as a pull-request gate.
-- The final focused links target contains 37 passing tests. A fresh standalone
-  full suite contained 174 passing tests: 2 library unit, 35 classification,
-  19 CLI, 37 links, 10 Markdown, and 71 scanner tests. Fresh local
+- The final focused links target contains 40 passing tests. A fresh standalone
+  full suite contained 177 passing tests: 2 library unit, 35 classification,
+  19 CLI, 40 links, 10 Markdown, and 71 scanner tests. Fresh local
   `links --local --check`, `generate --check`, `classify --check`, and
   `scan --check` commands exited 0. Formatting and all-target clippy with
   warnings denied also exited 0.
