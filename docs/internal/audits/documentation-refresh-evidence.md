@@ -2880,22 +2880,29 @@ PY
   `8d12168733c63ecce2566f3267fde5741155a87cf767b8415fc845d496bbf3ca`.
   Root `Cargo.lock` remained byte-identical at
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
-  The Task 7 Files list and original staging command remain exact for its
-  21-path diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`,
-  including the scanner class/test required by the new manifest vocabulary
-  and the process-fixture synchronization required by the repeated default
-  suite, while excluding all unchanged files: the five checked core sources;
-  the checked source template; this evidence file and the execution plan; the
-  standalone manifest, lockfile, and README; the tracked, maintained,
-  sensitive, and settings-companion manifests; the standalone library,
-  Markdown, scanner, and settings implementations; and the scanner and
-  settings integration-test files. The review correction is exactly the 10
-  paths in Task 7 Step 8: four core sources, this evidence file and the plan,
-  the sensitive and settings-companion manifests, and the standalone settings
-  implementation and test. The second correction is exactly the seven paths
-  in Task 7 Step 9: the source-derived profile harness and template, this
-  evidence file and the plan, the sensitive manifest, and the standalone
-  settings implementation and test.
+  The current Task 7 Files list is exact for the final 21-path diff from
+  `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`, including the scanner
+  class/test required by the new manifest vocabulary and the process-fixture
+  synchronization required by the repeated default suite, while excluding
+  all unchanged files: the five checked core sources; the checked source
+  template; this evidence file and the execution plan; the standalone
+  manifest, lockfile, and README; the tracked, maintained, sensitive, and
+  settings-companion manifests; the standalone library, Markdown, scanner,
+  and settings implementations; and the scanner and settings integration-test
+  files. The historical Step 7 staging command contains exactly 20 paths and
+  omits `trusted-server.example.toml`; adding the Step 8 staging command does
+  not change that 20-path union. Step 8 itself is the exact 10-path first
+  correction: four core sources, this evidence file and the plan, the
+  sensitive and settings-companion manifests, and the standalone settings
+  implementation and test. The `cc6be34f96cdc9e88031bd0908cb7ffc206a1347..c5afbf9e4e3a5a41516c47503760ad82def43765`
+  second correction is exactly the seven paths in Step 9: the source-derived
+  profile harness and template, this evidence file and the plan, the sensitive
+  manifest, and the standalone settings implementation and test. Mechanical
+  set comparison reports 20 Step 7 paths, seven paths in that second
+  correction, 21 paths in the aggregate Task 7 diff, and 21 paths in the union
+  of the Step 7, Step 8, and Step 9 staging commands; every pairwise set
+  difference between the final aggregate and that union is empty. Step 10 is
+  the two-path governance-only correction to this evidence and the plan.
 
 #### Task 8 — Check integration capabilities and adapter routes
 

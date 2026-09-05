@@ -543,9 +543,11 @@ git add crates/trusted-server-core/src/config.rs crates/trusted-server-core/src/
 git commit -m "Close settings semantics review gaps"
 ```
 
-Expected: the correction diff contains exactly these 10 paths, the complete
-Task 7 diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c` remains the exact
-20-path **Files** set above, and Task 8 has not started.
+Expected: this historical correction diff contains exactly these 10 paths.
+The Step 7 staging command contains 20 paths, and the historical union of the
+Step 7 and Step 8 staging commands is the same 20-path set. Both exclude
+`trusted-server.example.toml`, which was added later in Step 9; this historical
+set is not the current 21-path **Files** set above. Task 8 has not started.
 
 - [x] **Step 9: Close the Task 7 extractor review**
 
@@ -558,6 +560,17 @@ Expected: the second correction diff contains exactly these seven paths. The
 complete Task 7 diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`
 contains the exact 21-path **Files** set above, including the newly checked
 source-template profile block, and Task 8 has not started.
+
+- [x] **Step 10: Correct the Task 7 staging evidence**
+
+```bash
+git add docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md
+git commit -m "Correct Task 7 staging evidence"
+```
+
+Expected: this governance-only correction contains exactly these two paths.
+The union of the Step 7, Step 8, and Step 9 staging commands remains equal to
+the final 21-path Task 7 diff, and Task 8 has not started.
 
 ### Task 8: Check integration capabilities and adapter routes
 
