@@ -7,7 +7,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use error_stack::{Report, ResultExt as _};
+use github_slugger::Slugger as GithubSlugger;
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use scraper::{Html, Selector};
 use serde::Deserialize;
+use unicode_normalization::UnicodeNormalization as _;
 use url::Url;
 
 use crate::repository::{NormalizedRelativePath, Repository};
@@ -16,6 +20,14 @@ const MAXIMUM_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAXIMUM_LINK_BYTES: usize = 8 * 1024;
 const MAXIMUM_REDIRECTS: usize = 5;
 const MAXIMUM_RETRY_ATTEMPTS: usize = 3;
+const MAXIMUM_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+const MAXIMUM_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+const MAXIMUM_RESPONSE_HEADERS: usize = 128;
+const MAXIMUM_HEADER_NAME_BYTES: usize = 256;
+const MAXIMUM_HEADER_VALUE_BYTES: usize = 8 * 1024;
+const MAXIMUM_HEADER_LINE_BYTES: usize = 8 * 1024;
+const CURL_TRAILER_BYTES: usize = 128;
+const CURL_WRITE_OUT: &str = "\nDOCS_PARITY_COUNTS:%{size_header}:%{size_download}\n";
 const PAGES_MANIFEST: &str = "tools/docs-parity/manifests/pages.toml";
 const ORPHANS_MANIFEST: &str = "tools/docs-parity/manifests/orphans.toml";
 const DIAGRAMS_MANIFEST: &str = "tools/docs-parity/manifests/diagrams.toml";
@@ -70,11 +82,17 @@ struct PagesManifest {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PageRecord {
-    path: String,
-    route: String,
-    navigation: bool,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PageRecord {
+    Live {
+        path: String,
+        route: String,
+        navigation: bool,
+    },
+    Tombstone {
+        route: String,
+        replacement: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +190,11 @@ fn read_pages_manifest(repository: &Repository) -> Result<PagesManifest, Report<
             detail: "cannot read pages manifest".to_owned(),
         })?
         .ok_or_else(|| generated_error("pages manifest is missing"))?;
+    if bytes.len() > MAXIMUM_DOCUMENT_BYTES {
+        return Err(generated_error(format!(
+            "pages manifest exceeds {MAXIMUM_DOCUMENT_BYTES} bytes"
+        )));
+    }
     let text = core::str::from_utf8(&bytes)
         .map_err(|_error| generated_error("pages manifest is not valid UTF-8"))?;
     let manifest: PagesManifest = toml::from_str(text)
@@ -410,6 +433,11 @@ pub fn render_generated_document(
             .ok_or_else(|| generated_error(format!("unknown generated region: {}", span.name)))?;
         let body = render_table(region, span.newline)?;
         rendered.splice(span.content_start..span.content_end, body.bytes());
+        if rendered.len() > MAXIMUM_DOCUMENT_BYTES {
+            return Err(generated_error(format!(
+                "rendered document exceeds {MAXIMUM_DOCUMENT_BYTES} bytes"
+            )));
+        }
     }
     Ok(rendered)
 }
@@ -660,7 +688,16 @@ pub struct LinkSource {
 #[derive(Clone, Debug)]
 struct ParsedMarkdown {
     anchors: BTreeSet<String>,
-    links: Vec<String>,
+    heading_anchors: BTreeSet<String>,
+    links: Vec<ParsedLink>,
+    mermaid_selectors: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedLink {
+    destination: String,
+    start: usize,
+    end: usize,
 }
 
 struct LinkIndex<'a> {
@@ -721,7 +758,7 @@ fn check_local_links_with_known(
                 source.path
             )));
         }
-        let parsed = parse_markdown(&source.path, &source.markdown)?;
+        let parsed = parse_markdown(&source.path, source.set, &source.markdown)?;
         parsed_by_path.insert(source.path.clone(), parsed);
         if source.set == LinkSourceSet::Public {
             let route = public_route(&source.path)?;
@@ -775,13 +812,14 @@ fn check_local_links_with_known(
 
 fn check_local_destination(
     source: &LinkSource,
-    destination: &str,
+    link: &ParsedLink,
     index: &LinkIndex<'_>,
 ) -> Result<(), Report<MarkdownError>> {
+    let destination = link.destination.as_str();
     if destination.len() > MAXIMUM_LINK_BYTES {
         return Err(local_error(format!(
-            "{} has an oversized destination",
-            source.path
+            "{} has an oversized destination at bytes {}-{}",
+            source.path, link.start, link.end
         )));
     }
     if destination
@@ -820,6 +858,14 @@ fn check_local_destination(
     } else if path.starts_with('/') {
         if source.set == LinkSourceSet::Public {
             let route = normalize_route(&path)?;
+            if let Some(excluded) =
+                excluded_public_target(&path, &route, index.known_excluded_paths)
+            {
+                return Err(local_error(format!(
+                    "{} links to excluded source {excluded}",
+                    source.path
+                )));
+            }
             if index.tombstones.contains(&route) {
                 return Err(local_error(format!(
                     "{} links to tombstone route {route}",
@@ -870,6 +916,11 @@ fn check_local_destination(
                 .then(|| public_route(&target))
                 .transpose()?;
             (target, route)
+        } else if index.known_excluded_paths.contains(&target) {
+            return Err(local_error(format!(
+                "{} links to excluded source {target}",
+                source.path
+            )));
         } else if index.known_paths.contains(&target) {
             if fragment.is_some() {
                 return Err(local_error(format!(
@@ -970,478 +1021,433 @@ fn validate_target_anchor(
     Ok(())
 }
 
-fn parse_markdown(path: &str, markdown: &str) -> Result<ParsedMarkdown, Report<MarkdownError>> {
+fn parse_markdown(
+    path: &str,
+    set: LinkSourceSet,
+    markdown: &str,
+) -> Result<ParsedMarkdown, Report<MarkdownError>> {
+    let mut options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+    if set == LinkSourceSet::Public {
+        options |= Options::ENABLE_HEADING_ATTRIBUTES;
+    }
+    let parser = Parser::new_ext(markdown, options).into_offset_iter();
     let mut anchors = BTreeSet::new();
+    let mut heading_anchors = BTreeSet::new();
     let mut links = Vec::new();
-    let mut references = BTreeMap::new();
-    let mut slug_counts = BTreeMap::<String, usize>::new();
-    let mut in_fence: Option<(char, usize)> = None;
-    let mut setext_candidate: Option<&str> = None;
-    let lines = markdown.split_inclusive('\n').collect::<Vec<_>>();
+    let mut mermaid_selectors = Vec::new();
+    let mut heading: Option<HeadingState> = None;
+    let mut slugs = HeadingSlugs::new(set);
+    let mut fence: Option<FenceState> = None;
 
-    for raw_line in &lines {
-        let line = raw_line
-            .strip_suffix('\n')
-            .unwrap_or(raw_line)
-            .strip_suffix('\r')
-            .unwrap_or_else(|| raw_line.strip_suffix('\n').unwrap_or(raw_line));
-        if let Some((character, count)) = fence_marker(line) {
-            match in_fence {
-                Some((open_character, open_count))
-                    if character == open_character && count >= open_count =>
-                {
-                    in_fence = None;
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::Heading {
+                id, classes, attrs, ..
+            }) => {
+                if heading.is_some() {
+                    return Err(local_error(format!("{path} has nested headings")));
                 }
-                None => in_fence = Some((character, count)),
-                _ => {}
-            }
-            continue;
-        }
-        if in_fence.is_some() {
-            continue;
-        }
-        if is_setext_underline(line)
-            && let Some(heading) = setext_candidate.take()
-        {
-            insert_heading_anchor(path, heading, &mut slug_counts, &mut anchors)?;
-            continue;
-        }
-        if let Some(heading) = heading_text(line) {
-            insert_heading_anchor(path, heading, &mut slug_counts, &mut anchors)?;
-            setext_candidate = None;
-        } else if setext_candidate_text(line) {
-            setext_candidate = Some(line.trim());
-        } else {
-            setext_candidate = None;
-        }
-        if let Some((label, destination)) = reference_definition(line) {
-            let normalized = normalize_reference(label);
-            if references.insert(normalized.clone(), destination).is_some() {
-                return Err(local_error(format!(
-                    "{path} has duplicate reference definition {normalized}"
-                )));
-            }
-        }
-    }
-
-    in_fence = None;
-    for raw_line in lines {
-        let line = raw_line
-            .strip_suffix('\n')
-            .unwrap_or(raw_line)
-            .strip_suffix('\r')
-            .unwrap_or_else(|| raw_line.strip_suffix('\n').unwrap_or(raw_line));
-        if let Some((character, count)) = fence_marker(line) {
-            match in_fence {
-                Some((open_character, open_count))
-                    if character == open_character && count >= open_count =>
-                {
-                    in_fence = None;
+                if set == LinkSourceSet::Public && (!classes.is_empty() || !attrs.is_empty()) {
+                    return Err(local_error(format!(
+                        "{path} has an invalid explicit heading id or unsupported heading attributes"
+                    )));
                 }
-                None => in_fence = Some((character, count)),
-                _ => {}
-            }
-            continue;
-        }
-        if in_fence.is_none() {
-            parse_inline(path, line, &references, &mut anchors, &mut links)?;
-        }
-    }
-    Ok(ParsedMarkdown { anchors, links })
-}
-
-fn insert_heading_anchor(
-    path: &str,
-    heading: &str,
-    slug_counts: &mut BTreeMap<String, usize>,
-    anchors: &mut BTreeSet<String>,
-) -> Result<(), Report<MarkdownError>> {
-    let (heading, explicit) = explicit_heading_id(heading);
-    let base = explicit.unwrap_or_else(|| slugify(heading));
-    if base.is_empty() {
-        return Err(local_error(format!("{path} has an empty heading anchor")));
-    }
-    let count = slug_counts.entry(base.clone()).or_default();
-    let slug = if *count == 0 {
-        base.clone()
-    } else {
-        format!("{base}-{count}")
-    };
-    *count += 1;
-    anchors.insert(slug);
-    Ok(())
-}
-
-fn is_setext_underline(line: &str) -> bool {
-    let trimmed = line.trim_start_matches(' ').trim_end();
-    let indentation = line.len() - line.trim_start_matches(' ').len();
-    indentation <= 3
-        && !trimmed.is_empty()
-        && (trimmed.bytes().all(|byte| byte == b'=') || trimmed.bytes().all(|byte| byte == b'-'))
-}
-
-fn setext_candidate_text(line: &str) -> bool {
-    let trimmed = line.trim();
-    !trimmed.is_empty()
-        && !trimmed.starts_with(['#', '>', '-', '+', '*', '[', '<'])
-        && !trimmed.starts_with("```")
-        && !trimmed.starts_with("~~~")
-}
-
-fn fence_marker(line: &str) -> Option<(char, usize)> {
-    let trimmed = line.strip_prefix("   ").unwrap_or_else(|| {
-        line.strip_prefix("  ")
-            .or_else(|| line.strip_prefix(' '))
-            .unwrap_or(line)
-    });
-    let character = trimmed.chars().next()?;
-    if !matches!(character, '`' | '~') {
-        return None;
-    }
-    let count = trimmed
-        .chars()
-        .take_while(|value| *value == character)
-        .count();
-    (count >= 3).then_some((character, count))
-}
-
-fn heading_text(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start_matches(' ');
-    if line.len() - trimmed.len() > 3 {
-        return None;
-    }
-    let count = trimmed.bytes().take_while(|byte| *byte == b'#').count();
-    if !(1..=6).contains(&count) || trimmed.as_bytes().get(count) != Some(&b' ') {
-        return None;
-    }
-    Some(trimmed[count + 1..].trim_end_matches('#').trim())
-}
-
-fn explicit_heading_id(heading: &str) -> (&str, Option<String>) {
-    let Some(prefix) = heading.strip_suffix('}') else {
-        return (heading, None);
-    };
-    let Some(index) = prefix.rfind(" {#") else {
-        return (heading, None);
-    };
-    let identifier = &prefix[index + 3..];
-    if identifier.is_empty() {
-        return (heading, None);
-    }
-    (prefix[..index].trim_end(), Some(identifier.to_owned()))
-}
-
-fn slugify(value: &str) -> String {
-    let mut output = String::new();
-    let mut previous_input_was_whitespace = false;
-    for character in value.chars() {
-        if character == '`' {
-            previous_input_was_whitespace = false;
-            continue;
-        }
-        if character.is_alphanumeric() || character == '_' {
-            for lowercase in character.to_lowercase() {
-                output.push(lowercase);
-            }
-            previous_input_was_whitespace = false;
-        } else if character.is_whitespace() {
-            if !output.is_empty() && !previous_input_was_whitespace {
-                output.push('-');
-            }
-            previous_input_was_whitespace = true;
-        } else if character == '-' {
-            output.push('-');
-            previous_input_was_whitespace = false;
-        } else {
-            previous_input_was_whitespace = false;
-        }
-    }
-    output.trim_matches('-').to_owned()
-}
-
-fn reference_definition(line: &str) -> Option<(&str, String)> {
-    let trimmed = line.trim_start_matches(' ');
-    if line.len() - trimmed.len() > 3 || !trimmed.starts_with('[') {
-        return None;
-    }
-    let close = find_unescaped(trimmed, 1, ']')?;
-    if trimmed.as_bytes().get(close + 1) != Some(&b':') {
-        return None;
-    }
-    let destination = parse_destination(trimmed[close + 2..].trim_start())?;
-    Some((&trimmed[1..close], destination))
-}
-
-fn normalize_reference(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-fn parse_inline(
-    path: &str,
-    line: &str,
-    references: &BTreeMap<String, String>,
-    anchors: &mut BTreeSet<String>,
-    links: &mut Vec<String>,
-) -> Result<(), Report<MarkdownError>> {
-    let bytes = line.as_bytes();
-    let mut index = 0;
-    let mut code_delimiter = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[index] == b'`' {
-            let count = bytes[index..]
-                .iter()
-                .take_while(|byte| **byte == b'`')
-                .count();
-            if code_delimiter == 0 {
-                code_delimiter = count;
-            } else if code_delimiter == count {
-                code_delimiter = 0;
-            }
-            index += count;
-            continue;
-        }
-        if code_delimiter != 0 {
-            index += 1;
-            continue;
-        }
-        let open = if bytes[index] == b'[' {
-            Some(index)
-        } else if bytes[index] == b'!' && bytes.get(index + 1) == Some(&b'[') {
-            Some(index + 1)
-        } else {
-            None
-        };
-        if let Some(open) = open
-            && let Some(close) = find_unescaped(line, open + 1, ']')
-        {
-            let label = &line[open + 1..close];
-            if bytes.get(close + 1) == Some(&b'(') {
-                let end = find_balanced_parenthesis(line, close + 1).ok_or_else(|| {
-                    local_error(format!("{path} has an unclosed link destination"))
-                })?;
-                let destination = parse_destination(&line[close + 2..end])
-                    .ok_or_else(|| local_error(format!("{path} has an empty link destination")))?;
-                links.push(destination);
-                index = end + 1;
-                continue;
-            }
-            if bytes.get(close + 1) == Some(&b'[') {
-                let reference_end = find_unescaped(line, close + 2, ']')
-                    .ok_or_else(|| local_error(format!("{path} has an unclosed link reference")))?;
-                let reference = &line[close + 2..reference_end];
-                let key = normalize_reference(if reference.is_empty() {
-                    label
-                } else {
-                    reference
+                heading = Some(HeadingState {
+                    text: String::new(),
+                    explicit_id: id.map(pulldown_cmark::CowStr::into_string),
                 });
-                let destination = references.get(&key).ok_or_else(|| {
-                    local_error(format!("{path} has missing link reference {key}"))
-                })?;
-                links.push(destination.clone());
-                index = reference_end + 1;
-                continue;
             }
-            let key = normalize_reference(label);
-            if let Some(destination) = references.get(&key) {
-                links.push(destination.clone());
-                index = close + 1;
-                continue;
+            Event::End(TagEnd::Heading(_level)) => {
+                let current = heading
+                    .take()
+                    .ok_or_else(|| local_error(format!("{path} closes an unopened heading")))?;
+                let slug = slugs.slug(path, &current.text, current.explicit_id.as_deref())?;
+                anchors.insert(slug.clone());
+                heading_anchors.insert(slug);
             }
-        }
-        if bytes[index] == b'<'
-            && let Some(end_offset) = line[index + 1..].find('>')
-        {
-            let end = index + 1 + end_offset;
-            let inner = &line[index + 1..end];
-            if inner.starts_with("https://") || inner.starts_with("http://") {
-                links.push(inner.to_owned());
-            } else if inner.starts_with('a') || inner.starts_with("/a") {
-                parse_anchor_tag(path, inner, anchors, links)?;
+            Event::Text(value) | Event::Code(value) if heading.is_some() => {
+                heading
+                    .as_mut()
+                    .expect("heading should be present")
+                    .text
+                    .push_str(&value);
             }
-            index = end + 1;
-            continue;
-        }
-        index += 1;
-    }
-    Ok(())
-}
-
-fn parse_anchor_tag(
-    path: &str,
-    tag: &str,
-    anchors: &mut BTreeSet<String>,
-    links: &mut Vec<String>,
-) -> Result<(), Report<MarkdownError>> {
-    if tag.starts_with("/a") {
-        return Ok(());
-    }
-    let mut index = 1;
-    while index < tag.len() {
-        while tag
-            .as_bytes()
-            .get(index)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            index += 1;
-        }
-        if index >= tag.len() || tag.as_bytes()[index] == b'/' {
-            break;
-        }
-        let name_start = index;
-        while tag
-            .as_bytes()
-            .get(index)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b':'))
-        {
-            index += 1;
-        }
-        if name_start == index {
-            return Err(local_error(format!("{path} has malformed anchor HTML")));
-        }
-        let name = tag[name_start..index].to_ascii_lowercase();
-        while tag
-            .as_bytes()
-            .get(index)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            index += 1;
-        }
-        if tag.as_bytes().get(index) != Some(&b'=') {
-            continue;
-        }
-        index += 1;
-        while tag
-            .as_bytes()
-            .get(index)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            index += 1;
-        }
-        let quote = *tag
-            .as_bytes()
-            .get(index)
-            .ok_or_else(|| local_error(format!("{path} has missing HTML attribute value")))?;
-        if !matches!(quote, b'\'' | b'"') {
-            return Err(local_error(format!(
-                "{path} has an unquoted HTML attribute"
-            )));
-        }
-        index += 1;
-        let value_start = index;
-        while tag.as_bytes().get(index).is_some_and(|byte| *byte != quote) {
-            index += 1;
-        }
-        if index >= tag.len() {
-            return Err(local_error(format!(
-                "{path} has an unclosed HTML attribute"
-            )));
-        }
-        let value = &tag[value_start..index];
-        index += 1;
-        match name.as_str() {
-            "id" | "name" if !value.is_empty() => {
-                anchors.insert(value.to_owned());
+            Event::SoftBreak | Event::HardBreak if heading.is_some() => {
+                heading
+                    .as_mut()
+                    .expect("heading should be present")
+                    .text
+                    .push(' ');
             }
-            "href" => links.push(value.to_owned()),
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn find_unescaped(value: &str, start: usize, needle: char) -> Option<usize> {
-    let bytes = value.as_bytes();
-    let needle = needle as u8;
-    let mut index = start;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            index += 2;
-        } else if bytes[index] == needle {
-            return Some(index);
-        } else {
-            index += 1;
-        }
-    }
-    None
-}
-
-fn find_balanced_parenthesis(value: &str, open: usize) -> Option<usize> {
-    let bytes = value.as_bytes();
-    let mut depth = 0;
-    let mut index = open;
-    let mut angle = false;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => index += 2,
-            b'<' if depth == 1 => {
-                angle = true;
-                index += 1;
+            Event::Start(Tag::Link { dest_url, .. })
+            | Event::Start(Tag::Image { dest_url, .. }) => {
+                links.push(ParsedLink {
+                    destination: dest_url.into_string(),
+                    start: range.start,
+                    end: range.end,
+                });
             }
-            b'>' if angle => {
-                angle = false;
-                index += 1;
+            Event::Html(value) | Event::InlineHtml(value) => {
+                parse_html_fragment(
+                    path,
+                    &value,
+                    range.start,
+                    range.end,
+                    &mut anchors,
+                    &mut links,
+                )?;
             }
-            b'(' if !angle => {
-                depth += 1;
-                index += 1;
-            }
-            b')' if !angle => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+                let opening = parse_opening_fence(path, markdown, range.start, &info)?;
+                if opening.mermaid {
+                    mermaid_selectors.push(format!("mermaid:{}", mermaid_selectors.len() + 1));
                 }
-                index += 1;
+                fence = Some(opening);
             }
-            _ => index += 1,
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) => {
+                fence = None;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(opening) = fence.take() {
+                    validate_closing_fence(path, markdown, &opening, range.start, range.end)?;
+                }
+            }
+            Event::Text(_)
+            | Event::Code(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+            | Event::Rule
+            | Event::TaskListMarker(_)
+            | Event::FootnoteReference(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::Start(_)
+            | Event::End(_) => {}
         }
     }
-    None
+    if heading.is_some() || fence.is_some() {
+        return Err(local_error(format!(
+            "{path} has an unterminated semantic block"
+        )));
+    }
+    Ok(ParsedMarkdown {
+        anchors,
+        heading_anchors,
+        links,
+        mermaid_selectors,
+    })
 }
 
-fn parse_destination(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if let Some(inner) = trimmed.strip_prefix('<') {
-        return inner.find('>').map(|end| unescape_markdown(&inner[..end]));
-    }
-    let mut output = String::new();
-    let mut escaped = false;
-    for character in trimmed.chars() {
-        if escaped {
-            output.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character.is_whitespace() {
-            break;
-        } else {
-            output.push(character);
-        }
-    }
-    (!output.is_empty()).then_some(output)
+struct HeadingState {
+    text: String,
+    explicit_id: Option<String>,
 }
 
-fn unescape_markdown(value: &str) -> String {
-    let mut output = String::new();
-    let mut escaped = false;
-    for character in value.chars() {
-        if escaped {
-            output.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
+enum HeadingSlugs {
+    Vitepress(UniqueSlugs),
+    Github(GithubSlugger),
+}
+
+impl HeadingSlugs {
+    fn new(set: LinkSourceSet) -> Self {
+        if set == LinkSourceSet::Public {
+            Self::Vitepress(UniqueSlugs::default())
         } else {
-            output.push(character);
+            Self::Github(GithubSlugger::default())
         }
+    }
+
+    fn slug(
+        &mut self,
+        path: &str,
+        heading: &str,
+        explicit_id: Option<&str>,
+    ) -> Result<String, Report<MarkdownError>> {
+        let slug = match self {
+            Self::Vitepress(seen) => {
+                let base = if let Some(identifier) = explicit_id {
+                    validate_explicit_heading_id(path, identifier)?;
+                    identifier.to_owned()
+                } else {
+                    if heading.contains("{#") {
+                        return Err(local_error(format!(
+                            "{path} has an invalid explicit heading id"
+                        )));
+                    }
+                    vitepress_slugify(heading)
+                };
+                seen.unique(&base)
+            }
+            Self::Github(slugger) => slugger.slug(heading),
+        };
+        if slug.is_empty() {
+            return Err(local_error(format!("{path} has an empty heading anchor")));
+        }
+        Ok(slug)
+    }
+}
+
+#[derive(Default)]
+struct UniqueSlugs {
+    seen: BTreeSet<String>,
+}
+
+impl UniqueSlugs {
+    fn unique(&mut self, base: &str) -> String {
+        let mut candidate = base.to_owned();
+        let mut suffix = 1;
+        while self.seen.contains(&candidate) {
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        self.seen.insert(candidate.clone());
+        candidate
+    }
+}
+
+fn validate_explicit_heading_id(path: &str, identifier: &str) -> Result<(), Report<MarkdownError>> {
+    if identifier.is_empty()
+        || identifier.len() > 128
+        || identifier.chars().any(|character| {
+            !(character.is_alphanumeric() || matches!(character, '-' | '_' | ':' | '.'))
+        })
+    {
+        return Err(local_error(format!(
+            "{path} has an invalid explicit heading id"
+        )));
+    }
+    Ok(())
+}
+
+fn vitepress_slugify(value: &str) -> String {
+    let mut output = String::new();
+    let mut pending_separator = false;
+    for character in value.nfkd() {
+        if ('\u{0300}'..='\u{036f}').contains(&character)
+            || ('\u{0000}'..='\u{001f}').contains(&character)
+        {
+            continue;
+        }
+        if vitepress_special(character) {
+            pending_separator = !output.is_empty();
+            continue;
+        }
+        if pending_separator {
+            output.push('-');
+            pending_separator = false;
+        }
+        for lowercase in character.to_lowercase() {
+            output.push(lowercase);
+        }
+    }
+    while output.ends_with('-') {
+        output.pop();
+    }
+    if output.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        output.insert(0, '_');
     }
     output
+}
+
+fn vitepress_special(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '~' | '`'
+                | '!'
+                | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '^'
+                | '&'
+                | '*'
+                | '('
+                | ')'
+                | '-'
+                | '_'
+                | '+'
+                | '='
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '\\'
+                | ';'
+                | ':'
+                | '"'
+                | '\''
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '<'
+                | '>'
+                | ','
+                | '.'
+                | '?'
+                | '/'
+        )
+}
+
+fn parse_html_fragment(
+    path: &str,
+    raw: &str,
+    start: usize,
+    end: usize,
+    anchors: &mut BTreeSet<String>,
+    links: &mut Vec<ParsedLink>,
+) -> Result<(), Report<MarkdownError>> {
+    if raw.len() > MAXIMUM_LINK_BYTES || raw.chars().any(|character| character == '\0') {
+        return Err(local_error(format!(
+            "{path} has an oversized or unsafe HTML fragment at bytes {start}-{end}"
+        )));
+    }
+    let document = Html::parse_fragment(raw);
+    let selector =
+        Selector::parse("*").map_err(|_error| local_error("internal HTML selector is invalid"))?;
+    for element in document.select(&selector) {
+        for name in ["id", "name"] {
+            if let Some(value) = element.value().attr(name)
+                && !value.is_empty()
+            {
+                anchors.insert(value.to_owned());
+            }
+        }
+        if let Some(destination) = element.value().attr("href") {
+            links.push(ParsedLink {
+                destination: destination.to_owned(),
+                start,
+                end,
+            });
+        }
+    }
+    Ok(())
+}
+
+struct FenceState {
+    character: u8,
+    count: usize,
+    mermaid: bool,
+}
+
+fn parse_opening_fence(
+    path: &str,
+    markdown: &str,
+    start: usize,
+    info: &str,
+) -> Result<FenceState, Report<MarkdownError>> {
+    let line = markdown[start..]
+        .lines()
+        .next()
+        .ok_or_else(|| local_error(format!("{path} has an empty fenced block")))?;
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return Err(local_error(format!("{path} has an invalid fenced block")));
+    }
+    let character = *trimmed
+        .as_bytes()
+        .first()
+        .ok_or_else(|| local_error(format!("{path} has an empty fence")))?;
+    let count = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == character)
+        .count();
+    if !matches!(character, b'`' | b'~') || count < 3 {
+        return Err(local_error(format!("{path} has an invalid opening fence")));
+    }
+    let mermaid = validate_mermaid_info(path, info)?;
+    Ok(FenceState {
+        character,
+        count,
+        mermaid,
+    })
+}
+
+fn validate_mermaid_info(path: &str, info: &str) -> Result<bool, Report<MarkdownError>> {
+    let trimmed = info.trim();
+    let first = trimmed.split_whitespace().next().unwrap_or_default();
+    if first != "mermaid" {
+        if first.starts_with("mermaid") {
+            return Err(local_error(format!(
+                "{path} has invalid mermaid fence info: {trimmed}"
+            )));
+        }
+        return Ok(false);
+    }
+    let remainder = trimmed[first.len()..].trim();
+    let valid = remainder.is_empty()
+        || (remainder.starts_with('{')
+            && remainder.ends_with('}')
+            && valid_mermaid_attributes(&remainder[1..remainder.len() - 1]));
+    if !valid {
+        return Err(local_error(format!(
+            "{path} has invalid mermaid fence attributes: {remainder}"
+        )));
+    }
+    Ok(true)
+}
+
+fn valid_mermaid_attributes(attributes: &str) -> bool {
+    let mut found = false;
+    for attribute in attributes.split_ascii_whitespace() {
+        found = true;
+        let valid_identifier = |value: &str| {
+            !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ':' | '.')
+                })
+        };
+        let valid = attribute
+            .strip_prefix('#')
+            .or_else(|| attribute.strip_prefix('.'))
+            .is_some_and(valid_identifier)
+            || attribute
+                .split_once('=')
+                .is_some_and(|(name, value)| valid_identifier(name) && valid_identifier(value));
+        if !valid {
+            return false;
+        }
+    }
+    found
+}
+
+fn validate_closing_fence(
+    path: &str,
+    markdown: &str,
+    opening: &FenceState,
+    start: usize,
+    end: usize,
+) -> Result<(), Report<MarkdownError>> {
+    let raw = markdown
+        .get(start..end)
+        .ok_or_else(|| local_error(format!("{path} has invalid fence offsets")))?;
+    let line = raw
+        .trim_end_matches(['\r', '\n'])
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_start_matches(' ');
+    let count = line
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == opening.character)
+        .count();
+    if count < opening.count
+        || line[count..]
+            .chars()
+            .any(|character| !character.is_ascii_whitespace())
+    {
+        return Err(local_error(format!(
+            "{path} has a mismatched or unterminated fenced block at bytes {start}-{end}: {raw:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn strict_percent_decode(value: &str, source: &str) -> Result<String, Report<MarkdownError>> {
@@ -1471,6 +1477,20 @@ fn strict_percent_decode(value: &str, source: &str) -> Result<String, Report<Mar
     }
     String::from_utf8(decoded)
         .map_err(|_error| local_error(format!("{source} percent-decodes to invalid UTF-8")))
+        .and_then(|decoded| {
+            let bytes = decoded.as_bytes();
+            if bytes.windows(3).any(|window| {
+                window[0] == b'%'
+                    && hexadecimal(window[1]).is_some()
+                    && hexadecimal(window[2]).is_some()
+            }) {
+                Err(local_error(format!(
+                    "{source} has residual percent encoding after one decode"
+                )))
+            } else {
+                Ok(decoded)
+            }
+        })
 }
 
 const fn hexadecimal(value: u8) -> Option<u8> {
@@ -1597,6 +1617,23 @@ fn route_for_relative_target(path: &str) -> Result<String, Report<MarkdownError>
     }
 }
 
+fn excluded_public_target<'a>(
+    raw_path: &str,
+    route: &str,
+    excluded_paths: &'a BTreeSet<String>,
+) -> Option<&'a str> {
+    let repository_path = raw_path.trim_start_matches('/');
+    excluded_paths.iter().find_map(|path| {
+        if path == repository_path
+            || public_route(path).is_ok_and(|excluded_route| excluded_route == route)
+        {
+            Some(path.as_str())
+        } else {
+            None
+        }
+    })
+}
+
 fn local_error(detail: impl Into<String>) -> Report<MarkdownError> {
     Report::new(MarkdownError::LocalLink {
         detail: detail.into(),
@@ -1617,9 +1654,7 @@ pub(crate) fn check_local_repository(repository: &Repository) -> Result<(), Repo
     validate_manifest_attestation(orphans.version, orphans.reviewed, "orphans")?;
     validate_manifest_attestation(diagrams.version, diagrams.reviewed, "diagrams")?;
 
-    let intended_paths = pages
-        .pages
-        .iter()
+    let intended_paths = live_pages(&pages.pages)
         .map(|page| page.path.clone())
         .collect::<BTreeSet<_>>();
     let loaded = load_link_sources(repository, &intended_paths)?;
@@ -1637,21 +1672,42 @@ pub(crate) fn check_local_repository(repository: &Repository) -> Result<(), Repo
     let config_text = core::str::from_utf8(&config_bytes)
         .map_err(|_error| local_error("VitePress configuration is not UTF-8"))?;
     let vitepress = parse_vitepress_config(config_text)?;
-    validate_page_inventory(repository, &pages, &vitepress)?;
-    let (manual_orphans, tombstones) = validate_orphan_records(&orphans)?;
-    let intended = pages
-        .pages
+    let page_inventory = validate_page_inventory(repository, &pages, &vitepress)?;
+    let orphan_inventory = validate_orphan_records(&orphans)?;
+    if page_inventory.tombstones != orphan_inventory.tombstones {
+        return Err(local_error(format!(
+            "tombstone inventory mismatch; pages-only={:?}, orphans-only={:?}",
+            page_inventory
+                .tombstones
+                .iter()
+                .find(|entry| !orphan_inventory.tombstones.contains(*entry)),
+            orphan_inventory
+                .tombstones
+                .iter()
+                .find(|entry| !page_inventory.tombstones.contains(*entry))
+        )));
+    }
+    let intended = page_inventory
+        .live
         .iter()
         .map(|page| page.path.clone())
         .collect::<Vec<_>>();
     check_local_links_with_known(
         &loaded.sources,
         &intended,
-        &tombstones.iter().cloned().collect::<Vec<_>>(),
+        &page_inventory
+            .tombstones
+            .iter()
+            .map(|(route, _replacement)| route.clone())
+            .collect::<Vec<_>>(),
         &loaded.excluded_paths,
         &loaded.known_paths,
     )?;
-    validate_reachability(&loaded.sources, &pages.pages, &manual_orphans)?;
+    validate_reachability(
+        &loaded.sources,
+        &page_inventory.live,
+        &orphan_inventory.manual,
+    )?;
     validate_diagrams(&loaded.sources, &diagrams)?;
     Ok(())
 }
@@ -1732,6 +1788,38 @@ fn validate_manifest_attestation(
 struct VitepressRecords {
     src_excludes: BTreeSet<String>,
     navigation_routes: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LivePage {
+    path: String,
+    route: String,
+    navigation: bool,
+}
+
+struct PageInventory {
+    live: Vec<LivePage>,
+    tombstones: BTreeSet<(String, String)>,
+}
+
+struct OrphanInventory {
+    manual: BTreeSet<String>,
+    tombstones: BTreeSet<(String, String)>,
+}
+
+fn live_pages(records: &[PageRecord]) -> impl Iterator<Item = LivePage> + '_ {
+    records.iter().filter_map(|record| match record {
+        PageRecord::Live {
+            path,
+            route,
+            navigation,
+        } => Some(LivePage {
+            path: path.clone(),
+            route: route.clone(),
+            navigation: *navigation,
+        }),
+        PageRecord::Tombstone { .. } => None,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1907,11 +1995,12 @@ fn validate_page_inventory(
     repository: &Repository,
     manifest: &PagesManifest,
     vitepress: &VitepressRecords,
-) -> Result<(), Report<MarkdownError>> {
+) -> Result<PageInventory, Report<MarkdownError>> {
     let mut manifest_paths = BTreeSet::new();
     let mut manifest_routes = BTreeSet::new();
     let mut manifest_navigation = BTreeSet::new();
-    for page in &manifest.pages {
+    let live = live_pages(&manifest.pages).collect::<Vec<_>>();
+    for page in &live {
         validate_repo_path(&page.path)?;
         let expected_route = public_route(&page.path)?;
         let route = normalize_route(&page.route)?;
@@ -1930,6 +2019,29 @@ fn validate_page_inventory(
         if page.navigation {
             manifest_navigation.insert(route);
         }
+    }
+    let mut tombstone_routes = BTreeSet::new();
+    let mut tombstones = BTreeSet::new();
+    for page in &manifest.pages {
+        let PageRecord::Tombstone { route, replacement } = page else {
+            continue;
+        };
+        let route = normalize_route(route)?;
+        let replacement = normalize_route(replacement)?;
+        if manifest_routes.contains(&route) {
+            return Err(local_error(format!(
+                "tombstone route collides with live page: {route}"
+            )));
+        }
+        if !manifest_routes.contains(&replacement) {
+            return Err(local_error(format!(
+                "tombstone {route} replacement is not a live route: {replacement}"
+            )));
+        }
+        if !tombstone_routes.insert(route.clone()) {
+            return Err(local_error(format!("duplicate tombstone page: {route}")));
+        }
+        tombstones.insert((route, replacement));
     }
     let expected_navigation = vitepress
         .navigation_routes
@@ -1976,7 +2088,7 @@ fn validate_page_inventory(
             manifest_paths.difference(&built_paths).next()
         )));
     }
-    Ok(())
+    Ok(PageInventory { live, tombstones })
 }
 
 fn matches_src_exclude(path: &str, pattern: &str) -> bool {
@@ -1988,12 +2100,13 @@ fn matches_src_exclude(path: &str, pattern: &str) -> bool {
 
 fn validate_orphan_records(
     manifest: &OrphansManifest,
-) -> Result<(BTreeSet<String>, BTreeSet<String>), Report<MarkdownError>> {
+) -> Result<OrphanInventory, Report<MarkdownError>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_error| local_error("system clock precedes Unix epoch"))?
         .as_secs();
     let mut manual = BTreeSet::new();
+    let mut tombstone_routes = BTreeSet::new();
     let mut tombstones = BTreeSet::new();
     for record in &manifest.exceptions {
         if record.owner.trim().is_empty() || record.reason.trim().is_empty() {
@@ -2029,21 +2142,24 @@ fn validate_orphan_records(
                 if record.path.is_some() {
                     return Err(local_error("tombstone cannot carry a path"));
                 }
-                if let Some(replacement) = &record.replacement {
-                    normalize_route(replacement)?;
-                }
-                if !tombstones.insert(route.clone()) {
+                let replacement = record
+                    .replacement
+                    .as_ref()
+                    .ok_or_else(|| local_error("tombstone requires replacement"))?;
+                let replacement = normalize_route(replacement)?;
+                if !tombstone_routes.insert(route.clone()) {
                     return Err(local_error(format!("duplicate tombstone: {route}")));
                 }
+                tombstones.insert((route, replacement));
             }
         }
     }
-    Ok((manual, tombstones))
+    Ok(OrphanInventory { manual, tombstones })
 }
 
 fn validate_reachability(
     sources: &[LinkSource],
-    pages: &[PageRecord],
+    pages: &[LivePage],
     manual_orphans: &BTreeSet<String>,
 ) -> Result<(), Report<MarkdownError>> {
     let public = sources
@@ -2065,9 +2181,10 @@ fn validate_reachability(
         let source = public
             .get(&path)
             .ok_or_else(|| local_error(format!("navigation page is not public: {path}")))?;
-        let parsed = parse_markdown(&path, &source.markdown)?;
+        let parsed = parse_markdown(&path, source.set, &source.markdown)?;
         for destination in parsed.links {
-            if let Some(target) = public_link_target(&path, &destination, &route_to_path)?
+            if let Some(target) =
+                public_link_target(&path, &destination.destination, &route_to_path)?
                 && reachable.insert(target.clone())
             {
                 queue.push_back(target);
@@ -2136,7 +2253,8 @@ fn validate_diagrams(
         .collect::<BTreeMap<_, _>>();
     let mut actual = BTreeSet::new();
     for source in public.values() {
-        for selector in mermaid_selectors(&source.markdown) {
+        let parsed = parse_markdown(&source.path, source.set, &source.markdown)?;
+        for selector in parsed.mermaid_selectors {
             actual.insert((source.path.clone(), selector));
         }
     }
@@ -2152,10 +2270,10 @@ fn validate_diagrams(
         let source = public
             .get(&record.path)
             .ok_or_else(|| local_error(format!("diagram source is not public: {}", record.path)))?;
-        let parsed = parse_markdown(&record.path, &source.markdown)?;
-        if !parsed.anchors.contains(&record.prose_anchor) {
+        let parsed = parse_markdown(&record.path, source.set, &source.markdown)?;
+        if !parsed.heading_anchors.contains(&record.prose_anchor) {
             return Err(local_error(format!(
-                "diagram {} {} has missing prose anchor #{}",
+                "diagram {} {} has missing prose heading #{}",
                 record.path, record.selector, record.prose_anchor
             )));
         }
@@ -2174,23 +2292,6 @@ fn validate_diagrams(
         )));
     }
     Ok(())
-}
-
-fn mermaid_selectors(markdown: &str) -> Vec<String> {
-    let mut selectors = Vec::new();
-    let mut count = 0;
-    let mut in_mermaid = false;
-    for raw_line in markdown.lines() {
-        let trimmed = raw_line.trim_start_matches(' ');
-        if !in_mermaid && (trimmed.starts_with("```mermaid") || trimmed.starts_with("~~~mermaid")) {
-            count += 1;
-            selectors.push(format!("mermaid:{count}"));
-            in_mermaid = true;
-        } else if in_mermaid && (trimmed.starts_with("```") || trimmed.starts_with("~~~")) {
-            in_mermaid = false;
-        }
-    }
-    selectors
 }
 
 /// Exact external-link exception with mandatory ownership and expiry.
@@ -2227,6 +2328,10 @@ pub struct ExternalResponse {
     /// Lowercase response headers. Transport implementations must reject
     /// duplicate security-relevant headers and oversized header sections.
     pub headers: BTreeMap<String, String>,
+    /// Exact number of header bytes read by the transport.
+    pub header_bytes: usize,
+    /// Exact number of body bytes read by the transport.
+    pub body_bytes: usize,
 }
 
 /// Injected external HTTP transport.
@@ -2259,10 +2364,8 @@ pub(crate) fn check_external_repository(
     repository: &Repository,
 ) -> Result<(), Report<MarkdownError>> {
     let pages = read_pages_manifest(repository)?;
-    let intended = pages
-        .pages
-        .iter()
-        .map(|page| page.path.clone())
+    let intended = live_pages(&pages.pages)
+        .map(|page| page.path)
         .collect::<BTreeSet<_>>();
     let loaded = load_link_sources(repository, &intended)?;
     let exceptions = pages
@@ -2279,7 +2382,7 @@ pub(crate) fn check_external_repository(
         .duration_since(UNIX_EPOCH)
         .map_err(|_error| external_error("system clock precedes Unix epoch"))?
         .as_secs();
-    let mut transport = CurlTransport;
+    let mut transport = CurlTransport::production();
     let mut sleeper = ThreadSleeper;
     check_external_links(
         &loaded.sources,
@@ -2298,78 +2401,231 @@ impl Sleeper for ThreadSleeper {
     }
 }
 
-struct CurlTransport;
+/// Bounded result returned by an injected external command runner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandOutput {
+    /// Whether the process exited successfully.
+    pub success: bool,
+    /// Platform exit code when one was available.
+    pub status_code: Option<i32>,
+    /// Complete stdout, bounded during the read by [`CommandRunner`].
+    pub stdout: Vec<u8>,
+}
 
-impl ExternalTransport for CurlTransport {
-    fn send(&mut self, request: &ExternalRequest) -> Result<ExternalResponse, String> {
-        let mut command = Command::new("curl");
-        command.args([
-            "--silent",
-            "--show-error",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--max-redirs",
-            "0",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            &request.timeout_seconds.to_string(),
-            "--max-filesize",
-            &request.maximum_body_bytes.to_string(),
-            "--dump-header",
-            "-",
-            "--output",
-            "/dev/null",
-        ]);
-        if request.method == "HEAD" {
-            command.arg("--head");
-        } else if request.method == "GET" {
-            command.args(["--request", "GET"]);
-        } else {
-            return Err(format!("unsupported transport method: {}", request.method));
-        }
-        command
-            .arg(&request.url)
+/// Injectable runner used by [`CurlTransport`].
+pub trait CommandRunner {
+    /// Run one command and cap stdout while it is being read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when spawning, reading, waiting, or the byte cap fails.
+    fn run(
+        &mut self,
+        program: &str,
+        arguments: &[String],
+        maximum_output_bytes: usize,
+    ) -> Result<CommandOutput, String>;
+}
+
+/// Production process runner for the bounded curl transport.
+pub struct ProcessCommandRunner;
+
+impl CommandRunner for ProcessCommandRunner {
+    fn run(
+        &mut self,
+        program: &str,
+        arguments: &[String],
+        maximum_output_bytes: usize,
+    ) -> Result<CommandOutput, String> {
+        let mut child = Command::new(program)
+            .args(arguments)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command
+            .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| format!("cannot start curl: {error}"))?;
+            .map_err(|error| format!("cannot start {program}: {error}"))?;
         let mut stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "curl stdout pipe is unavailable".to_owned())?;
-        let mut header_bytes = Vec::new();
+            .ok_or_else(|| format!("{program} stdout pipe is unavailable"))?;
+        let mut bytes = Vec::new();
         stdout
             .by_ref()
-            .take((64 * 1024 + 1) as u64)
-            .read_to_end(&mut header_bytes)
-            .map_err(|error| format!("cannot read curl headers: {error}"))?;
-        if header_bytes.len() > 64 * 1024 {
+            .take((maximum_output_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read {program} stdout: {error}"))?;
+        if bytes.len() > maximum_output_bytes {
             let _kill_result = child.kill();
             let _wait_result = child.wait();
-            return Err("curl response headers exceed 65536 bytes".to_owned());
+            return Err(format!(
+                "{program} stdout exceeds {maximum_output_bytes} bytes"
+            ));
         }
         let status = child
             .wait()
-            .map_err(|error| format!("cannot wait for curl: {error}"))?;
-        if !status.success() {
-            return Err(format!("curl exited with status {status}"));
-        }
-        parse_curl_headers(&header_bytes)
+            .map_err(|error| format!("cannot wait for {program}: {error}"))?;
+        Ok(CommandOutput {
+            success: status.success(),
+            status_code: status.code(),
+            stdout: bytes,
+        })
     }
 }
 
-fn parse_curl_headers(bytes: &[u8]) -> Result<ExternalResponse, String> {
+/// HTTPS-only, non-redirecting curl transport with an injectable command seam.
+pub struct CurlTransport<R = ProcessCommandRunner> {
+    runner: R,
+}
+
+impl CurlTransport<ProcessCommandRunner> {
+    fn production() -> Self {
+        Self {
+            runner: ProcessCommandRunner,
+        }
+    }
+}
+
+impl<R> CurlTransport<R> {
+    /// Create a transport from an injected command runner.
+    #[must_use]
+    pub const fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    /// Consume the transport and return its runner.
+    #[must_use]
+    pub fn into_runner(self) -> R {
+        self.runner
+    }
+}
+
+impl<R: CommandRunner> ExternalTransport for CurlTransport<R> {
+    fn send(&mut self, request: &ExternalRequest) -> Result<ExternalResponse, String> {
+        validate_transport_request(request)?;
+        let mut arguments = [
+            "--silent".to_owned(),
+            "--show-error".to_owned(),
+            "--proto".to_owned(),
+            "=https".to_owned(),
+            "--proto-redir".to_owned(),
+            "=https".to_owned(),
+            "--max-redirs".to_owned(),
+            "0".to_owned(),
+            "--connect-timeout".to_owned(),
+            "5".to_owned(),
+            "--max-time".to_owned(),
+            request.timeout_seconds.to_string(),
+            "--max-filesize".to_owned(),
+            request.maximum_body_bytes.to_string(),
+            "--dump-header".to_owned(),
+            "-".to_owned(),
+            "--output".to_owned(),
+            "-".to_owned(),
+            "--write-out".to_owned(),
+            CURL_WRITE_OUT.to_owned(),
+        ]
+        .to_vec();
+        if request.method == "HEAD" {
+            arguments.push("--head".to_owned());
+        } else {
+            arguments.extend(["--request".to_owned(), "GET".to_owned()]);
+        }
+        arguments.extend(["--url".to_owned(), request.url.clone()]);
+        let maximum_output =
+            MAXIMUM_RESPONSE_HEADER_BYTES + request.maximum_body_bytes + CURL_TRAILER_BYTES;
+        let output = self.runner.run("curl", &arguments, maximum_output)?;
+        if !output.success {
+            return Err(format!(
+                "curl exited unsuccessfully with status {:?}",
+                output.status_code
+            ));
+        }
+        parse_curl_output(&output.stdout, request.maximum_body_bytes)
+    }
+}
+
+fn validate_transport_request(request: &ExternalRequest) -> Result<(), String> {
+    if !matches!(request.method.as_str(), "HEAD" | "GET") {
+        return Err(format!("unsupported transport method: {}", request.method));
+    }
+    if !(1..=30).contains(&request.timeout_seconds) {
+        return Err("transport timeout is outside 1..=30 seconds".to_owned());
+    }
+    if request.maximum_body_bytes == 0 || request.maximum_body_bytes > MAXIMUM_RESPONSE_BODY_BYTES {
+        return Err("transport body bound is outside 1..=65536 bytes".to_owned());
+    }
+    let url = Url::parse(&request.url).map_err(|_error| "transport URL is malformed".to_owned())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("transport URL must be credential-free HTTPS".to_owned());
+    }
+    Ok(())
+}
+
+fn parse_curl_output(bytes: &[u8], maximum_body_bytes: usize) -> Result<ExternalResponse, String> {
+    let marker = b"\nDOCS_PARITY_COUNTS:";
+    let marker_start = bytes
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .ok_or_else(|| "curl output has no byte-count trailer".to_owned())?;
+    let trailer = bytes
+        .get(marker_start + marker.len()..)
+        .and_then(|value| value.strip_suffix(b"\n"))
+        .ok_or_else(|| "curl byte-count trailer is malformed".to_owned())?;
+    let trailer = core::str::from_utf8(trailer)
+        .map_err(|_error| "curl byte-count trailer is not UTF-8".to_owned())?;
+    let (header_text, body_text) = trailer
+        .split_once(':')
+        .ok_or_else(|| "curl byte-count trailer is malformed".to_owned())?;
+    let header_bytes = header_text
+        .parse::<usize>()
+        .map_err(|_error| "curl header byte count is malformed".to_owned())?;
+    let body_bytes = body_text
+        .parse::<usize>()
+        .map_err(|_error| "curl body byte count is malformed".to_owned())?;
+    if header_bytes > MAXIMUM_RESPONSE_HEADER_BYTES {
+        return Err(format!(
+            "curl response headers exceed {MAXIMUM_RESPONSE_HEADER_BYTES} bytes"
+        ));
+    }
+    if body_bytes > maximum_body_bytes {
+        return Err(format!(
+            "curl response body exceeds {maximum_body_bytes} bytes"
+        ));
+    }
+    if marker_start != header_bytes + body_bytes {
+        return Err("curl byte counts do not match captured output".to_owned());
+    }
+    let headers = bytes
+        .get(..header_bytes)
+        .ok_or_else(|| "curl header byte count exceeds output".to_owned())?;
+    let (status, headers) = parse_curl_headers(headers)?;
+    Ok(ExternalResponse {
+        status,
+        headers,
+        header_bytes,
+        body_bytes,
+    })
+}
+
+fn parse_curl_headers(bytes: &[u8]) -> Result<(u16, BTreeMap<String, String>), String> {
     let text = core::str::from_utf8(bytes)
         .map_err(|_error| "curl response headers are not UTF-8".to_owned())?;
-    let block = text
+    let blocks = text
+        .strip_suffix("\r\n\r\n")
+        .ok_or_else(|| "curl response headers have no terminator".to_owned())?
         .split("\r\n\r\n")
-        .filter(|part| part.starts_with("HTTP/"))
-        .last()
-        .ok_or_else(|| "curl response has no HTTP header block".to_owned())?;
+        .collect::<Vec<_>>();
+    let mut final_response = None;
+    for block in blocks {
+        final_response = Some(parse_curl_header_block(block)?);
+    }
+    final_response.ok_or_else(|| "curl response has no HTTP header block".to_owned())
+}
+
+fn parse_curl_header_block(block: &str) -> Result<(u16, BTreeMap<String, String>), String> {
     let mut lines = block.split("\r\n");
     let status_line = lines
         .next()
@@ -2378,11 +2634,13 @@ fn parse_curl_headers(bytes: &[u8]) -> Result<ExternalResponse, String> {
     let protocol = status_parts
         .next()
         .ok_or_else(|| "curl status has no protocol".to_owned())?;
-    let status = status_parts
+    let status_text = status_parts
         .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| "curl status code is malformed".to_owned())?;
-    if !protocol.starts_with("HTTP/") || !(100..=599).contains(&status) {
+        .ok_or_else(|| "curl status has no code".to_owned())?;
+    let status = status_text
+        .parse::<u16>()
+        .map_err(|_error| "curl status code is malformed".to_owned())?;
+    if !protocol.starts_with("HTTP/") || status_text.len() != 3 || !(100..=599).contains(&status) {
         return Err("curl status line is malformed".to_owned());
     }
     let mut headers = BTreeMap::new();
@@ -2390,22 +2648,33 @@ fn parse_curl_headers(bytes: &[u8]) -> Result<ExternalResponse, String> {
         if line.is_empty() {
             continue;
         }
+        if line.len() > MAXIMUM_HEADER_LINE_BYTES {
+            return Err("curl header line exceeds 8192 bytes".to_owned());
+        }
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "curl header line is malformed".to_owned())?;
-        if !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        if name.len() > MAXIMUM_HEADER_NAME_BYTES
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         {
             return Err("curl header name is malformed".to_owned());
         }
         let name = name.to_ascii_lowercase();
-        let value = value.trim().to_owned();
+        let value = value.trim();
+        if value.len() > MAXIMUM_HEADER_VALUE_BYTES || value.chars().any(char::is_control) {
+            return Err("curl header value exceeds bounds".to_owned());
+        }
+        let value = value.to_owned();
         if headers.insert(name.clone(), value).is_some() {
             return Err(format!("duplicate curl response header: {name}"));
         }
+        if headers.len() > MAXIMUM_RESPONSE_HEADERS {
+            return Err("curl response has too many headers".to_owned());
+        }
     }
-    Ok(ExternalResponse { status, headers })
+    Ok((status, headers))
 }
 
 /// Validate all external Markdown destinations using a deterministic transport.
@@ -2428,10 +2697,11 @@ pub fn check_external_links<T: ExternalTransport, S: Sleeper>(
 ) -> Result<(), Report<MarkdownError>> {
     let mut urls = BTreeSet::new();
     for source in sources {
-        let parsed = parse_markdown(&source.path, &source.markdown)?;
-        urls.extend(parsed.links.into_iter().filter(|link| {
-            let lower = link.to_ascii_lowercase();
-            lower.starts_with("https://") || lower.starts_with("http://")
+        let parsed = parse_markdown(&source.path, source.set, &source.markdown)?;
+        urls.extend(parsed.links.into_iter().filter_map(|link| {
+            let lower = link.destination.to_ascii_lowercase();
+            (lower.starts_with("https://") || lower.starts_with("http://"))
+                .then_some(link.destination)
         }));
     }
     let exception_map = validate_external_exceptions(exceptions, now_seconds, &urls)?;
@@ -2509,7 +2779,7 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
         let response = transport.send(&request).map_err(|diagnostic| {
             external_error(format!("request failed for {canonical}: {diagnostic}"))
         })?;
-        validate_response_headers(&response)?;
+        validate_response_headers(&response, request.maximum_body_bytes)?;
 
         if method == "HEAD" && matches!(response.status, 405 | 501) && !fallback_used {
             method = "GET";
@@ -2592,22 +2862,37 @@ fn validate_url_parts(url: &Url) -> Result<(), Report<MarkdownError>> {
     Ok(())
 }
 
-fn validate_response_headers(response: &ExternalResponse) -> Result<(), Report<MarkdownError>> {
-    if response.headers.len() > 128 {
+fn validate_response_headers(
+    response: &ExternalResponse,
+    maximum_body_bytes: usize,
+) -> Result<(), Report<MarkdownError>> {
+    if !(100..=599).contains(&response.status) {
+        return Err(external_error("response status is outside HTTP bounds"));
+    }
+    if response.headers.len() > MAXIMUM_RESPONSE_HEADERS {
         return Err(external_error("response has too many headers"));
     }
     let total = response
         .headers
         .iter()
-        .map(|(name, value)| name.len() + value.len())
+        .map(|(name, value)| name.len() + value.len() + 4)
         .sum::<usize>();
-    if total > 64 * 1024
-        || response
-            .headers
-            .iter()
-            .any(|(name, value)| name.len() > 256 || value.len() > 8 * 1024)
+    if response.header_bytes > MAXIMUM_RESPONSE_HEADER_BYTES
+        || total > MAXIMUM_RESPONSE_HEADER_BYTES
+        || response.headers.iter().any(|(name, value)| {
+            name.len() > MAXIMUM_HEADER_NAME_BYTES
+                || value.len() > MAXIMUM_HEADER_VALUE_BYTES
+                || name.len() + value.len() + 4 > MAXIMUM_HEADER_LINE_BYTES
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || value.chars().any(char::is_control)
+        })
     {
         return Err(external_error("response headers exceed bounds"));
+    }
+    if response.body_bytes > maximum_body_bytes {
+        return Err(external_error("response body exceeds bound"));
     }
     Ok(())
 }
@@ -2620,6 +2905,20 @@ fn retry_after_seconds(value: &str, now_seconds: u64) -> Option<u64> {
 }
 
 fn http_date_seconds(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 29
+        || bytes[3] != b','
+        || ![4, 7, 11, 16, 25]
+            .into_iter()
+            .all(|index| bytes[index] == b' ')
+        || bytes[19] != b':'
+        || bytes[22] != b':'
+        || ![5, 6, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24]
+            .into_iter()
+            .all(|index| bytes[index].is_ascii_digit())
+    {
+        return None;
+    }
     let mut parts = value.split_ascii_whitespace();
     let weekday = parts.next()?;
     let day = parts.next()?.parse::<u32>().ok()?;
@@ -2641,7 +2940,13 @@ fn http_date_seconds(value: &str) -> Option<u64> {
     let year = parts.next()?.parse::<u32>().ok()?;
     let time = parts.next()?;
     let zone = parts.next()?;
-    if parts.next().is_some() || !weekday.ends_with(',') || weekday.len() != 4 || zone != "GMT" {
+    if parts.next().is_some()
+        || !matches!(
+            weekday,
+            "Sun," | "Mon," | "Tue," | "Wed," | "Thu," | "Fri," | "Sat,"
+        )
+        || zone != "GMT"
+    {
         return None;
     }
     let mut clock = time.split(':');
@@ -2651,7 +2956,10 @@ fn http_date_seconds(value: &str) -> Option<u64> {
     if clock.next().is_some() {
         return None;
     }
-    timestamp_components(year, month, day, hour, minute, second)
+    let timestamp = timestamp_components(year, month, day, hour, minute, second)?;
+    let weekday_index = ((timestamp / 86_400 + 4) % 7) as usize;
+    let expected = ["Sun,", "Mon,", "Tue,", "Wed,", "Thu,", "Fri,", "Sat,"];
+    (weekday == expected[weekday_index]).then_some(timestamp)
 }
 
 fn timestamp_seconds(value: &str) -> Option<u64> {

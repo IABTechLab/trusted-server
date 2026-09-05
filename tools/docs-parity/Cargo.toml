@@ -62,14 +62,18 @@ path = "tests/links.rs"
 clap = { version = "4", features = ["derive"] }
 derive_more = { version = "2.0", features = ["display"] }
 error-stack = "0.6"
+github-slugger = "0.1"
 psl = "2"
+pulldown-cmark = "0.13"
 regex = "1"
+scraper = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
 toml_edit = "0.23"
 url = "2.5"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3.24"

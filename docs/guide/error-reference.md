@@ -8,7 +8,7 @@ Common errors, their causes, and solutions when working with Trusted Server.
 - [Runtime Errors](#runtime-errors)
 - [Integration Errors](#integration-errors)
 - [Request Signing Errors](#request-signing-errors)
-- [Build & Deployment Errors](#build--deployment-errors)
+- [Build & Deployment Errors](#build-deployment-errors)
 
 ---
 

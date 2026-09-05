@@ -4,211 +4,253 @@ site_root = "docs"
 vitepress_config = "docs/.vitepress/config.mts"
 
 [[pages]]
+kind = "live"
 path = "docs/guide/ad-serving.md"
 route = "/guide/ad-serving"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/api-reference.md"
 route = "/guide/api-reference"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/architecture.md"
 route = "/guide/architecture"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/asset-routes.md"
 route = "/guide/asset-routes"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/auction-orchestration.md"
 route = "/guide/auction-orchestration"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/cli.md"
 route = "/guide/cli"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/collective-sync.md"
 route = "/guide/collective-sync"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/configuration.md"
 route = "/guide/configuration"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/creative-processing.md"
 route = "/guide/creative-processing"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/ec-setup-guide.md"
 route = "/guide/ec-setup-guide"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/edge-cookies.md"
 route = "/guide/edge-cookies"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/error-reference.md"
 route = "/guide/error-reference"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/fastly.md"
 route = "/guide/fastly"
 navigation = false
 
 [[pages]]
+kind = "live"
 path = "docs/guide/first-party-proxy.md"
 route = "/guide/first-party-proxy"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/gdpr-compliance.md"
 route = "/guide/gdpr-compliance"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/getting-started.md"
 route = "/guide/getting-started"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/index.md"
 route = "/guide/"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integration-guide.md"
 route = "/guide/integration-guide"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations-overview.md"
 route = "/guide/integrations-overview"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/aps.md"
 route = "/guide/integrations/aps"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/datadome.md"
 route = "/guide/integrations/datadome"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/didomi.md"
 route = "/guide/integrations/didomi"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/gam.md"
 route = "/guide/integrations/gam"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/google_tag_manager.md"
 route = "/guide/integrations/google_tag_manager"
 navigation = false
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/gpt-diagnostics.md"
 route = "/guide/integrations/gpt-diagnostics"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/gpt.md"
 route = "/guide/integrations/gpt"
 navigation = false
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/kargo.md"
 route = "/guide/integrations/kargo"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/lockr.md"
 route = "/guide/integrations/lockr"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/nextjs.md"
 route = "/guide/integrations/nextjs"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/osano.md"
 route = "/guide/integrations/osano"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/permutive.md"
 route = "/guide/integrations/permutive"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/prebid.md"
 route = "/guide/integrations/prebid"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/integrations/sourcepoint.md"
 route = "/guide/integrations/sourcepoint"
 navigation = false
 
 [[pages]]
+kind = "live"
 path = "docs/guide/key-rotation.md"
 route = "/guide/key-rotation"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/proxy-signing.md"
 route = "/guide/proxy-signing"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/request-signing.md"
 route = "/guide/request-signing"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/rsc-hydration.md"
 route = "/guide/rsc-hydration"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/testing.md"
 route = "/guide/testing"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/ts-dev-proxy.md"
 route = "/guide/ts-dev-proxy"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/guide/what-is-trusted-server.md"
 route = "/guide/what-is-trusted-server"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/index.md"
 route = "/"
 navigation = true
 
 [[pages]]
+kind = "live"
 path = "docs/roadmap.md"
 route = "/roadmap"
 navigation = true

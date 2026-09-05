@@ -90,19 +90,29 @@ replaces only drifted region bodies; exact bytes outside the paired markers are
 preserved. Region names, rows, ownership markers, paths, file modes, sizes, and
 marker placement all fail closed. A second update is byte-identical.
 
-`links --local --check` validates semantic Markdown destinations over all
+`links --local --check` parses CommonMark events with source offsets over all
 maintained public, internal, and repository source sets. It checks relative
-files, VitePress routes, queries, strict percent decoding, duplicate heading
-slugs, explicit anchors, excluded-source links, tombstones, page/navigation
-set equality, reachable pages, and diagram prose equivalents. The command is
-offline and is suitable for pull-request validation.
+files, images, references, autolinks, HTML `href`/`id`/`name` attributes,
+VitePress routes, queries, strict single-pass percent decoding, and anchors.
+Public headings use the VitePress 1.6.4 `@mdit-vue/shared` slug contract;
+repository and maintained-internal headings use GitHub slugs. Code and HTML
+comments do not create destinations. The check also rejects links to excluded
+sources, validates the exact live-page and typed-tombstone inventories against
+navigation and orphan records, proves live-page reachability, and requires an
+owned prose heading for every exact semantic Mermaid fence. All three
+publication manifests and every Markdown input are bounded to 4 MiB. The
+command is offline and is suitable for pull-request validation.
 
 `links --external --check` is the only command that performs network I/O. It is
 reserved for scheduled or explicit manual execution. Requests require HTTPS,
 reject URL credentials, follow at most five redirects, use HEAD with GET only
 for unsupported HEAD responses, and make at most three attempts for 429/5xx.
-Response size and time are bounded. Exact exceptions require an owner, reason,
-and unexpired timestamp.
+The production curl process cannot follow redirects itself; the shared checker
+validates each relative or absolute redirect before issuing the next request.
+Transport arguments allow only credential-free HTTPS and HEAD/GET with bounded
+connect and total time. Stdout is bounded while read, then independently
+validated for status, header count, header line/name/value/total bytes, and
+body bytes. Exact exceptions require an owner, reason, and unexpired timestamp.
 
 ## Repository boundary
 

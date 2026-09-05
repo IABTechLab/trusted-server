@@ -371,3 +371,21 @@ fn generated_target_rejects_oversized_input_before_writing() {
         before
     );
 }
+
+#[test]
+fn generated_target_rejects_oversized_rendered_output_before_writing() {
+    let source = concat!(
+        "<!-- docs-parity:start adapter-support -->\n",
+        "old\n",
+        "<!-- docs-parity:end adapter-support -->\n",
+    );
+    let mut oversized = region();
+    oversized.rows[0].cells[0] = "x".repeat(4 * 1024 * 1024);
+
+    let result = render_generated_document(source.as_bytes(), &[oversized], &[]);
+
+    assert!(
+        format!("{:?}", result.expect_err("oversized output should fail"))
+            .contains("rendered document exceeds")
+    );
+}

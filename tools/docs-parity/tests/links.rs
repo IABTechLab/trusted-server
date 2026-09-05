@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use docs_parity::markdown::{
-    ExternalException, ExternalRequest, ExternalResponse, ExternalTransport, LinkSource,
-    LinkSourceSet, Sleeper, check_external_links, check_local_links,
+    CommandOutput, CommandRunner, CurlTransport, ExternalException, ExternalRequest,
+    ExternalResponse, ExternalTransport, LinkSource, LinkSourceSet, ProcessCommandRunner, Sleeper,
+    check_external_links, check_local_links,
 };
 use tempfile::TempDir;
 
@@ -25,9 +26,10 @@ impl PublicationRepository {
             ("README.md", "# Repository\n[public guide](/guide/)\n"),
             (
                 "docs/.vitepress/config.mts",
-                "export default { srcExclude: ['internal/**'], themeConfig: { nav: [{ link: '/' }] } }\n",
+                "export default { srcExclude: ['internal/**', 'private.md'], themeConfig: { nav: [{ link: '/' }] } }\n",
             ),
             ("docs/index.md", "# Home\n[guide](/guide/)\n"),
+            ("docs/private.md", "# Private\n"),
             (
                 "docs/guide/index.md",
                 "# Guide\n## Flow\n```mermaid\ngraph TD\n```\n",
@@ -36,13 +38,15 @@ impl PublicationRepository {
                 "docs/internal/note.md",
                 "# Internal\n[repository](/README.md)\n",
             ),
+            ("notes/included.md", "# Included repository note\n"),
+            ("static/logo.png", "not really a png fixture"),
             (
                 "tools/docs-parity/manifests/pages.toml",
                 concat!(
                     "version = 1\nreviewed = true\nsite_root = \"docs\"\n",
                     "vitepress_config = \"docs/.vitepress/config.mts\"\n\n",
-                    "[[pages]]\npath = \"docs/index.md\"\nroute = \"/\"\nnavigation = true\n\n",
-                    "[[pages]]\npath = \"docs/guide/index.md\"\nroute = \"/guide/\"\nnavigation = false\n",
+                    "[[pages]]\nkind = \"live\"\npath = \"docs/index.md\"\nroute = \"/\"\nnavigation = true\n\n",
+                    "[[pages]]\nkind = \"live\"\npath = \"docs/guide/index.md\"\nroute = \"/guide/\"\nnavigation = false\n",
                 ),
             ),
             (
@@ -67,6 +71,9 @@ impl PublicationRepository {
             "docs/guide/index.md",
             "docs/index.md",
             "docs/internal/note.md",
+            "docs/private.md",
+            "notes/included.md",
+            "static/logo.png",
             "tools/docs-parity/manifests/diagrams.toml",
             "tools/docs-parity/manifests/maintained-sources.toml",
             "tools/docs-parity/manifests/orphans.toml",
@@ -77,9 +84,17 @@ impl PublicationRepository {
         let mut maintained = "version = 1\nreviewed = true\n".to_owned();
         for path in all_paths {
             tracked.push_str(&format!(
-                "\n[[files]]\npath = \"{path}\"\nkind = \"text\"\n"
+                "\n[[files]]\npath = \"{path}\"\nkind = \"{}\"\n",
+                if path.ends_with(".png") {
+                    "binary"
+                } else {
+                    "text"
+                }
             ));
-            let include = path.ends_with(".md");
+            if path.ends_with(".png") {
+                continue;
+            }
+            let include = path.ends_with(".md") && path != "docs/private.md";
             maintained.push_str(&format!(
                 "\n[[sources]]\npath = \"{path}\"\nmode = \"whole\"\ndisposition = \"{}\"\n{}",
                 if include { "include" } else { "exclude" },
@@ -178,6 +193,17 @@ fn every_active_source_set_checks_missing_local_targets() {
 }
 
 #[test]
+fn semantic_image_destinations_are_checked() {
+    let sources = [source(
+        "docs/guide/source.md",
+        LinkSourceSet::Public,
+        "![missing diagram](missing.png)\n",
+    )];
+
+    assert!(local_error(&sources).contains("missing.png"));
+}
+
+#[test]
 fn semantic_markdown_links_resolve_files_queries_and_vitepress_routes() {
     let target = format!("target.{}", "md");
     let markdown = format!(
@@ -202,12 +228,12 @@ fn root_relative_repository_links_resolve_from_the_repository_root() {
         source(
             ".claude/commands/check.md",
             LinkSourceSet::Repository,
-            "[rules](/CLAUDE.md#build--test-commands)\n",
+            "[rules](/CLAUDE.md#build-and-test-commands)\n",
         ),
         source(
             "CLAUDE.md",
             LinkSourceSet::Repository,
-            "# Build and Test Commands {#build--test-commands}\n",
+            "# Build and Test Commands\n",
         ),
         source(
             "docs/internal/note.md",
@@ -218,6 +244,59 @@ fn root_relative_repository_links_resolve_from_the_repository_root() {
     ];
 
     check_local_links(&sources, &[], &[]).expect("repository-root link should resolve");
+}
+
+#[test]
+fn public_links_reject_every_spelling_of_an_excluded_markdown_source() {
+    for destination in ["private.md", "/docs/private.md", "/private"] {
+        let repository = PublicationRepository::new();
+        write_file(
+            repository.path(),
+            "docs/index.md",
+            &format!("# Home\n[private]({destination})\n[guide](/guide/)\n"),
+        );
+
+        let result = repository.check();
+
+        assert_eq!(status_code(&result), ERROR, "{destination} must fail");
+        assert!(
+            diagnostic(&result).contains("excluded source"),
+            "{destination} must identify the excluded source: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[test]
+fn included_repository_and_binary_targets_remain_distinct_from_exclusions() {
+    let repository = PublicationRepository::new();
+    write_file(
+        repository.path(),
+        "README.md",
+        concat!(
+            "# Repository\n",
+            "[included](notes/included.md)\n",
+            "[binary](static/logo.png)\n",
+            "[public](/guide/)\n",
+        ),
+    );
+
+    let clean = repository.check();
+    assert_eq!(
+        status_code(&clean),
+        SUCCESS,
+        "included text and binary paths must resolve: {}",
+        diagnostic(&clean)
+    );
+
+    write_file(
+        repository.path(),
+        "README.md",
+        "# Repository\n[bad binary anchor](static/logo.png#bytes)\n[public](/guide/)\n",
+    );
+    let anchored_binary = repository.check();
+    assert_eq!(status_code(&anchored_binary), ERROR);
+    assert!(diagnostic(&anchored_binary).contains("non-Markdown target"));
 }
 
 #[test]
@@ -232,7 +311,7 @@ fn anchors_use_duplicate_slugs_explicit_ids_and_strict_percent_decoding() {
         "docs/guide/source.md",
         LinkSourceSet::Public,
         &format!(
-            "[duplicate]({target_name}#same-heading-1) [encoded]({target_name}#named%2Danchor) [punctuation]({target_name}#build--deployment-errors)\n"
+            "[duplicate]({target_name}#same-heading-1) [encoded]({target_name}#named%2Danchor) [punctuation]({target_name}#build-deployment-errors)\n"
         ),
     );
     check_local_links(&[valid, target.clone()], &[], &[])
@@ -254,6 +333,57 @@ fn anchors_use_duplicate_slugs_explicit_ids_and_strict_percent_decoding() {
 }
 
 #[test]
+fn public_and_repository_heading_slugs_follow_their_renderers() {
+    let public_name = format!("public.{}", "md");
+    let public_target = source(
+        "docs/guide/public.md",
+        LinkSourceSet::Public,
+        concat!(
+            "# 123 Déjà  vu & API\n",
+            "# **Formatted** `code` &amp; _text_ {#exact-id}\n",
+            "# Repeat\n",
+            "# Repeat\n",
+        ),
+    );
+    let public_source = source(
+        "docs/guide/source.md",
+        LinkSourceSet::Public,
+        &format!(
+            "[normalized]({public_name}#_123-deja-vu-api)\n[explicit]({public_name}#exact-id)\n[duplicate]({public_name}#repeat-1)\n"
+        ),
+    );
+    check_local_links(&[public_source, public_target], &[], &[])
+        .expect("VitePress heading slugs should resolve");
+
+    let repository_target = source(
+        "notes/target.md",
+        LinkSourceSet::Repository,
+        "# Build & Deployment Errors\n# 123 Start\n",
+    );
+    let repository_source = source(
+        "README.md",
+        LinkSourceSet::Repository,
+        concat!(
+            "[GitHub punctuation](notes/target.md#build--deployment-errors)\n",
+            "[GitHub digit](notes/target.md#123-start)\n",
+        ),
+    );
+    check_local_links(&[repository_source, repository_target], &[], &[])
+        .expect("GitHub heading slugs should resolve");
+}
+
+#[test]
+fn invalid_explicit_heading_ids_fail_closed() {
+    let target = source(
+        "docs/guide/target.md",
+        LinkSourceSet::Public,
+        "# Unsafe {#two words}\n",
+    );
+    let error = local_error(&[target]);
+    assert!(error.contains("explicit heading id"));
+}
+
+#[test]
 fn setext_headings_are_available_as_semantic_anchors() {
     let target_name = format!("target.{}", "md");
     let sources = [
@@ -270,6 +400,62 @@ fn setext_headings_are_available_as_semantic_anchors() {
     ];
 
     check_local_links(&sources, &[], &[]).expect("setext heading should resolve");
+}
+
+#[test]
+fn commonmark_events_cover_multiline_references_html_images_and_code() {
+    let target = format!("target.{}", "md");
+    let missing = format!("missing.{}", "md");
+    let sources = [
+        source(
+            "docs/guide/source.md",
+            LinkSourceSet::Public,
+            &format!(
+                concat!(
+                    "[multiline](\n  {target}#target-heading\n)\n",
+                    "[reference][target]\n\n[target]: {target}#html-anchor\n\n",
+                    "<DIV\n  id=\"source-html\">\n",
+                    "  <A HREF=\"{target}#target-heading\">HTML link</A>\n</DIV>\n",
+                    "![image](../asset.png)\n<https://docs.example.com/path>\n",
+                    "<!-- <a href=\"{missing}\" id=\"ignored\"> -->\n",
+                    "    [indented code]({missing})\n",
+                    "`[inline code]({missing})`\n",
+                    "```md\n[code fence]({missing})\n```\n",
+                ),
+                target = target,
+                missing = missing,
+            ),
+        ),
+        source(
+            "docs/guide/target.md",
+            LinkSourceSet::Public,
+            "# Target *heading*\n<span id=\"html-anchor\"></span>\n",
+        ),
+        source(
+            "docs/asset.png",
+            LinkSourceSet::Repository,
+            "not parsed as an image fixture",
+        ),
+    ];
+
+    check_local_links(&sources, &[], &[]).expect("CommonMark destinations should resolve");
+}
+
+#[test]
+fn percent_decoding_rejects_invalid_utf8_and_residual_encoded_octets() {
+    let target = format!("target.{}", "md");
+    for fragment in ["%FF", "%252D"] {
+        let sources = [
+            source(
+                "docs/guide/source.md",
+                LinkSourceSet::Public,
+                &format!("[bad]({target}#{fragment})\n"),
+            ),
+            source("docs/guide/target.md", LinkSourceSet::Public, "# Target\n"),
+        ];
+        let error = local_error(&sources);
+        assert!(error.contains("percent"), "{fragment} must fail: {error}");
+    }
 }
 
 #[test]
@@ -330,7 +516,51 @@ fn response(status: u16, location: Option<&str>, retry_after: Option<&str>) -> E
     if let Some(retry_after) = retry_after {
         headers.insert("retry-after".to_owned(), retry_after.to_owned());
     }
-    ExternalResponse { status, headers }
+    ExternalResponse {
+        status,
+        headers,
+        header_bytes: 0,
+        body_bytes: 0,
+    }
+}
+
+#[derive(Default)]
+struct FakeCommandRunner {
+    outputs: VecDeque<Result<CommandOutput, String>>,
+    invocations: Vec<(String, Vec<String>, usize)>,
+}
+
+impl CommandRunner for FakeCommandRunner {
+    fn run(
+        &mut self,
+        program: &str,
+        arguments: &[String],
+        maximum_output_bytes: usize,
+    ) -> Result<CommandOutput, String> {
+        self.invocations
+            .push((program.to_owned(), arguments.to_vec(), maximum_output_bytes));
+        self.outputs
+            .pop_front()
+            .ok_or_else(|| "no scripted command output".to_owned())?
+    }
+}
+
+fn curl_output(status: &str, headers: &[(&str, &str)], body: &[u8]) -> CommandOutput {
+    let mut header = format!("HTTP/1.1 {status}\r\n").into_bytes();
+    for (name, value) in headers {
+        header.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    header.extend_from_slice(b"\r\n");
+    let mut stdout = header.clone();
+    stdout.extend_from_slice(body);
+    stdout.extend_from_slice(
+        format!("\nDOCS_PARITY_COUNTS:{}:{}\n", header.len(), body.len()).as_bytes(),
+    );
+    CommandOutput {
+        success: true,
+        status_code: Some(0),
+        stdout,
+    }
 }
 
 fn external_error(
@@ -476,6 +706,251 @@ fn valid_http_date_retry_after_is_honored_only_within_the_bound() {
 }
 
 #[test]
+fn malformed_or_inconsistent_http_date_retry_after_uses_local_delay() {
+    for value in [
+        "Xxx, 01 Jan 1970 00:00:05 GMT",
+        "Fri, 01 Jan 1970 00:00:05 GMT",
+        "Thu, 1 Jan 1970 00:00:05 GMT",
+        "Thu, 01 Jan 01970 00:00:05 GMT",
+        "Thu, 01 Jan 1970 0:00:05 GMT",
+    ] {
+        let sources = [source(
+            "README.md",
+            LinkSourceSet::Repository,
+            "[site](https://docs.example.com/)\n",
+        )];
+        let mut transport = FakeTransport {
+            responses: vec![response(429, None, Some(value)), response(200, None, None)].into(),
+            requests: Vec::new(),
+        };
+        let mut sleeper = FakeSleeper::default();
+
+        check_external_links(&sources, &[], 0, &mut transport, &mut sleeper)
+            .expect("malformed date should fall back to the local retry delay");
+        assert_eq!(sleeper.delays, vec![1], "{value} must not be honored");
+    }
+}
+
+#[test]
+fn external_checker_accepts_relative_redirects_and_rejects_final_errors() {
+    let sources = [source(
+        "README.md",
+        LinkSourceSet::Repository,
+        "[site](https://docs.example.com/start)\n",
+    )];
+    let mut transport = FakeTransport {
+        responses: vec![
+            response(302, Some("/final"), None),
+            response(204, None, None),
+        ]
+        .into(),
+        requests: Vec::new(),
+    };
+    let mut sleeper = FakeSleeper::default();
+    check_external_links(&sources, &[], 0, &mut transport, &mut sleeper)
+        .expect("relative HTTPS redirect should pass");
+    assert_eq!(transport.requests[1].url, "https://docs.example.com/final");
+
+    let (error, transport, _) = external_error(
+        "[site](https://docs.example.com/start)\n",
+        vec![response(404, None, None)],
+    );
+    assert!(error.contains("final status 404"));
+    assert_eq!(transport.requests.len(), 1);
+}
+
+#[test]
+fn curl_transport_uses_exact_bounded_nonredirecting_arguments_and_counts_bytes() {
+    let runner = FakeCommandRunner {
+        outputs: vec![Ok(curl_output(
+            "200 OK",
+            &[("Content-Type", "text/plain")],
+            b"body",
+        ))]
+        .into(),
+        invocations: Vec::new(),
+    };
+    let mut transport = CurlTransport::new(runner);
+    let request = ExternalRequest {
+        method: "GET".to_owned(),
+        url: "https://docs.example.com/path".to_owned(),
+        timeout_seconds: 15,
+        maximum_body_bytes: 64 * 1024,
+    };
+
+    let response = transport.send(&request).expect("curl output should parse");
+    let runner = transport.into_runner();
+
+    assert_eq!(response.status, 200);
+    assert!(response.header_bytes > 0);
+    assert_eq!(response.body_bytes, 4);
+    assert_eq!(runner.invocations.len(), 1);
+    let (program, arguments, maximum_output_bytes) = &runner.invocations[0];
+    assert_eq!(program, "curl");
+    assert_eq!(
+        arguments,
+        &[
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            "65536",
+            "--dump-header",
+            "-",
+            "--output",
+            "-",
+            "--write-out",
+            "\nDOCS_PARITY_COUNTS:%{size_header}:%{size_download}\n",
+            "--request",
+            "GET",
+            "--url",
+            "https://docs.example.com/path",
+        ]
+    );
+    assert_eq!(*maximum_output_bytes, 64 * 1024 + 64 * 1024 + 128);
+}
+
+#[test]
+fn curl_transport_rejects_unsafe_requests_and_malformed_command_output() {
+    for request in [
+        ExternalRequest {
+            method: "POST".to_owned(),
+            url: "https://docs.example.com/".to_owned(),
+            timeout_seconds: 15,
+            maximum_body_bytes: 64 * 1024,
+        },
+        ExternalRequest {
+            method: "GET".to_owned(),
+            url: "http://docs.example.com/".to_owned(),
+            timeout_seconds: 15,
+            maximum_body_bytes: 64 * 1024,
+        },
+        ExternalRequest {
+            method: "GET".to_owned(),
+            url: "https://user:password@docs.example.com/".to_owned(),
+            timeout_seconds: 15,
+            maximum_body_bytes: 64 * 1024,
+        },
+    ] {
+        let mut transport = CurlTransport::new(FakeCommandRunner::default());
+        assert!(transport.send(&request).is_err());
+        assert!(transport.into_runner().invocations.is_empty());
+    }
+
+    for output in [
+        CommandOutput {
+            success: true,
+            status_code: Some(0),
+            stdout: b"not HTTP\nDOCS_PARITY_COUNTS:8:0\n".to_vec(),
+        },
+        curl_output("999 Nope", &[], b""),
+        CommandOutput {
+            success: false,
+            status_code: Some(7),
+            stdout: Vec::new(),
+        },
+    ] {
+        let runner = FakeCommandRunner {
+            outputs: vec![Ok(output)].into(),
+            invocations: Vec::new(),
+        };
+        let mut transport = CurlTransport::new(runner);
+        let request = ExternalRequest {
+            method: "HEAD".to_owned(),
+            url: "https://docs.example.com/".to_owned(),
+            timeout_seconds: 15,
+            maximum_body_bytes: 64 * 1024,
+        };
+        assert!(transport.send(&request).is_err());
+    }
+}
+
+#[test]
+fn production_command_runner_stops_reading_at_the_stdout_bound() {
+    let mut runner = ProcessCommandRunner;
+    let arguments = [
+        "-c".to_owned(),
+        "while :; do printf 1234567890; done".to_owned(),
+    ];
+
+    let error = runner
+        .run("sh", &arguments, 32)
+        .expect_err("unbounded stdout must be terminated");
+
+    assert!(error.contains("stdout exceeds 32 bytes"));
+}
+
+#[test]
+fn external_response_header_and_body_bounds_fail_closed() {
+    let source = "[site](https://docs.example.com/)\n";
+    let mut cases = Vec::new();
+
+    let mut too_many = BTreeMap::new();
+    for index in 0..129 {
+        too_many.insert(format!("x-{index}"), "ok".to_owned());
+    }
+    cases.push(ExternalResponse {
+        status: 200,
+        headers: too_many,
+        header_bytes: 1024,
+        body_bytes: 0,
+    });
+    cases.push(ExternalResponse {
+        status: 200,
+        headers: BTreeMap::from([("x".repeat(257), "ok".to_owned())]),
+        header_bytes: 1024,
+        body_bytes: 0,
+    });
+    cases.push(ExternalResponse {
+        status: 200,
+        headers: BTreeMap::from([("x-test".to_owned(), "x".repeat(8 * 1024 + 1))]),
+        header_bytes: 16 * 1024,
+        body_bytes: 0,
+    });
+    cases.push(ExternalResponse {
+        status: 200,
+        headers: BTreeMap::new(),
+        header_bytes: 64 * 1024 + 1,
+        body_bytes: 0,
+    });
+    cases.push(ExternalResponse {
+        status: 200,
+        headers: BTreeMap::new(),
+        header_bytes: 32,
+        body_bytes: 64 * 1024 + 1,
+    });
+    cases.push(ExternalResponse {
+        status: 200,
+        headers: BTreeMap::from([("bad name".to_owned(), "ok".to_owned())]),
+        header_bytes: 32,
+        body_bytes: 0,
+    });
+    cases.push(ExternalResponse {
+        status: 200,
+        headers: BTreeMap::from([("x".repeat(256), "v".repeat(8 * 1024 - 255))]),
+        header_bytes: 16 * 1024,
+        body_bytes: 0,
+    });
+
+    for response in cases {
+        let (error, _, _) = external_error(source, vec![response]);
+        assert!(
+            error.contains("header") || error.contains("body"),
+            "bound failure must be specific: {error}"
+        );
+    }
+}
+
+#[test]
 fn external_exceptions_are_exact_typed_owned_and_expiring() {
     let sources = [source(
         "README.md",
@@ -560,5 +1035,176 @@ fn unlisted_orphan_and_missing_diagram_prose_fail_closed() {
     .expect("should break diagram prose record");
     let diagram = repository.check();
     assert_eq!(status_code(&diagram), ERROR);
-    assert!(diagnostic(&diagram).contains("missing prose anchor"));
+    assert!(diagnostic(&diagram).contains("missing prose heading"));
+}
+
+#[test]
+fn typed_page_tombstones_are_exact_and_require_live_replacements() {
+    let repository = PublicationRepository::new();
+    let pages_path = repository
+        .path()
+        .join("tools/docs-parity/manifests/pages.toml");
+    let pages = fs::read_to_string(&pages_path).expect("should read pages manifest");
+    let typed_pages = pages
+        + concat!(
+            "\n[[pages]]\n",
+            "kind = \"tombstone\"\n",
+            "route = \"/retired\"\n",
+            "replacement = \"/guide/\"\n",
+        );
+    fs::write(&pages_path, typed_pages).expect("should write typed page manifest");
+    write_file(
+        repository.path(),
+        "tools/docs-parity/manifests/orphans.toml",
+        concat!(
+            "version = 1\nreviewed = true\n\n",
+            "[[exceptions]]\n",
+            "kind = \"tombstone\"\n",
+            "route = \"/retired\"\n",
+            "replacement = \"/guide/\"\n",
+            "owner = \"docs-team\"\n",
+            "reason = \"Route retained for a bounded migration.\"\n",
+            "expires_at = \"2099-01-01T00:00:00Z\"\n",
+        ),
+    );
+
+    let clean = repository.check();
+    assert_eq!(
+        status_code(&clean),
+        SUCCESS,
+        "matching typed tombstone should pass: {}",
+        diagnostic(&clean)
+    );
+
+    let orphans_path = repository
+        .path()
+        .join("tools/docs-parity/manifests/orphans.toml");
+    let orphans = fs::read_to_string(&orphans_path).expect("should read orphans");
+    fs::write(&orphans_path, orphans.replace("/retired", "/extra-retired"))
+        .expect("should make tombstone inventories differ");
+    let mismatch = repository.check();
+    assert_eq!(status_code(&mismatch), ERROR);
+    assert!(diagnostic(&mismatch).contains("tombstone inventory mismatch"));
+}
+
+#[test]
+fn tombstones_reject_live_collisions_missing_replacements_and_stale_targets() {
+    for tombstone in [
+        "kind = \"tombstone\"\nroute = \"/guide/\"\nreplacement = \"/\"\n",
+        "kind = \"tombstone\"\nroute = \"/retired\"\n",
+        "kind = \"tombstone\"\nroute = \"/retired\"\nreplacement = \"/missing\"\n",
+    ] {
+        let repository = PublicationRepository::new();
+        let pages_path = repository
+            .path()
+            .join("tools/docs-parity/manifests/pages.toml");
+        let pages = fs::read_to_string(&pages_path).expect("should read pages");
+        let typed_pages = pages + &format!("\n[[pages]]\n{tombstone}");
+        fs::write(&pages_path, typed_pages).expect("should write pages");
+
+        let result = repository.check();
+        assert_eq!(status_code(&result), ERROR, "{tombstone} must fail");
+    }
+
+    let repository = PublicationRepository::new();
+    let pages_path = repository
+        .path()
+        .join("tools/docs-parity/manifests/pages.toml");
+    let pages = fs::read_to_string(&pages_path).expect("should read pages");
+    fs::write(
+        &pages_path,
+        pages
+            + concat!(
+                "\n[[pages]]\nkind = \"tombstone\"\nroute = \"/retired\"\n",
+                "replacement = \"/\"\n\n",
+                "[[pages]]\nkind = \"tombstone\"\nroute = \"/retired\"\n",
+                "replacement = \"/guide/\"\n",
+            ),
+    )
+    .expect("should write duplicate tombstones");
+    let duplicate = repository.check();
+    assert_eq!(status_code(&duplicate), ERROR);
+    assert!(
+        diagnostic(&duplicate).contains("duplicate tombstone page"),
+        "duplicate routes must fail before inventory comparison: {}",
+        diagnostic(&duplicate)
+    );
+}
+
+#[test]
+fn mermaid_inventory_uses_semantic_exact_and_closed_fences() {
+    for replacement in [
+        "```mermaid-extra\ngraph TD\n```",
+        "```mermaid {}\ngraph TD\n```",
+        "```mermaid {naked}\ngraph TD\n```",
+        "```mermaid {#}\ngraph TD\n```",
+        "```mermaid\ngraph TD",
+        "```mermaid\ngraph TD\n~~~",
+    ] {
+        let repository = PublicationRepository::new();
+        let guide_path = repository.path().join("docs/guide/index.md");
+        let guide = fs::read_to_string(&guide_path).expect("should read guide");
+        fs::write(
+            &guide_path,
+            guide.replace("```mermaid\ngraph TD\n```", replacement),
+        )
+        .expect("should replace diagram fence");
+
+        let result = repository.check();
+        assert_eq!(status_code(&result), ERROR, "{replacement} must fail");
+        assert!(diagnostic(&result).contains("mermaid"));
+    }
+
+    let repository = PublicationRepository::new();
+    let guide_path = repository.path().join("docs/guide/index.md");
+    let guide = fs::read_to_string(&guide_path).expect("should read guide");
+    fs::write(
+        &guide_path,
+        guide.replace(
+            "```mermaid",
+            "``` mermaid {#flow-diagram .wide data-role=flow}",
+        ),
+    )
+    .expect("should add supported fence attributes");
+    let valid = repository.check();
+    assert_eq!(
+        status_code(&valid),
+        SUCCESS,
+        "valid mermaid attributes should pass: {}",
+        diagnostic(&valid)
+    );
+}
+
+#[test]
+fn diagram_prose_must_be_a_heading_not_an_arbitrary_html_anchor() {
+    let repository = PublicationRepository::new();
+    write_file(
+        repository.path(),
+        "docs/guide/index.md",
+        "# Guide\n<a id=\"flow\"></a>\n```mermaid\ngraph TD\n```\n",
+    );
+
+    let result = repository.check();
+
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("prose heading"));
+}
+
+#[test]
+fn pages_manifest_is_bounded_before_deserialization() {
+    let repository = PublicationRepository::new();
+    let pages_path = repository
+        .path()
+        .join("tools/docs-parity/manifests/pages.toml");
+    let pages = fs::read_to_string(&pages_path).expect("should read pages");
+    fs::write(
+        &pages_path,
+        format!("{pages}\n# {}\n", "x".repeat(4 * 1024 * 1024)),
+    )
+    .expect("should write oversized pages manifest");
+
+    let result = repository.check();
+
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("pages manifest exceeds"));
 }

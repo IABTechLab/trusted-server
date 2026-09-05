@@ -2514,58 +2514,92 @@ PY
   the expected drift exit 1. Later focused red fixtures reproduced
   repository-root link misresolution, VitePress punctuation-slug mismatch,
   and a missing Setext anchor before their individual implementations.
+- The strict-review RED matrix then failed all seven challenged surfaces:
+  relative links to classified exclusions passed; public headings used the
+  repository slug contract; multiline CommonMark links were missed and a
+  residual `%252D` encoding survived; no injectable production-command seam
+  compiled; an invalid `Xxx` HTTP weekday was honored; `pages.toml` did not
+  accept typed live/tombstone records; and `mermaid-extra`, arbitrary HTML
+  prose anchors, and oversized rendered output were accepted. The combined
+  challenged link run contained 13 passes and 14 failures; the generated
+  Markdown run contained 9 passes and one failure before implementation.
 - Generated-region fixtures cover duplicate, missing, mismatched, nested,
   unknown, and non-standalone markers; unknown records; duplicate row keys;
   wrong cell counts; deterministic row sorting; hand drift; exact CRLF and
   outside-byte preservation; exact owner identity; check-mode no-write;
   same-directory stale-stage interruption; symlink, unsafe-mode, traversal,
-  and oversized-target rejection; and byte-identical second update. The final
-  focused Markdown target contains 9 passing tests.
-- Semantic Markdown fixtures cover one dead relative link in each of the
-  repository, maintained-internal, and public sets; repository-root paths;
-  VitePress routes; queries; inline/fenced-code exclusion; inline and
-  reference links; ATX and Setext headings; duplicate heading slugs; explicit
-  anchors; strict percent-decoded fragments; tombstones; unlisted pages;
-  excluded-source links; page/navigation equality; reachability; and diagram
-  prose ownership. The live check covers 77 maintained Markdown sources:
-  42 public pages, 4 maintained-internal sources, and 31 other repository
-  sources.
+  and oversized-target rejection; and byte-identical second update. Input
+  manifests, source documents, and rendered output are each bounded to 4 MiB.
+  The final focused Markdown target contains 10 passing tests.
+- Semantic Markdown fixtures use event offsets and cover one dead relative link
+  in each active source set; multiline inline/reference/HTML destinations;
+  uppercase and non-anchor HTML tags; `href`, `id`, and `name`; autolinks and
+  images; HTML comments; indented, fenced, and inline code exclusion;
+  repository-root paths; VitePress routes; queries; invalid UTF-8 and residual
+  percent encodings; ATX and Setext headings; entities, formatting, inline
+  code, Unicode normalization, leading digits, duplicate slugs, and validated
+  explicit IDs. Public headings implement the pinned VitePress 1.6.4 shared
+  slug contract; repository and maintained-internal headings use GitHub slug
+  semantics without VitePress IDs. Classified exclusions are checked before
+  known tracked paths for relative, root, and route spellings; included
+  repository Markdown and binary targets retain their distinct behavior.
+- The live check covers 77 maintained Markdown sources: 42 public pages,
+  4 maintained-internal sources, and 31 other repository sources. The corrected
+  public table-of-contents fragment is `#build-deployment-errors`; the corrected
+  auction diagram prose selector is `system-flow-prebid-aps`.
 - `pages.toml` is exact for the 42 currently built VitePress Markdown pages
   and 38 distinct local navigation routes parsed from the checked config.
   Reachability leaves one typed manual exception,
   `docs/guide/integrations/google_tag_manager.md`, owned by
   `documentation-maintainers` and expiring 2027-03-01. `diagrams.toml` is exact
   for 13 public Mermaid blocks; every record names an existing prose heading
-  anchor and owner. No tombstone exception is currently needed.
+  anchor and owner. Page records are explicitly typed as live or tombstone;
+  the page and orphan tombstone `(route, replacement)` sets must be equal,
+  tombstone routes cannot collide with live routes, and replacements must name
+  live routes. Manual-orphan equality is checked separately. The real inventory
+  contains zero tombstones.
 - External fixtures use injected transport, clock, and sleeper seams. They
   cover all three source sets, HTTPS and credential rejection, HEAD-to-GET
   fallback only for unsupported HEAD, final status, five-redirect depth,
   loops, relative redirects, three total 429/5xx attempts, 1-second and
   2-second local delays, valid bounded delta and HTTP-date `Retry-After`,
   malformed and over-30-second fallback, request time/body bounds, retry
-  exhaustion, and exact owned/reasoned expiry at the boundary. The production
-  curl transport is reachable only through explicit
+  exhaustion, exact owned/reasoned expiry at the boundary, final non-success,
+  relative redirects, exact non-redirecting HTTPS-only curl arguments,
+  malformed command output/status, bounded headers and bodies, header
+  count/name/value/line/total limits, and production stdout termination on
+  overflow. The injected and production transports enter the same
+  redirect/retry/final-status state machine. IMF-fixdate parsing requires the
+  exact grammar plus a calendar-consistent weekday. The production curl
+  transport is reachable only through explicit
   `links --external --check`; no external network check was run or represented
   as a pull-request gate.
-- The final focused links target contains 14 passing tests. A fresh standalone
-  full suite contained 150 passing tests: 2 library unit, 35 classification,
-  19 CLI, 14 links, 9 Markdown, and 71 scanner tests. Fresh local
-  `links --local --check`, `generate --check`, and `classify --check` commands
-  exited 0 before final scanner regeneration.
-- Only the standalone dependency graph changed: `url` and its transitive
-  packages were added to `tools/docs-parity/Cargo.lock`. Root `Cargo.lock`
+- The final focused links target contains 32 passing tests. A fresh standalone
+  full suite contained 169 passing tests: 2 library unit, 35 classification,
+  19 CLI, 32 links, 10 Markdown, and 71 scanner tests. Fresh local
+  `links --local --check`, `generate --check`, `classify --check`, and
+  `scan --check` commands exited 0. Formatting and all-target clippy with
+  warnings denied also exited 0.
+- Only the standalone dependency graph changed. Direct dependencies add the
+  CommonMark event parser, HTML fragment parser, GitHub slugger, and Unicode
+  normalization support; their resolved graph adds 45 packages to
+  `tools/docs-parity/Cargo.lock`, whose SHA-256 is
+  `9c071a95ca2abeff79d198296b698ae19b85e27c794d63184e748b01f6a309c0`.
+  Root `Cargo.lock`
   remained byte-identical with SHA-256
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
-- The reviewed sensitive inventory contains 5,343 exact occurrences, 28 more
-  than Task 5. All 28 additions are the exact GitHub registry host in new
-  `registry+https` source fields introduced by the standalone `url`
-  dependency graph; every one is classed `vendor_url`. Synthetic plain `.md`
-  link inputs are assembled from split literals, so repository filenames are
-  not misclassified as vendor domains. No prior semantic finding was removed.
+- The reviewed sensitive inventory contains 5,388 exact occurrences, 45 more
+  than the pre-review Task 6 inventory. All 45 additions are the exact registry
+  host in source fields introduced by the standalone parser dependency graph;
+  every one is classed `vendor_url`. Five unchanged vendor references in the
+  corrected public page moved back one byte, and pre-existing standalone-lock
+  records moved to their regenerated exact offsets. Synthetic plain `.md` link
+  inputs are assembled from split literals, so repository filenames are not
+  misclassified as vendor domains. No prior semantic finding was removed.
   Two classification updates retained identical tracked/source hashes
   (`9d907be9...` and `d30a510e...`), and repeated scanner bootstraps retained
   sensitive-manifest SHA-256
-  `981c5a607220bc5b3b837fd1859848e0673357b492c1013e06ff262a1616ab05`
+  `1aa5de36eb9457be69873d1a060a18f2926b5241482d4638cbee752b2c7e6e08`
   with `reviewed = true`. Two generated updates were byte-stable; subsequent
   generated, scanner, classification, and local-link check commands all
   exited 0.

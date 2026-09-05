@@ -46,7 +46,7 @@ owner = "documentation-maintainers"
 [[diagrams]]
 path = "docs/guide/auction-orchestration.md"
 selector = "mermaid:1"
-prose_anchor = "system-flow-prebid--aps"
+prose_anchor = "system-flow-prebid-aps"
 owner = "documentation-maintainers"
 
 [[diagrams]]
