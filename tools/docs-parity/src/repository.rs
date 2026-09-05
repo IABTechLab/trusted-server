@@ -287,6 +287,10 @@ impl Repository {
         commit(stage.path(), &absolute)
             .change_context(RepositoryError::FileOperation)
             .attach_with(|| format!("atomic target: {}", absolute.display()))?;
+        let (_committed_file, _vacated_stage_path) = stage
+            .keep()
+            .change_context(RepositoryError::FileOperation)
+            .attach("release cleanup ownership after atomic commit")?;
 
         File::open(parent)
             .and_then(|directory| directory.sync_all())
@@ -694,6 +698,42 @@ mod tests {
             )
             .expect("portable rename should replace after the documented check boundary");
 
+        assert_eq!(
+            fs::read(target).expect("should read committed target"),
+            b"generated"
+        );
+    }
+
+    #[test]
+    fn successful_commit_releases_the_vacated_stage_path_before_cleanup() {
+        let (directory, repository, path) = repository();
+        let target = directory.path().join("record.txt");
+        fs::write(&target, b"original").expect("should write original");
+        let stage_path = RefCell::new(None);
+
+        repository
+            .replace_atomically_with_hooks(
+                &path,
+                Some(b"original"),
+                b"generated",
+                |staged| {
+                    stage_path.replace(Some(staged.to_owned()));
+                    Ok(())
+                },
+                |staged, target| {
+                    fs::rename(staged, target)?;
+                    fs::write(staged, b"peer replacement")
+                },
+            )
+            .expect("successful commit should release its old stage path");
+
+        let stage_path = stage_path
+            .into_inner()
+            .expect("should observe the unique stage path");
+        assert_eq!(
+            fs::read(stage_path).expect("peer replacement should remain"),
+            b"peer replacement"
+        );
         assert_eq!(
             fs::read(target).expect("should read committed target"),
             b"generated"

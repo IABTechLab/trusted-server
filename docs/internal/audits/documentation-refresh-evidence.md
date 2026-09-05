@@ -2587,7 +2587,13 @@ PY
   changes, but portable rename cannot condition that observation on the final
   syscall and can replace a noncooperating write made inside that window. The
   implementation and records therefore do not claim compare-and-swap or
-  protection beyond the observed precommit boundary.
+  protection beyond the observed precommit boundary. A final ownership
+  regression proved that an armed temporary-file guard could unlink a peer
+  that recreated the vacated stage pathname after the raw rename. On supported
+  Unix hosts the writer now calls `NamedTempFile::keep` only after the commit
+  closure succeeds; this releases cleanup ownership without a second rename.
+  The deterministic fixture proves the peer remains, while failed commits
+  retain armed cleanup for the writer's own stage.
 - Response fields remain in wire order rather than being collapsed into a
   map. All proxy CONNECT and informational blocks are parsed and bounded, and
   only the final response drives redirects/retries. Legal repeated Set-Cookie,
@@ -2616,9 +2622,10 @@ PY
 - Task 6's Files list and staging command were reconciled against the sorted
   union of `git diff --name-only BASE..HEAD` (with `BASE` equal to
   `53a5a9e1d42d4dc78e4583d1b5d40ebdcc9c242a`) and the final framing worktree
-  diff. The resulting 19-path set is exact: it adds the changed
-  classification, repository, and scanner implementations and removes
-  unchanged main and model implementation files. A direct
+  diff. The resulting 20-path set is exact: it adds the changed
+  classification, repository, and scanner implementations plus the updated
+  CLI regression fixture, and removes unchanged main and model implementation
+  files. A direct
   planned-versus-actual diff exited 0. The generated-region RED step now
   correctly requires the second update to produce no diff.
 - Generated-region fixtures cover duplicate, missing, mismatched, nested,
@@ -2643,8 +2650,13 @@ PY
   an explicit ID repeats an auto or explicit ID. Auto headings still receive
   duplicate suffixes. Whole-string Unicode default lowercase conversion
   includes the Final_Sigma cased/case-ignorable context: `ΟΣ`, mixed sigma,
-  and combining-mark fixtures match the pinned renderer. Repository and
-  maintained-internal headings use GitHub
+  and combining-mark fixtures match the pinned renderer. The special-character
+  pass uses the exact ECMAScript whitespace set rather than Rust Unicode
+  whitespace: U+FEFF becomes a separator while U+0085 remains content after
+  the pinned control removal. Public heading title collection joins only text
+  and inline-code token content, so soft and hard breaks in multiline Setext
+  headings add no separator. Repository and maintained-internal headings use
+  GitHub
   title/slug semantics, including image alt text, without VitePress IDs.
   Query strings receive the same strict single decoding as paths and fragments,
   even though they do not participate in path resolution. Classified
@@ -2688,9 +2700,9 @@ PY
   transport is reachable only through explicit
   `links --external --check`; no external network check was run or represented
   as a pull-request gate.
-- The final focused links target contains 55 passing tests. Repeated default-
-  parallel standalone full suites each contained 207 passing tests: 16 library
-  unit, 35 classification, 19 CLI, 55 links, 11 Markdown, and 71 scanner
+- The final focused links target contains 57 passing tests. Repeated default-
+  parallel standalone full suites each contained 210 passing tests: 17 library
+  unit, 35 classification, 19 CLI, 57 links, 11 Markdown, and 71 scanner
   tests. Fresh local
   `links --local --check`, `generate --check`, `classify --check`, and
   `scan --check` commands exited 0. Formatting and all-target clippy with

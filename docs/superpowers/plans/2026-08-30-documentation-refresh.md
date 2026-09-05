@@ -370,11 +370,12 @@ separately checked.
 - [ ] **Step 3: Write set-specific Markdown tests**
 
 Add one dead-link fixture for each active set; include missing relative files,
-missing anchors, duplicate headings, contextual Unicode lowercasing,
-percent-encoded fragments, tombstone routes, an unlisted orphan, a built page
-that links to an excluded source, and bounded typed VitePress frontmatter with
-hero/action/feature targets, string/src/light-and-dark image variants, and
-configured/default public-asset resolution.
+missing anchors, duplicate headings, contextual Unicode lowercasing, exact
+ECMAScript whitespace, public soft/hard-break omission, percent-encoded
+fragments, tombstone routes, an unlisted orphan, a built page that links to an
+excluded source, and bounded typed VitePress frontmatter with hero/action/
+feature targets, string/src/light-and-dark image variants, and configured/
+default public-asset resolution.
 
 - [ ] **Step 4: Implement local and external link contracts**
 

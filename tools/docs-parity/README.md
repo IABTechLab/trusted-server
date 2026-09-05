@@ -109,11 +109,11 @@ shapes; both theme targets enter the same checker. Root assets resolve only
 through the configured literal `publicDir` or VitePress's `docs/public`
 default and must be regular, non-symlink repository files. Public headings use
 the VitePress 1.6.4 `@mdit-vue/shared` slug contract, including contextual
-Unicode lowercase conversion;
-their title extraction ignores image alt text, and colliding explicit IDs fail
-instead of receiving an automatic suffix. Repository and maintained-internal
-headings use GitHub title and slug behavior. Code and HTML comments do not
-create destinations. The check also rejects links to excluded
+Unicode lowercase conversion and the exact ECMAScript whitespace set. Their
+title extraction ignores image alt text plus soft and hard break events, and
+colliding explicit IDs fail instead of receiving an automatic suffix.
+Repository and maintained-internal headings use GitHub title and slug behavior.
+Code and HTML comments do not create destinations. The check also rejects links to excluded
 sources, validates the exact live-page and typed-tombstone inventories against
 navigation and orphan records, proves live-page reachability, and requires an
 owned prose heading for every exact semantic Mermaid fence. All three

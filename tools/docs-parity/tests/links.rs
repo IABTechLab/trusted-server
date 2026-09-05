@@ -645,6 +645,52 @@ fn vitepress_unicode_lowercase_uses_contextual_final_sigma() {
 }
 
 #[test]
+fn vitepress_slugging_uses_ecmascript_whitespace_not_rust_unicode_whitespace() {
+    let extension = "md";
+    let bom_target = source("docs/guide/bom.md", LinkSourceSet::Public, "# A\u{feff}B\n");
+    let c1_target = source("docs/guide/c1.md", LinkSourceSet::Public, "# A\u{0085}B\n");
+    let correct = source(
+        "docs/guide/source.md",
+        LinkSourceSet::Public,
+        &format!("[bom](bom.{extension}#a-b)\n[c1](c1.{extension}#a%C2%85b)\n"),
+    );
+    check_local_links(&[correct, bom_target.clone(), c1_target.clone()], &[], &[])
+        .expect("VitePress whitespace should match ECMAScript regular-expression semantics");
+
+    for (target_name, wrong_fragment, target) in
+        [("bom", "a%EF%BB%BFb", bom_target), ("c1", "a-b", c1_target)]
+    {
+        let wrong = source(
+            "docs/guide/source.md",
+            LinkSourceSet::Public,
+            &format!("[wrong]({target_name}.{extension}#{wrong_fragment})\n"),
+        );
+        assert!(
+            check_local_links(&[wrong, target], &[], &[]).is_err(),
+            "non-VitePress whitespace anchor must stay dead: {wrong_fragment}"
+        );
+    }
+}
+
+#[test]
+fn vitepress_heading_text_omits_soft_and_hard_break_events() {
+    let target_name = format!("target.{}", "md");
+    let target = source(
+        "docs/guide/target.md",
+        LinkSourceSet::Public,
+        "Foo\nBar\n---\n\nHard  \nBreak\n---\n",
+    );
+    let links = source(
+        "docs/guide/source.md",
+        LinkSourceSet::Public,
+        &format!("[soft]({target_name}#foobar)\n[hard]({target_name}#hardbreak)\n"),
+    );
+
+    check_local_links(&[links, target], &[], &[])
+        .expect("VitePress token text should join heading text and code without break content");
+}
+
+#[test]
 fn vitepress_heading_text_ignores_image_alt_but_keeps_rendered_inline_text() {
     let target_name = format!("target.{}", "md");
     let target = source(
@@ -1396,7 +1442,7 @@ fn curl_transport_rejects_duplicate_security_headers_and_malformed_intermediate_
                     maximum_body_bytes: 64 * 1024,
                 })
                 .is_err(),
-            "duplicate singleton must fail: {headers:?}"
+            "duplicate policy/security-rejected header must fail: {headers:?}"
         );
     }
 

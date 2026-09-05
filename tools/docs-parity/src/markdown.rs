@@ -1141,9 +1141,7 @@ fn parse_markdown(
                     .push_str(&value);
             }
             Event::SoftBreak | Event::HardBreak
-                if heading.as_ref().is_some_and(|current| {
-                    set != LinkSourceSet::Public || current.image_depth == 0
-                }) =>
+                if set != LinkSourceSet::Public && heading.is_some() =>
             {
                 heading
                     .as_mut()
@@ -1609,7 +1607,7 @@ fn unicode_property(property: &Regex, character: char) -> bool {
 }
 
 fn vitepress_special(character: char) -> bool {
-    character.is_whitespace()
+    ecmascript_whitespace(character)
         || matches!(
             character,
             '~' | '`'
@@ -1648,6 +1646,23 @@ fn vitepress_special(character: char) -> bool {
                 | '?'
                 | '/'
         )
+}
+
+const fn ecmascript_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
 }
 
 fn parse_html_fragment(
