@@ -840,10 +840,15 @@ fn check_local_destination(
         .map_or((destination, None), |(path, fragment)| {
             (path, Some(fragment))
         });
-    let raw_path = without_fragment
+    let (raw_path, raw_query) = without_fragment
         .split_once('?')
-        .map_or(without_fragment, |(path, _query)| path);
+        .map_or((without_fragment, None), |(path, query)| {
+            (path, Some(query))
+        });
     let path = strict_percent_decode(raw_path, &source.path)?;
+    raw_query
+        .map(|query| strict_percent_decode(query, &source.path))
+        .transpose()?;
     let fragment = raw_fragment
         .map(|value| strict_percent_decode(value, &source.path))
         .transpose()?;
@@ -1058,37 +1063,68 @@ fn parse_markdown(
                 heading = Some(HeadingState {
                     text: String::new(),
                     explicit_id: id.map(pulldown_cmark::CowStr::into_string),
+                    image_depth: 0,
                 });
             }
             Event::End(TagEnd::Heading(_level)) => {
                 let current = heading
                     .take()
                     .ok_or_else(|| local_error(format!("{path} closes an unopened heading")))?;
+                if current.image_depth != 0 {
+                    return Err(local_error(format!(
+                        "{path} closes a heading inside an image"
+                    )));
+                }
                 let slug = slugs.slug(path, &current.text, current.explicit_id.as_deref())?;
                 anchors.insert(slug.clone());
                 heading_anchors.insert(slug);
             }
-            Event::Text(value) | Event::Code(value) if heading.is_some() => {
+            Event::Text(value) | Event::Code(value)
+                if heading.as_ref().is_some_and(|current| {
+                    set != LinkSourceSet::Public || current.image_depth == 0
+                }) =>
+            {
                 heading
                     .as_mut()
                     .expect("heading should be present")
                     .text
                     .push_str(&value);
             }
-            Event::SoftBreak | Event::HardBreak if heading.is_some() => {
+            Event::SoftBreak | Event::HardBreak
+                if heading.as_ref().is_some_and(|current| {
+                    set != LinkSourceSet::Public || current.image_depth == 0
+                }) =>
+            {
                 heading
                     .as_mut()
                     .expect("heading should be present")
                     .text
                     .push(' ');
             }
-            Event::Start(Tag::Link { dest_url, .. })
-            | Event::Start(Tag::Image { dest_url, .. }) => {
+            Event::Start(Tag::Link { dest_url, .. }) => {
                 links.push(ParsedLink {
                     destination: dest_url.into_string(),
                     start: range.start,
                     end: range.end,
                 });
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                links.push(ParsedLink {
+                    destination: dest_url.into_string(),
+                    start: range.start,
+                    end: range.end,
+                });
+                if set == LinkSourceSet::Public
+                    && let Some(current) = &mut heading
+                {
+                    current.image_depth += 1;
+                }
+            }
+            Event::End(TagEnd::Image) if set == LinkSourceSet::Public && heading.is_some() => {
+                let current = heading.as_mut().expect("heading should be present");
+                current.image_depth = current.image_depth.checked_sub(1).ok_or_else(|| {
+                    local_error(format!("{path} closes an unopened heading image"))
+                })?;
             }
             Event::Html(value) | Event::InlineHtml(value) => {
                 parse_html_fragment(
@@ -1144,6 +1180,7 @@ fn parse_markdown(
 struct HeadingState {
     text: String,
     explicit_id: Option<String>,
+    image_depth: usize,
 }
 
 enum HeadingSlugs {
@@ -1168,18 +1205,17 @@ impl HeadingSlugs {
     ) -> Result<String, Report<MarkdownError>> {
         let slug = match self {
             Self::Vitepress(seen) => {
-                let base = if let Some(identifier) = explicit_id {
+                if let Some(identifier) = explicit_id {
                     validate_explicit_heading_id(path, identifier)?;
-                    identifier.to_owned()
+                    seen.claim_explicit(path, identifier)?
                 } else {
                     if heading.contains("{#") {
                         return Err(local_error(format!(
                             "{path} has an invalid explicit heading id"
                         )));
                     }
-                    vitepress_slugify(heading)
-                };
-                seen.unique(&base)
+                    seen.unique(&vitepress_slugify(heading))
+                }
             }
             Self::Github(slugger) => slugger.slug(heading),
         };
@@ -1205,6 +1241,19 @@ impl UniqueSlugs {
         }
         self.seen.insert(candidate.clone());
         candidate
+    }
+
+    fn claim_explicit(
+        &mut self,
+        path: &str,
+        identifier: &str,
+    ) -> Result<String, Report<MarkdownError>> {
+        if !self.seen.insert(identifier.to_owned()) {
+            return Err(local_error(format!(
+                "{path} has duplicate explicit heading id: {identifier}"
+            )));
+        }
+        Ok(identifier.to_owned())
     }
 }
 
@@ -2502,6 +2551,7 @@ impl<R: CommandRunner> ExternalTransport for CurlTransport<R> {
     fn send(&mut self, request: &ExternalRequest) -> Result<ExternalResponse, String> {
         validate_transport_request(request)?;
         let mut arguments = [
+            "--disable".to_owned(),
             "--silent".to_owned(),
             "--show-error".to_owned(),
             "--proto".to_owned(),
@@ -2654,11 +2704,7 @@ fn parse_curl_header_block(block: &str) -> Result<(u16, BTreeMap<String, String>
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "curl header line is malformed".to_owned())?;
-        if name.len() > MAXIMUM_HEADER_NAME_BYTES
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
+        if name.len() > MAXIMUM_HEADER_NAME_BYTES || !valid_header_name(name) {
             return Err("curl header name is malformed".to_owned());
         }
         let name = name.to_ascii_lowercase();
@@ -2883,9 +2929,7 @@ fn validate_response_headers(
             name.len() > MAXIMUM_HEADER_NAME_BYTES
                 || value.len() > MAXIMUM_HEADER_VALUE_BYTES
                 || name.len() + value.len() + 4 > MAXIMUM_HEADER_LINE_BYTES
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !valid_header_name(name)
                 || value.chars().any(char::is_control)
         })
     {
@@ -2895,6 +2939,30 @@ fn validate_response_headers(
         return Err(external_error("response body exceeds bound"));
     }
     Ok(())
+}
+
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn retry_after_seconds(value: &str, now_seconds: u64) -> Option<u64> {

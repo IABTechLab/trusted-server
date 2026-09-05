@@ -399,7 +399,7 @@ Expected: focused tests and current local repository checks pass; external netwo
 
 ```bash
 git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/markdown.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/tests/markdown.rs tools/docs-parity/tests/links.rs docs/guide/error-reference.md docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/internal/audits/documentation-refresh-evidence.md
-git commit -m "Harden documentation Markdown contracts"
+git commit -m "Close Markdown transport review gaps"
 ```
 
 ### Task 7: Extract settings semantics and execute the example harness

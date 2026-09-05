@@ -2523,6 +2523,14 @@ PY
   prose anchors, and oversized rendered output were accepted. The combined
   challenged link run contained 13 passes and 14 failures; the generated
   Markdown run contained 9 passes and one failure before implementation.
+- A subsequent focused re-review began with 32 passing and five failing link
+  fixtures. Those failures proved that image alt text incorrectly entered
+  public heading titles, explicit-ID collisions were suffixed, curl could read
+  ambient configuration, ignored query bytes escaped strict decoding, and the
+  header-name grammar both admitted empty names and rejected valid token
+  punctuation. Each fixture passed after its isolated correction. The curl
+  isolation fixture uses a temporary `CURL_HOME`, a visible `.curlrc` control
+  side effect, and a local file URL; it performs no network request.
 - Generated-region fixtures cover duplicate, missing, mismatched, nested,
   unknown, and non-standalone markers; unknown records; duplicate row keys;
   wrong cell counts; deterministic row sorting; hand drift; exact CRLF and
@@ -2539,8 +2547,13 @@ PY
   percent encodings; ATX and Setext headings; entities, formatting, inline
   code, Unicode normalization, leading digits, duplicate slugs, and validated
   explicit IDs. Public headings implement the pinned VitePress 1.6.4 shared
-  slug contract; repository and maintained-internal headings use GitHub slug
-  semantics without VitePress IDs. Classified exclusions are checked before
+  title/slug contract, including omitted image alt text and hard failure when
+  an explicit ID repeats an auto or explicit ID. Auto headings still receive
+  duplicate suffixes. Repository and maintained-internal headings use GitHub
+  title/slug semantics, including image alt text, without VitePress IDs.
+  Query strings receive the same strict single decoding as paths and fragments,
+  even though they do not participate in path resolution. Classified
+  exclusions are checked before
   known tracked paths for relative, root, and route spellings; included
   repository Markdown and binary targets retain their distinct behavior.
 - The live check covers 77 maintained Markdown sources: 42 public pages,
@@ -2566,17 +2579,19 @@ PY
   malformed and over-30-second fallback, request time/body bounds, retry
   exhaustion, exact owned/reasoned expiry at the boundary, final non-success,
   relative redirects, exact non-redirecting HTTPS-only curl arguments,
-  malformed command output/status, bounded headers and bodies, header
+  with `--disable` as the first argument, malformed command output/status,
+  bounded headers and bodies, nonempty RFC field-name tokens, header
   count/name/value/line/total limits, and production stdout termination on
-  overflow. The injected and production transports enter the same
+  overflow. The injected and production transports share the header validator
+  and enter the same
   redirect/retry/final-status state machine. IMF-fixdate parsing requires the
   exact grammar plus a calendar-consistent weekday. The production curl
   transport is reachable only through explicit
   `links --external --check`; no external network check was run or represented
   as a pull-request gate.
-- The final focused links target contains 32 passing tests. A fresh standalone
-  full suite contained 169 passing tests: 2 library unit, 35 classification,
-  19 CLI, 32 links, 10 Markdown, and 71 scanner tests. Fresh local
+- The final focused links target contains 37 passing tests. A fresh standalone
+  full suite contained 174 passing tests: 2 library unit, 35 classification,
+  19 CLI, 37 links, 10 Markdown, and 71 scanner tests. Fresh local
   `links --local --check`, `generate --check`, `classify --check`, and
   `scan --check` commands exited 0. Formatting and all-target clippy with
   warnings denied also exited 0.

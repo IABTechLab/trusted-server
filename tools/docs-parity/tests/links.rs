@@ -373,6 +373,68 @@ fn public_and_repository_heading_slugs_follow_their_renderers() {
 }
 
 #[test]
+fn vitepress_heading_text_ignores_image_alt_but_keeps_rendered_inline_text() {
+    let target_name = format!("target.{}", "md");
+    let target = source(
+        "docs/guide/target.md",
+        LinkSourceSet::Public,
+        concat!(
+            "# Before ![alt](https://example.invalid/image.png) After\n",
+            "# **Bold** [linked](https://example.invalid/) `code` _after_\n",
+        ),
+    );
+    let links = source(
+        "docs/guide/source.md",
+        LinkSourceSet::Public,
+        &format!(
+            "[image heading]({target_name}#before-after)\n[inline text]({target_name}#bold-linked-code-after)\n"
+        ),
+    );
+
+    check_local_links(&[links, target], &[], &[])
+        .expect("heading text should match the pinned VitePress renderer");
+
+    let repository_target = source(
+        "notes/target.md",
+        LinkSourceSet::Repository,
+        "# Before ![alt](https://example.invalid/image.png) After\n",
+    );
+    let repository_source = source(
+        "README.md",
+        LinkSourceSet::Repository,
+        "[image heading](notes/target.md#before-alt-after)\n",
+    );
+    check_local_links(&[repository_source, repository_target], &[], &[])
+        .expect("GitHub heading text should retain image alt text");
+}
+
+#[test]
+fn vitepress_explicit_heading_ids_reject_collisions_without_auto_suffixing() {
+    for markdown in ["# Foo\n# Bar {#foo}\n", "# Bar {#foo}\n# Baz {#foo}\n"] {
+        let target = source("docs/guide/target.md", LinkSourceSet::Public, markdown);
+        let error = local_error(&[target]);
+        assert!(
+            error.contains("duplicate explicit heading id"),
+            "explicit collision must fail: {error}"
+        );
+    }
+
+    let target_name = format!("target.{}", "md");
+    let target = source(
+        "docs/guide/target.md",
+        LinkSourceSet::Public,
+        "# Bar {#foo}\n# Foo\n",
+    );
+    let links = source(
+        "docs/guide/source.md",
+        LinkSourceSet::Public,
+        &format!("[custom]({target_name}#foo) [auto]({target_name}#foo-1)\n"),
+    );
+    check_local_links(&[links, target], &[], &[])
+        .expect("an auto heading after a custom ID should receive a suffix");
+}
+
+#[test]
 fn invalid_explicit_heading_ids_fail_closed() {
     let target = source(
         "docs/guide/target.md",
@@ -455,6 +517,33 @@ fn percent_decoding_rejects_invalid_utf8_and_residual_encoded_octets() {
         ];
         let error = local_error(&sources);
         assert!(error.contains("percent"), "{fragment} must fail: {error}");
+    }
+}
+
+#[test]
+fn query_percent_encoding_is_validated_with_one_strict_decode() {
+    let target = format!("target.{}", "md");
+    let valid = [
+        source(
+            "docs/guide/source.md",
+            LinkSourceSet::Public,
+            &format!("[valid]({target}?next=%2Fguide%2F#target)\n"),
+        ),
+        source("docs/guide/target.md", LinkSourceSet::Public, "# Target\n"),
+    ];
+    check_local_links(&valid, &[], &[]).expect("one encoded query pass should be valid");
+
+    for query in ["bad=%ZZ", "bad=%", "bad=%FF", "bad=%252F"] {
+        let sources = [
+            source(
+                "docs/guide/source.md",
+                LinkSourceSet::Public,
+                &format!("[invalid]({target}?{query}#target)\n"),
+            ),
+            source("docs/guide/target.md", LinkSourceSet::Public, "# Target\n"),
+        ];
+        let error = local_error(&sources);
+        assert!(error.contains("percent"), "{query} must fail: {error}");
     }
 }
 
@@ -790,6 +879,7 @@ fn curl_transport_uses_exact_bounded_nonredirecting_arguments_and_counts_bytes()
     assert_eq!(
         arguments,
         &[
+            "--disable",
             "--silent",
             "--show-error",
             "--proto",
@@ -887,6 +977,102 @@ fn production_command_runner_stops_reading_at_the_stdout_bound() {
         .expect_err("unbounded stdout must be terminated");
 
     assert!(error.contains("stdout exceeds 32 bytes"));
+}
+
+#[test]
+fn curl_disable_first_ignores_ambient_curlrc_without_network_access() {
+    let directory = tempfile::tempdir().expect("should create curl home");
+    let payload = directory.path().join("payload.txt");
+    let side_effect = directory.path().join("curlrc-output.txt");
+    fs::write(&payload, "local payload").expect("should write local payload");
+    fs::write(
+        directory.path().join(".curlrc"),
+        format!("output = \"{}\"\n", side_effect.display()),
+    )
+    .expect("should write isolated curl config");
+    let url = format!("file://{}", payload.display());
+
+    let control = Command::new("curl")
+        .env("CURL_HOME", directory.path())
+        .args(["--silent", "--show-error", "--url", &url])
+        .output()
+        .expect("should execute curl control");
+    assert!(control.status.success());
+    assert_eq!(
+        fs::read_to_string(&side_effect).expect("curlrc should affect control"),
+        "local payload"
+    );
+    fs::remove_file(&side_effect).expect("should reset bounded fixture side effect");
+
+    let isolated = Command::new("curl")
+        .env("CURL_HOME", directory.path())
+        .args(["--disable", "--silent", "--show-error", "--url", &url])
+        .output()
+        .expect("should execute isolated curl");
+    assert!(isolated.status.success());
+    assert_eq!(isolated.stdout, b"local payload");
+    assert!(!side_effect.exists(), "--disable must ignore .curlrc");
+}
+
+#[test]
+fn response_header_names_use_the_complete_nonempty_rfc_token_grammar() {
+    let source = "[site](https://docs.example.invalid/)\n";
+    let valid_name = "x!#$%&'*+-.^_`|~";
+    let valid = ExternalResponse {
+        status: 200,
+        headers: BTreeMap::from([(valid_name.to_owned(), "ok".to_owned())]),
+        header_bytes: 64,
+        body_bytes: 0,
+    };
+    let sources = [self::source("README.md", LinkSourceSet::Repository, source)];
+    let mut transport = FakeTransport {
+        responses: vec![valid].into(),
+        requests: Vec::new(),
+    };
+    let mut sleeper = FakeSleeper::default();
+    check_external_links(&sources, &[], 0, &mut transport, &mut sleeper)
+        .expect("every RFC field-name token character should be accepted");
+
+    for name in ["", "bad name", "bad\u{0001}name", "tést"] {
+        let response = ExternalResponse {
+            status: 200,
+            headers: BTreeMap::from([(name.to_owned(), "ok".to_owned())]),
+            header_bytes: 64,
+            body_bytes: 0,
+        };
+        let (error, _, _) = external_error(source, vec![response]);
+        assert!(error.contains("header"), "{name:?} must fail: {error}");
+    }
+
+    for name in ["", "bad name", "bad\u{0001}name", "tést"] {
+        let runner = FakeCommandRunner {
+            outputs: vec![Ok(curl_output("200 OK", &[(name, "value")], b""))].into(),
+            invocations: Vec::new(),
+        };
+        let mut transport = CurlTransport::new(runner);
+        let request = ExternalRequest {
+            method: "HEAD".to_owned(),
+            url: "https://docs.example.invalid/".to_owned(),
+            timeout_seconds: 15,
+            maximum_body_bytes: 64 * 1024,
+        };
+        assert!(transport.send(&request).is_err(), "{name:?} must fail");
+    }
+
+    let runner = FakeCommandRunner {
+        outputs: vec![Ok(curl_output("200 OK", &[(valid_name, "value")], b""))].into(),
+        invocations: Vec::new(),
+    };
+    let mut transport = CurlTransport::new(runner);
+    let request = ExternalRequest {
+        method: "HEAD".to_owned(),
+        url: "https://docs.example.invalid/".to_owned(),
+        timeout_seconds: 15,
+        maximum_body_bytes: 64 * 1024,
+    };
+    transport
+        .send(&request)
+        .expect("curl parsing should accept the same RFC token grammar");
 }
 
 #[test]
