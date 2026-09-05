@@ -638,6 +638,7 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Set
         .collect::<BTreeSet<_>>();
     require_equal("companion source set", &actual_sources, &expected_sources)?;
 
+    let mut schemas = Vec::new();
     for (source_path, required_type) in SOURCE_TYPES {
         let source = read_repository_text(repository, source_path, true)?;
         let schema = extract_schema(source_path, &source, &companions)?;
@@ -678,13 +679,19 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Set
             .collect::<BTreeSet<_>>();
             require_equal("Settings root field set", &actual, &expected)?;
         }
+        schemas.push(schema);
     }
 
-    check_field_dispositions(&companions)?;
+    let alias_targets = source_alias_targets(&schemas)?;
+    verify_alias_dispositions(&companions, &alias_targets)?;
+    check_field_dispositions(&companions, &alias_targets)?;
     check_template_contract(repository, &companions)
 }
 
-fn check_field_dispositions(companions: &CompanionManifest) -> Result<(), Report<SettingsError>> {
+fn check_field_dispositions(
+    companions: &CompanionManifest,
+    aliases: &BTreeMap<String, String>,
+) -> Result<(), Report<SettingsError>> {
     let store_resolved = string_set(&[
         "DataDomeConfig.server_side_key_secret_name",
         "DataDomeProtectionTestBypassConfig.credential_secret_name",
@@ -705,16 +712,6 @@ fn check_field_dispositions(companions: &CompanionManifest) -> Result<(), Report
         "DataDomeProtectionTestBypassConfig.credential_secret_store",
         "S3SigV4AuthConfig.secret_store",
         "TinybirdSettings.secret_store",
-    ]);
-    let aliases = BTreeMap::from([
-        (
-            "AssetOriginAuth.s3_sig_v4".to_owned(),
-            "AssetOriginAuth.s3".to_owned(),
-        ),
-        (
-            "LegacyApsProviderConfig.pub_id".to_owned(),
-            "LegacyApsProviderConfig.account_id".to_owned(),
-        ),
     ]);
     let expected_paths = store_resolved
         .iter()
@@ -789,6 +786,73 @@ fn check_field_dispositions(companions: &CompanionManifest) -> Result<(), Report
         require_equal(&format!("field disposition {path}"), &actual, &expected)?;
     }
     Ok(())
+}
+
+fn source_alias_targets(
+    schemas: &[ExtractedSchema],
+) -> Result<BTreeMap<String, String>, Report<SettingsError>> {
+    let mut targets = BTreeMap::new();
+    for schema in schemas {
+        for item in &schema.types {
+            for field in &item.fields {
+                let canonical = format!("{}.{}", item.name, field.name);
+                for alias in &field.aliases {
+                    insert_source_alias(
+                        &mut targets,
+                        &format!("{}.{}", item.name, alias),
+                        canonical.clone(),
+                    )?;
+                }
+            }
+            for variant in &item.variants {
+                let canonical = format!("{}.{}", item.name, variant.name);
+                for alias in &variant.aliases {
+                    insert_source_alias(
+                        &mut targets,
+                        &format!("{}.{}", item.name, alias),
+                        canonical.clone(),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn insert_source_alias(
+    targets: &mut BTreeMap<String, String>,
+    alias: &str,
+    canonical: String,
+) -> Result<(), Report<SettingsError>> {
+    if targets.insert(alias.to_owned(), canonical).is_some() {
+        return invalid_contract(format!("duplicate source alias {alias}"));
+    }
+    Ok(())
+}
+
+fn verify_alias_dispositions(
+    companions: &CompanionManifest,
+    source_targets: &BTreeMap<String, String>,
+) -> Result<(), Report<SettingsError>> {
+    let reviewed_targets = companions
+        .fields
+        .values()
+        .filter(|field| field.key_identity == KeyIdentity::Alias)
+        .map(|field| {
+            (
+                field.path.clone(),
+                field
+                    .alias_of
+                    .clone()
+                    .expect("alias target shape was validated while parsing"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    require_equal(
+        "source-derived alias disposition set",
+        &reviewed_targets,
+        source_targets,
+    )
 }
 
 fn check_template_contract(
@@ -1001,7 +1065,7 @@ pub fn extract_schema(
     companions: &CompanionManifest,
 ) -> Result<ExtractedSchema, Report<SettingsError>> {
     let file = syn::parse_file(source).change_context(SettingsError::RustSyntax)?;
-    let literal_defaults = literal_default_functions(&file.items);
+    let literal_defaults = literal_default_functions(&file.items)?;
     let mut types = Vec::new();
     let mut discovered_companions = BTreeSet::new();
 
@@ -1009,6 +1073,9 @@ pub fn extract_schema(
         match item {
             Item::Struct(item) => {
                 let name = item.ident.to_string();
+                if !is_production_item(&item.attrs, &name)? {
+                    continue;
+                }
                 let serde = parse_serde_attributes(
                     &item.attrs,
                     &name,
@@ -1060,12 +1127,18 @@ pub fn extract_schema(
             }
             Item::Enum(item) => {
                 let name = item.ident.to_string();
+                if !is_production_item(&item.attrs, &name)? {
+                    continue;
+                }
                 let serde =
                     parse_serde_attributes(&item.attrs, &name, AttributeSite::EnumContainer)?;
                 let mut variants = Vec::new();
                 for variant in &item.variants {
                     let rust_name = variant.ident.to_string();
                     let context = format!("{name}::{rust_name}");
+                    if !is_production_item(&variant.attrs, &context)? {
+                        continue;
+                    }
                     let attributes =
                         parse_serde_attributes(&variant.attrs, &context, AttributeSite::Variant)?;
                     if attributes.skip {
@@ -1149,6 +1222,9 @@ fn extract_fields(
             .map(ToString::to_string)
             .unwrap_or_else(|| index.to_string());
         let field_context = format!("{container}.{rust_name}");
+        if !is_production_item(&field.attrs, &field_context)? {
+            continue;
+        }
         let serde = parse_serde_attributes(
             &field.attrs,
             &field_context,
@@ -1533,19 +1609,64 @@ fn parse_integer_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<i12
     }
 }
 
-fn literal_default_functions(items: &[Item]) -> BTreeMap<String, String> {
-    items
+fn literal_default_functions(
+    items: &[Item],
+) -> Result<BTreeMap<String, String>, Report<SettingsError>> {
+    let mut defaults = BTreeMap::new();
+    for item in items {
+        let Item::Fn(function) = item else {
+            continue;
+        };
+        let name = function.sig.ident.to_string();
+        if !is_production_item(&function.attrs, &name)? {
+            continue;
+        }
+        let [Stmt::Expr(expression, None)] = function.block.stmts.as_slice() else {
+            continue;
+        };
+        if let Some(value) = literal_expression(expression) {
+            defaults.insert(name, value);
+        }
+    }
+    Ok(defaults)
+}
+
+fn is_production_item(attributes: &[Attribute], item: &str) -> Result<bool, Report<SettingsError>> {
+    let conditional = attributes
         .iter()
-        .filter_map(|item| {
-            let Item::Fn(function) = item else {
-                return None;
-            };
-            let [Stmt::Expr(expression, None)] = function.block.stmts.as_slice() else {
-                return None;
-            };
-            literal_expression(expression).map(|value| (function.sig.ident.to_string(), value))
+        .filter(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if conditional.is_empty() {
+        return Ok(true);
+    }
+    if conditional.len() != 1 || !conditional[0].path().is_ident("cfg") {
+        return Err(Report::new(SettingsError::InvalidAttribute {
+            attribute: "cfg",
+            item: item.to_owned(),
+        }));
+    }
+    let syn::Meta::List(predicate) = &conditional[0].meta else {
+        return Err(Report::new(SettingsError::InvalidAttribute {
+            attribute: "cfg",
+            item: item.to_owned(),
+        }));
+    };
+    let Ok(identifier) = syn::parse2::<syn::Ident>(predicate.tokens.clone()) else {
+        return Err(Report::new(SettingsError::InvalidAttribute {
+            attribute: "cfg",
+            item: item.to_owned(),
+        }));
+    };
+    if identifier == "test" {
+        Ok(false)
+    } else {
+        Err(Report::new(SettingsError::InvalidAttribute {
+            attribute: "cfg",
+            item: item.to_owned(),
+        }))
+    }
 }
 
 fn literal_expression(expression: &Expr) -> Option<String> {
@@ -1688,5 +1809,144 @@ fn apply_variant_rename_rule(name: &str, rule: &str) -> String {
             apply_variant_rename_rule(name, "SCREAMING_SNAKE_CASE").replace('_', "-")
         }
         _ => unreachable!("validated rename rule should be complete"),
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    fn alias_manifest(rows: &[(&str, &str)]) -> CompanionManifest {
+        let mut source = "version = 1\nreviewed = true\n".to_owned();
+        for (path, target) in rows {
+            source.push_str(&format!(
+                r#"
+                [[fields]]
+                path = "{path}"
+                lifecycle = "deprecated"
+                key_identity = "alias"
+                alias_of = "{target}"
+                serialization = "skipped"
+                runtime = "deserialization_only"
+                secret = "none"
+                "#
+            ));
+        }
+        CompanionManifest::parse(&source).expect("alias fixture manifest should parse")
+    }
+
+    #[test]
+    fn source_alias_targets_cover_struct_fields_and_enum_variants() {
+        let source = r#"
+            struct FieldFixture {
+                #[serde(rename = "current", alias = "legacy")]
+                value: String,
+            }
+
+            enum AssetOriginAuth {
+                #[serde(rename = "s3_sigv4", alias = "s3_sig_v4")]
+                S3,
+            }
+        "#;
+        let schema = extract_schema("fixture.rs", source, &empty_manifest())
+            .expect("alias fixture should extract");
+        let targets = source_alias_targets(&[schema]).expect("aliases should be unique");
+        assert_eq!(
+            targets,
+            BTreeMap::from([
+                (
+                    "AssetOriginAuth.s3_sig_v4".to_owned(),
+                    "AssetOriginAuth.s3_sigv4".to_owned(),
+                ),
+                (
+                    "FieldFixture.legacy".to_owned(),
+                    "FieldFixture.current".to_owned(),
+                ),
+            ])
+        );
+        verify_alias_dispositions(
+            &alias_manifest(&[
+                ("AssetOriginAuth.s3_sig_v4", "AssetOriginAuth.s3_sigv4"),
+                ("FieldFixture.legacy", "FieldFixture.current"),
+            ]),
+            &targets,
+        )
+        .expect("reviewed alias targets should equal source-derived targets");
+    }
+
+    #[test]
+    fn alias_dispositions_reject_stale_nonexistent_and_wrong_canonical_targets() {
+        let targets = BTreeMap::from([("Fixture.legacy".to_owned(), "Fixture.current".to_owned())]);
+        for manifest in [
+            alias_manifest(&[
+                ("Fixture.legacy", "Fixture.current"),
+                ("Fixture.stale", "Fixture.current"),
+            ]),
+            alias_manifest(&[("Fixture.legacy", "Fixture.missing")]),
+            alias_manifest(&[("Fixture.legacy", "Other.current")]),
+        ] {
+            let error = verify_alias_dispositions(&manifest, &targets)
+                .expect_err("stale or incorrect alias truth must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("source-derived alias disposition set")
+            );
+        }
+    }
+
+    #[test]
+    fn source_alias_targets_reject_duplicate_aliases() {
+        let source = r#"
+            struct Fixture {
+                #[serde(alias = "legacy")]
+                first: String,
+                #[serde(alias = "legacy")]
+                second: String,
+            }
+        "#;
+        let schema = extract_schema("fixture.rs", source, &empty_manifest())
+            .expect("field extraction should retain both alias declarations");
+        let error = source_alias_targets(&[schema])
+            .expect_err("duplicate source aliases must be rejected as ambiguous");
+        assert!(error.to_string().contains("duplicate source alias"));
+    }
+
+    #[test]
+    fn alias_manifest_rejects_duplicate_paths() {
+        let source = r#"
+            version = 1
+            reviewed = true
+
+            [[fields]]
+            path = "Fixture.legacy"
+            lifecycle = "deprecated"
+            key_identity = "alias"
+            alias_of = "Fixture.current"
+            serialization = "skipped"
+            runtime = "deserialization_only"
+            secret = "none"
+
+            [[fields]]
+            path = "Fixture.legacy"
+            lifecycle = "deprecated"
+            key_identity = "alias"
+            alias_of = "Fixture.other"
+            serialization = "skipped"
+            runtime = "deserialization_only"
+            secret = "none"
+        "#;
+        let error = CompanionManifest::parse(source)
+            .expect_err("duplicate reviewed alias paths must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate field disposition path")
+        );
+    }
+
+    fn empty_manifest() -> CompanionManifest {
+        CompanionManifest::parse("version = 1\nreviewed = true\n")
+            .expect("empty fixture manifest should parse")
     }
 }

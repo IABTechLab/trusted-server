@@ -13,6 +13,91 @@ fn empty_companions() -> CompanionManifest {
         .expect("should parse empty companions")
 }
 
+#[test]
+fn production_extraction_excludes_exact_test_cfg_items_fields_and_variants() {
+    let source = r#"
+        #[cfg(test)]
+        struct TestOnly { hidden: String }
+
+        struct Live {
+            visible: String,
+            #[cfg(test)]
+            hidden: String,
+        }
+
+        enum Choice {
+            Visible,
+            #[cfg(test)]
+            Hidden,
+        }
+    "#;
+
+    let schema = extract_schema("fixture.rs", source, &empty_companions())
+        .expect("exact cfg(test) items should be excluded from production extraction");
+    assert_eq!(
+        schema
+            .types
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Live", "Choice"]
+    );
+    assert_eq!(
+        schema
+            .type_named("Live")
+            .expect("live struct")
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["visible"]
+    );
+    assert_eq!(
+        schema
+            .type_named("Choice")
+            .expect("live enum")
+            .variants
+            .iter()
+            .map(|variant| variant.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Visible"]
+    );
+}
+
+#[test]
+fn production_extraction_rejects_unsupported_or_ambiguous_cfg() {
+    for source in [
+        r#"#[cfg(feature = "optional")] struct Fixture { value: String }"#,
+        r#"#[cfg_attr(test, serde(default))] struct Fixture { value: String }"#,
+        r#"struct Fixture { #[cfg(feature = "optional")] value: String }"#,
+        r#"enum Fixture { #[cfg(any(test, feature = "optional"))] Value }"#,
+        r#"
+            struct Fixture { #[serde(default = "default_value")] value: i32 }
+            #[cfg(feature = "optional")]
+            fn default_value() -> i32 { 7 }
+        "#,
+    ] {
+        let error = extract_schema("fixture.rs", source, &empty_companions())
+            .expect_err("non-exact production cfg must fail closed");
+        assert!(
+            error.to_string().contains("invalid cfg attribute"),
+            "cfg rejection should identify the production-selection boundary: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn test_only_literal_default_functions_do_not_attest_production_defaults() {
+    let source = r#"
+        struct Fixture { #[serde(default = "default_value")] value: i32 }
+        #[cfg(test)]
+        fn default_value() -> i32 { 7 }
+    "#;
+    let error = extract_schema("fixture.rs", source, &empty_companions())
+        .expect_err("a test-only function must not resolve a production default");
+    assert!(error.to_string().contains("missing default companion"));
+}
+
 fn cargo_check_serde_fixture(source: &str) -> Output {
     let directory = tempfile::tempdir().expect("should create Serde compile fixture");
     let source_directory = directory.path().join("src");

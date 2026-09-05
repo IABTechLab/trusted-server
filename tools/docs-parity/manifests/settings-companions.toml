@@ -294,54 +294,10 @@ negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_aucti
 
 [[companions]]
 source = "crates/trusted-server-core/src/integrations/aps.rs"
-symbol = "default_endpoint"
-kind = "default"
-value = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
-positive_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_default_endpoint_default_positive"
-negative_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_default_endpoint_default_negative"
-
-[[companions]]
-source = "crates/trusted-server-core/src/integrations/aps.rs"
 symbol = "deserialize_account_id"
 kind = "deserializer"
 positive_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_positive"
 negative_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_negative"
-
-[[companions]]
-source = "crates/trusted-server-core/src/integrations/aps.rs"
-symbol = "validate_inventory_identity_override"
-kind = "validator"
-positive_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_identity_override_validator_positive"
-negative_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_identity_override_validator_negative"
-
-[[companions]]
-source = "crates/trusted-server-core/src/integrations/aps.rs"
-symbol = "validate_aps_endpoint"
-kind = "validator"
-positive_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_aps_endpoint_validator_positive"
-negative_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_aps_endpoint_validator_negative"
-
-[[companions]]
-source = "crates/trusted-server-core/src/integrations/aps.rs"
-symbol = "validate_inventory_domain"
-kind = "validator"
-positive_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_domain_validator_positive"
-negative_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_domain_validator_negative"
-
-[[companions]]
-source = "crates/trusted-server-core/src/integrations/aps.rs"
-symbol = "validate_inventory_page_origin"
-kind = "validator"
-positive_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_page_origin_validator_positive"
-negative_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_page_origin_validator_negative"
-
-[[companions]]
-source = "crates/trusted-server-core/src/integrations/prebid.rs"
-symbol = "default_bidders"
-kind = "default"
-value = "[mocktioneer]"
-positive_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_default_bidders_default_positive"
-negative_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_default_bidders_default_negative"
 
 [[companions]]
 source = "crates/trusted-server-core/src/integrations/prebid.rs"
@@ -491,16 +447,7 @@ secret = "none"
 path = "AssetOriginAuth.s3_sig_v4"
 lifecycle = "deprecated"
 key_identity = "alias"
-alias_of = "AssetOriginAuth.s3"
-serialization = "skipped"
-runtime = "deserialization_only"
-secret = "none"
-
-[[fields]]
-path = "LegacyApsProviderConfig.pub_id"
-lifecycle = "deprecated"
-key_identity = "alias"
-alias_of = "LegacyApsProviderConfig.account_id"
+alias_of = "AssetOriginAuth.s3_sigv4"
 serialization = "skipped"
 runtime = "deserialization_only"
 secret = "none"

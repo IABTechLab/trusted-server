@@ -461,6 +461,7 @@ git commit -m "Close documentation execution quality gaps"
 - Modify/Test: `crates/trusted-server-core/src/integrations/aps.rs`
 - Modify/Test: `crates/trusted-server-core/src/integrations/prebid.rs`
 - Modify/Test: `trusted-server.example.toml`
+- Modify: `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md`
 - Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
@@ -476,8 +477,11 @@ shape-changing attributes. Parse every named and indexed tuple field before
 classifying its attributes. Function-path values must be quoted `LitStr`
 values that parse as paths, matching the compiled Serde grammar; only direct
 numeric negation counts as a literal default, and named-field-only `flatten`
-must fail on tuple shapes. Expected: unclassified, site-invalid,
-malformed-path, and unsupported tuple-field behavior fails closed.
+must fail on tuple shapes. Exclude one exact `#[cfg(test)]` from production
+type, field, variant, and literal-default extraction; reject every other,
+combined, or `cfg_attr` form as unsupported production selection. Expected:
+unclassified, site-invalid, malformed-path, unsupported tuple-field, and
+ambiguous cfg behavior fails closed.
 
 - [x] **Step 2: Implement the AST plus companion chain**
 
@@ -487,7 +491,10 @@ and require equality between the AST-discovered and reviewed companion sets.
 Bind every reviewed value and unique probe name to a module-local compiled
 positive/negative receipt, with exact receipt-set equality per source. Emit
 independent lifecycle, key identity, serialization, runtime, and
-secret-handling axes; never collapse overlapping dispositions.
+secret-handling axes; never collapse overlapping dispositions. Derive every
+struct-field and enum-variant alias path and canonical serialized target from
+the production AST, and require exact equality with reviewed alias
+dispositions; stale, missing, wrong-target, and duplicate aliases fail.
 
 - [x] **Step 3: Write the eight-phase template harness failures**
 
@@ -547,7 +554,7 @@ Expected: this historical correction diff contains exactly these 10 paths.
 The Step 7 staging command contains 20 paths, and the historical union of the
 Step 7 and Step 8 staging commands is the same 20-path set. Both exclude
 `trusted-server.example.toml`, which was added later in Step 9; this historical
-set is not the current 21-path **Files** set above. Task 8 has not started.
+set is not the current 22-path **Files** set above. Task 8 has not started.
 
 - [x] **Step 9: Close the Task 7 extractor review**
 
@@ -556,10 +563,12 @@ git add crates/trusted-server-core/src/config.rs docs/internal/audits/documentat
 git commit -m "Close settings extractor review gaps"
 ```
 
-Expected: the second correction diff contains exactly these seven paths. The
-complete Task 7 diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`
-contains the exact 21-path **Files** set above, including the newly checked
-source-template profile block, and Task 8 has not started.
+Expected: the second correction diff contains exactly these seven paths. At
+this historical checkpoint, the complete Task 7 diff from
+`24fc8cdd3300daf7de8b9e8de65974e5b5b6127c` contains the exact 21-path union
+of the Step 7, Step 8, and Step 9 staging commands, including the newly checked
+source-template profile block but excluding the design spec added in Step 11.
+Task 8 has not started.
 
 - [x] **Step 10: Correct the Task 7 staging evidence**
 
@@ -570,7 +579,19 @@ git commit -m "Correct Task 7 staging evidence"
 
 Expected: this governance-only correction contains exactly these two paths.
 The union of the Step 7, Step 8, and Step 9 staging commands remains equal to
-the final 21-path Task 7 diff, and Task 8 has not started.
+the then-current 21-path Task 7 diff, and Task 8 has not started.
+
+- [x] **Step 11: Correct settings alias semantics**
+
+```bash
+git add crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/integrations/prebid.rs docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/superpowers/specs/2026-08-19-documentation-refresh-design.md tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/settings-companions.toml tools/docs-parity/src/settings.rs tools/docs-parity/tests/settings.rs
+git commit -m "Correct settings alias semantics"
+```
+
+Expected: the alias/cfg correction contains exactly these nine paths. The
+complete Task 7 diff from `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`
+contains the exact 22-path **Files** set above, the union of the Step 7 through
+Step 11 staging commands equals that set, and Task 8 has not started.
 
 ### Task 8: Check integration capabilities and adapter routes
 

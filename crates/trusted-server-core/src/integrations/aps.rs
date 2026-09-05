@@ -3300,53 +3300,16 @@ mod tests {
 
     #[test]
     fn task7_aps_companions_are_exact_and_compiled_per_record() {
-        let actual = BTreeSet::from([
-            task7_companion_receipt!(
-                task7_crates_trusted_server_core_src_integrations_aps_rs_default_endpoint_default_positive,
-                task7_crates_trusted_server_core_src_integrations_aps_rs_default_endpoint_default_negative,
-                "default_endpoint", "default", dynamic default_endpoint(),
-                { assert!(default_endpoint().starts_with("https://")); },
-                { assert!(!default_endpoint().starts_with("http://")); }
-            ),
-            task7_companion_receipt!(
-                task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_positive,
-                task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_negative,
-                "deserialize_account_id", "deserializer", None,
-                {
-                    let numeric: LegacyApsProviderConfig = serde_json::from_value(json!({"enabled":true,"account_id":12345})).expect("numeric account ID should deserialize");
-                    assert_eq!(numeric.account_id, "12345");
-                },
-                { serde_json::from_value::<LegacyApsProviderConfig>(json!({"enabled":true,"account_id":[]})).expect_err("array account ID should fail"); }
-            ),
-            task7_companion_receipt!(
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_identity_override_validator_positive,
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_identity_override_validator_negative,
-                "validate_inventory_identity_override", "validator", None,
-                { validate_inventory_identity_override_values(Some("publisher.example"), Some("https://publisher.example")).expect("matching identity should validate"); },
-                { validate_inventory_identity_override_values(Some("publisher.example"), Some("https://other.example")).expect_err("mismatched identity should fail"); }
-            ),
-            task7_companion_receipt!(
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_aps_endpoint_validator_positive,
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_aps_endpoint_validator_negative,
-                "validate_aps_endpoint", "validator", None,
-                { validate_aps_endpoint("https://ads.example/openrtb2/auction").expect("HTTPS endpoint should validate"); },
-                { validate_aps_endpoint("http://ads.example/openrtb2/auction").expect_err("insecure endpoint should fail"); }
-            ),
-            task7_companion_receipt!(
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_domain_validator_positive,
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_domain_validator_negative,
-                "validate_inventory_domain", "validator", None,
-                { validate_inventory_domain("publisher.example").expect("plain domain should validate"); },
-                { validate_inventory_domain("https://publisher.example").expect_err("domain scheme should fail"); }
-            ),
-            task7_companion_receipt!(
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_page_origin_validator_positive,
-                task7_crates_trusted_server_core_src_integrations_aps_rs_validate_inventory_page_origin_validator_negative,
-                "validate_inventory_page_origin", "validator", None,
-                { validate_inventory_page_origin("https://publisher.example").expect("HTTPS origin should validate"); },
-                { validate_inventory_page_origin("http://publisher.example").expect_err("insecure origin should fail"); }
-            ),
-        ]);
+        let actual = BTreeSet::from([task7_companion_receipt!(
+            task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_positive,
+            task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_negative,
+            "deserialize_account_id", "deserializer", None,
+            {
+                let numeric: ApsProfileConfig = serde_json::from_value(json!({"account_id":12345})).expect("numeric account ID should deserialize");
+                assert_eq!(numeric.account_id, "12345");
+            },
+            { serde_json::from_value::<ApsProfileConfig>(json!({"account_id":[]})).expect_err("array account ID should fail"); }
+        )]);
         let checked: Task7CompanionManifest = toml::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tools/docs-parity/manifests/settings-companions.toml"

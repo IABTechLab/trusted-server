@@ -2755,6 +2755,10 @@ PY
   accepted Serde attributes were not a closed site-aware grammar, stale
   companions and broad probe names could pass, and the eight negative harness
   cases mutated a manually supplied observation instead of production state.
+  Quality review of `8240f294954735a18a0d7d73eb59772eadc14301` then found
+  that the reviewed S3 alias target was nonexistent and self-confirmed by a
+  tool constant, and that `#[cfg(test)]` legacy APS and Prebid types were being
+  inventoried as production settings.
 - `settings --check` parses four bounded, strict-UTF-8 production sources with
   `syn`: the root settings model, standard auction profile, APS profile, and
   Prebid settings. Its closed grammar covers Serde container, variant, and
@@ -2771,26 +2775,36 @@ PY
   strings whose contents parse as paths; offline Serde 1.0.228 compile fixtures
   prove both accepted and rejected forms. Literal unary expressions accept
   only direct negative integers and floats; `!true` requires a checked
-  companion. Invalid rules, accepted attributes on invalid sites, and unknown
-  shape-changing attributes fail closed. The checked schema requires exact
-  equality with the 17-field `Settings` root.
-- `settings-companions.toml` is a versioned, explicitly reviewed record with 46
+  companion. Production presence is closed over the extracted syntax: items,
+  fields, variants, and literal-default functions without a cfg are included,
+  one exact `#[cfg(test)]` is excluded, and every other, combined, or
+  `cfg_attr` form fails closed. This excludes the test-only legacy APS and
+  Prebid types and their semantics from the production inventory. Invalid
+  rules, accepted attributes on invalid sites, and unknown shape-changing
+  attributes fail closed. The checked schema requires exact equality with the
+  17-field `Settings` root.
+- `settings-companions.toml` is a versioned, explicitly reviewed record with 40
   exact nonliteral-default, deserializer, and validator companions. Each names
   its exact source, symbol, kind, value when applicable, and unique
   source/symbol/kind-bound positive and negative probe functions. The
   AST-discovered and reviewed sets must be equal, so missing and stale entries
-  both fail. Module-local compiled receipt producers execute and bind all 46
-  records: 34 in settings, six in APS, and six in Prebid. Wrong values,
+  both fail. Module-local compiled receipt producers execute and bind all 40
+  production records: 34 in settings, one in APS, and five in Prebid. Wrong values,
   probe-symbol mismatches, duplicate receipts, and reusable broad probe names
   fail exact equality. No public production API or behavior changed.
-- The same manifest contains 19 directional field records whose five axes are
+- The same manifest contains 18 directional field records whose five axes are
   checked independently: lifecycle, key identity, serialization, runtime,
   and secret handling. Exact equality requires 11 active store-resolved
   secret-key paths, one active deliberately-inline shared secret, one
   deprecated accepted-and-discarded selector, four deprecated
-  normalized-away store selectors, and two deserialization-only aliases with
-  their canonical targets. An axis cannot substitute for or erase another
-  disposition.
+  normalized-away store selectors, and one production deserialization-only
+  alias. That alias is derived from the extracted enum variant and resolves
+  exactly from `AssetOriginAuth.s3_sig_v4` to
+  `AssetOriginAuth.s3_sigv4`; the former `pub_id` record came from a
+  `#[cfg(test)]` legacy APS type and is excluded. Source-derived struct-field
+  and enum-variant alias maps must equal the reviewed alias path/target map, so
+  stale, nonexistent, wrong-canonical, and duplicate aliases fail. An axis
+  cannot substitute for or erase another disposition.
 - The production-API harness parses `trusted-server.example.toml`, proves that
   its unmodified form reports exactly the three publisher placeholders, and
   applies three non-secret publisher customizations in memory. It then
@@ -2816,11 +2830,11 @@ PY
   `publisher.cookie_domain, publisher.domain` and its exact normalized
   diagnostic, not the checked three-path result. The manual-observation model
   and its self-reported negative tests were removed.
-- The standalone settings target contains 20 passing tests. The complete
-  standalone suite contains 231 passing tests: 17 library unit, 35
-  classification, 19 CLI, 57 links, 11 Markdown, 72 scanner, and 20 settings
+- The standalone settings target contains 23 passing tests. The complete
+  standalone suite contains 238 passing tests: 21 library unit, 35
+  classification, 19 CLI, 57 links, 11 Markdown, 72 scanner, and 23 settings
   tests. It passed two fresh, consecutive default-parallel runs after the
-  second extractor correction. Root and standalone fmt checks, standalone
+  alias/cfg correction. Root and standalone fmt checks, standalone
   all-target clippy with warnings denied, and all three root target clippy
   aliases exited 0.
 - A final default-parallel repetition exposed one existing Task 6 process
@@ -2848,18 +2862,23 @@ PY
   values, and detector cross-use fail. This is the only scanner behavior
   expansion; using the fake-credential class for schema identifiers would
   make its semantic claim false.
-- The reviewed sensitive inventory contains 5,406 exact occurrences, a net 15
-  over Task 6: 13 settings-schema identifiers, the exact APS vendor endpoint
-  recorded as a companion value, and one synthetic credential-shaped test
-  literal. Classification added only the three new standalone text paths;
+- The final reviewed sensitive inventory contains 5,405 exact occurrences, a
+  net 14 over Task 6: 13 settings-schema identifiers and one synthetic
+  credential-shaped test literal. The alias/cfg correction removed the APS
+  vendor endpoint occurrence with its test-only companion record, moved 13
+  unchanged settings-schema selectors with the smaller companion manifest,
+  and moved the existing synthetic fixture selector with the expanded
+  standalone test. No exception class, path, detector, fingerprint, owner,
+  rationale, or expiry changed for the retained records. Classification added
+  only the three new standalone text paths;
   their reviewed dispositions are one non-documentation manifest and two
   source-code files. Repeated classification updates retained tracked/source
   SHA-256 values
   `c0747847b67394a370255388dd2955bd595216acb31def101f2a386ac557332c`
   and
   `108c4769bca7aa7709b88da1560b6879702b33e7111d46e46b346132570fd506`.
-  The reviewed companion manifest SHA-256 is
-  `28fa989f91f04618e762d6647e3e16d153eb724bb0c1b8b63bc94acb66515c0a`.
+  The final reviewed companion manifest SHA-256 is
+  `13571b03124f7a3e389cf2828976ab379bf0310322ecfb5bd6d96e1f7e8637c6`.
   Repeated sensitive bootstraps retained reviewed-manifest SHA-256
   `eaabfc0d1bea32bcffa58d95a3aa4889a6de133aa37876ba1790239d52169acd`
   for the original Task 7 checkpoint. The review correction preserves the
@@ -2872,6 +2891,9 @@ PY
   existing synthetic credential fixture in the expanded standalone settings
   test. Two final bootstraps retained reviewed-manifest SHA-256
   `e09dc7859e133e7001e4b71d2ba66a5835a7aacf01c6477a58730c48ec5a0b03`
+  byte-for-byte. After the alias/cfg audit and explicit re-attestation, two
+  final bootstraps retained reviewed-manifest SHA-256
+  `73ebcec67f181f9443fe5d3b5b3ae2d18ae867106aa14b45e07196e4a41fe593`
   byte-for-byte.
   Fresh `settings --check`, local-link, generated-region, classification, and
   sensitive-scan checks all exited 0.
@@ -2880,29 +2902,34 @@ PY
   `8d12168733c63ecce2566f3267fde5741155a87cf767b8415fc845d496bbf3ca`.
   Root `Cargo.lock` remained byte-identical at
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
-  The current Task 7 Files list is exact for the final 21-path diff from
+  The current Task 7 Files list is exact for the final 22-path diff from
   `24fc8cdd3300daf7de8b9e8de65974e5b5b6127c`, including the scanner
   class/test required by the new manifest vocabulary and the process-fixture
   synchronization required by the repeated default suite, while excluding
   all unchanged files: the five checked core sources; the checked source
-  template; this evidence file and the execution plan; the standalone
-  manifest, lockfile, and README; the tracked, maintained, sensitive, and
-  settings-companion manifests; the standalone library, Markdown, scanner,
-  and settings implementations; and the scanner and settings integration-test
-  files. The historical Step 7 staging command contains exactly 20 paths and
-  omits `trusted-server.example.toml`; adding the Step 8 staging command does
-  not change that 20-path union. Step 8 itself is the exact 10-path first
-  correction: four core sources, this evidence file and the plan, the
-  sensitive and settings-companion manifests, and the standalone settings
-  implementation and test. The `cc6be34f96cdc9e88031bd0908cb7ffc206a1347..c5afbf9e4e3a5a41516c47503760ad82def43765`
+  template; the design spec, this evidence file, and the execution plan; the
+  standalone manifest, lockfile, and README; the tracked, maintained,
+  sensitive, and settings-companion manifests; the standalone library,
+  Markdown, scanner, and settings implementations; and the scanner and
+  settings integration-test files. The historical Step 7 staging command
+  contains exactly 20 paths and omits `trusted-server.example.toml`; adding the
+  Step 8 staging command does not change that 20-path union. Step 8 itself is
+  the exact 10-path first correction: four core sources, this evidence file and
+  the plan, the sensitive and settings-companion manifests, and the standalone
+  settings implementation and test. The
+  `cc6be34f96cdc9e88031bd0908cb7ffc206a1347..c5afbf9e4e3a5a41516c47503760ad82def43765`
   second correction is exactly the seven paths in Step 9: the source-derived
   profile harness and template, this evidence file and the plan, the sensitive
-  manifest, and the standalone settings implementation and test. Mechanical
-  set comparison reports 20 Step 7 paths, seven paths in that second
-  correction, 21 paths in the aggregate Task 7 diff, and 21 paths in the union
-  of the Step 7, Step 8, and Step 9 staging commands; every pairwise set
-  difference between the final aggregate and that union is empty. Step 10 is
-  the two-path governance-only correction to this evidence and the plan.
+  manifest, and the standalone settings implementation and test. Step 10 is
+  the exact two-path governance-only correction to this evidence and the plan.
+  The alias/cfg correction is exactly the nine paths in Step 11: the APS and
+  Prebid compiled receipts, the design spec, this evidence file and the plan,
+  the sensitive and settings-companion manifests, and the standalone settings
+  implementation and test. Mechanical set comparison reports 20 Step 7 paths,
+  10 Step 8 paths, seven Step 9 paths, two Step 10 paths, and nine Step 11
+  paths. The Step 7 and Step 8 union is 20, the union through Steps 9 and 10 is
+  21, and the union through Step 11 is 22; the final 22-path aggregate and
+  Files sets equal that union with every directional set difference empty.
 
 #### Task 8 — Check integration capabilities and adapter routes
 

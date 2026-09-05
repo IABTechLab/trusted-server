@@ -9259,13 +9259,6 @@ set = { networkId = 42 }
     fn task7_prebid_companions_are_exact_and_compiled_per_record() {
         let actual = BTreeSet::from([
             task7_companion_receipt!(
-                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_bidders_default_positive,
-                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_bidders_default_negative,
-                "default_bidders", "default", Some("[mocktioneer]"),
-                { assert_eq!(default_bidders(), vec!["mocktioneer".to_owned()]); },
-                { assert_ne!(default_bidders(), vec!["other".to_owned()]); }
-            ),
-            task7_companion_receipt!(
                 task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_positive,
                 task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_negative,
                 "default_script_patterns", "default", Some("[/prebid.js,/prebid.min.js,/prebidjs.js,/prebidjs.min.js]"),
@@ -9277,10 +9270,10 @@ set = { networkId = 42 }
                 task7_crates_trusted_server_core_src_integrations_prebid_rs_crate_settings_vec_from_seq_or_map_deserializer_negative,
                 "crate::settings::vec_from_seq_or_map", "deserializer", None,
                 {
-                    let parsed: LegacyPrebidServerConfig = toml::from_str("server_url = \"https://prebid.example/openrtb2/auction\"\nbidders = { 0 = \"first\", 1 = \"second\" }").expect("map bidders should deserialize");
-                    assert_eq!(parsed.bidders, ["first", "second"]);
+                    let parsed: PrebidIntegrationConfig = toml::from_str("script_patterns = { 0 = \"first\", 1 = \"second\" }").expect("map script patterns should deserialize");
+                    assert_eq!(parsed.script_patterns, ["first", "second"]);
                 },
-                { toml::from_str::<LegacyPrebidServerConfig>("server_url = \"https://prebid.example/openrtb2/auction\"\nbidders = 42").expect_err("scalar bidders should fail"); }
+                { toml::from_str::<PrebidIntegrationConfig>("script_patterns = 42").expect_err("scalar script patterns should fail"); }
             ),
             task7_companion_receipt!(
                 task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_url_validator_positive,

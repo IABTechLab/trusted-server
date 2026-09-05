@@ -587,9 +587,11 @@ provider profile schemas, and the secret model.
   "one of" (real fields overlap: `S3SigV4AuthConfig.secret_store` is
   simultaneously deprecated, skip-serializing, and normalized away) -
   lifecycle (canonical / deprecated / rejected), key identity
-  (canonical / alias, with `alias_of` - `s3_sig_v4` and `pub_id` are
-  aliases, while `S3SigV4AuthConfig.secret_store` is a deprecated
-  accepted field, not an alias), serialization (serialized / skipped),
+  (canonical / alias, with `alias_of` - `s3_sig_v4` is a
+  production-discovered alias; `pub_id` occurs only on a `#[cfg(test)]`
+  legacy type and is excluded from the production inventory, while
+  `S3SigV4AuthConfig.secret_store` is a deprecated accepted field, not an
+  alias), serialization (serialized / skipped),
   runtime (active / normalized-away / deserialization-only), and secret
   handling (store-resolved / deliberately-inline / none); removed
   validators get a `rejected`/removed disposition too - the delta
@@ -618,7 +620,8 @@ provider profile schemas, and the secret model.
   validator in Appendix B's inventory gets a companion entry with
   positive/negative probes, fail-closed on unclassified validator
   functions; `serde(skip)` fields never become documented paths;
-  canonical keys vs deprecated aliases (`pub_id`, `s3_sig_v4`).
+  canonical keys vs deprecated production aliases (`s3_sig_v4`); aliases on
+  `#[cfg(test)]` legacy types such as `pub_id` are excluded.
 
 Acceptance: every canonical-runtime-active field path appears in
 template and reference; deprecated/ignored/deserialization-only paths
