@@ -1,0 +1,2887 @@
+version = 1
+max_text_bytes = 4194304
+reviewed = true
+
+[[files]]
+path = ".cargo/config.toml"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/build-validator.md"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/code-architect.md"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/code-simplifier.md"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/issue-creator.md"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/pr-creator.md"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/pr-reviewer.md"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/repo-explorer.md"
+kind = "text"
+
+[[files]]
+path = ".claude/agents/verify-app.md"
+kind = "text"
+
+[[files]]
+path = ".claude/commands/check-ci.md"
+kind = "text"
+
+[[files]]
+path = ".claude/commands/review-changes.md"
+kind = "text"
+
+[[files]]
+path = ".claude/commands/test-all.md"
+kind = "text"
+
+[[files]]
+path = ".claude/commands/test-crate.md"
+kind = "text"
+
+[[files]]
+path = ".claude/commands/verify.md"
+kind = "text"
+
+[[files]]
+path = ".claude/settings.json"
+kind = "text"
+
+[[files]]
+path = ".claude/skills/deploying-trusted-server-to-fastly/SKILL.md"
+kind = "text"
+
+[[files]]
+path = ".env.dev"
+kind = "text"
+
+[[files]]
+path = ".env.example"
+kind = "text"
+
+[[files]]
+path = ".github/ISSUE_TEMPLATE/bug_report.yml"
+kind = "text"
+
+[[files]]
+path = ".github/ISSUE_TEMPLATE/config.yml"
+kind = "text"
+
+[[files]]
+path = ".github/ISSUE_TEMPLATE/story.yml"
+kind = "text"
+
+[[files]]
+path = ".github/ISSUE_TEMPLATE/task.yml"
+kind = "text"
+
+[[files]]
+path = ".github/actions/setup-integration-test-env/action.yml"
+kind = "text"
+
+[[files]]
+path = ".github/dependabot.yml"
+kind = "text"
+
+[[files]]
+path = ".github/pull_request_template.md"
+kind = "text"
+
+[[files]]
+path = ".github/workflows/codeql.yml"
+kind = "text"
+
+[[files]]
+path = ".github/workflows/deploy-docs.yml"
+kind = "text"
+
+[[files]]
+path = ".github/workflows/format.yml"
+kind = "text"
+
+[[files]]
+path = ".github/workflows/integration-tests.yml"
+kind = "text"
+
+[[files]]
+path = ".github/workflows/test.yml"
+kind = "text"
+
+[[files]]
+path = ".gitignore"
+kind = "text"
+
+[[files]]
+path = ".tool-versions"
+kind = "text"
+
+[[files]]
+path = "AGENTS.md"
+kind = "text"
+
+[[files]]
+path = "CHANGELOG.md"
+kind = "text"
+
+[[files]]
+path = "CLAUDE.md"
+kind = "text"
+
+[[files]]
+path = "CONTRIBUTING.md"
+kind = "text"
+
+[[files]]
+path = "Cargo.lock"
+kind = "text"
+
+[[files]]
+path = "Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "FAQ_POC.md"
+kind = "text"
+
+[[files]]
+path = "LICENSE"
+kind = "text"
+
+[[files]]
+path = "ProjectGovernance.md"
+kind = "text"
+
+[[files]]
+path = "README.md"
+kind = "text"
+
+[[files]]
+path = "TESTING.md"
+kind = "text"
+
+[[files]]
+path = "clippy.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/axum.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/src/app.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/src/main.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/src/middleware.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/src/platform.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-axum/tests/routes.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/.gitignore"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/build.sh"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/cloudflare.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/src/app.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/src/middleware.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/src/platform.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/tests/routes.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/wrangler.ci.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/wrangler.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/app.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/backend.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/compat.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/ec_kv.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/esi_assembly.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/logging.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/main.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/management_api.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/middleware.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/platform.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/rate_limiter.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/template_cache.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/src/tinybird.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/tests/kv_store/counter_store.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/tests/kv_store/opid_store.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/.gitignore"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/spin.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/src/app.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/src/middleware.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/src/platform.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-spin/tests/routes.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/ad_templates/compare.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/ad_templates/expected.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/ad_templates/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/ad_templates/output.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/app_config.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/ad_template_collector.js"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/ad_templates.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/browser.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/browser_scroll.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/collector.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/consent_stub.js"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/analyzer.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/browser_collector.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/collector.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/crawl_plan.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/evidence.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/page_patterns.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/slot_toml.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/unit_template.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/validate.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/audit/page.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/config/ad_templates.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/config/init.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/config/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/browser.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/ca.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/config.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/metrics.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/prefixed_io.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/rewrite.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/server.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/body.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/connect.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/dns.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/key.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/manager.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/commands/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/error.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/main.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/output.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/prebid_bundle.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/src/run.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/tests/config_env_overlay.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/tests/proxy_e2e.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/tests/proxy_perf.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/tests/support/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/README.md"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/benches/consent_decode.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/benches/html_processor_bench.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/build.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/asset_image_optimizer.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/README.md"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/config.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/context.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/endpoints.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/formats.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/openrtb.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/openrtb/test_executor.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/openrtb/tests.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/orchestrator.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/plan.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/profile.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/provider.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/routing.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/telemetry.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/test_support.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction/types.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auction_config_types.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/auth.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/cache_policy.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/config.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/config_payload.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent/extraction.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent/gpp.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent/jurisdiction.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent/tcf.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent/types.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent/us_privacy.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/consent_config.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/constants.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/cookies.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/creative.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/creative_opportunities.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/admin.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/auth.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/batch_sync.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/consent.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/cookies.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/device.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/eids.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/finalize.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/generation.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/identify.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/kv.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/kv_backend.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/kv_types.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/partner.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/prebid_eids.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/pull_sync.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/rate_limiter.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/ec/registry.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/edge_cookie.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/error.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/geo.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/host_header.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/host_rewrite.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/html_processor.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/html_processor.test.html"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/http_util.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/adserver_mock.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/aps.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/datadome.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/datadome/protection.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/datadome/protection_scope.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/didomi.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/google_tag_manager.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/gpt.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/gpt_bootstrap.js"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/gpt_diagnostics.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/lockr.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/fixtures/inlined-data-escaped.html"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/fixtures/inlined-data-nonce.html"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/html_post_process.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/rsc.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/rsc_placeholders.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/nextjs/shared.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/osano.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/permutive.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/prebid.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/registry.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/sourcepoint.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/integrations/testlight.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/migration_guards.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/models.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/openrtb.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/backend_naming.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/error.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/http.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/image_optimizer.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/kv.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/template_assembly.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/template_cache.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/test_support.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/traits.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/platform/types.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/price_bucket.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/proxy.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/publisher.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/redacted.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/request_signing/discovery.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/request_signing/endpoints.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/request_signing/jwks.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/request_signing/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/request_signing/rotation.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/request_signing/signing.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/response_privacy.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/rsc_flight.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/s3_sigv4.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/secret_resolution.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/settings.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/settings_data.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/storage/kv_store.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/storage/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/streaming_processor.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/streaming_replacer.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/test_support.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/tester_cookie.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-core/src/tsjs.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/.dockerignore"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/README.md"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/global-setup.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/global-teardown.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/helpers/gpt-stub.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/helpers/infra.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/helpers/state.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/helpers/wait-for-ready.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/package-lock.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/package.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/playwright.config.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/nextjs/api-passthrough.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/nextjs/form-rewriting.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/nextjs/gpt-diagnostics.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/nextjs/navigation.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/shared/aps-renderer.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/shared/creative-sandbox.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/shared/script-bundle.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/shared/script-injection.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tests/wordpress/admin-injection.spec.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/browser/tsconfig.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/Dockerfile"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/about/page.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/api/data/route.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/api/hello/route.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/components/Navigation.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/components/RouteScript.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/contact/page.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/dashboard/page.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/gpt-diagnostics/page.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/layout.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/page.tsx"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/next.config.mjs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/package-lock.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/package.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/Dockerfile"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/theme/index.php"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/theme/wp-admin/index.php"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/common/assertions.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/common/config.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/common/ec.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/common/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/common/runtime.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/environments/axum.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/environments/cloudflare.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/environments/fastly.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/environments/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/frameworks/mod.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/frameworks/nextjs.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/frameworks/scenarios.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/frameworks/wordpress.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/integration.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-integration-tests/tests/parity.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/.gitignore"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/build.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/.gitignore"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/.prettierignore"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/.prettierrc.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/build-all.mjs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/eslint.config.js"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/package-lock.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/package.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/auction.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/config.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/context.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/first_impression.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/global.d.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/log.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/queue.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/registry.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/render.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/request.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/slot_element.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/styles/normalize.css"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/templates/iframe.html"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/types.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/core/util.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/aps/render.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/creative/click.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/creative/dynamic_src_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/creative/iframe.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/creative/image.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/creative/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/creative/proxy_sign.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/datadome/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/datadome/script_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/didomi/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/google_tag_manager/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/google_tag_manager/script_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt/script_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/api.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/badges.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/binding.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/exhaustive.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/observer.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/overlay.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/presentation_helpers.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/slot_size_observer.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/store.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/lockr/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/lockr/script_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/osano/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/permutive/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/permutive/script_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/permutive/segments.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/prebid/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/prebid/prebid_modules/aliases.d.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/prebid/prebid_modules/liveIntentIdSystem.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/sourcepoint/script_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/integrations/testlight/index.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/shared/async.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/shared/beacon_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/shared/dom_insertion_dispatcher.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/shared/globals.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/shared/origin.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/shared/scheduler.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/src/shared/script_guard.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/build-prebid-external.test.mjs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/core/auction.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/core/config.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/core/context.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/core/index.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/core/registry.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/core/render.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/core/request.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/aps/render.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/creative/click.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/creative/helpers.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/creative/iframe.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/creative/image.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/creative/proxy_sign.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/datadome/script_guard.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/didomi/index.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/google_tag_manager/script_guard.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt/gpt_bootstrap.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt/index.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt/schedule_initial_ad_init.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt/script_guard.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt/spa_hook.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/api.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/badges.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/binding.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/index.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/observer.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/overlay.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/slot_size_observer.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/store.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/types.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/lockr/script_guard.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/osano/index.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/permutive/segments.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/prebid/user_id_modules.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/sourcepoint/index.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/integrations/sourcepoint/script_guard.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/shared/async.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/shared/beacon_guard.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/shared/dom_insertion_dispatcher.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/shared/origin.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/test/shared/scheduler.test.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/tsconfig.json"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/vite.config.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/lib/vitest.config.ts"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/src/bundle.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-js/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb-codegen/.gitignore"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb-codegen/Cargo.lock"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb-codegen/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb-codegen/src/main.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb/README.md"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb/generate.sh"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb/proto/openrtb.proto"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb/src/codegen.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb/src/generated.rs"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "docs/.gitignore"
+kind = "text"
+
+[[files]]
+path = "docs/.prettierignore"
+kind = "text"
+
+[[files]]
+path = "docs/.prettierrc"
+kind = "text"
+
+[[files]]
+path = "docs/.vitepress/config.mts"
+kind = "text"
+
+[[files]]
+path = "docs/.vitepress/theme/custom.css"
+kind = "text"
+
+[[files]]
+path = "docs/.vitepress/theme/index.ts"
+kind = "text"
+
+[[files]]
+path = "docs/README.md"
+kind = "text"
+
+[[files]]
+path = "docs/business-use-cases.md"
+kind = "text"
+
+[[files]]
+path = "docs/epics/revenue-operations-dashboard.md"
+kind = "text"
+
+[[files]]
+path = "docs/eslint.config.js"
+kind = "text"
+
+[[files]]
+path = "docs/guide/ad-serving.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/api-reference.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/architecture.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/asset-routes.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/auction-orchestration.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/cli.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/collective-sync.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/configuration.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/creative-processing.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/ec-setup-guide.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/edge-cookies.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/error-reference.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/fastly.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/first-party-proxy.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/gdpr-compliance.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/getting-started.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/index.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integration-guide.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations-overview.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/aps.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/datadome.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/didomi.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/gam.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/google_tag_manager.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/gpt-diagnostics.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/gpt.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/kargo.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/lockr.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/nextjs.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/osano.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/permutive.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/prebid.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/sourcepoint.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/key-rotation.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/proxy-signing.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/request-signing.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/rsc-hydration.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/testing.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/ts-dev-proxy.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/what-is-trusted-server.md"
+kind = "text"
+
+[[files]]
+path = "docs/index.md"
+kind = "text"
+
+[[files]]
+path = "docs/internal/EDGEZERO_MIGRATION.md"
+kind = "text"
+
+[[files]]
+path = "docs/internal/audits/documentation-refresh-decisions.md"
+kind = "text"
+
+[[files]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+kind = "text"
+
+[[files]]
+path = "docs/internal/onboarding.md"
+kind = "text"
+
+[[files]]
+path = "docs/package-lock.json"
+kind = "text"
+
+[[files]]
+path = "docs/package.json"
+kind = "text"
+
+[[files]]
+path = "docs/public/images/hero-graphic.jpeg"
+kind = "binary"
+
+[[files]]
+path = "docs/roadmap.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/archive/2026-03-19-sequence-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/archive/2026-03-24-optimization-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/archive/2026-03-24-publisher-ids-audit-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/archive/2026-08-10-1009-esi-validation-spike.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/implementation-notes/2026-07-10-dev-proxy-performance.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-03-25-streaming-response.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-03-30-pr7-geo-client-info.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-03-31-pr9-wire-signing-to-store-primitives.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-04-02-pr10-logging-initialization.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-04-08-prebid-generic-bid-param-override-rules.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-04-14-edgezero-pr15-remove-fastly-core.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-04-15-sourcepoint-gpp-consent.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-04-17-pr17-cloudflare-adapter.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-04-30-server-side-ad-templates.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-05-20-pr18-phase5-verification.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-05-21-pr19-cutover-canary-rollout.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-05-22-spin-adapter-integration.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-05-27-pr20-legacy-cleanup.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-05-29-pr680-reviewer-findings.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-05-29-prebid-creative-rendering-fix.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-06-16-edgezero-based-ts-audit-implementation-plan.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-06-16-edgezero-based-ts-cli-implementation-plan.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-06-16-trusted-server-cli-respec-context.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-06-22-ts-dev-proxy.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-06-23-auction-telemetry-direct-tinybird.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-06-23-integration-viceroy-config-generation-plan.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-06-26-server-side-ad-template-cli.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-06-cache-control-header-implementation-plan.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-08-true-origin-streaming-fastly.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-10-dev-proxy-performance.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-12-dev-proxy-review-backfill.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-13-ssat-render-inline-creative.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-14-dev-proxy-pr-feedback.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-15-aps-openrtb-first-class-integration.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-15-gam-ts-cohort-attribution.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-20-ssat-debug-comment-config.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-22-ssat-root-document-304-prevention.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-23-per-section-gam-unit-path.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-24-prebid-refresh-gam-path-opt-out.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-24-prevent-duplicate-gpt-slot-requests.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-07-28-gpt-runtime-diagnostics-overlay.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-03-datadome-ip-excluded-client-tag.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-04-gpt-delivery-evidence-and-auction-competition.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-06-gpt-refresh-diagnostics-port.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-06-server-side-ad-templates-cache-control.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-08-1009-measurement-and-stage-0.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-08-1009-measurement-findings.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-10-1009-esi-validation-spike.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-11-config-first-auction-provider-architecture-implementation-plan.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-12-1009-esi-merge-hardening.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-14-1009-esi-parser-assembly.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-18-admin-diagnostics-review-fixes.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-18-contiguous-generated-slot-tables.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-18-pr-823-review-resolution.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-18-pre-navigation-cookie-install.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-18-ssat-debug-comment-format.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-19-ad-template-generation-progress.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-19-gam-attribution-review-resolution.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-19-pr-1013-review-remediation.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-19-pr928-comprehensive-review-resolution.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-19-refuse-volatile-div-collisions.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-19-template-cache-terminology.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-19-trusted-client-ip-header.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-20-pr-1013-round-3-review-remediation.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-21-pr-823-round-5-review-resolution.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-24-ad-template-div-id-reconciliation.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-24-ad-template-generate-scroll-staleness.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-26-first-party-sign-allowlist-enforcement.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-27-pr-1079-review-remediation.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/plans/2026-08-30-documentation-refresh.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-01-15-attestation-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-03-11-production-readiness-report-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-03-19-auction-orchestration-flow-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-03-19-edgezero-migration-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-03-24-ssc-prd-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-03-24-ssc-technical-spec-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-03-25-streaming-response-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-03-30-pr7-geo-client-info-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-04-02-pr10-logging-initialization-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-04-08-prebid-generic-bid-param-override-rules-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-04-15-server-side-ad-templates-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-04-15-sourcepoint-gpp-consent-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-04-28-multi-backend-asset-proxy-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-05-19-asset-s3-auth-fastly-io-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-05-28-edgezero-image-optimizer-primitive-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-05-28-external-prebid-first-party-proxy-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-05-29-prebid-creative-rendering-fix.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-11-datadome-server-side-protection-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-16-edgezero-based-ts-audit-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-16-edgezero-based-ts-cli-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-17-osano-consent-mirror-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-17-prebid-bundle-cli-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-22-auction-prebid-metrics-tinybird-grafana-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-22-ts-dev-proxy-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-06-26-server-side-ad-template-cli-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-06-cache-control-header-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-10-dev-proxy-performance-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-13-ssat-render-inline-creative-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-15-aps-openrtb-first-class-integration-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-15-gam-ts-cohort-attribution-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-20-ssat-debug-comment-config-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-22-ssat-root-document-304-prevention-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-23-per-section-gam-unit-path-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-24-prebid-refresh-gam-path-opt-out-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-24-prevent-duplicate-gpt-slot-requests-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-07-28-gpt-runtime-diagnostics-overlay-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-03-datadome-ip-excluded-client-tag-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-04-gpt-delivery-evidence-and-auction-competition-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-05-gpt-refresh-source-and-replacement-diagnostics-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-10-config-first-auction-provider-architecture-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-11-1009-streaming-assembly-architecture.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-12-1009-esi-merge-hardening-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-14-1009-esi-parser-assembly-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-18-admin-diagnostics-review-fixes-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-18-contiguous-generated-slot-tables-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-18-pr-823-review-resolution-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-18-pre-navigation-cookie-install-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-18-ssat-debug-comment-format-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-ad-template-generation-progress-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-documentation-refresh-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-gam-attribution-review-resolution-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-pr-1013-review-remediation-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-pr928-comprehensive-review-resolution-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-refuse-volatile-div-collisions-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-template-cache-terminology-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-19-trusted-client-ip-header-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-20-pr-1013-round-3-review-remediation-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-21-pr-823-round-5-review-resolution-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-24-ad-template-div-id-reconciliation-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-24-ad-template-generate-scroll-staleness-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-26-first-party-sign-allowlist-enforcement-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/specs/2026-08-27-pr-1079-review-remediation-design.md"
+kind = "text"
+
+[[files]]
+path = "docs/tsconfig.json"
+kind = "text"
+
+[[files]]
+path = "edgezero.toml"
+kind = "text"
+
+[[files]]
+path = "fastly.toml"
+kind = "text"
+
+[[files]]
+path = "rust-toolchain.toml"
+kind = "text"
+
+[[files]]
+path = "scripts/batch-sync.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/benchmark.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/generate-integration-viceroy-configs.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/integration-tests-browser.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/integration-tests.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/profile.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/template-cache-local-test.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/test-cli.sh"
+kind = "text"
+
+[[files]]
+path = "tinybird/datasources/access_logs_raw.datasource"
+kind = "text"
+
+[[files]]
+path = "tinybird/datasources/auction_bid_stats_rollup.datasource"
+kind = "text"
+
+[[files]]
+path = "tinybird/datasources/auction_events_raw.datasource"
+kind = "text"
+
+[[files]]
+path = "tinybird/datasources/auction_overview_rollup.datasource"
+kind = "text"
+
+[[files]]
+path = "tinybird/datasources/auction_provider_stats_rollup.datasource"
+kind = "text"
+
+[[files]]
+path = "tinybird/fixtures/auction_events_raw.ndjson"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/auction_bid_stats_mv.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/auction_overview_mv.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/auction_provider_stats_mv.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/auction_summary.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/ingestion_freshness.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/provider_health.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/provider_latency.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/quarantine_counts.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/pipes/seat_yield.pipe"
+kind = "text"
+
+[[files]]
+path = "tinybird/tests/auction_summary.yaml"
+kind = "text"
+
+[[files]]
+path = "tinybird/tests/provider_health.yaml"
+kind = "text"
+
+[[files]]
+path = "tinybird/tests/seat_yield.yaml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/Cargo.lock"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/README.md"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/adapter-support.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/diagrams.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/integrations.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/maintained-sources.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/orphans.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/pages.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/retired-identifiers.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/routes.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/sensitive-allowlist.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/settings-companions.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/tracked-files.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/classification.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/integrations.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/lib.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/main.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/markdown.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/model.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/repository.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/routes.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/scanner.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/settings.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/classification.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/cli.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/integrations.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/links.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/markdown.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/routes.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/scanner.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/settings.rs"
+kind = "text"
+
+[[files]]
+path = "trusted-server.example.toml"
+kind = "text"

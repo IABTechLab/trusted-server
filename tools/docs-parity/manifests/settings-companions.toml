@@ -1,0 +1,481 @@
+version = 1
+reviewed = true
+
+[template]
+source = "trusted-server.example.toml"
+placeholder_paths = ["publisher.cookie_domain", "publisher.domain", "publisher.origin_url"]
+integration_ids = ["adserver_mock", "aps", "datadome", "didomi", "google_tag_manager", "gpt", "gpt_diagnostics", "lockr", "nextjs", "osano", "permutive", "prebid", "sourcepoint", "testlight"]
+profile_ids = ["aps", "prebid-server", "standard"]
+consumer_literals = ["ec_passphrase", "handler_password", "publisher_proxy_secret"]
+expected_failure_diagnostic = "unmodified template rejects publisher.cookie_domain, publisher.domain, publisher.origin_url"
+
+[[consumers]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/mod.rs"
+mode = "literal_substitution"
+
+[[consumers]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/validate.rs"
+mode = "literal_substitution"
+
+[[consumers]]
+path = "crates/trusted-server-cli/src/commands/config/ad_templates.rs"
+mode = "literal_substitution"
+
+[[consumers]]
+path = "crates/trusted-server-cli/src/commands/config/init.rs"
+mode = "include_only"
+
+[[consumers]]
+path = "crates/trusted-server-core/src/config.rs"
+mode = "literal_substitution"
+
+[[consumers]]
+path = "scripts/template-cache-local-test.sh"
+mode = "literal_substitution"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_max_buffered_body_bytes"
+kind = "default"
+value = "16777216"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_max_buffered_body_bytes_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_max_buffered_body_bytes_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "from_value_or_str"
+kind = "deserializer"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_from_value_or_str_deserializer_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_from_value_or_str_deserializer_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "vec_from_seq_or_map"
+kind = "deserializer"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_vec_from_seq_or_map_deserializer_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_vec_from_seq_or_map_deserializer_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "map_from_obj_or_str"
+kind = "deserializer"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_map_from_obj_or_str_deserializer_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_map_from_obj_or_str_deserializer_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "bool_from_bool_or_str"
+kind = "deserializer"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_bool_from_bool_or_str_deserializer_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_bool_from_bool_or_str_deserializer_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "validate_publisher_domain"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_publisher_domain_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_publisher_domain_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "validate_cookie_domain"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_cookie_domain_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_cookie_domain_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "validate_no_trailing_slash"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_no_trailing_slash_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_no_trailing_slash_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "validate_host_header_override"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_host_header_override_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_host_header_override_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "validate_redacted_not_empty"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_redacted_not_empty_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_redacted_not_empty_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "EcPartner::validate_source_domain"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_validate_source_domain_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_validate_source_domain_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "Ec::validate_passphrase"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_validate_passphrase_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_validate_passphrase_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "validate_path"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_path_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_path_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "validate_trusted_client_ip"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_trusted_client_ip_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_validate_trusted_client_ip_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "EcPartner::default_openrtb_atype"
+kind = "default"
+value = "3"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_openrtb_atype_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_openrtb_atype_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "EcPartner::default_batch_rate_limit"
+kind = "default"
+value = "60"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_batch_rate_limit_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_batch_rate_limit_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "EcPartner::default_pull_sync_ttl_sec"
+kind = "default"
+value = "86400"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_ttl_sec_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_ttl_sec_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "EcPartner::default_pull_sync_rate_limit"
+kind = "default"
+value = "10"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_rate_limit_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ecpartner_default_pull_sync_rate_limit_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "Ec::default_pull_sync_concurrency"
+kind = "default"
+value = "3"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_default_pull_sync_concurrency_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_default_pull_sync_concurrency_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "Ec::default_cluster_trust_threshold"
+kind = "default"
+value = "10"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_trust_threshold_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_trust_threshold_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "Ec::default_cluster_recheck_secs"
+kind = "default"
+value = "3600"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_recheck_secs_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_ec_default_cluster_recheck_secs_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_s3_access_key_id"
+kind = "default"
+value = "access_key_id"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_s3_access_key_id_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_s3_access_key_id_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_s3_secret_access_key"
+kind = "default"
+value = "secret_access_key"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_s3_secret_access_key_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_s3_secret_access_key_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_profile_param"
+kind = "default"
+value = "profile"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_profile_param_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_profile_param_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_aspect_ratio_param"
+kind = "default"
+value = "ar"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_aspect_ratio_param_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_aspect_ratio_param_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_debug_param"
+kind = "default"
+value = "_io_debug"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_debug_param_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_debug_param_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_default_profile"
+kind = "default"
+value = "default"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_default_profile_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_default_profile_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_crop_offset_x_param"
+kind = "default"
+value = "x"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_x_param_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_x_param_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_crop_offset_y_param"
+kind = "default"
+value = "y"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_y_param_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_y_param_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_crop_offset_buckets"
+kind = "default"
+value = "[10,30,50,70,90]"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_buckets_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_crop_offset_buckets_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_tinybird_auction_dataset"
+kind = "default"
+value = "auction_events_raw"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_tinybird_auction_dataset_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_tinybird_auction_dataset_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_tinybird_access_dataset"
+kind = "default"
+value = "access_logs_raw"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_tinybird_access_dataset_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_tinybird_access_dataset_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_tinybird_max_body_bytes"
+kind = "default"
+value = "1048576"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_tinybird_max_body_bytes_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_tinybird_max_body_bytes_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/settings.rs"
+symbol = "default_auction_debug_metadata_keys"
+kind = "default"
+value = "[error_type,http_status,message]"
+positive_probe = "task7_crates_trusted_server_core_src_settings_rs_default_auction_debug_metadata_keys_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_settings_rs_default_auction_debug_metadata_keys_default_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/integrations/aps.rs"
+symbol = "deserialize_account_id"
+kind = "deserializer"
+positive_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_positive"
+negative_probe = "task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/integrations/prebid.rs"
+symbol = "default_script_patterns"
+kind = "default"
+value = "[/prebid.js,/prebid.min.js,/prebidjs.js,/prebidjs.min.js]"
+positive_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_positive"
+negative_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_negative"
+
+[[fields]]
+path = "Publisher.proxy_secret"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "Ec.passphrase"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "EcPartner.api_token"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "EcPartner.ts_pull_token"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "Handler.password"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "TinybirdSettings.auction_token_secret"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "DataDomeConfig.server_side_key_secret_name"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "DataDomeProtectionTestBypassConfig.credential_secret_name"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "S3SigV4AuthConfig.access_key_id"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "S3SigV4AuthConfig.secret_access_key"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "S3SigV4AuthConfig.session_token"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "store_resolved"
+
+[[fields]]
+path = "TrustedClientIpConfig.shared_secret"
+lifecycle = "canonical"
+key_identity = "canonical"
+serialization = "serialized"
+runtime = "active"
+secret = "deliberately_inline"
+
+[[fields]]
+path = "TinybirdSettings.access_token_secret"
+lifecycle = "deprecated"
+key_identity = "canonical"
+serialization = "skipped"
+runtime = "normalized_away"
+secret = "accepted_discarded"
+
+[[fields]]
+path = "S3SigV4AuthConfig.secret_store"
+lifecycle = "deprecated"
+key_identity = "canonical"
+serialization = "skipped"
+runtime = "normalized_away"
+secret = "none"
+
+[[fields]]
+path = "TinybirdSettings.secret_store"
+lifecycle = "deprecated"
+key_identity = "canonical"
+serialization = "skipped"
+runtime = "normalized_away"
+secret = "none"
+
+[[fields]]
+path = "DataDomeConfig.server_side_key_secret_store"
+lifecycle = "deprecated"
+key_identity = "canonical"
+serialization = "skipped"
+runtime = "normalized_away"
+secret = "none"
+
+[[fields]]
+path = "DataDomeProtectionTestBypassConfig.credential_secret_store"
+lifecycle = "deprecated"
+key_identity = "canonical"
+serialization = "skipped"
+runtime = "normalized_away"
+secret = "none"
+
+[[fields]]
+path = "AssetOriginAuth.s3_sig_v4"
+lifecycle = "deprecated"
+key_identity = "alias"
+alias_of = "AssetOriginAuth.s3_sigv4"
+serialization = "skipped"
+runtime = "deserialization_only"
+secret = "none"
+
+[[companions]]
+source = "crates/trusted-server-core/src/integrations/prebid.rs"
+symbol = "crate::settings::vec_from_seq_or_map"
+kind = "deserializer"
+positive_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_crate_settings_vec_from_seq_or_map_deserializer_positive"
+negative_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_crate_settings_vec_from_seq_or_map_deserializer_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/integrations/prebid.rs"
+symbol = "validate_external_bundle_url"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_url_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_url_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/integrations/prebid.rs"
+symbol = "validate_external_bundle_sri"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_sri_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_sri_validator_negative"
+
+[[companions]]
+source = "crates/trusted-server-core/src/integrations/prebid.rs"
+symbol = "validate_excluded_gam_ad_unit_path_suffixes"
+kind = "validator"
+positive_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_excluded_gam_ad_unit_path_suffixes_validator_positive"
+negative_probe = "task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_excluded_gam_ad_unit_path_suffixes_validator_negative"

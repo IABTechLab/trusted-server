@@ -274,6 +274,12 @@ impl core::error::Error for MyError {}
 - Do not write or commit real domains, customer names, credentials,
   configuration values, or other potentially sensitive real-world information in
   comments, tests, docs, or examples.
+- Sensitive-data exceptions are limited to these types: vendor URL,
+  hash-pinned fake-credential fixture, historical example, service ID, and
+  project-owned public domain.
+- Record every exception before use with its exact type and scope, owner,
+  rationale, and expiry timestamp. Ownerless, expired, broad, or untyped
+  exceptions are prohibited.
 
 ---
 

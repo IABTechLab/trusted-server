@@ -1,0 +1,285 @@
+version = 1
+reviewed = true
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/.well-known/trusted-server.json"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/verify-signature"
+methods = ["POST"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/admin/keys/rotate"
+methods = ["POST"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["axum", "cloudflare", "spin"]
+path = "/_ts/admin/keys/rotate"
+methods = ["POST"]
+shape = "literal"
+predicate = "always"
+status = "unsupported"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/admin/keys/deactivate"
+methods = ["POST"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["axum", "cloudflare", "spin"]
+path = "/_ts/admin/keys/deactivate"
+methods = ["POST"]
+shape = "literal"
+predicate = "always"
+status = "unsupported"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/admin/ec"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["axum", "cloudflare", "spin"]
+path = "/_ts/admin/ec"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "unsupported"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/admin/ec/{id}"
+methods = ["GET"]
+shape = "template"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["axum", "cloudflare", "spin"]
+path = "/_ts/admin/ec/{id}"
+methods = ["GET"]
+shape = "template"
+predicate = "always"
+status = "unsupported"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/_ts/admin/eids"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/admin/keys/rotate"
+methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+shape = "literal"
+predicate = "always"
+status = "guarded"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/admin/keys/deactivate"
+methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+shape = "literal"
+predicate = "always"
+status = "guarded"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/auction"
+methods = ["POST"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/_ts/page-bids"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/_ts/page-bids"
+methods = ["OPTIONS"]
+shape = "literal"
+predicate = "always"
+status = "guarded"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/__ts/page-bids"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/__ts/page-bids"
+methods = ["OPTIONS"]
+shape = "literal"
+predicate = "always"
+status = "guarded"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/first-party/proxy"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/first-party/click"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/first-party/sign"
+methods = ["GET", "POST"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/first-party/proxy-rebuild"
+methods = ["GET", "POST"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/api/v1/batch-sync"
+methods = ["POST"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/api/v1/identify"
+methods = ["GET", "OPTIONS"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/set-tester"
+methods = ["GET"]
+shape = "literal"
+predicate = "settings.tester_cookie.enabled"
+status = "real"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/clear-tester"
+methods = ["GET"]
+shape = "literal"
+predicate = "settings.tester_cookie.enabled"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/"
+methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+shape = "literal"
+predicate = "publisher_fallback"
+status = "publisher_fallback"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/{*rest}"
+methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+shape = "template"
+predicate = "publisher_fallback"
+status = "publisher_fallback"
+
+[[routes]]
+adapters = ["fastly", "axum", "spin"]
+path = "/health"
+methods = ["GET"]
+shape = "literal"
+predicate = "always"
+status = "real"
+
+[[routes]]
+adapters = ["fastly"]
+path = "/_ts/debug/ja4"
+methods = ["GET"]
+shape = "conditional"
+predicate = "settings.debug.ja4_endpoint_enabled"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/static/tsjs=<file>"
+methods = ["GET"]
+shape = "template"
+predicate = "path.starts_with(/static/tsjs=)"
+status = "real"
+
+[[routes]]
+adapters = ["fastly"]
+path = "<proxy.asset_routes[].prefix>{*rest}"
+methods = ["GET", "HEAD"]
+shape = "config_derived"
+predicate = "settings.proxy.asset_routes[]"
+status = "real"
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/"
+methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+shape = "literal"
+predicate = "startup_error"
+status = "startup_error"
+startup_router = true
+
+[[routes]]
+adapters = ["fastly", "axum", "cloudflare", "spin"]
+path = "/{*rest}"
+methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+shape = "template"
+predicate = "startup_error"
+status = "startup_error"
+startup_router = true
+
+[[routes]]
+adapters = ["fastly", "spin"]
+path = "/health"
+methods = ["GET"]
+shape = "literal"
+predicate = "startup_error"
+status = "real"
+startup_router = true

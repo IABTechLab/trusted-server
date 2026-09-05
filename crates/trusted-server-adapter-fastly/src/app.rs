@@ -1353,7 +1353,7 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1590,6 +1590,48 @@ mod tests {
     }
 
     #[test]
+    fn complete_route_registration_set_matches_the_prechange_contract() {
+        let named_paths = [
+            "/.well-known/trusted-server.json",
+            "/verify-signature",
+            "/_ts/admin/keys/rotate",
+            "/_ts/admin/keys/deactivate",
+            "/_ts/admin/ec",
+            "/_ts/admin/ec/{id}",
+            "/_ts/admin/eids",
+            "/admin/keys/rotate",
+            "/admin/keys/deactivate",
+            "/_ts/api/v1/batch-sync",
+            "/_ts/api/v1/identify",
+            "/_ts/set-tester",
+            "/_ts/clear-tester",
+            "/auction",
+            "/_ts/page-bids",
+            "/__ts/page-bids",
+            "/first-party/proxy",
+            "/first-party/click",
+            "/first-party/sign",
+            "/first-party/proxy-rebuild",
+        ];
+        let fallback_methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
+        let mut expected = BTreeSet::new();
+        for path in named_paths.into_iter().chain(["/", "/{*rest}"]) {
+            for method in fallback_methods {
+                expected.insert((method.to_owned(), path.to_owned()));
+            }
+        }
+        let observed = test_router()
+            .routes()
+            .into_iter()
+            .map(|route| (route.method().to_string(), route.path().to_owned()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed, expected,
+            "Fastly app router must preserve every named/fallback method exactly"
+        );
+    }
+
+    #[test]
     fn per_request_services_register_the_fastly_template_assembler() {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         let context = RequestContext::new(
@@ -1782,6 +1824,25 @@ mod tests {
             Some("text/plain; charset=utf-8"),
             "startup errors should stay plain-text for OPTIONS requests"
         );
+    }
+
+    #[test]
+    fn startup_error_route_set_matches_the_prechange_contract() {
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "startup failed".to_owned(),
+        });
+        let observed = startup_error_router(&report)
+            .routes()
+            .into_iter()
+            .map(|route| (route.method().to_string(), route.path().to_owned()))
+            .collect::<BTreeSet<_>>();
+        let mut expected = BTreeSet::new();
+        for path in ["/", "/{*rest}"] {
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                expected.insert((method.to_owned(), path.to_owned()));
+            }
+        }
+        assert_eq!(observed, expected);
     }
 
     #[test]

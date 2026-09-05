@@ -1333,4 +1333,24 @@ mod tests {
             "startup-fallback health body should be `ok`"
         );
     }
+
+    #[test]
+    fn startup_error_route_set_matches_the_prechange_contract() {
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "startup failure".to_owned(),
+        });
+        let observed = startup_error_router(&report)
+            .routes()
+            .into_iter()
+            .map(|route| (route.method().to_string(), route.path().to_owned()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected = std::collections::BTreeSet::new();
+        for path in ["/", "/{*rest}"] {
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                expected.insert((method.to_owned(), path.to_owned()));
+            }
+        }
+        expected.insert(("GET".to_owned(), "/health".to_owned()));
+        assert_eq!(observed, expected);
+    }
 }

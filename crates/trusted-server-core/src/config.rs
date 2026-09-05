@@ -432,13 +432,15 @@ fn report_to_validation_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+    use crate::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
+    use edgezero_core::blob_envelope::BlobEnvelope;
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -451,6 +453,33 @@ mod tests {
         price_granularity: serde_json::Value,
         #[serde(default)]
         slot: Vec<serde_json::Value>,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CheckedManifest {
+        template: Task7CheckedTemplate,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CheckedTemplate {
+        placeholder_paths: BTreeSet<String>,
+        integration_ids: BTreeSet<String>,
+        profile_ids: BTreeSet<String>,
+        consumer_literals: BTreeSet<String>,
+        expected_failure_diagnostic: String,
+    }
+
+    fn task7_checked_template() -> Task7CheckedTemplate {
+        let checked: Task7CheckedManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/settings-companions.toml"
+        )))
+        .expect("checked Task 7 settings manifest should parse");
+        checked.template
+    }
+
+    fn task7_checked_integration_ids() -> BTreeSet<String> {
+        task7_checked_template().integration_ids
     }
 
     fn app_config_with_creative_opportunities(
@@ -495,6 +524,40 @@ formats = [{ width = 300, height = 250 }]
         settings
     }
 
+    struct Task7SecretStore;
+
+    impl PlatformSecretStore for Task7SecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            let resolved = match key {
+                "publisher_proxy_secret" => "fictional-proxy-secret-32-bytes-ok",
+                "ec_passphrase" => "fictional-ec-passphrase-32-bytes-ok",
+                "handler_password" => "fictional-admin-password-32-bytes-ok",
+                _ => {
+                    return Err(Report::new(PlatformError::SecretStore)
+                        .attach(format!("unexpected Task 7 secret key: {key}")));
+                }
+            };
+            Ok(resolved.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
     /// Source-controlled operator-facing config template.
     const EXAMPLE_TEMPLATE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -537,7 +600,12 @@ formats = [{ width = 300, height = 250 }]
                     .strip_prefix("# ")
                     .or_else(|| line.strip_prefix('#'))
                     .unwrap_or(line);
-                out.push(bare.to_owned());
+                let syntax = bare.trim_start();
+                if syntax.starts_with('[') || syntax.contains('=') {
+                    out.push(bare.to_owned());
+                } else {
+                    out.push(line.to_owned());
+                }
             } else {
                 out.push(line.to_owned());
             }
@@ -1140,17 +1208,121 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
-    fn deploy_validation_covers_registered_integration_builders() {
-        let validated_ids: HashSet<&'static str> =
-            DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
-        let missing_ids = crate::integrations::registered_builder_ids()
-            .filter(|id| !validated_ids.contains(id))
-            .collect::<Vec<_>>();
+    fn deploy_validation_ids_match_checked_settings_record() {
+        let validated_ids: BTreeSet<String> = DEPLOY_VALIDATED_INTEGRATION_IDS
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        let registered_ids: BTreeSet<String> = crate::integrations::registered_builder_ids()
+            .map(str::to_owned)
+            .collect();
 
         assert!(
-            missing_ids.is_empty(),
-            "deploy validation should cover all registered integration builders: {missing_ids:?}"
+            registered_ids.is_subset(&validated_ids),
+            "deploy validation IDs should cover every registered integration builder"
         );
+
+        assert_eq!(
+            validated_ids,
+            task7_checked_integration_ids(),
+            "deploy validation IDs and the checked documentation record should be equal"
+        );
+    }
+
+    #[test]
+    fn task7_enables_every_deploy_validated_integration_in_isolation() {
+        let blocks = task7_source_integration_blocks();
+        assert_eq!(
+            blocks
+                .keys()
+                .map(|id| (*id).to_owned())
+                .collect::<BTreeSet<_>>(),
+            task7_checked_integration_ids(),
+            "source-template integration blocks and checked IDs must be equal"
+        );
+        for (id, header) in blocks {
+            let mut settings = task7_settings_with_source_integration_enabled(id, header);
+            validate_settings_for_deploy(&settings)
+                .unwrap_or_else(|error| panic!("{id} should validate while enabled: {error:?}"));
+
+            settings
+                .integrations
+                .get_mut(id)
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("source integration block should be an object")
+                .insert(
+                    "enabled".to_owned(),
+                    serde_json::Value::String("not-a-bool".to_owned()),
+                );
+            assert!(
+                validate_settings_for_deploy(&settings).is_err(),
+                "{id} should reject its source-derived negative probe"
+            );
+        }
+    }
+
+    fn task7_source_integration_blocks() -> BTreeMap<&'static str, &'static str> {
+        BTreeMap::from([
+            ("adserver_mock", "[integrations.adserver_mock]"),
+            ("aps", "[integrations.aps]"),
+            ("datadome", "[integrations.datadome]"),
+            ("didomi", "[integrations.didomi]"),
+            ("google_tag_manager", "[integrations.google_tag_manager]"),
+            ("gpt", "[integrations.gpt]"),
+            ("gpt_diagnostics", "[integrations.gpt_diagnostics]"),
+            ("lockr", "[integrations.lockr]"),
+            ("nextjs", "[integrations.nextjs]"),
+            ("osano", "[integrations.osano]"),
+            ("permutive", "[integrations.permutive]"),
+            ("prebid", "[integrations.prebid]"),
+            ("sourcepoint", "[integrations.sourcepoint]"),
+            ("testlight", "[integrations.testlight]"),
+        ])
+    }
+
+    fn task7_settings_with_source_integration_enabled(id: &str, header: &str) -> Settings {
+        let source = if EXAMPLE_TEMPLATE.lines().any(|line| line == header) {
+            EXAMPLE_TEMPLATE.to_owned()
+        } else {
+            let commented = format!("# {header}");
+            assert!(
+                EXAMPLE_TEMPLATE.lines().any(|line| line == commented),
+                "{id} must be represented by an exact source-template block"
+            );
+            uncomment_block(EXAMPLE_TEMPLATE, header)
+        };
+        let mut settings = toml::from_str::<TrustedServerAppConfig>(&source)
+            .unwrap_or_else(|error| panic!("source-derived {id} block should parse: {error}"))
+            .into_settings();
+        task7_customize_nonsecret_values(&mut settings);
+        let raw = settings
+            .integrations
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("source-derived {id} block should exist"));
+        let object = raw
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("source-derived {id} block should be an object"));
+        object.insert("enabled".to_owned(), serde_json::Value::Bool(true));
+        match id {
+            "prebid" => {
+                object.insert(
+                    "external_bundle_url".to_owned(),
+                    serde_json::json!("https://assets.example.com/prebid.js"),
+                );
+                settings.proxy.allowed_domains = vec!["assets.example.com".to_owned()];
+            }
+            "google_tag_manager" => {
+                object.insert("container_id".to_owned(), serde_json::json!("GTM-ABC123"));
+            }
+            _ => {}
+        }
+        settings
+    }
+
+    fn task7_customize_nonsecret_values(settings: &mut Settings) {
+        settings.publisher.domain = "publisher.example".to_owned();
+        settings.publisher.cookie_domain = ".publisher.example".to_owned();
+        settings.publisher.origin_url = "https://origin.publisher.example".to_owned();
     }
 
     #[test]
@@ -1229,5 +1401,402 @@ password = "production-admin-password-32-bytes"
             err.to_string().contains("missing-provider"),
             "validation error should mention invalid provider"
         );
+    }
+
+    #[test]
+    fn task7_source_template_round_trips_through_production_apis() {
+        let observation = run_task7_template_harness()
+            .expect("source template should pass every production harness phase");
+        let checked = task7_checked_template();
+        assert_eq!(observation.placeholder_paths, checked.placeholder_paths);
+        assert_eq!(
+            observation.failure_diagnostic,
+            checked.expected_failure_diagnostic
+        );
+        assert_eq!(
+            observation.integration_ids, checked.integration_ids,
+            "source-derived integration probe set must be exact"
+        );
+        assert_eq!(
+            observation.profile_ids, checked.profile_ids,
+            "source-derived profile compile set must be exact"
+        );
+        assert_eq!(
+            observation.consumer_literals, checked.consumer_literals,
+            "serialized secret-key consumer literals must be exact"
+        );
+    }
+
+    #[test]
+    fn task7_standard_profile_probe_is_derived_from_the_source_template() {
+        let cases = task7_source_profile_cases().expect("source profile cases should parse");
+        let (positive, negative) = cases
+            .get("standard")
+            .expect("source profile cases should contain standard");
+        let registration = crate::auction::profile::find_profile("standard")
+            .expect("standard profile should be registered");
+        let compiled = registration
+            .compile(positive)
+            .expect("source standard profile config should compile");
+        assert_eq!(compiled.id(), "standard");
+        let error = registration
+            .compile(negative)
+            .expect_err("malformed source-derived request_ext should fail");
+        assert!(error.to_string().contains("request_ext"));
+    }
+
+    #[test]
+    fn task7_production_harness_rejects_all_eight_contract_mutations() {
+        let typo_source = EXAMPLE_TEMPLATE.replacen(
+            "origin_url = \"https://origin.example.com\"",
+            "orgin_url = \"https://origin.example.com\"",
+            1,
+        );
+        toml::from_str::<TrustedServerAppConfig>(&typo_source)
+            .expect_err("a source-template key typo must fail typed parsing");
+
+        let mut disabled_unknown = toml::from_str::<TrustedServerAppConfig>(EXAMPLE_TEMPLATE)
+            .expect("source template should parse")
+            .into_settings();
+        task7_customize_nonsecret_values(&mut disabled_unknown);
+        disabled_unknown
+            .integrations
+            .get_mut("prebid")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("source Prebid block should be an object")
+            .insert("task7_unknown".to_owned(), serde_json::Value::Bool(true));
+        let _error = validate_settings_for_deploy(&disabled_unknown)
+            .expect_err("an unknown key must fail even in a disabled source block");
+
+        let mut bad_profile = toml::from_str::<TrustedServerAppConfig>(EXAMPLE_TEMPLATE)
+            .expect("source template should parse")
+            .into_settings();
+        task7_customize_nonsecret_values(&mut bad_profile);
+        bad_profile
+            .auction
+            .providers
+            .values_mut()
+            .find(|provider| provider.profile == "prebid-server")
+            .expect("source Prebid provider should exist")
+            .profile_config
+            .as_object_mut()
+            .expect("source profile config should be an object")
+            .insert("task7_unknown".to_owned(), serde_json::Value::Bool(true));
+        let _error = validate_settings_for_deploy(&bad_profile)
+            .expect_err("a bad source-derived provider profile must fail compilation");
+
+        let mut unresolved = task7_serialized_source_config(EXAMPLE_TEMPLATE)
+            .expect("customized source template should serialize");
+        *unresolved
+            .pointer_mut("/publisher/proxy_secret")
+            .expect("serialized publisher secret path should exist") =
+            serde_json::json!("task7_missing_secret");
+        task7_resolve_envelope(unresolved)
+            .expect_err("an unresolved secret key must fail fake-store resolution");
+
+        let stranded_source = EXAMPLE_TEMPLATE.replacen(
+            "password = \"handler_password\"",
+            "password = \"handler_password_stranded\"",
+            1,
+        );
+        let stranded = task7_serialized_source_config(&stranded_source)
+            .expect("stranded-literal source mutation should serialize");
+        assert_eq!(
+            task7_serialized_secret_literals(&stranded)
+                .expect("stranded source should retain all secret paths"),
+            BTreeSet::from([
+                "ec_passphrase".to_owned(),
+                "handler_password_stranded".to_owned(),
+                "publisher_proxy_secret".to_owned(),
+            ]),
+            "stranded source literal must produce the exact wrong consumer set"
+        );
+        task7_resolve_envelope(stranded)
+            .expect_err("a stranded literal must fail the production fake-store path");
+
+        let mut inactive =
+            task7_settings_with_source_integration_enabled("permutive", "[integrations.permutive]");
+        let inactive_raw = inactive
+            .integrations
+            .get_mut("permutive")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("source Permutive block should be an object");
+        inactive_raw.insert("enabled".to_owned(), serde_json::Value::Bool(false));
+        inactive_raw.insert(
+            "organization_id".to_owned(),
+            serde_json::Value::String(String::new()),
+        );
+        validate_settings_for_deploy(&inactive)
+            .expect("inactive invalid value demonstrates why forced-enabled probing is required");
+        inactive
+            .integrations
+            .get_mut("permutive")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("source Permutive block should be an object")
+            .insert("enabled".to_owned(), serde_json::Value::Bool(true));
+        let _error = validate_settings_for_deploy(&inactive)
+            .expect_err("the same source-derived block must fail when forced enabled");
+
+        let missing_profile = task7_probe_source_profiles(Some("aps"))
+            .expect("remaining source-derived profiles should compile");
+        let checked_profiles = task7_checked_template().profile_ids;
+        assert_eq!(
+            missing_profile,
+            BTreeSet::from(["prebid-server".to_owned(), "standard".to_owned()])
+        );
+        assert_ne!(
+            missing_profile, checked_profiles,
+            "omitting a compiled provider profile must fail exact set equality"
+        );
+
+        let mut wrong_diagnostic = toml::from_str::<TrustedServerAppConfig>(EXAMPLE_TEMPLATE)
+            .expect("source template should parse")
+            .into_settings();
+        wrong_diagnostic.publisher.origin_url = "https://origin.publisher.example".to_owned();
+        let (wrong_paths, wrong_text) = task7_placeholder_observation(&wrong_diagnostic)
+            .expect("remaining placeholders should produce a typed diagnostic");
+        assert_eq!(
+            wrong_paths,
+            BTreeSet::from([
+                "publisher.cookie_domain".to_owned(),
+                "publisher.domain".to_owned(),
+            ])
+        );
+        assert_eq!(
+            wrong_text,
+            "unmodified template rejects publisher.cookie_domain, publisher.domain"
+        );
+        assert_ne!(
+            wrong_text,
+            task7_checked_template().expected_failure_diagnostic,
+            "a partial placeholder diagnostic must fail exact equality"
+        );
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct Task7HarnessObservation {
+        placeholder_paths: BTreeSet<String>,
+        integration_ids: BTreeSet<String>,
+        profile_ids: BTreeSet<String>,
+        consumer_literals: BTreeSet<String>,
+        failure_diagnostic: String,
+    }
+
+    fn run_task7_template_harness() -> Result<Task7HarnessObservation, String> {
+        let source: TrustedServerAppConfig = toml::from_str(EXAMPLE_TEMPLATE)
+            .map_err(|error| format!("source template parse failed: {error}"))?;
+        let (placeholder_paths, failure_diagnostic) =
+            task7_placeholder_observation(source.settings())?;
+
+        let mut settings = source.into_settings();
+        task7_customize_nonsecret_values(&mut settings);
+        validate_settings_for_deploy(&settings)
+            .map_err(|error| format!("deploy validation failed: {error:?}"))?;
+
+        let app_config = TrustedServerAppConfig::new(settings)
+            .map_err(|error| format!("typed app config failed: {error:?}"))?;
+        let data = serde_json::to_value(&app_config)
+            .map_err(|error| format!("app config serialization failed: {error}"))?;
+        let consumer_literals = task7_serialized_secret_literals(&data)?;
+
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope)
+            .map_err(|error| format!("blob envelope serialization failed: {error}"))?;
+        let runtime = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &Task7SecretStore,
+            &StoreName::from("trusted_server_secrets"),
+        )
+        .map_err(|error| format!("runtime settings resolution failed: {error:?}"))?;
+
+        assert_eq!(
+            runtime.publisher.proxy_secret.expose(),
+            "fictional-proxy-secret-32-bytes-ok"
+        );
+        assert_eq!(
+            runtime.ec.passphrase.expose(),
+            "fictional-ec-passphrase-32-bytes-ok"
+        );
+        assert_eq!(
+            runtime.handlers[0].password.expose(),
+            "fictional-admin-password-32-bytes-ok"
+        );
+        let integration_ids = task7_probe_source_integrations()?;
+        let profile_ids = task7_probe_source_profiles(None)?;
+        Ok(Task7HarnessObservation {
+            placeholder_paths,
+            integration_ids,
+            profile_ids,
+            consumer_literals,
+            failure_diagnostic,
+        })
+    }
+
+    fn task7_placeholder_observation(
+        settings: &Settings,
+    ) -> Result<(BTreeSet<String>, String), String> {
+        let error = validate_settings_for_deploy(settings)
+            .expect_err("unmodified source template must reject its placeholders");
+        let TrustedServerError::InsecureDefault { field } = error.current_context() else {
+            return Err(format!(
+                "unexpected source-template failure context: {:?}",
+                error.current_context()
+            ));
+        };
+        let paths = field
+            .split(", ")
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let diagnostic = format!(
+            "unmodified template rejects {}",
+            paths.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        Ok((paths, diagnostic))
+    }
+
+    fn task7_serialized_secret_literals(
+        data: &serde_json::Value,
+    ) -> Result<BTreeSet<String>, String> {
+        [
+            "/publisher/proxy_secret",
+            "/ec/passphrase",
+            "/handlers/0/password",
+        ]
+        .into_iter()
+        .map(|pointer| {
+            data.pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("missing serialized secret-key literal at {pointer}"))
+        })
+        .collect()
+    }
+
+    fn task7_serialized_source_config(source: &str) -> Result<serde_json::Value, String> {
+        let mut settings = toml::from_str::<TrustedServerAppConfig>(source)
+            .map_err(|error| format!("source template parse failed: {error}"))?
+            .into_settings();
+        task7_customize_nonsecret_values(&mut settings);
+        validate_settings_for_deploy(&settings)
+            .map_err(|error| format!("source deploy validation failed: {error:?}"))?;
+        let app_config = TrustedServerAppConfig::new(settings)
+            .map_err(|error| format!("source typed app config failed: {error:?}"))?;
+        serde_json::to_value(app_config)
+            .map_err(|error| format!("source app config serialization failed: {error}"))
+    }
+
+    fn task7_resolve_envelope(data: serde_json::Value) -> Result<Settings, String> {
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope)
+            .map_err(|error| format!("blob envelope serialization failed: {error}"))?;
+        crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &Task7SecretStore,
+            &StoreName::from("trusted_server_secrets"),
+        )
+        .map_err(|error| format!("runtime settings resolution failed: {error:?}"))
+    }
+
+    fn task7_probe_source_integrations() -> Result<BTreeSet<String>, String> {
+        let mut observed = BTreeSet::new();
+        for (id, header) in task7_source_integration_blocks() {
+            let settings = task7_settings_with_source_integration_enabled(id, header);
+            validate_settings_for_deploy(&settings)
+                .map_err(|error| format!("source-derived {id} probe failed: {error:?}"))?;
+            observed.insert(id.to_owned());
+        }
+        Ok(observed)
+    }
+
+    fn task7_probe_source_profiles(omitted: Option<&str>) -> Result<BTreeSet<String>, String> {
+        let cases = task7_source_profile_cases()?;
+        let mut observed = BTreeSet::new();
+        for (id, (positive, negative)) in cases {
+            if omitted == Some(id) {
+                continue;
+            }
+            let registration = crate::auction::profile::find_profile(id)
+                .ok_or_else(|| format!("source-derived profile {id} is not registered"))?;
+            let compiled = registration
+                .compile(&positive)
+                .map_err(|error| format!("source-derived profile {id} failed: {error:?}"))?;
+            if compiled.id() != id {
+                return Err(format!(
+                    "source-derived profile {id} compiled as {}",
+                    compiled.id()
+                ));
+            }
+            if registration.compile(&negative).is_ok() {
+                return Err(format!("source-derived profile {id} negative probe passed"));
+            }
+            observed.insert(id.to_owned());
+        }
+        Ok(observed)
+    }
+
+    fn task7_source_profile_cases()
+    -> Result<BTreeMap<&'static str, (serde_json::Value, serde_json::Value)>, String> {
+        let source = toml::from_str::<TrustedServerAppConfig>(EXAMPLE_TEMPLATE)
+            .map_err(|error| format!("source template profile parse failed: {error}"))?
+            .into_settings();
+        let pbs = source
+            .auction
+            .providers
+            .values()
+            .find(|provider| provider.profile == "prebid-server")
+            .ok_or_else(|| "source template has no prebid-server provider".to_owned())?;
+        let aps_source = uncomment_block(
+            &uncomment_block(EXAMPLE_TEMPLATE, "[auction.providers.aps-main]"),
+            "[auction.providers.aps-main.profile_config]",
+        );
+        let aps_settings = toml::from_str::<TrustedServerAppConfig>(&aps_source)
+            .map_err(|error| format!("source APS provider parse failed: {error}"))?
+            .into_settings();
+        let aps = aps_settings
+            .auction
+            .providers
+            .values()
+            .find(|provider| provider.profile == "aps")
+            .ok_or_else(|| "source template has no APS provider".to_owned())?;
+        let standard_source = uncomment_block(
+            &uncomment_block(EXAMPLE_TEMPLATE, "[auction.providers.standard-main]"),
+            "[auction.providers.standard-main.profile_config]",
+        );
+        let standard_settings = toml::from_str::<TrustedServerAppConfig>(&standard_source)
+            .map_err(|error| format!("source standard provider parse failed: {error}"))?
+            .into_settings();
+        let standard = standard_settings
+            .auction
+            .providers
+            .values()
+            .find(|provider| provider.profile == "standard")
+            .ok_or_else(|| "source template has no standard provider".to_owned())?;
+        let mut malformed_standard = standard.profile_config.clone();
+        let request_ext = malformed_standard
+            .as_object_mut()
+            .and_then(|object| object.get_mut("request_ext"))
+            .ok_or_else(|| "source standard profile does not exercise request_ext".to_owned())?;
+        *request_ext = serde_json::Value::String("not-an-object".to_owned());
+
+        Ok(BTreeMap::from([
+            (
+                "aps",
+                (
+                    aps.profile_config.clone(),
+                    serde_json::json!({"debug": false}),
+                ),
+            ),
+            (
+                "prebid-server",
+                (
+                    pbs.profile_config.clone(),
+                    serde_json::json!({"unknown": true}),
+                ),
+            ),
+            (
+                "standard",
+                (standard.profile_config.clone(), malformed_standard),
+            ),
+        ]))
     }
 }

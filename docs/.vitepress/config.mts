@@ -38,6 +38,14 @@ export default withMermaid(
     description:
       'Edge computing for ad serving, consent signal handling, and edge cookie (EC) generation',
     base: '/trusted-server',
+    srcExclude: [
+      'superpowers/**',
+      'internal/**',
+      'epics/**',
+      'guide/onboarding.md',
+      'README.md',
+      'business-use-cases.md',
+    ],
 
     // Replace version placeholders like {{NODEJS_VERSION}} with values from .tool-versions
     markdown: {
@@ -58,8 +66,7 @@ export default withMermaid(
       // https://vitepress.dev/reference/default-theme-config
       nav: [
         { text: 'Home', link: '/' },
-        { text: 'Guide', link: '/guide/getting-started' },
-        { text: 'Business Value', link: '/business-use-cases' },
+        { text: 'Guide', link: '/guide/' },
         { text: 'Roadmap', link: '/roadmap' },
       ],
 

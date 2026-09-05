@@ -1963,6 +1963,8 @@ pub fn register_providers(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::auction::test_support::canonical_parity_auction_request;
     use crate::auction::types::{
@@ -1974,6 +1976,53 @@ mod tests {
     };
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
+
+    #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+    struct Task7CompanionReceipt {
+        source: String,
+        symbol: String,
+        kind: String,
+        value: Option<String>,
+        positive_probe: String,
+        negative_probe: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CompanionManifest {
+        companions: Vec<Task7CompanionReceipt>,
+    }
+
+    macro_rules! task7_companion_receipt {
+        ($positive:ident, $negative:ident, $symbol:literal, $kind:literal, $value:expr, $positive_body:block, $negative_body:block) => {{
+            fn $positive() $positive_body
+            fn $negative() $negative_body
+            $positive();
+            $negative();
+            let value: Option<&str> = $value;
+            Task7CompanionReceipt {
+                source: "crates/trusted-server-core/src/integrations/aps.rs".to_owned(),
+                symbol: $symbol.to_owned(),
+                kind: $kind.to_owned(),
+                value: value.map(str::to_owned),
+                positive_probe: stringify!($positive).to_owned(),
+                negative_probe: stringify!($negative).to_owned(),
+            }
+        }};
+        ($positive:ident, $negative:ident, $symbol:literal, $kind:literal, dynamic $value:expr, $positive_body:block, $negative_body:block) => {{
+            fn $positive() $positive_body
+            fn $negative() $negative_body
+            $positive();
+            $negative();
+            Task7CompanionReceipt {
+                source: "crates/trusted-server-core/src/integrations/aps.rs".to_owned(),
+                symbol: $symbol.to_owned(),
+                kind: $kind.to_owned(),
+                value: Some($value),
+                positive_probe: stringify!($positive).to_owned(),
+                negative_probe: stringify!($negative).to_owned(),
+            }
+        }};
+    }
 
     fn config() -> LegacyApsProviderConfig {
         LegacyApsProviderConfig {
@@ -3247,5 +3296,30 @@ mod tests {
         assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
         assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
         assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
+    }
+
+    #[test]
+    fn task7_aps_companions_are_exact_and_compiled_per_record() {
+        let actual = BTreeSet::from([task7_companion_receipt!(
+            task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_positive,
+            task7_crates_trusted_server_core_src_integrations_aps_rs_deserialize_account_id_deserializer_negative,
+            "deserialize_account_id", "deserializer", None,
+            {
+                let numeric: ApsProfileConfig = serde_json::from_value(json!({"account_id":12345})).expect("numeric account ID should deserialize");
+                assert_eq!(numeric.account_id, "12345");
+            },
+            { serde_json::from_value::<ApsProfileConfig>(json!({"account_id":[]})).expect_err("array account ID should fail"); }
+        )]);
+        let checked: Task7CompanionManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/settings-companions.toml"
+        )))
+        .expect("checked Task 7 companion manifest should parse");
+        let expected = checked
+            .companions
+            .into_iter()
+            .filter(|record| record.source == "crates/trusted-server-core/src/integrations/aps.rs")
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "compiled APS receipts must be exact");
     }
 }

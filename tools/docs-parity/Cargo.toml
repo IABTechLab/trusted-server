@@ -1,0 +1,91 @@
+[package]
+name = "docs-parity"
+description = "Checks deterministic documentation records for Trusted Server."
+version = "0.1.0"
+authors = []
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+autobins = false
+autolib = false
+autotests = false
+
+[workspace]
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "allow"
+panic = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "warn"
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+
+[lints]
+workspace = true
+
+[lib]
+name = "docs_parity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "docs-parity"
+path = "src/main.rs"
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+
+[[test]]
+name = "classification"
+path = "tests/classification.rs"
+
+[[test]]
+name = "scanner"
+path = "tests/scanner.rs"
+
+[[test]]
+name = "markdown"
+path = "tests/markdown.rs"
+
+[[test]]
+name = "links"
+path = "tests/links.rs"
+
+[[test]]
+name = "settings"
+path = "tests/settings.rs"
+
+[[test]]
+name = "integrations"
+path = "tests/integrations.rs"
+
+[[test]]
+name = "routes"
+path = "tests/routes.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+derive_more = { version = "2.0", features = ["display"] }
+error-stack = "0.6"
+github-slugger = "0.1"
+psl = "2"
+pulldown-cmark = "0.13"
+regex = "1"
+scraper = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = { package = "yaml_serde", version = "0.10" }
+sha2 = "0.10"
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+tempfile = "3.24"
+toml = "0.9"
+toml_edit = "0.23"
+url = "2.5"
+unicode-normalization = "0.1"

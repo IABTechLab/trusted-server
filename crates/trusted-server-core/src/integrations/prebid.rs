@@ -3425,9 +3425,42 @@ mod tests {
     use bytes::Bytes;
     use http::Method;
     use serde_json::json;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::io::Cursor;
     use std::str::FromStr as _;
+
+    #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+    struct Task7CompanionReceipt {
+        source: String,
+        symbol: String,
+        kind: String,
+        value: Option<String>,
+        positive_probe: String,
+        negative_probe: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Task7CompanionManifest {
+        companions: Vec<Task7CompanionReceipt>,
+    }
+
+    macro_rules! task7_companion_receipt {
+        ($positive:ident, $negative:ident, $symbol:literal, $kind:literal, $value:expr, $positive_body:block, $negative_body:block) => {{
+            fn $positive() $positive_body
+            fn $negative() $negative_body
+            $positive();
+            $negative();
+            let value: Option<&str> = $value;
+            Task7CompanionReceipt {
+                source: "crates/trusted-server-core/src/integrations/prebid.rs".to_owned(),
+                symbol: $symbol.to_owned(),
+                kind: $kind.to_owned(),
+                value: value.map(str::to_owned),
+                positive_probe: stringify!($positive).to_owned(),
+                negative_probe: stringify!($negative).to_owned(),
+            }
+        }};
+    }
 
     #[test]
     fn external_bundle_sha256_validation_matches_hex_pattern() {
@@ -9220,5 +9253,62 @@ set = { networkId = 42 }
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
             "should preserve the complete enabled PBS wire shape"
         );
+    }
+
+    #[test]
+    fn task7_prebid_companions_are_exact_and_compiled_per_record() {
+        let actual = BTreeSet::from([
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_default_script_patterns_default_negative,
+                "default_script_patterns", "default", Some("[/prebid.js,/prebid.min.js,/prebidjs.js,/prebidjs.min.js]"),
+                { assert_eq!(default_script_patterns(), ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]); },
+                { assert_ne!(default_script_patterns(), ["/prebid.js"]); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_crate_settings_vec_from_seq_or_map_deserializer_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_crate_settings_vec_from_seq_or_map_deserializer_negative,
+                "crate::settings::vec_from_seq_or_map", "deserializer", None,
+                {
+                    let parsed: PrebidIntegrationConfig = toml::from_str("script_patterns = { 0 = \"first\", 1 = \"second\" }").expect("map script patterns should deserialize");
+                    assert_eq!(parsed.script_patterns, ["first", "second"]);
+                },
+                { toml::from_str::<PrebidIntegrationConfig>("script_patterns = 42").expect_err("scalar script patterns should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_url_validator_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_url_validator_negative,
+                "validate_external_bundle_url", "validator", None,
+                { validate_external_bundle_url("https://assets.example/prebid.js").expect("HTTPS URL should validate"); },
+                { validate_external_bundle_url("http://assets.example/prebid.js").expect_err("insecure URL should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_sri_validator_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_external_bundle_sri_validator_negative,
+                "validate_external_bundle_sri", "validator", None,
+                { validate_external_bundle_sri(&test_sri("sha384", &[0; 48])).expect("algorithm-sized SRI should validate"); },
+                { validate_external_bundle_sri("sha384-AAAA").expect_err("wrong-size SRI should fail"); }
+            ),
+            task7_companion_receipt!(
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_excluded_gam_ad_unit_path_suffixes_validator_positive,
+                task7_crates_trusted_server_core_src_integrations_prebid_rs_validate_excluded_gam_ad_unit_path_suffixes_validator_negative,
+                "validate_excluded_gam_ad_unit_path_suffixes", "validator", None,
+                { validate_excluded_gam_ad_unit_path_suffixes(&["/excluded".to_owned()]).expect("non-root suffix should validate"); },
+                { validate_excluded_gam_ad_unit_path_suffixes(&["/".to_owned()]).expect_err("root suffix should fail"); }
+            ),
+        ]);
+        let checked: Task7CompanionManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/docs-parity/manifests/settings-companions.toml"
+        )))
+        .expect("checked Task 7 companion manifest should parse");
+        let expected = checked
+            .companions
+            .into_iter()
+            .filter(|record| {
+                record.source == "crates/trusted-server-core/src/integrations/prebid.rs"
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "compiled Prebid receipts must be exact");
     }
 }

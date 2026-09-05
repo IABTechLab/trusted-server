@@ -1,0 +1,93 @@
+version = 1
+reviewed = true
+
+[[diagrams]]
+path = "docs/guide/architecture.md"
+selector = "mermaid:1"
+fingerprint = "sha256:a6a7ee7340fbbde17c07a1233298830828a5c9149b4584def5a6c0f11192f930"
+prose_anchor = "high-level-overview"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:1"
+fingerprint = "sha256:e8448fa8944b726d0cd79667cdb4589d459977bfefcfb14bd7d2b969f66fa135"
+prose_anchor = "request-lifecycle"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:2"
+fingerprint = "sha256:fdaecd90425fd99b6adaaeeb5659977440039f2973d8132bffda3716b47f21f8"
+prose_anchor = "response-finalization"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:3"
+fingerprint = "sha256:b8f53f809aeae9251722b5454780dbd2f3b29d22af8b1c85c9fde0afbbd0c8f2"
+prose_anchor = "consent-model"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:4"
+fingerprint = "sha256:9467bb4a698e9f62487433b01e1ee97dde9942d4c35757ede3d9b04f81f8fec3"
+prose_anchor = "partner-sync-channels"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:5"
+fingerprint = "sha256:660afdd49c50f4e376e89bbc69983c63a2969131a42a00925aaada9a3dce0f67"
+prose_anchor = "prebid-eid-cookie-flow"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:6"
+fingerprint = "sha256:af4610ef92c6d7568c87ea96a2ac26f1c3c68aa015740f2c6ccffebdcfe64bd4"
+prose_anchor = "eid-seeding-and-prebid-bidstream-forwarding"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/auction-orchestration.md"
+selector = "mermaid:1"
+fingerprint = "sha256:8a541c12d53d76fa0d3fc799e2d4646344ba3c0c40824a05c4274f26b3832ffa"
+prose_anchor = "system-flow-prebid-aps"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/integrations/datadome.md"
+selector = "mermaid:1"
+fingerprint = "sha256:f199c03b93bd9da6d208ef4542e06ff5ee96e6ff83b8e2de9d7f6ba861d19698"
+prose_anchor = "how-it-works"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/first-party-proxy.md"
+selector = "mermaid:1"
+fingerprint = "sha256:8d6e7ade18725c27c8136b6c268f2aed55eaed024949d8db93af7be01d921f17"
+prose_anchor = "how-it-works"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/collective-sync.md"
+selector = "mermaid:1"
+fingerprint = "sha256:9f14a631b35ee1499d2a2414e0e6c65cf6eb0026e924d7691a8eeb4379419e7d"
+prose_anchor = "overview"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "mermaid:1"
+fingerprint = "sha256:1a2d18a270be1649599d0ec2bf43d30912c68240dcee7683389f6fc1bfa703a1"
+prose_anchor = "how-it-works"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/integrations/prebid.md"
+selector = "mermaid:1"
+fingerprint = "sha256:17b5a132c7668052f3c403a9ee692d36a22d28cdfec9faa4dd63317bd1888084"
+prose_anchor = "identity-flow"
+owner = "documentation-maintainers"
