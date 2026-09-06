@@ -240,6 +240,7 @@ struct StubHttpResponse {
     status: u16,
     body: Vec<u8>,
     headers: Vec<(String, String)>,
+    stream_body: bool,
 }
 
 impl StubHttpClient {
@@ -295,6 +296,20 @@ impl StubHttpClient {
                 status,
                 body,
                 headers,
+                stream_body: false,
+            });
+    }
+
+    /// Queue a canned response whose body is returned as a lazy stream.
+    pub fn push_streaming_response(&self, status: u16, body: Vec<u8>) {
+        self.responses
+            .lock()
+            .expect("should lock responses")
+            .push_back(StubHttpResponse {
+                status,
+                body,
+                headers: Vec::new(),
+                stream_body: true,
             });
     }
 
@@ -460,8 +475,15 @@ impl PlatformHttpClient for StubHttpClient {
         for (name, value) in response.headers {
             builder = builder.header(name, value);
         }
+        let body = if response.stream_body {
+            edgezero_core::body::Body::stream(futures::stream::iter([bytes::Bytes::from(
+                response.body,
+            )]))
+        } else {
+            edgezero_core::body::Body::from(response.body)
+        };
         let edge_response = builder
-            .body(edgezero_core::body::Body::from(response.body))
+            .body(body)
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_response))
@@ -527,6 +549,11 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock responses")
             .pop_front()
             .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
+
+        if response.stream_body {
+            return Err(Report::new(PlatformError::Unsupported)
+                .attach("streaming stub responses require StubHttpClient send"));
+        }
 
         let pending = StubPendingResponse {
             backend_name: backend_name.clone(),
