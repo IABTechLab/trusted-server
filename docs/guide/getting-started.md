@@ -6,8 +6,8 @@ Get up and running with Trusted Server quickly.
 
 Before you begin, ensure you have the following installed (versions are pinned in `.tool-versions`):
 
-- Rust {{RUST_VERSION}} (see `.tool-versions`)
-- NodeJS {{NODEJS_VERSION}}
+- Rust 1.98.1 (see `.tool-versions`)
+- NodeJS 24.20.0
 - Basic familiarity with Rust and WebAssembly
 
 **For Fastly deployment** (optional for local dev):
@@ -50,7 +50,7 @@ Simulates the full Fastly production environment locally.
 Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 ```
 
 Start the local Fastly simulator:

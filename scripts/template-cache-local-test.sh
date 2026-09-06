@@ -53,7 +53,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 command -v viceroy >/dev/null || {
-  echo "viceroy not found. Install: cargo install viceroy --version 0.17.0 --locked" >&2
+  echo "viceroy not found. Install: cargo install viceroy --version 0.21.0 --locked" >&2
   exit 1
 }
 command -v node >/dev/null || {
