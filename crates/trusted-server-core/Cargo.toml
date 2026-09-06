@@ -56,6 +56,7 @@ web-time = { workspace = true }
 # The Fastly adapter uses `wasm32-wasip1`, which has native POSIX RNG and does not
 # need these — this block is intentionally scoped to `target_os = "unknown"` only.
 getrandom = { workspace = true, features = ["js"] }
+getrandom_04 = { workspace = true, features = ["wasm_js"] }
 uuid = { workspace = true, features = ["js"] }
 
 [features]

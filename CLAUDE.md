@@ -32,12 +32,12 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 
 | Tool        | Version / Target                         |
 | ----------- | ---------------------------------------- |
-| Rust        | 1.95.0 (pinned in `rust-toolchain.toml`) |
+| Rust        | 1.98.1 (pinned in `rust-toolchain.toml`) |
 | WASM target | `wasm32-wasip1`                          |
-| Node        | 24.12.0 (from `.tool-versions`)          |
-| Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
-| Viceroy     | 0.17.0 (from `.tool-versions`)           |
-| Wasmtime    | 44.0.1 (from `.tool-versions`)           |
+| Node        | 24.20.0 (from `.tool-versions`)          |
+| Fastly CLI  | 16.0.0 (from `.tool-versions`)           |
+| Viceroy     | 0.21.0 (from `.tool-versions`)           |
+| Wasmtime    | 48.0.1 (from `.tool-versions`)           |
 
 ---
 
@@ -139,7 +139,7 @@ cd crates/trusted-server-js/lib && node build-all.mjs
 ### Install prerequisites
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 ```
 
 ---
@@ -326,7 +326,7 @@ IntegrationRegistration::builder(ID)
 | `fastly.toml`                   | Fastly service configuration and build settings                 |
 | `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
 | `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
+| `rust-toolchain.toml`           | Pins Rust version to 1.98.1                                     |
 | `.env.dev`                      | Local development environment variables                         |
 
 ---

@@ -178,7 +178,7 @@ fn resolve_fastly_chunk_pointer(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerError>> {
