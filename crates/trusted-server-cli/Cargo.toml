@@ -22,6 +22,7 @@ edgezero-cli = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }

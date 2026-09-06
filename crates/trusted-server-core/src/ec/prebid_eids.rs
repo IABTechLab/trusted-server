@@ -49,6 +49,22 @@ struct StructuredCookieUid {
     ext: Option<JsonValue>,
 }
 
+enum DecodedCookieEids {
+    Legacy(Vec<LegacyCookieEid>),
+    Structured(Vec<StructuredCookieEid>),
+}
+
+pub(crate) struct DiagnosticEidSource {
+    pub(crate) source: String,
+    pub(crate) uids: Vec<String>,
+}
+
+pub(crate) struct PrebidEidAnalysis {
+    pub(crate) eids: Vec<Eid>,
+    pub(crate) diagnostic_sources: Vec<DiagnosticEidSource>,
+    pub(crate) updates: Vec<PartnerIdUpdate>,
+}
+
 trait PartnerIdBulkWriter {
     fn upsert_partner_ids(
         &self,
@@ -77,6 +93,10 @@ impl PartnerIdBulkWriter for KvIdentityGraph {
 /// Returns an error when the cookie exceeds the raw size limit, is not valid
 /// base64, or does not contain either supported JSON payload shape.
 pub fn parse_prebid_eids_cookie(cookie_value: &str) -> Result<Vec<Eid>, String> {
+    decode_prebid_eids_cookie(cookie_value).map(DecodedCookieEids::into_openrtb)
+}
+
+fn decode_prebid_eids_cookie(cookie_value: &str) -> Result<DecodedCookieEids, String> {
     if eids_cookie_exceeds_size_limit(cookie_value) {
         return Err(format!(
             "ts-eids cookie too large ({} bytes)",
@@ -89,12 +109,42 @@ pub fn parse_prebid_eids_cookie(cookie_value: &str) -> Result<Vec<Eid>, String> 
         .map_err(|e| format!("base64 decode failed: {e}"))?;
 
     if let Ok(eids) = serde_json::from_slice::<Vec<LegacyCookieEid>>(&bytes) {
-        return Ok(legacy_cookie_eids_to_openrtb(eids));
+        return Ok(DecodedCookieEids::Legacy(eids));
     }
 
     let structured = serde_json::from_slice::<Vec<StructuredCookieEid>>(&bytes)
         .map_err(|e| format!("JSON parse failed: {e}"))?;
-    Ok(structured_cookie_eids_to_openrtb(structured))
+    Ok(DecodedCookieEids::Structured(structured))
+}
+
+impl DecodedCookieEids {
+    fn diagnostic_sources(&self) -> Vec<DiagnosticEidSource> {
+        match self {
+            Self::Legacy(entries) => entries
+                .iter()
+                .filter(|entry| !entry.source.is_empty())
+                .map(|entry| DiagnosticEidSource {
+                    source: entry.source.clone(),
+                    uids: vec![entry.id.clone()],
+                })
+                .collect(),
+            Self::Structured(entries) => entries
+                .iter()
+                .filter(|entry| !entry.source.is_empty())
+                .map(|entry| DiagnosticEidSource {
+                    source: entry.source.clone(),
+                    uids: entry.uids.iter().map(|uid| uid.id.clone()).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn into_openrtb(self) -> Vec<Eid> {
+        match self {
+            Self::Legacy(entries) => legacy_cookie_eids_to_openrtb(entries),
+            Self::Structured(entries) => structured_cookie_eids_to_openrtb(entries),
+        }
+    }
 }
 
 /// Parses request-local EID cookies and writes matched partner UIDs to KV.
@@ -175,17 +225,40 @@ fn ingest_eid_cookies_with_writer(
     }
 }
 
-fn collect_prebid_eid_updates(
+pub(crate) fn collect_prebid_eid_updates(
     cookie_value: &str,
     registry: &PartnerRegistry,
 ) -> Vec<PartnerIdUpdate> {
-    let Ok(eids) = parse_prebid_eids_cookie(cookie_value) else {
+    let Ok(analysis) = analyze_prebid_eids_cookie(cookie_value, registry) else {
         log::trace!("Prebid EIDs: failed to decode ts-eids cookie; dropping");
         return Vec::new();
     };
 
+    analysis.updates
+}
+
+pub(crate) fn analyze_prebid_eids_cookie(
+    cookie_value: &str,
+    registry: &PartnerRegistry,
+) -> Result<PrebidEidAnalysis, String> {
+    let decoded = decode_prebid_eids_cookie(cookie_value)?;
+    let diagnostic_sources = decoded.diagnostic_sources();
+    let eids = decoded.into_openrtb();
+    let updates = collect_prebid_eid_updates_from_eids(&eids, registry);
+
+    Ok(PrebidEidAnalysis {
+        eids,
+        diagnostic_sources,
+        updates,
+    })
+}
+
+fn collect_prebid_eid_updates_from_eids(
+    eids: &[Eid],
+    registry: &PartnerRegistry,
+) -> Vec<PartnerIdUpdate> {
     let mut updates = Vec::new();
-    for eid in &eids {
+    for eid in eids {
         let Some(partner) = registry.find_by_source_domain(&eid.source) else {
             log::debug!("Prebid EIDs: no partner for source '{}'", eid.source);
             continue;
@@ -209,7 +282,7 @@ fn collect_prebid_eid_updates(
     updates
 }
 
-fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
+pub(crate) fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
     let mut latest = std::collections::BTreeMap::new();
     for update in updates {
         latest.insert(update.partner_id, update.uid);
@@ -222,9 +295,11 @@ fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate>
 }
 
 fn first_valid_uid(uids: &[Uid]) -> Option<&Uid> {
-    uids.iter()
-        .filter(|uid| !uid.id.trim().is_empty())
-        .find(|uid| !eid_id_exceeds_size_limit(&uid.id))
+    uids.iter().find(|uid| is_valid_eid_uid(&uid.id))
+}
+
+pub(crate) fn is_valid_eid_uid(uid: &str) -> bool {
+    !uid.trim().is_empty() && !eid_id_exceeds_size_limit(uid)
 }
 
 /// `SharedID` EID source domain used for partner registry lookup.
@@ -246,7 +321,7 @@ pub fn ingest_sharedid_cookie(
     ingest_eid_cookies(None, Some(cookie_value), ec_id, kv, registry);
 }
 
-fn collect_sharedid_update(
+pub(crate) fn collect_sharedid_update(
     cookie_value: &str,
     registry: &PartnerRegistry,
 ) -> Option<PartnerIdUpdate> {

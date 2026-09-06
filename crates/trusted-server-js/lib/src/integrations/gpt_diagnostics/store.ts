@@ -21,6 +21,7 @@ export const MAX_DIAGNOSTIC_SLOTS = 64;
 export const MAX_REQUEST_CYCLES_PER_SLOT = 10;
 export const MAX_CALLBACK_ISSUES = 128;
 export const MAX_TRUSTED_SERVER_ASSOCIATIONS = 64;
+export const MAX_REQUESTED_SLOT_SIZES = 16;
 export const CREATIVE_ATTEMPT_WINDOW_MS = 30_000;
 export const MAX_CREATIVE_ATTEMPTS = 128;
 export const MAX_ATTRIBUTION_ISSUES = 128;
@@ -106,6 +107,7 @@ interface PendingSourceEvidence {
   observedAtMs: number;
   trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
   trustedServerAuctionId?: string;
+  requestedSlotSizes?: ReadonlyArray<Size>;
 }
 
 interface PendingRequestIntent {
@@ -205,6 +207,29 @@ function normalizedAuctionId(value: unknown): string | undefined {
   return new TextEncoder().encode(trimmed).length <= 256 ? trimmed : undefined;
 }
 
+function normalizedRequestedSlotSizes(value: unknown): ReadonlyArray<Size> | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const requestedSlotSizes: Size[] = [];
+  for (const candidate of value.slice(0, MAX_REQUESTED_SLOT_SIZES)) {
+    if (
+      !Array.isArray(candidate) ||
+      candidate.length !== 2 ||
+      typeof candidate[0] !== 'number' ||
+      typeof candidate[1] !== 'number' ||
+      !Number.isFinite(candidate[0]) ||
+      !Number.isFinite(candidate[1]) ||
+      candidate[0] <= 0 ||
+      candidate[1] <= 0
+    ) {
+      continue;
+    }
+    requestedSlotSizes.push(Object.freeze([candidate[0], candidate[1]] as [number, number]));
+  }
+
+  return requestedSlotSizes.length > 0 ? Object.freeze(requestedSlotSizes) : undefined;
+}
+
 function responseClass(cycle: MutableRequestCycle): GptDiagnosticsResponseClass | undefined {
   if (cycle.renderAtMs === undefined) return undefined;
   if (cycle.isEmpty === true) return 'empty';
@@ -248,7 +273,9 @@ function copyCycle(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsReq
   return {
     ...cycle,
     durations: derivedDurations(cycle),
+    requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size] as Size),
     size: cycle.size ? ([...cycle.size] as Size) : undefined,
+    observedSlotSize: cycle.observedSlotSize ? ([...cycle.observedSlotSize] as Size) : undefined,
     adManager: cycle.adManager
       ? {
           ...cycle.adManager,
@@ -309,7 +336,8 @@ export class GptDiagnosticsStore {
     slot: GptDiagnosticsSlotLike,
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
-    trustedServerAuctionId?: string
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<Size>
   ): void {
     if (
       !isSlotObject(slot) ||
@@ -331,6 +359,7 @@ export class GptDiagnosticsStore {
     this.recordRequestIntentSource(slot, 'trusted_server_direct', {
       trustedServerOpportunity: opportunity,
       trustedServerAuctionId: normalizedAuctionId(trustedServerAuctionId),
+      requestedSlotSizes: normalizedRequestedSlotSizes(requestedSlotSizes),
     });
   }
 
@@ -578,6 +607,9 @@ export class GptDiagnosticsStore {
       ...(trustedServerEvidence?.trustedServerAuctionId !== undefined
         ? { trustedServerAuctionId: trustedServerEvidence.trustedServerAuctionId }
         : {}),
+      ...(trustedServerEvidence?.requestedSlotSizes !== undefined
+        ? { requestedSlotSizes: trustedServerEvidence.requestedSlotSizes }
+        : {}),
       ...(trustedServerEvidence
         ? {
             opportunityToRequestMs: validDuration(trustedServerEvidence.observedAtMs, timestampMs),
@@ -664,6 +696,47 @@ export class GptDiagnosticsStore {
         }
       }
     );
+  }
+
+  /**
+   * Retain an outer CSS box only when this exact slot and request cycle still
+   * identify a filled render. Async DOM measurements use this guard so a prior
+   * render cannot alter a later refresh cycle.
+   */
+  recordObservedSlotSize(runtimeSlotNumber: number, requestNumber: number, size: Size): void {
+    if (
+      !Number.isSafeInteger(requestNumber) ||
+      requestNumber <= 0 ||
+      !Number.isFinite(size[0]) ||
+      !Number.isFinite(size[1]) ||
+      size[0] < 0 ||
+      size[1] < 0
+    ) {
+      return;
+    }
+
+    const record = this.slots.get(runtimeSlotNumber);
+    if (!record) return;
+
+    const cycle = record.requests.find((candidate) => candidate.requestNumber === requestNumber);
+    if (
+      !cycle ||
+      record.requests[record.requests.length - 1] !== cycle ||
+      cycle.isEmpty !== false ||
+      cycle.renderAtMs === undefined
+    ) {
+      return;
+    }
+
+    const observedSlotSize: Size = [size[0], size[1]];
+    if (
+      cycle.observedSlotSize?.[0] === observedSlotSize[0] &&
+      cycle.observedSlotSize[1] === observedSlotSize[1]
+    ) {
+      return;
+    }
+    cycle.observedSlotSize = observedSlotSize;
+    this.notify();
   }
 
   recordSlotOnload(slot: GptDiagnosticsSlotLike): void {
@@ -861,7 +934,10 @@ export class GptDiagnosticsStore {
   private recordRequestIntentSource(
     slot: object,
     source: RequestIntentSource,
-    facts: Pick<PendingSourceEvidence, 'trustedServerOpportunity' | 'trustedServerAuctionId'> = {}
+    facts: Pick<
+      PendingSourceEvidence,
+      'trustedServerOpportunity' | 'trustedServerAuctionId' | 'requestedSlotSizes'
+    > = {}
   ): void {
     const observedAtMs = this.now();
     let intent = this.pendingRequestIntents.get(slot);

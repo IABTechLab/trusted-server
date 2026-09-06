@@ -13,6 +13,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::cache_policy::{
+    CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
+    apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
+    remove_edge_cache_headers,
+};
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
@@ -96,7 +101,7 @@ const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
     ["set-cookie", "strict-transport-security", "clear-site-data"];
 
 /// Cache-control value used when asset proxy responses must not be stored.
-pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = "no-store, private";
+pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = NO_STORE_PRIVATE_CACHE_CONTROL;
 
 /// Cache policy metadata emitted by the asset proxy handler.
 ///
@@ -109,13 +114,32 @@ pub enum AssetProxyCachePolicy {
     OriginControlled,
     /// Reapply `Cache-Control: no-store, private` after standard finalization.
     NoStorePrivate,
+    /// Reapply an operator-selected normalized cache policy after finalization.
+    ///
+    /// The adapter must call [`Self::apply_after_route_finalization`] after
+    /// standard response and privacy finalization, passing its runtime
+    /// [`EdgeCacheHeader`]. Asset rehosting is Fastly-only today; a future
+    /// adapter must preserve this finalization step to emit its edge directive.
+    Normalized(CachePolicy),
 }
 
 impl AssetProxyCachePolicy {
     /// Apply protected cache headers after route-level response finalization.
-    pub fn apply_after_route_finalization(self, response: &mut Response<EdgeBody>) {
-        if self == Self::NoStorePrivate {
-            apply_no_store_cache_control(response);
+    pub fn apply_after_route_finalization(
+        self,
+        response: &mut Response<EdgeBody>,
+        edge_header: EdgeCacheHeader,
+    ) {
+        match self {
+            Self::OriginControlled => {}
+            Self::NoStorePrivate => apply_no_store_cache_control(response),
+            Self::Normalized(policy) => {
+                if cache_control_headers_are_private_or_no_store(response.headers()) {
+                    remove_edge_cache_headers(response.headers_mut());
+                } else {
+                    policy.apply_to_headers(response.headers_mut(), edge_header);
+                }
+            }
         }
     }
 }
@@ -167,6 +191,11 @@ impl AssetProxyResponse {
     fn apply_no_store_private_policy(&mut self) {
         self.cache_policy = AssetProxyCachePolicy::NoStorePrivate;
         apply_no_store_cache_control(&mut self.response);
+    }
+
+    fn apply_normalized_cache_policy(&mut self, policy: CachePolicy) {
+        self.cache_policy = AssetProxyCachePolicy::Normalized(policy);
+        policy.apply_to_headers(self.response.headers_mut(), EdgeCacheHeader::None);
     }
 
     /// Return cache policy metadata for router finalization.
@@ -328,6 +357,8 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
+    /// When true, ask the platform adapter to preserve the upstream response body as a stream.
+    pub stream_response: bool,
     /// Domains allowed for the initial request and any redirects.
     ///
     /// **Open mode** (`&[]`): every host is permitted. Most integration proxies pass
@@ -356,6 +387,7 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            stream_response: false,
             allowed_domains: &[],
             require_https: false,
         }
@@ -407,6 +439,13 @@ impl<'a> ProxyRequestConfig<'a> {
     #[must_use]
     pub fn with_https_only(mut self) -> Self {
         self.require_https = true;
+        self
+    }
+
+    /// Ask the platform adapter to preserve the upstream response body as a stream.
+    #[must_use]
+    pub fn with_stream_response(mut self) -> Self {
+        self.stream_response = true;
         self
     }
 }
@@ -720,6 +759,7 @@ struct ProxyRequestHeaders<'a> {
 struct ProxyRedirectPolicy<'a> {
     follow_redirects: bool,
     stream_passthrough: bool,
+    stream_response: bool,
     allowed_domains: &'a [String],
     require_https: bool,
 }
@@ -748,6 +788,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
+        stream_response,
         allowed_domains,
         require_https,
     } = config;
@@ -775,6 +816,8 @@ pub async fn proxy_request(
         ProxyRedirectPolicy {
             follow_redirects,
             stream_passthrough,
+            stream_response: stream_response
+                && services.http_client().supports_streaming_responses(),
             allowed_domains,
             require_https,
         },
@@ -991,6 +1034,7 @@ async fn send_asset_origin_request(
     outbound_headers: &http::HeaderMap,
     stream_response: bool,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
+    let stream_response = stream_response && services.http_client().supports_streaming_responses();
     let mut platform_req =
         build_asset_platform_request(method, target_url, outbound_headers, backend_name)?;
     if stream_response {
@@ -1020,10 +1064,7 @@ fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
 }
 
 fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(ASSET_NO_STORE_PRIVATE_CACHE_CONTROL),
-    );
+    apply_no_store_private_to_headers(response.headers_mut());
 }
 
 fn should_preflight_s3(
@@ -1193,7 +1234,10 @@ pub async fn handle_asset_proxy_request(
     if let Some(image_optimizer) = image_optimizer {
         platform_req = platform_req.with_image_optimizer(image_optimizer);
     }
-    platform_req = platform_req.with_stream_response();
+    let stream_response = services.http_client().supports_streaming_responses();
+    if stream_response {
+        platform_req = platform_req.with_stream_response();
+    }
 
     let platform_resp = services
         .http_client()
@@ -1203,8 +1247,19 @@ pub async fn handle_asset_proxy_request(
             message: "Failed to proxy asset request".to_string(),
         })?;
 
-    let mut response = platform_response_to_fastly_asset(platform_resp);
+    let mut response = if stream_response {
+        platform_response_to_fastly_asset(platform_resp)
+    } else {
+        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)?
+    };
     strip_asset_proxy_response_headers(response.response_mut());
+
+    let status = response.response().status();
+    if (status.is_success() || status == StatusCode::NOT_MODIFIED)
+        && let Some(policy) = settings.asset_cache_policy_for_path(incoming_path)?
+    {
+        response.apply_normalized_cache_policy(policy);
+    }
 
     Ok(response)
 }
@@ -1247,11 +1302,11 @@ fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
     }
 }
 
-/// Returns `true` when a redirect to `host` should be followed.
+/// Returns `true` when `host` is permitted by the proxy host policy.
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn redirect_is_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1319,7 +1374,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(redirect_policy.allowed_domains, host) {
+        if !is_host_permitted(redirect_policy.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -1383,10 +1438,15 @@ async fn proxy_with_redirects(
                     message: "failed to build proxy request".to_string(),
                 })?;
 
+        let mut platform_request = PlatformHttpRequest::new(edge_req, backend_name);
+        if redirect_policy.stream_response {
+            platform_request = platform_request.with_stream_response();
+        }
+
         let platform_resp = request_headers
             .services
             .http_client()
-            .send(PlatformHttpRequest::new(edge_req, backend_name))
+            .send(platform_request)
             .await
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to proxy".to_string(),
@@ -1480,7 +1540,7 @@ async fn proxy_with_redirects(
                 }));
             }
         };
-        if !redirect_is_permitted(redirect_policy.allowed_domains, next_host) {
+        if !is_host_permitted(redirect_policy.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
@@ -1544,6 +1604,7 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            stream_response: false,
             allowed_domains: &settings.proxy.allowed_domains,
             require_https: false,
         },
@@ -1640,7 +1701,8 @@ pub async fn handle_first_party_click(
 ///
 /// # Errors
 ///
-/// Returns an error if JSON parsing fails, the URL cannot be parsed, or the URL uses an unsupported scheme.
+/// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
+/// unsupported scheme, the URL lacks a host, or the host violates `proxy.allowed_domains`.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
@@ -1712,6 +1774,21 @@ pub async fn handle_first_party_proxy_sign(
     if scheme != "http" && scheme != "https" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "unsupported scheme".to_string(),
+        }));
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "missing host".to_string(),
+        })
+    })?;
+    if !is_host_permitted(&settings.proxy.allowed_domains, host) {
+        log::warn!(
+            "sign request for `{}` blocked: host not in proxy.allowed_domains",
+            host
+        );
+        return Err(Report::new(TrustedServerError::AllowlistViolation {
+            host: host.to_string(),
         }));
     }
 
@@ -2167,6 +2244,7 @@ mod tests {
     use std::io;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
         AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
@@ -2174,9 +2252,10 @@ mod tests {
         build_asset_proxy_target_url, clear_s3_credentials_cache_for_tests,
         handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
         handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
-        proxy_request, rebuild_response_with_body, reconstruct_and_validate_signed_target,
-        redirect_is_permitted, stream_asset_body,
+        is_host_permitted, proxy_request, rebuild_response_with_body,
+        reconstruct_and_validate_signed_target, stream_asset_body,
     };
+    use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
@@ -2191,9 +2270,9 @@ mod tests {
     use crate::settings::{
         AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
-        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, UnknownProfilePolicy,
+        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
@@ -2252,6 +2331,16 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(EdgeBody::from(body.to_string()))
             .expect("should build http post request")
+    }
+
+    fn build_proxy_sign_request(method: &Method, uri: &str, target: &str) -> HttpRequest<EdgeBody> {
+        if method == Method::GET {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair("url", target);
+            return build_http_request(method.clone(), format!("{uri}?{}", serializer.finish()));
+        }
+
+        build_http_post_json_request(uri, &serde_json::json!({ "url": target }))
     }
 
     fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
@@ -2371,6 +2460,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for StreamingResponseHttpClient {
+        fn supports_streaming_responses(&self) -> bool {
+            true
+        }
+
         async fn send(
             &self,
             _request: PlatformHttpRequest,
@@ -2516,6 +2609,152 @@ mod tests {
     }
 
     #[test]
+    fn proxy_sign_enforces_allowed_domains_for_get_and_post() {
+        struct Case {
+            name: &'static str,
+            allowed_domains: &'static [&'static str],
+            target: &'static str,
+            signing_uri: &'static str,
+            expected_base: Option<&'static str>,
+            permitted: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "exact match",
+                allowed_domains: &["cdn.example.com"],
+                target: "https://cdn.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "rejected host",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://blocked.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: false,
+            },
+            Case {
+                name: "wildcard match",
+                allowed_domains: &["*.example.com"],
+                target: "https://static.cdn.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "protocol-relative match",
+                allowed_domains: &["cdn.example.com"],
+                target: "//cdn.example.com/asset.js",
+                signing_uri: "http://edge.example.com/first-party/sign",
+                expected_base: Some("http://cdn.example.com/asset.js"),
+                permitted: true,
+            },
+            Case {
+                name: "open mode",
+                allowed_domains: &[],
+                target: "https://unlisted.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "user information cannot bypass",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://allowed.example.com@blocked.example.com:9443/path",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: false,
+            },
+            Case {
+                name: "non-host URL parts are ignored",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://user@allowed.example.com:9443/path?cache=1#section",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+        ];
+
+        futures::executor::block_on(async {
+            for case in cases {
+                for method in [&Method::GET, &Method::POST] {
+                    let label = format!("{} {}", method.as_str(), case.name);
+                    let mut settings = create_test_settings();
+                    settings.proxy.allowed_domains = case
+                        .allowed_domains
+                        .iter()
+                        .map(|domain| (*domain).to_string())
+                        .collect();
+                    let req = build_proxy_sign_request(method, case.signing_uri, case.target);
+                    let result =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req).await;
+
+                    if case.permitted {
+                        let response = result.unwrap_or_else(|error| {
+                            panic!("{label} should sign target: {error:?}")
+                        });
+                        assert_eq!(
+                            response.status(),
+                            StatusCode::OK,
+                            "{label} should return 200"
+                        );
+                        let body: serde_json::Value =
+                            serde_json::from_str(&response_body_string(response))
+                                .expect("should parse sign response JSON");
+                        let href = body["href"]
+                            .as_str()
+                            .expect("should include string href in sign response");
+                        let signed_url =
+                            url::Url::parse(&format!("https://edge.example.com{href}"))
+                                .expect("should parse signed proxy URL");
+                        assert_eq!(
+                            signed_url.path(),
+                            "/first-party/proxy",
+                            "{label} should return a first-party proxy href"
+                        );
+                        let signed_params: HashMap<_, _> = signed_url.query_pairs().collect();
+                        for parameter in ["tsurl", "tstoken", "tsexp"] {
+                            assert!(
+                                signed_params.contains_key(parameter),
+                                "{label} should include {parameter} in signed href"
+                            );
+                        }
+                        if let Some(expected_base) = case.expected_base {
+                            assert_eq!(
+                                body["base"].as_str(),
+                                Some(expected_base),
+                                "{label} should inherit the signing request scheme"
+                            );
+                        }
+                    } else {
+                        let error = match result {
+                            Ok(response) => {
+                                panic!("{label} should reject target, got {response:?}")
+                            }
+                            Err(error) => error,
+                        };
+                        assert!(
+                            matches!(
+                                error.current_context(),
+                                TrustedServerError::AllowlistViolation { .. }
+                            ),
+                            "{label} should return AllowlistViolation, got {error:?}"
+                        );
+                        assert_eq!(
+                            error.current_context().status_code(),
+                            StatusCode::FORBIDDEN,
+                            "{label} should map allowlist rejection to 403"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn proxy_sign_rejects_invalid_url() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -2616,7 +2855,8 @@ mod tests {
                 HeaderValue::from_static("application/octet-stream"),
             )
             .without_forward_headers()
-            .with_streaming();
+            .with_streaming()
+            .with_stream_response();
 
         assert_eq!(cfg.target_url, "https://example.com/asset");
         assert!(cfg.follow_redirects, "should follow redirects by default");
@@ -2630,6 +2870,10 @@ mod tests {
         assert!(
             cfg.stream_passthrough,
             "should enable streaming passthrough"
+        );
+        assert!(
+            cfg.stream_response,
+            "should request streaming platform responses"
         );
     }
 
@@ -3723,6 +3967,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3764,6 +4009,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3810,6 +4056,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3820,6 +4067,39 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response_body_string(response), "redirected");
+        });
+    }
+
+    #[test]
+    fn proxy_request_forwards_stream_response_flag_to_platform_request() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://example.com/");
+
+            proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig::new("https://example.com/resource")
+                    .without_forward_headers()
+                    .with_stream_response(),
+                &services,
+            )
+            .await
+            .expect("should proxy successfully");
+
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![true],
+                "should request a streaming platform response"
+            );
         });
     }
 
@@ -3859,6 +4139,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: true,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3924,6 +4205,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -4121,6 +4403,7 @@ mod tests {
             use crate::platform::test_support::StubHttpClient;
 
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(false);
             stub.push_response(200, b"ok".to_vec());
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -4186,6 +4469,11 @@ mod tests {
                 .into_response()
                 .expect("should return buffered asset response");
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![false],
+                "unsupported platforms should buffer asset proxy responses"
+            );
 
             let all_headers = stub.recorded_request_headers();
             assert_eq!(all_headers.len(), 1, "should have captured one request");
@@ -4251,6 +4539,29 @@ mod tests {
     }
 
     #[test]
+    fn handle_asset_proxy_request_streams_when_supported() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy streaming asset response");
+
+            assert_eq!(stub.recorded_stream_response_flags(), vec![true]);
+        });
+    }
+
+    #[test]
     fn handle_asset_proxy_request_strips_unsafe_response_headers() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
@@ -4300,6 +4611,167 @@ mod tests {
                 response_header(&response, header::ETAG),
                 Some("\"asset-etag\""),
                 "should preserve safe cache validator headers on asset responses"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_replaces_third_party_cache_policy_for_rehosted_asset() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "no-store")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "hex"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/assets/app.0123abcd.js",
+            );
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(
+                    Duration::from_secs(31_536_000)
+                )),
+                "should carry normalized cache policy metadata"
+            );
+
+            let mut response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=31536000, immutable"),
+                "configured rehost policy should replace the third-party no-store directive"
+            );
+            assert!(
+                response.headers().get("surrogate-control").is_none(),
+                "runtime-specific edge header should wait for adapter finalization"
+            );
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("surrogate-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=31536000"),
+                "Fastly finalization should render Surrogate-Control"
+            );
+        });
+    }
+
+    #[test]
+    fn normalized_asset_policy_preserves_final_private_or_no_store_directives() {
+        for cache_control in ["private, max-age=0", "no-store"] {
+            let mut response = edge_response_builder()
+                .header(header::CACHE_CONTROL, cache_control)
+                .header("surrogate-control", "max-age=31536000")
+                .header("cdn-cache-control", "max-age=31536000")
+                .header("cloudflare-cdn-cache-control", "max-age=31536000")
+                .body(EdgeBody::empty())
+                .expect("should build asset response");
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some(cache_control),
+                "final privacy directive should veto normalized cache policy"
+            );
+            assert!(
+                [
+                    "surrogate-control",
+                    "cdn-cache-control",
+                    "cloudflare-cdn-cache-control",
+                ]
+                .iter()
+                .all(|name| !response.headers().contains_key(*name)),
+                "final privacy directive should remove every edge-cache header"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_leaves_non_matching_assets_origin_controlled() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "public, max-age=60")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "hex"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(Method::GET, "https://www.example.com/assets/app.js");
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::OriginControlled,
+                "non-fingerprinted file should not receive normalized immutable policy"
+            );
+            let response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=60"),
+                "origin-controlled response should preserve origin cache header"
             );
         });
     }
@@ -4518,6 +4990,7 @@ mod tests {
     fn handle_asset_proxy_request_attaches_image_optimizer_metadata() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"ok".to_vec());
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -4745,6 +5218,7 @@ mod tests {
     fn handle_asset_proxy_request_preflights_s3_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, Vec::new());
             stub.push_response(200, b"optimized".to_vec());
             let services = build_services_with_secret_and_http_client(
@@ -4804,6 +5278,7 @@ mod tests {
     fn handle_asset_proxy_request_returns_raw_s3_error_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(404, Vec::new());
             stub.push_response_with_headers(
                 404,
@@ -4880,6 +5355,7 @@ mod tests {
     fn handle_asset_proxy_request_does_not_preflight_when_io_disabled() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"raw".to_vec());
             let services = build_services_with_secret_and_http_client(
                 HashMapSecretStore::new(test_s3_secrets()),
@@ -5212,11 +5688,11 @@ mod tests {
     }
 
     #[test]
-    fn redirect_empty_allowlist_permits_any() {
+    fn empty_allowlist_permits_any_host() {
         let allowed: [String; 0] = [];
         assert!(
-            redirect_is_permitted(&allowed, "evil.com"),
-            "empty allowlist should not block any redirect host"
+            is_host_permitted(&allowed, "evil.com"),
+            "empty allowlist should not block any host"
         );
     }
 
@@ -5231,72 +5707,72 @@ mod tests {
         );
     }
 
-    // --- redirect_is_permitted (full guard: empty-list bypass + is_host_allowed) ---
+    // --- is_host_permitted (full guard: empty-list bypass + is_host_allowed) ---
 
     #[test]
-    fn redirect_chain_allowed_when_host_matches_allowlist() {
+    fn host_is_permitted_when_it_matches_allowlist() {
         let allowed = vec!["ad.example.com".to_string(), "cdn.example.com".to_string()];
         assert!(
-            redirect_is_permitted(&allowed, "ad.example.com"),
-            "should permit redirect to exact-match host"
+            is_host_permitted(&allowed, "ad.example.com"),
+            "should permit exact-match host"
         );
         assert!(
-            redirect_is_permitted(&allowed, "cdn.example.com"),
-            "should permit redirect to second allowed host"
+            is_host_permitted(&allowed, "cdn.example.com"),
+            "should permit second allowed host"
         );
     }
 
     #[test]
-    fn redirect_chain_allowed_when_host_matches_wildcard() {
+    fn host_is_permitted_when_it_matches_wildcard() {
         let allowed = vec!["*.example.com".to_string()];
         assert!(
-            redirect_is_permitted(&allowed, "sub.example.com"),
-            "should permit redirect to wildcard-matched subdomain"
+            is_host_permitted(&allowed, "sub.example.com"),
+            "should permit wildcard-matched subdomain"
         );
     }
 
     #[test]
-    fn redirect_chain_blocked_when_host_not_in_allowlist() {
+    fn host_is_blocked_when_not_in_allowlist() {
         let allowed = vec!["ad.example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, "evil.com"),
-            "should block redirect to host not in allowlist"
+            !is_host_permitted(&allowed, "evil.com"),
+            "should block host not in allowlist"
         );
     }
 
     #[test]
-    fn redirect_chain_allowed_when_allowlist_is_empty() {
+    fn any_host_is_permitted_when_allowlist_is_empty() {
         let allowed: Vec<String> = vec![];
         assert!(
-            redirect_is_permitted(&allowed, "any-host.com"),
-            "should allow any redirect when allowlist is empty (open mode)"
+            is_host_permitted(&allowed, "any-host.com"),
+            "should allow any host when allowlist is empty (open mode)"
         );
     }
 
     #[test]
-    fn redirect_chain_blocked_when_host_is_empty() {
+    fn empty_host_is_blocked_when_allowlist_is_non_empty() {
         let allowed = vec!["example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, ""),
-            "should block redirect with empty host when allowlist is non-empty"
+            !is_host_permitted(&allowed, ""),
+            "should block empty host when allowlist is non-empty"
         );
     }
 
     #[test]
-    fn redirect_is_permitted_accepts_str_slices() {
+    fn is_host_permitted_accepts_str_slices() {
         // Verifies the &[impl AsRef<str>] bound works with &str literals,
         // not just Vec<String>.
         let allowed: &[&str] = &["example.com", "*.cdn.example.com"];
         assert!(
-            redirect_is_permitted(allowed, "example.com"),
+            is_host_permitted(allowed, "example.com"),
             "should permit exact match via &str slice"
         );
         assert!(
-            redirect_is_permitted(allowed, "static.cdn.example.com"),
+            is_host_permitted(allowed, "static.cdn.example.com"),
             "should permit wildcard match via &str slice"
         );
         assert!(
-            !redirect_is_permitted(allowed, "evil.com"),
+            !is_host_permitted(allowed, "evil.com"),
             "should block host not in &str slice allowlist"
         );
     }
@@ -5305,19 +5781,19 @@ mod tests {
     fn ip_literal_blocked_by_domain_allowlist() {
         let allowed = vec!["*.example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, "169.254.169.254"),
+            !is_host_permitted(&allowed, "169.254.169.254"),
             "should block cloud metadata IP"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "127.0.0.1"),
+            !is_host_permitted(&allowed, "127.0.0.1"),
             "should block loopback IPv4"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "[::1]"),
+            !is_host_permitted(&allowed, "[::1]"),
             "should block loopback IPv6"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "::1"),
+            !is_host_permitted(&allowed, "::1"),
             "should block bare loopback IPv6"
         );
     }

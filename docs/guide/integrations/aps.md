@@ -36,6 +36,8 @@ debug = false
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
 allow_script_creatives = false
+# Default. Set publisher_native only for the controlled friendly-frame experiment below.
+rendering_mode = "trusted_server"
 
 [auction]
 enabled = true
@@ -48,6 +50,28 @@ timeout_ms = 2000
 `debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
 
 `allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
+
+`rendering_mode` is a strict enum: `trusted_server` (the default) retains the opaque static renderer route, and `publisher_native` disables that route and adds `data-ts-aps-rendering-mode="publisher_native"` to the server-generated TSJS bundle tag. TSJS captures this server-owned attribute when the bundle executes, so markup added later cannot change the mode. The attribute works under a publisher CSP that blocks inline scripts. Unknown values fail configuration deserialization.
+
+### Publisher-native runner experiment
+
+`publisher_native` is an opt-in browser experiment, **not** general APS compatibility proof. No public `apstag` API was found that accepts an externally selected OpenRTB `aaxResponse`. In controlled browser testing, `apstag.renderImp(document, bidId)` did not render the Trusted Server bid because that bid was absent from the SDK's browser-auction state. Trusted Server therefore does not call `apstag`, `fetchBids`, or `setDisplayBids`, mutate the publisher's APS SDK, or start a second auction. Instead, this mode reuses the same `prebid/creative/render` runner contract already used by `trusted_server` mode, but inside a publisher-origin frame; that observed vendor contract still requires APS account-team validation.
+
+No publisher JavaScript change is required. After validating and freezing the exact selected descriptor, Trusted Server JS:
+
+1. resolves the direct-auction slot or its injected GAM div mapping;
+2. creates a hidden, publisher-origin friendly iframe sized to the winner;
+3. initializes only that fresh frame's account-scoped `_aps` event queue;
+4. queues `prebid/creative/render` with the selected `aaxResponse` and bid ID; and
+5. loads the fixed `https://client.aps.amazon-adsystem.com/prebid-creative.js` runner.
+
+The existing publisher content remains visible until the runner script loads. A runner error, a blocked script, a missing slot, a superseding dispatch, or a load taking longer than 10 seconds removes the pending frame and visibly declines the bid. It never falls back to `/integrations/aps/renderer` or sends a Universal Creative renderer response. Trusted Server treats runner load as successful handoff; the runner owns subsequent creative completion and resource loading.
+
+Unlike `trusted_server` mode, this friendly frame deliberately has no opaque-origin sandbox. Its initial document inherits the publisher CSP, so the publisher policy controls whether the APS runner and required creative resources can load. Trusted Server sets the frame document's referrer policy to `no-referrer`, matching the static renderer's existing protection. The fixed APS runner and its creative otherwise execute with publisher-origin privileges, so `publisher_native` has a larger security surface, especially when `allow_script_creatives = true`. Use only a controlled cohort.
+
+For a client-side Prebid APS capability, Trusted Server consumes the one-shot capability before starting the runner and calls `markWinningBidAsUsed` only after the runner loads. For server/GPT ownership, it similarly claims the slot/ad ID first. This prevents native and Trusted Server rendering from both owning the same response.
+
+Disable or coordinate existing publisher-native APS demand for every `publisher_native` cohort. Otherwise the publisher's normal APS auction and this server-selected bid can duplicate demand. Validate the exact account, inventory, CSP, iframe/script creative behavior, impression reporting, and click-through behavior with the APS account team before any production rollout.
 
 Set `inventory_domain` and `inventory_page_origin` together only when the public deployment hostname differs from the inventory identity authorized by APS. The domain becomes `site.domain`. The HTTPS page origin replaces the current page's scheme and host while preserving its path; query and fragment data are removed before forwarding. The origin must be the inventory domain or one of its subdomains and cannot include credentials, a port, path, query, or fragment. These values come only from operator configuration; Trusted Server never accepts APS inventory identity from the client auction payload.
 
@@ -150,7 +174,7 @@ Trusted Server does not insert APS creative markup into the publisher document. 
 
 Seats, `impid`, markup, notifications, user-sync data, sibling bids, losing seats, and unknown fields are not exposed. The browser decodes this envelope and cross-checks the ID, dimensions, URL, and tag type before any DOM mutation or message suppression.
 
-Both rendering paths use `GET /integrations/aps/renderer`, a static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`.
+In `trusted_server` mode, both rendering paths use `GET /integrations/aps/renderer`, a static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`.
 
 The outer iframe uses these sandbox permissions:
 
@@ -167,11 +191,13 @@ It deliberately omits `allow-same-origin`, so APS and bidder execution remains b
 
 ### Direct `/auction`
 
-The TSJS auction client validates the typed renderer descriptor, creates the opaque renderer iframe, and sends the minimized envelope after the frame loads. Ordinary non-APS `adm` continues through the existing sanitizer and generic creative iframe.
+In `trusted_server` mode, the TSJS auction client validates the typed renderer descriptor, creates the opaque renderer iframe, and sends the minimized envelope after the frame loads. In `publisher_native` mode it creates the injected friendly iframe and queues the response for the fixed APS Prebid creative runner. Ordinary non-APS `adm` continues through the existing sanitizer and generic creative iframe.
 
 ### GAM and Universal Creative
 
-For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program that creates the same opaque renderer iframe.
+For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid` and validates the complete envelope. In `trusted_server` mode it returns a static dynamic-renderer program that creates the same opaque renderer iframe. In `publisher_native` mode it instead resolves the publisher div and starts the friendly-frame runner without sending a Universal Creative renderer response.
+
+After the native runner loads, Trusted Server replaces the existing children of the resolved publisher div with the friendly frame. This removes the GAM or Universal Creative iframe when it is inside that div. If the runner fails, the existing iframe remains, but its Universal Creative request receives no response because Trusted Server has already claimed the selected bid. This one-owner behavior avoids a second render path, but GAM impression and viewability reporting must be validated with the APS account team for the controlled cohort.
 
 For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
 
@@ -209,17 +235,20 @@ This release is a direct protocol cutover:
 
 There is no legacy runtime switch. Roll back by disabling `[integrations.aps]`, restoring native APS for the cohort, or deploying the prior binary.
 
+Changing `rendering_mode` does not update pages that are already loaded or stored in an HTML cache. A cached `trusted_server` page can continue requesting `/integrations/aps/renderer` after a native-mode deployment removes that route. A cached `publisher_native` page continues using its captured native mode after rollback. Coordinate the mode change with HTML cache expiry or purge and reload active test sessions before judging the result.
+
 ## Rollout
 
 Use fictional values in source-controlled configuration and fixtures. Supply controlled account details out of band.
 
 1. Obtain APS account-team confirmation for edge-originated OpenRTB traffic.
 2. Enable Trusted Server APS only for an isolated cohort and disable native APS demand there.
-3. Keep `allow_script_creatives = false` and observe iframe bids through direct and GAM paths.
+3. Keep the default `trusted_server` mode and `allow_script_creatives = false`; observe iframe bids through direct and GAM paths.
 4. Confirm outbound privacy fields, aggregate diagnostics, decoded-price competition, line-item targeting, dimensions, click-throughs, and opaque-origin isolation.
-5. Run the restrictive-CSP browser proof for script behavior.
-6. Only then enable script creatives for the isolated cohort and validate them in a real browser.
-7. Expand traffic only after APS confirmation and successful controlled validation.
+5. In a still-smaller cohort, set `rendering_mode = "publisher_native"` and confirm the fixed runner request, friendly-frame dimensions, iframe creatives, impression reporting, and click-throughs without a request to `/integrations/aps/renderer`.
+6. Purge or expire cached HTML and reload active test sessions when changing modes. Confirm the publisher CSP permits the runner but does not need to permit inline Trusted Server scripts.
+7. Only after reviewing the friendly-frame security tradeoff, enable script creatives for the isolated native cohort and validate them in a real browser.
+8. Expand traffic only after APS confirmation and successful controlled validation.
 
 ## Troubleshooting
 
@@ -235,12 +264,12 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 
 ### Winner targets but does not render
 
-- Confirm `GET /integrations/aps/renderer` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
-- Confirm publisher CSP permits `frame-src 'self'`.
+- In `trusted_server` mode, confirm `GET /integrations/aps/renderer` returns HTML with its CSP and `Referrer-Policy: no-referrer`, and that publisher CSP permits `frame-src 'self'`.
+- In `publisher_native` mode, confirm the `#trustedserver-js` bundle tag carries `data-ts-aps-rendering-mode="publisher_native"`, the slot receives a hidden friendly iframe, and publisher CSP does not block `https://client.aps.amazon-adsystem.com/prebid-creative.js` or the selected creative's resources. The static renderer route is intentionally absent in this mode. Runner script load is the handoff signal, not proof that the creative painted.
 - Confirm the GAM creative uses the supported Prebid Universal Creative bridge and the winning `hb_adid`.
 - For client-side `trustedServer` adapter auctions, confirm Prebid's `bidResponse` contains a generated `adId` and that the corresponding capability appears briefly in `window.tsjs.apsPrebidRenderers` before rendering.
-- Ensure no native APS path is trying to handle the same cohort.
-- Keep script creatives disabled while diagnosing iframe rendering.
+- Ensure no publisher APS auction is trying to handle the same cohort.
+- Keep script creatives disabled while diagnosing either rendering mode.
 
 ## Verification
 

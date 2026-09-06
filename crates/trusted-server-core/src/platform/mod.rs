@@ -12,6 +12,8 @@
 //! - [`PlatformBackend`] — dynamic backend registration
 //! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
+//! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
+//! - [`PlatformTemplateCache`] — shared transformed-template caching
 //!
 //! ## Platform-Agnostic Components
 //!
@@ -36,6 +38,8 @@ mod error;
 mod http;
 mod image_optimizer;
 mod kv;
+mod template_assembly;
+mod template_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod traits;
@@ -52,6 +56,17 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
+pub use template_assembly::{
+    PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
+    contains_publisher_esi_directive,
+};
+pub use template_cache::{
+    PlatformTemplateCache, PlatformTemplateCacheReservation, REPLAYABLE_POLICY_HEADERS,
+    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
+    TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
+    TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
+    VaryHeaderValues, VarySpec,
+};
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,

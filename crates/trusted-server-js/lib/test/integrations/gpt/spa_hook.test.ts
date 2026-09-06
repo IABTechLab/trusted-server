@@ -216,9 +216,9 @@ describe('installSpaAuctionHook', () => {
   });
 
   it('skips adInit on an empty page-bids response with no prior TS state', async () => {
-    // A gated page-bids response (auction kill switch or consent denial) returns
-    // no slots. With no prior TS state to sweep, the hook must not call adInit()
-    // so a consent-denied navigation cannot activate the publisher's GPT setup.
+    // A gated page-bids response (template switch, auction gate, or consent
+    // denial) returns no slots. With no prior TS state to sweep, the hook must
+    // not call adInit() so a gated navigation cannot activate publisher GPT.
     fetchStub.mockResolvedValue({
       ok: true,
       json: async () => ({ slots: [], bids: {} }),

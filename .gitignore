@@ -37,6 +37,9 @@ src/*.html
 .specstory
 .vscode
 
+# Agent implementation worktrees
+/.worktrees/
+
 # Claude Code — ignore all, then whitelist shared config
 .claude/*
 !.claude/settings.json

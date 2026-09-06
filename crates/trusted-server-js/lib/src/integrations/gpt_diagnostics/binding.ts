@@ -1,5 +1,6 @@
 import type { GptDiagnosticsBinding, GptDiagnosticsSlotExport } from '../../core/types';
 
+import { scheduleFrame } from './presentation_helpers';
 import type { GptDiagnosticsBindingInput } from './store';
 
 interface BindingStore {
@@ -26,14 +27,6 @@ export interface GptDiagnosticsBindingView {
 }
 
 type BindingListener = () => void;
-
-function defaultScheduleFrame(callback: () => void): void {
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => callback());
-  } else {
-    queueMicrotask(callback);
-  }
-}
 
 function isVisibleInViewport(element: HTMLElement, window: BindingWindow): boolean {
   const rectangle = element.getBoundingClientRect();
@@ -97,7 +90,8 @@ export class GptDiagnosticsBindingManager {
     this.store = store;
     this.document = options.document ?? document;
     this.window = options.window ?? (window as unknown as BindingWindow);
-    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+    this.scheduleFrame =
+      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.unsubscribeStore = this.store.subscribe(() => this.scheduleRefresh());
 
     this.window.addEventListener('scroll', this.scheduleRefresh, { passive: true });

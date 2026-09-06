@@ -21,6 +21,7 @@ use trusted_server_core::platform::{
     PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
     PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
 };
+use trusted_server_core::settings::TrustedClientIpConfig;
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
@@ -694,7 +695,53 @@ impl PlatformGeo for FastlyPlatformGeo {
     }
 }
 
-/// Extract [`ClientInfo`] from the original Fastly request.
+fn single_utf8_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+    let mut values = req.get_header_all(name);
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
+}
+
+/// Resolve the request's client IP from an authenticated forwarding header.
+///
+/// When no trusted-client-IP configuration is present, or when either header
+/// is missing, duplicated, malformed, or unauthenticated, this returns the
+/// Fastly SDK peer address unchanged.
+///
+/// Every fallback taken while a configuration *is* present logs at debug level
+/// so a rotated secret or renamed header is diagnosable. Debug rather than warn
+/// keeps a direct client from driving log volume by sending junk trust headers.
+#[must_use]
+pub(crate) fn resolve_client_ip(
+    req: &Request,
+    peer_ip: Option<IpAddr>,
+    config: Option<&TrustedClientIpConfig>,
+) -> Option<IpAddr> {
+    let Some(config) = config else {
+        return peer_ip;
+    };
+    let Some(auth_candidate) = single_utf8_header(req, &config.auth_header) else {
+        log::debug!("Trusted client IP: auth header is missing, duplicated, or not UTF-8");
+        return peer_ip;
+    };
+    if !config.authenticates(auth_candidate) {
+        log::debug!("Trusted client IP: auth header did not match the configured shared secret");
+        return peer_ip;
+    }
+    let Some(ip_candidate) = single_utf8_header(req, &config.ip_header) else {
+        log::debug!("Trusted client IP: IP header is missing, duplicated, or not UTF-8");
+        return peer_ip;
+    };
+
+    ip_candidate.parse::<IpAddr>().ok().or_else(|| {
+        log::debug!("Trusted client IP: IP header is not a bare IPv4 or IPv6 address");
+        peer_ip
+    })
+}
+
+/// Extract [`ClientInfo`] from the original Fastly request and resolved client IP.
 ///
 /// Fastly's TLS, JA4, and HTTP/2 fingerprint accessors only return real values
 /// on the client request before it is converted to platform HTTP types. This
@@ -703,9 +750,9 @@ impl PlatformGeo for FastlyPlatformGeo {
 /// extensions so `build_per_request_services` can read back metadata the
 /// reconstructed request cannot expose.
 #[must_use]
-pub fn client_info_from_request(req: &Request) -> ClientInfo {
+pub fn client_info_from_request(req: &Request, client_ip: Option<IpAddr>) -> ClientInfo {
     ClientInfo {
-        client_ip: req.get_client_ip_addr(),
+        client_ip,
         tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_string),
         tls_cipher: req
             .get_tls_cipher_openssl_name()
@@ -741,6 +788,184 @@ mod tests {
     use super::*;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
+    use fastly::http::HeaderValue;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::settings::TrustedClientIpConfig;
+
+    const PEER_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+
+    fn trusted_client_ip_config() -> TrustedClientIpConfig {
+        TrustedClientIpConfig {
+            ip_header: "fastly-client-ip".to_owned(),
+            auth_header: "x-trusted-client-auth".to_owned(),
+            shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+        }
+    }
+
+    fn authenticated_request(ip: impl AsRef<[u8]>) -> Request {
+        let mut req = Request::get("https://example.com/");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
+        req.set_header("fastly-client-ip", ip.as_ref());
+        req
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_config_is_absent() {
+        let req = authenticated_request("198.51.100.7");
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), None);
+
+        assert_eq!(resolved, Some(PEER_IP), "should preserve the peer IP");
+    }
+
+    #[test]
+    fn resolve_client_ip_accepts_authenticated_ipv4() {
+        let req = authenticated_request("198.51.100.7");
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+        assert_eq!(
+            resolved,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7))),
+            "should use the authenticated IPv4 address"
+        );
+    }
+
+    #[test]
+    fn resolve_client_ip_accepts_authenticated_ipv6() {
+        let req = authenticated_request("2001:db8::7");
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+        assert_eq!(
+            resolved,
+            Some(IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 0, 0, 0, 0, 7,
+            ))),
+            "should use the authenticated IPv6 address"
+        );
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_auth_is_missing_empty_or_wrong() {
+        for auth_value in [None, Some(""), Some("fictional-wrong-secret")] {
+            let mut req = Request::get("https://example.com/");
+            if let Some(auth_value) = auth_value {
+                req.set_header("x-trusted-client-auth", auth_value);
+            }
+            req.set_header("fastly-client-ip", "198.51.100.7");
+
+            let resolved =
+                resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+            assert_eq!(
+                resolved,
+                Some(PEER_IP),
+                "should fall back for auth value {auth_value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_auth_is_duplicated() {
+        let mut req = authenticated_request("198.51.100.7");
+        req.append_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+        assert_eq!(resolved, Some(PEER_IP), "should reject duplicate auth");
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_auth_is_not_utf8() {
+        let mut req = Request::get("https://example.com/");
+        req.set_header(
+            "x-trusted-client-auth",
+            HeaderValue::from_bytes(b"fictional-shared-secret-0123456789\xff")
+                .expect("should build non-UTF-8 auth header"),
+        );
+        req.set_header("fastly-client-ip", "198.51.100.7");
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+        assert_eq!(resolved, Some(PEER_IP), "should reject non-UTF-8 auth");
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_ip_is_missing() {
+        let mut req = Request::get("https://example.com/");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+        assert_eq!(resolved, Some(PEER_IP), "should require an IP header");
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_ip_text_is_invalid() {
+        for ip_value in [
+            " 198.51.100.7",
+            "198.51.100.7 ",
+            "198.51.100.7:443",
+            "2001:db8::7%example0",
+            "198.51.100.7, 203.0.113.10",
+            "",
+        ] {
+            let req = authenticated_request(ip_value);
+
+            let resolved =
+                resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+            assert_eq!(
+                resolved,
+                Some(PEER_IP),
+                "should reject invalid IP value {ip_value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_ip_is_duplicated() {
+        let mut req = authenticated_request("198.51.100.7");
+        req.append_header("fastly-client-ip", "203.0.113.10");
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+        assert_eq!(resolved, Some(PEER_IP), "should reject duplicate IP values");
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_ip_is_not_utf8() {
+        let req = authenticated_request(
+            HeaderValue::from_bytes(b"198.51.100.7\xff").expect("should build non-UTF-8 IP header"),
+        );
+
+        let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
+
+        assert_eq!(resolved, Some(PEER_IP), "should reject non-UTF-8 IP");
+    }
+
+    #[test]
+    fn client_info_from_request_preserves_supplied_client_ip() {
+        let req = Request::get("https://example.com/");
+        let supplied_ip = Some(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)));
+
+        let client_info = client_info_from_request(&req, supplied_ip);
+
+        assert_eq!(
+            client_info.client_ip, supplied_ip,
+            "should preserve the supplied client IP"
+        );
+    }
 
     #[test]
     fn edge_request_to_fastly_replaces_url_derived_host_header() {

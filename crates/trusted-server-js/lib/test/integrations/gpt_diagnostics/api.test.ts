@@ -124,7 +124,9 @@ describe('GptDiagnosticsApiController', () => {
     expect(store.recordTrustedServerOpportunity).toHaveBeenCalledWith(
       slot,
       'auction-slot-example',
-      'renderable_candidate'
+      'renderable_candidate',
+      undefined,
+      undefined
     );
     expect(store.recordPrebidRefresh).toHaveBeenCalledTimes(1);
     expect(store.recordPrebidRefresh).toHaveBeenCalledWith(slots);
@@ -156,7 +158,8 @@ describe('GptDiagnosticsApiController', () => {
       slot,
       'auction-slot-example',
       'renderable_candidate',
-      'auction-123'
+      'auction-123',
+      undefined
     );
   });
 
@@ -214,6 +217,10 @@ describe('GptDiagnosticsApiController', () => {
               requestNumber: 1,
               durations: {},
               incompleteSequence: false,
+              requestedSlotSizes: [
+                [300, 250],
+                [728, 90],
+              ] as const,
               adManager: {
                 yieldGroupIds: [10],
                 companyIds: [20],
@@ -253,6 +260,14 @@ describe('GptDiagnosticsApiController', () => {
     expect(snapshot.attributionIssues).toEqual(source.attributionIssues);
     expect(snapshot.attributionIssues).not.toBe(source.attributionIssues);
     expect(snapshot.attributionIssues?.[0]).not.toBe(source.attributionIssues[0]);
+    expect(cycle?.requestedSlotSizes).toEqual([
+      [300, 250],
+      [728, 90],
+    ]);
+    expect(cycle?.requestedSlotSizes).not.toBe(source.slots[0]?.requests[0]?.requestedSlotSizes);
+    expect(cycle?.requestedSlotSizes?.[0]).not.toBe(
+      source.slots[0]?.requests[0]?.requestedSlotSizes?.[0]
+    );
     expect(cycle?.trustedServerCreativeFailures).toEqual(['cache_fetch_failed']);
     expect(cycle?.trustedServerCreativeFailures).not.toBe(
       source.slots[0]?.requests[0]?.trustedServerCreativeFailures
@@ -348,10 +363,12 @@ describe('GptDiagnosticsApiController', () => {
       'incompleteSequence',
       'isBackfill',
       'isEmpty',
+      'observedSlotSize',
       'renderAtMs',
       'requestNumber',
       'requestPath',
       'requestedAtMs',
+      'requestedSlotSizes',
       'responseAtMs',
       'responseClass',
       'size',
@@ -428,6 +445,10 @@ describe('GptDiagnosticsApiController', () => {
               requestNumber: 1,
               durations: { requestToResponseMs: 10 },
               incompleteSequence: false,
+              requestedSlotSizes: [
+                [300, 250],
+                [728, 90],
+              ],
               adManager: { yieldGroupIds: [10], companyIds: [20] },
               trustedServerCreativeFailures: ['cache_fetch_failed' as const],
             },
@@ -463,6 +484,9 @@ describe('GptDiagnosticsApiController', () => {
     controller.api.subscribe((snapshot) => {
       const cycle = snapshot.slots[0]!.requests[0]!;
       cycle.durations.requestToResponseMs = 999;
+      const requestedSlotSizes = cycle.requestedSlotSizes as unknown as Array<[number, number]>;
+      requestedSlotSizes[0]![0] = 1;
+      requestedSlotSizes.push([970, 250]);
       cycle.adManager!.yieldGroupIds!.push(99);
       cycle.trustedServerCreativeFailures!.push('response_post_failed');
       snapshot.attributionIssues?.push({
@@ -484,6 +508,10 @@ describe('GptDiagnosticsApiController', () => {
     expect(observedSnapshot?.capturedAt).toBe('2026-08-10T00:00:00.000Z');
     const observedCycle = observedSnapshot?.slots[0]?.requests[0];
     expect(observedCycle?.durations.requestToResponseMs).toBe(10);
+    expect(observedCycle?.requestedSlotSizes).toEqual([
+      [300, 250],
+      [728, 90],
+    ]);
     expect(observedCycle?.adManager?.yieldGroupIds).toEqual([10]);
     expect(observedCycle?.trustedServerCreativeFailures).toEqual(['cache_fetch_failed']);
     expect(observedSnapshot?.attributionIssues).toHaveLength(1);

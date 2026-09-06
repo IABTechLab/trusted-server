@@ -2,8 +2,11 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
+use edgezero_adapter_fastly::runtime_env_config;
+use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
@@ -11,6 +14,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -23,17 +27,21 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::settings_data::config_store_name;
 
 mod app;
 mod backend;
 mod compat;
 mod ec_kv;
+mod esi_assembly;
 mod logging;
 mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
+mod template_cache;
 mod tinybird;
 
 use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
@@ -42,18 +50,15 @@ use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_g
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
-const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
-
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
-fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
-    let store = EdgeZeroFastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
-        fastly::Error::msg(format!(
-            "failed to open config store `{TRUSTED_SERVER_CONFIG_STORE}`: {e}"
-        ))
+fn open_trusted_server_config_store(env: &EnvConfig) -> Result<ConfigStoreHandle, fastly::Error> {
+    let store_name = config_store_name(env);
+    let store = EdgeZeroFastlyConfigStore::try_open(store_name.as_ref()).map_err(|e| {
+        fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
@@ -81,16 +86,17 @@ fn main() {
     }
 
     logging::init_logger();
-    edgezero_main(req);
+    let env = runtime_env_config(TrustedServerApp::stores());
+    edgezero_main(req, &env);
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest) {
+fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match load_settings_from_config_store() {
+        match load_settings_from_config_store(env) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
             }
@@ -107,7 +113,7 @@ fn edgezero_main(mut req: FastlyRequest) {
         return;
     }
 
-    let config_store = match open_trusted_server_config_store() {
+    let config_store = match open_trusted_server_config_store(env) {
         Ok(cs) => cs,
         Err(e) => {
             log::error!("failed to open config store: {e}");
@@ -118,11 +124,16 @@ fn edgezero_main(mut req: FastlyRequest) {
         }
     };
 
-    let (app, app_state) = TrustedServerApp::build_app_with_state();
+    let (app, app_state) = TrustedServerApp::build_app_with_state(env);
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
+    let trusted_client_ip = settings_snapshot
+        .as_deref()
+        .and_then(|settings| settings.trusted_client_ip.as_ref());
 
-    // Strip client-spoofable forwarded headers before dispatch.
-    compat::sanitize_fastly_forwarded_headers(&mut req);
+    // Resolve the trusted client IP, then strip client-spoofable forwarded
+    // headers before dispatch. One call keeps resolution ahead of the
+    // sanitization that removes the headers it reads.
+    let resolved_client_ip = compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip);
 
     // Re-inject a trusted TLS scheme signal after sanitization has stripped any
     // client-sent fastly-ssl header. Setting it from Fastly's native TLS
@@ -133,9 +144,6 @@ fn edgezero_main(mut req: FastlyRequest) {
     {
         req.set_header("fastly-ssl", "1");
     }
-
-    // Capture client IP before the request is consumed by dispatch.
-    let client_ip = req.get_client_ip_addr();
 
     // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
     // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
@@ -156,7 +164,8 @@ fn edgezero_main(mut req: FastlyRequest) {
     // Capture metadata from the original FastlyRequest before conversion. These
     // accessors only return real values on the client request, so store them in
     // request extensions for build_per_request_services and EC bot classification.
-    let client_info = client_info_from_request(&req);
+    let client_info = client_info_from_request(&req, resolved_client_ip);
+    let client_ip = client_info.client_ip;
     let device_signals = derive_device_signals(&req);
 
     // Dispatch directly through the EdgeZero router without an intermediate
@@ -190,7 +199,7 @@ fn edgezero_main(mut req: FastlyRequest) {
         if let Some(settings) = settings_snapshot.as_deref() {
             apply_entry_point_finalize_headers(settings, &mut response, client_ip);
         } else {
-            match load_settings_from_config_store() {
+            match load_settings_from_config_store(env) {
                 Ok(settings) => {
                     apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
                 }
@@ -202,7 +211,7 @@ fn edgezero_main(mut req: FastlyRequest) {
     }
 
     if let Some(policy) = asset_cache_policy {
-        policy.apply_after_route_finalization(&mut response);
+        policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
     if let Some(ec_state) = ec_state {
@@ -220,7 +229,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                 }
             }
         } else {
-            match load_settings_from_config_store() {
+            match load_settings_from_config_store(env) {
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
                         Ok(partner_registry) => {
@@ -328,14 +337,7 @@ fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
-    if let Some(effects) = request_filter_effects {
-        effects.apply_to_response(&mut response);
-    }
-
-    // Final cache guard: EC finalization and request-filter effects may have
-    // added a per-user Set-Cookie after `apply_finalize_headers` ran, so
-    // re-apply the privacy downgrade before send.
-    crate::middleware::enforce_set_cookie_cache_privacy(&mut response);
+    apply_terminal_response_effects(&mut response, request_filter_effects);
 
     let (parts, body) = response.into_parts();
 
@@ -362,6 +364,29 @@ fn send_edgezero_response(
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
         }
     }
+}
+
+/// Apply every late response mutation, then restore privacy invariants before headers commit.
+fn apply_terminal_response_effects(
+    response: &mut HttpResponse,
+    request_filter_effects: Option<&RequestFilterEffects>,
+) {
+    let must_remain_private = response
+        .extensions()
+        .get::<TerminalPrivateResponse>()
+        .is_some();
+    if let Some(effects) = request_filter_effects {
+        effects.apply_to_response(response);
+    }
+    if must_remain_private {
+        trusted_server_core::response_privacy::enforce_private_no_store(response);
+    }
+
+    // Final cache guards: EC finalization and request-filter effects may have
+    // added a per-user Set-Cookie or a private/no-store directive after
+    // `apply_finalize_headers` and normalized asset policy reapplication ran.
+    crate::middleware::enforce_set_cookie_cache_privacy(response);
+    crate::middleware::enforce_uncacheable_cache_privacy(response);
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -485,6 +510,7 @@ mod tests {
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
     use fastly::mime;
+    use trusted_server_core::integrations::HeaderMutation;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -554,6 +580,187 @@ mod tests {
         assert!(
             response.headers().get("x-ts-finalized").is_none(),
             "sentinel should not be sent to clients"
+        );
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_an_assembled_response_public() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .header("etag", "\"reader-document\"")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(TerminalPrivateResponse);
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+                HeaderMutation::set("cdn-cache-control", "public, max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        assert!(response.headers().get("surrogate-control").is_none());
+        assert!(response.headers().get("cdn-cache-control").is_none());
+        assert!(response.headers().get("etag").is_none());
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_a_page_bids_response_public() {
+        let mut response = trusted_server_core::publisher::page_bids_preflight_denied();
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+                HeaderMutation::set("cdn-cache-control", "public, max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        assert!(response.headers().get("surrogate-control").is_none());
+        assert!(response.headers().get("cdn-cache-control").is_none());
+    }
+
+    fn diagnostics_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [integrations.gpt_diagnostics]
+            enabled = true
+            "#,
+        )
+        .expect("should parse diagnostics settings")
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_an_active_diagnostics_response_public() {
+        // The narrowest hole: an established diagnostics session sets no new cookie, so
+        // the `Set-Cookie` privacy net never fires, and before this the decision only
+        // stamped `Cache-Control` without leaving a marker for the terminal guard.
+        let mut request = edgezero_core::http::request_builder()
+            .method(fastly::http::Method::GET)
+            .uri("https://test-publisher.com/article")
+            .header("sec-fetch-dest", "document")
+            .header("cookie", "__Host-ts-console=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let decision = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+            &diagnostics_settings(),
+            &mut request,
+        )
+        .expect("should prepare the diagnostics decision");
+        assert!(
+            decision.active(),
+            "the session cookie should activate diagnostics"
+        );
+
+        let mut response = response_builder()
+            .header("cache-control", "public, max-age=600")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        trusted_server_core::integrations::gpt_diagnostics::finalize_response(
+            &decision,
+            &mut response,
+        );
+
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert!(
+            response.headers().get("set-cookie").is_none(),
+            "the case under test is the one with no Set-Cookie to protect it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "request-scoped diagnostics HTML must never become shared-cacheable"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip CDN cache directives a late filter added"
+        );
+    }
+
+    #[test]
+    fn terminal_response_preserves_unmarked_origin_private_policy() {
+        let mut response = response_builder()
+            .header("cache-control", "private, max-age=600")
+            .header("etag", "\"origin\"")
+            .header("last-modified", "Wed, 12 Aug 2026 00:00:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        apply_terminal_response_effects(&mut response, None);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=600"),
+            "should preserve the origin browser-cache policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok()),
+            Some("\"origin\""),
+            "should preserve the origin validator"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("last-modified")
+                .and_then(|value| value.to_str().ok()),
+            Some("Wed, 12 Aug 2026 00:00:00 GMT"),
+            "should preserve the origin modification date"
         );
     }
 

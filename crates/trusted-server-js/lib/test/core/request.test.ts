@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AdUnit } from '../../src/core/types';
+import {
+  APS_PREBID_CREATIVE_RUNNER_URL,
+  APS_RENDERING_MODE_ATTRIBUTE_NAME,
+} from '../../src/integrations/aps/render';
 import envelope from '../fixtures/aps-renderer-v1.json';
 
 async function flushRequestAds(): Promise<void> {
@@ -135,6 +139,73 @@ describe('request.requestAds', () => {
       })
     );
     expect(document.querySelector('#slot1 span')).toBeNull();
+  });
+
+  it('contract test: renders a direct APS bid through the injected native runner', async () => {
+    const apsBid = envelope.seatbid[0].bid[0];
+    const renderer = {
+      type: 'aps' as const,
+      version: 1 as const,
+      accountId: 'example-account-id',
+      bidId: apsBid.id,
+      tagType: apsBid.ext.tagtype as 'iframe',
+      creativeUrl: apsBid.ext.creativeurl,
+      aaxResponse: btoa(JSON.stringify(envelope)),
+      width: apsBid.w,
+      height: apsBid.h,
+    };
+    const publisherScript = document.createElement('script');
+    publisherScript.setAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME, 'publisher_native');
+    const currentScriptSpy = vi
+      .spyOn(document, 'currentScript', 'get')
+      .mockReturnValue(publisherScript);
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            seat: 'aps',
+            bid: [{ impid: 'slot1', ext: { trusted_server: { renderer } } }],
+          },
+        ],
+      }),
+    });
+
+    try {
+      const { addAdUnits } = await import('../../src/core/registry');
+      const { requestAds } = await import('../../src/core/request');
+      currentScriptSpy.mockRestore();
+      document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
+      addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
+
+      requestAds();
+      await flushRequestAds();
+      const frame = document.querySelector<HTMLIFrameElement>('#slot1 iframe')!;
+      const runner = frame.contentDocument?.querySelector<HTMLScriptElement>('script');
+      expect(runner).not.toBeNull();
+      const frameWindow = frame.contentWindow as unknown as {
+        _aps: Map<string, { queue: Array<CustomEvent<Record<string, string>>> }>;
+      };
+      const queued = frameWindow._aps.get(renderer.accountId)?.queue[0];
+
+      expect(frame.getAttribute('sandbox')).toBeNull();
+      expect(runner!.src).toBe(APS_PREBID_CREATIVE_RUNNER_URL);
+      expect(queued?.type).toBe('prebid/creative/render');
+      expect(queued?.detail).toEqual({
+        aaxResponse: renderer.aaxResponse,
+        seatBidId: renderer.bidId,
+      });
+      expect(document.querySelector('#slot1 span')).not.toBeNull();
+
+      runner!.dispatchEvent(new Event('load'));
+      await Promise.resolve();
+      expect(document.querySelector('#slot1 span')).toBeNull();
+      expect(frame.style.display).toBe('');
+    } finally {
+      currentScriptSpy.mockRestore();
+    }
   });
 
   it('does not mutate the slot for an invalid APS descriptor', async () => {

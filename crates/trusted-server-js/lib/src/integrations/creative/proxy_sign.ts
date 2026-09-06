@@ -20,8 +20,15 @@ export function shouldProxyExternalUrl(raw: string): boolean {
   }
 }
 
-export async function signProxyUrl(raw: string): Promise<string | null> {
-  if (typeof fetch !== 'function') return null;
+export type ProxySignOutcome =
+  | { outcome: 'signed'; href: string }
+  | { outcome: 'fallback' }
+  | { outcome: 'blocked' };
+
+const FALLBACK: ProxySignOutcome = { outcome: 'fallback' };
+
+export async function signProxyUrl(raw: string): Promise<ProxySignOutcome> {
+  if (typeof fetch !== 'function') return FALLBACK;
   // A sandboxed srcdoc creative without `allow-same-origin` has an opaque
   // origin: this JSON POST would preflight with `Origin: null` and fail, so
   // skip the doomed request and leave the resource URL unsigned. Dynamic
@@ -30,12 +37,12 @@ export async function signProxyUrl(raw: string): Promise<string | null> {
   // https://github.com/IABTechLab/trusted-server/issues/982. Until then,
   // dynamically inserted resources degrade to loading directly, which the
   // sandbox still isolates from the publisher origin.
-  if (hasOpaqueOrigin()) return null;
+  if (hasOpaqueOrigin()) return FALLBACK;
   let absolute: string;
   try {
     absolute = new URL(raw, location.href).toString();
   } catch {
-    return null;
+    return FALLBACK;
   }
 
   let endpoint = '/first-party/sign';
@@ -54,13 +61,13 @@ export async function signProxyUrl(raw: string): Promise<string | null> {
     });
     if (!resp.ok) {
       log.warn('tsjs-creative: sign HTTP error', resp.status);
-      return null;
+      return resp.status === 403 ? { outcome: 'blocked' } : FALLBACK;
     }
     const data = (await resp.json()) as { href?: string } | null;
-    const href = data && typeof data.href === 'string' ? data.href : null;
-    return href;
+    const href = data && typeof data.href === 'string' ? data.href : '';
+    return href ? { outcome: 'signed', href } : FALLBACK;
   } catch (err) {
     log.warn('tsjs-creative: sign request failed', err);
-    return null;
+    return FALLBACK;
   }
 }

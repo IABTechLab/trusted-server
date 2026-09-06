@@ -420,6 +420,227 @@ describe('GPT shim – runtime gating', () => {
   });
 });
 
+describe('GPT GAM attribution bundle fallback', () => {
+  interface AttributionPubAds {
+    getSlots: () => unknown[];
+    refresh: (...args: unknown[]) => void;
+  }
+
+  interface AttributionGoogleTag {
+    cmd: Array<() => void>;
+    pubads: () => AttributionPubAds;
+    defineSlot: (...args: unknown[]) => unknown;
+    display: (...args: unknown[]) => void;
+    getConfig?: (keys: string | string[]) => Record<string, unknown> | undefined;
+    setConfig?: (config: Record<string, unknown>) => void;
+  }
+
+  type AttributionWindow = Omit<Window, 'tsjs'> & {
+    tsjs?: Partial<TsjsApi>;
+    googletag?: AttributionGoogleTag;
+    __tsjs_gpt_enabled?: boolean;
+    __tsjs_installGptShim?: unknown;
+    __tsjs_slim_prebid_url?: string;
+  };
+
+  let win: AttributionWindow;
+  let executingScript: HTMLScriptElement | null;
+  let originalCurrentScriptDescriptor: PropertyDescriptor | undefined;
+  let originalPushState: History['pushState'];
+  let originalReplaceState: History['replaceState'];
+  let addEventListenerSpy: ReturnType<typeof vi.spyOn>;
+
+  function makeGoogleTag(overrides: Partial<AttributionGoogleTag> = {}): AttributionGoogleTag {
+    const pubads: AttributionPubAds = {
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+
+    return {
+      cmd: [],
+      pubads: vi.fn(() => pubads),
+      defineSlot: vi.fn(),
+      display: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  function attributedScript(ownerDocument: Document = document): HTMLScriptElement {
+    const script = ownerDocument.createElement('script');
+    script.id = 'trustedserver-js';
+    script.setAttribute('data-ts-gam-attribution', 'true');
+    return script;
+  }
+
+  async function importFreshGptBundle(): Promise<void> {
+    await import('../../../src/integrations/gpt/index');
+  }
+
+  beforeEach(async () => {
+    const guard = await importGuardModule();
+    guard.resetGuardState();
+    vi.resetModules();
+
+    win = window as AttributionWindow;
+    delete win.tsjs;
+    delete win.googletag;
+    delete win.__tsjs_gpt_enabled;
+    delete win.__tsjs_installGptShim;
+    delete win.__tsjs_slim_prebid_url;
+
+    executingScript = null;
+    originalCurrentScriptDescriptor = Object.getOwnPropertyDescriptor(document, 'currentScript');
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      get: () => executingScript,
+    });
+
+    originalPushState = history.pushState;
+    originalReplaceState = history.replaceState;
+    addEventListenerSpy = vi.spyOn(window, 'addEventListener').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    const guard = await importGuardModule();
+    guard.resetGuardState();
+    history.pushState = originalPushState;
+    history.replaceState = originalReplaceState;
+    if (originalCurrentScriptDescriptor) {
+      Object.defineProperty(document, 'currentScript', originalCurrentScriptDescriptor);
+    } else {
+      delete (document as unknown as Record<string, unknown>).currentScript;
+    }
+    delete win.tsjs;
+    delete win.googletag;
+    delete win.__tsjs_gpt_enabled;
+    delete win.__tsjs_installGptShim;
+    delete win.__tsjs_slim_prebid_url;
+    vi.restoreAllMocks();
+  });
+
+  it('reuses the existing queue and pushes exact targeting before adInit exists', async () => {
+    const queue: Array<() => void> = [];
+    const adInitAtPush: Array<unknown> = [];
+    const arrayPush = queue.push.bind(queue);
+    queue.push = (...callbacks: Array<() => void>) => {
+      callbacks.forEach(() => adInitAtPush.push(win.tsjs?.adInit));
+      return arrayPush(...callbacks);
+    };
+    const setConfig = vi.fn();
+    const tag = makeGoogleTag({ cmd: queue, setConfig });
+    win.googletag = tag;
+    executingScript = attributedScript();
+    const initialScriptCount = document.scripts.length;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    await importFreshGptBundle();
+
+    expect(win.googletag!.cmd).toBe(queue);
+    expect(adInitAtPush[0]).toBeUndefined();
+    expect(queue.length).toBeGreaterThan(0);
+    queue[0]();
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+    expect(document.scripts).toHaveLength(initialScriptCount);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no current script', null],
+    ['missing attribute', undefined],
+    ['empty attribute', ''],
+    ['false attribute', 'false'],
+    ['non-exact attribute', 'TRUE'],
+  ])('fails closed for %s', async (_label, attributeValue) => {
+    if (attributeValue === null) {
+      executingScript = null;
+    } else {
+      executingScript = document.createElement('script');
+      if (attributeValue !== undefined) {
+        executingScript.setAttribute('data-ts-gam-attribution', attributeValue);
+      }
+    }
+
+    await importFreshGptBundle();
+
+    expect(win.googletag).toBeUndefined();
+  });
+
+  it('ignores a marked duplicate-ID decoy when the executing tag is unmarked', async () => {
+    const decoy = attributedScript();
+    document.head.appendChild(decoy);
+    executingScript = document.createElement('script');
+    executingScript.id = 'trustedserver-js';
+
+    await importFreshGptBundle();
+
+    expect(win.googletag).toBeUndefined();
+    decoy.remove();
+  });
+
+  it('characterizes a marked document.write clone as able to activate', async () => {
+    const clonedDocument = document.implementation.createHTMLDocument('nested clone');
+    clonedDocument.write('<script id="trustedserver-js" data-ts-gam-attribution="true"></script>');
+    clonedDocument.close();
+    executingScript = clonedDocument.querySelector('script');
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn();
+    win.googletag = makeGoogleTag({ cmd: queue, setConfig });
+
+    await importFreshGptBundle();
+    queue[0]();
+
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+  });
+
+  it.each(['missing', 'throwing'])(
+    'keeps module installation working with %s setConfig',
+    async (setConfigMode) => {
+      const queue: Array<() => void> = [];
+      const setConfig =
+        setConfigMode === 'throwing'
+          ? vi.fn(() => {
+              throw new Error('publisher setConfig failed');
+            })
+          : undefined;
+      win.googletag = makeGoogleTag({ cmd: queue, setConfig });
+      win.__tsjs_slim_prebid_url = 'https://cdn.example.com/slim-prebid.js';
+      executingScript = attributedScript();
+
+      await importFreshGptBundle();
+
+      expect(() => [...queue].forEach((command) => command())).not.toThrow();
+      expect(typeof win.tsjs?.adInit).toBe('function');
+      expect(typeof win.tsjs?.scheduleInitialAdInit).toBe('function');
+      expect(win.tsjs?.spaHookInstalled).toBe(true);
+      expect(addEventListenerSpy).toHaveBeenCalledWith('popstate', expect.any(Function));
+      expect(addEventListenerSpy).toHaveBeenCalledWith('load', expect.any(Function));
+      expect(addEventListenerSpy).toHaveBeenCalledWith('message', expect.any(Function));
+      if (setConfig) {
+        expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+      }
+    }
+  );
+
+  it('preserves GPT-enabled shim behavior without queuing attribution when unmarked', async () => {
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn();
+    const tag = makeGoogleTag({ cmd: queue, setConfig });
+    win.googletag = tag;
+    win.__tsjs_gpt_enabled = true;
+    executingScript = document.createElement('script');
+
+    await importFreshGptBundle();
+    [...queue].forEach((command) => command());
+    const guard = await importGuardModule();
+
+    expect(guard.isGuardInstalled()).toBe(true);
+    expect(win.googletag).toBe(tag);
+    expect(win.googletag!.cmd).toBe(queue);
+    expect(setConfig).not.toHaveBeenCalled();
+    expect(typeof win.tsjs?.adInit).toBe('function');
+  });
+});
+
 describe('GPT debug ADM iframe hardening', () => {
   it('sandbox token list omits allow-same-origin', async () => {
     const mod = await import('../../../src/integrations/gpt/index');
