@@ -6446,7 +6446,6 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
- "temp-env",
  "tempfile",
  "time",
  "tokio",

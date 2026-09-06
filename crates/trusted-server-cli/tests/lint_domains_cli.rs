@@ -2,7 +2,7 @@
 //! binary as a whole: exit codes, stdout, and stderr.
 //!
 //! The pure-function and collector logic is covered by inline unit
-//! tests in `src/dev/lint/domains.rs`; this file locks the
+//! tests in `src/commands/dev/lint/domains.rs`; this file locks the
 //! binary-observable contract (exit 0 / 1 / 2, report shape).
 
 mod common;
@@ -479,7 +479,9 @@ fn full_repo_path_exclusions_are_skipped() {
 #[test]
 fn explicit_absolute_path_to_self_skips() {
     let temp = tempfile::tempdir().expect("should create tempdir");
-    let nested = temp.path().join("crates/trusted-server-cli/src/dev/lint");
+    let nested = temp
+        .path()
+        .join("crates/trusted-server-cli/src/commands/dev/lint");
     std::fs::create_dir_all(&nested).expect("nested dir");
     let self_clone = nested.join("domains.rs");
     std::fs::write(&self_clone, "let bad = \"https://test.com\";\n")

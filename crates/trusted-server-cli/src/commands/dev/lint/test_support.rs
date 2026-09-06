@@ -1,13 +1,14 @@
-//! Shared git-repo fixture helpers for the `dev/lint` inline tests.
+//! Shared git-repo fixture helpers for the `commands/dev/lint` tests.
 //!
 //! All operations go through `gix` — no subprocess, no `git` binary.
 //! Commits use a fixed signature so they do not depend on ambient
 //! `user.name` / `user.email` config and are deterministic across
 //! runs (clean CI machines included).
 //!
-//! NOTE: integration tests under `tests/` cannot reach `pub(crate)`
-//! items here, so `tests/common/mod.rs` carries the same helpers.
-//! Keep the two files in sync when editing either.
+//! This is the single source of these helpers: the inline unit tests
+//! reach it as `crate::commands::dev::lint::test_support`, and the
+//! integration suite includes it verbatim via a `#[path]` module in
+//! `tests/common/mod.rs`.
 
 // Fixture helpers — not every inline test module uses every helper.
 // (The module is already `#[cfg(test)]`-gated at its declaration in

@@ -36,9 +36,9 @@ which = { workspace = true }
 
 # `ts dev lint domains` and `ts dev install-hooks` drive all git access through
 # gitoxide (no `git` subprocess). Cross-host: the linter runs in CI on every
-# target. Versions verified via `cargo tree -p gix -p gix-config` to avoid
-# duplicate versions in the lock file.
-gix = { version = "0.83", default-features = false, features = [
+# target. Version pins live in the root `[workspace.dependencies]`; the feature
+# set is crate-local.
+gix = { workspace = true, features = [
     "blob-diff",
     "index",
     "revision",
@@ -46,7 +46,7 @@ gix = { version = "0.83", default-features = false, features = [
     # Fixture repos in the unit tests construct trees via gix-only APIs.
     "tree-editor",
 ] }
-gix-config = "0.56"
+gix-config = { workspace = true }
 
 # `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
 # automation via `networksetup`, and a native TLS / networking stack. Scoping
@@ -76,7 +76,6 @@ tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
-temp-env = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
 tempfile = { workspace = true }

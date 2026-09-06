@@ -524,7 +524,7 @@ fenced code blocks.
 - `dist/`
 - `.git/`
 - `.worktrees/`, `.claude/worktrees/`
-- `crates/trusted-server-cli/src/dev/lint/domains.rs` itself (so the
+- `crates/trusted-server-cli/src/commands/dev/lint/domains.rs` itself (so the
   module's own allowlist constants and doc comments cannot self-flag)
 - **`crates/trusted-server-core/src/integrations/**/fixtures/**` —
   publisher-capture HTML/JS fixtures.** Real-world snapshots used as
@@ -545,7 +545,7 @@ ARE scanned.** Only the publisher-capture path above is excluded.
 ### Module structure
 
 ```rust
-// crates/trusted-server-cli/src/dev/lint/domains.rs
+// crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 
 use core::error::Error;
 use std::path::PathBuf;
@@ -721,6 +721,15 @@ the match.
 - The host capture `[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}`
   requires at least one dot followed by a TLD-like suffix and a
   leading alphanumeric character.
+- **Intentional asymmetry with the absolute-URL regex**: the
+  absolute pattern accepts single-label hosts (`http://myservice/`,
+  no dot), while this protocol-relative pattern requires a dotted
+  suffix. This is deliberate — a bare `http://evilhost/` exfiltration
+  target has no dot, so relaxing the absolute rule to require one
+  would blind the linter to it. The cost is that single-label
+  infrastructure hosts (docker-compose service names, in-cluster
+  Kubernetes names, `registry:5000`) flag in absolute form; add such
+  names to `EXACT_HOSTS` (or suppress per-line) as they appear.
 - **Known limitation**: back-to-back protocol-relative URLs without a
   separator (`//foo.com//bar.com`) miss the second one because the
   engine continues from `/bar.com` with no boundary char. Accepted
@@ -838,7 +847,7 @@ fn staged_added_lines(repo_path: &Path)
 ```
 
 **The `gix` API surface is RESOLVED by the implementation** — see
-`crates/trusted-server-cli/src/dev/lint/domains.rs` for
+`crates/trusted-server-cli/src/commands/dev/lint/domains.rs` for
 `collect_added_from_trees` and `write_index_to_tree`. The conceptual
 operations:
 
@@ -1152,7 +1161,7 @@ trusted-server.toml:15: disallowed host 68.183.113.79
 
 2 disallowed hosts found in 2 files.
 To allow a new integration proxy, add it to EXACT_HOSTS in
-crates/trusted-server-cli/src/dev/lint/domains.rs and document the
+crates/trusted-server-cli/src/commands/dev/lint/domains.rs and document the
 integration in a comment.
 To suppress one line (e.g., security-test attacker hosts), append
 `// allow-domain: <host>` in a comment.

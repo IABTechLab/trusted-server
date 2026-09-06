@@ -878,22 +878,29 @@ const EXCLUDED_LOCKFILES: &[&str] = &[
 /// Path components that exclude any path containing them.
 const EXCLUDED_DIR_COMPONENTS: &[&str] = &["node_modules", "target", "dist", ".git", ".worktrees"];
 
-/// The linter's own source file — excluded so its allowlist
-/// constants and doc comments cannot self-flag.
-const SELF_PATH: &str = "crates/trusted-server-cli/src/dev/lint/domains.rs";
+/// The linter's own source and E2E test file — excluded so the
+/// intentionally disallowed hosts in their allowlist constants, doc
+/// comments, and test fixtures cannot self-flag.
+const SELF_EXCLUDED_PATHS: &[&str] = &[
+    "crates/trusted-server-cli/src/commands/dev/lint/domains.rs",
+    "crates/trusted-server-cli/tests/lint_domains_cli.rs",
+];
 
 /// Whether a path should be scanned. Accepts either a repo-relative
 /// path (with `/` separators) or an absolute path; the
 /// `Path::ends_with` self-exclusion is component-aware so an
 /// explicit-mode invocation like `ts dev lint domains
-/// /abs/.../crates/trusted-server-cli/src/dev/lint/domains.rs` still
-/// skips the linter's own source file. See spec §"File extensions
+/// /abs/.../crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
+/// still skips the linter's own source file. See spec §"File extensions
 /// scanned" and §"Always excluded (paths)".
 fn path_is_scanned(rel_path: &str) -> bool {
     // Self-exclude. `Path::ends_with` matches whole path components,
     // so the suffix can be an absolute path or a repo-relative path
     // without false positives (e.g., `barcrates/.../domains.rs`).
-    if Path::new(rel_path).ends_with(SELF_PATH) {
+    if SELF_EXCLUDED_PATHS
+        .iter()
+        .any(|p| Path::new(rel_path).ends_with(p))
+    {
         return false;
     }
     // Excluded directory components (whole-segment match).
@@ -906,6 +913,12 @@ fn path_is_scanned(rel_path: &str) -> bool {
     }
     // `.claude/worktrees/` — two-segment exclusion.
     if components.windows(2).any(|w| w == [".claude", "worktrees"]) {
+        return false;
+    }
+    // `docs/superpowers/` — this linter's own design docs (spec + plan)
+    // quote fixture hosts (`test.com`, `evil.com`) as examples of what it
+    // catches; they are internal design prose, not shipped source.
+    if components.windows(2).any(|w| w == ["docs", "superpowers"]) {
         return false;
     }
     // Publisher-capture HTML fixtures: the narrow
@@ -947,11 +960,18 @@ fn read_blob(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>, Report<Dom
 /// Compute the new-side added lines between two blob contents.
 ///
 /// Returns `(1-based line number, content)` for every inserted line.
+///
+/// A non-UTF-8 new blob is treated as binary and skipped (empty result),
+/// matching full-repo mode's binary skip — otherwise `from_utf8_lossy`
+/// would fabricate line numbers and host matches from raw bytes.
 fn added_lines(old: Option<&[u8]>, new: &[u8]) -> Vec<(usize, String)> {
+    let Ok(new_text) = from_utf8(new) else {
+        return Vec::new();
+    };
+    let new_text = new_text.to_owned();
     let old_text = old
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
-    let new_text = String::from_utf8_lossy(new).into_owned();
 
     let input = InternedInput::new(old_text.as_str(), new_text.as_str());
     let diff = Diff::compute(Algorithm::Myers, &input);
@@ -992,7 +1012,7 @@ fn bytes_to_pathbuf(raw: &[u8]) -> (PathBuf, bool) {
 pub(crate) fn staged_added_lines(
     repo_path: &Path,
 ) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
-    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
+    let repo = gix::discover(repo_path).change_context(DomainsLintError::OpenRepo)?;
 
     // HEAD tree — or the empty tree on an unborn HEAD (fresh repo
     // with no commits), in which case every staged file is genuinely
@@ -1022,6 +1042,11 @@ pub(crate) fn staged_added_lines(
 /// Build an in-memory tree object from the current index and write it
 /// to the object database. The returned `ObjectId` can be loaded as a
 /// `gix::Tree` for tree-vs-tree diffing.
+// NOTE: `editor.write()` persists a real tree object into `.git/objects`,
+// so `--staged` writes one unreferenced (gc-able) tree per run, including
+// on every pre-commit invocation. Nothing references it and `git gc`
+// reclaims it, but a future move to a memory-backed ODB would keep the
+// linter read-only. See spec §"Staged mode".
 fn write_index_to_tree(repo: &gix::Repository) -> Result<ObjectId, Report<DomainsLintError>> {
     let index = repo.index().change_context(DomainsLintError::Index)?;
     let empty_tree_id = repo.empty_tree().id;
@@ -1187,7 +1212,7 @@ pub(crate) fn changed_vs_added_lines(
     repo_path: &Path,
     reference: &str,
 ) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
-    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
+    let repo = gix::discover(repo_path).change_context(DomainsLintError::OpenRepo)?;
     let head_id = repo
         .head_id()
         .change_context(DomainsLintError::OpenRepo)?
@@ -1560,7 +1585,7 @@ fn warn_skip_bytes(bytes: &[u8], reason: &str) -> Result<(), Report<DomainsLintE
 /// scanned file fails to read for a reason other than binary
 /// content.
 pub(crate) fn full_repo_lines(repo_path: &Path) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
-    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
+    let repo = gix::discover(repo_path).change_context(DomainsLintError::OpenRepo)?;
     let work_dir = repo
         .workdir()
         .ok_or_else(|| Report::new(DomainsLintError::OpenRepo))?
@@ -1645,6 +1670,23 @@ mod full_repo_tests {
         let lines = full_repo_lines(temp.path()).expect("should scan repo");
         let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
         assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// The collector resolves the repository from a nested subdirectory
+    /// via `gix::discover`, so `ts dev lint domains` works when run from
+    /// anywhere inside the checkout, not only the repo root.
+    #[test]
+    fn discovers_repo_from_nested_subdirectory() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(temp.path().join("a.rs"), "one\ntwo\n").expect("should write file");
+        test_support::stage_all(&repo);
+        let nested = temp.path().join("crates/trusted-server-cli/src");
+        fs::create_dir_all(&nested).expect("should create nested dir");
+
+        let lines = full_repo_lines(&nested).expect("should discover repo from a subdirectory");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(texts, vec!["one", "two"]);
     }
 
     /// Case 1: a tracked file removed from the working tree is
@@ -1732,7 +1774,6 @@ mod path_is_scanned_tests {
             "CHANGELOG.md",
             "CONTRIBUTING.md",
             "docs/guide/onboarding.md",
-            "docs/superpowers/specs/2026-05-18-check-domains-design.md",
         ] {
             assert!(path_is_scanned(p), "should be scanned: {p}");
         }
@@ -1749,7 +1790,10 @@ mod path_is_scanned_tests {
             "package-lock.json",
             "pnpm-lock.yaml",
             "Cargo.lock",
-            "crates/trusted-server-cli/src/dev/lint/domains.rs",
+            "crates/trusted-server-cli/src/commands/dev/lint/domains.rs",
+            "crates/trusted-server-cli/tests/lint_domains_cli.rs",
+            "docs/superpowers/specs/2026-05-18-check-domains-design.md",
+            "docs/superpowers/plans/2026-05-18-ts-dev-lint-domains.md",
             "foo.markdown",
             "foo.MD",
             "target/debug/build.rs",
@@ -1765,13 +1809,13 @@ mod path_is_scanned_tests {
     #[test]
     fn self_excludes_via_absolute_path_suffix() {
         assert!(!path_is_scanned(
-            "/Users/anyone/checkout/crates/trusted-server-cli/src/dev/lint/domains.rs"
+            "/Users/anyone/checkout/crates/trusted-server-cli/src/commands/dev/lint/domains.rs"
         ));
         // False-positive guard: a path that merely contains the
         // suffix as a substring (no component boundary) must still
         // be scanned.
         assert!(path_is_scanned(
-            "crates/notrusted-server-cli/src/dev/lint/domains.rs"
+            "crates/notrusted-server-cli/src/commands/dev/lint/domains.rs"
         ));
     }
 }
@@ -2051,7 +2095,7 @@ fn emit_human(violations: &[FileViolation]) -> Result<(), Report<CliError>> {
         ))?;
         write_stdout_line(
             "To allow a new integration proxy, add it to EXACT_HOSTS in \
-             crates/trusted-server-cli/src/dev/lint/domains.rs.",
+             crates/trusted-server-cli/src/commands/dev/lint/domains.rs.",
         )?;
         write_stdout_line(
             "To suppress one line (e.g., security tests), append \

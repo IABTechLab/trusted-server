@@ -776,8 +776,8 @@ Spec §"Allowlist (Rust constants)", §"URL extraction (without lookahead)", §"
 
 **Files:**
 
-- Create: `crates/trusted-server-cli/src/dev/lint/mod.rs`
-- Create: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Create: `crates/trusted-server-cli/src/commands/dev/lint/mod.rs`
+- Create: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 - Modify: `crates/trusted-server-cli/src/dev/mod.rs`
 
 - [ ] **Step 1: Create `dev/lint/mod.rs`**
@@ -967,7 +967,7 @@ Expected: PASS (with a couple of "unused" warnings for the new constants — fin
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/ crates/trusted-server-cli/src/dev/mod.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/ crates/trusted-server-cli/src/dev/mod.rs
 git commit -m "Scaffold dev/lint/domains.rs with allowlist constants
 
 EXACT_HOSTS, SUBDOMAIN_HOSTS, REFERENCE_HOSTS, RESERVED_TLDS, and
@@ -980,7 +980,7 @@ parsing arrive in subsequent commits."
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1039,7 +1039,7 @@ Expected: 3 PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/domains.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 git commit -m "Add normalise_host: bracket-strip + lowercase
 
 Tested against IPv6 bracket forms (case-insensitive), regular
@@ -1050,7 +1050,7 @@ lowercase, and pass-through cases. Pure function; no I/O."
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1168,7 +1168,7 @@ Expected: 8 PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/domains.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 git commit -m "Add is_allowed implementing the three-array check
 
 Pure function: suppressed-set short-circuit, reserved-TLD suffix,
@@ -1181,7 +1181,7 @@ examples from spec §'Matching summary'."
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1293,7 +1293,7 @@ Expected: 6 PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/domains.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 git commit -m "Add extract_absolute_hosts using the no-lookahead regex
 
 Standard regex crate; host must start with an alphanumeric to reject
@@ -1306,7 +1306,7 @@ the malformed-host rejection from spec test 20a."
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1407,7 +1407,7 @@ Expected: 6 PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/domains.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 git commit -m "Add extract_protocol_relative_hosts with boundary class
 
 Boundary class includes start-of-line, whitespace, quotes, paren,
@@ -1422,7 +1422,7 @@ by the scheme separator). Six tests cover the cases from spec
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1540,7 +1540,7 @@ Expected: 6 PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/domains.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 git commit -m "Add parse_suppression_marker with bypass-resistant anchor
 
 Marker regex requires start-of-line or whitespace before the comment
@@ -1555,7 +1555,7 @@ substring; pathological host literally named 'allow-domain')."
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 `scan_line` returns **two** things: the violations and an
 "unused suppression" report. Per spec §"Per-Line Suppression":
@@ -1783,7 +1783,7 @@ Expected: 11 PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/domains.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 git commit -m "Add scan_line returning violations + unused-suppression report
 
 Composes parse_suppression_marker + extract_absolute_hosts +
@@ -1815,8 +1815,8 @@ A shared helper module for git-repo fixtures lives at `dev/lint/test_support.rs`
 
 **Files:**
 
-- Create: `crates/trusted-server-cli/src/dev/lint/test_support.rs`
-- Modify: `crates/trusted-server-cli/src/dev/lint/mod.rs`
+- Create: `crates/trusted-server-cli/src/commands/dev/lint/test_support.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/mod.rs`
 
 **Critical: helper commits MUST set explicit author/committer
 signatures, not rely on ambient git config.** A clean test
@@ -1880,7 +1880,7 @@ Expected: PASS.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/test_support.rs crates/trusted-server-cli/src/dev/lint/mod.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/test_support.rs crates/trusted-server-cli/src/commands/dev/lint/mod.rs
 git commit -m "Add dev/lint/test_support: shared git fixtures for module tests
 
 Lifts the working gix helper bodies from tests/spike_gix_*.rs into
@@ -1894,7 +1894,7 @@ stubs through the pinned implementations."
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 **Path representation for staged diffs.** `gix` returns diff entry
 paths as `BString` (byte strings). `DiffLine::path` is a `PathBuf`,
@@ -2053,7 +2053,7 @@ Expected: PASS (both the normal case and the non-UTF-8 case).
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing inline tests**
 
@@ -2078,7 +2078,7 @@ Signature: `pub(crate) fn changed_vs_added_lines(repo_path: &Path, reference: &s
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing inline tests** (`mod full_repo_tests`) for each of the five edge cases in spec §"Handling tracked-but-missing files and symlinks":
   1. Tracked-but-missing file → warns and skips.
@@ -2105,7 +2105,7 @@ Signature: `pub(crate) fn full_repo_lines(repo_path: &Path) -> Result<Vec<DiffLi
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing inline tests** (`mod explicit_path_tests`):
   1. Existing valid file → reports violations from it normally.
@@ -2146,7 +2146,7 @@ Signature: `pub(crate) fn explicit_path_lines(paths: &[PathBuf]) -> Result<Vec<D
   - `crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx` → scanned (proves the **/fixtures/** blanket exclusion was removed; only the narrow `crates/trusted-server-core/src/integrations/**/fixtures/**` path is excluded).
   - `crates/integration-tests/fixtures/frameworks/nextjs/Dockerfile` → **scanned** (Dockerfile matched by basename; this fixture path is NOT the excluded publisher-capture path).
   - `crates/integration-tests/fixtures/frameworks/wordpress/Dockerfile` → **scanned** (same reasoning).
-  - `crates/trusted-server-cli/src/dev/lint/domains.rs` → NOT scanned (self-exclude).
+  - `crates/trusted-server-cli/src/commands/dev/lint/domains.rs` → NOT scanned (self-exclude).
   - **Markdown coverage (spec §"File extensions scanned" mandates `.md` is in scope):**
     - `README.md` → scanned.
     - `CHANGELOG.md` → scanned.
@@ -2250,7 +2250,7 @@ violation' from 'could not even run the scan' in CI logs."
 **Files:**
 
 - Modify: `crates/trusted-server-cli/src/dev/mod.rs`
-- Modify: `crates/trusted-server-cli/src/dev/lint/mod.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/mod.rs`
 
 - [ ] **Step 1: Add the nested clap types**
 
@@ -2372,7 +2372,7 @@ the CLI scaffolding so --help works end-to-end."
 
 **Files:**
 
-- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+- Modify: `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
 
 - [ ] **Step 1: Implement `domains::run`**
 
@@ -2485,7 +2485,7 @@ fn emit_human(violations: &[FileViolation])
         ))?;
         write_stdout_line(
             "To allow a new integration proxy, add it to EXACT_HOSTS in \
-             crates/trusted-server-cli/src/dev/lint/domains.rs."
+             crates/trusted-server-cli/src/commands/dev/lint/domains.rs."
         )?;
         write_stdout_line(
             "To suppress one line (e.g., security tests), append \
@@ -2563,7 +2563,7 @@ extracting the path from `cargo build --message-format=json`.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/trusted-server-cli/src/dev/lint/domains.rs
+git add crates/trusted-server-cli/src/commands/dev/lint/domains.rs
 git commit -m "Implement domains::run mode dispatch + human/JSON reporting
 
 Routes --staged, --changed-vs, explicit paths, and full-repo to the

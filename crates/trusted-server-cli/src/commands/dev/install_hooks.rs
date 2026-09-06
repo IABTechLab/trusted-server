@@ -61,6 +61,16 @@ pub enum InstallHooksError {
         /// The value `install-hooks` would set.
         proposed: String,
     },
+    /// Setting `core.hooksPath` would silence executable hooks already
+    /// installed in the default `.git/hooks` directory.
+    #[display(
+        "refusing to silence existing .git/hooks hook(s): {}; re-run with --force to proceed",
+        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    WouldSilenceDefaultHooks {
+        /// The executable, non-`.sample` hooks that would stop running.
+        paths: Vec<PathBuf>,
+    },
 }
 
 impl Error for InstallHooksError {}
@@ -182,7 +192,10 @@ fn set_local_config_value(
 ///
 /// Returns [`InstallHooksError`] on any failure; see the variants.
 pub fn install_hooks(repo_path: &Path, force: bool) -> Result<(), Report<InstallHooksError>> {
-    let repo = gix::open(repo_path).change_context(InstallHooksError::OpenRepo)?;
+    // `gix::discover` walks upward to the repository root, so the command
+    // works from any subdirectory (git invokes hooks at the worktree root,
+    // but a developer running `ts dev install-hooks` may be anywhere).
+    let repo = gix::discover(repo_path).change_context(InstallHooksError::OpenRepo)?;
     let work_dir = repo
         .workdir()
         .ok_or_else(|| Report::new(InstallHooksError::NoWorkdir))?
@@ -201,6 +214,16 @@ pub fn install_hooks(repo_path: &Path, force: bool) -> Result<(), Report<Install
         }
         Some(other) => Some(other.to_string()),
     };
+
+    // Preflight: setting `core.hooksPath` also moves git away from the
+    // default `.git/hooks`, silently disabling any executable hooks that
+    // already live there. Refuse without `--force`; note them under it.
+    let displaced_default_hooks = displaced_default_hooks(&repo)?;
+    if !displaced_default_hooks.is_empty() && !force {
+        return Err(Report::new(InstallHooksError::WouldSilenceDefaultHooks {
+            paths: displaced_default_hooks,
+        }));
+    }
 
     let hooks_dir = work_dir.join(".githooks");
     let hook_path = hooks_dir.join("pre-commit");
@@ -241,6 +264,13 @@ pub fn install_hooks(repo_path: &Path, force: bool) -> Result<(), Report<Install
         ))
         .change_context(InstallHooksError::WriteHook)?;
     }
+    for hook in displaced_default_hooks {
+        write_stderr_line(format!(
+            "note: `{}` in .git/hooks no longer runs while core.hooksPath is set",
+            hook.display()
+        ))
+        .change_context(InstallHooksError::WriteHook)?;
+    }
     Ok(())
 }
 
@@ -258,6 +288,48 @@ fn set_executable(path: &Path) -> Result<(), Report<InstallHooksError>> {
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) -> Result<(), Report<InstallHooksError>> {
     Ok(())
+}
+
+/// Whether `path` has any executable bit set (Unix). On non-Unix, git
+/// treats every hook file as executable, so report `true`.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
+}
+
+/// Executable, non-`.sample` hooks in the default `.git/hooks`
+/// directory that setting `core.hooksPath` would silence.
+///
+/// Returns an empty list when the directory is absent.
+fn displaced_default_hooks(
+    repo: &gix::Repository,
+) -> Result<Vec<PathBuf>, Report<InstallHooksError>> {
+    let dir = repo.git_dir().join("hooks");
+    let mut found = Vec::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(e) => {
+            return Err(Report::new(InstallHooksError::WriteHook).attach(e.to_string()));
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "sample") {
+            continue;
+        }
+        if path.is_file() && is_executable(&path) {
+            found.push(path);
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// `ts dev install-hooks` entry point.
@@ -424,6 +496,52 @@ mod install_hooks_tests {
 
         install_hooks(temp.path(), false).expect("first install should succeed");
         install_hooks(temp.path(), false).expect("re-install should be idempotent");
+        assert_eq!(hooks_path_value(temp.path()).as_deref(), Some(".githooks"));
+    }
+
+    /// An executable hook already in `.git/hooks` would be silenced by
+    /// setting `core.hooksPath`; refuse without `--force`, proceed with it.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_silence_existing_default_hooks_without_force() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        let default_hooks = repo.git_dir().join("hooks");
+        fs::create_dir_all(&default_hooks).expect("should create hooks dir");
+        let existing = default_hooks.join("pre-commit");
+        fs::write(&existing, "#!/bin/sh\nexit 1\n").expect("should write hook");
+        set_executable(&existing).expect("should mark executable");
+
+        let err = install_hooks(temp.path(), false)
+            .expect_err("should refuse to silence a populated .git/hooks");
+        assert!(
+            matches!(
+                err.current_context(),
+                InstallHooksError::WouldSilenceDefaultHooks { .. }
+            ),
+            "should be a WouldSilenceDefaultHooks error"
+        );
+        // Config must be untouched by the refused install.
+        assert_eq!(hooks_path_value(temp.path()), None);
+
+        install_hooks(temp.path(), true).expect("--force should proceed");
+        assert_eq!(hooks_path_value(temp.path()).as_deref(), Some(".githooks"));
+    }
+
+    /// A non-executable or `.sample` file in `.git/hooks` does not block
+    /// install: git never runs those, so nothing is silenced.
+    #[cfg(unix)]
+    #[test]
+    fn sample_hooks_do_not_block_install() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        let default_hooks = repo.git_dir().join("hooks");
+        fs::create_dir_all(&default_hooks).expect("should create hooks dir");
+        let sample = default_hooks.join("pre-commit.sample");
+        fs::write(&sample, "#!/bin/sh\nexit 0\n").expect("should write sample");
+        set_executable(&sample).expect("should mark executable");
+
+        install_hooks(temp.path(), false).expect("sample hooks should not block install");
         assert_eq!(hooks_path_value(temp.path()).as_deref(), Some(".githooks"));
     }
 

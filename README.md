@@ -81,9 +81,14 @@ cargo test-fastly      # Fastly/WASM (requires Viceroy)
 cargo test-axum        # Axum native adapter
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter (native host)
+
+# Install the pre-commit URL-host linter hook (once per checkout)
+ts dev install-hooks
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+Contributors should run `ts dev install-hooks` to enable the pre-commit
+URL-host linter; see [CONTRIBUTING.md](CONTRIBUTING.md) for that and the rest of
+the contribution guidelines.
 
 ## License
 
