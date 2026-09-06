@@ -3096,11 +3096,108 @@ PY
   checks exit 0. Two generated updates preserve the page, diagram, and orphan
   hashes; two classification updates and two sensitive bootstraps are
   byte-stable.
-- Step 7 is the exact eight-path correction: the compiled core receipt; this
+- Step 7 was the exact eight-path correction: the compiled core receipt; this
   evidence, plan, and design specification; and the two standalone
-  implementation/test pairs. The aggregate from the approved Task 7 head is the
-  current 24-path Task 8 **Files** set. The correction, aggregate, and
+  implementation/test pairs. The aggregate from the approved Task 7 head was
+  the then-current 24-path Task 8 **Files** set. The correction, aggregate, and
   plan/staging directional set differences are empty.
+
+- Quality review of `a04ae1fd6e431c2c0ccf1c5b32886682f9da4a7d`
+  found six execution-oracle gaps. RED fixtures reproduced decoy and ambiguous
+  integration owners; macro, closure, dead-branch, and conditional registration
+  hiding; Cloudflare decoy/multiple builder authority and unsupported dataflow;
+  over-limit and symlinked repository inputs; missing, duplicate, or nonexistent
+  compiled JavaScript bundles and wrong loading evidence; route method, path,
+  predicate, status, handler, dead-branch, and comment-decoy mutations; and raw
+  route identity collisions whose metadata differed.
+- Integration extraction now resolves one exact production top-level function
+  or owned inherent method, excludes only exact `cfg(test)` definitions, rejects
+  every other conditional or ambiguous definition, and accepts only the closed
+  registration statement shapes exercised by production. The complete
+  `with_plan` body is checked statement by statement, including each nested
+  proxy-route conversion, router selection, insertion/error path, recorded
+  route, capability transfer, JavaScript disposition, and returned registry.
+  Plan and mediator registrations must bind the returned value into the
+  production collection or mediator result; extra mutation, shadowing, nested
+  control flow, and evaluated macro arguments fail closed. Source visitors
+  retain raw insert cardinality. Cloudflare extraction proves exactly one raw
+  builder occurrence across the complete production function and follows its
+  uniquely returned authority through the supported assignment, loop, and
+  returned-chain forms; replacement builders, aliases, macros, nested items,
+  and unsupported control flow fail closed.
+- All integration and route repository inputs are read through a non-symlink
+  regular-file reader with a 4 MiB pre-read bound and bounded streaming read.
+  Before and after the read, descriptor snapshots compare device, inode, mode,
+  length, and nanosecond modification/change timestamps; a separate path check
+  proves that the name still resolves to the opened descriptor. Manifests cap
+  total input, rows, nested lists, and every string field. Exact-limit,
+  limit-plus-one, symlink, same-length in-place mutation, and same-length path
+  replacement fixtures pass only at the documented boundary.
+- The compiled capability receipt compares the raw output of
+  `trusted_server_js::all_module_ids()` with every checked emitted bundle and
+  verifies `module_bundle` for every browser-served ID. Creative, Prebid, and
+  GPT diagnostics loading assignments come from their runtime paths. Route
+  receipts structurally bind Fastly health and JA4 control flow, each adapter's
+  dynamic TSJS condition and returned handler, Fastly asset routing,
+  healthy/startup fallback loops, health handlers, startup status, page-bids
+  preflight handlers, and legacy denial handlers. Named and Cloudflare route
+  records also bind the expected handler identity under an explicit production
+  `cfg` policy. Comments, unrelated expressions, dead branches, unused closures,
+  disconnected helpers, and discarded builders cannot attest those routes.
+- One raw route accumulator now rejects any repeated
+  `(adapter, path, method, startup_router)` before shape, predicate, or status
+  grouping. Manifest, named adapter, Cloudflare, and synthesized receipt records
+  all cross that boundary, including a named-versus-synthesized collision
+  fixture.
+- Repeated independent adversarial rereviews reproduced the remaining
+  false passes before the correction was committed: deploy generic-type swaps;
+  unused deploy/runtime validation entrypoints; suffix-only plan, constructor,
+  handler, fallback-iterator, and mediator calls; mediator alternative side effects;
+  shadowed or helper-built Cloudflare authorities; opaque initializer macros;
+  dead, unused, shadowed, or trailing health, TSJS, asset, handler, fallback,
+  and startup-status evidence; route calls in dead closures; post-registration
+  builder resets; omitted Fastly early/method handlers; and conditional,
+  duplicate, or hardcoded imported path constants. A final reachability pass
+  also reproduced local validator shadowing, prior conditional exits from
+  validation and Fastly health, router construction that returned before
+  registration, dead reviewed named-route collections paired with empty
+  iterators, handler calls hidden after an earlier diversion, block-scoped
+  direct or aliased imports that replaced validation and fallback authorities,
+  conditional terminal paths before a trailing expected handler call,
+  control-flow or error propagation hidden in local initializers,
+  named-collection import shadows, handler argument substitutions, validation
+  helpers that swallowed errors, unchecked response-construction statements,
+  suffix-matched constructors and statuses, and synthesized guarded statuses
+  without handler-body receipts. The
+  final RED fixtures bind both production validation entrypoints and their
+  reachable lexical sequence; their exact error-propagating helper flows; full
+  registration paths, types, receivers, arguments, and constructors; lexical
+  router and response identity through the returned value; every reviewed named
+  collection to its live registration loop; each named handler identifier to a
+  closed reachable production body, exact arguments, and terminal behavior;
+  guarded and unsupported statuses to exact response bodies; and exact
+  production ownership for nested functions and referenced constants.
+  Page-bids paths are read from their authoritative core publisher definitions
+  rather than fallback literals.
+- The focused correction targets pass 33 integration and 68 route tests. A
+  fresh default-parallel standalone suite passes all 343 tests: 25 library,
+  35 classification, 19 CLI, 33 integration, 57 links, 11 Markdown, 68 route,
+  72 scanner, and 23 settings tests. Standalone formatting and all-target,
+  all-feature clippy with warnings denied pass.
+- Pinned Viceroy 0.17.0 with `SSL_CERT_FILE=/etc/ssl/cert.pem` passes the three
+  Task 8 receipts and the full matrix: 175 Fastly adapter tests, 2,425 core
+  tests with six ignored, two JavaScript tests, 21 OpenRTB tests, and four core
+  doctests with four ignored. Axum passes 15 library, one binary, and 27 route
+  tests after the expected loopback-permitted rerun; Cloudflare passes 23
+  library and 23 route tests; Spin passes 50 library and 38 route tests; and
+  cross-adapter parity passes 13 tests. Root formatting and all six adapter
+  clippy aliases pass.
+- Step 8 is the exact eight-path correction: the compiled core receipt; this
+  evidence and plan; the standalone integration, repository, and route
+  implementations; and both focused test modules. The
+  aggregate from the approved Task 7 head is the current 25-path Task 8
+  **Files** set. Both directional differences for the correction, aggregate,
+  and plan/staging sets are empty. Neither lockfile changes.
 
 #### Task 9 — Check CLI help, snippets, gates, and workflow foundations
 

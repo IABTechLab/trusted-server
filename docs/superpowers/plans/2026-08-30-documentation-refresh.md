@@ -601,6 +601,7 @@ Step 11 staging commands equals that set, and Task 8 has not started.
 - Modify: `tools/docs-parity/README.md`
 - Create: `tools/docs-parity/src/integrations.rs`
 - Create: `tools/docs-parity/src/routes.rs`
+- Modify: `tools/docs-parity/src/repository.rs`
 - Modify: `tools/docs-parity/src/lib.rs`
 - Create: `tools/docs-parity/manifests/integrations.toml`
 - Create: `tools/docs-parity/manifests/routes.toml`
@@ -700,7 +701,29 @@ git commit -m "Close integration inventory review gaps"
 
 Expected: the correction commit contains exactly these eight paths, the
 standalone suite contains 267 tests, and the full Task 8 aggregate contains
-exactly the 24 paths in **Files** above.
+the then-current 24-path set. The quality correction in Step 8 adds the bounded
+repository reader to the current 25-path Task 8 **Files** set above.
+
+- [x] **Step 8: Close integration execution quality gaps**
+
+Resolve exact production registration owners and reject hidden or ambiguous
+registration grammar. Follow Cloudflare's uniquely returned builder authority.
+Bound manifest and Rust-source reads before allocation. Bind emitted JavaScript
+bundles and loading modes to compiled runtime receipts. Replace route substring
+checks with exact AST/control-flow receipts, and reject duplicate raw route
+identities before metadata grouping.
+
+```bash
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test integrations
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test routes
+PATH=/private/tmp/task7-viceroy/bin:$PATH SSL_CERT_FILE=/etc/ssl/cert.pem cargo test-fastly task8_
+git add crates/trusted-server-core/src/integrations/registry.rs docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/src/integrations.rs tools/docs-parity/src/repository.rs tools/docs-parity/src/routes.rs tools/docs-parity/tests/integrations.rs tools/docs-parity/tests/routes.rs
+git commit -m "Close integration execution quality gaps"
+```
+
+Expected: the correction commit contains exactly these eight paths, the
+standalone suite contains 343 tests, and the full Task 8 aggregate contains
+exactly the 25 paths in **Files** above.
 
 ### Task 9: Check CLI help, snippets, gates, and final workflow foundations
 

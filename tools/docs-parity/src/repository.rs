@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{ErrorKind, Write as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -197,6 +197,95 @@ impl Repository {
         fs::read(&absolute)
             .change_context(RepositoryError::FileOperation)
             .attach_with(|| format!("read tracked path: {}", absolute.display()))
+    }
+
+    pub(crate) fn read_tracked_bounded(
+        &self,
+        path: &NormalizedRelativePath,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, Report<RepositoryError>> {
+        self.read_tracked_bounded_with_hook(path, maximum_bytes, || Ok(()))
+    }
+
+    fn read_tracked_bounded_with_hook<F>(
+        &self,
+        path: &NormalizedRelativePath,
+        maximum_bytes: usize,
+        after_read: F,
+    ) -> Result<Vec<u8>, Report<RepositoryError>>
+    where
+        F: FnOnce() -> Result<(), std::io::Error>,
+    {
+        self.validate_existing(path, false)?;
+        let absolute = self.root.join(path.as_path());
+        let path_before = FileSnapshot::read_path(&absolute)?;
+        if path_before.size > maximum_bytes as u64 {
+            return Err(Report::new(RepositoryError::UnsafeEntry).attach(format!(
+                "bounded path exceeds {maximum_bytes} bytes: {}",
+                absolute.display()
+            )));
+        }
+
+        let mut file = File::open(&absolute)
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("open bounded path: {}", absolute.display()))?;
+        let opened_before = FileSnapshot::from_metadata(
+            &file
+                .metadata()
+                .change_context(RepositoryError::FileOperation)?,
+        )?;
+        if opened_before != path_before {
+            return Err(Report::new(RepositoryError::FileOperation).attach(format!(
+                "bounded path changed before read: {}",
+                absolute.display()
+            )));
+        }
+
+        let capacity = usize::try_from(opened_before.size).map_err(|error| {
+            Report::new(RepositoryError::UnsafeEntry)
+                .attach(format!("bounded file size cannot be represented: {error}"))
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        std::io::Read::take(&mut file, (maximum_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("read bounded path: {}", absolute.display()))?;
+        if bytes.len() > maximum_bytes {
+            return Err(Report::new(RepositoryError::UnsafeEntry).attach(format!(
+                "bounded path exceeds {maximum_bytes} bytes: {}",
+                absolute.display()
+            )));
+        }
+        after_read()
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("bounded read hook: {}", absolute.display()))?;
+        self.validate_existing(path, false)?;
+        let path_after = FileIdentity::read(&absolute)?;
+        if path_after != opened_before.identity {
+            return Err(Report::new(RepositoryError::FileOperation).attach(format!(
+                "bounded path identity changed while reading: {}",
+                absolute.display()
+            )));
+        }
+        let opened_after = FileSnapshot::from_metadata(
+            &file
+                .metadata()
+                .change_context(RepositoryError::FileOperation)
+                .attach_with(|| format!("reinspect opened bounded path: {}", absolute.display()))?,
+        )?;
+        let path_metadata = fs::symlink_metadata(&absolute)
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("reinspect bounded path: {}", absolute.display()))?;
+        if opened_after != opened_before
+            || opened_after.size != bytes.len() as u64
+            || FileIdentity::from_metadata(&path_metadata)? != opened_before.identity
+        {
+            return Err(Report::new(RepositoryError::FileOperation).attach(format!(
+                "bounded path changed while reading: {}",
+                absolute.display()
+            )));
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn read_optional(
@@ -485,6 +574,36 @@ struct FileIdentity {
     mode: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileSnapshot {
+    identity: FileIdentity,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl FileSnapshot {
+    fn read_path(path: &Path) -> Result<Self, Report<RepositoryError>> {
+        let metadata = fs::symlink_metadata(path)
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("inspect bounded path snapshot: {}", path.display()))?;
+        Self::from_metadata(&metadata)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Self, Report<RepositoryError>> {
+        Ok(Self {
+            identity: FileIdentity::from_metadata(metadata)?,
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+}
+
 impl FileIdentity {
     fn read(path: &Path) -> Result<Self, Report<RepositoryError>> {
         let metadata = fs::symlink_metadata(path)
@@ -493,6 +612,15 @@ impl FileIdentity {
         if !metadata.is_file() || unsafe_mode(&metadata) {
             return Err(Report::new(RepositoryError::UnsafeEntry)
                 .attach(format!("unsafe atomic target: {}", path.display())));
+        }
+        Self::from_metadata(&metadata)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Self, Report<RepositoryError>> {
+        if !metadata.is_file() || unsafe_mode(metadata) {
+            return Err(
+                Report::new(RepositoryError::UnsafeEntry).attach("unsafe bounded file metadata")
+            );
         }
         Ok(Self {
             device: metadata.dev(),
@@ -737,6 +865,73 @@ mod tests {
         assert_eq!(
             fs::read(target).expect("should read committed target"),
             b"generated"
+        );
+    }
+
+    #[test]
+    fn bounded_read_accepts_the_limit_and_rejects_larger_or_symlink_entries() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let (directory, repository, path) = repository();
+        let target = directory.path().join("record.txt");
+        fs::write(&target, vec![b'x'; LIMIT]).expect("should write exact-limit fixture");
+        assert_eq!(
+            repository
+                .read_tracked_bounded(&path, LIMIT)
+                .expect("exact-limit input should be readable")
+                .len(),
+            LIMIT
+        );
+        fs::write(&target, vec![b'x'; LIMIT + 1]).expect("should write over-limit fixture");
+        assert!(
+            repository.read_tracked_bounded(&path, LIMIT).is_err(),
+            "over-limit input must fail before allocation"
+        );
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::fs::symlink;
+
+            let linked = directory.path().join("linked.txt");
+            symlink(&target, &linked).expect("should create symlink fixture");
+            let linked = NormalizedRelativePath::new(Path::new("linked.txt"))
+                .expect("should normalize linked path");
+            assert!(
+                repository.read_tracked_bounded(&linked, LIMIT).is_err(),
+                "a symlink input must fail before reading"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_read_rejects_same_length_in_place_mutation() {
+        let (directory, repository, path) = repository();
+        let target = directory.path().join("record.txt");
+        fs::write(&target, b"original").expect("should write original fixture");
+
+        let result =
+            repository.read_tracked_bounded_with_hook(&path, 8, || fs::write(&target, b"mutated!"));
+
+        assert!(
+            result.is_err(),
+            "descriptor metadata must expose a same-length in-place mutation"
+        );
+    }
+
+    #[test]
+    fn bounded_read_rejects_same_length_path_replacement() {
+        let (directory, repository, path) = repository();
+        let target = directory.path().join("record.txt");
+        let replacement = directory.path().join("replacement.txt");
+        fs::write(&target, b"original").expect("should write original fixture");
+
+        let result = repository.read_tracked_bounded_with_hook(&path, 8, || {
+            fs::write(&replacement, b"replaced")?;
+            fs::rename(&replacement, &target)
+        });
+
+        assert!(
+            result.is_err(),
+            "path identity must expose a same-length replacement"
         );
     }
 

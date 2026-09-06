@@ -2374,6 +2374,8 @@ mod tests {
     #[test]
     fn task8_behavioral_capability_matrix_matches_checked_records_exactly() {
         let manifest = task8_checked_manifest();
+        task8_validate_bundle_receipt(&manifest.js_bundle_ids)
+            .expect("compiled JS bundles must equal the reviewed bundle inventory");
         let observed = task8_observed_capabilities();
         assert_eq!(
             observed,
@@ -2559,6 +2561,20 @@ mod tests {
             task8_insert_capability(&mut capabilities, capability).is_err(),
             "compiled capability observations must reject duplicate rows"
         );
+
+        let compiled = trusted_server_js::all_module_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut duplicate_bundle = compiled.clone();
+        duplicate_bundle.push(compiled[0].clone());
+        assert!(task8_validate_bundle_receipt(&duplicate_bundle).is_err());
+        let mut missing_bundle = compiled.clone();
+        missing_bundle.pop();
+        assert!(task8_validate_bundle_receipt(&missing_bundle).is_err());
+        let mut nonexistent_bundle = compiled;
+        nonexistent_bundle.push("nonexistent".to_owned());
+        assert!(task8_validate_bundle_receipt(&nonexistent_bundle).is_err());
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -2585,6 +2601,8 @@ mod tests {
 
     #[derive(Deserialize)]
     struct Task8Manifest {
+        #[serde(default)]
+        js_bundle_ids: Vec<String>,
         #[serde(default)]
         capabilities: Vec<Task8Capability>,
         #[serde(default)]
@@ -2623,6 +2641,21 @@ mod tests {
         }
     }
 
+    fn task8_validate_bundle_receipt(expected: &[String]) -> Result<(), String> {
+        let compiled = trusted_server_js::all_module_ids();
+        let compiled_set = task8_unique_receipt_values("JS bundle IDs", compiled.iter().copied())?;
+        let expected_set = task8_unique_receipt_values("checked JS bundle IDs", expected)?;
+        if compiled_set != expected_set {
+            return Err("compiled JS bundle inventory differs".to_owned());
+        }
+        for id in expected {
+            if trusted_server_js::module_bundle(id).is_none() {
+                return Err(format!("checked JS bundle `{id}` has no emitted bundle"));
+            }
+        }
+        Ok(())
+    }
+
     fn task8_insert_capability(
         observations: &mut BTreeSet<Task8Capability>,
         capability: Task8Capability,
@@ -2636,6 +2669,15 @@ mod tests {
 
     fn task8_observed_capabilities() -> BTreeSet<Task8Capability> {
         let mut observations = BTreeSet::new();
+        let empty_registry = IntegrationRegistry::empty_for_tests();
+        let creative_mode = if empty_registry.js_module_ids_immediate() == ["creative"]
+            && empty_registry.js_module_ids_deferred().is_empty()
+            && trusted_server_js::module_bundle("creative").is_some()
+        {
+            "bundled"
+        } else {
+            "invalid"
+        };
         task8_insert_capability(
             &mut observations,
             Task8Capability {
@@ -2648,7 +2690,7 @@ mod tests {
                 post_processors: BTreeSet::new(),
                 request_filters: BTreeSet::new(),
                 providers: BTreeSet::new(),
-                js_mode: "bundled".to_owned(),
+                js_mode: creative_mode.to_owned(),
             },
         )
         .expect("should insert the creative capability observation");
@@ -2894,7 +2936,12 @@ mod tests {
         )
         .expect("should observe unique integration request filters");
         let js_mode = if registration.js_disabled {
-            if id == "gpt_diagnostics" {
+            if id == "gpt_diagnostics"
+                && crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::active_for_tests()
+                    .module_script_tag()
+                    .is_some_and(|tag| tag.contains("tsjs-gpt_diagnostics.min.js"))
+                && trusted_server_js::module_bundle(id).is_some()
+            {
                 "standalone"
             } else {
                 "none"
