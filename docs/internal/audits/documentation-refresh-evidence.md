@@ -3275,6 +3275,17 @@ for the standalone tool.
   No hosted receipt is claimed. Linux/macOS goldens and `cli-captures.toml`
   remain absent until the first successful same-head PR #1049 capture run is
   authenticated and imported twice.
+- The first pushed capture attempt, Run Tests run `34089500428` at source SHA
+  `996008540a49963642816a9e2f571e4bee6d2859`, failed identically on Linux and
+  macOS before artifact upload. Both job logs reported Clap exit 101 because
+  `cli-help --check` named the `action` subcommand in an argument-only
+  `required_unless_present` relation. The failure reproduced locally with
+  `cli-help --help`. A named regression now builds that exact command tree;
+  the repaired parser uses `args_conflicts_with_subcommands` and
+  `subcommand_negates_reqs`, and a complete local macOS capture wrote a valid
+  inner ZIP. The corrected standalone suite passed all 395 tests, including 25
+  CLI and 38 library tests; formatting and all-target, all-feature clippy with
+  warnings denied also passed. The failed run is not an import receipt.
 
 #### Task 10 — Complete WP2 truth pass and dispositions
 

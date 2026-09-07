@@ -178,6 +178,29 @@ fn help_is_deterministic() {
 }
 
 #[test]
+fn cli_help_command_tree_is_constructible() {
+    let help = output(
+        command_in(
+            env::current_dir()
+                .expect("should read current directory")
+                .as_path(),
+        )
+        .args(["cli-help", "--help"]),
+    );
+
+    assert_eq!(
+        status_code(&help),
+        SUCCESS,
+        "the CLI-help subcommand must not panic while Clap builds its argument tree: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let stdout = String::from_utf8(help.stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("--check"));
+    assert!(stdout.contains("capture"));
+    assert!(stdout.contains("import-hosted"));
+}
+
+#[test]
 fn unknown_subcommand_uses_the_cli_error_exit_code() {
     let result = output(
         command_in(

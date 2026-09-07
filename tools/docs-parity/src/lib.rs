@@ -109,9 +109,10 @@ enum Command {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct CliHelpArguments {
     /// Validate imported native goldens without network access.
-    #[arg(long, conflicts_with = "action", required_unless_present = "action")]
+    #[arg(long, required = true)]
     check: bool,
     #[command(subcommand)]
     action: Option<CliHelpAction>,
