@@ -15,7 +15,7 @@ use crate::integrations::{
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
     ensure_integration_backend,
 };
-use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::platform::{GeoInfo, PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
@@ -101,6 +101,101 @@ fn default_api_origin() -> String {
 enum DidomiBackend {
     Sdk,
     Api,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DidomiGeo {
+    country: String,
+    region: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DidomiGeoError {
+    MissingCountry,
+    MissingRegion,
+    InvalidCountry,
+    InvalidRegion,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CanonicalLoaderUrl {
+    browser_target: String,
+    query: String,
+}
+
+fn is_notice_loader(method: &Method, consent_path: &str) -> bool {
+    if *method != Method::GET {
+        return false;
+    }
+
+    let Some(path) = consent_path.strip_prefix('/') else {
+        return false;
+    };
+    let mut segments = path.split('/');
+    let public_key = segments.next();
+    let file_name = segments.next();
+
+    public_key.is_some_and(|segment| !segment.is_empty())
+        && file_name == Some("loader.js")
+        && segments.next().is_none()
+}
+
+fn trim_ascii(value: &str) -> &str {
+    value.trim_matches(|character: char| character.is_ascii_whitespace())
+}
+
+fn normalize_didomi_geo(geo: &GeoInfo) -> Result<DidomiGeo, DidomiGeoError> {
+    let country = trim_ascii(&geo.country).to_ascii_uppercase();
+    if country.is_empty() {
+        return Err(DidomiGeoError::MissingCountry);
+    }
+    if country.len() != 2
+        || !country.bytes().all(|byte| byte.is_ascii_alphabetic())
+        || matches!(country.as_str(), "XX" | "ZZ")
+    {
+        return Err(DidomiGeoError::InvalidCountry);
+    }
+
+    let Some(region) = geo.region.as_deref() else {
+        return Err(DidomiGeoError::MissingRegion);
+    };
+    let region = trim_ascii(region).to_ascii_uppercase();
+    if region.is_empty() {
+        return Err(DidomiGeoError::MissingRegion);
+    }
+    let region = match region.split_once('-') {
+        Some((prefix, subdivision)) if prefix == country => subdivision,
+        Some(_) => return Err(DidomiGeoError::InvalidRegion),
+        None => region.as_str(),
+    };
+    if !(1..=3).contains(&region.len()) || !region.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(DidomiGeoError::InvalidRegion);
+    }
+
+    Ok(DidomiGeo {
+        country,
+        region: region.to_string(),
+    })
+}
+
+fn canonical_loader_url(path: &str, query: Option<&str>, geo: &DidomiGeo) -> CanonicalLoaderUrl {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(query) = query {
+        for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if !name.eq_ignore_ascii_case("country") && !name.eq_ignore_ascii_case("region") {
+                serializer.append_pair(&name, &value);
+            }
+        }
+    }
+    serializer.append_pair("country", &geo.country);
+    serializer.append_pair("region", &geo.region);
+    let query = serializer.finish();
+
+    CanonicalLoaderUrl {
+        browser_target: format!("{path}?{query}"),
+        query,
+    }
 }
 
 struct DidomiIntegration {
@@ -371,6 +466,7 @@ mod tests {
 
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::platform::GeoInfo;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use http::Method;
@@ -383,6 +479,19 @@ mod tests {
             proxy_path: None,
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
+        }
+    }
+
+    fn geo_info(country: &str, region: Option<&str>) -> GeoInfo {
+        GeoInfo {
+            city: String::new(),
+            country: country.to_string(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: region.map(str::to_string),
+            asn: None,
         }
     }
 
@@ -422,6 +531,123 @@ mod tests {
             config.geo_query_parameters,
             "should retain explicit geo query parameter opt-in"
         );
+    }
+
+    #[test]
+    fn matches_only_exact_get_notice_loader_paths() {
+        assert!(is_notice_loader(&Method::GET, "/public-key/loader.js"));
+
+        for (method, path) in [
+            (Method::POST, "/public-key/loader.js"),
+            (Method::GET, "/loader.js"),
+            (Method::GET, "/api/public-key/loader.js"),
+            (Method::GET, "/public-key/loader.js/"),
+            (Method::GET, "/public-key/loader.js.map"),
+            (Method::GET, "/nested/public-key/loader.js"),
+            (Method::GET, "/public-key/other.js"),
+        ] {
+            assert!(
+                !is_notice_loader(&method, path),
+                "should reject {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_country_and_region() {
+        let geo = geo_info(" us \n", Some(" ca\t"));
+
+        assert_eq!(
+            normalize_didomi_geo(&geo).expect("should normalize geo"),
+            DidomiGeo {
+                country: "US".to_string(),
+                region: "CA".to_string(),
+            },
+            "should trim ASCII whitespace and uppercase both values"
+        );
+    }
+
+    #[test]
+    fn normalizes_matching_country_prefixed_region() {
+        let geo = geo_info("us", Some("us-ca"));
+
+        assert_eq!(
+            normalize_didomi_geo(&geo).expect("should normalize prefixed region"),
+            DidomiGeo {
+                country: "US".to_string(),
+                region: "CA".to_string(),
+            },
+            "should remove a matching country prefix"
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_geo() {
+        for (country, region) in [
+            ("", None),
+            ("US", None),
+            ("XX", Some("CA")),
+            ("ZZ", Some("CA")),
+            ("U1", Some("CA")),
+            ("USA", Some("CA")),
+            ("ÜS", Some("CA")),
+            ("US", Some("")),
+            ("US", Some("C-A")),
+            ("US", Some("CAL1")),
+            ("US", Some("CA!")),
+            ("US", Some("GB-LND")),
+        ] {
+            let geo = geo_info(country, region);
+
+            assert!(
+                normalize_didomi_geo(&geo).is_err(),
+                "should reject country {country:?} and region {region:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalizes_loader_query_with_authoritative_geo() {
+        let geo = DidomiGeo {
+            country: "US".to_string(),
+            region: "CA".to_string(),
+        };
+        let canonical = canonical_loader_url(
+            "/integrations/didomi/consent/key/loader.js",
+            Some("target_type=notice&x=1&Country=gb&%72egion=lnd&x=2&empty=&space=a+b&plus=%2B"),
+            &geo,
+        );
+
+        assert_eq!(
+            canonical.query,
+            "target_type=notice&x=1&x=2&empty=&space=a+b&plus=%2B&country=US&region=CA",
+            "should preserve unrelated decoded pairs and replace all geo pairs"
+        );
+        assert_eq!(
+            canonical.browser_target,
+            "/integrations/didomi/consent/key/loader.js?target_type=notice&x=1&x=2&empty=&space=a+b&plus=%2B&country=US&region=CA",
+            "should build a relative same-origin target"
+        );
+    }
+
+    #[test]
+    fn canonical_loader_query_is_idempotent() {
+        let geo = DidomiGeo {
+            country: "US".to_string(),
+            region: "CA".to_string(),
+        };
+        let first = canonical_loader_url(
+            "/integrations/didomi/consent/key/loader.js",
+            Some("quote=%27&country=US&region=CA"),
+            &geo,
+        );
+        let second = canonical_loader_url(
+            "/integrations/didomi/consent/key/loader.js",
+            Some(&first.query),
+            &geo,
+        );
+
+        assert_eq!(second, first, "should remain stable after canonicalization");
     }
 
     #[test]
