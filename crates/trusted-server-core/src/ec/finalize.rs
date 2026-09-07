@@ -155,7 +155,9 @@ fn recover_orphaned_ec(
 ) {
     // Snapshot the orphaned ID once so every fail-closed exit binds the failed
     // snapshot to the same key.
-    let orphan_id = ec_context.ec_value().unwrap_or_default().to_owned();
+    let Some(orphan_id) = ec_context.ec_value().map(str::to_owned) else {
+        return;
+    };
     let Some(client_ip) = ec_context.client_ip().map(str::to_owned) else {
         log::warn!("Orphan EC recovery skipped because client IP is unavailable");
         ec_context.set_kv_snapshot(EcKvSnapshot::Failed {

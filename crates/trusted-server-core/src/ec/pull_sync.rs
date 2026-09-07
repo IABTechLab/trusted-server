@@ -105,6 +105,11 @@ pub fn dispatch_pull_sync(
 ) {
     let now = current_timestamp();
     let Some(request_entry) = context.snapshot.entry_for(context.ec_id()) else {
+        log::debug!(
+            "Pull sync: skipping dispatch for '{}' because the request captured no usable \
+             identity snapshot",
+            super::log_id(context.ec_id())
+        );
         return;
     };
     if !request_entry.consent.ok {

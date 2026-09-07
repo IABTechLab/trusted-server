@@ -198,13 +198,13 @@ dispatch pull sync.
 
 Valid partner responses are collected across every HTTP concurrency batch into
 one request-wide set of `PartnerIdUpdate` values and merged in one final bulk
-CAS operation. Draining a network batch never writes KV. When the finalized snapshot still
-has a usable generation, the uncontended case performs one write and no
-additional read. When finalization already wrote the row, pull sync uses its
-updated entry for eligibility, collects responses, then performs one refresh
-lookup to obtain the new generation before its bulk CAS. A conflict rereads the
-latest entry, rejects a tombstone, re-merges every collected update, and retries
-within the existing bound. Pull sync never creates a missing root.
+CAS operation. Draining a network batch never writes KV. Because pull sync runs
+after the response is flushed and discloses the raw EC ID to partners, the live
+row is re-read once before the first partner request; anything short of a live,
+consenting entry cancels the dispatch, and that refreshed snapshot supplies the
+generation for the bulk CAS. A conflict rereads the latest entry, rejects a
+tombstone, re-merges every collected update, and retries within the existing
+bound. Pull sync never creates a missing root.
 
 Rate limiting, URL allowlisting, bearer-token handling, response-size limits,
 UID validation, concurrency limits, and best-effort post-send behavior remain

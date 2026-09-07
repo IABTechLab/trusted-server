@@ -9781,6 +9781,111 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn esi_cache_hit_with_ec_snapshot_does_not_start_pending_origin() {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_concurrent_fanout(true);
+            stub.set_streaming_responses_supported(true);
+            stub.set_pending_streaming_responses_supported(true);
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let http_calls_at_lookup = Arc::new(AtomicUsize::new(0));
+            let graph = KvIdentityGraph::new(OrderRecordingKv {
+                inner: InMemoryEcKv::new("esi-scheduling-store"),
+                http: Arc::clone(&stub),
+                http_calls_at_lookup: Arc::clone(&http_calls_at_lookup),
+                lookups: Arc::clone(&lookups),
+            });
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            // Only the cold request has an origin response available.
+            queue_shareable_html(&stub);
+
+            for (index, cache_status) in ["miss-stored", "hit"].into_iter().enumerate() {
+                let mut ec_context = EcContext::new_for_test_with_ip(
+                    Some(format!("{}.CkId01", "b".repeat(64))),
+                    scheduling_consent(),
+                    Some("203.0.113.7".to_owned()),
+                );
+                let response = handle_publisher_request(
+                    &settings,
+                    &services,
+                    Some(&graph),
+                    &mut ec_context,
+                    AuctionDispatch {
+                        orchestrator: &orchestrator,
+                        slots: &[article_slot()],
+                        registry: None,
+                    },
+                    navigation_request(),
+                    EdgeCacheHeader::SMaxageFallback,
+                )
+                .await
+                .expect("should serve ESI navigation with an active EC");
+                assert_eq!(
+                    lookups.load(Ordering::SeqCst),
+                    index + 1,
+                    "should load exactly one EC snapshot per navigation"
+                );
+                assert_eq!(
+                    http_calls_at_lookup.load(Ordering::SeqCst),
+                    index,
+                    "should defer origin dispatch until after the ESI cache lookup"
+                );
+                let response = publisher_response_into_streaming_response(
+                    response,
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await
+                .expect("should finalize ESI response");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(HEADER_X_TS_TEMPLATE_CACHE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_status),
+                    "should populate the cache on the cold request and reuse it on the warm request"
+                );
+                // Consume the stream so the cold request finishes storing its template.
+                let body = body_of(response).await;
+                assert!(
+                    !body.is_empty(),
+                    "should return the assembled publisher body"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "should fetch origin only for the cold cache miss"
+                );
+            }
+            assert_eq!(
+                cache
+                    .lookups
+                    .lock()
+                    .expect("should lock cache lookups")
+                    .len(),
+                2,
+                "should consult the template cache on both navigations"
+            );
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![true],
+                "should preserve streaming on the cold origin fetch"
+            );
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![true],
+                "should bypass platform caching for the cold origin fetch"
+            );
+        }
+
+        #[tokio::test]
         async fn only_the_cold_miss_uses_the_platform_assembler() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
