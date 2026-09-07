@@ -1542,7 +1542,7 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
- "fastly 0.13.1",
+ "fastly",
  "fern",
  "flate2",
  "futures",
@@ -1768,14 +1768,13 @@ dependencies = [
 [[package]]
 name = "esi"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "026264c3022569f7bc5052f9452362537e923b34ecc9248b803437c2b89cdd81"
+source = "git+https://github.com/stackpop/esi?rev=75bfbb396#75bfbb396d4cb7792610f1287cbec61675f13f38"
 dependencies = [
  "atoi",
  "base64",
  "bytes",
  "chrono",
- "fastly 0.12.1",
+ "fastly",
  "html-escape",
  "log",
  "md5",
@@ -1811,34 +1810,6 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastly"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "531e4c3df48350d9f4fc95b4deaf87fd29820336b7926bb84bf460457c2a126b"
-dependencies = [
- "anyhow",
- "bytes",
- "downcast-rs",
- "elsa",
- "fastly-macros 0.12.1",
- "fastly-shared 0.12.1",
- "fastly-sys 0.12.1",
- "http",
- "itertools 0.13.0",
- "lazy_static",
- "mime",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_urlencoded",
- "sha2 0.9.9",
- "smallvec",
- "thiserror 1.0.69",
- "time",
- "url",
-]
-
-[[package]]
-name = "fastly"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c5c07c0c67d0b5826d1cb2311e563a17860b50e2ae89e1c703d6400d904d1e2"
@@ -1847,9 +1818,9 @@ dependencies = [
  "bytes",
  "downcast-rs",
  "elsa",
- "fastly-macros 0.13.1",
- "fastly-shared 0.13.1",
- "fastly-sys 0.13.1",
+ "fastly-macros",
+ "fastly-shared",
+ "fastly-sys",
  "http",
  "itertools 0.13.0",
  "mime",
@@ -1862,17 +1833,6 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "url",
-]
-
-[[package]]
-name = "fastly-macros"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc2aef5f9690b04c8890f9a54ddb591b12b9779ec25ee0e572d207106e52e3d8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -1888,16 +1848,6 @@ dependencies = [
 
 [[package]]
 name = "fastly-shared"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "080ad138403159fd366d3e0b14bb49cb0c01dc18c25095bbbd1c85e3338f5413"
-dependencies = [
- "bitflags 1.3.2",
- "http",
-]
-
-[[package]]
-name = "fastly-shared"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "191c2cf082f5d17f4ca0685cedaa0642ad4ade949fac8d1dbdd62ff756b13500"
@@ -1908,25 +1858,12 @@ dependencies = [
 
 [[package]]
 name = "fastly-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de75ef193f6c29c43d667458bede648970715aedd5db2d42c2eba3ffa3ad738b"
-dependencies = [
- "bitflags 1.3.2",
- "fastly-shared 0.12.1",
- "http",
- "wasip2",
- "wit-bindgen 0.51.0",
-]
-
-[[package]]
-name = "fastly-sys"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "239c77706cf9110b423a89b6b03b8011729b144390d2a7f641d95ef66b2768b8"
 dependencies = [
  "bitflags 1.3.2",
- "fastly-shared 0.13.1",
+ "fastly-shared",
  "http",
  "wasip2",
  "wit-bindgen 0.51.0",
@@ -3001,7 +2938,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "433713b6191ad3e1d5248db9536f3e2d99a12d7ff998afd272a98d96e6dbc2ed"
 dependencies = [
- "fastly 0.13.1",
+ "fastly",
  "log",
  "regex",
 ]
@@ -3781,7 +3718,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -3801,7 +3738,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3814,7 +3751,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -5509,7 +5446,7 @@ dependencies = [
  "edgezero-core",
  "error-stack",
  "esi",
- "fastly 0.13.1",
+ "fastly",
  "fern",
  "futures",
  "log",

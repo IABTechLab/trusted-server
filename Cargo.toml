@@ -131,6 +131,13 @@ which = "8"
 worker = { version = "0.8", default-features = false, features = ["http"] }
 x509-parser = "0.16"
 
+# `esi` 0.7.2 pins `fastly = "^0.12"` while EdgeZero requires 0.13, and both
+# meet in `trusted-server-adapter-fastly`. The fork carries the range bump
+# and no source change (stackpop/esi@chore/fastly-0.13); drop this patch
+# once the fix is released upstream. See issue #1122.
+[patch.crates-io]
+esi = { git = "https://github.com/stackpop/esi", rev = "75bfbb396" }
+
 [workspace.lints.clippy]
 # Correctness - Force explicit error handling in production code
 unwrap_used = "deny"
