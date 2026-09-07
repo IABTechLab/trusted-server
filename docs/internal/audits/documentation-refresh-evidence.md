@@ -259,10 +259,10 @@ Task 17 records that disposition instead of fabricating an owner or URL.
 
 | Surface    | Exact commit/ref | Command or operation                                    | Expected oracle                                                       | Receipt / result |
 | ---------- | ---------------- | ------------------------------------------------------- | --------------------------------------------------------------------- | ---------------- |
-| Axum       | Pending          | `scripts/smoke-axum.sh`                                 | Non-health publisher response satisfies the documented strong oracle  | Pending          |
-| Fastly     | Pending          | `scripts/smoke-fastly.sh`                               | Local push and required secrets yield a non-health publisher response | Pending          |
-| Cloudflare | Pending          | `scripts/smoke-cloudflare.sh`                           | Envelope transfer yields a non-health publisher response              | Pending          |
-| Spin       | Pending          | `scripts/smoke-spin.sh` or time-bounded manual contract | Local push and variables yield a non-health publisher response        | Pending          |
+| Axum       | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-axum.sh` | Non-health publisher response satisfies the documented strong oracle | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994105), passed |
+| Fastly     | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-fastly.sh` | Local push and required secrets yield a non-health publisher response | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994046), passed |
+| Cloudflare | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-cloudflare.sh` | Envelope transfer yields a non-health publisher response | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994160), passed |
+| Spin       | `552dbeebe63aa6c742f2def95565bfcc80076513` | `./scripts/smoke-spin.sh` | Local push and variables yield a non-health publisher response | Local Spin 4.1.0 receipt, passed; expires `2026-10-07T00:00:00Z` |
 
 ### Generated-diff proof
 
@@ -3648,6 +3648,17 @@ region`. The completed contract renders one canonical adapter-support row in
   tests with six ignored, two JS tests, 21 OpenRTB tests, and four passing core
   doctests with four ignored. A fresh successful hosted Run Tests execution is
   still required before importing its authenticated CLI captures.
+- Run Tests run `34163493945`, attempt 1, completed successfully on exact PR
+  head `bf8adfdce5639b5405e09789d7ffac96bd3a715a`. Its authenticated
+  [Linux capture job](https://github.com/IABTechLab/trusted-server/actions/runs/34163493945/job/101869893744)
+  and
+  [macOS capture job](https://github.com/IABTechLab/trusted-server/actions/runs/34163493945/job/101869893800)
+  both passed. `cli-help import-hosted --run-id 34163493945` preserved the
+  reviewed help bytes (`d1cae561…a6786` for Linux and
+  `cecd3a52…f450` for macOS) and updated only the authenticated source SHA,
+  run ID, and `.tool-versions` source blob. Repeating the exact import produced
+  byte-identical goldens and manifest; the manifest SHA-256 remained
+  `a9af2e38cbd85dbb029b67b90600d47919ee06f7dbfdc3e51d69cf79972530a9`.
 
 The exact Task 13 deployment implementation SHA is
 `2f1f11c2cf94cf0b5606e107672d6386d283959a`; the capability-receipt

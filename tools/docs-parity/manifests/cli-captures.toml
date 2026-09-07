@@ -1,8 +1,8 @@
 version = 1
 reviewed = true
 repository = "IABTechLab/trusted-server"
-source_sha = "8a60b4466a4ba3145012a4444b4328c1311466e9"
-run_id = 34090529367
+source_sha = "bf8adfdce5639b5405e09789d7ffac96bd3a715a"
+run_id = 34163493945
 run_attempt = 1
 
 [[captures]]
@@ -19,7 +19,7 @@ blob = "1302091e0be10c1e23180ced4015ba2d96b65f7d"
 
 [[sources]]
 path = ".tool-versions"
-blob = "7581468008b644d7efc32c673b8eb37ac1fa0296"
+blob = "d34ca63d52a743d155adfced1d1791e870846ba7"
 
 [[sources]]
 path = "Cargo.lock"
