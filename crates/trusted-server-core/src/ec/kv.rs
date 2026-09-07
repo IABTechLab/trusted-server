@@ -638,7 +638,8 @@ impl KvIdentityGraph {
         }
 
         log::warn!(
-            "snapshot partner upsert for '{}': CAS conflict after {MAX_CAS_RETRIES} retries;              {} partner updates were not persisted",
+            "snapshot partner upsert for '{}': CAS conflict after {MAX_CAS_RETRIES} retries; \
+             {} partner updates were not persisted",
             log_id(ec_id),
             updates.len(),
         );
@@ -1030,7 +1031,8 @@ impl KvIdentityGraph {
         // live with consent granted while the browser cookie is cleared. That
         // divergence is only visible to operators if it is logged here.
         log::warn!(
-            "withdrawal tombstone for '{}': CAS conflict after {MAX_CAS_RETRIES} retries; the              identity-graph row may still be live with consent granted",
+            "withdrawal tombstone for '{}': CAS conflict after {MAX_CAS_RETRIES} retries; the \
+             identity-graph row may still be live with consent granted",
             log_id(ec_id)
         );
         EcKvSnapshot::Failed {
