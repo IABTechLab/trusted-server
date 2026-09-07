@@ -2771,6 +2771,10 @@ path = "tools/docs-parity/manifests/adapter-support.toml"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/manifests/cli-overrides.toml"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/manifests/diagrams.toml"
 kind = "text"
 
@@ -2807,11 +2811,27 @@ path = "tools/docs-parity/manifests/settings-companions.toml"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/manifests/snippets.toml"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/manifests/tracked-files.toml"
 kind = "text"
 
 [[files]]
 path = "tools/docs-parity/src/classification.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/cli_help.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/dependency_snapshot.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/gates.rs"
 kind = "text"
 
 [[files]]
@@ -2851,11 +2871,31 @@ path = "tools/docs-parity/src/settings.rs"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/src/snippets.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/src/workflow.rs"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/tests/classification.rs"
 kind = "text"
 
 [[files]]
 path = "tools/docs-parity/tests/cli.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/cli_help.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/dependency_snapshot.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/gates.rs"
 kind = "text"
 
 [[files]]
@@ -2880,6 +2920,14 @@ kind = "text"
 
 [[files]]
 path = "tools/docs-parity/tests/settings.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/snippets.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/workflow.rs"
 kind = "text"
 
 [[files]]

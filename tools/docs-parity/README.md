@@ -11,6 +11,7 @@ development commands from that root:
 
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- update \
   --tracked-paths-record path/to/record.txt
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
@@ -23,8 +24,24 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --local --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- settings --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- integrations --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- routes --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- workflow --check
 # Scheduled or manual only; this command performs bounded network requests.
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external --check
+# Scheduled reader only; findings are retained in a deterministic inner ZIP.
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external \
+  --artifact /path/to/link-results.zip
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- dependency-snapshot \
+  generate --output /path/to/dependency-snapshot.zip
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- dependency-snapshot \
+  validate --archive /path/to/dependency-snapshot.zip
+# Hosted native capture job only.
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture \
+  --output /path/to/cli-help-platform.zip
+# Maintainer import after one successful same-head Linux/macOS capture run.
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help \
+  import-hosted --run-id RUN_ID
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help --check
 ```
 
 The tool may also be launched from any nested worktree directory. Derive and
@@ -39,6 +56,21 @@ cargo run --manifest-path "$repository_root/tools/docs-parity/Cargo.toml" -- che
 the repository boundary. With `--tracked-paths-record`, it compares the named
 repository-relative file with the deterministic, lexically sorted path record.
 It never creates directories, creates files, or changes existing bytes.
+
+`check --all` runs an explicit compiled registry of the offline repository
+checks available at the current commit. It cannot invoke external HTTP,
+native-help capture or hosted import, artifact generation, issue access, or
+dependency submission, and it does not change repository bytes. CLI golden
+comparison joins this registry only after authenticated Linux and macOS
+captures have been imported; until then, the capture workflow policy remains
+in the registry but the absent goldens do not weaken or disable another check.
+The aggregate test executes this real registry with only Git and the pinned
+Node syntax validator available on `PATH` and with an active production
+external-transport constructor sentinel. It proves that the sentinel is not
+tripped, propagates drift and operational errors separately, and requires
+byte-identical repository status before and after the run. A complementary
+real CLI test proves that the explicit external command trips the sentinel and
+stops before a request.
 
 `update` requires `--tracked-paths-record` and replaces that file atomically.
 It owns a unique sibling stage file, writes and syncs it before a
@@ -154,6 +186,74 @@ of a kill failure, and joins the reader; primary, kill, wait, and join
 diagnostics are retained. Exact exceptions require an owner, reason, and
 unexpired timestamp.
 
+Artifact mode returns the same complete scan as a closed `LinkResultsV1`
+record. A reachable non-success status or exhausted redirect/retry path is a
+finding and therefore still produces an artifact; malformed input, untrusted
+context, unsafe URLs, invalid response framing, and bounds failures remain
+operational errors. The stored ZIP has exactly one regular
+`link-results.json` member at mode `0644` and is validated against immutable
+repository, ref, SHA, run-ID, and run-attempt context before writer use.
+
+## CLI captures and checked snippets
+
+The permanent pull-request capture job builds the native `ts` binary for the
+host reported by `rustc -vV`, recursively records `--help`, and writes a
+bounded deterministic inner ZIP. Platform selection is compiled from the
+native host; no command-line platform override exists. Capture requires the
+GitHub repository/run and runner identity variables used by the workflow.
+
+`cli-help import-hosted` uses the authenticated `gh` session and accepts only
+one successful `.github/workflows/test.yml` pull-request run for PR #1049 at
+the exact current `HEAD`. It verifies both same-attempt artifact digests,
+timestamps, closed outer/inner ZIPs, provenance, source SHA, and platform
+before atomically replacing the two checked help files and capture manifest.
+`cli-help --check` is offline and also requires the recorded capture commit to
+remain an ancestor and its complete CLI source/blob set to be unchanged.
+It parses both transcripts into a lexically ordered command union. Commands
+present on only one host require a fingerprint-bound platform annotation;
+different help for a shared command requires unexpired, fingerprint-bound
+replacements that resolve both records to one value. That checked union is the
+only CLI-help input available to the documentation renderer.
+
+`snippets --check` extracts every fence from the classified maintained
+Markdown universe and requires exact set equality with `snippets.toml`.
+Executable and expected-failure modes run in fresh directories; expected
+failures must match their phase and stable diagnostic. Illustrative fragments
+require a narrow owner, rationale, and unexpired waiver. Missing, extra,
+duplicate, stale, language-mismatched, or newly valid records fail closed.
+Executable records use a closed syntax-validation grammar. Bash and Node
+validators receive only temporary snippet files, a cleared environment, bounded
+output, and a wall-clock deadline; snippet contents and manifest command text
+are never executed as shell programs.
+
+Canonical gate regions must equal their deterministic render, have one exact
+marker pair, and begin immediately after one unique consumer-specific
+placement anchor. Moving a valid region away from that anchor is drift.
+
+`workflow --check` parses `.github/workflows/test.yml` as YAML data and applies
+the currently activated capture-job policy. The final scheduled reader/writer
+policy is fixture-tested here but is not activated against repository
+workflows until its complete materialization task. The final pull-request
+fixture installs Node from `.tool-versions` through a commit-pinned action
+before invoking the aggregate. Its no-checkout writer revalidates UTC, HTTPS,
+credential-free URLs, nonblank diagnostics, archive identity, and schema
+bounds. Issue reconciliation exhaustively pages the API, acts only on the one
+exact body-marker-owned issue, rejects title collisions and duplicates, and
+lets every API failure abort the job.
+
+## Dependency snapshot artifacts
+
+Dependency generation requires immutable `GITHUB_REPOSITORY`, `GITHUB_SHA`,
+`GITHUB_REF`, `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT` values. It reads the
+root and standalone Cargo lockfiles and writes one deterministic inner ZIP
+whose only regular `0644` member is `dependency-snapshot.json`. Validation
+requires the same context and enforces the closed GitHub dependency-submission
+version-0 schema, fixed detector/job identity, record and string bounds, and
+the two exact repository-relative manifest locations. Validation reads through
+one bounded descriptor and rejects growth, replacement, symlinks, unsafe
+modes, and identity drift across the read. These commands create or validate
+an artifact only; they never call the submission endpoint.
+
 ## Settings semantics
 
 `settings --check` parses the four checked Rust settings/profile sources with
@@ -222,7 +322,12 @@ cargo test --manifest-path tools/docs-parity/Cargo.toml --test links
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test settings
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test integrations
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test routes
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli_help
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test snippets
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test gates
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test workflow
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test dependency_snapshot
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
-cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
+cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets --all-features -- -D warnings
 ```

@@ -4033,6 +4033,12 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "tools/docs-parity/manifests/cli-overrides.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = "tools/docs-parity/manifests/diagrams.toml"
 mode = "whole"
 disposition = "exclude"
@@ -4087,6 +4093,12 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "tools/docs-parity/manifests/snippets.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = "tools/docs-parity/manifests/tracked-files.toml"
 mode = "whole"
 disposition = "exclude"
@@ -4094,6 +4106,24 @@ exclude_kind = "non_documentation"
 
 [[sources]]
 path = "tools/docs-parity/src/classification.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/src/cli_help.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/src/dependency_snapshot.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/src/gates.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"
@@ -4153,6 +4183,18 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/src/snippets.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/src/workflow.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "tools/docs-parity/tests/classification.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4160,6 +4202,24 @@ exclude_kind = "source_code"
 
 [[sources]]
 path = "tools/docs-parity/tests/cli.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/cli_help.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/dependency_snapshot.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/gates.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"
@@ -4196,6 +4256,18 @@ exclude_kind = "source_code"
 
 [[sources]]
 path = "tools/docs-parity/tests/settings.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/snippets.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/workflow.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"
@@ -4741,121 +4813,145 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:496-565"
+selector = "bytes:514-539"
+fingerprint = "sha256:2ab19d1caf413004b4539e5db0817c6323cf0264bbdb15aba8e8f3864fdd8d54"
+disposition = "include"
+
+[[comments]]
+path = ".github/workflows/test.yml"
+selector = "bytes:1151-1199"
+fingerprint = "sha256:842c0aa07d94b3a357bc624c79c101208feba70dde9e9df2dbf5d221f3d7c1c9"
+disposition = "include"
+
+[[comments]]
+path = ".github/workflows/test.yml"
+selector = "bytes:1399-1426"
+fingerprint = "sha256:bbe8da767f9b01fd20b006317293e73fca03b7aa732f0355387d9fe9775c0744"
+disposition = "include"
+
+[[comments]]
+path = ".github/workflows/test.yml"
+selector = "bytes:2004-2036"
+fingerprint = "sha256:096c24d01365d94d233b2d92f4c5cc45972fefb63a7b5c73ce170754bb5e9973"
+disposition = "include"
+
+[[comments]]
+path = ".github/workflows/test.yml"
+selector = "bytes:2734-2803"
 fingerprint = "sha256:851cf80f5d728881efd2b8cf4e16f9508f6a45ad3d4ab404b515a88ec0ae0164"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:574-644"
+selector = "bytes:2812-2882"
 fingerprint = "sha256:9d17d34b4053a571cbe8d7c4dc1064841cf9cdbf137eb3acc1a5de26891d8b29"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:2622-2684"
+selector = "bytes:4860-4922"
 fingerprint = "sha256:dddd1c73fc23a32f9f82b87dd2dc6d4a39056019a913524783617838ee48dab5"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:2695-2752"
+selector = "bytes:4933-4990"
 fingerprint = "sha256:e7462ddcda9246b78604882126b32d821fe6e487f87c76d9d0627cec8f81469d"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:3054-3140"
+selector = "bytes:5292-5378"
 fingerprint = "sha256:c6669917038ed4d2a44e99243f003462d13cfc5f01ff5ededfe111fd9f0a545d"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:3311-3386"
+selector = "bytes:5549-5624"
 fingerprint = "sha256:6f1c410220b2af1fbd9fa52b47f81c53e21fdcd6181be21f7eb416a495ca3a54"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:3393-3458"
+selector = "bytes:5631-5696"
 fingerprint = "sha256:b86e41e444aacb0ebc00a85275f68f910262efd3f7ed9d430154a19ff33ddada"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:5670-5743"
+selector = "bytes:7908-7981"
 fingerprint = "sha256:8974a9e0f79b30eaafe4754b6e51037c7d8169f81e77a359e12c3c9f790abd41"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:5752-5825"
+selector = "bytes:7990-8063"
 fingerprint = "sha256:380a9741132d67dc7a1145ca3a1288615e54708bfe8f34ec358e112c3505b5a6"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:5834-5901"
+selector = "bytes:8072-8139"
 fingerprint = "sha256:bccb1320a64134df7139a0055c838787b2fa48c193d3ba7f9ba1a34f04a9f7cd"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:5910-5964"
+selector = "bytes:8148-8202"
 fingerprint = "sha256:139e535c32794ec9fb2b1939699f36b6ff18345b6eff7a6332fa4794d7723e55"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:7523-7601"
+selector = "bytes:9761-9839"
 fingerprint = "sha256:b06c5338992f1662d3abae13e3984faf95b1ef3442b91efeefb7fceb267a7775"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:7606-7684"
+selector = "bytes:9844-9922"
 fingerprint = "sha256:3f442a0ccb751273c537b03424f8eb1aee472049d49a3ef51ab8241b43ab60d0"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:7689-7770"
+selector = "bytes:9927-10008"
 fingerprint = "sha256:9e45c88657f733c83e78f5f2c4570b6358794b5790139ac07a3f0903a371618a"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:7775-7852"
+selector = "bytes:10013-10090"
 fingerprint = "sha256:bc25867ab4fd5236382749d0bbabbd00976c739dac3f2c2e408d3513a5430bb6"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:7857-7924"
+selector = "bytes:10095-10162"
 fingerprint = "sha256:a264bf6ac101c168dae446940ca42facf19ac94a3b065b6f23ad76a8d3f23723"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:8495-8570"
+selector = "bytes:10733-10808"
 fingerprint = "sha256:da8b34b5c8e2c1a3bf6a08d682555a1fcbff653614bee41ae48a9d9c51e2fd35"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:8577-8653"
+selector = "bytes:10815-10891"
 fingerprint = "sha256:b895c72a0578ff3ae34474218aa8e7b684c31a786b18d8070ff1b1f2940307ab"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:8660-8736"
+selector = "bytes:10898-10974"
 fingerprint = "sha256:e5dda19814742b949f9ac09203ffae37f43165b5b1470a650dd04be857431ad0"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:8743-8822"
+selector = "bytes:10981-11060"
 fingerprint = "sha256:c2d2731be2dc78c9c5bb1ac73695c63a420e52c587346c0a6f7d52e08a17c91c"
 disposition = "include"
 

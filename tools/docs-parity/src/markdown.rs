@@ -1,8 +1,8 @@
 //! Deterministic generated regions and semantic Markdown link validation.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::Read;
-use std::path::Path;
+use std::io::{Cursor, Read, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     LazyLock,
@@ -16,13 +16,15 @@ use github_slugger::Slugger as GithubSlugger;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use scraper::{Html, Selector};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use sha2::{Digest as _, Sha256};
 use unicode_normalization::UnicodeNormalization as _;
 use url::Url;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::repository::{NormalizedRelativePath, Repository};
+use crate::repository::{NormalizedRelativePath, Repository, validate_exact_zip_framing};
 
 const MAXIMUM_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAXIMUM_FRONTMATTER_BYTES: usize = 64 * 1024;
@@ -35,9 +37,15 @@ const MAXIMUM_RESPONSE_HEADERS: usize = 128;
 const MAXIMUM_HEADER_NAME_BYTES: usize = 256;
 const MAXIMUM_HEADER_VALUE_BYTES: usize = 8 * 1024;
 const MAXIMUM_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAXIMUM_LINK_RESULT_ARCHIVE_BYTES: usize = 2 * 1024 * 1024;
+const MAXIMUM_LINK_RESULT_JSON_BYTES: usize = 1024 * 1024;
+const MAXIMUM_LINK_FINDINGS: usize = 500;
+const MAXIMUM_LINK_RESULT_STRING_BYTES: usize = 2_048;
 const CURL_TRAILER_BYTES: usize = 128;
 const CURL_WRITE_OUT: &str = "\nDOCS_PARITY_COUNTS:%{size_header}:%{size_download}\n";
 const CURL_EXECUTABLE: &str = "/usr/bin/curl";
+const EXTERNAL_TRANSPORT_SENTINEL: &str = "DOCS_PARITY_TEST_EXTERNAL_SENTINEL";
+const EXTERNAL_TRANSPORT_SENTINEL_BYTES: &[u8] = b"production external transport constructed\n";
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PAGES_MANIFEST: &str = "tools/docs-parity/manifests/pages.toml";
 const ORPHANS_MANIFEST: &str = "tools/docs-parity/manifests/orphans.toml";
@@ -2807,14 +2815,115 @@ pub struct ExternalHeader {
     pub value: String,
 }
 
+/// Immutable workflow context bound into a link-result artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkRunContext {
+    /// Exact repository identity.
+    pub repository: String,
+    /// Authenticated source ref.
+    pub source_ref: String,
+    /// Authenticated lowercase 40-hex source commit.
+    pub source_sha: String,
+    /// GitHub Actions run ID.
+    pub run_id: u64,
+    /// GitHub Actions run attempt.
+    pub run_attempt: u64,
+    /// Canonical UTC scan timestamp.
+    pub checked_at: String,
+}
+
+/// Closed external-link finding class.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkFindingKind {
+    /// The transport could not reach the requested destination.
+    Unreachable,
+    /// The final HTTP response was not successful.
+    HttpStatus,
+    /// Redirect policy could not reach a final safe destination.
+    Redirect,
+}
+
+/// One bounded external-link finding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkFinding {
+    /// Closed finding class.
+    pub kind: LinkFindingKind,
+    /// Exact requested URL.
+    pub requested_url: String,
+    /// Final URL when one was reached.
+    pub final_url: Option<String>,
+    /// Final status when one was received.
+    pub status: Option<u16>,
+    /// Stable bounded diagnostic.
+    pub diagnostic: String,
+}
+
+/// Closed result for a complete external-link scan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkResultsV1 {
+    /// Closed schema version, always one.
+    pub schema_version: u32,
+    /// Exact repository identity.
+    pub repository: String,
+    /// Authenticated source ref.
+    pub source_ref: String,
+    /// Authenticated source commit.
+    pub source_sha: String,
+    /// GitHub Actions run ID.
+    pub run_id: u64,
+    /// GitHub Actions run attempt.
+    pub run_attempt: u64,
+    /// Canonical UTC scan timestamp.
+    pub checked_at: String,
+    /// Complete bounded finding set.
+    pub findings: Vec<LinkFinding>,
+}
+
+/// Typed failure from the external HTTP transport boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalTransportError {
+    /// The endpoint could not be reached after a terminal network failure.
+    Unreachable {
+        /// Bounded transport diagnostic.
+        diagnostic: String,
+    },
+    /// The scan could not produce a trustworthy transport result.
+    Operational {
+        /// Bounded operational diagnostic.
+        diagnostic: String,
+    },
+}
+
+impl ExternalTransportError {
+    /// Construct a terminal network-unreachability outcome.
+    pub fn unreachable(diagnostic: impl Into<String>) -> Self {
+        Self::Unreachable {
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    /// Construct an operational transport failure.
+    pub fn operational(diagnostic: impl Into<String>) -> Self {
+        Self::Operational {
+            diagnostic: diagnostic.into(),
+        }
+    }
+}
+
 /// Injected external HTTP transport.
 pub trait ExternalTransport {
     /// Send one request without following redirects or retrying.
     ///
     /// # Errors
     ///
-    /// Returns a bounded diagnostic when the request cannot be completed.
-    fn send(&mut self, request: &ExternalRequest) -> Result<ExternalResponse, String>;
+    /// Returns a typed bounded failure when the request cannot be completed.
+    fn send(
+        &mut self,
+        request: &ExternalRequest,
+    ) -> Result<ExternalResponse, ExternalTransportError>;
 }
 
 /// Injected bounded sleeper used by retry tests and production execution.
@@ -2855,12 +2964,45 @@ pub(crate) fn check_external_repository(
         .duration_since(UNIX_EPOCH)
         .map_err(|_error| external_error("system clock precedes Unix epoch"))?
         .as_secs();
-    let mut transport = CurlTransport::production();
+    let mut transport = CurlTransport::production()?;
     let mut sleeper = ThreadSleeper;
     check_external_links(
         &loaded.sources,
         &exceptions,
         now,
+        &mut transport,
+        &mut sleeper,
+    )
+}
+
+pub(crate) fn collect_external_repository(
+    repository: &Repository,
+    context: &LinkRunContext,
+) -> Result<LinkResultsV1, Report<MarkdownError>> {
+    let pages = read_pages_manifest(repository)?;
+    let intended = live_pages(&pages.pages)
+        .map(|page| page.path)
+        .collect::<BTreeSet<_>>();
+    let loaded = load_link_sources(repository, &intended)?;
+    let exceptions = pages
+        .external_exceptions
+        .into_iter()
+        .map(|record| ExternalException {
+            url: record.url,
+            owner: record.owner,
+            reason: record.reason,
+            expires_at: record.expires_at,
+        })
+        .collect::<Vec<_>>();
+    let now = timestamp_seconds(&context.checked_at)
+        .ok_or_else(|| external_error("checked_at is not canonical UTC"))?;
+    let mut transport = CurlTransport::production()?;
+    let mut sleeper = ThreadSleeper;
+    collect_external_link_results(
+        &loaded.sources,
+        &exceptions,
+        now,
+        context,
         &mut transport,
         &mut sleeper,
     )
@@ -3211,10 +3353,28 @@ pub struct CurlTransport<R = ProcessCommandRunner> {
 }
 
 impl CurlTransport<ProcessCommandRunner> {
-    fn production() -> Self {
-        Self {
-            runner: ProcessCommandRunner,
+    fn production() -> Result<Self, Report<MarkdownError>> {
+        if let Some(marker) = std::env::var_os(EXTERNAL_TRANSPORT_SENTINEL) {
+            let marker = PathBuf::from(marker);
+            if marker.as_os_str().is_empty() {
+                return Err(external_error("external transport sentinel path is empty"));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .map_err(|_error| external_error("cannot create external transport sentinel"))?;
+            file.write_all(EXTERNAL_TRANSPORT_SENTINEL_BYTES)
+                .map_err(|_error| external_error("cannot write external transport sentinel"))?;
+            file.sync_all()
+                .map_err(|_error| external_error("cannot sync external transport sentinel"))?;
+            return Err(external_error(
+                "production external transport forbidden by active test sentinel",
+            ));
         }
+        Ok(Self {
+            runner: ProcessCommandRunner,
+        })
     }
 }
 
@@ -3233,8 +3393,11 @@ impl<R> CurlTransport<R> {
 }
 
 impl<R: CommandRunner> ExternalTransport for CurlTransport<R> {
-    fn send(&mut self, request: &ExternalRequest) -> Result<ExternalResponse, String> {
-        validate_transport_request(request)?;
+    fn send(
+        &mut self,
+        request: &ExternalRequest,
+    ) -> Result<ExternalResponse, ExternalTransportError> {
+        validate_transport_request(request).map_err(ExternalTransportError::operational)?;
         let mut arguments = [
             "--disable".to_owned(),
             "--silent".to_owned(),
@@ -3276,19 +3439,28 @@ impl<R: CommandRunner> ExternalTransport for CurlTransport<R> {
         arguments.extend(["--url".to_owned(), request.url.clone()]);
         let maximum_output =
             MAXIMUM_RESPONSE_HEADER_BYTES + request.maximum_body_bytes + CURL_TRAILER_BYTES;
-        let output = self.runner.run(
-            CURL_EXECUTABLE,
-            &arguments,
-            maximum_output,
-            Duration::from_secs(request.timeout_seconds),
-        )?;
+        let output = self
+            .runner
+            .run(
+                CURL_EXECUTABLE,
+                &arguments,
+                maximum_output,
+                Duration::from_secs(request.timeout_seconds),
+            )
+            .map_err(ExternalTransportError::operational)?;
         if !output.success {
-            return Err(format!(
+            let diagnostic = format!(
                 "curl exited unsuccessfully with status {:?}",
                 output.status_code
-            ));
+            );
+            return Err(if matches!(output.status_code, Some(5..=7)) {
+                ExternalTransportError::unreachable(diagnostic)
+            } else {
+                ExternalTransportError::operational(diagnostic)
+            });
         }
         parse_curl_output(&output.stdout, request.maximum_body_bytes)
+            .map_err(ExternalTransportError::operational)
     }
 }
 
@@ -3473,6 +3645,252 @@ pub fn check_external_links<T: ExternalTransport, S: Sleeper>(
     Ok(())
 }
 
+/// Complete an external-link scan and return clean or finding-bearing data.
+///
+/// Transport unreachability, terminal HTTP status, and redirect exhaustion
+/// become findings. Invalid URLs, credentials, response framing, exception
+/// governance, context, clock, and bounds remain operational errors.
+///
+/// # Errors
+///
+/// Returns an error when the source, context, schema, transport response, or
+/// bounds cannot be trusted enough to produce a complete result.
+pub fn collect_external_link_results<T: ExternalTransport, S: Sleeper>(
+    sources: &[LinkSource],
+    exceptions: &[ExternalException],
+    now_seconds: u64,
+    context: &LinkRunContext,
+    transport: &mut T,
+    sleeper: &mut S,
+) -> Result<LinkResultsV1, Report<MarkdownError>> {
+    validate_link_context(context)?;
+    let mut urls = BTreeSet::new();
+    for source in sources {
+        let parsed = parse_markdown(&source.path, source.set, &source.markdown)?;
+        urls.extend(parsed.links.into_iter().filter_map(|link| {
+            let lower = link.destination.to_ascii_lowercase();
+            (lower.starts_with("https://") || lower.starts_with("http://"))
+                .then_some(link.destination)
+        }));
+    }
+    if urls.len() > MAXIMUM_LINK_FINDINGS {
+        return Err(external_error("external URL count exceeds 500"));
+    }
+    let exception_map = validate_external_exceptions(exceptions, now_seconds, &urls)?;
+    let mut findings = Vec::new();
+    for url in urls {
+        if exception_map.contains(&url) {
+            continue;
+        }
+        match check_external_url_detailed(&url, now_seconds, transport, sleeper) {
+            Ok(()) => {}
+            Err(ExternalLinkFailure::Finding(finding)) => {
+                validate_link_result_string(&finding.diagnostic, "finding diagnostic")?;
+                findings.push(LinkFinding {
+                    kind: finding.kind,
+                    requested_url: url,
+                    final_url: finding.final_url,
+                    status: finding.status,
+                    diagnostic: finding.diagnostic,
+                });
+            }
+            Err(ExternalLinkFailure::Operational(report)) => return Err(report),
+        }
+    }
+    let result = LinkResultsV1 {
+        schema_version: 1,
+        repository: context.repository.clone(),
+        source_ref: context.source_ref.clone(),
+        source_sha: context.source_sha.clone(),
+        run_id: context.run_id,
+        run_attempt: context.run_attempt,
+        checked_at: context.checked_at.clone(),
+        findings,
+    };
+    validate_link_results(&result, context)?;
+    Ok(result)
+}
+
+/// Encode one complete link result as a deterministic closed inner ZIP.
+///
+/// # Errors
+///
+/// Returns an error for invalid schema/bounds, JSON serialization, or archive
+/// generation.
+pub fn encode_link_results_archive(
+    result: &LinkResultsV1,
+) -> Result<Vec<u8>, Report<MarkdownError>> {
+    let context = LinkRunContext {
+        repository: result.repository.clone(),
+        source_ref: result.source_ref.clone(),
+        source_sha: result.source_sha.clone(),
+        run_id: result.run_id,
+        run_attempt: result.run_attempt,
+        checked_at: result.checked_at.clone(),
+    };
+    validate_link_results(result, &context)?;
+    let json = serde_json::to_vec(result)
+        .map_err(|_error| external_error("cannot serialize link-results JSON"))?;
+    if json.len() > MAXIMUM_LINK_RESULT_JSON_BYTES {
+        return Err(external_error("link-results JSON exceeds 1048576 bytes"));
+    }
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .unix_permissions(0o644);
+    writer
+        .start_file("link-results.json", options)
+        .map_err(|_error| external_error("cannot create link-results ZIP member"))?;
+    writer
+        .write_all(&json)
+        .map_err(|_error| external_error("cannot write link-results ZIP member"))?;
+    let bytes = writer
+        .finish()
+        .map_err(|_error| external_error("cannot finish link-results ZIP"))?
+        .into_inner();
+    if bytes.len() > MAXIMUM_LINK_RESULT_ARCHIVE_BYTES {
+        return Err(external_error("link-results ZIP exceeds 2097152 bytes"));
+    }
+    Ok(bytes)
+}
+
+/// Validate one link-result ZIP against immutable workflow context.
+///
+/// # Errors
+///
+/// Returns an error for size, member, mode, traversal, JSON schema, string,
+/// finding-count, URL, or workflow-context violations.
+pub fn validate_link_results_archive(
+    bytes: &[u8],
+    context: &LinkRunContext,
+) -> Result<LinkResultsV1, Report<MarkdownError>> {
+    validate_link_context(context)?;
+    if bytes.len() > MAXIMUM_LINK_RESULT_ARCHIVE_BYTES {
+        return Err(external_error("link-results ZIP exceeds 2097152 bytes"));
+    }
+    validate_exact_zip_framing(bytes)
+        .map_err(|detail| external_error(format!("link-results {detail}")))?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes))
+        .map_err(|_error| external_error("cannot parse link-results ZIP"))?;
+    if archive.len() != 1 {
+        return Err(external_error("link-results ZIP must contain one member"));
+    }
+    let mut member = archive
+        .by_index(0)
+        .map_err(|_error| external_error("cannot read link-results ZIP member"))?;
+    let safe_mode = member
+        .unix_mode()
+        .is_some_and(|mode| mode & 0o7777 == 0o644 && matches!(mode & 0o170000, 0 | 0o100000));
+    if member.name() != "link-results.json"
+        || member.enclosed_name().is_none()
+        || !member.is_file()
+        || !safe_mode
+        || member.size() > MAXIMUM_LINK_RESULT_JSON_BYTES as u64
+    {
+        return Err(external_error(
+            "link-results member name, type, mode, or size differs",
+        ));
+    }
+    let mut json = Vec::with_capacity(
+        usize::try_from(member.size())
+            .map_err(|_error| external_error("link-results member is too large"))?,
+    );
+    std::io::Read::take(
+        &mut member,
+        (MAXIMUM_LINK_RESULT_JSON_BYTES as u64).saturating_add(1),
+    )
+    .read_to_end(&mut json)
+    .map_err(|_error| external_error("cannot read link-results member"))?;
+    if json.len() > MAXIMUM_LINK_RESULT_JSON_BYTES {
+        return Err(external_error("link-results JSON exceeds 1048576 bytes"));
+    }
+    let result = serde_json::from_slice::<LinkResultsV1>(&json)
+        .map_err(|_error| external_error("link-results JSON does not match closed schema"))?;
+    validate_link_results(&result, context)?;
+    let canonical = encode_link_results_archive(&result)?;
+    if canonical != bytes {
+        return Err(external_error(
+            "link-results ZIP or JSON framing is not canonical",
+        ));
+    }
+    Ok(result)
+}
+
+fn validate_link_context(context: &LinkRunContext) -> Result<(), Report<MarkdownError>> {
+    if context.repository != "IABTechLab/trusted-server"
+        || context.source_ref != "refs/heads/main"
+        || context.source_sha.len() != 40
+        || !context
+            .source_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || context.run_id == 0
+        || context.run_attempt == 0
+        || timestamp_seconds(&context.checked_at).is_none()
+    {
+        return Err(external_error("link-result context is invalid"));
+    }
+    for value in [
+        &context.repository,
+        &context.source_ref,
+        &context.source_sha,
+        &context.checked_at,
+    ] {
+        validate_link_result_string(value, "context string")?;
+    }
+    Ok(())
+}
+
+fn validate_link_results(
+    result: &LinkResultsV1,
+    context: &LinkRunContext,
+) -> Result<(), Report<MarkdownError>> {
+    validate_link_context(context)?;
+    if result.schema_version != 1
+        || result.repository != context.repository
+        || result.source_ref != context.source_ref
+        || result.source_sha != context.source_sha
+        || result.run_id != context.run_id
+        || result.run_attempt != context.run_attempt
+        || result.checked_at != context.checked_at
+        || result.findings.len() > MAXIMUM_LINK_FINDINGS
+    {
+        return Err(external_error(
+            "link-result schema or immutable context differs",
+        ));
+    }
+    for finding in &result.findings {
+        validate_link_result_string(&finding.requested_url, "requested URL")?;
+        validate_link_result_string(&finding.diagnostic, "finding diagnostic")?;
+        validate_external_url(&finding.requested_url)?;
+        if finding.diagnostic.trim().is_empty() {
+            return Err(external_error("finding diagnostic is blank"));
+        }
+        if let Some(final_url) = &finding.final_url {
+            validate_link_result_string(final_url, "final URL")?;
+            validate_external_url(final_url)?;
+        }
+        if finding
+            .status
+            .is_some_and(|status| !(100..=599).contains(&status))
+        {
+            return Err(external_error("finding status is outside HTTP bounds"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_link_result_string(
+    value: &str,
+    field: &'static str,
+) -> Result<(), Report<MarkdownError>> {
+    if value.len() > MAXIMUM_LINK_RESULT_STRING_BYTES || value.contains('\0') {
+        return Err(external_error(format!("{field} exceeds 2048 bytes")));
+    }
+    Ok(())
+}
+
 fn validate_external_exceptions(
     exceptions: &[ExternalException],
     now_seconds: u64,
@@ -3518,7 +3936,43 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
     transport: &mut T,
     sleeper: &mut S,
 ) -> Result<(), Report<MarkdownError>> {
-    let mut current = validate_external_url(initial)?;
+    check_external_url_detailed(initial, now_seconds, transport, sleeper)
+        .map_err(ExternalLinkFailure::into_report)
+}
+
+struct ExternalFinding {
+    kind: LinkFindingKind,
+    final_url: Option<String>,
+    status: Option<u16>,
+    diagnostic: String,
+}
+
+enum ExternalLinkFailure {
+    Finding(ExternalFinding),
+    Operational(Report<MarkdownError>),
+}
+
+impl ExternalLinkFailure {
+    fn into_report(self) -> Report<MarkdownError> {
+        match self {
+            Self::Finding(finding) => {
+                let location = finding
+                    .final_url
+                    .map_or_else(String::new, |url| format!(" for {url}"));
+                external_error(format!("{}{location}", finding.diagnostic))
+            }
+            Self::Operational(report) => report,
+        }
+    }
+}
+
+fn check_external_url_detailed<T: ExternalTransport, S: Sleeper>(
+    initial: &str,
+    now_seconds: u64,
+    transport: &mut T,
+    sleeper: &mut S,
+) -> Result<(), ExternalLinkFailure> {
+    let mut current = validate_external_url(initial).map_err(ExternalLinkFailure::Operational)?;
     let mut visited = BTreeSet::new();
     let mut redirects = 0;
     let mut method = "HEAD";
@@ -3527,7 +3981,12 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
     loop {
         let canonical = current.as_str().to_owned();
         if !visited.insert((method, canonical.clone())) {
-            return Err(external_error(format!("redirect loop at {canonical}")));
+            return Err(ExternalLinkFailure::Finding(ExternalFinding {
+                kind: LinkFindingKind::Redirect,
+                final_url: Some(canonical),
+                status: None,
+                diagnostic: "redirect loop".to_owned(),
+            }));
         }
         let request = ExternalRequest {
             method: method.to_owned(),
@@ -3535,10 +3994,28 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
             timeout_seconds: 15,
             maximum_body_bytes: 64 * 1024,
         };
-        let response = transport.send(&request).map_err(|diagnostic| {
-            external_error(format!("request failed for {canonical}: {diagnostic}"))
-        })?;
-        validate_response_headers(&response, request.maximum_body_bytes)?;
+        let response = match transport.send(&request) {
+            Ok(response) => response,
+            Err(ExternalTransportError::Unreachable { diagnostic }) => {
+                let diagnostic = format!("request failed: {diagnostic}");
+                validate_link_result_string(&diagnostic, "transport diagnostic")
+                    .map_err(ExternalLinkFailure::Operational)?;
+                return Err(ExternalLinkFailure::Finding(ExternalFinding {
+                    kind: LinkFindingKind::Unreachable,
+                    final_url: None,
+                    status: None,
+                    diagnostic,
+                }));
+            }
+            Err(ExternalTransportError::Operational { diagnostic }) => {
+                let diagnostic = format!("external transport failed operationally: {diagnostic}");
+                validate_link_result_string(&diagnostic, "transport diagnostic")
+                    .map_err(ExternalLinkFailure::Operational)?;
+                return Err(ExternalLinkFailure::Operational(external_error(diagnostic)));
+            }
+        };
+        validate_response_headers(&response, request.maximum_body_bytes)
+            .map_err(ExternalLinkFailure::Operational)?;
 
         if method == "HEAD" && matches!(response.status, 405 | 501) && !fallback_used {
             method = "GET";
@@ -3548,9 +4025,15 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
         if matches!(response.status, 429 | 500..=599) {
             retry_attempts += 1;
             if retry_attempts >= MAXIMUM_RETRY_ATTEMPTS {
-                return Err(external_error(format!(
-                    "retry attempts exhausted for {canonical}"
-                )));
+                return Err(ExternalLinkFailure::Finding(ExternalFinding {
+                    kind: LinkFindingKind::HttpStatus,
+                    final_url: Some(canonical),
+                    status: Some(response.status),
+                    diagnostic: format!(
+                        "retry attempts exhausted after status {}",
+                        response.status
+                    ),
+                }));
             }
             let local_delay = if retry_attempts == 1 { 1 } else { 2 };
             let delay = response
@@ -3564,17 +4047,24 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
         }
         if (300..=399).contains(&response.status) {
             if redirects >= MAXIMUM_REDIRECTS {
-                return Err(external_error(format!(
-                    "redirect depth exceeds {MAXIMUM_REDIRECTS}"
-                )));
+                return Err(ExternalLinkFailure::Finding(ExternalFinding {
+                    kind: LinkFindingKind::Redirect,
+                    final_url: Some(canonical),
+                    status: Some(response.status),
+                    diagnostic: format!("redirect depth exceeds {MAXIMUM_REDIRECTS}"),
+                }));
             }
             let location = response.header("location").ok_or_else(|| {
-                external_error(format!("redirect {canonical} has no Location header"))
+                ExternalLinkFailure::Operational(external_error(format!(
+                    "redirect {canonical} has no Location header"
+                )))
             })?;
             let next = current.join(location).map_err(|_error| {
-                external_error(format!("redirect {canonical} has malformed Location"))
+                ExternalLinkFailure::Operational(external_error(format!(
+                    "redirect {canonical} has malformed Location"
+                )))
             })?;
-            validate_url_parts(&next)?;
+            validate_url_parts(&next).map_err(ExternalLinkFailure::Operational)?;
             redirects += 1;
             current = next;
             method = "HEAD";
@@ -3582,12 +4072,14 @@ fn check_external_url<T: ExternalTransport, S: Sleeper>(
             continue;
         }
         if !(200..=299).contains(&response.status) {
-            return Err(external_error(format!(
-                "final status {} for {canonical}",
-                response.status
-            )));
+            return Err(ExternalLinkFailure::Finding(ExternalFinding {
+                kind: LinkFindingKind::HttpStatus,
+                final_url: Some(canonical),
+                status: Some(response.status),
+                diagnostic: format!("final status {}", response.status),
+            }));
         }
-        validate_url_parts(&current)?;
+        validate_url_parts(&current).map_err(ExternalLinkFailure::Operational)?;
         return Ok(());
     }
 }
@@ -3847,12 +4339,42 @@ fn external_error(detail: impl Into<String>) -> Report<MarkdownError> {
 
 #[cfg(test)]
 mod process_tests {
+    use std::env;
     use std::fs;
     use std::io;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
+    use std::sync::Mutex;
 
     use super::*;
+
+    static EXTERNAL_SENTINEL_ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn production_transport_records_an_active_external_execution_sentinel() {
+        let _environment = EXTERNAL_SENTINEL_ENVIRONMENT
+            .lock()
+            .expect("external sentinel environment lock should be available");
+        let directory = tempfile::tempdir().expect("should create sentinel directory");
+        let marker = directory.path().join("external-transport-constructed");
+        // SAFETY: This module serializes the only test that mutates this
+        // test-specific variable, and no production transport is constructed
+        // by another library test.
+        unsafe {
+            env::set_var("DOCS_PARITY_TEST_EXTERNAL_SENTINEL", &marker);
+        }
+
+        let _transport = CurlTransport::production();
+
+        // SAFETY: See the matching serialized mutation above.
+        unsafe {
+            env::remove_var("DOCS_PARITY_TEST_EXTERNAL_SENTINEL");
+        }
+        assert!(
+            marker.is_file(),
+            "production transport construction must leave an observable sentinel"
+        );
+    }
 
     #[test]
     fn bounded_process_clears_path_proxy_and_curl_environment_to_the_fixed_locale() {

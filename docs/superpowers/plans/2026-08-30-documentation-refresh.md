@@ -59,7 +59,7 @@
 | `tools/docs-parity/src/workflow.rs`            | YAML policy for read-only PR checks and final default-branch readers/writers.                         |
 | `tools/docs-parity/src/dependency_snapshot.rs` | Bounded dependency snapshot schema and deterministic generation.                                      |
 
-Checked records live under `tools/docs-parity/manifests/`: `tracked-files.toml`, `maintained-sources.toml`, `sensitive-allowlist.toml`, `retired-identifiers.toml`, `snippets.toml`, `settings-companions.toml`, `routes.toml`, `integrations.toml`, `adapter-support.toml`, `cli-overrides.toml`, `gates.toml`, `pages.toml`, `diagrams.toml`, and `orphans.toml`. CLI goldens live at `tools/docs-parity/goldens/cli-linux.txt` and `tools/docs-parity/goldens/cli-macos.txt`. Synthetic fixtures live under `tools/docs-parity/tests/fixtures/`; never add a live secret, internal contact, or real customer value.
+Checked records live under `tools/docs-parity/manifests/`: `tracked-files.toml`, `maintained-sources.toml`, `sensitive-allowlist.toml`, `retired-identifiers.toml`, `snippets.toml`, `settings-companions.toml`, `routes.toml`, `integrations.toml`, `adapter-support.toml`, `cli-overrides.toml`, `cli-captures.toml`, `gates.toml`, `pages.toml`, `diagrams.toml`, and `orphans.toml`. CLI goldens live at `tools/docs-parity/goldens/cli-linux.txt` and `tools/docs-parity/goldens/cli-macos.txt`. Synthetic fixtures live inline in their owning integration-test modules unless a task explicitly enumerates a path under `tools/docs-parity/tests/fixtures/`; never add a live secret, internal contact, or real customer value.
 
 ### Existing product/documentation surfaces
 
@@ -731,74 +731,132 @@ exactly the 25 paths in **Files** above.
 
 - Modify: `tools/docs-parity/Cargo.toml`
 - Modify: `tools/docs-parity/Cargo.lock`
+- Modify: `tools/docs-parity/README.md`
 - Create: `tools/docs-parity/src/cli_help.rs`
 - Create: `tools/docs-parity/src/snippets.rs`
 - Create: `tools/docs-parity/src/gates.rs`
 - Create: `tools/docs-parity/src/workflow.rs`
 - Create: `tools/docs-parity/src/dependency_snapshot.rs`
 - Modify: `tools/docs-parity/src/{main,lib,model,repository}.rs`
-- Create: `tools/docs-parity/manifests/{cli-overrides,snippets,gates}.toml`
-- Modify: `tools/docs-parity/manifests/{tracked-files,maintained-sources}.toml`
+- Modify: `tools/docs-parity/src/markdown.rs`
+- Create: `tools/docs-parity/manifests/{cli-overrides,cli-captures,snippets}.toml`
+- Modify: `tools/docs-parity/manifests/{tracked-files,maintained-sources,sensitive-allowlist}.toml`
 - Create: `tools/docs-parity/goldens/{cli-linux,cli-macos}.txt`
 - Create/Test: `tools/docs-parity/tests/{cli_help,snippets,gates,workflow,dependency_snapshot}.rs`
+- Modify/Test: `tools/docs-parity/tests/{cli,links}.rs`
 - Modify: `.github/workflows/test.yml`
-- Create: `.github/workflows/docs-links.yml`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
+- Modify: `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md`
+- Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
 
-- [ ] **Step 1: Write CLI capture and snippet failures**
+- [x] **Step 1: Write CLI capture, snippet, and aggregate failures**
 
-Cover recursive help, host-OS detection with no caller platform override, missing native capture provenance, stale overrides, every snippet mode, wrong failure phase/diagnostic, missing classification, expired waiver, and formerly invalid examples becoming valid.
+Cover recursive help; automatic host-OS detection with no platform override;
+exact-head checkout; missing, mixed-run, stale, malformed, oversized, or
+unauthenticated capture provenance; stale overrides; every snippet mode; wrong
+failure phase or diagnostic; missing classification; expired waiver; formerly
+invalid examples becoming valid; and `check --all` drift/error/no-write
+behavior. Prove `check --all` never constructs the external transport or
+invokes capture, import, issue, or dependency-submission paths.
 
-- [ ] **Step 2: Add native capture CI**
+- [x] **Step 2: Add native capture CI**
 
-Add a permanent Linux/macOS PR matrix job that checks out the exact PR head, runs the same capture command, records runner/`uname`/Rust/Node/source SHA metadata, and uploads bounded raw artifacts. Commit capture-ready code before generating goldens and push that commit to #1049.
+Add a permanent read-only Linux/macOS pull-request matrix job. Pin every
+external action changed in `test.yml` to a lowercase 40-hex SHA. Checkout
+`github.event.pull_request.head.sha` with `persist-credentials: false`, assert
+that `git rev-parse HEAD` equals it, run the same command with no platform
+override. Upload GitHub artifacts named exactly `cli-help-linux` and
+`cli-help-macos`; each outer artifact contains one regular file named
+`cli-help-<platform>.zip`. Enforce the design's 4 MiB outer, 2 MiB inner, 1 MiB
+help, 64 KiB provenance, 256-command, command-path, field, string, member, mode,
+and traversal limits. Provenance includes detected platform, source SHA, runner
+identity, `uname -a`, `rustc -vV`, Node/tool versions, run ID and attempt, help
+length, and help SHA-256. Commit and push capture-ready code before requesting
+hosted output.
 
 - [ ] **Step 3: Import authenticated goldens**
 
-Download both artifacts from the same hosted run and exact source SHA. Verify hashes and provenance, import through the deterministic tool command, never hand-edit the goldens, and prove a second import is unchanged.
+Run `docs-parity cli-help import-hosted --run-id <id>` from the capture-ready
+commit. Through the authenticated `gh` session, require repository
+`IABTechLab/trusted-server`, event `pull_request`, successful conclusion, PR
+#1049, workflow `.github/workflows/test.yml`, and `head_sha == HEAD`. Require
+exactly one unexpired artifact per platform from the same run attempt, verify
+the API digests, attempt timestamps, outer and inner members, schemas, bounds,
+identical run IDs/attempts, and shared source SHA, and
+atomically write both goldens plus `cli-captures.toml`. Never hand-edit these
+files. Prove a second import is byte-identical. Later checks require the capture
+SHA to be an ancestor and the CLI source/blob set unchanged from that capture;
+CI fetches the recorded commit before comparison. Task 17 repeats this capture
+from the pushed Task 16 head because Task 16 modifies CLI source.
 
-- [ ] **Step 4: Implement snippets and canonical gates**
+- [x] **Step 4: Implement snippets and gate foundations**
 
-Define every command once with runner/target/mode; generate checked regions or enforce link-only consumers. Execute fences in isolated working directories and require stable phase/diagnostic matches.
+Define every snippet command once with runner, target, and mode. Execute fences
+in isolated working directories and require stable phase/diagnostic matches.
+Implement the gate schema, deterministic renderer, ownership comparison, and
+link-only comparison against synthetic fixtures defined inline in the owning
+integration-test modules. Task 17 creates
+`gates.toml` and modifies real gate consumers.
 
-- [ ] **Step 5: Write final-workflow security fixtures first**
+- [x] **Step 5: Write final-workflow policy fixtures first**
 
 Positive fixtures: ordinary read-only PR validation, scheduled clean/finding link paths, issue dedup/auto-close, dependency generation/submission, and closed manual refresh. Negative fixtures: `pull_request_target`, `merge_group`, status write, caller tool/SHA input, privileged PR checkout, unpinned action, expanded permissions, unsafe cache/service/local action, stale source, extra path/member, traversal, unsafe mode/symlink, mixed inputs, malformed/oversized artifacts, unknown schema fields, and write job executing repository code.
 
-- [ ] **Step 6: Implement workflow and snapshot policy**
+- [x] **Step 6: Implement workflow, result, and snapshot policy**
 
-Parse YAML as data. Require read-only PR jobs, full action SHA pins, default-deny permissions, separated no-checkout writers, fixed concurrency/timeouts, exact archive member names, schema closure, and authenticated source SHA. Link bounds: 2 MiB archive, 1 MiB JSON, 500 findings, 2,048-byte strings. Snapshot bounds: 4 MiB archive, 2 MiB JSON, 5,000 records, 2,048-byte strings.
+Parse YAML as data. Implement reusable policy for read-only pull-request jobs,
+lowercase 40-hex external action pins, default-deny permissions, same-run
+reader/writer transfer, no-checkout writers, fixed concurrency/timeouts, closed
+inner archives, closed JSON schemas, and authenticated source SHA/ref. Make the
+external-link engine return `LinkResultsV1`; interactive check mode still fails
+on findings, while artifact mode writes a complete result. Implement the exact
+dependency-submission version-0 schema and fixed identity from the design. Link
+bounds are 2 MiB ZIP, 1 MiB JSON, 500 findings, and 2,048-byte strings;
+snapshot bounds are 4 MiB ZIP, 2 MiB JSON, 5,000 records, and 2,048-byte
+strings. Task 9 applies repository workflow policy only to the modified capture
+job; Task 17 activates whole-automation equality.
 
-- [ ] **Step 7: Materialize the final workflow foundation**
+- [x] **Step 7: Materialize only capture and offline foundations**
 
-Create `docs-links.yml` directly in final-state shape: ordinary read-only PR validation; default-branch schedule; split link reader/issue writer; split snapshot reader/writer; and no-input manual refresh. It contains no temporary rc target, controller attestation, protected-file lifecycle, or caller-selected executable.
+Add only the permanent read-only CLI-capture matrix to `test.yml` and the
+offline `check --all` aggregate. Do not create `docs-links.yml`, a schedule, a
+manual writer path, or a real gate-consumer manifest in Task 9; Task 17 owns
+their one-time final materialization.
 
 - [ ] **Step 8: Verify and commit in two adjacent checkpoints**
 
-First commit capture-ready sources and workflow foundation:
+First commit capture-ready sources and offline policy foundations:
 
 ```bash
-cargo test --manifest-path tools/docs-parity/Cargo.toml cli_help
-cargo test --manifest-path tools/docs-parity/Cargo.toml snippets
-cargo test --manifest-path tools/docs-parity/Cargo.toml gates
-cargo test --manifest-path tools/docs-parity/Cargo.toml workflow
-cargo test --manifest-path tools/docs-parity/Cargo.toml dependency_snapshot
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli_help
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test snippets
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test gates
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test workflow
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test dependency_snapshot
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test links
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
-cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
-git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/src/cli_help.rs tools/docs-parity/src/snippets.rs tools/docs-parity/src/gates.rs tools/docs-parity/src/workflow.rs tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/cli-overrides.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/gates.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/tests/cli_help.rs tools/docs-parity/tests/snippets.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/workflow.rs tools/docs-parity/tests/dependency_snapshot.rs .github/workflows/test.yml .github/workflows/docs-links.yml docs/internal/audits/documentation-refresh-evidence.md
+cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets --all-features -- -D warnings
+git add .github/workflows/test.yml docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/superpowers/specs/2026-08-19-documentation-refresh-design.md tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/manifests/cli-overrides.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/cli_help.rs tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/src/gates.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/main.rs tools/docs-parity/src/markdown.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/src/snippets.rs tools/docs-parity/src/workflow.rs tools/docs-parity/tests/cli.rs tools/docs-parity/tests/cli_help.rs tools/docs-parity/tests/dependency_snapshot.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/links.rs tools/docs-parity/tests/snippets.rs tools/docs-parity/tests/workflow.rs
 git diff --cached --check
 git commit -m "Add documentation enforcement foundations"
 git push origin spec-docs-refresh
 ```
 
-After the native artifacts return, stage only the goldens, regenerated tracked/source manifests, and evidence:
+After both native artifacts return from the same successful hosted run, import
+them twice and stage only the goldens, capture record, regenerated governance
+manifests, and evidence:
 
 ```bash
-git add tools/docs-parity/goldens/cli-linux.txt tools/docs-parity/goldens/cli-macos.txt tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml docs/internal/audits/documentation-refresh-evidence.md
+git add docs/internal/audits/documentation-refresh-evidence.md tools/docs-parity/goldens/cli-linux.txt tools/docs-parity/goldens/cli-macos.txt tools/docs-parity/manifests/cli-captures.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml
 git diff --cached --check
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
 git commit -m "Record cross-platform CLI help goldens"
+git push origin spec-docs-refresh
 ```
 
 ### Task 10: Complete WP2 truth pass and dispositions
@@ -1339,7 +1397,8 @@ git commit -m "Complete in-code documentation"
 - Modify: `.github/workflows/integration-tests.yml`
 - Modify: `.github/workflows/codeql.yml`
 - Modify: `.github/workflows/deploy-docs.yml`
-- Modify: `.github/workflows/docs-links.yml`
+- Create: `.github/workflows/docs-links.yml`
+- Modify: `.github/actions/setup-integration-test-env/action.yml`
 - Modify: `.github/dependabot.yml`
 - Modify: `.tool-versions`
 - Modify: `crates/trusted-server-openrtb-codegen/Cargo.toml`
@@ -1348,48 +1407,85 @@ git commit -m "Complete in-code documentation"
 - Modify: `TESTING.md`
 - Modify: `docs/guide/testing.md`
 - Create: `docs/internal/runbooks/documentation-automation-release.md`
+- Modify: `tools/docs-parity/src/lib.rs`
 - Modify: `tools/docs-parity/src/{gates,workflow,dependency_snapshot}.rs`
+- Modify/Test: `tools/docs-parity/tests/cli.rs`
 - Modify/Test: `tools/docs-parity/tests/{gates,workflow,dependency_snapshot}.rs`
-- Modify: `tools/docs-parity/manifests/{tracked-files,maintained-sources,gates,snippets}.toml`
+- Modify: `tools/docs-parity/goldens/{cli-linux,cli-macos}.txt`
+- Modify: `tools/docs-parity/manifests/cli-captures.toml`
+- Create: `tools/docs-parity/manifests/gates.toml`
+- Modify: `tools/docs-parity/manifests/{tracked-files,maintained-sources,sensitive-allowlist,snippets}.toml`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
 - [ ] **Step 1: Write failing automation fixtures**
 
 Assert missing rc CodeQL triggers, docs-parity jobs, rustdoc/doctest jobs, nested lockfile cache inputs, Node pins, Dependabot roots, Wrangler pin, generated gate equality, action SHA pins, final `main` targets, reader/writer separation, closed manual refresh, and release-pending runbook fields.
 
-- [ ] **Step 2: Wire blocking deterministic checks**
+- [ ] **Step 2: Import the final CLI recapture**
 
-Add host docs-parity fmt/clippy/test/check, generated no-diff, settings/examples/inventory/snippets/scanner/local links/readmes/JSDoc/workflow fixtures, rustdoc matrix, native doctests, docs build, and existing target regression jobs. External network links remain scheduled, not a PR dependency.
+Require Task 16 to be committed and pushed. Select the one successful native
+Linux/macOS capture run at that exact Task 16 head, import it through
+`cli-help import-hosted`, and prove a second import is byte-identical. Record
+the authenticated run, attempt, artifacts, digests, source SHA, and CLI-source
+set. The remaining Task 17 changes must not alter the CLI source/blob set.
 
-- [ ] **Step 3: Normalize existing automation**
+- [ ] **Step 3: Wire blocking deterministic checks**
 
-Add CodeQL `rc/*` PR triggers, `.tool-versions` deploy paths, exact setup-node lockfile paths, pinned Wrangler, all approved Dependabot roots targeting `main`, and `[lints] workspace = true`. Choose current stable action/tool versions at implementation time, cite their primary release sources, and pin every new `uses` by full SHA.
+Add host docs-parity fmt/clippy/test/check, generated no-diff,
+settings/examples/inventory/snippets/scanner/local links/readmes/JSDoc/workflow
+fixtures, rustdoc matrix, native doctests, docs build, and existing target
+regression jobs. CLI-capture and final docs-parity jobs use `fetch-depth: 0` so
+the recorded capture commit is available for ancestry and blob comparison.
+External network links remain scheduled, not a PR dependency.
 
-- [ ] **Step 4: Finalize `docs-links.yml`**
+- [ ] **Step 4: Normalize existing automation**
 
-Preserve ordinary read-only PR validation. Finalize weekly `17 9 * * 1` schedule, fixed non-canceling concurrency, 30/20/5-minute timeouts, bounded artifacts, issue dedup/auto-close, fixed snapshot identity, authenticated default-branch SHA, and no-input manual refresh. Require no `pull_request_target`, `merge_group`, status writer, temporary rc target, retirement path, or caller-selected tool.
+Add CodeQL `rc/*` PR triggers, `.tool-versions` deploy paths, exact setup-node
+lockfile paths, pinned Wrangler, all approved Dependabot roots targeting `main`,
+and `[lints] workspace = true`. Pin every external `uses:` reference in all
+tracked workflow and composite-action YAML to a lowercase 40-hex SHA; permit
+normalized `./...` local actions only in read-only checkout jobs. Record each
+pin's release version and primary release URL in evidence.
 
-- [ ] **Step 5: Write the release-pending runbook**
+- [ ] **Step 5: Finalize `docs-links.yml`**
+
+Create `docs-links.yml` once in final form: ordinary read-only pull-request
+validation; weekly `17 9 * * 1` default-branch schedule; input-free manual
+dispatch; repository/main guards on every scheduled/manual reader and writer;
+fixed non-canceling concurrency; 30/20/5-minute timeouts; same-run split link
+and dependency readers/writers; exact inner archive schemas and digests; one
+owned issue with dedup/auto-close; the fixed dependency snapshot identity; and
+unchanged-body submission after revalidation. Reject `pull_request_target`,
+`merge_group`, status writes, temporary rc targets, retirement paths, cross-run
+artifact selection, caller-selected refs/tools/SHAs, writer checkout, and writer
+execution of checked-out repository code.
+
+- [ ] **Step 6: Write the release-pending runbook**
 
 Document exact post-main Pages/CNAME smoke, first scheduled link run, first dependency submission and 201/graph proof, Dependabot/action-pin inspection, alert owner/SLA, and optional branch-protection activation only after contexts report from expected apps. Mark every receipt release-pending; do not create another PR or claim execution from rc.
 
-- [ ] **Step 6: Generate all gate consumers**
+- [ ] **Step 7: Generate all gate consumers**
 
-Regenerate CLAUDE/AGENTS/TESTING/guide testing from `gates.toml`. Prove command files, CONTRIBUTING, and PR template remain link-only. A second generation produces no diff.
+Create `gates.toml`, regenerate CLAUDE/AGENTS/TESTING/guide testing from it,
+prove command files, CONTRIBUTING, and the PR template remain link-only,
+register gate equality in `check --all`, and prove a second generation produces
+no diff.
 
-- [ ] **Step 7: Deduplicate all code follow-ups**
+- [ ] **Step 8: Deduplicate all code follow-ups**
 
 Search the tracker for every item in the spec. File or record an exact existing-issue disposition for all twelve, with URL, owner, and labels. Do not collapse distinct adapter-store, config-bridge, health, reserved-field, placeholder, inline-secret, deploy-ID, CLI-help, telemetry, env-store, or staging-blob findings.
 
-- [ ] **Step 8: Run WP8 acceptance and commit**
+- [ ] **Step 9: Run WP8 acceptance and commit**
 
 ```bash
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
-cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
+cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cd docs && npm run lint && npm run format && npm run build
 ```
@@ -1397,7 +1493,7 @@ cd docs && npm run lint && npm run format && npm run build
 Stage exactly the enumerated files and commit:
 
 ```bash
-git add .github/workflows/format.yml .github/workflows/test.yml .github/workflows/integration-tests.yml .github/workflows/codeql.yml .github/workflows/deploy-docs.yml .github/workflows/docs-links.yml .github/dependabot.yml .tool-versions crates/trusted-server-openrtb-codegen/Cargo.toml CLAUDE.md AGENTS.md TESTING.md docs/guide/testing.md docs/internal/runbooks/documentation-automation-release.md tools/docs-parity/src/gates.rs tools/docs-parity/src/workflow.rs tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/workflow.rs tools/docs-parity/tests/dependency_snapshot.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/gates.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md
+git add .github/actions/setup-integration-test-env/action.yml .github/workflows/format.yml .github/workflows/test.yml .github/workflows/integration-tests.yml .github/workflows/codeql.yml .github/workflows/deploy-docs.yml .github/workflows/docs-links.yml .github/dependabot.yml .tool-versions crates/trusted-server-openrtb-codegen/Cargo.toml CLAUDE.md AGENTS.md TESTING.md docs/guide/testing.md docs/internal/runbooks/documentation-automation-release.md tools/docs-parity/goldens/cli-linux.txt tools/docs-parity/goldens/cli-macos.txt tools/docs-parity/manifests/cli-captures.toml tools/docs-parity/manifests/gates.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/src/gates.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/workflow.rs tools/docs-parity/tests/cli.rs tools/docs-parity/tests/dependency_snapshot.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/workflow.rs docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Activate documentation enforcement gates"
 ```
 

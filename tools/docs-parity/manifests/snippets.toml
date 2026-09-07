@@ -1,0 +1,4340 @@
+version = 1
+reviewed = true
+
+[[commands]]
+id = "illustrative-bash"
+runner = "none"
+target = "none"
+language = "bash"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The bash fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-css"
+runner = "none"
+target = "none"
+language = "css"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The css fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-html"
+runner = "none"
+target = "none"
+language = "html"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The html fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-http"
+runner = "none"
+target = "none"
+language = "http"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The http fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-javascript"
+runner = "none"
+target = "none"
+language = "javascript"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The javascript fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-json"
+runner = "none"
+target = "none"
+language = "json"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The json fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-markdown"
+runner = "none"
+target = "none"
+language = "markdown"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The markdown fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-mermaid"
+runner = "none"
+target = "none"
+language = "mermaid"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The mermaid fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-plain"
+runner = "none"
+target = "none"
+language = "plain"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The plain fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-rust"
+runner = "none"
+target = "none"
+language = "rust"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The rust fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-text"
+runner = "none"
+target = "none"
+language = "text"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The text fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-toml"
+runner = "none"
+target = "none"
+language = "toml"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The toml fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-ts"
+runner = "none"
+target = "none"
+language = "ts"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The ts fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "illustrative-vcl"
+runner = "none"
+target = "none"
+language = "vcl"
+mode = "illustrative"
+owner = "documentation-maintainers"
+rationale = "The vcl fence family contains partial or context-dependent examples that cannot be validated as standalone artifacts; the truth pass must narrow or replace them before expiry"
+expires_at = "2026-10-31T00:00:00Z"
+
+[[commands]]
+id = "validate-bash"
+runner = "shell-syntax"
+target = "host"
+language = "bash"
+mode = "executable"
+command = "validate syntax"
+
+[[commands]]
+id = "validate-javascript"
+runner = "node-syntax"
+target = "host"
+language = "javascript"
+mode = "executable"
+command = "validate syntax"
+
+[[commands]]
+id = "validate-js"
+runner = "node-syntax"
+target = "host"
+language = "js"
+mode = "executable"
+command = "validate syntax"
+
+[[commands]]
+id = "validate-json"
+runner = "json"
+target = "host"
+language = "json"
+mode = "executable"
+command = "validate syntax"
+
+[[commands]]
+id = "validate-rust"
+runner = "rust-syntax"
+target = "host"
+language = "rust"
+mode = "executable"
+command = "validate syntax"
+
+[[commands]]
+id = "validate-sh"
+runner = "shell-syntax"
+target = "host"
+language = "sh"
+mode = "executable"
+command = "validate syntax"
+
+[[commands]]
+id = "validate-toml"
+runner = "toml"
+target = "host"
+language = "toml"
+mode = "executable"
+command = "validate syntax"
+
+[[commands]]
+id = "validate-yaml"
+runner = "yaml"
+target = "host"
+language = "yaml"
+mode = "executable"
+command = "validate syntax"
+
+[[snippets]]
+path = ".claude/agents/build-validator.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:4a6dbd34db09e14dee4caab388512e83f81dfde8e4bbed771acc3c8f1fa1de3f"
+
+[[snippets]]
+path = ".claude/agents/build-validator.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:b494183dba64e9f77b19b85e69c787e5f5cdf564ef9bcfb32bb83821357ec312"
+
+[[snippets]]
+path = ".claude/agents/build-validator.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:2840ec75b4ddf2ab7e11ebc461f437166cce3529a4b5b0b0668a6d2e2d920e46"
+
+[[snippets]]
+path = ".claude/agents/build-validator.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:b6e19c16e0d5f97094745b63c78c4f15238111c4de91b081bba774a71abff1e8"
+
+[[snippets]]
+path = ".claude/agents/build-validator.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:a820b13e4d949ab7005d8edbe761b05ad5228b1cd9e17cb4c5365d7abdb87330"
+
+[[snippets]]
+path = ".claude/agents/issue-creator.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:fe83911769dbe444d5476daccc8ac4cc05bc43ba7ff68e9a3e1c4f34bf33316f"
+
+[[snippets]]
+path = ".claude/agents/issue-creator.md"
+selector = "fence:2"
+command = "illustrative-plain"
+fingerprint = "sha256:281d65e9c53ae7c3a0743de1e11d45e7891c8ce72fd2ed03fdb99bad55e2961e"
+
+[[snippets]]
+path = ".claude/agents/issue-creator.md"
+selector = "fence:3"
+command = "illustrative-plain"
+fingerprint = "sha256:35fd22e6fcc8c5213035f551507a2a899f7312eecfccf176f824e52e28bc118e"
+
+[[snippets]]
+path = ".claude/agents/issue-creator.md"
+selector = "fence:4"
+command = "illustrative-plain"
+fingerprint = "sha256:88b733e5b32d49967c297080381d0a1a96b75ba43431bf874f3e43428ffc87b6"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:89a91c41b1a7704e7620c022a0e164ed606576dadd79deedf678eae4e481b035"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:2"
+command = "illustrative-plain"
+fingerprint = "sha256:cf2da99be550b214250250a5c2b1a6643973d944663c01017dc705ee3be7b207"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:3"
+command = "illustrative-plain"
+fingerprint = "sha256:fd5985fff9591b20efe428b3f241603b7ebd23e9f0ab58a1d46ca38d5dc1adb1"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:4"
+command = "illustrative-plain"
+fingerprint = "sha256:956865af16859160e401e7436fc8a45dad904f59732a26bfc1679b521bdeb385"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:5"
+command = "illustrative-plain"
+fingerprint = "sha256:6d8aae9733a9503439bae427812a5d37ad8337a0f0dcf774460b7c9e0a548d5b"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:6"
+command = "illustrative-plain"
+fingerprint = "sha256:760c0d9c8f3725f29adb615fbeee191bea4178ff7f602c0390defd3d7ef94193"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:88b733e5b32d49967c297080381d0a1a96b75ba43431bf874f3e43428ffc87b6"
+
+[[snippets]]
+path = ".claude/agents/pr-creator.md"
+selector = "fence:8"
+command = "illustrative-plain"
+fingerprint = "sha256:281d65e9c53ae7c3a0743de1e11d45e7891c8ce72fd2ed03fdb99bad55e2961e"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:60abaae0d3186cdaffa33adc1ef2776079807dbd82ca1fba45758d3f1dd7900b"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:bc6de36cd0b47989faa508dc4f262e5e7dd9029e288aa31e4b61c5b5ddba21b4"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:eb4b50fda01667a861131e0fc9007a620880dcb9c292aa2a27c3c057f89cd397"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:60e834d27912d9dfe22f37dca100b2c53e2280b86ed5d52e8ecb5ad0b4ce5450"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:77cfd2f74b5e26155296af7a04838662b8a152ba1f6979e815fe118fe82ea6c0"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:5f6263ccc29c610967c502cf93bab1de422db83098420e6a576209949eb3ead3"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:93462d1780a585ce82fead9c899c06e04f74bcc64ab7f91dccea95c494f98186"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:e0787968bf7f4e0ba48b2fe39d6564f3e7fde424d5b7c19136b25f475ebf8a95"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:022faca37b6d85409831a4875833e3cd2729bd2acd4584e9b33a3d818f4f131a"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:10"
+command = "validate-bash"
+fingerprint = "sha256:233ddbd6c8d2b9fe07f560c1589d449a98421a9da3828f8a36d198eb3440e965"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:11"
+command = "illustrative-bash"
+fingerprint = "sha256:488e29ba901bceb761322a4a7232a3a268f9e5850b30f367bb3073cebae7a56c"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:12"
+command = "validate-json"
+fingerprint = "sha256:a2442599dc6dbf16732fc1316a6c6658e6ee2162acfaa6b188dc8cb99457db62"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:13"
+command = "validate-json"
+fingerprint = "sha256:0ff8da594a571e8b81cafcc213edcbb29ec221a98fc8d4338feabe149805ff5f"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:14"
+command = "validate-json"
+fingerprint = "sha256:933d209680f56013a2c561a04971e29a420b9b1ec142261bc0381a07e3d9bc29"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:15"
+command = "validate-json"
+fingerprint = "sha256:eb97a72646579f19197a5abe012e20e832b36ab2d3f54ff0e88de652b9fa00a8"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:16"
+command = "validate-bash"
+fingerprint = "sha256:c0f4e41bf402ed259ed94d22bc177280481b397392c9405b9428a931dc433385"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:17"
+command = "validate-bash"
+fingerprint = "sha256:2a63221411df7fd91fd6bce600e8fa1a1485cef02d91efa71bad67070b6f8d4e"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:18"
+command = "validate-bash"
+fingerprint = "sha256:3de71b8c802b0711c24f0950cddb506a664f620c461b60e0cc7d8e1d0d56ac6e"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:19"
+command = "validate-bash"
+fingerprint = "sha256:606112bb12ecc96ad7c5e1ae4b95ded8fe0a968c84fc4d58b6e42cbe5d25a9bc"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:20"
+command = "validate-bash"
+fingerprint = "sha256:7b0e6334317942c0c297ac4b882077c8d3b48be479de99cfcde46dba5abdafe9"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:21"
+command = "validate-bash"
+fingerprint = "sha256:8aa1d3b9277e379f4e50ff9b534e3cd1c330c92c321f3a2d13a06c433b4f2094"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:22"
+command = "validate-bash"
+fingerprint = "sha256:3c76e7eaa492d96580e79460b59c2e4a14933af3e791973a840b3d230b5b77e9"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:23"
+command = "validate-bash"
+fingerprint = "sha256:8e68bd02ac92cc81f906f400c247b8e7326121395cd78d339b6312343336e2f6"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:24"
+command = "illustrative-markdown"
+fingerprint = "sha256:7ef4912bb0357ba9d66f9a39d7b19d37459034470b94d34c65395265517b562c"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:25"
+command = "validate-bash"
+fingerprint = "sha256:b2ac080d4e5950bead05d9edf88e0e6e3f6ff46cb08d39ac0782f6ef4a5ff53f"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:26"
+command = "validate-bash"
+fingerprint = "sha256:2d7988e51350fd815be065df2c9eec73d5038d2b02f895dd0b8fa3fc19087159"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:27"
+command = "validate-bash"
+fingerprint = "sha256:512a7454f487173503b6b6a73dfe5f2656f79aeeb1f2e77dfc46009c9be9a113"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:28"
+command = "validate-bash"
+fingerprint = "sha256:6a686565d76af03bab228b5de577e40c69e4c3fb1cd3c98ebcbab12b9aae7959"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:29"
+command = "validate-bash"
+fingerprint = "sha256:b3ab92589e54882e37e8566429ff39a338778240f0f6e6f32bae8a53a4604a71"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:30"
+command = "validate-bash"
+fingerprint = "sha256:b8da71302ff5ff628aa762b5874106a86772ebfd297c7be615820bac775212ae"
+
+[[snippets]]
+path = ".claude/agents/pr-reviewer.md"
+selector = "fence:31"
+command = "validate-bash"
+fingerprint = "sha256:48dc0eda4a75d71c172b82827ff9dded91e2050ba7c024f559e322037e6a1afc"
+
+[[snippets]]
+path = ".claude/agents/verify-app.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:b6e19c16e0d5f97094745b63c78c4f15238111c4de91b081bba774a71abff1e8"
+
+[[snippets]]
+path = ".claude/agents/verify-app.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:a9945c56b5806da17d42eff6b27306085c8209e4d974eec7d41f85a39176b5c2"
+
+[[snippets]]
+path = ".claude/agents/verify-app.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:294389015d29c48d8d286d04a1e5c26b41dc7d44f22b948431ffc0ba5bcc9bce"
+
+[[snippets]]
+path = ".claude/agents/verify-app.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:07f2fc0149418a3ff684b4f51779e9e1ba750c5a2914ece825803878a458c57f"
+
+[[snippets]]
+path = ".claude/agents/verify-app.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:0639df7f60ada8f829b45c181ab1056d031ebcbca283180f3a800078e9fb8eb4"
+
+[[snippets]]
+path = ".claude/agents/verify-app.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:4f055874a91f260c40bc5c575fc2f09fd23796805d7551683f922e8956e0db57"
+
+[[snippets]]
+path = ".claude/agents/verify-app.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:b494183dba64e9f77b19b85e69c787e5f5cdf564ef9bcfb32bb83821357ec312"
+
+[[snippets]]
+path = "CLAUDE.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:660a6da789fb58ec054157a6e4a874bc3becb9c5e9b0b25f835136d9e18debdd"
+
+[[snippets]]
+path = "CLAUDE.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:d4fb51e947b44319e975087c60cfe748db09d8ababd6aa49a30f0a9e74895982"
+
+[[snippets]]
+path = "CLAUDE.md"
+selector = "fence:3"
+command = "illustrative-bash"
+fingerprint = "sha256:463e145cdd9a8df5abdae512a6b7f5b1f7a69c3fefdff0496323ca85ff1c8a9b"
+
+[[snippets]]
+path = "CLAUDE.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:3ea371184b4f39fe90ef7e80392b196bcdc5d06464d252f9948194cc5a937ed3"
+
+[[snippets]]
+path = "CLAUDE.md"
+selector = "fence:5"
+command = "validate-rust"
+fingerprint = "sha256:ed9e18fc1b854673b94953a1799af2be231fc2cb4a3b2584f90ccf4d8558526d"
+
+[[snippets]]
+path = "CLAUDE.md"
+selector = "fence:6"
+command = "validate-rust"
+fingerprint = "sha256:c71a99b011ee28d8d6047707bc0ea9bd4d111eff4f3e3d9c12bea4cbd893129f"
+
+[[snippets]]
+path = "CLAUDE.md"
+selector = "fence:7"
+command = "illustrative-rust"
+fingerprint = "sha256:1977cba09378d87fc4f50c849bebeb18c9736b29d9968aecc82abbafc9d539a2"
+
+[[snippets]]
+path = "CONTRIBUTING.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:ec1160aedd5a6f8874cd005174891688ae0da590c480444af34bc3cc7c1e73c5"
+
+[[snippets]]
+path = "CONTRIBUTING.md"
+selector = "fence:2"
+command = "illustrative-rust"
+fingerprint = "sha256:29d58510f883df1ae2931d6ccd05385b5bc8250467d97f31ce4e8e7bae0ddf7d"
+
+[[snippets]]
+path = "README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:e99fc9d9795f28a97bcd3f6ff51a7b1f22e642e95777dbe266ada4767ac2ee21"
+
+[[snippets]]
+path = "README.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:7975237cb3942e7487085db14e255bfde12b884d021d724e1e2f58c6f2ce6a2a"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:27e7383df1f4a402e36ccc0dc2c87bc1c28329773552d6e2d76b95c0346d3685"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:92bd1b3579b550ba4536785ebce2cc9e5cf1f4079d1dcb59c6dfc649bbb103b1"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:395620c048b6fc84a568f9ce02105da30a8f385e07c528c023719ea5acd2064e"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:d00c9fa2ce12907affc5569d0a10eefb18a5e1989735857a52d8f39635490a9a"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:5"
+command = "validate-toml"
+fingerprint = "sha256:30edf58148da9134f5f9ea4c2a1dde57b674eb91612ef389d2ab080eb90f411b"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:6"
+command = "validate-toml"
+fingerprint = "sha256:14d2154cfc55d0aaac2b4e15d3d280be6482dcebc2d1dea961623401a7571848"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:322edcb804a5ade117a3507865ff34ea49968486e0b5b765d5a5da32cea63c98"
+
+[[snippets]]
+path = "TESTING.md"
+selector = "fence:8"
+command = "illustrative-plain"
+fingerprint = "sha256:c1cea405679b0269274eaf08f3826744518cdf2aca77ceb9cf41c84db6a7c15f"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:df71cb3dde7ed207d76339e7f4f59194598a04c2d38fb8543f5d701b0ffd1084"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:2"
+command = "illustrative-plain"
+fingerprint = "sha256:fea7f23c768e3bd014d49b40669478428e07eccc4da1dfa26d80e8265299faa6"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:3"
+command = "validate-json"
+fingerprint = "sha256:e7f92458690361d5de59e4bc04a9e71f54aea21f82d0c5fe6d1816b8ded3e649"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:4"
+command = "illustrative-rust"
+fingerprint = "sha256:e7e87a4533b51388b8f438fb507d9ca5cc85dcc3f4755d8ef92efc43127a04ed"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:5"
+command = "validate-rust"
+fingerprint = "sha256:262698e9243c142c6b53ef4dd3bd730b06730a1c1059e39ae1bc4320eb7a8bf3"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:6"
+command = "validate-json"
+fingerprint = "sha256:a903219c97ea7c4dc5bb3727169b206c16753d35a78a24f99942bdcaea47b0b0"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:7"
+command = "illustrative-rust"
+fingerprint = "sha256:c3b819709599def50b9d60d1d61ad5b675c141d37e100bbdfe18d4c90e12e758"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:8"
+command = "validate-rust"
+fingerprint = "sha256:3b349b19a7b28c7540f91e6a6022db78b38f33e906266d06b50939c5649199de"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:9"
+command = "illustrative-json"
+fingerprint = "sha256:2a0bdffd6a15fb4e2bfaef0e6ff694b783154c0623be75cc6edf6a81d59a33a0"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:10"
+command = "validate-json"
+fingerprint = "sha256:483f3a6188aa9269997f526b6c2422cd6a584e8d540567f209cea534c8bf1fcb"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:11"
+command = "validate-toml"
+fingerprint = "sha256:946414782759ffda6c4795f32b647e19f870ed71d047426cca594a1d38150415"
+
+[[snippets]]
+path = "crates/trusted-server-core/src/auction/README.md"
+selector = "fence:12"
+command = "validate-toml"
+fingerprint = "sha256:47bda951602930eb19276a638f6e0a52d4676d814c5663d934013f9e687de298"
+
+[[snippets]]
+path = "crates/trusted-server-integration-tests/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:4bc64fcd6b17d074079c87d6be0b0c7ff61dd86c8362b13dc9a56506f83e2ffb"
+
+[[snippets]]
+path = "crates/trusted-server-integration-tests/README.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:502f7cfcbaa48b8fb84473b9f36693fd7395d935a2f9130f38451c605a98d58d"
+
+[[snippets]]
+path = "crates/trusted-server-integration-tests/README.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:94a17b77f5a3b5936a5c14a5fc1787c991f578169075dfd5b07323afd89c7e7b"
+
+[[snippets]]
+path = "crates/trusted-server-integration-tests/README.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:75b7f769cde7b938efe6908d7ce0df19cb9ccd0c12d12ad4f4a57071f545a1fb"
+
+[[snippets]]
+path = "crates/trusted-server-integration-tests/README.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:3d86b69f7951271852d9e88ec02fbf4e7cae2a39963665a3b9802c2131b90933"
+
+[[snippets]]
+path = "crates/trusted-server-integration-tests/README.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:e356a7d232eeb5d5b3f7907bc6fb35048567cce576acb6dc86b0091babd48577"
+
+[[snippets]]
+path = "crates/trusted-server-integration-tests/README.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:fb5d90b1e565b4d4420e3a7e3ef73e263fcbea1b06764c9c5c581ba5f4a95b8e"
+
+[[snippets]]
+path = "crates/trusted-server-openrtb/README.md"
+selector = "fence:1"
+command = "validate-sh"
+fingerprint = "sha256:531754ea90eda1474e535020aa2313a21c306f51c9ce55633a58c00c7504329b"
+
+[[snippets]]
+path = "crates/trusted-server-openrtb/README.md"
+selector = "fence:2"
+command = "validate-rust"
+fingerprint = "sha256:2cd4fd57f7118f55d23cda5043b574549664cb6187614c2712a46bb881099fb4"
+
+[[snippets]]
+path = "crates/trusted-server-openrtb/README.md"
+selector = "fence:3"
+command = "illustrative-rust"
+fingerprint = "sha256:3d002d17565f88ac421c160876f9c5d478e5d223c7ecc49a9f812070d0e3f6b7"
+
+[[snippets]]
+path = "docs/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:eff0ac7d7e24305c4a4e4043d228e60d7671ac6abd35134dbb4935755cc625ec"
+
+[[snippets]]
+path = "docs/README.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:082f99de1da154a4f7c68f3f9ee6d6734eb995a8dab67b95a6346af9008b98a3"
+
+[[snippets]]
+path = "docs/README.md"
+selector = "fence:3"
+command = "illustrative-plain"
+fingerprint = "sha256:75e0b8271714399ebbebfa4144671a9367db4c068d252c203bec2a440f7f5584"
+
+[[snippets]]
+path = "docs/README.md"
+selector = "fence:4"
+command = "illustrative-plain"
+fingerprint = "sha256:69ab3232ca431ec715e2683cd7c2b4ca56b5fec9b4bf27b631bf03761e041174"
+
+[[snippets]]
+path = "docs/README.md"
+selector = "fence:5"
+command = "illustrative-plain"
+fingerprint = "sha256:16bd3e33d5c05acfd314c0caeb96711bb392ff5098eaa803c631b1e354b6b87a"
+
+[[snippets]]
+path = "docs/README.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:07bd7a255380482aeb7eb92495199915e482998b9353677b441f59943ac39736"
+
+[[snippets]]
+path = "docs/README.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:440d98ebab06629e05517e641639c9b838cdf35780f37f7da61d9a0bfdad514f"
+
+[[snippets]]
+path = "docs/epics/revenue-operations-dashboard.md"
+selector = "fence:1"
+command = "validate-json"
+fingerprint = "sha256:918ca8eb9f599cfd23bba3c3499ec4224d509358c8c70e46e70b7805241dc339"
+
+[[snippets]]
+path = "docs/epics/revenue-operations-dashboard.md"
+selector = "fence:2"
+command = "validate-json"
+fingerprint = "sha256:6f8be7c5cb3a58f4461575bf7276157368e50be97581656d8df071dc4c8f74a5"
+
+[[snippets]]
+path = "docs/epics/revenue-operations-dashboard.md"
+selector = "fence:3"
+command = "validate-json"
+fingerprint = "sha256:a393168d031e4a8ad9eb6b59cf267ced0b4c292a0f3d12288ec4db0212ad3cf6"
+
+[[snippets]]
+path = "docs/epics/revenue-operations-dashboard.md"
+selector = "fence:4"
+command = "validate-json"
+fingerprint = "sha256:8c15118a4074d82f5c2b6546c5a6317b8cac12f86d9cc517234a09e5bed7c52d"
+
+[[snippets]]
+path = "docs/epics/revenue-operations-dashboard.md"
+selector = "fence:5"
+command = "validate-toml"
+fingerprint = "sha256:f4cebf4d270538f196c083c40403bfc6de85266d6da838cbba32165b20c612da"
+
+[[snippets]]
+path = "docs/epics/revenue-operations-dashboard.md"
+selector = "fence:6"
+command = "illustrative-plain"
+fingerprint = "sha256:9f0b60925f3405a9ba887c709d38fce80cbe5e0b8271930b217329b187b91513"
+
+[[snippets]]
+path = "docs/guide/ad-serving.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:24418142967972c008e794086cdd50992f32c2e6b7348528f66bfd2328b17ffa"
+
+[[snippets]]
+path = "docs/guide/ad-serving.md"
+selector = "fence:2"
+command = "validate-javascript"
+fingerprint = "sha256:7ecca0f73c58b54ef7387a4de7d2d84edcf2535295b12616d3a8c2d4777991ff"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:410ecd428ee86af89b9e0277416864c59d0b87776254c6e59f54e16d1be36b0d"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:2"
+command = "illustrative-http"
+fingerprint = "sha256:d9866bc8e0dda529703e4a1aee95afaa0640fc9d43bebcc34fc6147c4a34cff0"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:d83b58619da571ff6a2c7343fcca04412e99a1566e8ab44433d3ab2257fbf9bd"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:4"
+command = "illustrative-http"
+fingerprint = "sha256:6cb87ed502f5360ec4400abb6cae37e6c4c94a5c0cf9fed30ecdc6d842dc7c55"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:1b921bc62a4df70ca0ad8dbeb84750f723484814b218379f720786d7316a4146"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:6"
+command = "validate-json"
+fingerprint = "sha256:4eb510dbae25c850c8564dbb5e58c30a438ef0901d917a6edefd9f102e2b4b91"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:1dab3744d983511ec8ce79bc2132c9703b33e036c65d177d3e561867a2940ea5"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:8"
+command = "validate-json"
+fingerprint = "sha256:321c21c4476176c7adbe36553e539f2dc8e5b26cdc75600ca552bc1e694503c1"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:9"
+command = "validate-json"
+fingerprint = "sha256:9c99d3d03810b7996b0c020aca1be9a028c7ffabe6a8b452a9747ee31668d104"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:10"
+command = "validate-json"
+fingerprint = "sha256:af7966364875e9d1824c87c6445f5a9a800db5e219eda3cc47abfac172fd92d6"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:648d15790f9515f248a32b2ee0f7eb3651496444a3151672d97dc4c50f960e99"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:12"
+command = "validate-bash"
+fingerprint = "sha256:31271a7f2dba485309a8460473c76fe364bb8668d824a45432f7e01e2589481d"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:13"
+command = "validate-bash"
+fingerprint = "sha256:b6b4d3729a1b059ba08b4a34be111715fddd784f65afa706f356c52e752cb4a5"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:14"
+command = "validate-bash"
+fingerprint = "sha256:4c69ee2b9a7b9bcfced05a1805343b66d35eff22d39c680a49562d17de946e2b"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:15"
+command = "validate-json"
+fingerprint = "sha256:eaa3908b9ff305c980567371db6bee32f8ccb9bd5eca54a053649e64cb65d002"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:16"
+command = "validate-json"
+fingerprint = "sha256:0c4112f21ccba1b220ab78b661991cf7707538a3cf3584225165105fb9b82694"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:17"
+command = "validate-json"
+fingerprint = "sha256:aa486320e0e61a54724059cabf999db89e151dcd2a6ce9bea42d3dd1b7c8a669"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:18"
+command = "validate-json"
+fingerprint = "sha256:55106ecf398801704ab920cd7f74fbf17cdf664662d11f23ce6de916c06a2043"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:19"
+command = "validate-bash"
+fingerprint = "sha256:664b9692eabca626528b09ac1d49a3be624a4920c0ba4ec892220894f200512b"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:20"
+command = "validate-json"
+fingerprint = "sha256:d81e6f6e0cbc905512b5f9d4a11767c22b3a5a87c5d4e3dc7b3fb9a8942d1ab6"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:21"
+command = "validate-json"
+fingerprint = "sha256:7487aa96c87058c91602e4a736e952f06f800a93ca5aa6b32c29182893d39076"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:22"
+command = "validate-json"
+fingerprint = "sha256:193eb92412956f3bdda38b0fe43015d7050a2ef31382eba035932ede9435a64e"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:23"
+command = "validate-bash"
+fingerprint = "sha256:a7fae8b7e87fd15eeaae4e64647ecc2f41560e5f6f9f623391318155cfc7c287"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:24"
+command = "validate-json"
+fingerprint = "sha256:b76f19e03b85d55450a4729a1da639aac25e81badd5ec164316063422aaa0131"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:25"
+command = "validate-json"
+fingerprint = "sha256:be4c6cd35d18675f06c5485e1e60f95c335bab2a8120f026e0b5636c7114bd64"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:26"
+command = "validate-bash"
+fingerprint = "sha256:7a2284ad487261173682631b441bd43b7b5f04b88c214837fa111a850be98cf1"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:27"
+command = "validate-json"
+fingerprint = "sha256:dab797c4d280e9b853811184231f82532757c5caf28c3d2a1c9436d671c40312"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:28"
+command = "validate-json"
+fingerprint = "sha256:d5273e78c64d6833c9f7ff835b8d7661bf93cb028a942e210321d9a0809deadd"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:29"
+command = "validate-bash"
+fingerprint = "sha256:301762f08cfee88660285b7974a6a2b2df9c3e2d6a3461077e1d57359ce1d18c"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:30"
+command = "validate-bash"
+fingerprint = "sha256:876d60bd11767c15a91f4eace51e745fa8fcd40a4020d764b02b82fbd160cade"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:31"
+command = "validate-json"
+fingerprint = "sha256:9ab0788952d95995210fb958b5c15c0eb16a08da1ba0f3eee307466c7908073d"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:32"
+command = "validate-bash"
+fingerprint = "sha256:ca2b61fa0c4cd8d605ed9dea6dde9fd0822673130d54c66909a2df120336b638"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:33"
+command = "illustrative-html"
+fingerprint = "sha256:89e602f872c3e7735b8e9938a7ff90ddfddeb9e341c291c1b89349d7bbd80001"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:34"
+command = "validate-bash"
+fingerprint = "sha256:ac78b0307547adc1661c72a74536c76fbc203f803d3e26521c89595d37827edf"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:35"
+command = "validate-json"
+fingerprint = "sha256:042e110feb2bf7c9f4e35cb191d5d1e448badec945cb300cf0c84db9b2299972"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:36"
+command = "validate-json"
+fingerprint = "sha256:26cbd02fb7b44b5d6f871b4a98b1c3997a72c2a7779c9e01c777ea46c07f9a38"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:37"
+command = "validate-toml"
+fingerprint = "sha256:1340dfbef500e2786ad1d204e31c5da02e85ba252746daa7577b34fc0e50a427"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:38"
+command = "validate-bash"
+fingerprint = "sha256:4a9bd5c411760cb9d569566bf27b17d6458c8621585b34ad7baa1e29fa0c24bd"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:39"
+command = "validate-toml"
+fingerprint = "sha256:5ceb806cfa8372538a62180f9c9e6997f8ba1cd9a3c2b84a309b12a3a89d79b6"
+
+[[snippets]]
+path = "docs/guide/architecture.md"
+selector = "fence:1"
+command = "illustrative-mermaid"
+fingerprint = "sha256:a6a7ee7340fbbde17c07a1233298830828a5c9149b4584def5a6c0f11192f930"
+
+[[snippets]]
+path = "docs/guide/architecture.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:46e87ce0a890a8506aa37cb73f857e8a311f83d7bf0e39f209aa6d6db76e2d6a"
+
+[[snippets]]
+path = "docs/guide/architecture.md"
+selector = "fence:3"
+command = "validate-rust"
+fingerprint = "sha256:494c152ef1edccb0f84281887f8fc9dfe15cb19bd2b8f6fdc4d0cea925358205"
+
+[[snippets]]
+path = "docs/guide/asset-routes.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:60da85bf69f321fb595e01d2f56050734fe5eb659f741625269f8d836130312d"
+
+[[snippets]]
+path = "docs/guide/asset-routes.md"
+selector = "fence:2"
+command = "illustrative-text"
+fingerprint = "sha256:e866e6c0a1193858845550e632410ef87303d5bda7a867db9b26d5bcee9c7309"
+
+[[snippets]]
+path = "docs/guide/asset-routes.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:df5f5a536a01abea60ed4342191f334c234d5d985d9c17b0bff78308569ab5e4"
+
+[[snippets]]
+path = "docs/guide/asset-routes.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:7ad02952d790b493afd89feb0886f153fbf3576e5a57a13e2770ed81a520bb91"
+
+[[snippets]]
+path = "docs/guide/asset-routes.md"
+selector = "fence:5"
+command = "validate-toml"
+fingerprint = "sha256:113bc0dcdf45038830c00e72db6e23e1e0c73b74948bbdaf3970979daeb4efe7"
+
+[[snippets]]
+path = "docs/guide/asset-routes.md"
+selector = "fence:6"
+command = "illustrative-text"
+fingerprint = "sha256:43b56b760b200cf665e5a165b4600cce8a93775e2261ec9d45dc0840d00e3ae3"
+
+[[snippets]]
+path = "docs/guide/asset-routes.md"
+selector = "fence:7"
+command = "illustrative-text"
+fingerprint = "sha256:fcde5adf32a79c3f9537f456609e765c98e35cf6b1aba09b2216fa5840724d53"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:1"
+command = "illustrative-mermaid"
+fingerprint = "sha256:8a541c12d53d76fa0d3fc799e2d4646344ba3c0c40824a05c4274f26b3832ffa"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:2"
+command = "illustrative-plain"
+fingerprint = "sha256:faaa2147c00d1524c75b41721ff8c7ce9822515e2fa2015bff521b7eb5bdad88"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:2270d4635435db3e7f5535e33cd29c574f09baa6b25d1f4c4a919dc11fc9a7fd"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:77977cec63c360ce4cecd48ee3b0d2bbdf87237dd4ba4abd4803afa9d4b56dae"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:5"
+command = "validate-rust"
+fingerprint = "sha256:a7bcca1e266fde23157547a5840018e5a22cfe12b25cee9de592bc9158c9e04c"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:6"
+command = "validate-toml"
+fingerprint = "sha256:20087047b5d8a9d91a29fb53ded726bc382d27748e58627c5208866eda428d28"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:7"
+command = "validate-toml"
+fingerprint = "sha256:0c250168575132e5cd6694b351bf51b5a3016f65357d357e4d7e1376071ea59d"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:8"
+command = "validate-json"
+fingerprint = "sha256:7b440ec8fdda4d27c08ccc57972984a0bd39666de36f6d969494519b11d8e98f"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:9"
+command = "validate-toml"
+fingerprint = "sha256:5b419f86655e08973c15233b42f0ba7a98b558d558d041d04430edfb846ebce3"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:10"
+command = "validate-rust"
+fingerprint = "sha256:b50c5682a58c576522f4fc2196d2acd9945dc24e60b4c7ac0a006363cfbd3ab7"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:11"
+command = "validate-rust"
+fingerprint = "sha256:6d9dda3e7855b581120160b8641f14c52d04d76fa472761d4b9bd6e4d1221dee"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:12"
+command = "validate-rust"
+fingerprint = "sha256:94496bcebd3e05d5c6c3e47b05bb0e2292c611a1217be8b002a1a7e5493c4b18"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:13"
+command = "validate-rust"
+fingerprint = "sha256:f94c5ea788acdc6a053dca84bf50109b33a834378879f563d2bacb2f7c05876d"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:14"
+command = "validate-json"
+fingerprint = "sha256:5f25530a50f8d77e7a3d4ea92d11524becd61dd470fb47148652d1a74996542e"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:15"
+command = "validate-json"
+fingerprint = "sha256:472194410e291033ccfc4f7143222e5c7cc2a57d6855bfb25a255c58eadc3b11"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:16"
+command = "validate-json"
+fingerprint = "sha256:64611d17bf69fc5e43bd8ec89a29bc95bc2029c91fdad8de60740ab69409a031"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:17"
+command = "validate-toml"
+fingerprint = "sha256:650a6cf9d70f49f5862cee2a4bc5aadd90e989be83a7605832643249a9c2eb8c"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:18"
+command = "validate-toml"
+fingerprint = "sha256:699f1d621a5c6239f2eee85488badf6efa903ad1b744f900946b736f5028c102"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:19"
+command = "validate-bash"
+fingerprint = "sha256:416ae2c0b02be4647eb99156ad5840bc4f12c43b2763c9bcd05d175336ccc121"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:20"
+command = "validate-json"
+fingerprint = "sha256:ddb0ab75bbd3b512e8d197a37b4a6831d6040275133eed9a6a0806dd08cdca1b"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:21"
+command = "validate-toml"
+fingerprint = "sha256:c3c05d3f621e898ad2b29ddc3acde927a489bd5b94a1e0e3f4016defce00a653"
+
+[[snippets]]
+path = "docs/guide/auction-orchestration.md"
+selector = "fence:22"
+command = "validate-bash"
+fingerprint = "sha256:e8e18e37971b473e43fefb9167fe3ab952a9c075a73fbf22121504096eec7996"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:3400aea90401209125509a74ac73211fc9bad8d5e66c8691301cbc7b5275a363"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:c86d043f0de89539d480f5636fa031862455070b1effece939dd06f6b91fbef4"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:9d5a2a0b82d1fe532c1cfb5d3ac02ff346ad9060480acf56add7e674c28f62fc"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:1c045cc088a2223f6ed3ec51bce9f0ede1f8625c7420ef2c3e4181b810ab7342"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:bbbba0ba9d4fb87c61945ecce65eefab20f7fbe1c9d3880bbfe99a2a5075c6b8"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:028c5cb1434a75848b76d17205575f4f51616b77f4984507af12156fc3f9e8fa"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:7143c92e0ed541463b75f4649f1395b7e08174f16f976c0fd001689ab018d6b8"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:703cdef6cc43dcb28cf35e99200e8d50f61d636383f64cc1510e424b4aa1d44f"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:844c0ebf85b5bb60e74c895d08951eba3ef147e41ea9eab6cfcb3612b66950fb"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:10"
+command = "validate-bash"
+fingerprint = "sha256:0653a7265922aafa71dc06144bef7db80cedfee14345188fca8e8eb31a866a06"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:43f95db04f72411deeb5f838496b3eb8a9389b45fec5f08a18ddf57e2c5e7e60"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:12"
+command = "validate-bash"
+fingerprint = "sha256:2add5b71ac6602108bab03bb2dbfef1aa5c53fd642bbeee768acdd96b2436cd7"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:13"
+command = "illustrative-bash"
+fingerprint = "sha256:beca215035a8c72670081470321e5e4b7b7f53017273f03061e47ddf06015f89"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:14"
+command = "validate-bash"
+fingerprint = "sha256:d925e346585a3a7d8c0957ad033418a4997c26a2319a97865949f0443ac6cbaf"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:15"
+command = "validate-bash"
+fingerprint = "sha256:028c5cb1434a75848b76d17205575f4f51616b77f4984507af12156fc3f9e8fa"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:16"
+command = "validate-bash"
+fingerprint = "sha256:f55c30ec32139c91f9552edfbebacb3723ffeb63b564757f5768ea18cddf1f92"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:17"
+command = "validate-bash"
+fingerprint = "sha256:070436954ec1097d46752da8bc70819aa7f819760755d9e9ac8e87aa603eed38"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:18"
+command = "validate-bash"
+fingerprint = "sha256:f9da5f59c467d8b312fcd42f8408d52c9e8485504d29996db8a7caf0aa5c17e8"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:19"
+command = "validate-bash"
+fingerprint = "sha256:06d957942aa2144f91b43aa19b30bfabc3b639c911cfde97e3c38ffd3d719112"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:20"
+command = "validate-toml"
+fingerprint = "sha256:670e250b9a3db7a326329f1138696496b1f82971e1c81a57cf36b2bfbd5476fc"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:21"
+command = "validate-bash"
+fingerprint = "sha256:e82b75a76398a8e9471898e698d033d431ff563a48d0ca987cfb7ead4778153a"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:22"
+command = "validate-bash"
+fingerprint = "sha256:d0e5deec340c3b9c2580140c6fcf6f7ea5974a714937b8a96432b5664f374fd2"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:23"
+command = "validate-bash"
+fingerprint = "sha256:8c3166a3fc81f0c8c86c5bf68a18d2f8a61007c75a437abe6c404ad0fdc44ba8"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:24"
+command = "validate-bash"
+fingerprint = "sha256:ef1f61485f6ee3782221cb92a940c31cada9569223126497bb7c88fca3478c2d"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:25"
+command = "illustrative-text"
+fingerprint = "sha256:624a11b2fcf2e1dc4840ec503d828d19e31c2d7a79c51032cd95070148920900"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:26"
+command = "validate-bash"
+fingerprint = "sha256:3e04d9a60f403f91b4ca1f8a1a748c8c5f1348ae11847906440e33d828b3ae28"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:27"
+command = "validate-bash"
+fingerprint = "sha256:3bc4c60bf582731230db5af1264f413110573dead52a02b1235d381574a22901"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:28"
+command = "validate-bash"
+fingerprint = "sha256:254874ea3f979e07245575ee5d7bc4fdc3eed37f6c00ce8df931b4dab900002a"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:29"
+command = "validate-toml"
+fingerprint = "sha256:b844f1f542d54e3db577d8a41ca88e11b8b7b3ad82bf2e1254f1530a70792b7d"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:30"
+command = "validate-bash"
+fingerprint = "sha256:813ceeaf0571dae6f63d22b968fe0510e1cafe640a242094e20f92cef4dce144"
+
+[[snippets]]
+path = "docs/guide/cli.md"
+selector = "fence:31"
+command = "validate-bash"
+fingerprint = "sha256:54108af02720070954239bc8ae0cbcad69f37ceb8c25accf9c2c2f91e1927d68"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:1"
+command = "illustrative-mermaid"
+fingerprint = "sha256:9f14a631b35ee1499d2a2414e0e6c65cf6eb0026e924d7691a8eeb4379419e7d"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:9e016509de33776827fe9d3b55690eeb839d76a354fa7b0dbbc9a74a32a096a5"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:94d920ec5bbcbf4099835cd8a6d72ede6f780213dbf73be8f83d6541f9225d73"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:4"
+command = "validate-json"
+fingerprint = "sha256:aa1097874836e142b9d94218c8b6a2eede168976681c2d769b182b7ff15a63bc"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:5"
+command = "validate-json"
+fingerprint = "sha256:36c567a8dd740cc7de67cf696a6161881c8a6a5e182a99cb3e0b7f979abded14"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:6"
+command = "illustrative-http"
+fingerprint = "sha256:1aad9f7409f4294f1c0961e7d3705f94b0cd4b10c00c4fe14150bc7787bbca63"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:7"
+command = "illustrative-json"
+fingerprint = "sha256:c3c18445874fb0ad43ff7240b50d1e06d15244f765e12fa0fc0b70d3f891dfe2"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:8"
+command = "illustrative-http"
+fingerprint = "sha256:e4b6a29098b17b6d223fbee7533a29de1e4103fddc46d1e2b46f1ccc4c06d220"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:9"
+command = "illustrative-json"
+fingerprint = "sha256:c7642b1d9127b938af05e3612349cefd0bbe2c4c33e58d68049cb041372062ba"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:10"
+command = "illustrative-http"
+fingerprint = "sha256:286ecdd0c7fc17200cc86aea77713a9eae47a98b9a5f70efc625196dfc8a47e3"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:11"
+command = "illustrative-plain"
+fingerprint = "sha256:c49de79a978bc51d316e7dd3dd737b9ff8e4d3e52a3fdb3596a57edf58830343"
+
+[[snippets]]
+path = "docs/guide/collective-sync.md"
+selector = "fence:12"
+command = "illustrative-plain"
+fingerprint = "sha256:6dce49cc5bf8afb3c8597b2e8d0e969ad9aad86ea31b4c31f6860bd395ba100a"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:55e54c734192397ae8daead87041612db9d9f1a8495f959f3b57154ebeb5b233"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:f89cbb79af0b96965b5edfd7462f23671722431ac24a724a227bcd92af5c1d83"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:4361b9609b85a3612cd184e3c035cd427e48c25be6f70b9c61da758310bf6937"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:08416003cf3cddb123d9548a0db75622f6822d13ab02d57f7d237c4228c38f60"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:51a6c16a3bcb42fe410f395684290956125113e3789b752192d5264b809f19ec"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:6"
+command = "validate-toml"
+fingerprint = "sha256:c05498bd9a0311358c27071afa8e281afb5a76eda419e319e3ed395d14b07b7f"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:77ec98201a376fad3f71068abe9c00c2b360d0e27687f7be4ebcd1b44409cd66"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:8f5043944a9dde67f1f6af0d8ba33d093ca3e05d5c6e61d6d5ee7df4abfacae4"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:791b6d1ca7adf6e2fd2a6c6f59bffaf14a6f4a3a843269493f921155db960698"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:10"
+command = "validate-bash"
+fingerprint = "sha256:2784f9833cf3dd48b74c2d7d89ab14b50936bb751c8d543538f809ef790d0b0a"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:af9ffb95278cc6775d164dc2a4833cd949aa8e64f547f03773716d625b5f5d5f"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:12"
+command = "validate-bash"
+fingerprint = "sha256:22f79a94836fa1be9cd1db2ea238c503d6953a9ee3ffa7229c370bec595a579b"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:13"
+command = "illustrative-toml"
+fingerprint = "sha256:469a152c186d5e2bf936d45880750c5a826a4be6fb5dab689bfc895f58075d56"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:14"
+command = "validate-bash"
+fingerprint = "sha256:a95a4b5a5192e2e7f4cfc46e9cdf973370c69b96e833df8df79ee8d8b965e2d4"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:15"
+command = "validate-bash"
+fingerprint = "sha256:682f17738d35e8967f5c49f55a20848fbdc6e6b578fb4766500392c9da26e3b1"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:16"
+command = "validate-toml"
+fingerprint = "sha256:2f17edaf8a0fe218a8050c707fbe434a12634703de251fe4f1fe941fed3f73fe"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:17"
+command = "validate-bash"
+fingerprint = "sha256:bc2278ef1f3820e06d297d573f8ef6c5300044d995dea0a684ce651156393a17"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:18"
+command = "illustrative-http"
+fingerprint = "sha256:d9866bc8e0dda529703e4a1aee95afaa0640fc9d43bebcc34fc6147c4a34cff0"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:19"
+command = "illustrative-http"
+fingerprint = "sha256:6cb87ed502f5360ec4400abb6cae37e6c4c94a5c0cf9fed30ecdc6d842dc7c55"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:20"
+command = "validate-toml"
+fingerprint = "sha256:410ecd428ee86af89b9e0277416864c59d0b87776254c6e59f54e16d1be36b0d"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:21"
+command = "validate-bash"
+fingerprint = "sha256:9eb0674b8c3706705e6c1666c3df61da67f0d7bccdec85cb2cd0f298f420dd48"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:22"
+command = "validate-toml"
+fingerprint = "sha256:918471e871f649835a47f5b83af9fc2ba64af1a844483b7081bd1abb767b2c00"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:23"
+command = "validate-bash"
+fingerprint = "sha256:260ae3f02edb1df3c8439354545c12a685a8b502c592d4e8b5f497d511492245"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:24"
+command = "validate-toml"
+fingerprint = "sha256:7629fd38fd5c544800cc6e4a44d22ff876f8aada50d800953b32e1bd9aa15bbe"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:25"
+command = "validate-bash"
+fingerprint = "sha256:29f3385b7020183c913f4ff19950e5396f25ec9ef04d2051cbf815d4b482791c"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:26"
+command = "validate-toml"
+fingerprint = "sha256:8ee177e445fbd38350ed3d09e262c63e8ceb8dffc816256e697b8b6dc0fb6714"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:27"
+command = "validate-bash"
+fingerprint = "sha256:4405d91e14cd3ca56be9b6f3dcaea293dd027cabba9b0b886c3fc1854e0806bd"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:28"
+command = "validate-bash"
+fingerprint = "sha256:9e502c94813c113d29106088ecbe0d62928cda93b010f566b687ce8f577f1f9d"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:29"
+command = "validate-bash"
+fingerprint = "sha256:1ddfba0d258b17eaa61a36fed4d244cb063007c8fd266c7f2ab6ccc1c6711d90"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:30"
+command = "validate-toml"
+fingerprint = "sha256:cba0b6bcef57f8d09137934eeed9943e77aee3d96104363a45421887a52b16bd"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:31"
+command = "illustrative-toml"
+fingerprint = "sha256:1783959f4964681217237cecdb59f3d1c061376965051c7a2e96d54223de2c95"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:32"
+command = "validate-bash"
+fingerprint = "sha256:e9dac440660210e926d5b895ddf28f9bbad97941a9412c3259cf39cbfec5816f"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:33"
+command = "illustrative-toml"
+fingerprint = "sha256:4f6ba81d759f50dace957bda18a4caa39bc678e5a659838115a887f643093dfb"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:34"
+command = "validate-toml"
+fingerprint = "sha256:fce2585e5e9083f89edbe09e1adeb18095c79eab532ab3225b8013aa4b1c8c13"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:35"
+command = "validate-bash"
+fingerprint = "sha256:edb668b55aa15fd64513812fd6cefe6f4d14ec8603b130b2eda2855736b4ec4d"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:36"
+command = "illustrative-toml"
+fingerprint = "sha256:af80c70a8f4c56b0d249edbd758343160da03863a25810e4e60effdc351f1c25"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:37"
+command = "illustrative-toml"
+fingerprint = "sha256:22fa48ce87e7ba1e273954071fb165a71cb1864b0b9f296514cab38b081ae44c"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:38"
+command = "validate-toml"
+fingerprint = "sha256:78d0dc627671276caf903797505c4aaca24c58d41af88d4f0906e237d31aa43b"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:39"
+command = "validate-toml"
+fingerprint = "sha256:12d9d00e8451b07d6689b80919d2ad8e29a4c66531c0bfcea055c47b8a955412"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:40"
+command = "validate-toml"
+fingerprint = "sha256:3c946db563e5a28b2c0d632ce65b7f960799e48c3d397d03a7d60356c983dc47"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:41"
+command = "validate-toml"
+fingerprint = "sha256:fbbd8201f29923d1ca5339a5a2631eb0b44dfaef628338bae51e132392c2d9ce"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:42"
+command = "validate-toml"
+fingerprint = "sha256:1b9dbaad0a4b279c46d8d63ed41b4c434d4d41d41585d784f9280855d420a7cd"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:43"
+command = "validate-bash"
+fingerprint = "sha256:74696d952cde6c83b5f50d89fa9a837de2368d8bffe06b0c53cc69c126c88916"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:44"
+command = "validate-toml"
+fingerprint = "sha256:20f7461b3dbdc6f0bae0189bff72096b54ad0299e022d6ca281c7a30d8bb32e6"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:45"
+command = "validate-toml"
+fingerprint = "sha256:0d7db5c9836cdd8dd8e7d3bca7a505dd9579df45bb791a4a522345745b863320"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:46"
+command = "validate-toml"
+fingerprint = "sha256:df5f5a536a01abea60ed4342191f334c234d5d985d9c17b0bff78308569ab5e4"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:47"
+command = "validate-toml"
+fingerprint = "sha256:7ad02952d790b493afd89feb0886f153fbf3576e5a57a13e2770ed81a520bb91"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:48"
+command = "validate-toml"
+fingerprint = "sha256:6c224bcd090472a13006d21d57b94d1e8b91553e227316169c071ee0c44bd0da"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:49"
+command = "validate-toml"
+fingerprint = "sha256:77c6e963cb841714d5452615077ea96078e92242615c049a375d714bba1506e8"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:50"
+command = "validate-toml"
+fingerprint = "sha256:d915d07903cf7a51381228b4d8487d5d3d7b6ec3544c577a9e088a5440927a9c"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:51"
+command = "validate-toml"
+fingerprint = "sha256:399c24f06c2b1ea3a0ffb4fd37bcb2de39fe00969e5f9418d95ed4d253eac037"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:52"
+command = "validate-toml"
+fingerprint = "sha256:ad6c3358b68963d408befa3effff1a05ab5789e474b48058134800143b5aead4"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:53"
+command = "validate-toml"
+fingerprint = "sha256:049166b27a49bb3d1c5e234ca1b8307eb16aee55cf8f7c04fbaef52a1d8aaaca"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:54"
+command = "validate-toml"
+fingerprint = "sha256:57959790f9e4ba05c78130b066605fd1f123354c0fc1992bb3694f4361a25228"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:55"
+command = "validate-bash"
+fingerprint = "sha256:3d6208efe3e99ad35db7b6e89170ab23318033dbd9cb902bec67e492ca5f38d2"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:56"
+command = "validate-toml"
+fingerprint = "sha256:ed491e20e950d0c5f9c0934a8c893d975fc991f63d83b8dc604d10b423a9c61b"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:57"
+command = "validate-bash"
+fingerprint = "sha256:f8354ba405f9650eb1adb6dd4bf8960c0eed75cfce229ecfaefcbe513d148ca2"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:58"
+command = "validate-toml"
+fingerprint = "sha256:82002e0cd5b574b9c76a43f72b505c6842ae58694cce5a333f924c44156e4ed8"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:59"
+command = "validate-bash"
+fingerprint = "sha256:c73697cb3b16d257114a9238b12d3010714fd7ba6872594102985c871f94af1f"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:60"
+command = "validate-toml"
+fingerprint = "sha256:36c07c7f4323f9e809929094b7d1e45d378f10df191191192b86a4c31f4f4cff"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:61"
+command = "validate-toml"
+fingerprint = "sha256:30bbd6e9b8519598a7f2c4a87cc2deb8387209fd4216158e8f6067ba79e25953"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:62"
+command = "validate-toml"
+fingerprint = "sha256:9794cb5928971bc69aaca0c0e59e6265d9806f17a1683b6633e8ec3dfdb34629"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:63"
+command = "validate-toml"
+fingerprint = "sha256:016b276737d1e76ee8b3b91636d93f64d75913d283243c2689e31d6891ea83dc"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:64"
+command = "validate-bash"
+fingerprint = "sha256:416ae2c0b02be4647eb99156ad5840bc4f12c43b2763c9bcd05d175336ccc121"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:65"
+command = "validate-toml"
+fingerprint = "sha256:e29cd6a49b56c33b068fc4c86eadc6c77f0568b24b4b807b00b96e2e8621cde8"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:66"
+command = "validate-bash"
+fingerprint = "sha256:82c9fdb11d806e78ee2fe4518abe85e00545b88baaba3cd88df2cd4506860408"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:67"
+command = "validate-toml"
+fingerprint = "sha256:d49c22e618f5fb5f8f5c0e6ffcaeb564cca241d6b5e6ff7c868c0b298d425402"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:68"
+command = "validate-toml"
+fingerprint = "sha256:1974e6b5e5e2e3442d0a63ff642ee06af3fec838174c09342b7313053b937654"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:69"
+command = "validate-bash"
+fingerprint = "sha256:8f4669de483f409c37fe0404d8a87fd03ba732badc0cf92d6fabde70229c0add"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:70"
+command = "illustrative-plain"
+fingerprint = "sha256:315b73d8516060bc6f13bafbf4939ac4130dd190ac685771ac4f490f469b6497"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:71"
+command = "validate-toml"
+fingerprint = "sha256:958bd6b9f8ebc252ea024c16eaa7afe7d6cfd9826da90812aaffad2be4dbc2ca"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:72"
+command = "illustrative-plain"
+fingerprint = "sha256:67f45cb57d45f94cae1887a0106e7df2b85a54d0096ab833def30bf38a76eaf4"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:73"
+command = "illustrative-plain"
+fingerprint = "sha256:7366b06e4126ff3170f2b2715d25d3ae5ca25fa4650788a5c171c11cb336c940"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:74"
+command = "illustrative-rust"
+fingerprint = "sha256:d0322f0dda2c8610338a07d3ca0ea13f05672c4044d9054adc3100ecfb42650a"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:75"
+command = "validate-bash"
+fingerprint = "sha256:88b50a4adbd4dcd56c38f8a7e3f2a52d69aa374e669e622b13d3ac5bbfe731ad"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:76"
+command = "validate-bash"
+fingerprint = "sha256:dd5111ee740e613440010e73138558d1ea2d5b81c48f33ea397beb6f5144d398"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:96098471c50bf593acc49475253d342138d296131fddba67496487ce0ea4e548"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:650a6cf9d70f49f5862cee2a4bc5aadd90e989be83a7605832643249a9c2eb8c"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:3"
+command = "illustrative-html"
+fingerprint = "sha256:fb30673ddc991a35b27b5acf9d803b5469f65c8f16117b149fb743b0fd936512"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:4"
+command = "illustrative-html"
+fingerprint = "sha256:fcecf1decf91909415e7699d6d5ff987327699606dc8278b5aba79c521120b41"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:5"
+command = "illustrative-html"
+fingerprint = "sha256:44d03ad94a12616b4ea0aa0ca1e927e84a3d9d589f77c838d243c2439e61ff89"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:6"
+command = "illustrative-html"
+fingerprint = "sha256:e6389fc818161e9beb513b78d28c62b87d98569b2aa1dec1ab6d5594b065d06d"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:7"
+command = "illustrative-html"
+fingerprint = "sha256:1e464d2a39685e3777c237d4e223884173209da42a3d9833b1ff917bf9696800"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:8"
+command = "illustrative-html"
+fingerprint = "sha256:23278fb00cffb0a5d93c682f68a21b753e17c3399ab4146149361779b4ebdaca"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:9"
+command = "illustrative-html"
+fingerprint = "sha256:6efd931e526bfd4f7fcca7ca2a18809b009b07b7dc9c70413f563604ea58735a"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:10"
+command = "illustrative-html"
+fingerprint = "sha256:4ca41a5f286ca5a65c110c1aa0d7e1c8247b9ac440a43ae15cc52cb83005f5ba"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:11"
+command = "illustrative-html"
+fingerprint = "sha256:569788bbea834a1d56f990aaece84533c7d990ddafc2c4c02acfb63f4b99518c"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:12"
+command = "illustrative-html"
+fingerprint = "sha256:7234ce6cd0e66f975d4b32e605fa55a9eebe2da161779d2ba758dcc293079447"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:13"
+command = "illustrative-plain"
+fingerprint = "sha256:a7d098ea969c959cba65271fe489ac749184a6af50a4ff38cabfb72c1011978c"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:14"
+command = "illustrative-plain"
+fingerprint = "sha256:037c532879c8b8bb5c94f00e3b701826ee87d58c6a7d649e9497fa1e19e9ba22"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:15"
+command = "illustrative-plain"
+fingerprint = "sha256:4964a453ba2e3da85addeb53f67e0ec88bf70459c626313ff43a8ad27a126ae8"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:16"
+command = "illustrative-plain"
+fingerprint = "sha256:49acd26d668e85b867c1f160c52c8dbeaaa5f226dcd84dc64ff675af03ee0e13"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:17"
+command = "illustrative-html"
+fingerprint = "sha256:7ccd7248abdda46d643601139004af2c70f150823b1163b8452546c7ccc7e417"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:18"
+command = "illustrative-html"
+fingerprint = "sha256:30c0b021be1e8e2ab9eae8a440721f27a7df3016e910922005f12c934dd20e41"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:19"
+command = "illustrative-html"
+fingerprint = "sha256:f0469780a2f2285398e0cac6316565203f893d27eb876f0b7c45f7b6c57a2733"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:20"
+command = "illustrative-css"
+fingerprint = "sha256:cfe85c785a85e9094b4b4469fdd8f38dad49825b229d7130ee3c17b9d4f706ca"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:21"
+command = "illustrative-css"
+fingerprint = "sha256:7cf8b56c88299c00d4e5e1324e60464ac4e87602c1ef78bfc50207be041ca03b"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:22"
+command = "illustrative-css"
+fingerprint = "sha256:6d135d73b25cd95b8a60191873b904c24394c23aadd46eafe1a6e0b3d1baa41a"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:23"
+command = "illustrative-css"
+fingerprint = "sha256:dfc18e3715fdaa27ddca65b333f386134dadbc6a405bb4d684c1e73560a512af"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:24"
+command = "validate-toml"
+fingerprint = "sha256:e17eb27bf9d5e57b2228f9aa246934f694fc8315cf3b7035f6d458f653092d0b"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:25"
+command = "illustrative-plain"
+fingerprint = "sha256:adf0a5115e9202aa4b8d290745fdb0d6491c53096bee8d51b6611182353b2cc2"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:26"
+command = "illustrative-plain"
+fingerprint = "sha256:03a6769134fd5e3f3f1d756569a02de544d1d910051ee099ec9e4a790cdaed5d"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:27"
+command = "validate-toml"
+fingerprint = "sha256:876b161971aaf00ee884702ad092f6b329c0635f9cd0697e2fe2161df935d346"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:28"
+command = "validate-toml"
+fingerprint = "sha256:d8462546523f48499c2fddf032681bd8c9c93ddd768bbb52526023b27f25d8fd"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:29"
+command = "validate-toml"
+fingerprint = "sha256:08cff81e4c69dcfe9c85b59a5126c8e08994ee1f124dd31763c574cbd95f102f"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:30"
+command = "validate-rust"
+fingerprint = "sha256:9b571a15c99841e5d08de195646e020024119644aff4f4fdc880f8d47e98dc09"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:31"
+command = "validate-rust"
+fingerprint = "sha256:f64d0f8fe51c7de4bd79596c97499e33e9e5f75bc96f469d62e1ddd880e3cc5d"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:32"
+command = "validate-rust"
+fingerprint = "sha256:a89b982a2d3184d3748d3ca689ad0b2670ef92f46294bdef44db8a4050f9a169"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:33"
+command = "illustrative-html"
+fingerprint = "sha256:e4515ac7cc79554d6803f8abf52fd2880acb01260ee832145be191ecd4173e72"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:34"
+command = "illustrative-rust"
+fingerprint = "sha256:bfd7d401535a0027dba249cab15e6443413ae53f81b058f72bd32a927212da94"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:35"
+command = "illustrative-html"
+fingerprint = "sha256:c361154d194f7308f4be1be287fc70fc83e951cbc5ced289b4a5eb143d2600bd"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:36"
+command = "illustrative-plain"
+fingerprint = "sha256:9f65efdd7900ef0acdbed0dcd8316056156a96e5169051b856241f0bc89a0a20"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:37"
+command = "illustrative-plain"
+fingerprint = "sha256:7aa49975fbef7338784c0b9e5e780ac8a53cedac3428812e97592c63c68be801"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:38"
+command = "illustrative-http"
+fingerprint = "sha256:4d0b5149bd5f983e05ec2cdb8394acd688a8433d3c1e6707c3e2286ae9a138fe"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:39"
+command = "validate-rust"
+fingerprint = "sha256:15d19327854539ce55b2a173470244bd8248318616296003d022c2f9c635bdbd"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:40"
+command = "illustrative-rust"
+fingerprint = "sha256:3e1c5e0e97608242aeca65234f64db4826a6ade3655506e26e4f52f2d8215fae"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:41"
+command = "validate-rust"
+fingerprint = "sha256:1b7dda1c0eb1c9ec2358255be22a8708000fbc84fc64449cdc314377fdadaebe"
+
+[[snippets]]
+path = "docs/guide/creative-processing.md"
+selector = "fence:42"
+command = "illustrative-http"
+fingerprint = "sha256:1038650eb79f74bda67442e9645c0f1298e1e8b540a26dd8fa447cb8a7109170"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:58edfb265460c83f8e083d31084cb756d457d6af430f1b0fb2662835d60674a7"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:bd001b3f70d533f32c3f0397abffc8c8b3c781af6eab8eaff40b32e38aca9ebd"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:b51d555fda74553a781dccdd610d804919cac13c128320a77fbf326dd8bcdae5"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:f08462859622954031453cb6efcab96a99c147a857624f5c4a3d9d3ac34d6540"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:444a0fe22c0c363ab56b086706994468475b1cf3492f00df5a1fd9bfd45db922"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:6"
+command = "validate-json"
+fingerprint = "sha256:af7966364875e9d1824c87c6445f5a9a800db5e219eda3cc47abfac172fd92d6"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:10cc6e759ba35749751c6e5d87932422aeaad0d28eedcf5dda7486d1f59b430a"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:8"
+command = "validate-json"
+fingerprint = "sha256:43998ead4e0ac8394c109ca7220a60f302d06ff1bcc669d6fd7a25c73b78e7c6"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:ac3b9371d3c7e395f4d6887a8e8ea5d5993bc43564fba0ca06dbac950dd6cb8e"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:10"
+command = "validate-bash"
+fingerprint = "sha256:4058be8c2b03aca989def6b280734a4012190375136d98ef665ad3b92f0ff632"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:9bd536822dd408f3dfea09e774dd4fc557be88b4388aedd7cf76f915422375c0"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:12"
+command = "illustrative-bash"
+fingerprint = "sha256:0c963b7bbe162185c3c3f2b8303a49de7d25d2fd2ea65b26283042a13b17b58b"
+
+[[snippets]]
+path = "docs/guide/ec-setup-guide.md"
+selector = "fence:13"
+command = "validate-bash"
+fingerprint = "sha256:92d243b0aef33d52f3eac13150c33cb1cf8f35ac66cb0b14943897bfa0c242dd"
+
+[[snippets]]
+path = "docs/guide/edge-cookies.md"
+selector = "fence:1"
+command = "illustrative-mermaid"
+fingerprint = "sha256:e8448fa8944b726d0cd79667cdb4589d459977bfefcfb14bd7d2b969f66fa135"
+
+[[snippets]]
+path = "docs/guide/edge-cookies.md"
+selector = "fence:2"
+command = "illustrative-mermaid"
+fingerprint = "sha256:fdaecd90425fd99b6adaaeeb5659977440039f2973d8132bffda3716b47f21f8"
+
+[[snippets]]
+path = "docs/guide/edge-cookies.md"
+selector = "fence:3"
+command = "illustrative-mermaid"
+fingerprint = "sha256:b8f53f809aeae9251722b5454780dbd2f3b29d22af8b1c85c9fde0afbbd0c8f2"
+
+[[snippets]]
+path = "docs/guide/edge-cookies.md"
+selector = "fence:4"
+command = "illustrative-mermaid"
+fingerprint = "sha256:9467bb4a698e9f62487433b01e1ee97dde9942d4c35757ede3d9b04f81f8fec3"
+
+[[snippets]]
+path = "docs/guide/edge-cookies.md"
+selector = "fence:5"
+command = "illustrative-mermaid"
+fingerprint = "sha256:660afdd49c50f4e376e89bbc69983c63a2969131a42a00925aaada9a3dce0f67"
+
+[[snippets]]
+path = "docs/guide/edge-cookies.md"
+selector = "fence:6"
+command = "illustrative-mermaid"
+fingerprint = "sha256:af4610ef92c6d7568c87ea96a2ac26f1c3c68aa015740f2c6ccffebdcfe64bd4"
+
+[[snippets]]
+path = "docs/guide/edge-cookies.md"
+selector = "fence:7"
+command = "validate-json"
+fingerprint = "sha256:143e570c76dada5d6a1c6f5c8c7bc359048304bc8a613c8d3ef312c14c2e0371"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:17c28c99598658b01794d2426ecb21c00de98227c33a567168df77d97c51247d"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:2"
+command = "illustrative-toml"
+fingerprint = "sha256:7910b2f847f6073dacfdc550c8fcab201204b855850acc61b2bd7ecd1b7e298c"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:3"
+command = "illustrative-plain"
+fingerprint = "sha256:3e7a3bcddb0430710c19d2041b0f7756d0da557345a94735eb79ac4431bc28ed"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:536c5f7d0fc94ec15a11490f7bc9b99b6ccc1e5d7d49cdc5356813a74ebd9b70"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:5"
+command = "illustrative-plain"
+fingerprint = "sha256:2b02d21b9173690de99d6084889eb5b7ad0245c83f68667c44d0eaffc1bfd7b9"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:6"
+command = "illustrative-toml"
+fingerprint = "sha256:02963f26ac781d68bfab7ed7850ba070bf8ef2e70fd61103386ca09b85bf31da"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:9005aba2c9124b344bdebbe0e2b52bafe5e1a0c9cd57ff1b95270cb0597f1d68"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:b3d9b345f0722a73cdb78cef8caca54db1a2adb565ded40fd6ebae3620160edc"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:9"
+command = "illustrative-plain"
+fingerprint = "sha256:0e37417f24d04ea06461a8fb8faf234c311231f01aa279822075668f3709c936"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:10"
+command = "validate-toml"
+fingerprint = "sha256:c0c93770552ead2ba429f678276c3aabe3edbfb1ba6749c49b465cdbca789aff"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:08685e0778af213f9f044cce77a1d698934aa45c8e05892290750dd5018a276d"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:12"
+command = "illustrative-plain"
+fingerprint = "sha256:4fa8e1c24d6284314e6b9f6df9d1de31935570a960f97e440f6e53b8107391b1"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:13"
+command = "illustrative-plain"
+fingerprint = "sha256:538e72cf332000ba3635f329364bccf299666fc9237d49c0be35d712eb6c12d5"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:14"
+command = "validate-bash"
+fingerprint = "sha256:c57aab6b34e568fdedf77054b56e51e6f6e5ffa40a51cf18a922c443646ab5c6"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:15"
+command = "illustrative-plain"
+fingerprint = "sha256:3afbc4e7c50910708538f0e6aacd4a333dc1c7124d972fa7dc26d651abd4ef5d"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:16"
+command = "validate-toml"
+fingerprint = "sha256:ac6fc7bda0706eb5ab305337715ec031def9042530c4265a1b3a5e57cba6319c"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:17"
+command = "validate-bash"
+fingerprint = "sha256:b094307c58ad6ddffbfc7054c58fac4a1ac0e775772a4eca80ec4657dbd95b91"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:18"
+command = "illustrative-plain"
+fingerprint = "sha256:40c64520c12f10e0a7d794b4634439201f4c43ee22b5d6d85bb3b38e41e95240"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:19"
+command = "validate-toml"
+fingerprint = "sha256:6a369234579f252bae5396eb955b90644efab12c24a58d3524552ea68b32db31"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:20"
+command = "illustrative-plain"
+fingerprint = "sha256:23134eac449e8e37cdc116e0b2eca22a526db8c8a9ab5f751117e9f90391c65e"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:21"
+command = "validate-toml"
+fingerprint = "sha256:7c2fa3565ce11103eb972dabc8c9349c5284c029bc825c51e7fe61e8dd5f4d79"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:22"
+command = "illustrative-javascript"
+fingerprint = "sha256:e84131410ff560a8de17198cdd1798351ddd6d871f475ea6d087abc6dd2b9c2c"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:23"
+command = "illustrative-plain"
+fingerprint = "sha256:e443558e331b88a316ab2b3fbf708f89602d902861b6768441a639a57656f830"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:24"
+command = "validate-toml"
+fingerprint = "sha256:ba48e7f94724b7b90f4dbe6c0ef32135565e11baff0ceb4ab11da4312be5809f"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:25"
+command = "illustrative-plain"
+fingerprint = "sha256:af8703fbdd5755d79902ac8552ee42af46ea1ff852b63b78dd5cf96bcf0e23dd"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:26"
+command = "validate-toml"
+fingerprint = "sha256:8dd065190ae28f5b09c92e3ae83e2f6a302259f10e871c3a4e7c8acea78a5534"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:27"
+command = "validate-bash"
+fingerprint = "sha256:096517fe95bcce868e2944558d4f474c6b5a0c4394317f1c580fbf8addd772b2"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:28"
+command = "illustrative-plain"
+fingerprint = "sha256:d7bbe46fac8922831fd805ae79c04546d30fca236a155f9e4900f4695930a04d"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:29"
+command = "validate-toml"
+fingerprint = "sha256:75c566cc8796386c64953ee7f37c64e5e420c7a5b633c7b9bb94659cd64991b6"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:30"
+command = "illustrative-plain"
+fingerprint = "sha256:c70c7adc63636b0ff07418b738cb99c6649a2376db1c38ea16e864919b6585ac"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:31"
+command = "validate-bash"
+fingerprint = "sha256:fff65aa04a43b443fe17216720675ed429e64038e17b30ee1e1c8fdaf475950d"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:32"
+command = "illustrative-plain"
+fingerprint = "sha256:32666cf8af5c2667c999d9e815420c621c267460f8e357362faabe3e8a200a82"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:33"
+command = "validate-bash"
+fingerprint = "sha256:fff65aa04a43b443fe17216720675ed429e64038e17b30ee1e1c8fdaf475950d"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:34"
+command = "illustrative-plain"
+fingerprint = "sha256:161b05f6c0863a91a7bb34e2634dbab594dea5d5f73a45f87d87b2c610610040"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:35"
+command = "validate-bash"
+fingerprint = "sha256:c53140b06dc8891dcfeca2f06cd4b3d47a45875508459d72920012e44d0a3625"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:36"
+command = "validate-bash"
+fingerprint = "sha256:46d564a1fab4a259804edfdd6965d06b0e21d79b478eb1ba9bee0ccb86aaa85b"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:37"
+command = "illustrative-plain"
+fingerprint = "sha256:7597d52f67919473619a968d092854ef9a7d382ea44b2e98c9a148aff3b4c718"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:38"
+command = "validate-toml"
+fingerprint = "sha256:50e6e7a6cf8b28ca34c67f0e539054bbe1096740ac7c472183360688b997097e"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:39"
+command = "illustrative-plain"
+fingerprint = "sha256:6889afb3c5dff45fc51637481c4a04a66f4c8c0350ffc02019f21c0d7c09610c"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:40"
+command = "validate-bash"
+fingerprint = "sha256:3d95dcc2e5f200b70bd5d9acc012260598916226baf8d781f5be0e090bedca51"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:41"
+command = "validate-bash"
+fingerprint = "sha256:793635edf51b86b15e1d57d95e8c130ca25452aba4ede016d42861700613fb15"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:42"
+command = "validate-bash"
+fingerprint = "sha256:ceb08081d6acc7e3f842541fb145822714258d14a98e74bc468b57a097882e44"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:43"
+command = "illustrative-plain"
+fingerprint = "sha256:98568d914179c729bef22eac9023969c7bef0dade1cbd8fd34319356197c98c1"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:44"
+command = "validate-toml"
+fingerprint = "sha256:8bfe27e9203f97803d22573d675df3cac501f79b09431b80291d398b5226a4ad"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:45"
+command = "validate-bash"
+fingerprint = "sha256:1491c0de3600ac4755a87352be2451afc6ccc300e4735cc441666bc2756e6791"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:46"
+command = "illustrative-plain"
+fingerprint = "sha256:ecb878de760149d84af5befd8525613421eade8e4f9f910d7c703283aa6a5bbf"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:47"
+command = "validate-bash"
+fingerprint = "sha256:f29229c402dac12b3ad21c6be901f78184095f3d57b51fe8f4d57e6e404d3331"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:48"
+command = "validate-bash"
+fingerprint = "sha256:dae58de3ddfde95b066b259e24d83e50d15aedeafb58b0b20d7b26dd324ef0ef"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:49"
+command = "validate-bash"
+fingerprint = "sha256:bb6c63ed2350bc0c85efcade606ea97c5aa07f6cc33f0fca96d54842e8cf9f35"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:50"
+command = "validate-bash"
+fingerprint = "sha256:29ba55c0247f88be3db2875bbc42e716f3a7bf909b62ceab7ad9724fb46c1bcf"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:51"
+command = "illustrative-plain"
+fingerprint = "sha256:ab6f9766e1675aa927d74b051834d09fb68a4115a337e22de71acd5e31789750"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:52"
+command = "validate-bash"
+fingerprint = "sha256:3ea371184b4f39fe90ef7e80392b196bcdc5d06464d252f9948194cc5a937ed3"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:53"
+command = "validate-toml"
+fingerprint = "sha256:d634d4bd0c55effe3d4b0c1d8c5ef8acf3cec2d82a18c884302c17a056f22743"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:54"
+command = "validate-toml"
+fingerprint = "sha256:7c2fa3565ce11103eb972dabc8c9349c5284c029bc825c51e7fe61e8dd5f4d79"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:55"
+command = "validate-bash"
+fingerprint = "sha256:75445afe9015ec355afafd52bf74bd381b1a8c253d16a42847e8edc771b1c9ee"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:56"
+command = "validate-bash"
+fingerprint = "sha256:e42c130eef99955a971186cfa04ac5b1e4a63691078afc61fe4b19101325400d"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:57"
+command = "validate-bash"
+fingerprint = "sha256:be19c9f39b7567c058cf156fa16215a03609b6654a8d2c12c71b15b25aa873b2"
+
+[[snippets]]
+path = "docs/guide/error-reference.md"
+selector = "fence:58"
+command = "validate-bash"
+fingerprint = "sha256:60184e5d18bf35a5ab156c23a1b4110e6a04e28cf2c3eb1a39fa33fc52b7a718"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:94300a1b59e593249a81d1e7c07e54bc08c5394004c8e18b1f885e9a37c6520f"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:2f17edaf8a0fe218a8050c707fbe434a12634703de251fe4f1fe941fed3f73fe"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:3"
+command = "illustrative-vcl"
+fingerprint = "sha256:a760ee7882621391b07d0a47247372be5f0a2ba3c25a480eb6f6135a648b15ea"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:a39483b2fef3bba55b9eca73bb8c114638e14058dfb2a6b1a44fdbd9bc9039d0"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:c3022933b68c0ddf995ceeeda7d11a09804b860b5ea0fb60deee26c347780373"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:4c8e28d8cd248ae7e522731ae6534041d7a742364c9f77eadf079d1aa0d6cb99"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:7"
+command = "illustrative-text"
+fingerprint = "sha256:f0fe5b15388e0125ba4196904386a08ddab20607a607426e96c633f24563ebef"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:a9cedfac52067929f6b1d45219d93aa8a18a3a0c322762d92ce25bb368594934"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:686f02063627b7420a218fb7bd584dc9c5cd06adcb6a613d56b8b65d354edf74"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:10"
+command = "validate-toml"
+fingerprint = "sha256:062cb4132ee844b543aa8b28ed994da5c7f9d9c3d8b72ee6926858b0a41611b8"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:11"
+command = "illustrative-bash"
+fingerprint = "sha256:199172da6a461863827e2740ff814880b0f75627044cf3edc6632106665999be"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:12"
+command = "validate-bash"
+fingerprint = "sha256:9bd536822dd408f3dfea09e774dd4fc557be88b4388aedd7cf76f915422375c0"
+
+[[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:13"
+command = "illustrative-bash"
+fingerprint = "sha256:0c963b7bbe162185c3c3f2b8303a49de7d25d2fd2ea65b26283042a13b17b58b"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:1"
+command = "illustrative-mermaid"
+fingerprint = "sha256:8d6e7ade18725c27c8136b6c268f2aed55eaed024949d8db93af7be01d921f17"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:2"
+command = "illustrative-plain"
+fingerprint = "sha256:a8c056d3ae6db7876299179ccd9e4be1f6ec9340abe1e1f2a8f8032dcbaaf54d"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:3"
+command = "illustrative-plain"
+fingerprint = "sha256:b9f3a464e3f7a179d54fbfbe99335c927224dae36589a2ef22a598a632eb33a1"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:4"
+command = "illustrative-plain"
+fingerprint = "sha256:efe57d07216b42127a9d18d105c0a492f4f5539cd7fd7bd72cbfa1c1490b4b5e"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:5"
+command = "illustrative-plain"
+fingerprint = "sha256:dcb14dcda704b9de9f40da521a20ff2af5a2f687f2dbf750c598661f8587a0c9"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:6"
+command = "illustrative-plain"
+fingerprint = "sha256:b57b44259a3ca7d57c3334ef5a613db1f413f83f0f85bc8c691b45f02f02fe3a"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:7"
+command = "illustrative-html"
+fingerprint = "sha256:d2a842305ed8956790b22fb07e4b8f2e279c1e6a226128f1eb98c34004f2c7a6"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:8"
+command = "illustrative-plain"
+fingerprint = "sha256:0b9c967c28271d0b528c12bae64ae875386ca98b969aa6a9561190b973b641e0"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:9"
+command = "illustrative-plain"
+fingerprint = "sha256:e3841f1dd954b16fcf721de9587024213be4a51c73902604881e7df0ebe2a4d4"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:10"
+command = "illustrative-json"
+fingerprint = "sha256:c2d074167aaad8d5816e5ff59f2b2aa368f351ccbc846741522b0f2b45d306a7"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:11"
+command = "validate-json"
+fingerprint = "sha256:468cfc5d62e7aa2d4400838ae6adc1eca5ee62a48f87e60cf467aee7df07eb48"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:12"
+command = "validate-javascript"
+fingerprint = "sha256:147d70bc0344004042da3fb818e68bca76cde87302c88d649efc5a3e2ab98641"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:13"
+command = "illustrative-plain"
+fingerprint = "sha256:85569b44f8567c64a76c2e61e0de70da4e23b24415dc8ea2314edb0d547a368c"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:14"
+command = "validate-json"
+fingerprint = "sha256:d3c5d1e01e213bebb19f1ff2f08a9083197ba47f64895bdabb2cddd8ee9e5945"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:15"
+command = "illustrative-plain"
+fingerprint = "sha256:bbd256a80ff33370182c141cc9fe830aed78513370c49ce5486bd5ac9b6989d6"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:16"
+command = "illustrative-css"
+fingerprint = "sha256:a3b17f49bfab2992fe726a8963df272bb5aa736a98a9239790fc2bbdff793fbc"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:17"
+command = "illustrative-plain"
+fingerprint = "sha256:e20125458512c2eb494ae59fb6a5c528dd756e303d1afc4aaf6f51e927c6d823"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:18"
+command = "illustrative-plain"
+fingerprint = "sha256:f329d9ee3105bbd840e5f8ece9cd27b745f56a1a02c4bacf1efccf1d675c947b"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:19"
+command = "illustrative-plain"
+fingerprint = "sha256:b9b5c0731f1e396e9f5f4083c3bbd6c102230f2a9b1b618a6e154c4f876fc480"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:20"
+command = "illustrative-plain"
+fingerprint = "sha256:f2d8cf1d2fdcdc6c67a7d948cedaeac617d3d76c6573b950f9e0473981d74759"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:21"
+command = "illustrative-html"
+fingerprint = "sha256:7210c6ce350a4c283e878b98472ef5fe34b0c2fa5928523a96c179705bca1019"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:22"
+command = "illustrative-plain"
+fingerprint = "sha256:25f4b8917f1693e84c0e3fc4d3156c7bbe1965fdecbb3f86efffdaa50a4c2f1a"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:23"
+command = "validate-toml"
+fingerprint = "sha256:f9863a38a05b99c04b69da8db8297cfc5782b70ada3d073cfb49dad66bdc9f0e"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:24"
+command = "validate-toml"
+fingerprint = "sha256:0d7db5c9836cdd8dd8e7d3bca7a505dd9579df45bb791a4a522345745b863320"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:25"
+command = "validate-toml"
+fingerprint = "sha256:1b9dbaad0a4b279c46d8d63ed41b4c434d4d41d41585d784f9280855d420a7cd"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:26"
+command = "validate-toml"
+fingerprint = "sha256:20f7461b3dbdc6f0bae0189bff72096b54ad0299e022d6ca281c7a30d8bb32e6"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:27"
+command = "validate-toml"
+fingerprint = "sha256:da8c3769ef291b23b5096bf8945eeafa127ddcfe143ea7be31391dba43ad6c88"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:28"
+command = "illustrative-rust"
+fingerprint = "sha256:dbe0fc6bf9e763aa2407b2628eab35bd4374ceb40518bae20b13d5b2087c32c2"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:29"
+command = "illustrative-http"
+fingerprint = "sha256:4d0b5149bd5f983e05ec2cdb8394acd688a8433d3c1e6707c3e2286ae9a138fe"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:30"
+command = "illustrative-plain"
+fingerprint = "sha256:3eebdbe5eb159a2fa149e3911ea4e46c7e2b947f01ffd8d3bbb68c6d95a1d10a"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:31"
+command = "illustrative-plain"
+fingerprint = "sha256:d90410f77d12e80c39a5a678ecea69ebe8d4f00fc758735ba87f6a1e1dc0d35d"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:32"
+command = "illustrative-plain"
+fingerprint = "sha256:2c274c5861e801c56d06f98f82109f9b10c275e80e2a49b2f492bd1f5b5040bc"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:33"
+command = "illustrative-plain"
+fingerprint = "sha256:fac8a9f13e41514dc4a597effc8cfb0dfbdf80ae5efa46d6de3f49ffe6a209a2"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:34"
+command = "illustrative-plain"
+fingerprint = "sha256:6e9db7624471c9886fd304b93c561f5a70d93cf580ad4c6d2d602e049cdcbdde"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:35"
+command = "illustrative-plain"
+fingerprint = "sha256:26c2f66d846a1a2496edd4b7cb94a80b86de67a1f8f355675463977ace35e453"
+
+[[snippets]]
+path = "docs/guide/first-party-proxy.md"
+selector = "fence:36"
+command = "validate-toml"
+fingerprint = "sha256:f01464e7750a46a13f1707f2a52e71e64e596e89ef4296b00ba948a1f72676ba"
+
+[[snippets]]
+path = "docs/guide/gdpr-compliance.md"
+selector = "fence:1"
+command = "illustrative-rust"
+fingerprint = "sha256:91974189c83c1fe1d4807b43597026ed846151583caf6ee42e1317b914fbe5c4"
+
+[[snippets]]
+path = "docs/guide/gdpr-compliance.md"
+selector = "fence:2"
+command = "validate-javascript"
+fingerprint = "sha256:d575c4614b0e12925184cf912790e159313551bea920e5172d801facd4a8377d"
+
+[[snippets]]
+path = "docs/guide/gdpr-compliance.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:14bae8c24d829f209500f947d2825c1634a7620236be42613e81ae2a7fe75df2"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:eabf91ebd3a46ad8b9ae8f6d4573c54f8723033611cb5aa8a6870fc4e8d88144"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:fb29366028a3927f0c78d9b13522d15eb9bdde31097bfdb19edb2a994f7d54af"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:3ea371184b4f39fe90ef7e80392b196bcdc5d06464d252f9948194cc5a937ed3"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:27e7383df1f4a402e36ccc0dc2c87bc1c28329773552d6e2d76b95c0346d3685"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:2125ce943b5a9419b52d07acaff4ef1f47ed7f6b4884004c67da717bb46e2959"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:30179fc42f01eac40fdbcff86dc789af72962618e9705e16b70c19a2971bc1d3"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:321d108d3dc336dda9b0c7a62a40209f9f20c34207d61d2fadf646647aac81dd"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:bbbba0ba9d4fb87c61945ecce65eefab20f7fbe1c9d3880bbfe99a2a5075c6b8"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:d925e346585a3a7d8c0957ad033418a4997c26a2319a97865949f0443ac6cbaf"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:10"
+command = "validate-bash"
+fingerprint = "sha256:088f9417c0f4acd7ace3b431b4e1b28f6d387c54e2b1d394da47df97a32cc871"
+
+[[snippets]]
+path = "docs/guide/getting-started.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:e6a10392d4b48f1aee2a6b8a1f885fd270877b1b4296f2a7fd17905d2e505910"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:7390058b1fe00bce36a385bc215f319b46671e1b8ddbd5b70d58e8b529eed35c"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:2"
+command = "illustrative-rust"
+fingerprint = "sha256:52c46f4010fa14c5054e558df6ae8f655ad3eeefa1e420d92358cd61d022a16a"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:3"
+command = "validate-rust"
+fingerprint = "sha256:ff31cab8873e20a1c06f17cf2014f7e1d3d25ff5573146be4f583a35ff17d49f"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:4"
+command = "validate-rust"
+fingerprint = "sha256:0ec5068938c5eb7cf31377b75a78bd38cded5944283a9c83dbe5545092a4d919"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:5"
+command = "illustrative-rust"
+fingerprint = "sha256:dc1c0730d7e55d011dbd097ae411fbde634897fe71449067b84a74dd7f860709"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:6"
+command = "illustrative-rust"
+fingerprint = "sha256:a77ac7206f059e4be1cef10fb2b710bc0c8c0e3a9bf77cd63190d667b3e4441c"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:7"
+command = "validate-rust"
+fingerprint = "sha256:60351e28a9d2a7884354aeb1b2ccadd6c3b0925ca4a507aa6b1ce4640a15320e"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:8"
+command = "validate-rust"
+fingerprint = "sha256:8436c5a4ce7c999eda9f99760fd6e5c0be6ec9827a47ad8e4a140286d8c57b20"
+
+[[snippets]]
+path = "docs/guide/integration-guide.md"
+selector = "fence:9"
+command = "validate-toml"
+fingerprint = "sha256:6ee6434548b03ff75acdcbfaf8f7f288307603c6cf66a83f447fa569b033bec2"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:c5a255b45ac0b350aa0b873022dc4c1784bacb3503352e13cea19c74e1f92240"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:892b0dec820b1492de6300382d667dadf6de3fec9943ec2ac8a8cb9199e17c4c"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:530bb748302c9b111e583b9258e810f14ca8672c647011252c14e4efa2c1a7b0"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:29a6117f7b495069dfec7dfee8ccc4f3a06e6bea24502054db2ab24669565e95"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:5"
+command = "validate-toml"
+fingerprint = "sha256:82002e0cd5b574b9c76a43f72b505c6842ae58694cce5a333f924c44156e4ed8"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:6"
+command = "validate-toml"
+fingerprint = "sha256:65303a0e8ad9f503339dd8c4ee9ee7b26a122a5cd44b73ca24ae5ee63cc49d23"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:7"
+command = "validate-toml"
+fingerprint = "sha256:cc88d4ab632b17d9c3bdb98865e6a597647d9a8b54de803f44e70519b8d14396"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:8"
+command = "illustrative-plain"
+fingerprint = "sha256:6757971de9043fbd19bef834e501333b6943fa7a7025ae20f276586ac78751e2"
+
+[[snippets]]
+path = "docs/guide/integrations-overview.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:4574779335c982c27b83f09cfb11e8c3db3bd43f22ce71a736eef7e20192a1c1"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:2296c4ed7ff235798947144b49ab21cc9c983f5e277e1413da40e5eac45f13ee"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:2156a96608566244e78d473e36997923fd2c968cd695e77d0cd90a37c9a3e5b7"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:3"
+command = "validate-toml"
+fingerprint = "sha256:129945b460e1f724280f3f98cf777892e95efe3bfe1daf82d08c9b74fc83731e"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:c6ec092dbcee1587f047c00fd619a2cec0b44888e41559877131b4d4f5577101"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:5"
+command = "validate-json"
+fingerprint = "sha256:5d18ac7fa6c6530f720f8ae2b3efa7b9aa57674c8b834fc8a81de256fb9bd5b8"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:6"
+command = "validate-json"
+fingerprint = "sha256:c89e5d535c1565b4b5d6e4beca3f8787606515f9658d5201d4ec03739eb6ea4d"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:7"
+command = "illustrative-text"
+fingerprint = "sha256:cebb0869afd292634bbfa18b16b054f4fea3ca07a693fe1e84ffde17e22935b9"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:8"
+command = "illustrative-text"
+fingerprint = "sha256:2323c2cb5882c070d2395fd1c466155e6ed340c6da6ff5eeeae3cabd989d64f7"
+
+[[snippets]]
+path = "docs/guide/integrations/aps.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:5be469f18c13e3c1cfbdbf265f05255fa3b80f0809968e03fd9daec8c03eb33d"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:8e670a42bcf0453c1a99c1b0953aab08526600bb0202f94a04c59b63874b8d74"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:56432e60f6b1143e29474a79ec8d3db9f2249f96cd9b2ddd5b9edd36bd9580ba"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:3"
+command = "illustrative-html"
+fingerprint = "sha256:2cf55d36a8d918ae32a421970b7c0a61eddaff59693d734200784a6c89373b72"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:b3247fe329b90b628cf89f19f83a30db669e2f7c9c4dddfffff85b2b3685eac3"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:5"
+command = "illustrative-html"
+fingerprint = "sha256:a9658d1b52b3def5764b99bf5dac441c8a98c2adade54e8b002c7ca7aad93be3"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:6"
+command = "illustrative-html"
+fingerprint = "sha256:d9e1249cc30a6b7ee2d13511a5ef98d2d6cbefc8b1d0de8c6fd9bacb351272fc"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:7"
+command = "validate-toml"
+fingerprint = "sha256:8b5e0d06d5952924975b625af556fb04d623628dc8d0d5b5cc3a9851bba47119"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:8"
+command = "illustrative-ts"
+fingerprint = "sha256:91eb16d1e227b0ffdb2f67eff7871b7384f71a3c95cfc5b34a12408eeebe252a"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:9"
+command = "illustrative-text"
+fingerprint = "sha256:65acf67d59d6cfd7658a6f6536c89ce61eee3d8e0c494976d75d1706efe53de2"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:10"
+command = "validate-toml"
+fingerprint = "sha256:25f48cf7d026171073f13da8c6c2b8ed0e8495850262a7f5f275ba9bcbd6ecb7"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:11"
+command = "validate-toml"
+fingerprint = "sha256:b580f9db98f20d11350fe079bf8621ae9dae4329795e2056005d17d278dba431"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:12"
+command = "illustrative-mermaid"
+fingerprint = "sha256:f199c03b93bd9da6d208ef4542e06ff5ee96e6ff83b8e2de9d7f6ba861d19698"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:13"
+command = "validate-bash"
+fingerprint = "sha256:150691d842c1ca175679023941ce8b7496076b480efa40fd1c66ae31ca5047d0"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:14"
+command = "validate-toml"
+fingerprint = "sha256:6b92a5c45352821607221d08229c285bbce84b78ad62fa0647f6fd9d6a8ad462"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:15"
+command = "validate-bash"
+fingerprint = "sha256:2d82abceda6feb4141d7cf7241e308dea2d5c39581484914705749d5ec741005"
+
+[[snippets]]
+path = "docs/guide/integrations/datadome.md"
+selector = "fence:16"
+command = "validate-toml"
+fingerprint = "sha256:af2216c738cbb4509a0ba240a5857b05786f38c16f2c03c407a9f4c6836ad481"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:d9165914ae916dae297949c7091adac84f01a13dadabbf511a76d45784c1cb43"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:d083ecb1a0593e13103d8a9bfd5fc1ec70fc275260169e3727cd56c34c2740f3"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:dd47010c9bc65e48fc1b9ee3c6ff32a612f571775ba4bd3a53f1050d27e0828b"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:e1d8214525d6d0527a1aaa50d61e9afa9fe95d28f9823597c70427c0c82111fe"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:5"
+command = "illustrative-plain"
+fingerprint = "sha256:36a27878cda7a7c19d190be311e35ba0ebbceb025d618a71165b471d9a4054cc"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:6"
+command = "illustrative-http"
+fingerprint = "sha256:e155b48388cf8d08cc0ad16601d4d66e1a9814c6f76e764eb80637b5ade24be0"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:c924eb646208060d39ee0dadfcd9a53bd6c267963ac5fdef8305b7dda6df8aa2"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:8"
+command = "illustrative-rust"
+fingerprint = "sha256:175c4c74431cdafdb3ead19c479080e999cb8111c5afc7f2e1fe0ea9eb62e2aa"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:9"
+command = "validate-rust"
+fingerprint = "sha256:08076460ea77f97bc991cb379a774f8f7fffcf558e354ab46152cf5db893f7fb"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:10"
+command = "illustrative-html"
+fingerprint = "sha256:f441e7ea234876b84cf51fd9b7cb9d7a11c1236512e3bae20d1b4628643852ab"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:11"
+command = "validate-javascript"
+fingerprint = "sha256:2bfaa9d51aa4c95af86a3ce75bec7ad0ce95ecbd89ea41e1ec924fba5f98b194"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:12"
+command = "illustrative-html"
+fingerprint = "sha256:efb9da01cd96a2a7cfd7dc1e24dd6444e0f9a2a7f7859c7ef1b869bdedc7787e"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:13"
+command = "illustrative-html"
+fingerprint = "sha256:1bf641a1669e9c9d6da24fab2ef8be817365c7e80a65d1f47acc6d6402bb0a1c"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:14"
+command = "illustrative-http"
+fingerprint = "sha256:fb3dd1f8d39123a09c853583060ce92d5595eb9a544464d282f0da84e7cb46aa"
+
+[[snippets]]
+path = "docs/guide/integrations/didomi.md"
+selector = "fence:15"
+command = "illustrative-http"
+fingerprint = "sha256:8fd7e5ace6ffe3a33041cd7d395d0821f0ab25ac36466ddb25398ec88fc9e151"
+
+[[snippets]]
+path = "docs/guide/integrations/gam.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:56820318263204cb4f7ef1d101a19f86dc7a1fafacb340b997f1b3fae079818f"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:6d529263b36fb61544d9aefefc651337b485b9ac36be4592c4ac905b90b82d65"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:2"
+command = "illustrative-mermaid"
+fingerprint = "sha256:1a2d18a270be1649599d0ec2bf43d30912c68240dcee7683389f6fc1bfa703a1"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:3"
+command = "illustrative-html"
+fingerprint = "sha256:c30cef6f0ac735260eaed619fe1e03d5486c8308b47dbf5a29ba82f09a92ae7a"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:4"
+command = "illustrative-html"
+fingerprint = "sha256:6fde9ec9c98b3c3c1d48b1c33a439cb7f2ea836550d975334be3e7b27913f490"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:5"
+command = "illustrative-plain"
+fingerprint = "sha256:1a25a55ff62ea600d02a0a46e9e45ed74b6f5e603ba6b90ce5780a11573c82da"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:6"
+command = "illustrative-plain"
+fingerprint = "sha256:bda7f6b4b883fa0893c795b6b00d81f961373d8bb6e7911f370e21fcba4767cc"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:7"
+command = "illustrative-plain"
+fingerprint = "sha256:1ac7897b14358a5d2520ada189e6e7aecb44e411125260f961f43bf52c10ace4"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:7a82ac24c0b46042f19ce7313f91e85f56310fb0f4f1c4a74d13cc84132a34a1"
+
+[[snippets]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:fd7340a3d304f7e4bb172ac410217fe3a3d0f6346be6fe173bc73521bebf412f"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt-diagnostics.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:65303a0e8ad9f503339dd8c4ee9ee7b26a122a5cd44b73ca24ae5ee63cc49d23"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt-diagnostics.md"
+selector = "fence:2"
+command = "illustrative-text"
+fingerprint = "sha256:34b174ca35fb3c032fecb7c3307a637329ff5f103160e11dc142c6261536f625"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt-diagnostics.md"
+selector = "fence:3"
+command = "illustrative-text"
+fingerprint = "sha256:1094e8b2bfa53b2605626c4fe63c03edd0f8f12b427f86ac406bb6594379a768"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt-diagnostics.md"
+selector = "fence:4"
+command = "illustrative-text"
+fingerprint = "sha256:49157fc2680b795f23893732e44648ec9af15b88542664da9c2bd7cf20f09497"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt-diagnostics.md"
+selector = "fence:5"
+command = "illustrative-text"
+fingerprint = "sha256:83f816b2cb9bc13fc95f1bfca97ff6fd3727308dab1c4377615eef4a485e65c6"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt-diagnostics.md"
+selector = "fence:6"
+command = "validate-js"
+fingerprint = "sha256:a40f5a95dba706be94a209c0d1c365d360fb0f58069d086f5a6fdbbc5c759a37"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:d0ebc66b964a51557dff0612c7e5fa0bc4e8ac296ca48a5ec215a08c495c0fbd"
+
+[[snippets]]
+path = "docs/guide/integrations/gpt.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:747e1162502b915c2b4c3a1f1e889b30f9e234deb1c41bec2c654c35e7135353"
+
+[[snippets]]
+path = "docs/guide/integrations/kargo.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:fc8c02fb550ccb97341c1c8920ed3435964d76a89b73032f9d740ff8e5c33b7f"
+
+[[snippets]]
+path = "docs/guide/integrations/lockr.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:58daafa1379b197a85f712c9a2340b99fe2724138b6cd4038e90d92177dce4fb"
+
+[[snippets]]
+path = "docs/guide/integrations/lockr.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:04c40b7b339629308398d572ca5049c3be463c37de3bbbd6ed6f054624e31b90"
+
+[[snippets]]
+path = "docs/guide/integrations/lockr.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:b7fafaf51bb3265867ddd2fa87b9746abe9e38be7efc7ca4f1a954fcb6a47c6d"
+
+[[snippets]]
+path = "docs/guide/integrations/lockr.md"
+selector = "fence:4"
+command = "validate-json"
+fingerprint = "sha256:1dc2fc293fe161b42698c9c79c9fe9c2a954cb9b6e19b7b20293dd402d0aa9d8"
+
+[[snippets]]
+path = "docs/guide/integrations/lockr.md"
+selector = "fence:5"
+command = "illustrative-rust"
+fingerprint = "sha256:e25ae1b49a23d46cd797640693378cc4510df32e11a8b9e47f5e187021010195"
+
+[[snippets]]
+path = "docs/guide/integrations/lockr.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:710f4d961d92883362f406d5e46b717268eb90bf2996b554245e1c3b10833e44"
+
+[[snippets]]
+path = "docs/guide/integrations/nextjs.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:892b0dec820b1492de6300382d667dadf6de3fec9943ec2ac8a8cb9199e17c4c"
+
+[[snippets]]
+path = "docs/guide/integrations/nextjs.md"
+selector = "fence:2"
+command = "illustrative-plain"
+fingerprint = "sha256:0d9923b2b520b0b4706891270a7d25476fc3a16bba8db4257967783ab50a020e"
+
+[[snippets]]
+path = "docs/guide/integrations/nextjs.md"
+selector = "fence:3"
+command = "illustrative-html"
+fingerprint = "sha256:73e1e8b39cf1399f60dc2ed165e8422b2c960b5ec5f5696094804ad3b70eee53"
+
+[[snippets]]
+path = "docs/guide/integrations/nextjs.md"
+selector = "fence:4"
+command = "validate-toml"
+fingerprint = "sha256:711ef4885333dcd6f3b228d2ebe7c96f1cc13f911a814bdf92d0b9626c4b2709"
+
+[[snippets]]
+path = "docs/guide/integrations/nextjs.md"
+selector = "fence:5"
+command = "validate-toml"
+fingerprint = "sha256:1f4f77522aa04adfa7d04b619d4c91f755c9b7dee53c649d676fae0d82965c91"
+
+[[snippets]]
+path = "docs/guide/integrations/nextjs.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:4bb571f388466d208f4c0ac4c5dcd80c186a4dfd65a3290582a8d1160a816f90"
+
+[[snippets]]
+path = "docs/guide/integrations/osano.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:82002e0cd5b574b9c76a43f72b505c6842ae58694cce5a333f924c44156e4ed8"
+
+[[snippets]]
+path = "docs/guide/integrations/permutive.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:75e2adb997e1bc456294859b1ce11432e7319a22983f7658069c720afb88e947"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:2b04c398c2577cae5c00bb4d1ecfb6c1f928a37f506302122eef3e6f27d84cb2"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:a38da429095e8f860c575d3862b05d28810fb85e9c5728a8dc81ac936be1c123"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:3"
+command = "validate-json"
+fingerprint = "sha256:417adc569eb5b6b331c177b7a1def9928b1e0b532e60a76ba4b31cafff84f75c"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:4"
+command = "validate-json"
+fingerprint = "sha256:55738d1b875a3716ca5d57c07dd72c057007f178ca9dcd14f1a0b5015af4c243"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:5"
+command = "illustrative-toml"
+fingerprint = "sha256:64524ea628cae21f82e64ef98e8ffb909889fce89fd6702717cf604bb1b06d9b"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:6"
+command = "validate-toml"
+fingerprint = "sha256:8233a134555741f629a5f146508a6cca2a58b732e78df37f6f1474cd9f85f91a"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:7"
+command = "illustrative-text"
+fingerprint = "sha256:cf09fe67e1d72392e27214123e7e14eec65bcf85b82d50025815884b1ddd74e4"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:8"
+command = "validate-toml"
+fingerprint = "sha256:6988b5bd95e6485072df8d32baded7c5226f5b701c5162b328ffd8648d12afc1"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:9"
+command = "validate-json"
+fingerprint = "sha256:85c086dd239af1259157360261ce451a1371b769f69fc705a2d284f3a67c99ef"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:10"
+command = "validate-json"
+fingerprint = "sha256:91b66759fe2e5a666a2de4705cbf4a7b79d69ac1d93155c582e219c03d195d65"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:11"
+command = "illustrative-text"
+fingerprint = "sha256:4ead2e4487f9ed5267f06a923ce35d6a8aafd5ec8cf50d9e462eb0b674677f3f"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:12"
+command = "validate-toml"
+fingerprint = "sha256:4356e759ec2273664ddcfd097adedc1530c4ad82faf340cc7bf9517be36f2f3e"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:13"
+command = "illustrative-text"
+fingerprint = "sha256:7be3d5eb0aba622b3f202714e2af1624c2a628e91db591308860efaa458aae80"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:14"
+command = "validate-toml"
+fingerprint = "sha256:efbb028ebc7d8a9e28cd54ff4fc0c5d4fb6e5bbae7396630f44a8df267f4512e"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:15"
+command = "validate-toml"
+fingerprint = "sha256:731edcf695a746042b7fb05dd9cc8390c8ebe51d3261d378bd44ffa9c88486c6"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:16"
+command = "validate-bash"
+fingerprint = "sha256:9fdfee5897bab0ff2af0dd93de16471d203eb7f47990ccefa3c1b14425733957"
+
+[[snippets]]
+path = "docs/guide/integrations/prebid.md"
+selector = "fence:17"
+command = "illustrative-mermaid"
+fingerprint = "sha256:17b5a132c7668052f3c403a9ee692d36a22d28cdfec9faa4dd63317bd1888084"
+
+[[snippets]]
+path = "docs/guide/integrations/sourcepoint.md"
+selector = "fence:1"
+command = "validate-toml"
+fingerprint = "sha256:e8cbb48020f382e25db87e4e416c0640dbcb2d61be0cdea662b121f75e2737d3"
+
+[[snippets]]
+path = "docs/guide/integrations/sourcepoint.md"
+selector = "fence:2"
+command = "illustrative-html"
+fingerprint = "sha256:a83f81f570f62919d785b9a4bafbd307cf5bd49cd921f40e3944503542b3ba0f"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:8ced0f693840be2f93b2d3c9592ffa951f295db82ceb498d429355eeeb510c26"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:6c81a6fba86cb7027be10c053094176bc9dcae9a271d74900b9e3599068179ed"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:3"
+command = "illustrative-bash"
+fingerprint = "sha256:2f5af1b49df55b38cec04e5b6181dcb08b4229ae392bee9e95a26379b920677c"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:094159fb4645cb758b46a9939957f42c57734e4b603190e104b72abf3636bb96"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:5"
+command = "validate-toml"
+fingerprint = "sha256:adecf9950559b279136a59cc8d77730bf7218259cb910874bbb97a961170c64e"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:6"
+command = "validate-toml"
+fingerprint = "sha256:00544626e0bf753e5a62199bbe2bf0dd3699950a1b627581b1de8d03ed10b4c4"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:6de2c2bc700d9644dda24544ac36efd824e592cc916dc636750028066d4cfed3"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:8"
+command = "illustrative-plain"
+fingerprint = "sha256:47c81d9c34b51c8279ed2bcf665864c09869ce27cf6323b533aa3000224fdcf6"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:ea4c303084c0703aa638082fe3c1203dcb48b36ad6b8a58f8a1a277c72ff58a3"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:10"
+command = "validate-json"
+fingerprint = "sha256:025de27cfbcf3c951fae6c8d69b66582eae78f7e85a0516c42c1b3b97da08562"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:a14bb2d47b6dadc93822742160fcdcb718bd7132f6deb2cb42176f0447bb2084"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:12"
+command = "illustrative-json"
+fingerprint = "sha256:78e35e286928aa000801b5ac947634747854f0067775807c26d180e8500824dc"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:13"
+command = "illustrative-rust"
+fingerprint = "sha256:8527053e15eee23ff55d7b35fedf96698f9f8d85b80648d557925e307c95031d"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:14"
+command = "illustrative-rust"
+fingerprint = "sha256:7a120990e2ecc2de838528e3342d72523519139c0f0e2a01a2f5b99c78dfa38b"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:15"
+command = "illustrative-plain"
+fingerprint = "sha256:e82ca4e45da8687d164257a68d4b35ac00185d12ef3894a4ae21152908c6b935"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:16"
+command = "validate-bash"
+fingerprint = "sha256:0094f93043318867993ae6a9de6cb7ce8a32452b56783f049ecccf6a8b13d99a"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:17"
+command = "validate-json"
+fingerprint = "sha256:cbaddd0f5e787971ea848fb71532c85ae7b90b24fe35b99b5d3a4b7460ada57e"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:18"
+command = "validate-bash"
+fingerprint = "sha256:58770368c648319bf9bbaffc8796ec9b63f99c51b7cbd88a7dc5e133858468dd"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:19"
+command = "validate-json"
+fingerprint = "sha256:f19e898d58f01a41e217a8a9d150b75dcd851ab93a3560f9b3d93acf9d77faa4"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:20"
+command = "illustrative-rust"
+fingerprint = "sha256:4e8f34a2267aeb71ee5f8945628fa4e3ec99f36740234058b2a12a8c76b7457e"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:21"
+command = "validate-bash"
+fingerprint = "sha256:01ad4b940fcadf7e43e5bd251ef05c41a5f52192dba296e6f9630ebc76f4ae47"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:22"
+command = "validate-bash"
+fingerprint = "sha256:fb46a4e1400752fe3ef753f3e8a784966afaf0d210672763a9c2ee631ff658ff"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:23"
+command = "illustrative-rust"
+fingerprint = "sha256:ffc63afe1847f1f67089c993d2461ab68c38b4b30933f99065fd067090deda94"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:24"
+command = "illustrative-rust"
+fingerprint = "sha256:e7127ad956134e04fd5df24683bedee99c53606724ad08854df9a42d137162e9"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:25"
+command = "illustrative-rust"
+fingerprint = "sha256:35ef3da19f1a939f0d975cb52753b937ac831682f0cd952ad2bd1eb25ec3627d"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:26"
+command = "validate-bash"
+fingerprint = "sha256:54fd3cb45b672708ddcbf0602b95b516e528cdd607d2c2e1cc0c2e4342e4f3a6"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:27"
+command = "validate-bash"
+fingerprint = "sha256:815532d1eb953671ca160b83a3201ce92cc96012e54c1cab95a3cb3cd0076477"
+
+[[snippets]]
+path = "docs/guide/key-rotation.md"
+selector = "fence:28"
+command = "validate-bash"
+fingerprint = "sha256:880825a0a5bdbc357803432614d2605f5fe329c499a82d2c46d0c2de1fbed2bb"
+
+[[snippets]]
+path = "docs/guide/proxy-signing.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:5799fafa6665157febbe2ce68b2e6f343af734a25a2816eabc16391efc071712"
+
+[[snippets]]
+path = "docs/guide/proxy-signing.md"
+selector = "fence:2"
+command = "validate-toml"
+fingerprint = "sha256:a61f998dd77c647b5f764e97b83a253186a88915d34553e51b3066105eca01bd"
+
+[[snippets]]
+path = "docs/guide/proxy-signing.md"
+selector = "fence:3"
+command = "illustrative-plain"
+fingerprint = "sha256:3b0223662c6d07de33936e68102051c01c9282517b1b964be772927bd7ae2fa7"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:1"
+command = "illustrative-plain"
+fingerprint = "sha256:47b1b41f8c0fc46f99d268aed9d36897c52e2c2a73172b6200f6115a0031b7d3"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:2"
+command = "illustrative-rust"
+fingerprint = "sha256:97b05e79724016fd5d8791c3524ce73d537e1f194d8a5ed507cfb075b0e26c62"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:3"
+command = "illustrative-rust"
+fingerprint = "sha256:831e79a5552a8fcf19d05bbaf8ca27fb32304bdc6c67ce362eb4c4e2dc10220f"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:4"
+command = "illustrative-rust"
+fingerprint = "sha256:49ebdf27b3e2fdf62920c8e51793213688574a1e9893b554e3a80be24b6116d5"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:5"
+command = "validate-json"
+fingerprint = "sha256:e7c9654d8fd0d14fa81849ffb7631690b504c9db3e1cde7ee98a1198b3c7ebf0"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:6"
+command = "validate-json"
+fingerprint = "sha256:5756e8e02052de9ea8220cd64049021fb4707a1654dc2b0a141f11627e34d06f"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:7"
+command = "validate-json"
+fingerprint = "sha256:8bd4b24bdea16787397d418828ff762b01a061613992d599b4fe416ab02a53a8"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:8"
+command = "validate-javascript"
+fingerprint = "sha256:1ccf76b1f7eefdeaba54f4efe8716b5901d8e1b0ed55d26f3cc22bf926b108ab"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:9"
+command = "illustrative-json"
+fingerprint = "sha256:8998632ce7b4c649fe5c731cdaf9300e0099a04aed08fede9a96b66e39afa8e3"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:10"
+command = "validate-toml"
+fingerprint = "sha256:44f12780fd3255dd904653c39367b9356cb5af81846cbce7fae3b0a44fa7e477"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:e15964dd09dba3e3b9f0b294df59d2d0e54d123ff950e84babdf2d93dbcfed0b"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:12"
+command = "validate-toml"
+fingerprint = "sha256:cba0b6bcef57f8d09137934eeed9943e77aee3d96104363a45421887a52b16bd"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:13"
+command = "illustrative-plain"
+fingerprint = "sha256:5fd6f5f742fa7882010a7ba7de581c43c630f342026618651da86534388446cc"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:14"
+command = "illustrative-plain"
+fingerprint = "sha256:0de87d1ebac8bc1021bac57cb679d360f720e6b2daab83c56164cf021cc750be"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:15"
+command = "illustrative-plain"
+fingerprint = "sha256:43745e2e25846f44ada9d5b0e625f0c8a78e9a789e06f0e0eb15c608f5d4c921"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:16"
+command = "validate-rust"
+fingerprint = "sha256:7ed43bb2b82971bf7b9c4203b5165720c83d609c4c403e49eeebd5237039c6fc"
+
+[[snippets]]
+path = "docs/guide/request-signing.md"
+selector = "fence:17"
+command = "validate-bash"
+fingerprint = "sha256:5083cace13cb8a6da03c8330704b6e299a2a2511e10303be96646a539452265f"
+
+[[snippets]]
+path = "docs/guide/rsc-hydration.md"
+selector = "fence:1"
+command = "illustrative-html"
+fingerprint = "sha256:00173073420c7d09d8508e2bac034df83ff95e10ce77f56ce6eb11b7f2c252da"
+
+[[snippets]]
+path = "docs/guide/rsc-hydration.md"
+selector = "fence:2"
+command = "illustrative-plain"
+fingerprint = "sha256:9fe25a340bbe89c9530def9a8dbc21d4dd5b9e5f8f9edfdb3bec5c557e5910ac"
+
+[[snippets]]
+path = "docs/guide/rsc-hydration.md"
+selector = "fence:3"
+command = "illustrative-html"
+fingerprint = "sha256:fc3fed45d50ac9cd0afce49340a68e90ecd271c69940555f427d78a31bed38b0"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:d415049146b644f66ac5af69f9744026087da92823df6c89611dc78893f18bff"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:ed8c69bc7ade21caa245f474f515fb25a0a18a0abb2072ad318909168fb20b4c"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:3"
+command = "validate-rust"
+fingerprint = "sha256:71a3487d7bceac084ac6346d0251b100537806fd7b51042e2c556ebff10d3998"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:f197a6053f42463f046bda4a40206510da828fdb9180537267624eda3b4b440a"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:51b7a7e90a14e47a15ed4b4367cfe367eb2d3d8cf7105556fe7b665844169a33"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:6"
+command = "validate-bash"
+fingerprint = "sha256:d248ad393d23869f4dfc84a88076175e5d775bcfbb74a7367aabf5cdcfeb3ea7"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:e517e10e45e67a3d815046d0094bcca83d0accc896ebba6f341363de543530c3"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:8"
+command = "validate-rust"
+fingerprint = "sha256:bd88acd61ea03844983d1556f2e5bae2dc3c3835a58dfc447017bf14d6283441"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:9"
+command = "validate-rust"
+fingerprint = "sha256:fd1f9487653161defcd6b6b4c8319e718d4ff7df7a50698ad80edb6316f2cdcd"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:10"
+command = "validate-rust"
+fingerprint = "sha256:7d2ed3b094daf2f8ee96cda0f220fc0bb976baa8de038f725dabe7578b2d0417"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:11"
+command = "illustrative-rust"
+fingerprint = "sha256:19a78ce41020572a19955643197a566e9e1d6be8ab2f8f007945e00c8acd50f7"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:12"
+command = "validate-bash"
+fingerprint = "sha256:3266d24eb5f87360b162b34f16527a1cff7cb8f7bc39d838e39a8769aed4f898"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:13"
+command = "validate-bash"
+fingerprint = "sha256:10f1baee211f4b500954311fde229c88410da7acbcd261dde1d538fd5283d254"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:14"
+command = "validate-bash"
+fingerprint = "sha256:fede513130aeaf764fbda92e5d9b118309c5751793195ba74190f1df360e4c41"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:15"
+command = "validate-yaml"
+fingerprint = "sha256:8dc63a14391d1f0eadc564a38474a5d49710cb6e0c0307391c0b4a3d86efa7d8"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:16"
+command = "validate-bash"
+fingerprint = "sha256:c146e0434fb887aedc4e23b926940f237f9149704d5c26793616f7a6aeddbf31"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:17"
+command = "validate-bash"
+fingerprint = "sha256:44b153d3fc466d82f69f7c34a08bc22b13caea811f52f91985e8cf172414c3a7"
+
+[[snippets]]
+path = "docs/guide/testing.md"
+selector = "fence:18"
+command = "validate-bash"
+fingerprint = "sha256:aacfd4f9ad0164eaae58db04d11a06325c78320370c090e61acbf2fbeadb00f7"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:3400aea90401209125509a74ac73211fc9bad8d5e66c8691301cbc7b5275a363"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:fd897a5535c39252715dde10d02828b70437ea6cfa7deb5032cdf5d2272c0baf"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:4e812731b15a38fb2644570a13d043b0401b64b3dfb591deac55ffd334c37581"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:769a86cf7529d439b7f74994204dd071ccc620aa639096e6f4ce428bcd1a9a3c"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:5"
+command = "validate-bash"
+fingerprint = "sha256:1ead687160c52b67e8b10b12111f6a941a707977d3eb848f0b48c0e8d545b72f"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:6"
+command = "illustrative-plain"
+fingerprint = "sha256:2bb0b902bd1d110bc001b2b097951b21a10cc840642460166370fec8fcc83179"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:7"
+command = "validate-bash"
+fingerprint = "sha256:b8c8d2c5b75a57cdc6acb717b77b3eaaad870079c4fb27dfbe0f9e1f24874432"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:8"
+command = "validate-bash"
+fingerprint = "sha256:a840b6749b6bb9f39092f976d8a8b15924fc62871b6eca363c535213f963deae"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:9"
+command = "validate-bash"
+fingerprint = "sha256:cd98d4051aea9267018c8bf1bb67994a419e6630369cd5563d70b49edd31329e"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:10"
+command = "validate-bash"
+fingerprint = "sha256:f2a115f44a256a8c432f8e66d50df16f7625c556406c2962310409b981ea8b40"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:11"
+command = "validate-bash"
+fingerprint = "sha256:302b065726d0487c4da4d28ce8143325bf38c7b584e48c10d0148a107ef98327"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:12"
+command = "validate-bash"
+fingerprint = "sha256:f4fd02fd9ec02b2099b47a377eeeb5275209bbbdee04041e52d57cf8c26d1773"
+
+[[snippets]]
+path = "docs/guide/ts-dev-proxy.md"
+selector = "fence:13"
+command = "illustrative-plain"
+fingerprint = "sha256:74044331dc9c7e4654c7f0df2fc420ca6ae9ca838cb61e140838795dc5069bae"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:1"
+command = "illustrative-text"
+fingerprint = "sha256:9d54e9664ec23e51e87c9ae1025f0e2f26bfa00ef701fef28c68f50e63b88eec"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:2"
+command = "illustrative-text"
+fingerprint = "sha256:565125d90ec8173d27d2b76f85becdb3321914018e5b3464e256a2d12cd4922d"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:3"
+command = "validate-sh"
+fingerprint = "sha256:47fe07841a75dd9a515af732ce7dc8561cbf34d626c989dc93aa6afbc5c93249"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:4"
+command = "validate-json"
+fingerprint = "sha256:ddea5e3429c862d35fa9d3864ee5663bfdb9c8da5ff269751e344cab9fe9d237"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:5"
+command = "validate-sh"
+fingerprint = "sha256:b2137e6d78ea1480d84fa5e9bfa674692254ceb29f8375c5ebe2f604dcaafde9"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:6"
+command = "validate-json"
+fingerprint = "sha256:7d2e9d27e69789149eafb99956a4608c391d5cce71aff71e19ad9942cbd0d44e"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:7"
+command = "validate-sh"
+fingerprint = "sha256:682d0cc5d0315459f8f70023a968c37eeb58acb90bf35e14e9b57f0fff7d1910"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:8"
+command = "validate-sh"
+fingerprint = "sha256:e94d9d28efb0290afb73d1834a6f8ac1f43f8b4a6dda2f23050ec3f4259c7de5"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:9"
+command = "illustrative-text"
+fingerprint = "sha256:3aaa39652618931e282f9b7a560ee82ec062b3d446aa9a40ff9db0b839222f9a"
+
+[[snippets]]
+path = "docs/internal/audits/documentation-refresh-evidence.md"
+selector = "fence:10"
+command = "validate-bash"
+fingerprint = "sha256:dfcb9cf10b6c483587853cd2e72719081d3ec4dbe2df2cab79eba721bcdb3276"
+
+[[snippets]]
+path = "tools/docs-parity/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:59a6728758d0cdc0eb3a03180f790490062d69a84a0359a7df3140311b377c60"
+
+[[snippets]]
+path = "tools/docs-parity/README.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:22309887a6c0dfeee36ad23c03768bc37ebcbb0d9d622d370e41c8d11a220d06"
+
+[[snippets]]
+path = "tools/docs-parity/README.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:0545e719bed1afcd9b34e7936ea1ba23bd626a774036eb07d46556f935f658a7"

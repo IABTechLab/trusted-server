@@ -882,10 +882,43 @@ WP8a lands after WP1 and creates the checked foundation in #1049:
   version, source SHA, and SHA-256 are recorded. Platform-only commands are
   annotated; prose overrides require owner, rationale, expiry, and a source
   fingerprint.
+- `cli-help import-hosted --run-id <id>` uses the authenticated `gh` session
+  to require repository `IABTechLab/trusted-server`, a successful
+  `pull_request` run for PR #1049 of `.github/workflows/test.yml`, and
+  `head_sha == HEAD`. Artifact names are exactly `cli-help-linux` and
+  `cli-help-macos`. Each API-reported outer artifact is at most 4 MiB and,
+  after authenticated download, contains exactly one regular file named
+  `cli-help-<platform>.zip`. That inner ZIP is at most 2 MiB and contains
+  exactly regular `cli-help.txt` and `provenance.json` members at mode `0644`.
+  Help is at most 1 MiB with at most 256 command records and 256-byte command
+  paths; provenance is at most 64 KiB, uses a closed field set, and limits
+  every string to 8,192 UTF-8 bytes. Both archive layers reject traversal,
+  links, duplicate members, unsafe modes, and extra members. Provenance records
+  the detected platform, source SHA, runner identity, `uname -a`, `rustc -vV`,
+  Node and tool versions, run ID, run attempt, help byte length, and help
+  SHA-256. Import requires both artifacts' run ID, run attempt, and source SHA
+  to agree with authenticated run metadata and requires each artifact's
+  creation time to fall within that attempt. It verifies the API digests,
+  schemas, and bounds, then atomically writes the two goldens and
+  `cli-captures.toml`. A second import is byte-identical. Later checks require
+  the capture SHA to remain an ancestor and the CLI source/blob set to be
+  unchanged. CI fetches the recorded capture commit before this comparison.
+  Because WP7 changes CLI sources, WP8b performs one mandatory final two-host
+  recapture from the pushed WP7 head before final acceptance.
 - Every Markdown fence has a checked mode: executable,
   expected compile/validation failure with phase and stable diagnostic, or
   illustrative fragment with an expiring waiver. A nonzero exit with the
   wrong diagnostic fails.
+- `docs-parity check --all` is the deterministic offline aggregate. It runs
+  every repository check materialized at that commit, including
+  classification, sensitive scanning, generated-region drift, local links,
+  settings, integrations, routes, CLI goldens, snippets, and the currently
+  activated gate and workflow policies. It never performs external HTTP
+  requests, captures or imports CLI output, changes repository bytes, creates
+  an issue, or submits a dependency snapshot. The aggregate uses an explicit
+  compiled registry; adding a repository check without registering it fails a
+  set-equality test. WP8b extends that registry with final gate consumers,
+  workflow equality, README checks, and JSDoc checks.
 - The example-template harness performs all eight phases: unchanged parse,
   exact placeholder failure, deterministic in-memory non-secret
   customization, deploy validation with secret names intact, envelope
@@ -911,37 +944,79 @@ WP8b lands last in the same PR and wires the final state:
   manual refresh operation. It contains no `pull_request_target`,
   `merge_group`, status writer, caller-selected executable SHA, or PR-code
   execution in a privileged job.
-- Every new `uses` reference is pinned by full SHA with its source version
-  recorded. Workflow-policy fixtures parse YAML and reject unpinned actions,
-  expanded permissions, unsafe events, checkout/cache/service-container use
-  in writers, caller-selected tools, unbounded artifacts, unexpected paths or
-  modes, symlinks, archive traversal, and unknown schema fields.
+- Every external `uses:` reference introduced or changed in WP8a is pinned to
+  a lowercase 40-hex commit SHA with its release version recorded. WP8b
+  extends that invariant to every external `uses:` reference under
+  `.github/workflows` and `.github/actions`. Normalized repository-local
+  `uses: ./...` references are permitted only in read-only checkout jobs.
+  Workflow-policy fixtures parse YAML and reject tags, branches, abbreviated
+  SHAs, remote local-action lookalikes, expanded permissions, unsafe events,
+  checkout/cache/service-container use in writers, caller-selected tools,
+  unbounded artifacts, unexpected paths or modes, symlinks, archive traversal,
+  and unknown schema fields.
 - The scheduled external-link reader uses `contents: read`, a fixed
   non-canceling concurrency group, and a 30-minute timeout. It follows at most
   five redirects, validates final HTTPS/status, falls back from unsupported
   HEAD to GET, and makes at most three attempts for 429/5xx with 1-second then
   2-second delays. `Retry-After` is honored only when valid and at most 30
   seconds. Exact-URL exceptions require owner, reason, and expiry.
-- The no-checkout issue writer has only `issues: write` and a 5-minute timeout.
-  Its archive has exactly one regular `link-results.json` member, at most
-  2 MiB compressed and 1 MiB decoded, with at most 500 findings and
-  2,048-byte strings. It validates before writing, deduplicates one owned
-  issue, and auto-closes it after a clean run.
-- The dependency-snapshot reader uses `contents: read` and produces exactly
-  one regular `dependency-snapshot.json` member, at most 4 MiB compressed and
-  2 MiB decoded, with at most 5,000 records and 2,048-byte strings. The
-  no-checkout writer has only `contents: write`, revalidates the schema and
-  authenticated default-branch SHA, and submits the fixed
-  detector/correlator identity. The manual refresh accepts no SHA or PR input.
-- `CLAUDE.md`, `AGENTS.md`, `TESTING.md`, and
-  `docs/guide/testing.md` gate regions are generated from one checked manifest.
-  Command files, CONTRIBUTING, and the PR template are link-only consumers.
+- The external-link engine returns a closed `LinkResultsV1` value for clean
+  and finding-bearing runs. Transport, clock, schema, and bounds failures are
+  operational errors; an unreachable URL is a finding. Interactive
+  `links --external --check` retains pass/fail behavior, while
+  `links --external --artifact link-results.zip` writes a deterministic inner
+  ZIP and exits successfully after a complete scan so the reporter can
+  reconcile its issue. External links never run under `check --all`.
+- `LinkResultsV1` has a closed schema containing its schema version,
+  repository, source ref and SHA, run ID and attempt, checked UTC timestamp,
+  and bounded findings. Each finding uses a closed kind enum and exact
+  requested URL, final URL when reached, status when received, and stable
+  diagnostic. Before issue access, the writer compares repository, ref, SHA,
+  run ID, and attempt with its immutable GitHub context.
+- Each reader uploads exactly one payload file to a same-run GitHub artifact:
+  `link-results.zip` or `dependency-snapshot.zip`. Its no-checkout writer
+  downloads only that named same-run artifact, requires the download directory
+  to contain exactly that regular payload, verifies its SHA-256 against the
+  reader output, and validates the inner ZIP before parsing JSON. The link ZIP
+  is at most 2 MiB and contains exactly one regular `link-results.json` member
+  at mode `0644`; JSON is at most 1 MiB, contains at most 500 findings, limits
+  every string to 2,048 UTF-8 bytes, and rejects unknown fields, traversal,
+  links, duplicate names, unsafe modes, and trailing members. The issue writer
+  has exactly `issues: write`, deduplicates one owned issue, and auto-closes it
+  after a clean run.
+- The dependency ZIP is at most 4 MiB and contains exactly one regular
+  `dependency-snapshot.json` member at mode `0644`; JSON is at most 2 MiB,
+  contains at most 5,000 resolved records, applies the same closed archive and
+  JSON rules, and limits every string to 2,048 UTF-8 bytes. The JSON is exactly
+  a GitHub dependency-submission version-0 request for `Cargo.lock` and
+  `tools/docs-parity/Cargo.lock`. Its fixed identity is correlator
+  `trusted-server-docs-parity-v1`, job ID
+  `<GITHUB_RUN_ID>.<GITHUB_RUN_ATTEMPT>`, detector name
+  `trusted-server-docs-parity`, serialized detector version exactly `0.1.0`
+  (the current `env!("CARGO_PKG_VERSION")` value), and detector URL
+  `https://github.com/IABTechLab/trusted-server/tree/main/tools/docs-parity`.
+  The request uses `github.sha`, `refs/heads/main`, repository-relative manifest
+  and source locations, canonical Cargo PURLs, and closed relationship/scope
+  enums. The writer has exactly `contents: write`, revalidates the workflow
+  context, and submits the unchanged body to the dependency-submission endpoint,
+  requiring HTTP 201. Same-run artifact transfer uses no cross-run token or run
+  selector. A docs-parity crate version change must update the generator and
+  checked writer policy together. Manual refresh accepts no SHA or PR input.
+- WP8a implements and fixture-tests the canonical gate schema, renderer,
+  ownership markers, and link-only consumer checker. WP8b creates the real
+  `gates.toml`, generates the regions in `CLAUDE.md`, `AGENTS.md`, `TESTING.md`,
+  and `docs/guide/testing.md`, and activates their equality check in
+  `check --all`. Command files, `CONTRIBUTING.md`, and the PR template are
+  link-only consumers. WP8a does not modify those real consumers.
 
-The scheduled and writer paths cannot execute from #1049 merely because they
-are present on rc: GitHub uses the default-branch workflow for schedules and
-manual availability. Their repository acceptance is static policy coverage,
-schema/parser tests, deterministic artifact fixtures, and final-state config
-inspection. The first real schedule, issue reconciliation, dependency
+WP8a proves scheduled, manual, reader, and writer behavior only with static
+fixtures. WP8b commits the final workflow, but its schedule remains dormant
+until the workflow exists on the default branch. `workflow_dispatch` declares
+no inputs, and every scheduled/manual reader and writer additionally requires
+`github.repository == 'IABTechLab/trusted-server'` and
+`github.ref == 'refs/heads/main'`; the explicit ref guard prevents a manual run
+from selecting a non-default ref. Pull-request runs execute only ordinary
+read-only validation. The first real schedule, issue reconciliation, dependency
 submission, and graph proof are release-pending.
 
 Acceptance requires positive fixtures for the ordinary read-only PR path,

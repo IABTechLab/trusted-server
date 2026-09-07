@@ -3198,11 +3198,83 @@ PY
   aggregate from the approved Task 7 head is the current 25-path Task 8
   **Files** set. Both directional differences for the correction, aggregate,
   and plan/staging sets are empty. Neither lockfile changes.
+- The approved correction was committed as
+  `2b324f80faa62b2ec2b36afc6f5923aa4d78aaaf` and pushed to PR #1049. The
+  remote PR remained open with head `spec-docs-refresh` at that exact SHA and
+  base `rc/202608`.
 
 #### Task 9 — Check CLI help, snippets, gates, and workflow foundations
 
-Pending. Preserve the planned adjacent source and golden commits and record
-both clean checkpoints.
+Started from clean SHA `2b324f80faa62b2ec2b36afc6f5923aa4d78aaaf`.
+Preserve the planned adjacent source and golden commits and record both clean
+checkpoints. Initial lockfile hashes are
+`9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`
+for the root workspace and
+`8d12168733c63ecce2566f3267fde5741155a87cf767b8415fc845d496bbf3ca`
+for the standalone tool.
+
+- Capture-ready candidate verification on 2026-09-06: the full standalone
+  suite passed all 394 tests. The focused Task 9 targets passed 24 CLI, 12
+  CLI-help, five snippet, five gate, three workflow, four dependency-snapshot,
+  and 61 link tests; 38 library unit tests also passed. Standalone formatting
+  and all-target, all-feature clippy with warnings denied passed. The repository
+  capture-workflow check passed.
+- The post-implementation review corrections replaced shape and substring
+  checks with structural workflow ownership, made the five-role final workflow
+  fixture closed, separated link findings from operational transport failures,
+  rejected noncanonical ZIP framing, bound dependency PURLs to exact resolved
+  keys, added deterministic gate-region equality, removed arbitrary snippet
+  command execution, and applied bounded output plus deadlines to native
+  subprocesses. CLI import now binds source blobs to the authenticated capture
+  SHA, includes `.tool-versions`, constructs the checked annotated two-host
+  union, applies per-command fingerprinted replacements, and rolls back all
+  installed outputs after pre-commit or post-commit-sync failure.
+- Final acceptance review then closed six additional Important gaps: the final
+  PR fixture now installs pinned Node from `.tool-versions`; the issue writer
+  uses exhaustive fail-closed API pagination plus an exact body ownership
+  marker and collision rejection; the privileged writer independently checks
+  UTC, HTTPS, credentials, and nonblank diagnostics; artifact validation reads
+  through one bounded identity-checked descriptor; canonical gate regions are
+  bound to unique placement anchors; and aggregate tests exercise clean,
+  drift, error, no-write, and restricted-executable behavior through the real
+  compiled registry. An active production-transport constructor sentinel now
+  proves that the real aggregate does not construct or send through the
+  absolute-path curl transport; a complementary explicit-external CLI test
+  proves the sentinel itself is live and stops before a request.
+- The checked snippet inventory closes over 689 fences in 77 maintained
+  Markdown sources: 458 executable syntax/parse validations and 231 expiring,
+  language-family illustrative fragments. Executable records comprise 227
+  Bash, 137 TOML, 56 JSON, 26 Rust, five `sh`, five JavaScript, one `js`, and
+  one YAML fence. No expected-failure record was required by the current
+  corpus. The illustrative records comprise 102 unlabelled, 30 HTML, 25 Rust,
+  18 text, 13 HTTP, 13 Mermaid, eight TOML, seven Bash, six JSON, five CSS, and
+  one each of JavaScript, Markdown, TypeScript, and VCL.
+- The permanent capture job uses these release-to-commit mappings, recorded
+  from the corresponding primary release pages: actions/checkout v7.0.1 at
+  `3d3c42e5aac5ba805825da76410c181273ba90b1`
+  (https://github.com/actions/checkout/releases/tag/v7.0.1), actions/setup-node
+  v7.0.0 at `820762786026740c76f36085b0efc47a31fe5020`
+  (https://github.com/actions/setup-node/releases/tag/v7.0.0),
+  actions/upload-artifact v7.0.1 at
+  `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`
+  (https://github.com/actions/upload-artifact/releases/tag/v7.0.1), and
+  actions-rust-lang/setup-rust-toolchain v1.17.0 at
+  `166cdcfd11aee3cb47222f9ddb555ce30ddb9659`
+  (https://github.com/actions-rust-lang/setup-rust-toolchain/releases/tag/v1.17.0).
+  The final-workflow fixture uses actions/download-artifact v8.0.1 at
+  `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`
+  (https://github.com/actions/download-artifact/releases/tag/v8.0.1).
+- From the fully staged capture-ready candidate, `classify --check`,
+  `scan --check`, `snippets --check`, `workflow --check`, and `check --all`
+  each exited 0. `git status --short` was byte-identical before and after the
+  aggregate, so the offline check changed neither working-tree nor index state.
+  The root lockfile remains
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`;
+  the reviewed standalone lockfile is
+  `234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
+  No hosted receipt is claimed. Linux/macOS goldens and `cli-captures.toml`
+  remain absent until the first successful same-head PR #1049 capture run is
+  authenticated and imported twice.
 
 #### Task 10 — Complete WP2 truth pass and dispositions
 

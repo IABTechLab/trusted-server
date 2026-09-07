@@ -9,6 +9,70 @@ on:
   pull_request:
 
 jobs:
+  cli-help-capture:
+    name: Capture CLI help (${{ matrix.platform }})
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Assert exact pull-request head
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+
+      - name: Read tool versions
+        id: tool-versions
+        run: |
+          echo "rust=$(awk '$1 == \"rust\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      # actions-rust-lang/setup-rust-toolchain v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          toolchain: ${{ steps.tool-versions.outputs.rust }}
+          cache: false
+
+      # actions/setup-node v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: ${{ steps.tool-versions.outputs.node }}
+
+      - name: Build Trusted Server JavaScript
+        working-directory: crates/trusted-server-js/lib
+        run: |
+          npm ci
+          npm run build
+
+      - name: Capture recursive native CLI help
+        env:
+          TSJS_SKIP_BUILD: "1"
+        run: |
+          cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture --output "${{ runner.temp }}/cli-help-${{ matrix.platform }}.zip"
+
+      # actions/upload-artifact v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cli-help-${{ matrix.platform }}
+          path: ${{ runner.temp }}/cli-help-${{ matrix.platform }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
   test-rust:
     name: cargo test
     runs-on: ubuntu-latest

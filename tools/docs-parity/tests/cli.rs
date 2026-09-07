@@ -70,6 +70,37 @@ fn status_code(output: &Output) -> i32 {
     output.status.code().expect("should exit normally")
 }
 
+fn executable_on_path(name: &str) -> PathBuf {
+    env::split_paths(&env::var_os("PATH").expect("PATH should be available"))
+        .map(|directory| directory.join(name))
+        .find_map(|candidate| fs::canonicalize(candidate).ok())
+        .filter(|candidate| candidate.is_file())
+        .expect("requested executable should resolve to a regular file")
+}
+
+fn node_executable() -> PathBuf {
+    let result = Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .expect("node should report its executable path");
+    assert!(
+        result.status.success(),
+        "node executable lookup should pass"
+    );
+    let path = String::from_utf8(result.stdout).expect("node path should be UTF-8");
+    fs::canonicalize(path.trim()).expect("node executable path should be canonicalizable")
+}
+
+fn git_status(repository: &Path) -> Vec<u8> {
+    let result = Command::new(executable_on_path("git"))
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(repository)
+        .output()
+        .expect("git status should execute");
+    assert!(result.status.success(), "git status should pass");
+    result.stdout
+}
+
 #[test]
 fn governance_requires_typed_owner_rationale_and_expiry() {
     let owner = Owner::new("documentation-maintainers").expect("owner should be valid");
@@ -167,6 +198,139 @@ fn unknown_subcommand_uses_the_cli_error_exit_code() {
             .expect("diagnostic should be UTF-8")
             .contains("unrecognized subcommand"),
         "diagnostic should identify the unknown subcommand"
+    );
+}
+
+#[test]
+fn check_all_conflicts_with_single_record_mode() {
+    let conflict = output(
+        command_in(
+            env::current_dir()
+                .expect("should read current directory")
+                .as_path(),
+        )
+        .args(["check", "--all", "--tracked-paths-record", "record.txt"]),
+    );
+    assert_eq!(
+        status_code(&conflict),
+        ERROR,
+        "aggregate and record modes must conflict"
+    );
+}
+
+#[test]
+fn capture_and_artifact_modes_are_not_reachable_from_check_all_syntax() {
+    let help = output(
+        command_in(
+            env::current_dir()
+                .expect("should read current directory")
+                .as_path(),
+        )
+        .args(["check", "--help"]),
+    );
+    let stdout = String::from_utf8(help.stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("--all"));
+    for forbidden in [
+        "capture",
+        "import-hosted",
+        "--artifact",
+        "dependency-snapshot",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "offline check help must not expose {forbidden}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_all_executes_clean_with_external_sentinel_and_without_repository_writes() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("tool manifest should be nested under the repository");
+    let restricted = tempfile::tempdir().expect("should create restricted PATH");
+    let sentinel = restricted.path().join("external-transport-constructed");
+    symlink(executable_on_path("git"), restricted.path().join("git"))
+        .expect("should expose only Git to repository checks");
+    symlink(node_executable(), restricted.path().join("node"))
+        .expect("should expose only Node syntax validation");
+    let before = git_status(repository);
+
+    let checked = output(
+        command_in(repository)
+            .env_clear()
+            .env("PATH", restricted.path())
+            .env("DOCS_PARITY_TEST_EXTERNAL_SENTINEL", &sentinel)
+            .args(["check", "--all"]),
+    );
+
+    assert_eq!(
+        status_code(&checked),
+        SUCCESS,
+        "the offline aggregate must pass without cargo, gh, capture, import, issue, submission, or production external-transport execution: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(
+        !sentinel.exists(),
+        "the offline aggregate must not construct the production external transport"
+    );
+    assert_eq!(
+        git_status(repository),
+        before,
+        "the offline aggregate must preserve every repository status byte"
+    );
+}
+
+#[test]
+fn explicit_external_check_trips_the_production_transport_sentinel() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("tool manifest should be nested under the repository");
+    let directory = tempfile::tempdir().expect("should create sentinel directory");
+    let sentinel = directory.path().join("external-transport-constructed");
+
+    let checked = output(
+        command_in(repository)
+            .env("DOCS_PARITY_TEST_EXTERNAL_SENTINEL", &sentinel)
+            .args(["links", "--external", "--check"]),
+    );
+
+    assert_eq!(
+        status_code(&checked),
+        ERROR,
+        "an active external sentinel must fail before network execution"
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("external check should write its construction sentinel"),
+        b"production external transport constructed\n"
+    );
+    assert!(
+        String::from_utf8(checked.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("production external transport forbidden by active test sentinel"),
+        "the failure must identify the blocked production transport"
+    );
+}
+
+#[test]
+fn check_all_propagates_operational_errors_without_writing() {
+    let repository = TestRepository::new(&["source.txt"]);
+    let before = git_status(repository.path());
+
+    let checked = output(repository.command().args(["check", "--all"]));
+
+    assert_eq!(
+        status_code(&checked),
+        ERROR,
+        "a materialized repository-check error must propagate"
+    );
+    assert_eq!(
+        git_status(repository.path()),
+        before,
+        "a failed aggregate must not alter repository state"
     );
 }
 

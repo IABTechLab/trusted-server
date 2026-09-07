@@ -8,6 +8,157 @@ use std::process::Command;
 
 use error_stack::{Report, ResultExt as _};
 
+const ZIP_LOCAL_HEADER_SIGNATURE: &[u8; 4] = b"PK\x03\x04";
+const ZIP_CENTRAL_HEADER_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
+const ZIP_END_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
+const ZIP_END_FIXED_BYTES: usize = 22;
+const ZIP_MAXIMUM_COMMENT_BYTES: usize = u16::MAX as usize;
+
+pub(crate) fn validate_exact_zip_framing(bytes: &[u8]) -> Result<(), &'static str> {
+    if !bytes.starts_with(ZIP_LOCAL_HEADER_SIGNATURE) || bytes.len() < ZIP_END_FIXED_BYTES {
+        return Err("ZIP has a preamble or no local header");
+    }
+    let search_start = bytes
+        .len()
+        .saturating_sub(ZIP_END_FIXED_BYTES + ZIP_MAXIMUM_COMMENT_BYTES);
+    let mut end_positions = (search_start..=bytes.len() - ZIP_END_FIXED_BYTES).filter(|position| {
+        bytes.get(*position..position.saturating_add(4)) == Some(ZIP_END_SIGNATURE)
+            && read_zip_u16(bytes, position.saturating_add(20)).is_some_and(|comment_bytes| {
+                position.checked_add(ZIP_END_FIXED_BYTES + usize::from(comment_bytes))
+                    == Some(bytes.len())
+            })
+    });
+    let end_position = end_positions
+        .next()
+        .ok_or("ZIP has trailing bytes or no exact end record")?;
+    if end_positions.next().is_some() {
+        return Err("ZIP has ambiguous end records");
+    }
+    let disk = read_zip_u16(bytes, end_position + 4).ok_or("ZIP end record is truncated")?;
+    let central_disk =
+        read_zip_u16(bytes, end_position + 6).ok_or("ZIP end record is truncated")?;
+    let disk_entries =
+        read_zip_u16(bytes, end_position + 8).ok_or("ZIP end record is truncated")?;
+    let total_entries =
+        read_zip_u16(bytes, end_position + 10).ok_or("ZIP end record is truncated")?;
+    let central_bytes = usize::try_from(
+        read_zip_u32(bytes, end_position + 12).ok_or("ZIP end record is truncated")?,
+    )
+    .map_err(|_error| "ZIP central-directory size is unrepresentable")?;
+    let central_offset = usize::try_from(
+        read_zip_u32(bytes, end_position + 16).ok_or("ZIP end record is truncated")?,
+    )
+    .map_err(|_error| "ZIP central-directory offset is unrepresentable")?;
+    if disk != 0
+        || central_disk != 0
+        || disk_entries == 0
+        || disk_entries != total_entries
+        || total_entries == u16::MAX
+        || central_bytes == u32::MAX as usize
+        || central_offset == u32::MAX as usize
+        || central_offset.checked_add(central_bytes) != Some(end_position)
+        || bytes.get(central_offset..central_offset.saturating_add(4))
+            != Some(ZIP_CENTRAL_HEADER_SIGNATURE)
+    {
+        return Err("ZIP central-directory framing is not exact");
+    }
+    Ok(())
+}
+
+pub(crate) fn read_bounded_regular_file(
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, Report<RepositoryError>> {
+    read_bounded_regular_file_with_hook(path, maximum_bytes, || Ok(()))
+}
+
+fn read_bounded_regular_file_with_hook<F>(
+    path: &Path,
+    maximum_bytes: usize,
+    after_read: F,
+) -> Result<Vec<u8>, Report<RepositoryError>>
+where
+    F: FnOnce() -> Result<(), std::io::Error>,
+{
+    let path_before = FileSnapshot::read_path(path)?;
+    if path_before.size > maximum_bytes as u64 {
+        return Err(Report::new(RepositoryError::UnsafeEntry).attach(format!(
+            "bounded path exceeds {maximum_bytes} bytes: {}",
+            path.display()
+        )));
+    }
+
+    let mut file = File::open(path)
+        .change_context(RepositoryError::FileOperation)
+        .attach_with(|| format!("open bounded path: {}", path.display()))?;
+    let opened_before = FileSnapshot::from_metadata(
+        &file
+            .metadata()
+            .change_context(RepositoryError::FileOperation)?,
+    )?;
+    if opened_before != path_before {
+        return Err(Report::new(RepositoryError::FileOperation).attach(format!(
+            "bounded path changed before read: {}",
+            path.display()
+        )));
+    }
+
+    let capacity = usize::try_from(opened_before.size).map_err(|error| {
+        Report::new(RepositoryError::UnsafeEntry)
+            .attach(format!("bounded file size cannot be represented: {error}"))
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    std::io::Read::take(&mut file, (maximum_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .change_context(RepositoryError::FileOperation)
+        .attach_with(|| format!("read bounded path: {}", path.display()))?;
+    if bytes.len() > maximum_bytes {
+        return Err(Report::new(RepositoryError::UnsafeEntry).attach(format!(
+            "bounded path exceeds {maximum_bytes} bytes: {}",
+            path.display()
+        )));
+    }
+    after_read()
+        .change_context(RepositoryError::FileOperation)
+        .attach_with(|| format!("bounded read hook: {}", path.display()))?;
+    let path_after = FileIdentity::read(path)?;
+    if path_after != opened_before.identity {
+        return Err(Report::new(RepositoryError::FileOperation).attach(format!(
+            "bounded path identity changed while reading: {}",
+            path.display()
+        )));
+    }
+    let opened_after = FileSnapshot::from_metadata(
+        &file
+            .metadata()
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("reinspect opened bounded path: {}", path.display()))?,
+    )?;
+    let path_metadata = fs::symlink_metadata(path)
+        .change_context(RepositoryError::FileOperation)
+        .attach_with(|| format!("reinspect bounded path: {}", path.display()))?;
+    if opened_after != opened_before
+        || opened_after.size != bytes.len() as u64
+        || FileIdentity::from_metadata(&path_metadata)? != opened_before.identity
+    {
+        return Err(Report::new(RepositoryError::FileOperation).attach(format!(
+            "bounded path changed while reading: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_zip_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let value: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+    Some(u16::from_le_bytes(value))
+}
+
+fn read_zip_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
+}
+
 #[derive(Debug, derive_more::Display)]
 pub(crate) enum RepositoryError {
     #[display("Git repository discovery failed")]
@@ -110,6 +261,10 @@ pub(crate) struct Repository {
 }
 
 impl Repository {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn discover(start: &Path) -> Result<Self, Report<RepositoryError>> {
         let start = fs::canonicalize(start)
             .change_context(RepositoryError::Discovery)
@@ -218,73 +373,8 @@ impl Repository {
     {
         self.validate_existing(path, false)?;
         let absolute = self.root.join(path.as_path());
-        let path_before = FileSnapshot::read_path(&absolute)?;
-        if path_before.size > maximum_bytes as u64 {
-            return Err(Report::new(RepositoryError::UnsafeEntry).attach(format!(
-                "bounded path exceeds {maximum_bytes} bytes: {}",
-                absolute.display()
-            )));
-        }
-
-        let mut file = File::open(&absolute)
-            .change_context(RepositoryError::FileOperation)
-            .attach_with(|| format!("open bounded path: {}", absolute.display()))?;
-        let opened_before = FileSnapshot::from_metadata(
-            &file
-                .metadata()
-                .change_context(RepositoryError::FileOperation)?,
-        )?;
-        if opened_before != path_before {
-            return Err(Report::new(RepositoryError::FileOperation).attach(format!(
-                "bounded path changed before read: {}",
-                absolute.display()
-            )));
-        }
-
-        let capacity = usize::try_from(opened_before.size).map_err(|error| {
-            Report::new(RepositoryError::UnsafeEntry)
-                .attach(format!("bounded file size cannot be represented: {error}"))
-        })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        std::io::Read::take(&mut file, (maximum_bytes as u64).saturating_add(1))
-            .read_to_end(&mut bytes)
-            .change_context(RepositoryError::FileOperation)
-            .attach_with(|| format!("read bounded path: {}", absolute.display()))?;
-        if bytes.len() > maximum_bytes {
-            return Err(Report::new(RepositoryError::UnsafeEntry).attach(format!(
-                "bounded path exceeds {maximum_bytes} bytes: {}",
-                absolute.display()
-            )));
-        }
-        after_read()
-            .change_context(RepositoryError::FileOperation)
-            .attach_with(|| format!("bounded read hook: {}", absolute.display()))?;
+        let bytes = read_bounded_regular_file_with_hook(&absolute, maximum_bytes, after_read)?;
         self.validate_existing(path, false)?;
-        let path_after = FileIdentity::read(&absolute)?;
-        if path_after != opened_before.identity {
-            return Err(Report::new(RepositoryError::FileOperation).attach(format!(
-                "bounded path identity changed while reading: {}",
-                absolute.display()
-            )));
-        }
-        let opened_after = FileSnapshot::from_metadata(
-            &file
-                .metadata()
-                .change_context(RepositoryError::FileOperation)
-                .attach_with(|| format!("reinspect opened bounded path: {}", absolute.display()))?,
-        )?;
-        let path_metadata = fs::symlink_metadata(&absolute)
-            .change_context(RepositoryError::FileOperation)
-            .attach_with(|| format!("reinspect bounded path: {}", absolute.display()))?;
-        if opened_after != opened_before
-            || opened_after.size != bytes.len() as u64
-            || FileIdentity::from_metadata(&path_metadata)? != opened_before.identity
-        {
-            return Err(Report::new(RepositoryError::FileOperation).attach(format!(
-                "bounded path changed while reading: {}",
-                absolute.display()
-            )));
-        }
         Ok(bytes)
     }
 
@@ -303,6 +393,20 @@ impl Repository {
             .map(Some)
             .change_context(RepositoryError::FileOperation)
             .attach_with(|| format!("read path: {}", absolute.display()))
+    }
+
+    pub(crate) fn regular_file_exists(
+        &self,
+        path: &NormalizedRelativePath,
+    ) -> Result<bool, Report<RepositoryError>> {
+        let absolute = self.root.join(path.as_path());
+        if final_entry_metadata(&absolute)?.is_none() {
+            self.validate_parent_chain(path)?;
+            return Ok(false);
+        }
+
+        self.validate_existing(path, false)?;
+        Ok(true)
     }
 
     pub(crate) fn validate_regular_file(
@@ -932,6 +1036,28 @@ mod tests {
         assert!(
             result.is_err(),
             "path identity must expose a same-length replacement"
+        );
+    }
+
+    #[test]
+    fn arbitrary_bounded_read_rejects_growth_and_path_replacement() {
+        let directory = tempfile::tempdir().expect("should create bounded-read directory");
+        let target = directory.path().join("artifact.bin");
+        fs::write(&target, b"original").expect("should write original artifact");
+
+        let grown =
+            read_bounded_regular_file_with_hook(&target, 8, || fs::write(&target, b"oversized"));
+        assert!(grown.is_err(), "growth after the bounded read must fail");
+
+        fs::write(&target, b"original").expect("should restore original artifact");
+        let replacement = directory.path().join("replacement.bin");
+        let replaced = read_bounded_regular_file_with_hook(&target, 8, || {
+            fs::write(&replacement, b"replaced")?;
+            fs::rename(&replacement, &target)
+        });
+        assert!(
+            replaced.is_err(),
+            "path replacement after the bounded read must fail"
         );
     }
 

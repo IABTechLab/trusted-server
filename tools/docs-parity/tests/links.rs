@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use docs_parity::markdown::{
     CommandOutput, CommandRunner, CurlTransport, ExternalException, ExternalHeader,
-    ExternalRequest, ExternalResponse, ExternalTransport, LinkSource, LinkSourceSet,
-    ProcessCommandRunner, Sleeper, check_external_links, check_local_links,
+    ExternalRequest, ExternalResponse, ExternalTransport, ExternalTransportError, LinkFindingKind,
+    LinkRunContext, LinkSource, LinkSourceSet, ProcessCommandRunner, Sleeper, check_external_links,
+    check_local_links, collect_external_link_results, encode_link_results_archive,
+    validate_link_results_archive,
 };
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
@@ -175,6 +177,17 @@ fn diagnostic(output: &Output) -> String {
 
 fn fingerprint(contents: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(contents))
+}
+
+fn link_context() -> LinkRunContext {
+    LinkRunContext {
+        repository: "IABTechLab/trusted-server".to_owned(),
+        source_ref: "refs/heads/main".to_owned(),
+        source_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        run_id: 7,
+        run_attempt: 2,
+        checked_at: "2026-09-06T00:00:00Z".to_owned(),
+    }
 }
 
 fn source(path: &str, set: LinkSourceSet, markdown: &str) -> LinkSource {
@@ -896,11 +909,28 @@ struct FakeTransport {
 }
 
 impl ExternalTransport for FakeTransport {
-    fn send(&mut self, request: &ExternalRequest) -> Result<ExternalResponse, String> {
+    fn send(
+        &mut self,
+        request: &ExternalRequest,
+    ) -> Result<ExternalResponse, ExternalTransportError> {
         self.requests.push(request.clone());
         self.responses
             .pop_front()
-            .ok_or_else(|| "no scripted response".to_owned())
+            .ok_or_else(|| ExternalTransportError::operational("no scripted response"))
+    }
+}
+
+struct ErrorTransport(Option<ExternalTransportError>);
+
+impl ExternalTransport for ErrorTransport {
+    fn send(
+        &mut self,
+        _request: &ExternalRequest,
+    ) -> Result<ExternalResponse, ExternalTransportError> {
+        Err(self
+            .0
+            .take()
+            .unwrap_or_else(|| ExternalTransportError::operational("transport reused")))
     }
 }
 
@@ -1632,6 +1662,53 @@ fn curl_transport_rejects_unsafe_requests_and_malformed_command_output() {
 }
 
 #[test]
+fn curl_transport_types_only_terminal_network_unreachability_as_a_finding() {
+    let request = ExternalRequest {
+        method: "HEAD".to_owned(),
+        url: "https://docs.example.com/".to_owned(),
+        timeout_seconds: 15,
+        maximum_body_bytes: 64 * 1024,
+    };
+    for status_code in [5, 6, 7] {
+        let mut transport = CurlTransport::new(FakeCommandRunner {
+            outputs: vec![Ok(CommandOutput {
+                success: false,
+                status_code: Some(status_code),
+                stdout: Vec::new(),
+            })]
+            .into(),
+            invocations: Vec::new(),
+        });
+        assert!(matches!(
+            transport.send(&request),
+            Err(ExternalTransportError::Unreachable { .. })
+        ));
+    }
+    for output in [
+        Err("spawn failed".to_owned()),
+        Ok(CommandOutput {
+            success: false,
+            status_code: Some(28),
+            stdout: Vec::new(),
+        }),
+        Ok(CommandOutput {
+            success: true,
+            status_code: Some(0),
+            stdout: b"malformed".to_vec(),
+        }),
+    ] {
+        let mut transport = CurlTransport::new(FakeCommandRunner {
+            outputs: vec![output].into(),
+            invocations: Vec::new(),
+        });
+        assert!(matches!(
+            transport.send(&request),
+            Err(ExternalTransportError::Operational { .. })
+        ));
+    }
+}
+
+#[test]
 fn production_command_runner_stops_reading_at_the_stdout_bound() {
     let mut runner = ProcessCommandRunner;
 
@@ -2168,4 +2245,166 @@ fn pages_manifest_is_bounded_before_deserialization() {
 
     assert_eq!(status_code(&result), ERROR);
     assert!(diagnostic(&result).contains("pages manifest exceeds"));
+}
+
+#[test]
+fn external_result_schema_represents_clean_and_finding_runs() {
+    let sources = [source(
+        "docs/guide/example.md",
+        LinkSourceSet::Public,
+        "[status](https://status.example.invalid/)\n",
+    )];
+    let mut clean_transport = FakeTransport {
+        responses: vec![response(200, None, None)].into(),
+        requests: Vec::new(),
+    };
+    let mut finding_transport = FakeTransport {
+        responses: vec![
+            response(503, None, None),
+            response(503, None, None),
+            response(503, None, None),
+        ]
+        .into(),
+        requests: Vec::new(),
+    };
+    let mut sleeper = FakeSleeper::default();
+
+    let clean = collect_external_link_results(
+        &sources,
+        &[],
+        0,
+        &link_context(),
+        &mut clean_transport,
+        &mut sleeper,
+    )
+    .expect("clean scan should return a result");
+    let findings = collect_external_link_results(
+        &sources,
+        &[],
+        0,
+        &link_context(),
+        &mut finding_transport,
+        &mut sleeper,
+    )
+    .expect("unreachable URL should be a finding, not an operational error");
+
+    assert!(clean.findings.is_empty());
+    assert_eq!(findings.findings.len(), 1);
+    assert_eq!(
+        findings.findings[0].requested_url,
+        "https://status.example.invalid/"
+    );
+    assert_eq!(findings.findings[0].kind, LinkFindingKind::HttpStatus);
+    assert_eq!(
+        findings.findings[0].final_url.as_deref(),
+        Some("https://status.example.invalid/")
+    );
+    assert_eq!(findings.findings[0].status, Some(503));
+    assert_eq!(
+        findings.findings[0].diagnostic,
+        "retry attempts exhausted after status 503"
+    );
+}
+
+#[test]
+fn external_result_schema_distinguishes_unreachability_from_operational_failure() {
+    let sources = [source(
+        "docs/guide/example.md",
+        LinkSourceSet::Public,
+        "[status](https://status.example.invalid/)\n",
+    )];
+    let mut sleeper = FakeSleeper::default();
+    let mut unreachable = ErrorTransport(Some(ExternalTransportError::unreachable(
+        "name resolution failed",
+    )));
+    let result = collect_external_link_results(
+        &sources,
+        &[],
+        0,
+        &link_context(),
+        &mut unreachable,
+        &mut sleeper,
+    )
+    .expect("terminal network unreachability should be a finding");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].kind, LinkFindingKind::Unreachable);
+    let archive = encode_link_results_archive(&result)
+        .expect("unreachability finding should encode in artifact mode");
+    let decoded = validate_link_results_archive(&archive, &link_context())
+        .expect("unreachability finding artifact should validate");
+    assert_eq!(decoded, result);
+
+    let mut operational = ErrorTransport(Some(ExternalTransportError::operational(
+        "response framing is malformed",
+    )));
+    assert!(
+        collect_external_link_results(
+            &sources,
+            &[],
+            0,
+            &link_context(),
+            &mut operational,
+            &mut sleeper,
+        )
+        .is_err(),
+        "parser, framing, timeout, spawn, and bound failures must abort the scan"
+    );
+    let mut oversized =
+        ErrorTransport(Some(ExternalTransportError::unreachable("x".repeat(2_049))));
+    assert!(
+        collect_external_link_results(
+            &sources,
+            &[],
+            0,
+            &link_context(),
+            &mut oversized,
+            &mut sleeper,
+        )
+        .is_err(),
+        "unbounded transport diagnostics must remain operational errors"
+    );
+}
+
+#[test]
+fn link_results_zip_is_deterministic_closed_and_context_bound() {
+    let result = docs_parity::markdown::LinkResultsV1 {
+        schema_version: 1,
+        repository: link_context().repository,
+        source_ref: link_context().source_ref,
+        source_sha: link_context().source_sha,
+        run_id: 7,
+        run_attempt: 2,
+        checked_at: link_context().checked_at,
+        findings: Vec::new(),
+    };
+    let first = encode_link_results_archive(&result).expect("should encode link results");
+    let second = encode_link_results_archive(&result).expect("should re-encode link results");
+    let parsed = validate_link_results_archive(&first, &link_context())
+        .expect("should validate link results");
+
+    assert_eq!(first, second, "link result ZIP should be byte-stable");
+    assert_eq!(parsed, result);
+
+    let mut stale = link_context();
+    stale.run_attempt = 3;
+    assert!(
+        validate_link_results_archive(&first, &stale).is_err(),
+        "immutable workflow context mismatch should fail"
+    );
+    assert!(
+        validate_link_results_archive(&vec![0; 2 * 1024 * 1024 + 1], &link_context()).is_err(),
+        "oversized archive should fail"
+    );
+    let mut prefixed = b"preamble".to_vec();
+    prefixed.extend_from_slice(&first);
+    assert!(
+        validate_link_results_archive(&prefixed, &link_context()).is_err(),
+        "ZIP preambles must fail closed"
+    );
+    let mut suffixed = first.clone();
+    suffixed.extend_from_slice(b"trailer");
+    assert!(
+        validate_link_results_archive(&suffixed, &link_context()).is_err(),
+        "ZIP trailing bytes must fail closed"
+    );
 }
