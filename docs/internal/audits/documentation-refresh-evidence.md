@@ -3527,8 +3527,11 @@ The immutable `origin/rc/202608` baseline remained
   synthetic `admin_password` secret-store key. No credential, token, or service
   identifier exception was added.
 
-The exact WP4 commit is recorded immediately after the repository checkpoint;
-no hosted receipt is inferred from local verification.
+The WP4 implementation commit is
+`78cd35c63acc988363cff86d8358ce07acef96ab`. GitHub readback at
+`2026-09-07T12:46:55Z` reported PR #1049 open from `spec-docs-refresh` into
+`rc/202608` with that exact head. This receipt does not include its own commit
+SHA.
 
 #### Task 13 — Add deployment guides and recurring first-success smokes
 
