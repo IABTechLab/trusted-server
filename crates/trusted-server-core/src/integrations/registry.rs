@@ -16,6 +16,7 @@ use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
+use crate::streaming_processor::StreamProcessor;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +572,24 @@ pub trait IntegrationHtmlPostProcessor: Send + Sync {
     fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool;
 }
 
+/// Owned request data supplied when an integration creates an HTML stream processor.
+#[derive(Clone)]
+pub struct IntegrationHtmlStreamContext {
+    pub request_host: String,
+    pub request_scheme: String,
+    pub origin_host: String,
+    pub document_state: IntegrationDocumentState,
+}
+
+/// Creates one mutable HTML output processor for each document.
+pub trait IntegrationHtmlStreamProcessorFactory: Send + Sync {
+    /// Identifier for logging and diagnostics.
+    fn integration_id(&self) -> &'static str;
+
+    /// Create a request-local streaming processor.
+    fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor>;
+}
+
 /// Trait for integration-provided HTML head injections.
 pub trait IntegrationHeadInjector: Send + Sync {
     /// Identifier for logging/diagnostics.
@@ -593,6 +612,7 @@ pub struct IntegrationRegistration {
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
@@ -619,6 +639,7 @@ impl IntegrationRegistrationBuilder {
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
             },
@@ -652,6 +673,15 @@ impl IntegrationRegistrationBuilder {
         processor: Arc<dyn IntegrationHtmlPostProcessor>,
     ) -> Self {
         self.registration.html_post_processors.push(processor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_html_stream_processor(
+        mut self,
+        processor: Arc<dyn IntegrationHtmlStreamProcessorFactory>,
+    ) -> Self {
+        self.registration.html_stream_processors.push(processor);
         self
     }
 
@@ -709,6 +739,7 @@ struct IntegrationRegistryInner {
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
@@ -730,6 +761,7 @@ impl Default for IntegrationRegistryInner {
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
+            html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
         }
@@ -859,6 +891,9 @@ impl IntegrationRegistry {
                 inner
                     .html_post_processors
                     .extend(registration.html_post_processors);
+                inner
+                    .html_stream_processors
+                    .extend(registration.html_stream_processors);
                 inner.head_injectors.extend(registration.head_injectors);
                 inner.request_filters.extend(registration.request_filters);
                 if registration.js_disabled {
@@ -1047,6 +1082,14 @@ impl IntegrationRegistry {
         self.inner.html_post_processors.clone()
     }
 
+    /// Expose registered per-document HTML stream processor factories.
+    #[must_use]
+    pub fn html_stream_processor_factories(
+        &self,
+    ) -> Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>> {
+        self.inner.html_stream_processors.clone()
+    }
+
     /// Collect HTML snippets for insertion at the start of `<head>`.
     #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
@@ -1217,6 +1260,7 @@ impl IntegrationRegistry {
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1246,6 +1290,7 @@ impl IntegrationRegistry {
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1271,6 +1316,7 @@ impl IntegrationRegistry {
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
                 deferred_js_ids: Vec::new(),
@@ -1336,6 +1382,7 @@ impl IntegrationRegistry {
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1537,6 +1584,76 @@ mod tests {
             label.as_str(),
             "first",
             "should return inserted string state"
+        );
+    }
+
+    struct CountingStreamFactory(&'static str);
+
+    impl IntegrationHtmlStreamProcessorFactory for CountingStreamFactory {
+        fn integration_id(&self) -> &'static str {
+            self.0
+        }
+
+        fn create(&self, _context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+            struct CountingStreamProcessor(usize);
+
+            impl StreamProcessor for CountingStreamProcessor {
+                fn process_chunk(
+                    &mut self,
+                    chunk: &[u8],
+                    _is_last: bool,
+                ) -> std::io::Result<Vec<u8>> {
+                    self.0 += 1;
+                    let mut output = self.0.to_string().into_bytes();
+                    output.extend_from_slice(chunk);
+                    Ok(output)
+                }
+            }
+
+            Box::new(CountingStreamProcessor(0))
+        }
+    }
+
+    #[test]
+    fn html_stream_factories_preserve_order_and_create_isolated_sessions() {
+        let registration = IntegrationRegistration::builder("test")
+            .with_html_stream_processor(Arc::new(CountingStreamFactory("first")))
+            .with_html_stream_processor(Arc::new(CountingStreamFactory("second")))
+            .build();
+        let identifiers: Vec<_> = registration
+            .html_stream_processors
+            .iter()
+            .map(|factory| factory.integration_id())
+            .collect();
+        assert_eq!(
+            identifiers,
+            ["first", "second"],
+            "should preserve factory registration order",
+        );
+
+        let context = IntegrationHtmlStreamContext {
+            request_host: "proxy.example.com".to_owned(),
+            request_scheme: "https".to_owned(),
+            origin_host: "origin.example.com".to_owned(),
+            document_state: IntegrationDocumentState::default(),
+        };
+        let factory = &registration.html_stream_processors[0];
+        let mut first = factory.create(context.clone());
+        let mut second = factory.create(context);
+
+        assert_eq!(
+            first
+                .process_chunk(b"a", false)
+                .expect("should process first session"),
+            b"1a",
+            "should initialize the first session counter",
+        );
+        assert_eq!(
+            second
+                .process_chunk(b"b", true)
+                .expect("should process second session"),
+            b"1b",
+            "should initialize an independent second session counter",
         );
     }
 

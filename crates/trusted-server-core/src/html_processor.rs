@@ -156,6 +156,28 @@ impl StreamProcessor for HtmlWithPostProcessing {
     fn reset(&mut self) {}
 }
 
+struct HtmlWithStreamingProcessors {
+    inner: Box<dyn StreamProcessor>,
+    processors: Vec<Box<dyn StreamProcessor>>,
+}
+
+impl StreamProcessor for HtmlWithStreamingProcessors {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        let mut output = self.inner.process_chunk(chunk, is_last)?;
+        for processor in &mut self.processors {
+            output = processor.process_chunk(&output, is_last)?;
+        }
+        Ok(output)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        for processor in &mut self.processors {
+            processor.reset();
+        }
+    }
+}
+
 /// What the `</body>` seam injects.
 ///
 /// This is a decision, not a side effect of whether the `<head>` script exists.
@@ -299,6 +321,7 @@ impl HtmlProcessorConfig {
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
+    let stream_processor_factories = config.integrations.html_stream_processor_factories();
     let document_state = IntegrationDocumentState::default();
     if config.suppress_datadome_client_side_tag {
         document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
@@ -800,7 +823,17 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
     let inner = HtmlRewriterAdapter::new(rewriter_settings);
 
-    HtmlWithPostProcessing {
+    let stream_context = crate::integrations::IntegrationHtmlStreamContext {
+        request_host: config.request_host.clone(),
+        request_scheme: config.request_scheme.clone(),
+        origin_host: config.origin_host.clone(),
+        document_state: document_state.clone(),
+    };
+    let processors = stream_processor_factories
+        .into_iter()
+        .map(|factory| factory.create(stream_context.clone()))
+        .collect();
+    let inner = HtmlWithPostProcessing {
         inner,
         post_processors,
         accumulated_output: Vec::new(),
@@ -810,6 +843,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         request_host: config.request_host,
         request_scheme: config.request_scheme,
         document_state,
+    };
+
+    HtmlWithStreamingProcessors {
+        inner: Box::new(inner),
+        processors,
     }
 }
 
@@ -1642,6 +1680,63 @@ mod tests {
             streaming_str, buffered_str,
             "streaming and buffered paths should produce identical output"
         );
+    }
+
+    #[test]
+    fn html_stream_processors_compose_in_order_and_receive_final_once() {
+        struct DecoratingProcessor {
+            prefix: u8,
+            final_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl StreamProcessor for DecoratingProcessor {
+            fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> io::Result<Vec<u8>> {
+                if is_last {
+                    self.final_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                let mut output = vec![self.prefix];
+                output.extend_from_slice(chunk);
+                Ok(output)
+            }
+        }
+
+        let inner_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut processor = HtmlWithStreamingProcessors {
+            inner: Box::new(DecoratingProcessor {
+                prefix: b'I',
+                final_calls: Arc::clone(&inner_final_calls),
+            }),
+            processors: vec![
+                Box::new(DecoratingProcessor {
+                    prefix: b'A',
+                    final_calls: Arc::clone(&first_final_calls),
+                }),
+                Box::new(DecoratingProcessor {
+                    prefix: b'B',
+                    final_calls: Arc::clone(&second_final_calls),
+                }),
+            ],
+        };
+
+        assert_eq!(
+            processor
+                .process_chunk(b"x", false)
+                .expect("should process intermediate chunk"),
+            b"BAIx",
+            "should emit intermediate output in registration order",
+        );
+        assert_eq!(
+            processor
+                .process_chunk(b"y", true)
+                .expect("should process final chunk"),
+            b"BAIy",
+            "should preserve processor order for final output",
+        );
+        assert_eq!(inner_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_final_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
