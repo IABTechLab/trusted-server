@@ -1032,14 +1032,14 @@ no separate `examples` subcommand. The generated Markdown renderer now emits
 Prettier-stable tables so generation and the required formatting gate can both
 hold on the same bytes.
 
-- [ ] **Step 6: Commit WP3**
+- [x] **Step 6: Commit WP3**
 
 ```bash
 git add docs/guide/configuration.md docs/guide/cli.md trusted-server.example.toml tools/docs-parity/manifests/settings-companions.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Complete configuration documentation"
 ```
 
-- [ ] **Step 7: Push and publish the Appendix B parity checklist to #1049**
+- [x] **Step 7: Push and publish the Appendix B parity checklist to #1049**
 
 Push the clean WP3 commit to `origin/spec-docs-refresh`, then update only the bounded `<!-- docs-refresh:settings-parity:start -->` / `<!-- docs-refresh:settings-parity:end -->` region of PR #1049's description. Render the checklist from the checked settings record and include all 17 roots, all 14 deploy IDs, all three provider profile schemas, the directional-disposition axes, the secret classifications, and the exact WP3 check results. Read the description back through the GitHub API/CLI and require the rendered rows to equal the checked record; preserve every unrelated PR-description section.
 

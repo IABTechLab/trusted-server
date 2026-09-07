@@ -3463,8 +3463,17 @@ The immutable `origin/rc/202608` baseline remained
   `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`
   and `234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
 
-The repository checkpoint and bounded PR-description publication receipt are
-recorded after their identifiers exist; neither is inferred here.
+The exact WP3 repository checkpoint is
+`18f4d6b2eb2abdaef43b0b5f4b8c15d52be3eba0`; it was pushed to
+`origin/spec-docs-refresh` for PR #1049. The bounded
+`docs-refresh:settings-parity` region was appended to that PR description and
+read back at `2026-09-07T10:46:25Z`. The complete returned body has SHA-256
+`e0e6ff6e4881b7ca91719d87460c9090f062ee9a9390696605086eb8eda38849`.
+The readback contained exactly one marker pair, preserved the complete prior
+body byte-for-byte before that region, matched all 17 roots, all 14 integration
+IDs, all three profile summary rows, and all 18 disposition rows, and reported
+the pushed WP3 commit as the PR head. This receipt does not include its own
+commit SHA.
 
 #### Task 12 — Complete WP4 generated API contracts
 
