@@ -750,7 +750,9 @@ mod tests {
         };
         let canonical = canonical_loader_url(
             "/integrations/didomi/consent/key/loader.js",
-            Some("target_type=notice&x=1&Country=gb&%72egion=lnd&x=2&empty=&space=a+b&plus=%2B"),
+            Some(
+                "target_type=notice&x=1&Country=gb&%63ountry=de&%72egion=lnd&Region=ny&x=2&empty=&space=a+b&plus=%2B",
+            ),
             &geo,
         );
 
@@ -1083,12 +1085,15 @@ mod tests {
                 ("Surrogate-Control", "max-age=3600"),
             ],
         );
-        let services = services_with_geo(Arc::clone(&stub), GeoResult::Value(None));
+        let services = services_with_geo(
+            Arc::clone(&stub),
+            GeoResult::Value(Some(geo_info("US", Some("CA")))),
+        );
         let settings = create_test_settings();
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
             .method(Method::GET)
-            .uri("https://publisher.example/integrations/didomi/consent/sdk/v1/core.js")
+            .uri("https://publisher.example/integrations/didomi/consent/key/loader.js?country=US&region=CA")
             .body(EdgeBody::empty())
             .expect("should build request");
 
@@ -1099,7 +1104,7 @@ mod tests {
         assert_eq!(
             stub.recorded_cache_bypass_flags(),
             vec![false],
-            "should retain normal platform caching for SDK requests"
+            "should retain normal platform caching for canonical SDK loaders"
         );
         for (name, expected) in [
             (header::CACHE_CONTROL.as_str(), "public, max-age=3600"),
