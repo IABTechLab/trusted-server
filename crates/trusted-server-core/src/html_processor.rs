@@ -63,6 +63,9 @@ pub enum BodyCloseInjection {
     /// Read the auction result from `ad_bids_state` and inject it, falling back to
     /// an empty payload. Today's shipped behaviour.
     InlineBids,
+    /// Emit a request-specific marker at a structural body end. The publisher
+    /// streaming controller removes it after the auction completes.
+    DeferredInlineMarker(String),
     /// Emit this markup verbatim — an inert marker the assembly step splits on.
     /// Must be identical for every request that reaches the transform, or the
     /// cached template is not shared-safe.
@@ -371,7 +374,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                                 // Verbatim, and identical on every request that
                                 // reaches the transform — that is what makes the
                                 // cached template shared-safe.
-                                BodyCloseInjection::Marker(marker) => marker.clone(),
+                                BodyCloseInjection::Marker(marker)
+                                | BodyCloseInjection::DeferredInlineMarker(marker) => {
+                                    marker.clone()
+                                }
                                 BodyCloseInjection::InlineBids => {
                                     let script_guard = state.lock().expect("should lock bid state");
                                     match &*script_guard {
@@ -1847,6 +1853,87 @@ mod tests {
             1,
             "should emit exactly one transform-owned marker: {html}"
         );
+    }
+
+    #[test]
+    fn deferred_inline_marker_uses_only_the_structural_body_end() {
+        const TOKEN: &str = "<!--ts-inline-body-close-test-->";
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(Some("must-not-be-read".to_string())));
+        let mut config = marker_mode_config(TOKEN, None);
+        config.body_close = BodyCloseInjection::DeferredInlineMarker(TOKEN.to_string());
+        config.ad_bids_state = state;
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(
+                br#"<html><body><script>const x="</body>";</script><!-- </body> --></body></html>"#,
+                true,
+            )
+            .expect("should process deferred marker document");
+        let html = String::from_utf8(output).expect("output should be UTF-8");
+
+        assert_eq!(
+            html.matches(TOKEN).count(),
+            1,
+            "should emit one marker: {html}"
+        );
+        assert!(
+            html.contains(&format!("<!-- </body> -->{TOKEN}</body>")),
+            "marker should precede only the structural close: {html}"
+        );
+        assert!(!html.contains("must-not-be-read"));
+    }
+
+    #[test]
+    fn deferred_inline_marker_is_absent_without_an_explicit_body_end() {
+        const TOKEN: &str = "<!--ts-inline-body-close-test-->";
+        let mut config = marker_mode_config(TOKEN, None);
+        config.body_close = BodyCloseInjection::DeferredInlineMarker(TOKEN.to_string());
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(b"<html><script>const x='</body>'</script></html>", true)
+            .expect("should process bodyless document");
+        let html = String::from_utf8(output).expect("output should be UTF-8");
+
+        assert!(
+            !html.contains(TOKEN),
+            "bodyless document must have no marker: {html}"
+        );
+    }
+
+    #[test]
+    fn deferred_inline_marker_uses_parser_context_across_every_source_split() {
+        const TOKEN: &str = "<!--ts-inline-body-close-test-->";
+        for source in [
+            "<html><body><p>x</p></BoDy></html>",
+            "<html><body><script>const x='</body>';</script><p>later</p></body></html>",
+            "<html><body><!-- </body> --><p>later</p></body></html>",
+        ] {
+            for split in 0..=source.len() {
+                let mut config = marker_mode_config(TOKEN, None);
+                config.body_close = BodyCloseInjection::DeferredInlineMarker(TOKEN.to_string());
+                let mut processor = create_html_processor(config);
+                let mut output = processor
+                    .process_chunk(&source.as_bytes()[..split], false)
+                    .expect("should process first source fragment");
+                output.extend(
+                    processor
+                        .process_chunk(&source.as_bytes()[split..], true)
+                        .expect("should process final source fragment"),
+                );
+                let html = String::from_utf8(output).expect("output should be UTF-8");
+                assert_eq!(
+                    html.matches(TOKEN).count(),
+                    1,
+                    "should mark one structural close for split {split}: {html}"
+                );
+                assert!(
+                    html.to_ascii_lowercase()
+                        .contains(&format!("{TOKEN}</body>")),
+                    "marker should precede structural close for split {split}: {html}"
+                );
+            }
+        }
     }
 
     #[test]
