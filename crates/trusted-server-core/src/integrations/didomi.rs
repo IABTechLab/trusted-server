@@ -497,14 +497,22 @@ impl IntegrationProxy for DidomiIntegration {
             canonical_loader.as_ref().map(|(geo, _)| geo),
         );
 
+        let platform_request = PlatformHttpRequest::new(proxy_req, backend_name);
+        let platform_request = if matches!(backend, DidomiBackend::Api) {
+            platform_request.with_cache_bypass()
+        } else {
+            platform_request
+        };
         let mut response = services
             .http_client()
-            .send(PlatformHttpRequest::new(proxy_req, backend_name))
+            .send(platform_request)
             .await
             .change_context(Self::error("Didomi upstream request failed"))?;
 
         if matches!(backend, DidomiBackend::Sdk) {
             Self::add_cors_headers(&mut response.response);
+        } else {
+            crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response.response);
         }
 
         Ok(response.response)
@@ -962,6 +970,118 @@ mod tests {
             assert!(
                 stub.recorded_backend_names().is_empty(),
                 "should not contact Didomi on geo failure"
+            );
+        }
+    }
+
+    #[test]
+    fn api_requests_bypass_cache_and_strip_response_cache_metadata() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"event".to_vec(),
+            vec![
+                ("Cache-Control", "public, max-age=3600"),
+                ("Expires", "Wed, 21 Oct 2037 07:28:00 GMT"),
+                ("ETag", "\"api-response\""),
+                ("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                ("Age", "120"),
+                ("Surrogate-Control", "max-age=3600"),
+                ("CDN-Cache-Control", "max-age=3600"),
+            ],
+        );
+        let services = services_with_geo(Arc::clone(&stub), GeoResult::Value(None));
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/integrations/didomi/consent/api/events?x=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should proxy API request");
+
+        assert_eq!(
+            stub.recorded_cache_bypass_flags(),
+            vec![true],
+            "should bypass the platform cache for API requests"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "should make API responses private and non-storable"
+        );
+        for name in [
+            header::EXPIRES.as_str(),
+            header::ETAG.as_str(),
+            header::LAST_MODIFIED.as_str(),
+            header::AGE.as_str(),
+            "surrogate-control",
+            "cdn-cache-control",
+        ] {
+            assert!(
+                response.headers().get(name).is_none(),
+                "should remove API cache metadata {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_responses_preserve_origin_cache_metadata() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"sdk".to_vec(),
+            vec![
+                ("Cache-Control", "public, max-age=3600"),
+                ("Expires", "Wed, 21 Oct 2037 07:28:00 GMT"),
+                ("ETag", "\"sdk-response\""),
+                ("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                ("Age", "120"),
+                ("Surrogate-Control", "max-age=3600"),
+            ],
+        );
+        let services = services_with_geo(Arc::clone(&stub), GeoResult::Value(None));
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/integrations/didomi/consent/sdk/v1/core.js")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should proxy SDK request");
+
+        assert_eq!(
+            stub.recorded_cache_bypass_flags(),
+            vec![false],
+            "should retain normal platform caching for SDK requests"
+        );
+        for (name, expected) in [
+            (header::CACHE_CONTROL.as_str(), "public, max-age=3600"),
+            (header::EXPIRES.as_str(), "Wed, 21 Oct 2037 07:28:00 GMT"),
+            (header::ETAG.as_str(), "\"sdk-response\""),
+            (
+                header::LAST_MODIFIED.as_str(),
+                "Wed, 21 Oct 2015 07:28:00 GMT",
+            ),
+            (header::AGE.as_str(), "120"),
+            ("surrogate-control", "max-age=3600"),
+        ] {
+            assert_eq!(
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "should preserve SDK cache metadata {name}"
             );
         }
     }
