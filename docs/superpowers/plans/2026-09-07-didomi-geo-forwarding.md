@@ -17,7 +17,7 @@
 - Modify: `crates/trusted-server-core/src/integrations/didomi.rs:24-96,365-654`
 - Modify: `crates/trusted-server-core/src/config_payload.rs:50-150`
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 Add tests proving that an omitted `geo_query_parameters` field is `false`, an explicit `true` is retained by `Settings::integration_config::<DidomiIntegrationConfig>()`, and `true` survives `Settings` serialization through `BlobEnvelope` and `settings_from_config_blob`.
 
@@ -36,7 +36,7 @@ let config = settings
 assert!(config.geo_query_parameters, "should retain geo opt-in");
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -47,7 +47,7 @@ cargo test --package trusted-server-core --target aarch64-apple-darwin config_pa
 
 Expected: compilation or assertions fail because `DidomiIntegrationConfig` has no `geo_query_parameters` field.
 
-- [ ] **Step 3: Add the configuration field**
+- [x] **Step 3: Add the configuration field**
 
 Add the field without a custom default function so missing values deserialize to `false`:
 
@@ -59,11 +59,11 @@ pub geo_query_parameters: bool,
 
 Update every `DidomiIntegrationConfig` literal in tests. Keep the default test helper disabled and add a small helper or explicit assignment for enabled geo tests.
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run the two commands from Step 2. Expected: all matching tests pass.
 
-- [ ] **Step 5: Commit the configuration slice**
+- [x] **Step 5: Commit the configuration slice**
 
 ```bash
 git add crates/trusted-server-core/src/integrations/didomi.rs crates/trusted-server-core/src/config_payload.rs
@@ -76,7 +76,7 @@ git commit -m "Add Didomi geo forwarding configuration"
 
 - Modify: `crates/trusted-server-core/src/integrations/didomi.rs:98-229,365-654`
 
-- [ ] **Step 1: Write failing pure-behavior tests**
+- [x] **Step 1: Write failing pure-behavior tests**
 
 Add separate tests for:
 
@@ -96,11 +96,11 @@ target_type=notice&x=1&Country=gb&%72egion=lnd&x=2&empty=&space=a+b&plus=%2B
 
 and expect canonical WHATWG form serialization with only `country=US&region=CA` as the final geo pairs.
 
-- [ ] **Step 2: Run the Didomi tests and verify RED**
+- [x] **Step 2: Run the Didomi tests and verify RED**
 
 Run `cargo test --package trusted-server-core --target aarch64-apple-darwin didomi`. Expected: compilation fails because the matcher, normalized geo type, and canonicalization helpers do not exist.
 
-- [ ] **Step 3: Implement private pure helpers**
+- [x] **Step 3: Implement private pure helpers**
 
 Add a private normalized pair:
 
@@ -121,11 +121,11 @@ Implement private helpers that:
 
 Compare geo names with `eq_ignore_ascii_case` after form decoding. Do not add an ISO registry dependency or decode the path a second time.
 
-- [ ] **Step 4: Run the Didomi tests and verify GREEN**
+- [x] **Step 4: Run the Didomi tests and verify GREEN**
 
 Run `cargo test --package trusted-server-core --target aarch64-apple-darwin didomi`. Expected: all Didomi tests pass.
 
-- [ ] **Step 5: Commit the pure canonicalization slice**
+- [x] **Step 5: Commit the pure canonicalization slice**
 
 ```bash
 git add crates/trusted-server-core/src/integrations/didomi.rs
@@ -138,7 +138,7 @@ git commit -m "Canonicalize Didomi loader geo parameters"
 
 - Modify: `crates/trusted-server-core/src/integrations/didomi.rs:153-332,365-654`
 
-- [ ] **Step 1: Add request-level failing tests**
+- [x] **Step 1: Add request-level failing tests**
 
 Create a local `PlatformGeo` stub in the Didomi test module and build `RuntimeServices` with the existing `StubHttpClient` and `StubBackend`. Add tests proving:
 
@@ -152,11 +152,11 @@ Create a local `PlatformGeo` stub in the Didomi test module and build `RuntimeSe
 
 Queue a stub response only for canonical proxy tests. Assert call count through `recorded_backend_names`, the URI through `recorded_request_uris`, and outbound headers through `recorded_request_headers`.
 
-- [ ] **Step 2: Run request-level tests and verify RED**
+- [x] **Step 2: Run request-level tests and verify RED**
 
 Run `cargo test --package trusted-server-core --target aarch64-apple-darwin didomi`. Expected: redirect, authoritative-header, or failure assertions fail because `handle` still proxies every request directly.
 
-- [ ] **Step 3: Implement the loader decision in `handle`**
+- [x] **Step 3: Implement the loader decision in `handle`**
 
 Before backend registration or request body collection:
 
@@ -171,11 +171,11 @@ Use `crate::response_privacy::enforce_terminal_private_cache_privacy` on generat
 
 Refactor `copy_headers` to accept an optional authoritative `DidomiGeo`. On an enabled canonical loader, set all three compatibility headers from that pair. On other SDK requests, retain the existing header-copy behavior.
 
-- [ ] **Step 4: Run the Didomi tests and verify GREEN**
+- [x] **Step 4: Run the Didomi tests and verify GREEN**
 
 Run `cargo test --package trusted-server-core --target aarch64-apple-darwin didomi`. Expected: all request-level and existing Didomi tests pass.
 
-- [ ] **Step 5: Commit the request behavior**
+- [x] **Step 5: Commit the request behavior**
 
 ```bash
 git add crates/trusted-server-core/src/integrations/didomi.rs
@@ -188,15 +188,15 @@ git commit -m "Forward trusted geo to Didomi loaders"
 
 - Modify: `crates/trusted-server-core/src/integrations/didomi.rs:278-332,365-654`
 
-- [ ] **Step 1: Write failing API cache tests**
+- [x] **Step 1: Write failing API cache tests**
 
-Add tests proving an API request records `with_cache_bypass()` and its response is terminal-private with `Cache-Control: private, no-store` after upstream `Cache-Control`, `Expires`, `ETag`, `Last-Modified`, `Age`, `Surrogate-Control`, and `Fastly-CDN-Cache-Control` headers are supplied. Add a paired SDK test proving the same origin cache headers remain unchanged there.
+Add tests proving an API request records `with_cache_bypass()` and its response is terminal-private with `Cache-Control: private, no-store` after upstream `Cache-Control`, `Expires`, `ETag`, `Last-Modified`, `Age`, `Surrogate-Control`, and `CDN-Cache-Control` headers are supplied. Add a paired SDK test proving the same origin cache headers remain unchanged there.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run `cargo test --package trusted-server-core --target aarch64-apple-darwin didomi`. Expected: the API cache-bypass flag is `false` and upstream cache headers remain.
 
-- [ ] **Step 3: Implement API cache bypass and response privacy**
+- [x] **Step 3: Implement API cache bypass and response privacy**
 
 Build the outbound wrapper as follows:
 
@@ -211,11 +211,11 @@ let platform_request = if matches!(backend, DidomiBackend::Api) {
 
 After receiving an API response, call `enforce_terminal_private_cache_privacy`. Continue adding CORS only to SDK responses and leave SDK origin cache headers intact.
 
-- [ ] **Step 4: Run the tests and verify GREEN**
+- [x] **Step 4: Run the tests and verify GREEN**
 
 Run `cargo test --package trusted-server-core --target aarch64-apple-darwin didomi`. Expected: all Didomi cache tests pass.
 
-- [ ] **Step 5: Commit the cache behavior**
+- [x] **Step 5: Commit the cache behavior**
 
 ```bash
 git add crates/trusted-server-core/src/integrations/didomi.rs
@@ -228,11 +228,11 @@ git commit -m "Enforce Didomi API cache privacy"
 
 - Modify: `crates/trusted-server-adapter-fastly/src/platform.rs:394-430,1009-1025`
 
-- [ ] **Step 1: Write the Fastly conversion test**
+- [x] **Step 1: Write the Fastly conversion test**
 
 Add a unit test that builds an EdgeZero request with the canonical URI emitted by the Didomi serializer, including spaces, literal plus values, percent escapes, duplicates, empty values, and an apostrophe. Convert it through `edge_request_to_fastly` and assert `get_url().query()` or the equivalent Fastly request accessor has the same decoded pairs in the same order and exactly one country/region pair.
 
-- [ ] **Step 2: Run the focused Fastly test**
+- [x] **Step 2: Run the focused Fastly test**
 
 Run:
 
@@ -242,7 +242,7 @@ cargo test-fastly edge_request_to_fastly_preserves_canonical_didomi_query
 
 Expected: pass if the existing adapter conversion is transparent. If it fails, first add a regression assertion showing the exact normalization difference, then make the smallest adapter correction that preserves existing request semantics.
 
-- [ ] **Step 3: Commit the adapter regression test**
+- [x] **Step 3: Commit the adapter regression test**
 
 ```bash
 git add crates/trusted-server-adapter-fastly/src/platform.rs
@@ -258,11 +258,11 @@ git commit -m "Test Didomi query conversion on Fastly"
 - Modify: `docs/guide/integrations/didomi.md:23-158,197-240,296-302`
 - Modify: `docs/superpowers/specs/2026-09-07-didomi-geo-design.md`
 
-- [ ] **Step 1: Update the TOML template and fixture**
+- [x] **Step 1: Update the TOML template and fixture**
 
 Add `geo_query_parameters = false` to the active Didomi blocks. Keep TOML as the primary configuration instructions. If documenting the derived environment override, describe it only as a `ts config validate`/`ts config push` overlay that requires the scalar TOML leaf and does not affect a running deployment.
 
-- [ ] **Step 2: Rewrite the Didomi guide around actual behavior**
+- [x] **Step 2: Rewrite the Didomi guide around actual behavior**
 
 Document:
 
@@ -277,7 +277,7 @@ Document:
 
 Remove the current incorrect statement that `Authorization` is forwarded and the hard-coded SDK `Cache-Control: public, max-age=3600` recommendation. Link the current Didomi reverse-proxy page at `https://developers.didomi.io/api-and-platform/domains/reverse-proxy`.
 
-- [ ] **Step 3: Format and check documentation**
+- [x] **Step 3: Format and check documentation**
 
 Run:
 
@@ -287,7 +287,7 @@ cd docs && npm run format
 
 Expected: Prettier completes successfully.
 
-- [ ] **Step 4: Commit configuration and documentation**
+- [x] **Step 4: Commit configuration and documentation**
 
 ```bash
 git add trusted-server.example.toml crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml docs/guide/integrations/didomi.md docs/superpowers/specs/2026-09-07-didomi-geo-design.md
@@ -300,7 +300,7 @@ git commit -m "Document Didomi geo forwarding"
 
 - Verify all files changed by Tasks 1-6
 
-- [ ] **Step 1: Run format checks**
+- [x] **Step 1: Run format checks**
 
 ```bash
 cargo fmt --all -- --check
@@ -309,7 +309,7 @@ cd docs && npm run format
 
 Expected: both commands exit successfully with no formatting changes left.
 
-- [ ] **Step 2: Run target-matched tests**
+- [x] **Step 2: Run target-matched tests**
 
 ```bash
 cargo test-fastly
@@ -320,7 +320,7 @@ cargo test-spin
 
 Expected: every target-matched test suite passes. Do not substitute bare `cargo test --workspace`.
 
-- [ ] **Step 3: Run target-matched clippy**
+- [x] **Step 3: Run target-matched clippy**
 
 ```bash
 cargo clippy-fastly
@@ -333,7 +333,7 @@ cargo clippy-spin-wasm
 
 Expected: every command exits successfully without warnings.
 
-- [ ] **Step 4: Review the final diff against issue 85 and the spec**
+- [x] **Step 4: Review the final diff against issue 85 and the spec**
 
 ```bash
 git status --short
@@ -343,6 +343,6 @@ git diff --stat main...HEAD
 
 Confirm each acceptance criterion in the spec has code, automated coverage where possible, or an explicit staging requirement. Confirm no Cloudflare, Axum, Spin, EdgeZero, or production JavaScript behavior changed beyond shared core behavior remaining disabled on unsupported adapters.
 
-- [ ] **Step 5: Prepare the branch for review**
+- [x] **Step 5: Prepare the branch for review**
 
 Do not merge or push without the user's direction. Report the branch name, commits, validation evidence, and any staging-only checks that remain.

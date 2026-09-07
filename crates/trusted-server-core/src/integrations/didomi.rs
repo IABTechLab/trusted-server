@@ -835,6 +835,43 @@ mod tests {
     }
 
     #[test]
+    fn enabled_geo_redirects_loader_under_custom_proxy_prefix() {
+        let stub = Arc::new(StubHttpClient::new());
+        let services = services_with_geo(
+            Arc::clone(&stub),
+            GeoResult::Value(Some(geo_info("us", Some("ca")))),
+        );
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
+            proxy_path: Some("publisher/privacy".to_string()),
+            ..config_with_geo_query_parameters()
+        }));
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/publisher/privacy/key/loader.js?target_type=notice")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should return redirect");
+
+        assert_eq!(response.status(), http::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/publisher/privacy/key/loader.js?target_type=notice&country=US&region=CA"),
+            "should preserve the custom proxy prefix in the canonical target"
+        );
+        assert!(
+            stub.recorded_backend_names().is_empty(),
+            "should not contact Didomi before the custom-prefix redirect"
+        );
+    }
+
+    #[test]
     fn enabled_geo_proxies_canonical_loader_with_authoritative_headers() {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"loader".to_vec());
