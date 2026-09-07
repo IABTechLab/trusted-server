@@ -1253,9 +1253,11 @@ struct BrowserPerformanceEntry {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
+    use std::io::{ErrorKind, Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
 
     use chromiumoxide::cdp::browser_protocol::network::{Headers, RequestId, Response};
     use chromiumoxide::cdp::browser_protocol::security::SecurityState;
@@ -1396,34 +1398,173 @@ mod tests {
   </body>
 </html>"#;
 
-    fn gpt_fixture_url(html: &'static str) -> Url {
+    /// Local HTTP server that serves one fixture document for a browser test.
+    ///
+    /// Chrome opens several sockets per navigation: the document request, socket
+    /// pool preconnects that close without sending anything, and speculative
+    /// `/favicon.ico`, `/robots.txt`, and `/sitemap.xml` fetches. The server must
+    /// therefore keep accepting connections for as long as the test runs, must
+    /// serve them concurrently so a silent preconnect cannot stall the document
+    /// request, and must treat a connection that carries no request as normal.
+    /// Serving a single connection instead loses the accept race and fails the
+    /// navigation with `net::ERR_CONNECTION_REFUSED`.
+    struct GptFixtureServer {
+        url: Url,
+        address: SocketAddr,
+        shutdown: Arc<AtomicBool>,
+        acceptor: Option<JoinHandle<()>>,
+    }
+
+    impl GptFixtureServer {
+        fn url(&self) -> &Url {
+            &self.url
+        }
+
+        fn address(&self) -> SocketAddr {
+            self.address
+        }
+    }
+
+    impl Drop for GptFixtureServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(acceptor) = self.acceptor.take() {
+                let _ = acceptor.join();
+            }
+        }
+    }
+
+    /// Serves `html` for every request until the returned server is dropped.
+    fn gpt_fixture_server(html: &'static str) -> GptFixtureServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
         let address = listener.local_addr().expect("should read fixture address");
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("should accept browser request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("should set fixture read timeout");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut chunk = [0_u8; 1024];
-                let chunk_len = stream.read(&mut chunk).expect("should read HTTP request");
-                assert!(chunk_len > 0, "request should contain complete headers");
-                request.extend_from_slice(&chunk[..chunk_len]);
-                assert!(
-                    request.len() <= 16 * 1024,
-                    "request headers should be bounded"
-                );
+        listener
+            .set_nonblocking(true)
+            .expect("should poll the fixture listener without blocking");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let acceptor_shutdown = Arc::clone(&shutdown);
+        let acceptor = std::thread::spawn(move || {
+            while !acceptor_shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        std::thread::spawn(move || serve_gpt_fixture_connection(stream, html));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
             }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                html.len(),
-                html,
-            )
-            .expect("should write fixture response");
         });
-        Url::parse(&format!("http://{address}/")).expect("should parse fixture URL")
+
+        GptFixtureServer {
+            url: Url::parse(&format!("http://{address}/")).expect("should parse fixture URL"),
+            address,
+            shutdown,
+            acceptor: Some(acceptor),
+        }
+    }
+
+    /// Answers one fixture connection, ignoring sockets that carry no request.
+    fn serve_gpt_fixture_connection(mut stream: TcpStream, html: &'static str) {
+        // An accepted socket inherits the listener's non-blocking mode on some
+        // platforms; the bounded blocking read below needs it cleared.
+        if stream.set_nonblocking(false).is_err() {
+            return;
+        }
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .is_err()
+        {
+            return;
+        }
+
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut chunk = [0_u8; 1024];
+            match stream.read(&mut chunk) {
+                // A preconnect socket closes without a request; that is not a failure.
+                Ok(0) => return,
+                Ok(chunk_len) => request.extend_from_slice(&chunk[..chunk_len]),
+                Err(_) => return,
+            }
+            if request.len() > 16 * 1024 {
+                return;
+            }
+        }
+
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(),
+            html,
+        );
+    }
+
+    /// Requests `/` from a fixture server, failing if no response arrives in time.
+    fn fixture_document(address: SocketAddr) -> String {
+        let mut stream = TcpStream::connect(address).expect("should connect to the fixture server");
+        // A fixture that stalls behind another connection must fail this read
+        // rather than deliver the document late.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("should bound the fixture client read");
+        write!(stream, "GET / HTTP/1.1\r\nHost: fixture.test\r\n\r\n")
+            .expect("should send the fixture request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("should read the fixture response before the client timeout");
+        response
+    }
+
+    #[test]
+    fn fixture_server_serves_the_document_after_a_socket_that_sends_no_request() {
+        let fixture = gpt_fixture_server(DELAYED_GPT_FIXTURE);
+
+        // Chrome's socket-pool preconnect opens a socket and closes it without
+        // sending anything, and it can win the accept race with the navigation.
+        drop(TcpStream::connect(fixture.address()).expect("should open a preconnect socket"));
+
+        let response = fixture_document(fixture.address());
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "should still answer the document request: {response}"
+        );
+        assert!(
+            response.contains("ad-z-delayed-0"),
+            "should serve the fixture document body: {response}"
+        );
+    }
+
+    #[test]
+    fn fixture_server_serves_the_document_while_a_silent_socket_stays_open() {
+        let fixture = gpt_fixture_server(DELAYED_GPT_FIXTURE);
+
+        // Held open, sending nothing: serving connections sequentially would
+        // block the document request behind this socket's read timeout.
+        let _silent = TcpStream::connect(fixture.address()).expect("should open a silent socket");
+
+        let response = fixture_document(fixture.address());
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "should answer the document request without waiting for the silent socket: {response}"
+        );
+    }
+
+    #[test]
+    fn fixture_server_answers_every_speculative_browser_request() {
+        let fixture = gpt_fixture_server(LAZY_GPT_FIXTURE);
+
+        // Chrome follows the document with /favicon.ico, /robots.txt and
+        // /sitemap.xml probes on separate connections.
+        for _ in 0..4 {
+            let response = fixture_document(fixture.address());
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "should answer repeated fixture connections: {response}"
+            );
+        }
     }
 
     fn gpt_slot(unit_path: &str, div_id: &str) -> CollectedGptSlot {
@@ -1868,12 +2009,14 @@ mod tests {
             return;
         }
 
+        let unscrolled_fixture = gpt_fixture_server(LAZY_GPT_FIXTURE);
         let without_scroll = BrowserAuditCollector::default()
-            .collect_page(&gpt_fixture_url(LAZY_GPT_FIXTURE), &[])
+            .collect_page(unscrolled_fixture.url(), &[])
             .expect("should collect without scrolling");
+        let scrolled_fixture = gpt_fixture_server(LAZY_GPT_FIXTURE);
         let with_scroll = BrowserAuditCollector::default()
             .with_scroll(true)
-            .collect_page(&gpt_fixture_url(LAZY_GPT_FIXTURE), &[])
+            .collect_page(scrolled_fixture.url(), &[])
             .expect("should collect with scrolling");
 
         assert!(
@@ -1896,8 +2039,9 @@ mod tests {
             return;
         }
 
+        let delayed_fixture = gpt_fixture_server(DELAYED_GPT_FIXTURE);
         let collected = BrowserAuditCollector::default()
-            .collect_page(&gpt_fixture_url(DELAYED_GPT_FIXTURE), &[])
+            .collect_page(delayed_fixture.url(), &[])
             .expect("should collect delayed GPT registry");
 
         assert_eq!(
@@ -1925,8 +2069,9 @@ mod tests {
             return;
         }
 
+        let batched_fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
         let collected = BrowserAuditCollector::default()
-            .collect_page(&gpt_fixture_url(BATCHED_GPT_FIXTURE), &[])
+            .collect_page(batched_fixture.url(), &[])
             .expect("should collect batched GPT registry");
 
         assert_eq!(
