@@ -313,7 +313,9 @@ fn looks_random_suffix(value: &str) -> bool {
     // Single-case runs look generated only when they also lack the vowel spread
     // of a word. ALL-CAPS placement labels such as `BILLBOARD` are ordinary
     // publisher markup, while `zzqxwvkm` is a hash, and case alone cannot tell
-    // them apart in either direction.
+    // them apart in either direction. Vowel-free placement abbreviations can
+    // still be refused: these short tokens provide no reliable distinction
+    // between a consonant-only label and a generated suffix.
     let single_case = value.bytes().all(|byte| byte.is_ascii_uppercase())
         || value.bytes().all(|byte| byte.is_ascii_lowercase());
     if single_case && distinct >= 4 && !has_vowel_structure(value) {

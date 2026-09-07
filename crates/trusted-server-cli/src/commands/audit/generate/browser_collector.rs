@@ -15,7 +15,7 @@ use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
     resolve_chrome, set_browser_cookies,
 };
-use crate::commands::audit::browser_scroll;
+use crate::commands::audit::browser_scroll::{self, CDP_OPERATION_TIMEOUT};
 use crate::commands::audit::collector::{
     GENERATE_SETTLE_MAX_MS, GENERATE_SETTLE_QUIET_MS, GenerateBrowserOpts,
 };
@@ -34,7 +34,6 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// whatever rendered by then.
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Size the page's resource-timing buffer is raised to before navigation, and
 /// therefore also the count at which the buffer is full and entries were lost.
 /// One constant so the script and the warning threshold cannot drift apart.
@@ -640,7 +639,7 @@ async fn collect_open_page(
         }
     }
 
-    match timeout(PAGE_OPERATION_TIMEOUT, page.frames()).await {
+    match timeout(CDP_OPERATION_TIMEOUT, page.frames()).await {
         Ok(Ok(frames)) if frames.len() > 1 => warnings.push(format!(
             "browser evidence inspects only the main frame; {} child frame(s) were present",
             frames.len() - 1
@@ -650,22 +649,22 @@ async fn collect_open_page(
         Err(_) => warnings.push("timed out inspecting browser frames".to_string()),
     }
 
-    let final_url = timeout(PAGE_OPERATION_TIMEOUT, page.url())
+    let final_url = timeout(CDP_OPERATION_TIMEOUT, page.url())
         .await
         .map_err(|_| "timed out reading final page URL".to_string())?
         .map_err(|error| format!("failed to read final page URL: {error}"))?
         .ok_or("browser page URL was empty after navigation")?;
-    let page_title = timeout(PAGE_OPERATION_TIMEOUT, page.get_title())
+    let page_title = timeout(CDP_OPERATION_TIMEOUT, page.get_title())
         .await
         .map_err(|_| "timed out reading page title".to_string())?
         .map_err(|error| format!("failed to read page title: {error}"))?;
-    let html = timeout(PAGE_OPERATION_TIMEOUT, page.content())
+    let html = timeout(CDP_OPERATION_TIMEOUT, page.content())
         .await
         .map_err(|_| "timed out reading rendered page HTML".to_string())?
         .map_err(|error| format!("failed to read rendered page HTML: {error}"))?;
 
     let script_tags: Vec<BrowserScriptTag> = timeout(
-        PAGE_OPERATION_TIMEOUT,
+        CDP_OPERATION_TIMEOUT,
         page.evaluate(
             r#"() => Array.from(document.scripts).map((script) => ({
                 src: script.src || null,
@@ -680,7 +679,7 @@ async fn collect_open_page(
     .map_err(|error| format!("failed to decode rendered script tag data: {error}"))?;
 
     let network_requests: Vec<BrowserPerformanceEntry> = timeout(
-        PAGE_OPERATION_TIMEOUT,
+        CDP_OPERATION_TIMEOUT,
         page.evaluate(
             r#"() => performance.getEntriesByType('resource').map((entry) => ({
                 url: entry.name,
@@ -702,12 +701,12 @@ async fn collect_open_page(
     // are otherwise quiet. Wait for a non-empty registry to stabilize instead
     // of treating the first empty read as authoritative.
     //
-    // Verification needs no counterpart wait, so do not port this into
-    // `audit::browser`: its evidence collector is injected before publisher
-    // scripts run and wraps `googletag.defineSlot`, so every slot defined at
-    // any point before the read is already accumulated in its store. This
-    // command has no such hook and reads a `getSlots()` snapshot instead, which
-    // is why only this side can observe a half-registered registry.
+    // The ad-template verifier needs no counterpart wait: its evidence
+    // collector wraps `googletag.defineSlot` before publisher scripts run and
+    // accumulates every slot defined before the read. This command reads a
+    // `getSlots()` snapshot instead and can observe a half-registered registry.
+    // `ts audit page` also takes a snapshot, but reports what it saw rather
+    // than generating config from it.
     let gpt_slots = collect_stable_gpt_slots(
         page,
         settings.settle_quiet,
@@ -725,7 +724,7 @@ async fn collect_open_page(
     // loaded, it loaded but the command queue never drained, or slots really
     // are absent — and the operator's next move differs for each.
     if gpt_slots.is_empty() {
-        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(GPT_DIAGNOSTIC_SCRIPT)).await {
+        match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(GPT_DIAGNOSTIC_SCRIPT)).await {
             Ok(Ok(result)) => match result.into_value::<serde_json::Value>() {
                 Ok(state) => warnings.push(format!(
                     "no GPT slots in the registry; googletag state: {state}"
@@ -738,7 +737,7 @@ async fn collect_open_page(
     }
 
     let links: Vec<CollectedLink> =
-        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(LINKS_SCRIPT)).await {
+        match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(LINKS_SCRIPT)).await {
             Ok(Ok(result)) => match result.into_value() {
                 Ok(links) => links,
                 Err(error) => {
@@ -766,7 +765,7 @@ async fn collect_open_page(
             .return_by_value(true)
             .build()
             .map_err(|error| format!("failed to build sitemap evaluation: {error}"))?;
-        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(evaluation)).await {
+        match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(evaluation)).await {
             Ok(Ok(result)) => match result.into_value() {
                 Ok(locations) => locations,
                 Err(error) => {
@@ -1022,52 +1021,78 @@ async fn collect_stable_gpt_slots(
     budget: Duration,
     warnings: &mut Vec<String>,
 ) -> Vec<CollectedGptSlot> {
-    let start = std::time::Instant::now();
+    poll_gpt_registry(
+        || async {
+            match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(GPT_SLOTS_SCRIPT)).await {
+                Ok(Ok(result)) => result
+                    .into_value()
+                    .map_err(|error| format!("failed to decode live GPT slots: {error}")),
+                Ok(Err(error)) => Err(format!("failed to evaluate live GPT slots: {error}")),
+                Err(_) => Err(format!(
+                    "timed out evaluating live GPT slots after {}s; results may be partial",
+                    CDP_OPERATION_TIMEOUT.as_secs()
+                )),
+            }
+        },
+        dwell_target,
+        budget,
+        warnings,
+    )
+    .await
+}
+
+/// Polls registry snapshots separately from their browser transport.
+async fn poll_gpt_registry<F, R>(
+    mut read: F,
+    dwell_target: Duration,
+    budget: Duration,
+    warnings: &mut Vec<String>,
+) -> Vec<CollectedGptSlot>
+where
+    F: FnMut() -> R,
+    R: std::future::Future<Output = Result<Vec<CollectedGptSlot>, String>>,
+{
+    let start = tokio::time::Instant::now();
     let mut previous_nonempty: Option<Vec<CollectedGptSlot>> = None;
     let mut latest_nonempty = Vec::new();
     let mut stable_since = None;
+    let mut previous_empty = false;
+    let mut first_read = true;
 
     loop {
-        if start.elapsed() >= budget {
+        if !first_read && start.elapsed() >= budget {
             return expired_gpt_registry(latest_nonempty, dwell_target, budget, warnings);
         }
 
-        // Bound each read on its own so a wedged CDP connection is reported as
-        // a hung evaluate rather than as budget exhaustion, and vice versa.
-        let slots: Vec<CollectedGptSlot> =
-            match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(GPT_SLOTS_SCRIPT)).await {
-                Ok(Ok(result)) => match result.into_value() {
-                    Ok(slots) => slots,
-                    Err(error) => {
-                        warnings.push(format!("failed to decode live GPT slots: {error}"));
-                        return latest_nonempty;
-                    }
-                },
-                Ok(Err(error)) => {
-                    warnings.push(format!("failed to evaluate live GPT slots: {error}"));
-                    return latest_nonempty;
-                }
-                Err(_) => {
-                    warnings.push(format!(
-                        "timed out evaluating live GPT slots after {}s; results may be partial",
-                        PAGE_OPERATION_TIMEOUT.as_secs()
-                    ));
-                    return latest_nonempty;
-                }
-            };
+        first_read = false;
+        let slots = match read().await {
+            Ok(slots) => slots,
+            Err(error) => {
+                warnings.push(error);
+                return latest_nonempty;
+            }
+        };
 
         match gpt_registry_reading(previous_nonempty.as_deref(), &slots) {
             GptRegistryReading::Empty => {
+                // Two empty snapshots end this best-effort wait; they do not
+                // prove that a publisher can never register a later slot.
+                if previous_empty {
+                    return latest_nonempty;
+                }
+                previous_empty = true;
                 previous_nonempty = None;
                 stable_since = None;
             }
             GptRegistryReading::Changed => {
+                previous_empty = false;
                 latest_nonempty.clone_from(&slots);
                 previous_nonempty = Some(slots);
                 stable_since = None;
             }
             GptRegistryReading::Repeated => {
-                let stable_start = stable_since.get_or_insert_with(std::time::Instant::now);
+                previous_empty = false;
+                let stable_start = stable_since.get_or_insert_with(tokio::time::Instant::now);
                 if stable_start.elapsed() >= dwell_target {
                     return slots;
                 }
@@ -1132,14 +1157,14 @@ async fn wait_for_page_settle(
 
     while start.elapsed() < max_wait {
         let ready_state: String =
-            timeout(PAGE_OPERATION_TIMEOUT, page.evaluate("document.readyState"))
+            timeout(CDP_OPERATION_TIMEOUT, page.evaluate("document.readyState"))
                 .await
                 .map_err(|_| "timed out reading document ready state".to_string())?
                 .map_err(|error| format!("failed to read document ready state: {error}"))?
                 .into_value()
                 .map_err(|error| format!("failed to decode document ready state: {error}"))?;
         let resource_count: usize = timeout(
-            PAGE_OPERATION_TIMEOUT,
+            CDP_OPERATION_TIMEOUT,
             page.evaluate("performance.getEntriesByType('resource').length"),
         )
         .await
@@ -1466,6 +1491,173 @@ mod tests {
             gpt_registry_reading(Some(&previous), &grown),
             GptRegistryReading::Changed,
             "a later registration burst should reset the streak"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_stops_after_two_empty_readings() {
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let start = tokio::time::Instant::now();
+        let slots = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(Vec::new()))
+            },
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert!(slots.is_empty(), "should retain an empty registry");
+        assert_eq!(reads, 2, "should stop after consecutive empty snapshots");
+        assert_eq!(
+            start.elapsed(),
+            SETTLE_POLL_INTERVAL,
+            "should avoid spending the full budget"
+        );
+        assert!(
+            warnings.is_empty(),
+            "should leave the empty-state diagnostic to the caller"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_reads_once_with_zero_budget() {
+        let expected = vec![gpt_slot("/123/a", "ad-a")];
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let slots = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(expected.clone()))
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(reads, 1, "should always collect an initial snapshot");
+        assert_eq!(
+            slots, expected,
+            "should retain actual evidence at zero budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_resets_empty_streak_and_preserves_latest_evidence() {
+        let first = vec![gpt_slot("/123/a", "ad-a")];
+        let latest = vec![gpt_slot("/123/b", "ad-b")];
+        let mut readings = [
+            Vec::new(),
+            first,
+            Vec::new(),
+            latest.clone(),
+            Vec::new(),
+            Vec::new(),
+        ]
+        .into_iter();
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || {
+                std::future::ready(Ok(readings
+                    .next()
+                    .expect("should stop at consecutive empties")))
+            },
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(
+            result, latest,
+            "should retain the latest snapshot through empty readings"
+        );
+        assert!(
+            readings.next().is_none(),
+            "should reset each empty streak on a nonempty reading"
+        );
+        assert!(warnings.is_empty(), "should not report budget exhaustion");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_requires_dwell_after_a_later_registration_burst() {
+        let first = vec![gpt_slot("/123/a", "ad-a")];
+        let latest = vec![gpt_slot("/123/a", "ad-a"), gpt_slot("/123/b", "ad-b")];
+        let start = tokio::time::Instant::now();
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || {
+                std::future::ready(Ok(if start.elapsed() < Duration::from_millis(500) {
+                    first.clone()
+                } else {
+                    latest.clone()
+                }))
+            },
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(
+            result, latest,
+            "should include the second registration burst"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(1500),
+            "should reset the dwell after registration changes"
+        );
+        assert!(warnings.is_empty(), "should stabilize within the budget");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_expiry_preserves_changing_evidence() {
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(vec![gpt_slot("/123/a", &format!("ad-{reads}"))]))
+            },
+            Duration::from_millis(750),
+            Duration::from_millis(600),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(reads, 3, "should stop at the budget without an extra read");
+        assert_eq!(
+            result,
+            [gpt_slot("/123/a", "ad-3")],
+            "should retain the most recent evidence"
+        );
+        assert_eq!(warnings.len(), 1, "should report partial evidence once");
+        assert!(
+            warnings[0].contains("600ms budget"),
+            "should identify budget exhaustion"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_read_failure_preserves_evidence_and_reports_the_cause() {
+        let expected = vec![gpt_slot("/123/a", "ad-a")];
+        let mut readings = [Ok(expected.clone()), Err("read unavailable".to_string())].into_iter();
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || std::future::ready(readings.next().expect("should stop on read failure")),
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(
+            result, expected,
+            "should preserve evidence on a later read failure"
+        );
+        assert_eq!(
+            warnings,
+            ["read unavailable"],
+            "should distinguish transport failure from expiry"
         );
     }
 

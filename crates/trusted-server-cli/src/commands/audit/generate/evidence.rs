@@ -215,7 +215,9 @@ impl EvidenceTable {
         self.order
             .iter()
             .filter(|div_id| !self.ambiguous_stems.contains(*div_id))
-            .filter(|div_id| !self.refused_div_ids.contains(*div_id))
+            .filter(|div_id| {
+                !self.refused_div_ids.contains(*div_id) || self.slots.contains_key(*div_id)
+            })
             .map(String::as_str)
     }
 
@@ -457,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn later_refusal_removes_a_previously_accepted_literal() {
+    fn later_refusal_preserves_a_written_literal() {
         let mut table = EvidenceTable::default();
         table.fold_page(
             "/",
@@ -470,9 +472,15 @@ mod tests {
         refused.refused_div_ids.insert("ad-x".to_string());
         table.fold_page("/news", &refused);
 
-        assert!(
-            table.observed_literals().next().is_none(),
-            "a site-wide refusal should remove an earlier literal-routing candidate"
+        assert_eq!(
+            table.observed_literals().collect::<Vec<_>>(),
+            ["ad-x"],
+            "should retain a concrete slot even when another page refuses its stem"
+        );
+        assert_eq!(
+            table.slot_count(),
+            1,
+            "should still write the concrete slot"
         );
         assert_eq!(
             table.observed_div_ids().collect::<BTreeSet<_>>(),
