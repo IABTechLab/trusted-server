@@ -260,3 +260,280 @@ kind = "live"
 path = "docs/roadmap.md"
 route = "/roadmap"
 navigation = true
+
+[[regions]]
+name = "settings-roots"
+path = "docs/guide/configuration.md"
+columns = ["Section", "Purpose"]
+
+[[regions.rows]]
+key = "auction"
+cells = ["`[auction]`", "Auction orchestration, provider instances, bidder routes, and mediation"]
+
+[[regions.rows]]
+key = "cache"
+cells = ["`[cache]`", "Static and rehosted asset cache policy"]
+
+[[regions.rows]]
+key = "consent"
+cells = ["`[consent]`", "Consent interpretation, forwarding, and conflict resolution"]
+
+[[regions.rows]]
+key = "creative_opportunities"
+cells = ["`[creative_opportunities]`", "Server-side page ad opportunities and templates"]
+
+[[regions.rows]]
+key = "debug"
+cells = ["`[debug]`", "Explicit non-production diagnostics"]
+
+[[regions.rows]]
+key = "ec"
+cells = ["`[ec]`", "Edge Cookie identity, persistence, and partner sync"]
+
+[[regions.rows]]
+key = "handlers"
+cells = ["`[[handlers]]`", "Ordered HTTP Basic-auth rules"]
+
+[[regions.rows]]
+key = "image_optimizer"
+cells = ["`[image_optimizer]`", "Reusable Fastly Image Optimizer profiles"]
+
+[[regions.rows]]
+key = "integrations"
+cells = ["`[integrations.*]`", "Typed partner and browser integration settings"]
+
+[[regions.rows]]
+key = "proxy"
+cells = ["`[proxy]`", "Proxy allowlist, TLS policy, and asset routes"]
+
+[[regions.rows]]
+key = "publisher"
+cells = ["`[publisher]`", "Publisher domain, origin, and proxy signing key"]
+
+[[regions.rows]]
+key = "request_signing"
+cells = ["`[request_signing]`", "Outbound Ed25519 request signing and management-store IDs"]
+
+[[regions.rows]]
+key = "response_headers"
+cells = ["`[response_headers]`", "Headers added to Trusted Server responses"]
+
+[[regions.rows]]
+key = "rewrite"
+cells = ["`[rewrite]`", "First-party URL rewrite exclusions"]
+
+[[regions.rows]]
+key = "tester_cookie"
+cells = ["`[tester_cookie]`", "Optional tester-cookie endpoints"]
+
+[[regions.rows]]
+key = "tinybird"
+cells = ["`[tinybird]`", "Direct Tinybird auction telemetry"]
+
+[[regions.rows]]
+key = "trusted_client_ip"
+cells = ["`[trusted_client_ip]`", "Authenticated front-door client-IP forwarding"]
+
+[[regions]]
+name = "integration-configurations"
+path = "docs/guide/configuration.md"
+columns = ["Section", "Reference"]
+
+[[regions.rows]]
+key = "adserver_mock"
+cells = ["`[integrations.adserver_mock]`", "Mediator settings on this page"]
+
+[[regions.rows]]
+key = "aps"
+cells = ["`[integrations.aps]`", "[APS](/guide/integrations/aps)"]
+
+[[regions.rows]]
+key = "datadome"
+cells = ["`[integrations.datadome]`", "[DataDome](/guide/integrations/datadome)"]
+
+[[regions.rows]]
+key = "didomi"
+cells = ["`[integrations.didomi]`", "[Didomi](/guide/integrations/didomi)"]
+
+[[regions.rows]]
+key = "google_tag_manager"
+cells = ["`[integrations.google_tag_manager]`", "[Google Tag Manager](/guide/integrations/google_tag_manager)"]
+
+[[regions.rows]]
+key = "gpt"
+cells = ["`[integrations.gpt]`", "[GPT](/guide/integrations/gpt)"]
+
+[[regions.rows]]
+key = "gpt_diagnostics"
+cells = ["`[integrations.gpt_diagnostics]`", "[GPT diagnostics](/guide/integrations/gpt-diagnostics)"]
+
+[[regions.rows]]
+key = "lockr"
+cells = ["`[integrations.lockr]`", "[lockr](/guide/integrations/lockr)"]
+
+[[regions.rows]]
+key = "nextjs"
+cells = ["`[integrations.nextjs]`", "[Next.js](/guide/integrations/nextjs)"]
+
+[[regions.rows]]
+key = "osano"
+cells = ["`[integrations.osano]`", "[Osano](/guide/integrations/osano)"]
+
+[[regions.rows]]
+key = "permutive"
+cells = ["`[integrations.permutive]`", "[Permutive](/guide/integrations/permutive)"]
+
+[[regions.rows]]
+key = "prebid"
+cells = ["`[integrations.prebid]`", "[Prebid](/guide/integrations/prebid)"]
+
+[[regions.rows]]
+key = "sourcepoint"
+cells = ["`[integrations.sourcepoint]`", "[Sourcepoint](/guide/integrations/sourcepoint)"]
+
+[[regions.rows]]
+key = "testlight"
+cells = ["`[integrations.testlight]`", "Test integration settings on this page"]
+
+[[regions]]
+name = "provider-profile-fields"
+path = "docs/guide/configuration.md"
+columns = ["Profile", "Field", "Required", "Default", "Provider timeout default", "Constraints"]
+
+[[regions.rows]]
+key = "aps.account_id"
+cells = ["`aps`", "`account_id`", "Yes", "—", "`800 ms`", "String or integer; trimmed, nonempty, at most 1024 bytes"]
+
+[[regions.rows]]
+key = "aps.allow_script_creatives"
+cells = ["`aps`", "`allow_script_creatives`", "No", "`false`", "`800 ms`", "Script creatives are ineligible unless enabled"]
+
+[[regions.rows]]
+key = "aps.debug"
+cells = ["`aps`", "`debug`", "No", "`false`", "`800 ms`", "May expose unredacted request and response data"]
+
+[[regions.rows]]
+key = "aps.inventory_domain"
+cells = ["`aps`", "`inventory_domain`", "No", "`None`", "`800 ms`", "DNS name, at most 253 bytes; configure with inventory_page_origin"]
+
+[[regions.rows]]
+key = "aps.inventory_page_origin"
+cells = ["`aps`", "`inventory_page_origin`", "No", "`None`", "`800 ms`", "HTTPS origin without credentials, port, path, query, or fragment; host must equal or be beneath inventory_domain"]
+
+[[regions.rows]]
+key = "prebid-server.bid_param_override_rules"
+cells = ["`prebid-server`", "`bid_param_override_rules`", "No", "`[]`", "`1000 ms`", "Ordered exact-match rules; at least one matcher and a nonempty set object"]
+
+[[regions.rows]]
+key = "prebid-server.bid_param_overrides"
+cells = ["`prebid-server`", "`bid_param_overrides`", "No", "`{}`", "`1000 ms`", "Per-bidder nonempty shallow-merge objects"]
+
+[[regions.rows]]
+key = "prebid-server.bid_param_zone_overrides"
+cells = ["`prebid-server`", "`bid_param_zone_overrides`", "No", "`{}`", "`1000 ms`", "Per-bidder, per-zone nonempty shallow-merge objects"]
+
+[[regions.rows]]
+key = "prebid-server.consent_forwarding"
+cells = ["`prebid-server`", "`consent_forwarding`", "No", "`both`", "`1000 ms`", "`openrtb_only`, `cookies_only`, or `both`"]
+
+[[regions.rows]]
+key = "prebid-server.debug"
+cells = ["`prebid-server`", "`debug`", "No", "`false`", "`1000 ms`", "Includes upstream exchange diagnostics"]
+
+[[regions.rows]]
+key = "prebid-server.debug_query_params"
+cells = ["`prebid-server`", "`debug_query_params`", "No", "`None`", "`1000 ms`", "Optional legacy page-URL query fragment"]
+
+[[regions.rows]]
+key = "prebid-server.test_mode"
+cells = ["`prebid-server`", "`test_mode`", "No", "`false`", "`1000 ms`", "Sets OpenRTB `test = 1`"]
+
+[[regions.rows]]
+key = "standard.imp_ext"
+cells = ["`standard`", "`imp_ext`", "No", "`{}`", "Auction timeout", "JSON object; at most 16384 bytes, depth 8, and 256 keys per object"]
+
+[[regions.rows]]
+key = "standard.request_ext"
+cells = ["`standard`", "`request_ext`", "No", "`{}`", "Auction timeout", "JSON object; at most 16384 bytes, depth 8, and 256 keys per object; `trusted_server` is reserved"]
+
+[[regions]]
+name = "settings-field-dispositions"
+path = "docs/guide/configuration.md"
+columns = ["Path", "Lifecycle", "Key identity", "Serialization", "Runtime", "Secret handling"]
+
+[[regions.rows]]
+key = "AssetOriginAuth.s3_sig_v4"
+cells = ["`AssetOriginAuth.s3_sig_v4`", "deprecated", "alias of `AssetOriginAuth.s3_sigv4`", "skipped", "deserialization only", "none"]
+
+[[regions.rows]]
+key = "DataDomeConfig.server_side_key_secret_name"
+cells = ["`DataDomeConfig.server_side_key_secret_name`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "DataDomeConfig.server_side_key_secret_store"
+cells = ["`DataDomeConfig.server_side_key_secret_store`", "deprecated", "canonical", "skipped", "normalized away", "none"]
+
+[[regions.rows]]
+key = "DataDomeProtectionTestBypassConfig.credential_secret_name"
+cells = ["`DataDomeProtectionTestBypassConfig.credential_secret_name`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "DataDomeProtectionTestBypassConfig.credential_secret_store"
+cells = ["`DataDomeProtectionTestBypassConfig.credential_secret_store`", "deprecated", "canonical", "skipped", "normalized away", "none"]
+
+[[regions.rows]]
+key = "Ec.passphrase"
+cells = ["`Ec.passphrase`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "EcPartner.api_token"
+cells = ["`EcPartner.api_token`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "EcPartner.ts_pull_token"
+cells = ["`EcPartner.ts_pull_token`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "Handler.password"
+cells = ["`Handler.password`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "Publisher.proxy_secret"
+cells = ["`Publisher.proxy_secret`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "S3SigV4AuthConfig.access_key_id"
+cells = ["`S3SigV4AuthConfig.access_key_id`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "S3SigV4AuthConfig.secret_access_key"
+cells = ["`S3SigV4AuthConfig.secret_access_key`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "S3SigV4AuthConfig.secret_store"
+cells = ["`S3SigV4AuthConfig.secret_store`", "deprecated", "canonical", "skipped", "normalized away", "none"]
+
+[[regions.rows]]
+key = "S3SigV4AuthConfig.session_token"
+cells = ["`S3SigV4AuthConfig.session_token`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "TinybirdSettings.access_token_secret"
+cells = ["`TinybirdSettings.access_token_secret`", "deprecated", "canonical", "skipped", "normalized away", "accepted, then discarded"]
+
+[[regions.rows]]
+key = "TinybirdSettings.auction_token_secret"
+cells = ["`TinybirdSettings.auction_token_secret`", "canonical", "canonical", "serialized", "active", "store resolved"]
+
+[[regions.rows]]
+key = "TinybirdSettings.secret_store"
+cells = ["`TinybirdSettings.secret_store`", "deprecated", "canonical", "skipped", "normalized away", "none"]
+
+[[regions.rows]]
+key = "TrustedClientIpConfig.shared_secret"
+cells = ["`TrustedClientIpConfig.shared_secret`", "canonical", "canonical", "serialized", "active", "deliberately inline"]
+
+[[ownership]]
+name = "configuration-reference"
+path = "docs/guide/configuration.md"
+owner = "documentation-maintainers"

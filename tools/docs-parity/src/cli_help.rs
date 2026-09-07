@@ -1170,13 +1170,19 @@ fn cli_blobs_at(root: &Path, revision: &str) -> Result<Vec<SourceBlob>, Report<C
         &mut command,
         MAXIMUM_PROVENANCE_BYTES,
         MAXIMUM_PROVENANCE_BYTES,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
-    .map_err(cli_error)?;
+    .map_err(|detail| {
+        cli_error(format!(
+            "CLI source blob enumeration failed or exceeded bounds: {detail}"
+        ))
+    })?;
     if !output.success || !output.stderr.is_empty() {
-        return Err(cli_error(
-            "CLI source blob enumeration failed or exceeded bounds",
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(cli_error(format!(
+            "CLI source blob enumeration failed or exceeded bounds: success={}, stderr={stderr}",
+            output.success
+        )));
     }
     let text = core::str::from_utf8(&output.stdout)
         .map_err(|_error| cli_error("CLI source blob record is not UTF-8"))?;

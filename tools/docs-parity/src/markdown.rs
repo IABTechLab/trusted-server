@@ -644,32 +644,60 @@ fn marker_name<'a>(line: &'a str, prefix: &str, suffix: &str) -> Option<&'a str>
 fn render_table(region: &GeneratedRegion, newline: &str) -> Result<String, Report<MarkdownError>> {
     let mut rows = region.rows.clone();
     rows.sort_by(|left, right| left.key.cmp(&right.key));
+    let columns = escaped_cells(&region.columns)?;
+    let rows = rows
+        .into_iter()
+        .map(|row| escaped_cells(&row.cells))
+        .collect::<Result<Vec<_>, _>>()?;
+    let widths = (0..columns.len())
+        .map(|index| {
+            rows.iter()
+                .map(|row| row[index].chars().count())
+                .chain(core::iter::once(columns[index].chars().count()))
+                .max()
+                .unwrap_or(0)
+                .max(3)
+        })
+        .collect::<Vec<_>>();
     let mut output = String::new();
-    output.push_str(&render_cells(&region.columns)?);
+    output.push_str(newline);
+    output.push_str(&render_aligned_cells(&columns, &widths));
     output.push_str(newline);
     output.push('|');
-    for _column in &region.columns {
-        output.push_str(" --- |");
+    for width in &widths {
+        output.push(' ');
+        output.push_str(&"-".repeat(*width));
+        output.push_str(" |");
     }
     output.push_str(newline);
     for row in rows {
-        output.push_str(&render_cells(&row.cells)?);
+        output.push_str(&render_aligned_cells(&row, &widths));
         output.push_str(newline);
     }
+    output.push_str(newline);
     Ok(output)
 }
 
-fn render_cells(cells: &[String]) -> Result<String, Report<MarkdownError>> {
-    let mut line = String::from("|");
+fn escaped_cells(cells: &[String]) -> Result<Vec<String>, Report<MarkdownError>> {
+    let mut escaped = Vec::with_capacity(cells.len());
     for cell in cells {
         if cell.contains(['\r', '\n']) {
             return Err(generated_error("generated cells cannot contain newlines"));
         }
+        escaped.push(cell.replace('\\', "\\\\").replace('|', "\\|"));
+    }
+    Ok(escaped)
+}
+
+fn render_aligned_cells(cells: &[String], widths: &[usize]) -> String {
+    let mut line = String::from("|");
+    for (cell, width) in cells.iter().zip(widths) {
         line.push(' ');
-        line.push_str(&cell.replace('\\', "\\\\").replace('|', "\\|"));
+        line.push_str(cell);
+        line.push_str(&" ".repeat(width.saturating_sub(cell.chars().count())));
         line.push_str(" |");
     }
-    Ok(line)
+    line
 }
 
 fn marker_error(detail: impl Into<String>) -> Report<MarkdownError> {

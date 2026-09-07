@@ -142,15 +142,6 @@ pull_sync_concurrency = 3
 # Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
 # exclude_domains = ["*.cdn.example.com"]
 
-# Trust a fronting CDN's reader IP only when the same request also supplies
-# the matching shared secret. The front door must set both headers on requests
-# it sends here and remove client-supplied copies on its other routes.
-# Fastly-only; see docs/guide/fastly.md for the required front-door setup.
-# [trusted_client_ip]
-# ip_header = "x-ts-client-ip"
-# auth_header = "x-ts-client-ip-auth"
-# shared_secret = "replace-with-a-random-shared-secret"
-
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
 # [tester_cookie]
@@ -203,7 +194,6 @@ pull_sync_concurrency = 3
 # type = "s3_sigv4"
 # region = "us-east-1"
 # origin_query = "strip"
-# secret_store = "s3-auth"
 # access_key_id = "access_key_id"
 # secret_access_key = "secret_access_key"
 #
@@ -423,7 +413,6 @@ auction_timeout_ms = 500
 # [tinybird]
 # enabled = true
 # api_host = "api.us-east.tinybird.example"   # required when enabled; host only
-# secret_store = "ts_secrets"                 # Secret Store holding the append token
 # auction_dataset = "auction_events"          # Events API datasource name
 # auction_token_secret = "tinybird_auction_append_token"  # Secret Store key for the token
 
@@ -556,7 +545,6 @@ enabled = false
 # rewrite_sdk = true
 # Server-side Protection API validation (fails open on timeout/error):
 # enable_protection = false
-# server_side_key_secret_store = "ts_secrets"
 # server_side_key_secret_name = "datadome_server_side_key"
 # protection_api_origin = "https://api.example.com"
 # timeout_ms = 1500
@@ -572,7 +560,6 @@ enabled = false
 # Never enable in production.
 # [integrations.datadome.protection_test_bypass]
 # enabled = true
-# credential_secret_store = "ts_secrets"
 # credential_secret_name = "datadome_protection_test_bypass"
 
 # Google Publisher Tag (GPT) first-party proxy. Kept active but disabled so

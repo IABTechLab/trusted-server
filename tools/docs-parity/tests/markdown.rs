@@ -131,12 +131,18 @@ fn generated_regions_sort_rows_and_preserve_every_outside_byte() {
     );
     assert!(
         rendered
-            .find("| Axum | yes |")
+            .find("| Axum    | yes    |")
             .expect("Axum row should exist")
             < rendered
-                .find("| Spin | yes |")
+                .find("| Spin    | yes    |")
                 .expect("Spin row should exist"),
         "rows should use stable key ordering"
+    );
+    assert!(rendered.contains(
+        "<!-- docs-parity:start adapter-support -->\r\n\r\n| Adapter | Health |\r\n| ------- | ------ |"
+    ));
+    assert!(
+        rendered.contains("| Spin    | yes    |\r\n\r\n<!-- docs-parity:end adapter-support -->")
     );
     assert_eq!(
         render(&rendered, &[region()], &[]),

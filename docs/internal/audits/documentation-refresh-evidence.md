@@ -3397,13 +3397,74 @@ and `234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
   including all 62 link tests. No product fixture changed, so no additional
   adapter regression target was required.
 
-The exact WP2 commit is recorded after creation; no receipt is inferred from
-the passing local checks.
+The exact WP2 commit is `95847a545bffdf98a6e667b3aeac0be3d33674dd`;
+it was pushed to PR #1049. No hosted receipt is inferred from the passing local
+checks.
 
 #### Task 11 — Complete WP3 configuration reference and template
 
-Pending. Record generated reference equality, compiled probes, template
-round-trip proof, and bounded PR-description publication.
+Started from clean SHA `95847a545bffdf98a6e667b3aeac0be3d33674dd`.
+The immutable `origin/rc/202608` baseline remained
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
+
+- The initial `settings --check` unexpectedly passed: Task 7 checked the Rust
+  schemas, compiled probes, template, and literal consumers but did not bind
+  those records to reader-facing Markdown. After adding that binding, the
+  focused repository-contract test failed on the absent generated
+  `settings-roots` region. The completed check now requires exact rows for all
+  17 settings roots, all 14 deploy-validated integration IDs, all 14 fields
+  across the three provider profile schemas, and all 18 exceptional field
+  dispositions. Missing profile documentation, duplicate records, generated
+  drift, and incomplete schema sets fail closed.
+- The configuration reference now has standalone `[consent]`, `[tinybird]`,
+  and `[debug]` contracts and subsections for every integration ID. The existing
+  five integration sections were re-audited against source; the DataDome table
+  now covers all 21 canonical top-level fields plus the nested CIDR-source,
+  exclusion-rule, and bypass contracts. The profile table records requiredness,
+  resolved defaults, profile timeout defaults, APS identity grammars, Prebid
+  override semantics, and the standard profile's 16-KiB/eight-level/256-key
+  limits plus its `request_ext.trusted_server` reservation. Manually maintained
+  prose remains outside the generated regions under the checked
+  `configuration-reference` ownership marker.
+- The secret section enumerates the 11 store-resolved paths, the deliberately
+  inline `trusted_client_ip.shared_secret`, the discarded
+  `tinybird.access_token_secret`, four deprecated store selectors, and the
+  `s3_sig_v4` input alias on independent lifecycle, key, serialization,
+  runtime, and secret-handling axes. Both the configuration and CLI guides
+  warn that diff, dry-run, and confirmation output can expose inline values.
+- The example template retains all 17 roots and all 14 integration IDs while
+  removing its duplicate trusted-client-IP block and the four ignored
+  `secret_store` recommendations. The production configuration harness passed
+  199 selected core tests, including its eight mutation phases, and 12 selected
+  Fastly adapter tests. The first sandboxed Viceroy run could not access the
+  native certificate keychain; the same command outside the sandbox passed.
+- Adding generated regions exposed an incompatibility between compact table
+  output and the repository's Prettier gate. A focused renderer test failed
+  first; the generator now emits deterministically aligned, blank-line-delimited
+  tables. `generate --check` and `npm run format` consequently pass on the same
+  bytes. The new links also made the GTM guide reachable, so its stale manual
+  orphan waiver was removed. Snippet reconciliation classifies 77 fences in
+  `configuration.md` without changing validators for byte-identical fences.
+- The reviewed sensitive-value bootstrap rebased exact byte selectors changed
+  by the reference and snippet inventory and added nine occurrences of public
+  vendor or reserved example hosts used by the new field tables. `scan --check`
+  passed after review. No credential, token, or service-ID exception was added.
+- The first default-parallel standalone run exposed a bounded Git provenance
+  subprocess failure that did not reproduce in the focused test. Its deadline
+  is now 60 seconds instead of 30 and its failure reports the bounded process
+  detail. The focused test, full CLI binary, and subsequent default-parallel
+  suite passed. The complete standalone suite passed all 398 tests; standalone
+  formatting and all-target, all-feature clippy with warnings denied passed.
+- Final staged checks passed `settings --check`, `generate --check`,
+  `snippets --check`, `classify --check`, `scan --check`,
+  `links --local --check`, and `check --all`. Documentation ESLint, Prettier,
+  and VitePress build passed. The root and standalone lockfile hashes remain,
+  respectively,
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`
+  and `234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
+
+The repository checkpoint and bounded PR-description publication receipt are
+recorded after their identifiers exist; neither is inferred here.
 
 #### Task 12 — Complete WP4 generated API contracts
 

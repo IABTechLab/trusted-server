@@ -981,35 +981,56 @@ replace this list with `git add docs`, `git add .github`, or another directory.
 - Modify: `trusted-server.example.toml`
 - Modify: `tools/docs-parity/manifests/settings-companions.toml`
 - Modify: `tools/docs-parity/manifests/snippets.toml`
+- Modify: `tools/docs-parity/manifests/pages.toml`
+- Modify: `tools/docs-parity/manifests/orphans.toml`
+- Modify: `tools/docs-parity/manifests/sensitive-allowlist.toml`
+- Modify: `tools/docs-parity/src/settings.rs`
+- Modify: `tools/docs-parity/tests/settings.rs`
+- Modify: `tools/docs-parity/src/markdown.rs`
+- Modify: `tools/docs-parity/tests/markdown.rs`
+- Modify: `tools/docs-parity/src/cli_help.rs`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
+- Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
 - Modify: PR #1049 description through GitHub API/CLI
 
-- [ ] **Step 1: Make parity fail on the baseline gaps**
+- [x] **Step 1: Make parity fail on the baseline gaps**
 
 Run settings check before edits. Expected diagnostics: missing `[consent]`, `[debug]`, and standalone `[tinybird]`; 10/17 key-section rows; 5/14 integration subsections; missing profile schemas; stale template store selectors; duplicate `[trusted_client_ip]`; incomplete directional/secret dispositions.
 
-- [ ] **Step 2: Generate canonical field/profile regions**
+Implementation correction: the baseline command unexpectedly exited zero
+because the Task 7 checker covered schemas and the example harness but did not
+bind reader-facing Markdown. The added repository-contract assertion failed on
+the missing `settings-roots` region before the reference was generated. This
+RED result replaces the inaccurate expected diagnostic list above and closes
+the checker gap instead of treating the passing baseline as acceptance.
+
+- [x] **Step 2: Generate canonical field/profile regions**
 
 Render all 17 roots, 14 deploy IDs, three profile configs, resolved defaults/requiredness/grammars/ranges/limits, and every independent disposition axis. Manual prose stays outside markers with an ownership marker.
 
-- [ ] **Step 3: Repair the example template conservatively**
+- [x] **Step 3: Repair the example template conservatively**
 
 Audit all existing root blocks, remove the four accepted-and-discarded store selectors and duplicate trusted-client-IP block, preserve exact placeholder strings/key references, and do not normalize deprecated/ignored fields into recommended examples.
 
-- [ ] **Step 4: Document the secret model and CLI exposure**
+- [x] **Step 4: Document the secret model and CLI exposure**
 
 Classify the 11 store-resolved paths, inline trusted-client-IP secret, and discarded Tinybird secret. Warn that config diff/dry-run/push output can expose inline values.
 
-- [ ] **Step 5: Run extractor, harness, and docs gates**
+- [x] **Step 5: Run extractor, harness, and docs gates**
 
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- settings --check
-cargo run --manifest-path tools/docs-parity/Cargo.toml -- examples --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
 cargo test-fastly config
 cd docs && npm run lint && npm run format && npm run build
 ```
 
 Expected: every active canonical field appears in reference/template, noncanonical paths are labeled only, all literal consumers remain connected, and all eight example-harness phases pass.
+
+`settings --check` owns and executes the eight-phase example harness; there is
+no separate `examples` subcommand. The generated Markdown renderer now emits
+Prettier-stable tables so generation and the required formatting gate can both
+hold on the same bytes.
 
 - [ ] **Step 6: Commit WP3**
 

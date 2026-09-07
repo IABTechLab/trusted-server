@@ -9,6 +9,88 @@ profile_ids = ["aps", "prebid-server", "standard"]
 consumer_literals = ["ec_passphrase", "handler_password", "publisher_proxy_secret"]
 expected_failure_diagnostic = "unmodified template rejects publisher.cookie_domain, publisher.domain, publisher.origin_url"
 
+[[profile_schemas]]
+id = "aps"
+timeout_default = "`800 ms`"
+
+[[profile_schemas]]
+id = "prebid-server"
+timeout_default = "`1000 ms`"
+
+[[profile_schemas]]
+id = "standard"
+timeout_default = "Auction timeout"
+
+[[profile_fields]]
+path = "aps.account_id"
+default = "—"
+constraints = "String or integer; trimmed, nonempty, at most 1024 bytes"
+
+[[profile_fields]]
+path = "aps.allow_script_creatives"
+default = "`false`"
+constraints = "Script creatives are ineligible unless enabled"
+
+[[profile_fields]]
+path = "aps.debug"
+default = "`false`"
+constraints = "May expose unredacted request and response data"
+
+[[profile_fields]]
+path = "aps.inventory_domain"
+default = "`None`"
+constraints = "DNS name, at most 253 bytes; configure with inventory_page_origin"
+
+[[profile_fields]]
+path = "aps.inventory_page_origin"
+default = "`None`"
+constraints = "HTTPS origin without credentials, port, path, query, or fragment; host must equal or be beneath inventory_domain"
+
+[[profile_fields]]
+path = "prebid-server.bid_param_override_rules"
+default = "`[]`"
+constraints = "Ordered exact-match rules; at least one matcher and a nonempty set object"
+
+[[profile_fields]]
+path = "prebid-server.bid_param_overrides"
+default = "`{}`"
+constraints = "Per-bidder nonempty shallow-merge objects"
+
+[[profile_fields]]
+path = "prebid-server.bid_param_zone_overrides"
+default = "`{}`"
+constraints = "Per-bidder, per-zone nonempty shallow-merge objects"
+
+[[profile_fields]]
+path = "prebid-server.consent_forwarding"
+default = "`both`"
+constraints = "`openrtb_only`, `cookies_only`, or `both`"
+
+[[profile_fields]]
+path = "prebid-server.debug"
+default = "`false`"
+constraints = "Includes upstream exchange diagnostics"
+
+[[profile_fields]]
+path = "prebid-server.debug_query_params"
+default = "`None`"
+constraints = "Optional legacy page-URL query fragment"
+
+[[profile_fields]]
+path = "prebid-server.test_mode"
+default = "`false`"
+constraints = "Sets OpenRTB `test = 1`"
+
+[[profile_fields]]
+path = "standard.imp_ext"
+default = "`{}`"
+constraints = "JSON object; at most 16384 bytes, depth 8, and 256 keys per object"
+
+[[profile_fields]]
+path = "standard.request_ext"
+default = "`{}`"
+constraints = "JSON object; at most 16384 bytes, depth 8, and 256 keys per object; `trusted_server` is reserved"
+
 [[consumers]]
 path = "crates/trusted-server-cli/src/commands/audit/generate/mod.rs"
 mode = "literal_substitution"

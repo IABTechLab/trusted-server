@@ -71,6 +71,13 @@ fields to existing configs before relying on their overrides. Pass `--no-env`
 for file-only operation. See [Configuration](/guide/configuration#environment-variable-overrides-typed-cli)
 for migration and rollback guidance.
 
+`config diff`, `config push --dry-run`, and the confirmation preview shown by
+`config push` render resolved app-config values. Store-backed secret fields are
+key names at this stage, but deliberately inline values such as
+`trusted_client_ip.shared_secret` can appear verbatim. Use `--no-diff` for a
+push when terminal output or CI logs are not an approved place for inline
+configuration secrets; `--no-diff` does not change validation or publication.
+
 `config push` publishes a single EdgeZero `BlobEnvelope` containing the validated
 Trusted Server settings JSON. This blob model is intentional because full
 Trusted Server configs can exceed Fastly limits when split into one config-store

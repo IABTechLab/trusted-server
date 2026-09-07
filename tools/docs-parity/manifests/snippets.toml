@@ -1601,311 +1601,323 @@ fingerprint = "sha256:260ae3f02edb1df3c8439354545c12a685a8b502c592d4e8b5f497d511
 path = "docs/guide/configuration.md"
 selector = "fence:24"
 command = "validate-toml"
-fingerprint = "sha256:7629fd38fd5c544800cc6e4a44d22ff876f8aada50d800953b32e1bd9aa15bbe"
+fingerprint = "sha256:910e8bf41753d312986229315221060b0f1b39e33c211e1122080b19bb883fef"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
 selector = "fence:25"
+command = "validate-toml"
+fingerprint = "sha256:7629fd38fd5c544800cc6e4a44d22ff876f8aada50d800953b32e1bd9aa15bbe"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:26"
 command = "validate-bash"
 fingerprint = "sha256:29f3385b7020183c913f4ff19950e5396f25ec9ef04d2051cbf815d4b482791c"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:26"
+selector = "fence:27"
 command = "validate-toml"
 fingerprint = "sha256:8ee177e445fbd38350ed3d09e262c63e8ceb8dffc816256e697b8b6dc0fb6714"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:27"
+selector = "fence:28"
 command = "validate-bash"
 fingerprint = "sha256:4405d91e14cd3ca56be9b6f3dcaea293dd027cabba9b0b886c3fc1854e0806bd"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:28"
+selector = "fence:29"
 command = "validate-bash"
 fingerprint = "sha256:9e502c94813c113d29106088ecbe0d62928cda93b010f566b687ce8f577f1f9d"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:29"
+selector = "fence:30"
 command = "validate-bash"
 fingerprint = "sha256:1ddfba0d258b17eaa61a36fed4d244cb063007c8fd266c7f2ab6ccc1c6711d90"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:30"
+selector = "fence:31"
 command = "validate-toml"
 fingerprint = "sha256:cba0b6bcef57f8d09137934eeed9943e77aee3d96104363a45421887a52b16bd"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:31"
+selector = "fence:32"
 command = "illustrative-toml"
 fingerprint = "sha256:1783959f4964681217237cecdb59f3d1c061376965051c7a2e96d54223de2c95"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:32"
+selector = "fence:33"
 command = "validate-bash"
 fingerprint = "sha256:e9dac440660210e926d5b895ddf28f9bbad97941a9412c3259cf39cbfec5816f"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:33"
+selector = "fence:34"
 command = "illustrative-toml"
 fingerprint = "sha256:4f6ba81d759f50dace957bda18a4caa39bc678e5a659838115a887f643093dfb"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:34"
+selector = "fence:35"
 command = "validate-toml"
 fingerprint = "sha256:fce2585e5e9083f89edbe09e1adeb18095c79eab532ab3225b8013aa4b1c8c13"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:35"
+selector = "fence:36"
 command = "validate-bash"
 fingerprint = "sha256:edb668b55aa15fd64513812fd6cefe6f4d14ec8603b130b2eda2855736b4ec4d"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:36"
+selector = "fence:37"
 command = "illustrative-toml"
 fingerprint = "sha256:af80c70a8f4c56b0d249edbd758343160da03863a25810e4e60effdc351f1c25"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:37"
+selector = "fence:38"
 command = "illustrative-toml"
 fingerprint = "sha256:22fa48ce87e7ba1e273954071fb165a71cb1864b0b9f296514cab38b081ae44c"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:38"
+selector = "fence:39"
 command = "validate-toml"
 fingerprint = "sha256:78d0dc627671276caf903797505c4aaca24c58d41af88d4f0906e237d31aa43b"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:39"
+selector = "fence:40"
 command = "validate-toml"
 fingerprint = "sha256:12d9d00e8451b07d6689b80919d2ad8e29a4c66531c0bfcea055c47b8a955412"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:40"
+selector = "fence:41"
 command = "validate-toml"
 fingerprint = "sha256:3c946db563e5a28b2c0d632ce65b7f960799e48c3d397d03a7d60356c983dc47"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:41"
+selector = "fence:42"
 command = "validate-toml"
 fingerprint = "sha256:fbbd8201f29923d1ca5339a5a2631eb0b44dfaef628338bae51e132392c2d9ce"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:42"
+selector = "fence:43"
 command = "validate-toml"
 fingerprint = "sha256:1b9dbaad0a4b279c46d8d63ed41b4c434d4d41d41585d784f9280855d420a7cd"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:43"
+selector = "fence:44"
 command = "validate-bash"
 fingerprint = "sha256:74696d952cde6c83b5f50d89fa9a837de2368d8bffe06b0c53cc69c126c88916"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:44"
+selector = "fence:45"
 command = "validate-toml"
 fingerprint = "sha256:20f7461b3dbdc6f0bae0189bff72096b54ad0299e022d6ca281c7a30d8bb32e6"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:45"
+selector = "fence:46"
 command = "validate-toml"
 fingerprint = "sha256:0d7db5c9836cdd8dd8e7d3bca7a505dd9579df45bb791a4a522345745b863320"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:46"
+selector = "fence:47"
 command = "validate-toml"
 fingerprint = "sha256:df5f5a536a01abea60ed4342191f334c234d5d985d9c17b0bff78308569ab5e4"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:47"
+selector = "fence:48"
 command = "validate-toml"
 fingerprint = "sha256:7ad02952d790b493afd89feb0886f153fbf3576e5a57a13e2770ed81a520bb91"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:48"
+selector = "fence:49"
 command = "validate-toml"
 fingerprint = "sha256:6c224bcd090472a13006d21d57b94d1e8b91553e227316169c071ee0c44bd0da"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:49"
+selector = "fence:50"
 command = "validate-toml"
 fingerprint = "sha256:77c6e963cb841714d5452615077ea96078e92242615c049a375d714bba1506e8"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:50"
+selector = "fence:51"
 command = "validate-toml"
 fingerprint = "sha256:d915d07903cf7a51381228b4d8487d5d3d7b6ec3544c577a9e088a5440927a9c"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:51"
+selector = "fence:52"
 command = "validate-toml"
 fingerprint = "sha256:399c24f06c2b1ea3a0ffb4fd37bcb2de39fe00969e5f9418d95ed4d253eac037"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:52"
+selector = "fence:53"
 command = "validate-toml"
 fingerprint = "sha256:ad6c3358b68963d408befa3effff1a05ab5789e474b48058134800143b5aead4"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:53"
+selector = "fence:54"
 command = "validate-toml"
 fingerprint = "sha256:049166b27a49bb3d1c5e234ca1b8307eb16aee55cf8f7c04fbaef52a1d8aaaca"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:54"
+selector = "fence:55"
 command = "validate-toml"
 fingerprint = "sha256:57959790f9e4ba05c78130b066605fd1f123354c0fc1992bb3694f4361a25228"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:55"
+selector = "fence:56"
 command = "validate-bash"
 fingerprint = "sha256:3d6208efe3e99ad35db7b6e89170ab23318033dbd9cb902bec67e492ca5f38d2"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:56"
+selector = "fence:57"
 command = "validate-toml"
 fingerprint = "sha256:ed491e20e950d0c5f9c0934a8c893d975fc991f63d83b8dc604d10b423a9c61b"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:57"
+selector = "fence:58"
 command = "validate-bash"
 fingerprint = "sha256:f8354ba405f9650eb1adb6dd4bf8960c0eed75cfce229ecfaefcbe513d148ca2"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:58"
+selector = "fence:59"
 command = "validate-toml"
 fingerprint = "sha256:82002e0cd5b574b9c76a43f72b505c6842ae58694cce5a333f924c44156e4ed8"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:59"
+selector = "fence:60"
 command = "validate-bash"
 fingerprint = "sha256:c73697cb3b16d257114a9238b12d3010714fd7ba6872594102985c871f94af1f"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:60"
+selector = "fence:61"
 command = "validate-toml"
 fingerprint = "sha256:36c07c7f4323f9e809929094b7d1e45d378f10df191191192b86a4c31f4f4cff"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:61"
+selector = "fence:62"
 command = "validate-toml"
 fingerprint = "sha256:30bbd6e9b8519598a7f2c4a87cc2deb8387209fd4216158e8f6067ba79e25953"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:62"
+selector = "fence:63"
 command = "validate-toml"
 fingerprint = "sha256:9794cb5928971bc69aaca0c0e59e6265d9806f17a1683b6633e8ec3dfdb34629"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:63"
+selector = "fence:64"
 command = "validate-toml"
 fingerprint = "sha256:016b276737d1e76ee8b3b91636d93f64d75913d283243c2689e31d6891ea83dc"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:64"
+selector = "fence:65"
 command = "validate-bash"
 fingerprint = "sha256:416ae2c0b02be4647eb99156ad5840bc4f12c43b2763c9bcd05d175336ccc121"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:65"
+selector = "fence:66"
 command = "validate-toml"
 fingerprint = "sha256:e29cd6a49b56c33b068fc4c86eadc6c77f0568b24b4b807b00b96e2e8621cde8"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:66"
+selector = "fence:67"
 command = "validate-bash"
 fingerprint = "sha256:82c9fdb11d806e78ee2fe4518abe85e00545b88baaba3cd88df2cd4506860408"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:67"
+selector = "fence:68"
 command = "validate-toml"
 fingerprint = "sha256:d49c22e618f5fb5f8f5c0e6ffcaeb564cca241d6b5e6ff7c868c0b298d425402"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:68"
+selector = "fence:69"
+command = "validate-toml"
+fingerprint = "sha256:5a3b8621927107df05d0ee43535be455ddef6979968d4151980665e6aed3d41b"
+
+[[snippets]]
+path = "docs/guide/configuration.md"
+selector = "fence:70"
 command = "validate-toml"
 fingerprint = "sha256:1974e6b5e5e2e3442d0a63ff642ee06af3fec838174c09342b7313053b937654"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:69"
+selector = "fence:71"
 command = "validate-bash"
 fingerprint = "sha256:8f4669de483f409c37fe0404d8a87fd03ba732badc0cf92d6fabde70229c0add"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:70"
+selector = "fence:72"
 command = "illustrative-plain"
 fingerprint = "sha256:315b73d8516060bc6f13bafbf4939ac4130dd190ac685771ac4f490f469b6497"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:71"
+selector = "fence:73"
 command = "validate-toml"
 fingerprint = "sha256:958bd6b9f8ebc252ea024c16eaa7afe7d6cfd9826da90812aaffad2be4dbc2ca"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:72"
+selector = "fence:74"
 command = "illustrative-plain"
 fingerprint = "sha256:67f45cb57d45f94cae1887a0106e7df2b85a54d0096ab833def30bf38a76eaf4"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:73"
+selector = "fence:75"
 command = "illustrative-plain"
 fingerprint = "sha256:7366b06e4126ff3170f2b2715d25d3ae5ca25fa4650788a5c171c11cb336c940"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:74"
+selector = "fence:76"
 command = "validate-bash"
 fingerprint = "sha256:88b50a4adbd4dcd56c38f8a7e3f2a52d69aa374e669e622b13d3ac5bbfe731ad"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:75"
+selector = "fence:77"
 command = "validate-bash"
 fingerprint = "sha256:dd5111ee740e613440010e73138558d1ea2d5b81c48f33ea397beb6f5144d398"
 

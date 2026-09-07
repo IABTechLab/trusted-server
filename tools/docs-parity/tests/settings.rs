@@ -875,6 +875,37 @@ fn aliases_require_an_exact_canonical_target() {
 }
 
 #[test]
+fn profile_documentation_requires_unique_nonblank_semantics() {
+    for source in [
+        r#"
+        version = 1
+        reviewed = true
+
+        [[profile_schemas]]
+        id = "standard"
+        timeout_default = "Auction timeout"
+
+        [[profile_schemas]]
+        id = "standard"
+        timeout_default = "1000 ms"
+        "#,
+        r#"
+        version = 1
+        reviewed = true
+
+        [[profile_fields]]
+        path = "standard.request_ext"
+        default = "{}"
+        constraints = ""
+        "#,
+    ] {
+        let error = CompanionManifest::parse(source)
+            .expect_err("ambiguous profile documentation must fail closed");
+        assert!(error.to_string().contains("profile"));
+    }
+}
+
+#[test]
 fn checked_companions_cover_the_real_settings_sources() {
     let companions =
         CompanionManifest::parse(include_str!("../manifests/settings-companions.toml"))
@@ -907,6 +938,12 @@ fn checked_companions_cover_the_real_settings_sources() {
             schema.type_named(required_type).is_some(),
             "{path} should include {required_type}"
         );
+        if path.ends_with("auction/profile.rs") {
+            assert!(
+                schema.type_named("PrebidProfileConfig").is_some(),
+                "profile source should include PrebidProfileConfig"
+            );
+        }
     }
 }
 

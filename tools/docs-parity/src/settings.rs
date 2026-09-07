@@ -357,6 +357,10 @@ struct RawCompanionManifest {
     template: Option<TemplateRecord>,
     #[serde(default)]
     consumers: Vec<ConsumerRecord>,
+    #[serde(default)]
+    profile_schemas: Vec<ProfileSchemaDocumentation>,
+    #[serde(default)]
+    profile_fields: Vec<ProfileFieldDocumentation>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -382,6 +386,44 @@ enum ConsumerMode {
 struct ConsumerRecord {
     path: String,
     mode: ConsumerMode,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileSchemaDocumentation {
+    id: String,
+    timeout_default: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileFieldDocumentation {
+    path: String,
+    default: String,
+    constraints: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DocumentationManifest {
+    #[serde(default)]
+    regions: Vec<DocumentationRegion>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentationRegion {
+    name: String,
+    path: String,
+    columns: Vec<String>,
+    #[serde(default)]
+    rows: Vec<DocumentationRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct DocumentationRow {
+    key: String,
+    cells: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -421,6 +463,8 @@ pub struct CompanionManifest {
     fields: BTreeMap<String, FieldDisposition>,
     template: Option<TemplateRecord>,
     consumers: BTreeMap<String, ConsumerMode>,
+    profile_schemas: BTreeMap<String, ProfileSchemaDocumentation>,
+    profile_fields: BTreeMap<String, ProfileFieldDocumentation>,
 }
 
 impl CompanionManifest {
@@ -444,6 +488,8 @@ impl CompanionManifest {
             fields: raw_fields,
             template,
             consumers: raw_consumers,
+            profile_schemas: raw_profile_schemas,
+            profile_fields: raw_profile_fields,
         } = raw;
 
         let mut entries = BTreeMap::new();
@@ -533,11 +579,38 @@ impl CompanionManifest {
                 }));
             }
         }
+        let mut profile_schemas = BTreeMap::new();
+        for schema in raw_profile_schemas {
+            if schema.id.trim().is_empty()
+                || schema.timeout_default.trim().is_empty()
+                || profile_schemas.insert(schema.id.clone(), schema).is_some()
+            {
+                return Err(Report::new(SettingsError::InvalidCompanion {
+                    symbol: "profile schema".to_owned(),
+                    reason: "profile schema IDs and timeout defaults must be nonblank and unique",
+                }));
+            }
+        }
+        let mut profile_fields = BTreeMap::new();
+        for field in raw_profile_fields {
+            if field.path.trim().is_empty()
+                || field.default.trim().is_empty()
+                || field.constraints.trim().is_empty()
+                || profile_fields.insert(field.path.clone(), field).is_some()
+            {
+                return Err(Report::new(SettingsError::InvalidCompanion {
+                    symbol: "profile field".to_owned(),
+                    reason: "profile field paths, defaults, and constraints must be nonblank and unique",
+                }));
+            }
+        }
         Ok(Self {
             entries,
             fields,
             template,
             consumers,
+            profile_schemas,
+            profile_fields,
         })
     }
 
@@ -685,7 +758,309 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Set
     let alias_targets = source_alias_targets(&schemas)?;
     verify_alias_dispositions(&companions, &alias_targets)?;
     check_field_dispositions(&companions, &alias_targets)?;
-    check_template_contract(repository, &companions)
+    check_template_contract(repository, &companions)?;
+    check_documentation_contract(repository, &companions, &schemas)?;
+    if crate::markdown::generate(repository, false).change_context(SettingsError::Repository)? {
+        return invalid_contract("generated configuration reference has drift".to_owned());
+    }
+    Ok(())
+}
+
+fn check_documentation_contract(
+    repository: &Repository,
+    companions: &CompanionManifest,
+    schemas: &[ExtractedSchema],
+) -> Result<(), Report<SettingsError>> {
+    let source = read_repository_text(repository, "tools/docs-parity/manifests/pages.toml", false)?;
+    let manifest = toml::from_str::<DocumentationManifest>(&source).map_err(|error| {
+        Report::new(SettingsError::InvalidContract {
+            reason: format!("cannot parse generated documentation records: {error}"),
+        })
+    })?;
+    let mut regions = BTreeMap::new();
+    for region in manifest.regions {
+        if regions.insert(region.name.clone(), region).is_some() {
+            return invalid_contract("duplicate generated documentation region".to_owned());
+        }
+    }
+
+    let settings = find_extracted_type(schemas, "Settings")?;
+    let root_keys = settings
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<BTreeSet<_>>();
+    check_summary_region(
+        &regions,
+        "settings-roots",
+        &["Section", "Purpose"],
+        &root_keys,
+        |key| match key {
+            "handlers" => "`[[handlers]]`".to_owned(),
+            "integrations" => "`[integrations.*]`".to_owned(),
+            _ => format!("`[{key}]`"),
+        },
+    )?;
+
+    let integration_keys = companions
+        .template
+        .as_ref()
+        .ok_or_else(|| {
+            Report::new(SettingsError::InvalidContract {
+                reason: "missing [template] record".to_owned(),
+            })
+        })?
+        .integration_ids
+        .clone();
+    check_summary_region(
+        &regions,
+        "integration-configurations",
+        &["Section", "Reference"],
+        &integration_keys,
+        |key| format!("`[integrations.{key}]`"),
+    )?;
+
+    let expected_profiles = profile_documentation_rows(schemas, companions)?;
+    check_exact_region(
+        &regions,
+        "provider-profile-fields",
+        &[
+            "Profile",
+            "Field",
+            "Required",
+            "Default",
+            "Provider timeout default",
+            "Constraints",
+        ],
+        &expected_profiles,
+    )?;
+
+    let expected_dispositions = disposition_documentation_rows(companions);
+    check_exact_region(
+        &regions,
+        "settings-field-dispositions",
+        &[
+            "Path",
+            "Lifecycle",
+            "Key identity",
+            "Serialization",
+            "Runtime",
+            "Secret handling",
+        ],
+        &expected_dispositions,
+    )
+}
+
+fn check_summary_region<F>(
+    regions: &BTreeMap<String, DocumentationRegion>,
+    name: &str,
+    columns: &[&str],
+    expected_keys: &BTreeSet<String>,
+    first_cell: F,
+) -> Result<(), Report<SettingsError>>
+where
+    F: Fn(&str) -> String,
+{
+    let region = require_documentation_region(regions, name, columns)?;
+    let actual_keys = region
+        .rows
+        .iter()
+        .map(|row| row.key.clone())
+        .collect::<BTreeSet<_>>();
+    if actual_keys.len() != region.rows.len() {
+        return invalid_contract(format!("{name} has duplicate row keys"));
+    }
+    require_equal(&format!("{name} row set"), &actual_keys, expected_keys)?;
+    for row in &region.rows {
+        if row.cells.len() != columns.len()
+            || row.cells.first() != Some(&first_cell(&row.key))
+            || row.cells.iter().any(|cell| cell.trim().is_empty())
+        {
+            return invalid_contract(format!("{name} row {} is invalid", row.key));
+        }
+    }
+    Ok(())
+}
+
+fn check_exact_region(
+    regions: &BTreeMap<String, DocumentationRegion>,
+    name: &str,
+    columns: &[&str],
+    expected: &BTreeMap<String, Vec<String>>,
+) -> Result<(), Report<SettingsError>> {
+    let region = require_documentation_region(regions, name, columns)?;
+    let actual = region
+        .rows
+        .iter()
+        .map(|row| (row.key.clone(), row.cells.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if actual.len() != region.rows.len() {
+        return invalid_contract(format!("{name} has duplicate row keys"));
+    }
+    require_equal(&format!("{name} rows"), &actual, expected)
+}
+
+fn require_documentation_region<'a>(
+    regions: &'a BTreeMap<String, DocumentationRegion>,
+    name: &str,
+    columns: &[&str],
+) -> Result<&'a DocumentationRegion, Report<SettingsError>> {
+    let region = regions.get(name).ok_or_else(|| {
+        Report::new(SettingsError::InvalidContract {
+            reason: format!("missing generated documentation region {name}"),
+        })
+    })?;
+    let expected_columns = columns
+        .iter()
+        .map(|column| (*column).to_owned())
+        .collect::<Vec<_>>();
+    if region.path != "docs/guide/configuration.md" || region.columns != expected_columns {
+        return invalid_contract(format!("{name} path or columns differ"));
+    }
+    Ok(region)
+}
+
+fn find_extracted_type<'a>(
+    schemas: &'a [ExtractedSchema],
+    name: &str,
+) -> Result<&'a ExtractedType, Report<SettingsError>> {
+    let matches = schemas
+        .iter()
+        .filter_map(|schema| schema.type_named(name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [item] => Ok(*item),
+        _ => invalid_contract(format!(
+            "expected exactly one extracted documentation type {name}"
+        )),
+    }
+}
+
+fn profile_documentation_rows(
+    schemas: &[ExtractedSchema],
+    companions: &CompanionManifest,
+) -> Result<BTreeMap<String, Vec<String>>, Report<SettingsError>> {
+    let mut rows = BTreeMap::new();
+    for (profile, type_name) in [
+        ("standard", "StandardProfileConfig"),
+        ("prebid-server", "PrebidProfileConfig"),
+        ("aps", "ApsProfileConfig"),
+    ] {
+        let profile_schema = companions.profile_schemas.get(profile).ok_or_else(|| {
+            Report::new(SettingsError::InvalidContract {
+                reason: format!("missing profile documentation for {profile}"),
+            })
+        })?;
+        let item = find_extracted_type(schemas, type_name)?;
+        for field in &item.fields {
+            let key = format!("{profile}.{}", field.name);
+            let documented = companions.profile_fields.get(&key).ok_or_else(|| {
+                Report::new(SettingsError::InvalidContract {
+                    reason: format!("missing profile field documentation for {key}"),
+                })
+            })?;
+            let required = if field.optional || field.default.is_some() {
+                "No"
+            } else {
+                "Yes"
+            };
+            rows.insert(
+                key,
+                vec![
+                    format!("`{profile}`"),
+                    format!("`{}`", field.name),
+                    required.to_owned(),
+                    documented.default.clone(),
+                    profile_schema.timeout_default.clone(),
+                    documented.constraints.clone(),
+                ],
+            );
+        }
+    }
+    let actual_profiles = companions
+        .profile_schemas
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    require_equal(
+        "profile documentation schema set",
+        &actual_profiles,
+        &string_set(&["aps", "prebid-server", "standard"]),
+    )?;
+    let actual_fields = companions
+        .profile_fields
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_fields = rows.keys().cloned().collect::<BTreeSet<_>>();
+    require_equal(
+        "profile documentation field set",
+        &actual_fields,
+        &expected_fields,
+    )?;
+    Ok(rows)
+}
+
+fn disposition_documentation_rows(companions: &CompanionManifest) -> BTreeMap<String, Vec<String>> {
+    companions
+        .fields
+        .iter()
+        .map(|(path, disposition)| {
+            let key_identity = match disposition.key_identity {
+                KeyIdentity::Canonical => "canonical".to_owned(),
+                KeyIdentity::Alias => format!(
+                    "alias of `{}`",
+                    disposition
+                        .alias_of
+                        .as_deref()
+                        .expect("alias shape is validated while parsing")
+                ),
+            };
+            (
+                path.clone(),
+                vec![
+                    format!("`{path}`"),
+                    lifecycle_name(disposition.lifecycle).to_owned(),
+                    key_identity,
+                    serialization_name(disposition.serialization).to_owned(),
+                    runtime_name(disposition.runtime).to_owned(),
+                    secret_name(disposition.secret).to_owned(),
+                ],
+            )
+        })
+        .collect()
+}
+
+const fn lifecycle_name(value: Lifecycle) -> &'static str {
+    match value {
+        Lifecycle::Canonical => "canonical",
+        Lifecycle::Deprecated => "deprecated",
+        Lifecycle::Rejected => "rejected",
+    }
+}
+
+const fn serialization_name(value: SerializationDisposition) -> &'static str {
+    match value {
+        SerializationDisposition::Serialized => "serialized",
+        SerializationDisposition::Skipped => "skipped",
+    }
+}
+
+const fn runtime_name(value: RuntimeDisposition) -> &'static str {
+    match value {
+        RuntimeDisposition::Active => "active",
+        RuntimeDisposition::NormalizedAway => "normalized away",
+        RuntimeDisposition::DeserializationOnly => "deserialization only",
+    }
+}
+
+const fn secret_name(value: SecretDisposition) -> &'static str {
+    match value {
+        SecretDisposition::StoreResolved => "store resolved",
+        SecretDisposition::DeliberatelyInline => "deliberately inline",
+        SecretDisposition::AcceptedDiscarded => "accepted, then discarded",
+        SecretDisposition::None => "none",
+    }
 }
 
 fn check_field_dispositions(
