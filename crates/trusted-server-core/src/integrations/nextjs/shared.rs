@@ -15,7 +15,7 @@ use crate::host_rewrite::rewrite_bare_host_at_boundaries;
 /// RSC push script call pattern for extracting payload string boundaries.
 pub(crate) static RSC_PUSH_CALL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?s)(?:(?:self|window)\.__next_f\.push|\(\s*(?:self|window)\.__next_f\s*=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.push)\(\[\s*1\s*,\s*(['"])"#,
+        r#"(?s)(?:(?:(?:self|window)\.)?__next_f\.push|\(\s*(?:self|window)\.__next_f\s*=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.push)\(\[\s*1\s*,\s*(['"])"#,
     )
     .expect("valid RSC push call regex")
 });

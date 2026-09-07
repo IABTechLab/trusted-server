@@ -13,16 +13,12 @@ const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 mod html_post_process;
 mod rsc;
 mod rsc_placeholders;
-#[allow(
-    dead_code,
-    reason = "classifier is consumed by the bounded streaming session introduced with it"
-)]
 mod rsc_stream;
 mod script_rewriter;
 mod shared;
 
 // Re-export deprecated legacy functions for backward compatibility.
-// Production code should use the placeholder-based approach via NextJsHtmlPostProcessor.
+// Production code uses the bounded placeholder streaming processor.
 #[allow(
     deprecated,
     reason = "legacy HTML post-processing functions remain re-exported for compatibility"
@@ -30,8 +26,8 @@ mod shared;
 pub use html_post_process::{post_process_rsc_html, post_process_rsc_html_in_place};
 pub use rsc::rewrite_rsc_scripts_combined;
 
-use html_post_process::NextJsHtmlPostProcessor;
 use rsc_placeholders::NextJsRscPlaceholderRewriter;
+use rsc_stream::NextJsRscStreamProcessorFactory;
 use script_rewriter::NextJsNextDataRewriter;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -99,17 +95,16 @@ pub fn register(
     // Register a structured (Pages Router __NEXT_DATA__) rewriter.
     let structured = Arc::new(NextJsNextDataRewriter::new(config.clone())?);
 
-    // Insert placeholders for App Router RSC payload scripts during the initial HTML rewrite pass,
-    // then substitute them during post-processing without re-parsing HTML.
+    // Insert placeholders for App Router RSC payload scripts during the HTML rewrite pass,
+    // then substitute them through the bounded output stream processor.
     let placeholders = Arc::new(NextJsRscPlaceholderRewriter::new(config.clone()));
 
-    // Register post-processor for cross-script RSC T-chunks
-    let post_processor = Arc::new(NextJsHtmlPostProcessor::new(config.clone()));
+    let stream_processor = Arc::new(NextJsRscStreamProcessorFactory::new(config.clone()));
 
     let builder = IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
         .with_script_rewriter(structured)
         .with_script_rewriter(placeholders)
-        .with_html_post_processor(post_processor);
+        .with_html_stream_processor(stream_processor);
 
     Ok(Some(builder.build()))
 }
@@ -642,19 +637,12 @@ mod tests {
     }
 
     /// Regression test: a fragmented `self.__next_f.push([1, "…"])` RSC script
-    /// must still have its origin URLs rewritten after going through the full
-    /// streaming pipeline into the accumulating post-processor. Exercises the
-    /// "fallback" branch of `NextJsHtmlPostProcessor` where no placeholders
-    /// were captured during streaming (because every fragment returned `Keep`
-    /// on `!is_last`) and `post_process_rsc_html_in_place_with_limit` has to
-    /// re-parse the accumulated HTML to find RSC push scripts.
+    /// must still have its origin URLs rewritten through the streaming pipeline.
     #[test]
-    fn small_chunk_rsc_push_survives_fragmentation_via_post_processor_fallback() {
+    fn small_chunk_rsc_push_survives_fragmentation() {
         // Build an RSC push script whose payload contains multiple origin URLs.
         // With chunk_size = 128, this script's text node will be fragmented at
-        // chunk boundaries by the streaming input, so NextJsRscPlaceholderRewriter
-        // will return Keep on every fragment and the post-processor fallback
-        // has to rewrite on the accumulated HTML.
+        // chunk boundaries by the streaming input.
         let html = format!(
             r#"<html><body><script>self.__next_f.push([1,"1:{{\"link\":\"https://origin.example.com/a\",\"img\":\"https://origin.example.com/img.png\",\"nested\":{{\"url\":\"https://origin.example.com/deep/path?q=1\",\"extra\":\"{}\"}}}}"])</script></body></html>"#,
             "x".repeat(400), // pad to guarantee chunk-boundary fragmentation

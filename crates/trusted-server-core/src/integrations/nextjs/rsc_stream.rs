@@ -1,11 +1,19 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::io;
 use std::sync::{Arc, Mutex};
 
-use crate::integrations::IntegrationDocumentState;
+use crate::integrations::{
+    IntegrationDocumentState, IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+};
+use crate::streaming_processor::StreamProcessor;
 
-use super::NEXTJS_INTEGRATION_ID;
-use super::rsc::{TChunkScan, scan_tchunks};
+use super::rsc::{
+    DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, TChunkScan, rewrite_rsc_scripts_combined_with_limit,
+    scan_tchunks,
+};
+use super::shared::RscUrlRewriter;
+use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_PREFIX: &str = "__ts_rsc_";
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_SUFFIX: &str = "__";
@@ -18,7 +26,7 @@ pub(super) enum FragmentState {
     BypassUntilLast,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct CapturedPayload {
     pub(super) placeholder: String,
     pub(super) original: String,
@@ -29,6 +37,7 @@ pub(super) struct NextJsDocumentState {
     pub(super) namespace: String,
     pub(super) next_data: FragmentState,
     pub(super) rsc_script: FragmentState,
+    pub(super) rsc_probe: String,
     pub(super) captured_payloads: VecDeque<CapturedPayload>,
     pub(super) captured_payload_bytes: usize,
     pub(super) next_placeholder_index: usize,
@@ -41,6 +50,7 @@ impl Default for NextJsDocumentState {
             namespace: uuid::Uuid::new_v4().simple().to_string(),
             next_data: FragmentState::Idle,
             rsc_script: FragmentState::Idle,
+            rsc_probe: String::new(),
             captured_payloads: VecDeque::new(),
             captured_payload_bytes: 0,
             next_placeholder_index: 0,
@@ -122,6 +132,361 @@ pub(super) fn capture_fragment<'a>(
             FragmentCapture::PassThrough
         }
     }
+}
+
+pub(super) struct NextJsRscStreamProcessorFactory {
+    config: Arc<NextJsIntegrationConfig>,
+}
+
+impl NextJsRscStreamProcessorFactory {
+    pub(super) fn new(config: Arc<NextJsIntegrationConfig>) -> Self {
+        Self { config }
+    }
+}
+
+impl IntegrationHtmlStreamProcessorFactory for NextJsRscStreamProcessorFactory {
+    fn integration_id(&self) -> &'static str {
+        NEXTJS_INTEGRATION_ID
+    }
+
+    fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+        let limit = if self.config.max_combined_payload_bytes == 0 {
+            DEFAULT_MAX_COMBINED_PAYLOAD_BYTES
+        } else {
+            self.config.max_combined_payload_bytes
+        };
+        Box::new(NextJsRscStreamProcessor::new(
+            document_state(&context.document_state),
+            context.origin_host,
+            context.request_host,
+            context.request_scheme,
+            limit,
+        ))
+    }
+}
+
+pub(super) struct NextJsRscStreamProcessor {
+    state: Arc<Mutex<NextJsDocumentState>>,
+    origin_host: String,
+    request_host: String,
+    request_scheme: String,
+    limit: usize,
+    pending_candidate: Vec<u8>,
+    held_output: Vec<u8>,
+    group: Vec<CapturedPayload>,
+    rewriter: RscUrlRewriter,
+}
+
+impl NextJsRscStreamProcessor {
+    fn new(
+        state: Arc<Mutex<NextJsDocumentState>>,
+        origin_host: String,
+        request_host: String,
+        request_scheme: String,
+        limit: usize,
+    ) -> Self {
+        Self {
+            state,
+            origin_host,
+            request_host,
+            request_scheme,
+            limit,
+            pending_candidate: Vec::new(),
+            held_output: Vec::new(),
+            group: Vec::new(),
+            rewriter: RscUrlRewriter::new(),
+        }
+    }
+
+    fn namespace_prefix(&self) -> Vec<u8> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!("{RSC_PAYLOAD_PLACEHOLDER_PREFIX}{}_", state.namespace).into_bytes()
+    }
+
+    fn next_captured(&self) -> Option<CapturedPayload> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .captured_payloads
+            .front()
+            .cloned()
+    }
+
+    fn pop_captured(&self, placeholder: &str) -> io::Result<CapturedPayload> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(payload) = state.captured_payloads.pop_front() else {
+            return Err(io::Error::other(
+                "Next.js RSC placeholder has no captured payload",
+            ));
+        };
+        if payload.placeholder != placeholder {
+            state.captured_payloads.push_front(payload);
+            return Err(io::Error::other(
+                "Next.js RSC placeholders are out of document order",
+            ));
+        }
+        state.captured_payload_bytes = state
+            .captured_payload_bytes
+            .saturating_sub(payload.original.len());
+        Ok(payload)
+    }
+
+    fn append_held(&mut self, bytes: &[u8]) -> bool {
+        if self
+            .held_output
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|combined| combined > self.limit)
+        {
+            false
+        } else {
+            self.held_output.extend_from_slice(bytes);
+            true
+        }
+    }
+
+    fn release_group(&mut self, rewritten: Option<Vec<String>>) -> io::Result<Vec<u8>> {
+        let replacements: Vec<&str> = match &rewritten {
+            Some(rewritten) => rewritten.iter().map(String::as_str).collect(),
+            None => self
+                .group
+                .iter()
+                .map(|payload| payload.original.as_str())
+                .collect(),
+        };
+        let output = substitute_payloads(
+            std::mem::take(&mut self.held_output),
+            &self.group,
+            &replacements,
+            &self.namespace_prefix(),
+        )?;
+        self.group.clear();
+        Ok(output)
+    }
+
+    fn resolve_group(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let payloads: Vec<&str> = self
+            .group
+            .iter()
+            .map(|payload| payload.original.as_str())
+            .collect();
+        match classify_rsc_group(&payloads, self.limit) {
+            RscGroupStatus::NeedMore => Ok(None),
+            RscGroupStatus::CompleteRewritable => {
+                let rewritten = rewrite_rsc_scripts_combined_with_limit(
+                    &payloads,
+                    &self.rewriter,
+                    &self.origin_host,
+                    &self.request_host,
+                    &self.request_scheme,
+                    self.limit,
+                );
+                if rewritten.len() != self.group.len() {
+                    return Err(io::Error::other(
+                        "Next.js RSC rewrite returned a mismatched payload count",
+                    ));
+                }
+                self.release_group(Some(rewritten)).map(Some)
+            }
+            RscGroupStatus::CompleteUnrewritable => self.release_group(None).map(Some),
+            RscGroupStatus::Invalid => {
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .bypass_rsc = true;
+                self.release_group(None).map(Some)
+            }
+        }
+    }
+
+    fn release_bypass(&mut self, current: &[u8]) -> io::Result<Vec<u8>> {
+        let mut output = self.release_group(None)?;
+        output.extend_from_slice(&self.pending_candidate);
+        self.pending_candidate.clear();
+        let captured = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.bypass_rsc = true;
+            state.captured_payload_bytes = 0;
+            state.captured_payloads.drain(..).collect::<Vec<_>>()
+        };
+        let replacements: Vec<&str> = captured
+            .iter()
+            .map(|payload| payload.original.as_str())
+            .collect();
+        output.extend(substitute_payloads(
+            current.to_vec(),
+            &captured,
+            &replacements,
+            &self.namespace_prefix(),
+        )?);
+        Ok(output)
+    }
+}
+
+impl StreamProcessor for NextJsRscStreamProcessor {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> io::Result<Vec<u8>> {
+        let mut current = std::mem::take(&mut self.pending_candidate);
+        current.extend_from_slice(chunk);
+
+        let bypass = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bypass_rsc;
+        if bypass {
+            return self.release_bypass(&current);
+        }
+
+        let namespace_prefix = self.namespace_prefix();
+        let mut output = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let Some(expected) = self.next_captured() else {
+                let remainder = &current[cursor..];
+                if self.group.is_empty() {
+                    output.extend_from_slice(remainder);
+                } else if !self.append_held(remainder) {
+                    output.extend(self.release_bypass(remainder)?);
+                }
+                break;
+            };
+
+            let remainder = &current[cursor..];
+            let Some(relative_start) = find_bytes(remainder, &namespace_prefix) else {
+                let retained = longest_suffix_prefix(remainder, expected.placeholder.as_bytes());
+                let ready_end = remainder.len() - retained;
+                let ready = &remainder[..ready_end];
+                if self.group.is_empty() {
+                    output.extend_from_slice(ready);
+                } else if !self.append_held(ready) {
+                    output.extend(self.release_bypass(remainder)?);
+                    break;
+                }
+                self.pending_candidate
+                    .extend_from_slice(&remainder[ready_end..]);
+                break;
+            };
+
+            let placeholder_start = cursor + relative_start;
+            let before = &current[cursor..placeholder_start];
+            if self.group.is_empty() {
+                output.extend_from_slice(before);
+            } else if !self.append_held(before) {
+                output.extend(self.release_bypass(&current[placeholder_start..])?);
+                break;
+            }
+
+            let placeholder = expected.placeholder.as_bytes();
+            let available = &current[placeholder_start..];
+            if available.len() < placeholder.len() && placeholder.starts_with(available) {
+                self.pending_candidate.extend_from_slice(available);
+                break;
+            }
+            if !available.starts_with(placeholder) {
+                return Err(io::Error::other(
+                    "Next.js RSC output contains an unknown generated placeholder",
+                ));
+            }
+            if !self.append_held(placeholder) {
+                output.extend(self.release_bypass(&current[placeholder_start..])?);
+                break;
+            }
+            let captured = self.pop_captured(&expected.placeholder)?;
+            self.group.push(captured);
+            cursor = placeholder_start + placeholder.len();
+
+            if let Some(released) = self.resolve_group()? {
+                output.extend(released);
+            }
+        }
+
+        if is_last {
+            if !self.pending_candidate.is_empty() {
+                if self.group.is_empty() {
+                    output.append(&mut self.pending_candidate);
+                } else {
+                    let pending = std::mem::take(&mut self.pending_candidate);
+                    if !self.append_held(&pending) {
+                        output.extend(self.release_bypass(&pending)?);
+                    }
+                }
+            }
+            if !self.group.is_empty() {
+                output.extend(self.release_group(None)?);
+            }
+            if self.next_captured().is_some() {
+                return Err(io::Error::other(
+                    "Next.js RSC captured payload was not present in parser output",
+                ));
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty())
+        .then(|| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .flatten()
+}
+
+fn longest_suffix_prefix(bytes: &[u8], pattern: &[u8]) -> usize {
+    let maximum = bytes.len().min(pattern.len().saturating_sub(1));
+    (1..=maximum)
+        .rev()
+        .find(|length| bytes.ends_with(&pattern[..*length]))
+        .unwrap_or(0)
+}
+
+fn substitute_payloads(
+    mut input: Vec<u8>,
+    payloads: &[CapturedPayload],
+    replacements: &[&str],
+    namespace_prefix: &[u8],
+) -> io::Result<Vec<u8>> {
+    if payloads.len() != replacements.len() {
+        return Err(io::Error::other(
+            "Next.js RSC substitution received mismatched payloads",
+        ));
+    }
+    for (payload, replacement) in payloads.iter().zip(replacements) {
+        let placeholder = payload.placeholder.as_bytes();
+        let Some(position) = find_bytes(&input, placeholder) else {
+            return Err(io::Error::other(
+                "Next.js RSC captured placeholder is missing from held output",
+            ));
+        };
+        let mut next = Vec::with_capacity(
+            input
+                .len()
+                .saturating_sub(placeholder.len())
+                .saturating_add(replacement.len()),
+        );
+        next.extend_from_slice(&input[..position]);
+        next.extend_from_slice(replacement.as_bytes());
+        next.extend_from_slice(&input[position + placeholder.len()..]);
+        input = next;
+    }
+    if find_bytes(&input, namespace_prefix).is_some() {
+        return Err(io::Error::other(
+            "Next.js RSC generated placeholder remained after substitution",
+        ));
+    }
+    Ok(input)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,5 +728,104 @@ mod tests {
             RscGroupStatus::Invalid,
             "should reject a group larger than its configured bound",
         );
+    }
+
+    fn processor_with_payloads(
+        payloads: &[&str],
+        limit: usize,
+    ) -> (NextJsRscStreamProcessor, Vec<String>) {
+        let integration_state = IntegrationDocumentState::default();
+        let shared = document_state(&integration_state);
+        let mut placeholders = Vec::new();
+        {
+            let mut state = shared.lock().expect("should lock document state");
+            for payload in payloads {
+                let placeholder =
+                    rsc_payload_placeholder(&state.namespace, state.next_placeholder_index);
+                state.next_placeholder_index += 1;
+                state.captured_payload_bytes += payload.len();
+                state.captured_payloads.push_back(CapturedPayload {
+                    placeholder: placeholder.clone(),
+                    original: (*payload).to_owned(),
+                });
+                placeholders.push(placeholder);
+            }
+        }
+        (
+            NextJsRscStreamProcessor::new(
+                shared,
+                "origin.example.com".to_owned(),
+                "proxy.example.com".to_owned(),
+                "https".to_owned(),
+                limit,
+            ),
+            placeholders,
+        )
+    }
+
+    #[test]
+    fn stream_processor_emits_ordinary_html_before_eof() {
+        let (mut processor, _) = processor_with_payloads(&[], 1024);
+
+        assert_eq!(
+            processor
+                .process_chunk(b"<html><body>ordinary", false)
+                .expect("should process ordinary HTML"),
+            b"<html><body>ordinary",
+            "should not wait for EOF without an unresolved RSC group",
+        );
+    }
+
+    #[test]
+    fn stream_processor_rewrites_and_releases_a_complete_payload_in_one_call() {
+        let payload = r#"1:T29,{"url":"https://origin.example.com/path"}"#;
+        let (mut processor, placeholders) = processor_with_payloads(&[payload], 1024);
+        let input = format!("before{}after", placeholders[0]);
+
+        let output = processor
+            .process_chunk(input.as_bytes(), false)
+            .expect("should process complete RSC payload");
+        let output = String::from_utf8(output).expect("should emit UTF-8 HTML");
+
+        assert!(output.starts_with("before"));
+        assert!(output.ends_with("after"));
+        assert!(output.contains("proxy.example.com/path"));
+        assert!(!output.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX));
+    }
+
+    #[test]
+    fn stream_processor_holds_only_until_cross_payload_content_completes() {
+        let payloads = ["1:T3,ab", "c"];
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, 1024);
+
+        let first = processor
+            .process_chunk(format!("head{}middle", placeholders[0]).as_bytes(), false)
+            .expect("should process incomplete group");
+        assert_eq!(first, b"head", "should hold from the first placeholder");
+
+        let second = processor
+            .process_chunk(format!("{}tail", placeholders[1]).as_bytes(), false)
+            .expect("should complete group");
+        assert_eq!(
+            second,
+            format!("{}middle{}tail", payloads[0], payloads[1]).as_bytes(),
+            "should release the complete group and interstitial output in order",
+        );
+    }
+
+    #[test]
+    fn stream_processor_matches_a_placeholder_split_across_output_chunks() {
+        let (mut processor, placeholders) = processor_with_payloads(&["plain"], 1024);
+        let placeholder = &placeholders[0];
+        let split = placeholder.len() / 2;
+
+        let first = processor
+            .process_chunk(placeholder[..split].as_bytes(), false)
+            .expect("should retain a partial placeholder");
+        assert!(first.is_empty(), "should retain only the candidate suffix");
+        let second = processor
+            .process_chunk(placeholder[split..].as_bytes(), false)
+            .expect("should finish the placeholder");
+        assert_eq!(second, b"plain", "should restore the captured payload");
     }
 }

@@ -18268,12 +18268,11 @@ mod tests {
         );
     }
 
-    /// Streaming dispatch contract: HTML with a registered post-processor still
-    /// routes through `Stream`, and the shared processor pipeline still applies
-    /// the post-processor rewrite.
+    /// Streaming dispatch contract: HTML with a registered stream processor
+    /// routes through `Stream`, and the shared processor pipeline applies it.
     #[test]
-    fn streaming_html_with_post_processors_rewrites_body() {
-        // Configure nextjs so a post-processor is registered.
+    fn streaming_html_with_stream_processors_rewrites_body() {
+        // Configure nextjs so a stream processor is registered.
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -18290,8 +18289,8 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
 
         assert!(
-            registry.has_html_post_processors(),
-            "nextjs integration must register an HTML post-processor"
+            !registry.html_stream_processor_factories().is_empty(),
+            "nextjs integration must register an HTML stream processor"
         );
         assert_eq!(
             classify_response_route(
@@ -18301,7 +18300,7 @@ mod tests {
                 "proxy.example.com",
             ),
             ResponseRoute::Stream,
-            "HTML with post-processors must route to Stream"
+            "HTML with stream processors must route to Stream"
         );
 
         // Feed a small HTML body through the same pipeline the Stream arm uses.
@@ -18348,13 +18347,12 @@ mod tests {
         );
     }
 
-    /// Document-state survives from the streaming pass into the post-processor.
+    /// Document-state survives from the parser pass into the stream processor.
     /// `NextJsRscPlaceholderRewriter` writes into `IntegrationDocumentState`
-    /// during streaming; `NextJsHtmlPostProcessor` reads it and substitutes.
-    /// Regression test: with post-processors registered, placeholders must
-    /// be inserted during streaming and substituted out of the final output.
+    /// during parsing; the request-local stream processor reads it and substitutes.
+    /// Regression test: placeholders must be inserted and removed from final output.
     #[test]
-    fn document_state_placeholders_substitute_through_accumulating_path() {
+    fn document_state_placeholders_substitute_through_streaming_path() {
         let mut settings = create_test_settings();
         settings
             .integrations

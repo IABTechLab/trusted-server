@@ -85,6 +85,42 @@ impl NextJsRscPlaceholderRewriter {
         rewritten.replace_range(payload_start..payload_end, &placeholder);
         ScriptRewriteAction::replace(rewritten)
     }
+
+    fn rewrite_claimed_fragment(
+        &self,
+        content: &str,
+        is_last: bool,
+        state: &mut super::rsc_stream::NextJsDocumentState,
+        limit: usize,
+    ) -> ScriptRewriteAction {
+        match capture_fragment(&mut state.rsc_script, content, is_last, limit) {
+            FragmentCapture::CompleteBorrowed(complete) => {
+                self.rewrite_complete(complete, false, state, limit)
+            }
+            FragmentCapture::CompleteOwned(complete) => {
+                self.rewrite_complete(&complete, true, state, limit)
+            }
+            FragmentCapture::Suppress => ScriptRewriteAction::RemoveNode,
+            FragmentCapture::Restore(restored) => {
+                state.bypass_rsc = true;
+                ScriptRewriteAction::replace(restored)
+            }
+            FragmentCapture::PassThrough => {
+                if is_last && content.len() > limit && content.contains("__next_f") {
+                    let unsafe_continuation = find_rsc_push_payload_range(content)
+                        .map(|(start, end)| match scan_tchunks(&content[start..end]) {
+                            TChunkScan::Complete(_) => false,
+                            TChunkScan::NeedMore | TChunkScan::Invalid => true,
+                        })
+                        .unwrap_or(true);
+                    state.bypass_rsc |= unsafe_continuation;
+                } else if !is_last && content.len() > limit {
+                    state.bypass_rsc = true;
+                }
+                ScriptRewriteAction::Keep
+            }
+        }
+    }
 }
 
 impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
@@ -111,51 +147,72 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             }
             return ScriptRewriteAction::keep();
         }
-        if matches!(state.rsc_script, super::rsc_stream::FragmentState::Idle)
-            && !content.contains("__next_f")
-        {
-            return ScriptRewriteAction::Keep;
-        }
-
         let limit = if self.config.max_combined_payload_bytes == 0 {
             DEFAULT_MAX_COMBINED_PAYLOAD_BYTES
         } else {
             self.config.max_combined_payload_bytes
         };
-        match capture_fragment(
-            &mut state.rsc_script,
-            content,
-            ctx.is_last_in_text_node,
-            limit,
-        ) {
-            FragmentCapture::CompleteBorrowed(complete) => {
-                self.rewrite_complete(complete, false, &mut state, limit)
+        if !matches!(state.rsc_script, super::rsc_stream::FragmentState::Idle) {
+            return self.rewrite_claimed_fragment(
+                content,
+                ctx.is_last_in_text_node,
+                &mut state,
+                limit,
+            );
+        }
+
+        let prior_probe = std::mem::take(&mut state.rsc_probe);
+        let mut combined = prior_probe.clone();
+        combined.push_str(content);
+        let Some(identifier_start) = combined.find("__next_f") else {
+            if ctx.is_last_in_text_node {
+                return if prior_probe.is_empty() {
+                    ScriptRewriteAction::Keep
+                } else {
+                    ScriptRewriteAction::replace(combined)
+                };
             }
-            FragmentCapture::CompleteOwned(complete) => {
-                self.rewrite_complete(&complete, true, &mut state, limit)
+            let probe_length = longest_identifier_prefix(combined.as_bytes());
+            let ready_length = combined.len() - probe_length;
+            state.rsc_probe.push_str(&combined[ready_length..]);
+            if prior_probe.is_empty() && probe_length == 0 {
+                return ScriptRewriteAction::Keep;
             }
-            FragmentCapture::Suppress => ScriptRewriteAction::RemoveNode,
-            FragmentCapture::Restore(restored) => {
-                state.bypass_rsc = true;
-                ScriptRewriteAction::replace(restored)
+            return if ready_length == 0 {
+                ScriptRewriteAction::RemoveNode
+            } else {
+                ScriptRewriteAction::replace(&combined[..ready_length])
+            };
+        };
+
+        let claimed_start = if prior_probe.is_empty() {
+            0
+        } else {
+            identifier_start
+        };
+        let prefix = &combined[..claimed_start];
+        let claimed = &combined[claimed_start..];
+        let action =
+            self.rewrite_claimed_fragment(claimed, ctx.is_last_in_text_node, &mut state, limit);
+        match action {
+            ScriptRewriteAction::RemoveNode if prefix.is_empty() => ScriptRewriteAction::RemoveNode,
+            ScriptRewriteAction::RemoveNode => ScriptRewriteAction::replace(prefix),
+            ScriptRewriteAction::Replace(rewritten) => {
+                ScriptRewriteAction::replace(format!("{prefix}{rewritten}"))
             }
-            FragmentCapture::PassThrough => {
-                if ctx.is_last_in_text_node && content.len() > limit && content.contains("__next_f")
-                {
-                    let unsafe_continuation = find_rsc_push_payload_range(content)
-                        .map(|(start, end)| match scan_tchunks(&content[start..end]) {
-                            TChunkScan::Complete(_) => false,
-                            TChunkScan::NeedMore | TChunkScan::Invalid => true,
-                        })
-                        .unwrap_or(true);
-                    state.bypass_rsc |= unsafe_continuation;
-                } else if !ctx.is_last_in_text_node && content.len() > limit {
-                    state.bypass_rsc = true;
-                }
-                ScriptRewriteAction::Keep
-            }
+            ScriptRewriteAction::Keep if prior_probe.is_empty() => ScriptRewriteAction::Keep,
+            ScriptRewriteAction::Keep => ScriptRewriteAction::replace(combined),
         }
     }
+}
+
+fn longest_identifier_prefix(bytes: &[u8]) -> usize {
+    let identifier = b"__next_f";
+    let maximum = bytes.len().min(identifier.len().saturating_sub(1));
+    (1..=maximum)
+        .rev()
+        .find(|length| bytes.ends_with(&identifier[..*length]))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
