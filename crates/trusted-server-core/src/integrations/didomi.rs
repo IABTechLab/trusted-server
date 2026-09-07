@@ -27,6 +27,9 @@ pub struct DidomiIntegrationConfig {
     /// Whether the integration is enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Add trusted country and region parameters to notice-loader URLs.
+    #[serde(default)]
+    pub geo_query_parameters: bool,
     /// Custom proxy path prefix to avoid ad-blocker detection.
     /// Defaults to "integrations/didomi/consent" if not set.
     #[serde(default)]
@@ -369,17 +372,56 @@ mod tests {
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use http::Method;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn config(enabled: bool) -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
             enabled,
+            geo_query_parameters: false,
             proxy_path: None,
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
         }
+    }
+
+    #[test]
+    fn geo_query_parameters_defaults_to_disabled() {
+        let settings = Settings::from_toml(&format!(
+            "{}\n[integrations.didomi]\nenabled = true\n",
+            crate_test_settings_str()
+        ))
+        .expect("should parse Didomi configuration");
+
+        let config = settings
+            .integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
+            .expect("should read Didomi configuration")
+            .expect("should enable Didomi");
+
+        assert!(
+            !config.geo_query_parameters,
+            "should disable geo query parameters when omitted"
+        );
+    }
+
+    #[test]
+    fn geo_query_parameters_parses_explicit_opt_in() {
+        let settings = Settings::from_toml(&format!(
+            "{}\n[integrations.didomi]\nenabled = true\ngeo_query_parameters = true\n",
+            crate_test_settings_str()
+        ))
+        .expect("should parse Didomi geo configuration");
+
+        let config = settings
+            .integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
+            .expect("should read Didomi configuration")
+            .expect("should enable Didomi");
+
+        assert!(
+            config.geo_query_parameters,
+            "should retain explicit geo query parameter opt-in"
+        );
     }
 
     #[test]
@@ -496,6 +538,7 @@ mod tests {
         let mut settings = create_test_settings();
         let custom_config = DidomiIntegrationConfig {
             enabled: true,
+            geo_query_parameters: false,
             proxy_path: Some("my-custom-consent".to_string()),
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
@@ -557,6 +600,7 @@ mod tests {
     fn head_injector_emits_proxy_path() {
         let custom_config = DidomiIntegrationConfig {
             enabled: true,
+            geo_query_parameters: false,
             proxy_path: Some("my-consent".to_string()),
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
