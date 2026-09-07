@@ -775,6 +775,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     request_scheme: &patterns.request_scheme,
                     origin_host: &patterns.origin_host,
                     is_last_in_text_node: text.last_in_text_node(),
+                    max_buffered_script_bytes: config.max_buffered_body_bytes,
                     document_state: &document_state,
                 };
                 match rewriter.rewrite(text.as_str(), &ctx) {

@@ -1,4 +1,128 @@
+use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use crate::integrations::IntegrationDocumentState;
+
+use super::NEXTJS_INTEGRATION_ID;
 use super::rsc::{TChunkScan, scan_tchunks};
+
+pub(super) const RSC_PAYLOAD_PLACEHOLDER_PREFIX: &str = "__ts_rsc_";
+pub(super) const RSC_PAYLOAD_PLACEHOLDER_SUFFIX: &str = "__";
+
+#[derive(Debug, Default)]
+pub(super) enum FragmentState {
+    #[default]
+    Idle,
+    Buffering(String),
+    BypassUntilLast,
+}
+
+#[derive(Debug)]
+pub(super) struct CapturedPayload {
+    pub(super) placeholder: String,
+    pub(super) original: String,
+}
+
+#[derive(Debug)]
+pub(super) struct NextJsDocumentState {
+    pub(super) namespace: String,
+    pub(super) next_data: FragmentState,
+    pub(super) rsc_script: FragmentState,
+    pub(super) captured_payloads: VecDeque<CapturedPayload>,
+    pub(super) captured_payload_bytes: usize,
+    pub(super) next_placeholder_index: usize,
+    pub(super) bypass_rsc: bool,
+}
+
+impl Default for NextJsDocumentState {
+    fn default() -> Self {
+        Self {
+            namespace: uuid::Uuid::new_v4().simple().to_string(),
+            next_data: FragmentState::Idle,
+            rsc_script: FragmentState::Idle,
+            captured_payloads: VecDeque::new(),
+            captured_payload_bytes: 0,
+            next_placeholder_index: 0,
+            bypass_rsc: false,
+        }
+    }
+}
+
+pub(super) fn document_state(state: &IntegrationDocumentState) -> Arc<Mutex<NextJsDocumentState>> {
+    state.get_or_insert_with(NEXTJS_INTEGRATION_ID, || {
+        Mutex::new(NextJsDocumentState::default())
+    })
+}
+
+pub(super) fn rsc_payload_placeholder(namespace: &str, index: usize) -> String {
+    format!("{RSC_PAYLOAD_PLACEHOLDER_PREFIX}{namespace}_{index}{RSC_PAYLOAD_PLACEHOLDER_SUFFIX}")
+}
+
+pub(super) enum FragmentCapture<'a> {
+    CompleteBorrowed(&'a str),
+    CompleteOwned(String),
+    Suppress,
+    Restore(String),
+    PassThrough,
+}
+
+pub(super) fn capture_fragment<'a>(
+    state: &mut FragmentState,
+    content: &'a str,
+    is_last: bool,
+    limit: usize,
+) -> FragmentCapture<'a> {
+    match state {
+        FragmentState::Idle if is_last => {
+            if content.len() > limit {
+                FragmentCapture::PassThrough
+            } else {
+                FragmentCapture::CompleteBorrowed(content)
+            }
+        }
+        FragmentState::Idle => {
+            if content.len() > limit {
+                *state = FragmentState::BypassUntilLast;
+                FragmentCapture::PassThrough
+            } else {
+                *state = FragmentState::Buffering(content.to_owned());
+                FragmentCapture::Suppress
+            }
+        }
+        FragmentState::Buffering(buffer) => {
+            let exceeds_limit = buffer
+                .len()
+                .checked_add(content.len())
+                .is_none_or(|combined| combined > limit);
+            if exceeds_limit {
+                let mut restored = std::mem::take(buffer);
+                restored.push_str(content);
+                *state = if is_last {
+                    FragmentState::Idle
+                } else {
+                    FragmentState::BypassUntilLast
+                };
+                FragmentCapture::Restore(restored)
+            } else {
+                buffer.push_str(content);
+                if is_last {
+                    let complete = std::mem::take(buffer);
+                    *state = FragmentState::Idle;
+                    FragmentCapture::CompleteOwned(complete)
+                } else {
+                    FragmentCapture::Suppress
+                }
+            }
+        }
+        FragmentState::BypassUntilLast => {
+            if is_last {
+                *state = FragmentState::Idle;
+            }
+            FragmentCapture::PassThrough
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RscGroupStatus {
@@ -29,16 +153,21 @@ pub(super) fn classify_rsc_group(
         return RscGroupStatus::Invalid;
     }
 
-    let mut combined = String::with_capacity(total_size);
     let mut boundaries = Vec::with_capacity(payloads.len().saturating_sub(1));
-    for (index, payload) in payloads.iter().enumerate() {
-        combined.push_str(payload);
-        if index + 1 < payloads.len() {
-            boundaries.push(combined.len());
+    let combined = if let [payload] = payloads {
+        Cow::Borrowed(*payload)
+    } else {
+        let mut combined = String::with_capacity(total_size);
+        for (index, payload) in payloads.iter().enumerate() {
+            combined.push_str(payload);
+            if index + 1 < payloads.len() {
+                boundaries.push(combined.len());
+            }
         }
-    }
+        Cow::Owned(combined)
+    };
 
-    let chunks = match scan_tchunks(&combined) {
+    let chunks = match scan_tchunks(combined.as_ref()) {
         TChunkScan::Complete(chunks) => chunks,
         TChunkScan::NeedMore => return RscGroupStatus::NeedMore,
         TChunkScan::Invalid => return RscGroupStatus::Invalid,

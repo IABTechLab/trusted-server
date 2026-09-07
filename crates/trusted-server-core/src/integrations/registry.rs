@@ -96,6 +96,7 @@ pub struct IntegrationScriptContext<'a> {
     pub request_scheme: &'a str,
     pub origin_host: &'a str,
     pub is_last_in_text_node: bool,
+    pub max_buffered_script_bytes: usize,
     pub document_state: &'a IntegrationDocumentState,
 }
 

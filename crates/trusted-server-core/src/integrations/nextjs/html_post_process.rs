@@ -1,16 +1,13 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use lol_html::{Settings as RewriterSettings, text};
 
 use crate::integrations::{IntegrationHtmlContext, IntegrationHtmlPostProcessor};
 
 use super::rsc::rewrite_rsc_scripts_combined_with_limit;
-use super::rsc_placeholders::{
-    NextJsRscPostProcessState, RSC_PAYLOAD_PLACEHOLDER_PREFIX, RSC_PAYLOAD_PLACEHOLDER_SUFFIX,
-};
+use super::rsc_stream::{CapturedPayload, NextJsDocumentState};
 use super::shared::{RscUrlRewriter, find_rsc_push_payload_range};
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
@@ -37,12 +34,12 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
         // Check if we have captured placeholders from streaming
         if let Some(state) = ctx
             .document_state
-            .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
+            .get::<std::sync::Mutex<NextJsDocumentState>>(NEXTJS_INTEGRATION_ID)
         {
             let guard = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !guard.payloads.is_empty() {
+            if !guard.captured_payloads.is_empty() {
                 return true;
             }
         }
@@ -54,14 +51,15 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
 
     fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool {
         // Try to get payloads captured during streaming (placeholder approach)
-        let payloads = ctx
+        let captured = ctx
             .document_state
-            .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
+            .get::<std::sync::Mutex<NextJsDocumentState>>(NEXTJS_INTEGRATION_ID)
             .map(|state| {
                 let mut guard = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.take_payloads()
+                guard.captured_payload_bytes = 0;
+                guard.captured_payloads.drain(..).collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
@@ -69,9 +67,9 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
         // regex is cached and reused regardless of which branch executes.
         let rsc_rewriter = RscUrlRewriter::new();
 
-        if !payloads.is_empty() {
+        if !captured.is_empty() {
             // Placeholder approach: substitute placeholders with rewritten payloads
-            return self.substitute_placeholders(html, ctx, payloads, &rsc_rewriter);
+            return self.substitute_placeholders(html, ctx, captured, &rsc_rewriter);
         }
 
         // Fallback: re-parse HTML to find RSC scripts that weren't captured during streaming
@@ -93,10 +91,13 @@ impl NextJsHtmlPostProcessor {
         &self,
         html: &mut String,
         ctx: &IntegrationHtmlContext<'_>,
-        payloads: Vec<String>,
+        captured: Vec<CapturedPayload>,
         rsc_rewriter: &RscUrlRewriter,
     ) -> bool {
-        let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
+        let payload_refs: Vec<&str> = captured
+            .iter()
+            .map(|payload| payload.original.as_str())
+            .collect();
         let mut rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payload_refs.as_slice(),
             rsc_rewriter,
@@ -106,13 +107,16 @@ impl NextJsHtmlPostProcessor {
             self.config.max_combined_payload_bytes,
         );
 
-        if rewritten_payloads.len() != payloads.len() {
+        if rewritten_payloads.len() != captured.len() {
             log::warn!(
                 "NextJs post-process skipping due to rewrite payload count mismatch: original={}, rewritten={}",
-                payloads.len(),
+                captured.len(),
                 rewritten_payloads.len()
             );
-            rewritten_payloads = payloads;
+            rewritten_payloads = captured
+                .iter()
+                .map(|payload| payload.original.clone())
+                .collect();
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -128,113 +132,25 @@ impl NextJsHtmlPostProcessor {
             );
         }
 
-        let (updated, replaced) =
-            substitute_rsc_payload_placeholders(html.as_str(), &rewritten_payloads);
-
-        let expected = rewritten_payloads.len();
-        if replaced != expected {
+        let expected = captured.len();
+        if !captured
+            .iter()
+            .all(|payload| html.matches(&payload.placeholder).count() == 1)
+        {
             log::warn!(
-                "NextJs post-process placeholder substitution count mismatch: expected={expected}, replaced={replaced}"
+                "NextJs post-process placeholder substitution count mismatch: expected={expected}"
             );
-        }
-
-        if contains_rsc_payload_placeholders(&updated) {
-            log::error!(
-                "NextJs post-process left RSC placeholders in output; attempting fallback substitution (scripts={expected})"
-            );
-
-            let fallback =
-                substitute_rsc_payload_placeholders_exact(html.as_str(), &rewritten_payloads);
-
-            if contains_rsc_payload_placeholders(&fallback) {
-                log::error!(
-                    "NextJs post-process fallback substitution still left RSC placeholders in output; hydration may break (scripts={expected})"
-                );
+            for payload in &captured {
+                *html = html.replace(&payload.placeholder, &payload.original);
             }
-
-            *html = fallback;
             return true;
         }
 
-        *html = updated;
+        for (payload, replacement) in captured.iter().zip(rewritten_payloads) {
+            *html = html.replacen(&payload.placeholder, &replacement, 1);
+        }
         true
     }
-}
-
-fn contains_rsc_payload_placeholders(html: &str) -> bool {
-    let mut cursor = 0_usize;
-    while let Some(next) = html[cursor..].find(RSC_PAYLOAD_PLACEHOLDER_PREFIX) {
-        let start = cursor + next;
-        let after_prefix = start + RSC_PAYLOAD_PLACEHOLDER_PREFIX.len();
-        let mut idx_end = after_prefix;
-        while idx_end < html.len() && html.as_bytes()[idx_end].is_ascii_digit() {
-            idx_end += 1;
-        }
-        if idx_end > after_prefix && html[idx_end..].starts_with(RSC_PAYLOAD_PLACEHOLDER_SUFFIX) {
-            return true;
-        }
-        cursor = after_prefix;
-    }
-    false
-}
-
-fn substitute_rsc_payload_placeholders(html: &str, replacements: &[String]) -> (String, usize) {
-    let mut output = String::with_capacity(html.len());
-    let mut cursor = 0_usize;
-    let mut replaced = 0_usize;
-
-    while let Some(next) = html[cursor..].find(RSC_PAYLOAD_PLACEHOLDER_PREFIX) {
-        let start = cursor + next;
-        output.push_str(&html[cursor..start]);
-
-        let after_prefix = start + RSC_PAYLOAD_PLACEHOLDER_PREFIX.len();
-        let mut idx_end = after_prefix;
-        while idx_end < html.len() && html.as_bytes()[idx_end].is_ascii_digit() {
-            idx_end += 1;
-        }
-
-        let suffix_ok =
-            idx_end > after_prefix && html[idx_end..].starts_with(RSC_PAYLOAD_PLACEHOLDER_SUFFIX);
-        if !suffix_ok {
-            output.push_str(RSC_PAYLOAD_PLACEHOLDER_PREFIX);
-            cursor = after_prefix;
-            continue;
-        }
-
-        let idx_str = &html[after_prefix..idx_end];
-        let Ok(index) = idx_str.parse::<usize>() else {
-            output.push_str(RSC_PAYLOAD_PLACEHOLDER_PREFIX);
-            output.push_str(idx_str);
-            output.push_str(RSC_PAYLOAD_PLACEHOLDER_SUFFIX);
-            cursor = idx_end + RSC_PAYLOAD_PLACEHOLDER_SUFFIX.len();
-            continue;
-        };
-
-        let Some(replacement) = replacements.get(index) else {
-            output.push_str(RSC_PAYLOAD_PLACEHOLDER_PREFIX);
-            output.push_str(idx_str);
-            output.push_str(RSC_PAYLOAD_PLACEHOLDER_SUFFIX);
-            cursor = idx_end + RSC_PAYLOAD_PLACEHOLDER_SUFFIX.len();
-            continue;
-        };
-
-        output.push_str(replacement);
-        replaced += 1;
-        cursor = idx_end + RSC_PAYLOAD_PLACEHOLDER_SUFFIX.len();
-    }
-
-    output.push_str(&html[cursor..]);
-    (output, replaced)
-}
-
-fn substitute_rsc_payload_placeholders_exact(html: &str, replacements: &[String]) -> String {
-    let mut out = html.to_owned();
-    for (index, replacement) in replacements.iter().enumerate() {
-        let placeholder =
-            format!("{RSC_PAYLOAD_PLACEHOLDER_PREFIX}{index}{RSC_PAYLOAD_PLACEHOLDER_SUFFIX}");
-        out = out.replace(&placeholder, replacement);
-    }
-    out
 }
 
 #[derive(Debug, Clone, Copy)]

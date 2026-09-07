@@ -1,34 +1,17 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
+use super::rsc::{DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, TChunkScan, scan_tchunks};
+#[cfg(test)]
+pub(super) use super::rsc_stream::RSC_PAYLOAD_PLACEHOLDER_PREFIX;
+use super::rsc_stream::{
+    CapturedPayload, FragmentCapture, capture_fragment, document_state, rsc_payload_placeholder,
+};
 use super::shared::find_rsc_push_payload_range;
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
-
-pub(super) const RSC_PAYLOAD_PLACEHOLDER_PREFIX: &str = "__ts_rsc_payload_";
-pub(super) const RSC_PAYLOAD_PLACEHOLDER_SUFFIX: &str = "__";
-
-/// State for RSC placeholder-based rewriting.
-///
-/// Stores RSC payloads extracted during streaming for later rewriting during post-processing.
-/// Only unfragmented RSC scripts are processed during streaming; fragmented scripts are
-/// handled by the post-processor which re-parses the final HTML.
-#[derive(Default)]
-pub(super) struct NextJsRscPostProcessState {
-    pub(super) payloads: Vec<String>,
-}
-
-impl NextJsRscPostProcessState {
-    pub(super) fn take_payloads(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.payloads)
-    }
-}
-
-fn rsc_payload_placeholder(index: usize) -> String {
-    format!("{RSC_PAYLOAD_PLACEHOLDER_PREFIX}{index}{RSC_PAYLOAD_PLACEHOLDER_SUFFIX}")
-}
 
 pub(super) struct NextJsRscPlaceholderRewriter {
     config: Arc<NextJsIntegrationConfig>,
@@ -37,6 +20,70 @@ pub(super) struct NextJsRscPlaceholderRewriter {
 impl NextJsRscPlaceholderRewriter {
     pub(super) fn new(config: Arc<NextJsIntegrationConfig>) -> Self {
         Self { config }
+    }
+
+    fn rewrite_complete(
+        &self,
+        content: &str,
+        was_buffered: bool,
+        state: &mut super::rsc_stream::NextJsDocumentState,
+        limit: usize,
+    ) -> ScriptRewriteAction {
+        if !content.contains("__next_f") {
+            return if was_buffered {
+                ScriptRewriteAction::replace(content.to_owned())
+            } else {
+                ScriptRewriteAction::Keep
+            };
+        }
+
+        let Some((payload_start, payload_end)) = find_rsc_push_payload_range(content) else {
+            return if was_buffered {
+                ScriptRewriteAction::replace(content.to_owned())
+            } else {
+                ScriptRewriteAction::Keep
+            };
+        };
+
+        if payload_start > payload_end
+            || payload_end > content.len()
+            || !content.is_char_boundary(payload_start)
+            || !content.is_char_boundary(payload_end)
+        {
+            state.bypass_rsc = true;
+            return if was_buffered {
+                ScriptRewriteAction::replace(content.to_owned())
+            } else {
+                ScriptRewriteAction::Keep
+            };
+        }
+
+        let payload = &content[payload_start..payload_end];
+        let exceeds_limit = payload.len() > limit
+            || state
+                .captured_payload_bytes
+                .checked_add(payload.len())
+                .is_none_or(|combined| combined > limit);
+        if exceeds_limit {
+            state.bypass_rsc = true;
+            return if was_buffered {
+                ScriptRewriteAction::replace(content.to_owned())
+            } else {
+                ScriptRewriteAction::Keep
+            };
+        }
+
+        let placeholder = rsc_payload_placeholder(&state.namespace, state.next_placeholder_index);
+        state.next_placeholder_index = state.next_placeholder_index.saturating_add(1);
+        state.captured_payload_bytes += payload.len();
+        state.captured_payloads.push_back(CapturedPayload {
+            placeholder: placeholder.clone(),
+            original: payload.to_owned(),
+        });
+
+        let mut rewritten = content.to_owned();
+        rewritten.replace_range(payload_start..payload_end, &placeholder);
+        ScriptRewriteAction::replace(rewritten)
     }
 }
 
@@ -54,53 +101,60 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             return ScriptRewriteAction::keep();
         }
 
-        // Deliberately does not accumulate fragments (unlike NextJsNextDataRewriter
-        // and GoogleTagManagerIntegration which use Mutex<String> buffers). RSC
-        // placeholder processing has a post-processor fallback that re-parses
-        // the final HTML at end-of-document, so fragmented scripts are safely
-        // deferred. Accumulation here would also risk corrupting non-RSC scripts
-        // that happen to be fragmented during streaming.
-        if !ctx.is_last_in_text_node {
-            return ScriptRewriteAction::keep();
-        }
-
-        // Quick check: skip scripts that can't be RSC payloads
-        if !content.contains("__next_f") {
-            return ScriptRewriteAction::keep();
-        }
-
-        let Some((payload_start, payload_end)) = find_rsc_push_payload_range(content) else {
-            // Contains __next_f but doesn't match RSC push pattern - leave unchanged
-            return ScriptRewriteAction::keep();
-        };
-
-        if payload_start > payload_end
-            || payload_end > content.len()
-            || !content.is_char_boundary(payload_start)
-            || !content.is_char_boundary(payload_end)
-        {
-            return ScriptRewriteAction::keep();
-        }
-
-        // Insert placeholder for this RSC payload and store original for post-processing
-        let state = ctx
-            .document_state
-            .get_or_insert_with(NEXTJS_INTEGRATION_ID, || {
-                Mutex::new(NextJsRscPostProcessState::default())
-            });
-        let mut guard = state
+        let state = document_state(ctx.document_state);
+        let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.bypass_rsc {
+            if ctx.is_last_in_text_node {
+                state.rsc_script = super::rsc_stream::FragmentState::Idle;
+            }
+            return ScriptRewriteAction::keep();
+        }
+        if matches!(state.rsc_script, super::rsc_stream::FragmentState::Idle)
+            && !content.contains("__next_f")
+        {
+            return ScriptRewriteAction::Keep;
+        }
 
-        let placeholder_index = guard.payloads.len();
-        let placeholder = rsc_payload_placeholder(placeholder_index);
-        guard
-            .payloads
-            .push(content[payload_start..payload_end].to_string());
-
-        let mut rewritten = content.to_owned();
-        rewritten.replace_range(payload_start..payload_end, &placeholder);
-        ScriptRewriteAction::replace(rewritten)
+        let limit = if self.config.max_combined_payload_bytes == 0 {
+            DEFAULT_MAX_COMBINED_PAYLOAD_BYTES
+        } else {
+            self.config.max_combined_payload_bytes
+        };
+        match capture_fragment(
+            &mut state.rsc_script,
+            content,
+            ctx.is_last_in_text_node,
+            limit,
+        ) {
+            FragmentCapture::CompleteBorrowed(complete) => {
+                self.rewrite_complete(complete, false, &mut state, limit)
+            }
+            FragmentCapture::CompleteOwned(complete) => {
+                self.rewrite_complete(&complete, true, &mut state, limit)
+            }
+            FragmentCapture::Suppress => ScriptRewriteAction::RemoveNode,
+            FragmentCapture::Restore(restored) => {
+                state.bypass_rsc = true;
+                ScriptRewriteAction::replace(restored)
+            }
+            FragmentCapture::PassThrough => {
+                if ctx.is_last_in_text_node && content.len() > limit && content.contains("__next_f")
+                {
+                    let unsafe_continuation = find_rsc_push_payload_range(content)
+                        .map(|(start, end)| match scan_tchunks(&content[start..end]) {
+                            TChunkScan::Complete(_) => false,
+                            TChunkScan::NeedMore | TChunkScan::Invalid => true,
+                        })
+                        .unwrap_or(true);
+                    state.bypass_rsc |= unsafe_continuation;
+                } else if !ctx.is_last_in_text_node && content.len() > limit {
+                    state.bypass_rsc = true;
+                }
+                ScriptRewriteAction::Keep
+            }
+        }
     }
 }
 
@@ -108,6 +162,7 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
 mod tests {
     use super::*;
     use crate::integrations::IntegrationDocumentState;
+    use crate::integrations::nextjs::rsc_stream::NextJsDocumentState;
 
     fn ctx(
         is_last_in_text_node: bool,
@@ -119,6 +174,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state,
         }
     }
@@ -148,48 +204,76 @@ mod tests {
         );
 
         let stored = state
-            .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
+            .get::<std::sync::Mutex<NextJsDocumentState>>(NEXTJS_INTEGRATION_ID)
             .expect("should store RSC state");
         let guard = stored.lock().expect("should lock Next.js RSC state");
-        assert_eq!(guard.payloads.len(), 1, "Should store exactly one payload");
         assert_eq!(
-            guard.payloads[0], "https://origin.example.com/page",
+            guard.captured_payloads.len(),
+            1,
+            "Should store exactly one payload"
+        );
+        assert_eq!(
+            guard
+                .captured_payloads
+                .front()
+                .expect("should contain captured payload")
+                .original,
+            "https://origin.example.com/page",
             "Stored payload should match original"
         );
     }
 
     #[test]
-    fn skips_fragmented_scripts_for_post_processor_handling() {
-        // Fragmented scripts are not processed during streaming - they're passed through
-        // unchanged and handled by the post-processor which re-parses the final HTML.
+    fn captures_fragmented_scripts_as_one_namespaced_placeholder() {
         let state = IntegrationDocumentState::default();
         let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
 
         let first = "self.__next_f.push([1,\"https://origin.example.com";
         let second = "/page\"])";
 
-        // Intermediate chunk should be kept (not processed)
         let action_first = rewriter.rewrite(first, &ctx(false, &state));
         assert_eq!(
             action_first,
-            ScriptRewriteAction::Keep,
-            "Intermediate chunk should be kept unchanged"
+            ScriptRewriteAction::RemoveNode,
+            "should suppress a bounded intermediate fragment"
         );
 
-        // Final chunk should also be kept since it doesn't contain the full RSC pattern
         let action_second = rewriter.rewrite(second, &ctx(true, &state));
+        assert!(
+            matches!(action_second, ScriptRewriteAction::Replace(ref value) if value.contains("__ts_rsc_")),
+            "should emit one request-namespaced placeholder",
+        );
+    }
+
+    #[test]
+    fn overflowing_fragmented_rsc_restores_prefix_and_bypasses_later_rsc() {
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+            max_combined_payload_bytes: 24,
+            ..(*test_config()).clone()
+        }));
+
         assert_eq!(
-            action_second,
+            rewriter.rewrite("self.__next_f", &ctx(false, &state)),
+            ScriptRewriteAction::RemoveNode,
+            "should initially suppress the script prefix",
+        );
+        assert_eq!(
+            rewriter.rewrite("-payload-overflow", &ctx(false, &state)),
+            ScriptRewriteAction::Replace("self.__next_f-payload-overflow".to_owned()),
+            "should restore suppressed text before overflow",
+        );
+        assert_eq!(
+            rewriter.rewrite("tail", &ctx(true, &state)),
             ScriptRewriteAction::Keep,
-            "Final chunk of fragmented script should be kept"
+            "should pass through until the text node ends",
         );
 
-        // No payloads should be stored - post-processor will handle this
-        assert!(
-            state
-                .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
-                .is_none(),
-            "No RSC state should be created for fragmented scripts"
+        let later = r#"self.__next_f.push([1,"later"])"#;
+        assert_eq!(
+            rewriter.rewrite(later, &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should keep later RSC scripts unchanged after unsafe overflow",
         );
     }
 
