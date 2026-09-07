@@ -758,8 +758,11 @@ Expected: all Fastly/core tests pass before the commit.
 
 - Modify: `crates/trusted-server-core/src/publisher.rs:16650-16895,17130-17690,18035-18430`
 - Modify: `crates/trusted-server-core/src/integrations/nextjs/mod.rs:285-710`
+- Modify: `crates/trusted-server-adapter-axum/src/app.rs:115-215,575-645`
 - Modify: `crates/trusted-server-adapter-axum/tests/routes.rs`
+- Modify: `crates/trusted-server-adapter-cloudflare/src/app.rs:120-230,330-630`
 - Modify: `crates/trusted-server-adapter-cloudflare/tests/routes.rs`
+- Modify: `crates/trusted-server-adapter-spin/src/app.rs:80-170,460-850`
 - Modify: `crates/trusted-server-adapter-spin/tests/routes.rs`
 - Modify: `docs/guide/integrations/nextjs.md`
 - Test: existing adapter/core test modules only
@@ -797,13 +800,51 @@ Expected: identity and all supported encodings preserve content/trailers; combin
 
 Document that ordinary HTML streams immediately, unresolved cross-script T-chunk groups are bounded, `max_combined_payload_bytes` limits payload and held output independently, and invalid/incomplete/over-limit groups are restored unchanged. Remove wording that implies guaranteed rewriting under fallback or full-document EOF post-processing.
 
-- [ ] **Step 5: Run adapter parity suites**
+- [ ] **Step 5: Add red adapter parity route tests**
 
-First add one buffered route regression in each adapter test module. Feed the same Next.js
-fixture and configuration through Axum, Cloudflare, and Spin, then assert the complete body
+Add one buffered route regression in each adapter test module. Build a fake
+`PlatformHttpClient` that returns the same Next.js origin fixture and deterministic auction
+response, place it in a complete `RuntimeServices` built with the existing public builder,
+and attempt to construct each real router with those services. Assert the complete body
 matches the core expected bytes: rewritten RSC URL and length, preserved script order, bid
 markup immediately before structural `</body>`, and no generated seam or RSC placeholder.
 These are final-byte assertions because these adapters collect the core stream.
+
+Run:
+
+```bash
+cargo test-axum adapter_buffers_nextjs_auction_output -- --nocapture
+cargo test-cloudflare adapter_buffers_nextjs_auction_output -- --nocapture
+cargo test-spin adapter_buffers_nextjs_auction_output -- --nocapture
+```
+
+Expected: compilation fails because `routes_with_settings` always constructs platform
+services internally and provides no injectable services seam.
+
+- [ ] **Step 6: Add a narrow injectable-services router seam**
+
+In each adapter's `app.rs`, add a private cloneable service source with two modes:
+
+```rust
+#[derive(Clone)]
+enum RuntimeServicesSource {
+    Platform,
+    Fixed(RuntimeServices),
+}
+```
+
+Give it `for_request(&RequestContext) -> RuntimeServices`: production calls the adapter's
+existing `build_runtime_services`, while `Fixed` clones the supplied services. Pass the
+source into `build_router` and every handler factory/dispatch path that currently constructs
+services. Keep `Hooks::routes()` and `routes_with_settings()` on `Platform`. Add a documented
+`routes_with_settings_and_services(settings, services)` constructor on each adapter for
+cross-crate integration tests; it builds the same `AppState` and router with `Fixed`.
+
+This seam changes dependency construction only. It must not expose
+`OwnedProcessResponseParams`, duplicate core finalization, or alter production client-info
+derivation. The injected fixture supplies the client metadata required by its request.
+
+- [ ] **Step 7: Run adapter parity suites**
 
 ```bash
 cargo test-axum
@@ -813,15 +854,18 @@ cargo test-spin
 
 Expected: native buffered adapters preserve final-byte behavior.
 
-- [ ] **Step 6: Run formatting and commit regressions/docs**
+- [ ] **Step 8: Run formatting and commit regressions/docs**
 
 ```bash
 cargo fmt --all -- --check
 (cd docs && npm run format)
 git add crates/trusted-server-core/src/publisher.rs \
   crates/trusted-server-core/src/integrations/nextjs/mod.rs \
+  crates/trusted-server-adapter-axum/src/app.rs \
   crates/trusted-server-adapter-axum/tests/routes.rs \
+  crates/trusted-server-adapter-cloudflare/src/app.rs \
   crates/trusted-server-adapter-cloudflare/tests/routes.rs \
+  crates/trusted-server-adapter-spin/src/app.rs \
   crates/trusted-server-adapter-spin/tests/routes.rs \
   docs/guide/integrations/nextjs.md
 git commit -m "Cover streaming seams across encodings and adapters"
