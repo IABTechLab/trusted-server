@@ -34,11 +34,11 @@ max_combined_payload_bytes = 10485760
 
 ### Configuration Options
 
-| Field                        | Type    | Default                   | Description                                      |
-| ---------------------------- | ------- | ------------------------- | ------------------------------------------------ |
-| `enabled`                    | boolean | `false`                   | Enable Next.js integration                       |
-| `rewrite_attributes`         | array   | `["href", "link", "url"]` | Attributes to rewrite in Next.js data            |
-| `max_combined_payload_bytes` | integer | `10485760`                | Maximum bytes retained for one unresolved group  |
+| Field                        | Type    | Default                   | Description                                     |
+| ---------------------------- | ------- | ------------------------- | ----------------------------------------------- |
+| `enabled`                    | boolean | `false`                   | Enable Next.js integration                      |
+| `rewrite_attributes`         | array   | `["href", "link", "url"]` | Attributes to rewrite in Next.js data           |
+| `max_combined_payload_bytes` | integer | `10485760`                | Maximum bytes retained for one unresolved group |
 
 ## How It Works
 

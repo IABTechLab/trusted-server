@@ -398,7 +398,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             Ok(())
                         });
                     handlers.push(handler);
-                } else if matches!(body_close, BodyCloseInjection::InlineBids) {
+                } else if matches!(
+                    body_close,
+                    BodyCloseInjection::InlineBids | BodyCloseInjection::DeferredInlineMarker(_)
+                ) {
                     // No end tag (implicitly closed or EOF `<body>`): lol_html
                     // cannot attach an end-tag handler, so tsjs.bids/adInit() are
                     // never injected even though adSlots was injected at `<head>`.

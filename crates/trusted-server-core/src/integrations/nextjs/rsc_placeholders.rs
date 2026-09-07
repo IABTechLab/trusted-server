@@ -161,6 +161,22 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             );
         }
 
+        if state.rsc_probe.is_empty() && !content.contains("__next_f") {
+            if ctx.is_last_in_text_node {
+                return ScriptRewriteAction::Keep;
+            }
+            let probe_length = longest_identifier_prefix(content.as_bytes());
+            let ready_length = content.len() - probe_length;
+            state.rsc_probe.push_str(&content[ready_length..]);
+            return if probe_length == 0 {
+                ScriptRewriteAction::Keep
+            } else if ready_length == 0 {
+                ScriptRewriteAction::RemoveNode
+            } else {
+                ScriptRewriteAction::replace(&content[..ready_length])
+            };
+        }
+
         let prior_probe = std::mem::take(&mut state.rsc_probe);
         let mut combined = prior_probe.clone();
         combined.push_str(content);

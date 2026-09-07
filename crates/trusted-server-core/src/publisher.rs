@@ -1236,7 +1236,13 @@ async fn hold_finish_ready_segments<P: StreamProcessor>(
     if !step.close_found
         && let Some(seam) = state.hold.take()
     {
-        let encoded = encoder.encode_chunk(seam.finish())?;
+        let encoded = match encoder.encode_chunk(seam.finish()) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
+                return Err(err);
+            }
+        };
         if !encoded.is_empty() {
             step.ready.push(bytes::Bytes::from(encoded));
         }
@@ -3943,25 +3949,57 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                let final_out = processor.process_chunk(&[], true).change_context(
+                let final_out = match processor.process_chunk(&[], true).change_context(
                     TrustedServerError::Proxy {
                         message: "Failed to finalize processor".to_string(),
                     },
-                )?;
+                ) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_process_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
                 let ready = match hold.as_mut() {
                     Some(seam) => seam.push(&final_out),
                     None => final_out,
                 };
-                writer
-                    .write_all(&ready)
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to write finalized output".to_string(),
-                    })?;
+                if let Err(err) =
+                    writer
+                        .write_all(&ready)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write finalized output".to_string(),
+                        })
+                {
+                    abandon_reader_auction(
+                        &mut dispatched,
+                        &mut telemetry,
+                        deps.services,
+                        "stream_write_error",
+                    )
+                    .await;
+                    return Err(err);
+                }
 
                 if hold.as_ref().is_some_and(InlineBodyCloseSeam::found) {
-                    writer.flush().change_context(TrustedServerError::Proxy {
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
                         message: "Failed to flush output before auction collection".to_string(),
-                    })?;
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     let dispatched = dispatched
                         .take()
                         .expect("should have dispatched auction to collect");
@@ -3977,16 +4015,34 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                             message: "Failed to write held body tail".to_string(),
                         })?;
                 } else {
-                    if let Some(seam) = hold.take() {
-                        writer.write_all(&seam.finish()).change_context(
+                    if let Some(seam) = hold.take()
+                        && let Err(err) = writer.write_all(&seam.finish()).change_context(
                             TrustedServerError::Proxy {
                                 message: "Failed to write terminal HTML output".to_string(),
                             },
-                        )?;
+                        )
+                    {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
                     }
-                    writer.flush().change_context(TrustedServerError::Proxy {
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
                         message: "Failed to flush output before auction collection".to_string(),
-                    })?;
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     if let Some(pending) = dispatched.take() {
                         collect_stream_auction(pending, telemetry.take(), &deps).await;
                     }
@@ -4017,16 +4073,36 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                     Some(seam) => seam.push(&processed),
                     None => processed,
                 };
-                writer
-                    .write_all(&ready)
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to write processed chunk".to_string(),
-                    })?;
+                if let Err(err) =
+                    writer
+                        .write_all(&ready)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write processed chunk".to_string(),
+                        })
+                {
+                    abandon_reader_auction(
+                        &mut dispatched,
+                        &mut telemetry,
+                        deps.services,
+                        "stream_write_error",
+                    )
+                    .await;
+                    return Err(err);
+                }
 
                 if hold.as_ref().is_some_and(InlineBodyCloseSeam::found) {
-                    writer.flush().change_context(TrustedServerError::Proxy {
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
                         message: "Failed to flush output before auction collection".to_string(),
-                    })?;
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     let pending = dispatched
                         .take()
                         .expect("should have dispatched auction to collect");
@@ -4064,6 +4140,17 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         message: "Failed to flush output".to_string(),
     })?;
     Ok(())
+}
+
+async fn abandon_reader_auction(
+    dispatched: &mut Option<DispatchedAuction>,
+    telemetry: &mut AuctionTelemetryCarry,
+    services: &RuntimeServices,
+    reason: &'static str,
+) {
+    if let Some(pending) = dispatched.take() {
+        emit_abandoned_auction(services, telemetry.observation.take(), pending, reason).await;
+    }
 }
 
 async fn emit_abandoned_auction(
@@ -15719,6 +15806,77 @@ mod tests {
         assert!(
             painted < bids && bids < close && close < late,
             "output order: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parser_seam_write_failure_abandons_auction_once() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected write failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let settings = create_test_settings();
+        let sink = Arc::new(RecordingTelemetrySink::default());
+        let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let ad_bids_state = AdBidsState::default();
+        let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+        let ctx = AuctionCollectCtx {
+            dispatched: DispatchedAuction::empty_for_test(test_auction_request(), 500),
+            telemetry: AuctionTelemetryCarry {
+                observation: Some(AuctionObservationContext::from_parts(
+                    AuctionSource::InitialNavigation,
+                    "proxy.example.com",
+                    "/article",
+                    1,
+                    &ec_context,
+                )),
+                auction_request: None,
+            },
+            deps: AuctionCollectDeps {
+                price_granularity: PriceGranularity::default(),
+                ad_bids_state: &ad_bids_state,
+                orchestrator: &orchestrator,
+                services: &services,
+                settings: &settings,
+                request_origin: String::new(),
+            },
+        };
+        let mut processor = RecordingProcessor {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            body_close_processed_at: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let error = body_close_hold_loop(
+            std::io::Cursor::new(b"<html><body>ready"),
+            &mut FailingWriter,
+            &mut processor,
+            ctx,
+            Some(b"<!--ts-inline-body-close-test-->".to_vec()),
+        )
+        .await
+        .expect_err("injected writer failure should surface");
+        assert!(format!("{error:?}").contains("Failed to write processed chunk"));
+
+        let batches = sink.batches.lock().expect("should lock telemetry batches");
+        let summaries: Vec<_> = batches
+            .iter()
+            .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+            .filter(|row| row.event_kind == "summary")
+            .collect();
+        assert_eq!(summaries.len(), 1, "should emit one terminal summary");
+        assert_eq!(summaries[0].terminal_status.as_deref(), Some("abandoned"));
+        assert_eq!(
+            summaries[0].terminal_reason.as_deref(),
+            Some("stream_write_error")
         );
     }
 

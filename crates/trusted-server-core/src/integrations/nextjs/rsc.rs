@@ -241,12 +241,18 @@ fn scan_tchunks_impl(content: &str, skip_markers: bool) -> TChunkScan {
                         None => break,
                     }
                 }
+                if consumed > declared_length {
+                    return TChunkScan::Invalid;
+                }
                 if consumed < declared_length {
                     return TChunkScan::NeedMore;
                 }
                 iter.position()
             } else {
                 let (pos, consumed) = consume_unescaped_bytes(content, header_end, declared_length);
+                if consumed > declared_length {
+                    return TChunkScan::Invalid;
+                }
                 if consumed < declared_length {
                     return TChunkScan::NeedMore;
                 }
@@ -589,6 +595,20 @@ mod tests {
         assert_eq!(calculate_unescaped_byte_length(r"\x41"), 1);
         assert_eq!(calculate_unescaped_byte_length(r"\u0041"), 1);
         assert_eq!(calculate_unescaped_byte_length(r"\u00e9"), 2);
+    }
+
+    #[test]
+    fn rejects_tchunk_lengths_that_split_a_decoded_character() {
+        for content in ["1:T1,€", r"1:T1,\ud83d\ude00"] {
+            assert!(
+                matches!(scan_tchunks(content), TChunkScan::Invalid),
+                "plain scanner should reject a split decoded character: {content}"
+            );
+            assert!(
+                matches!(scan_tchunks_impl(content, true), TChunkScan::Invalid),
+                "marker-aware scanner should reject a split decoded character: {content}"
+            );
+        }
     }
 
     #[test]

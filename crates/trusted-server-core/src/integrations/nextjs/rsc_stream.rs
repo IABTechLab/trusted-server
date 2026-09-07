@@ -17,6 +17,7 @@ use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_PREFIX: &str = "__ts_rsc_";
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_SUFFIX: &str = "__";
+const MAX_UNRESOLVED_RSC_PAYLOADS: usize = 256;
 
 #[derive(Debug, Default)]
 pub(super) enum FragmentState {
@@ -231,9 +232,6 @@ impl NextJsRscStreamProcessor {
                 "Next.js RSC placeholders are out of document order",
             ));
         }
-        state.captured_payload_bytes = state
-            .captured_payload_bytes
-            .saturating_sub(payload.original.len());
         Ok(payload)
     }
 
@@ -252,6 +250,11 @@ impl NextJsRscStreamProcessor {
     }
 
     fn release_group(&mut self, rewritten: Option<&[String]>) -> io::Result<Vec<u8>> {
+        let released_payload_bytes = self
+            .group
+            .iter()
+            .map(|payload| payload.original.len())
+            .sum::<usize>();
         let replacements: Vec<&str> = match &rewritten {
             Some(rewritten) => rewritten.iter().map(String::as_str).collect(),
             None => self
@@ -260,17 +263,35 @@ impl NextJsRscStreamProcessor {
                 .map(|payload| payload.original.as_str())
                 .collect(),
         };
+        let held_output = std::mem::take(&mut self.held_output);
         let output = substitute_payloads(
-            std::mem::take(&mut self.held_output),
+            &held_output,
             &self.group,
             &replacements,
             &self.namespace_prefix(),
         )?;
         self.group.clear();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.captured_payload_bytes = state
+            .captured_payload_bytes
+            .saturating_sub(released_payload_bytes);
         Ok(output)
     }
 
     fn resolve_group(&mut self) -> io::Result<Option<Vec<u8>>> {
+        // Classification scans the logical group. Bound its segment count as
+        // well as its bytes so adversarial tiny scripts cannot amplify that
+        // work quadratically; the hydration-safe fallback restores originals.
+        if self.group.len() > MAX_UNRESOLVED_RSC_PAYLOADS {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .bypass_rsc = true;
+            return self.release_group(None).map(Some);
+        }
         let payloads: Vec<&str> = self
             .group
             .iter()
@@ -323,7 +344,7 @@ impl NextJsRscStreamProcessor {
             .map(|payload| payload.original.as_str())
             .collect();
         output.extend(substitute_payloads(
-            current.to_vec(),
+            current,
             &captured,
             &replacements,
             &self.namespace_prefix(),
@@ -381,7 +402,7 @@ impl StreamProcessor for NextJsRscStreamProcessor {
             if self.group.is_empty() {
                 output.extend_from_slice(before);
             } else if !self.append_held(before) {
-                output.extend(self.release_bypass(&current[placeholder_start..])?);
+                output.extend(self.release_bypass(&current[cursor..])?);
                 break;
             }
 
@@ -406,6 +427,15 @@ impl StreamProcessor for NextJsRscStreamProcessor {
 
             if let Some(released) = self.resolve_group()? {
                 output.extend(released);
+            }
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .bypass_rsc
+            {
+                output.extend(self.release_bypass(&current[cursor..])?);
+                break;
             }
         }
 
@@ -453,7 +483,7 @@ fn longest_suffix_prefix(bytes: &[u8], pattern: &[u8]) -> usize {
 }
 
 fn substitute_payloads(
-    mut input: Vec<u8>,
+    input: &[u8],
     payloads: &[CapturedPayload],
     replacements: &[&str],
     namespace_prefix: &[u8],
@@ -463,30 +493,27 @@ fn substitute_payloads(
             "Next.js RSC substitution received mismatched payloads",
         ));
     }
+    let mut output = Vec::with_capacity(input.len());
+    let mut cursor = 0;
     for (payload, replacement) in payloads.iter().zip(replacements) {
         let placeholder = payload.placeholder.as_bytes();
-        let Some(position) = find_bytes(&input, placeholder) else {
+        let Some(relative_position) = find_bytes(&input[cursor..], placeholder) else {
             return Err(io::Error::other(
                 "Next.js RSC captured placeholder is missing from held output",
             ));
         };
-        let mut next = Vec::with_capacity(
-            input
-                .len()
-                .saturating_sub(placeholder.len())
-                .saturating_add(replacement.len()),
-        );
-        next.extend_from_slice(&input[..position]);
-        next.extend_from_slice(replacement.as_bytes());
-        next.extend_from_slice(&input[position + placeholder.len()..]);
-        input = next;
+        let position = cursor + relative_position;
+        output.extend_from_slice(&input[cursor..position]);
+        output.extend_from_slice(replacement.as_bytes());
+        cursor = position + placeholder.len();
     }
-    if find_bytes(&input, namespace_prefix).is_some() {
+    output.extend_from_slice(&input[cursor..]);
+    if find_bytes(&output, namespace_prefix).is_some() {
         return Err(io::Error::other(
             "Next.js RSC generated placeholder remained after substitution",
         ));
     }
-    Ok(input)
+    Ok(output)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -814,6 +841,50 @@ mod tests {
     }
 
     #[test]
+    fn held_output_overflow_restores_interstitial_bytes_before_the_next_payload() {
+        let payloads = ["1:T3,ab", "c"];
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, 80);
+
+        assert!(
+            processor
+                .process_chunk(placeholders[0].as_bytes(), false)
+                .expect("should hold incomplete group")
+                .is_empty()
+        );
+        let interstitial = "x".repeat(50);
+        let output = processor
+            .process_chunk(
+                format!("{interstitial}{}tail", placeholders[1]).as_bytes(),
+                false,
+            )
+            .expect("should restore over-limit group");
+        assert_eq!(
+            output,
+            format!("{}{interstitial}{}tail", payloads[0], payloads[1]).as_bytes(),
+            "overflow fallback must preserve bytes between payload scripts"
+        );
+    }
+
+    #[test]
+    fn invalid_group_restores_later_payloads_in_the_same_output_chunk() {
+        let payloads = [
+            "1:Tzz,invalid",
+            r#"1:T29,{"url":"https://origin.example.com/path"}"#,
+        ];
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, 1024);
+        let input = format!("{}middle{}tail", placeholders[0], placeholders[1]);
+
+        let output = processor
+            .process_chunk(input.as_bytes(), false)
+            .expect("should restore invalid group and later payload");
+        assert_eq!(
+            output,
+            format!("{}middle{}tail", payloads[0], payloads[1]).as_bytes(),
+            "document-wide bypass must take effect within the current output chunk"
+        );
+    }
+
+    #[test]
     fn stream_processor_matches_a_placeholder_split_across_output_chunks() {
         let (mut processor, placeholders) = processor_with_payloads(&["plain"], 1024);
         let placeholder = &placeholders[0];
@@ -827,5 +898,59 @@ mod tests {
             .process_chunk(&placeholder.as_bytes()[split..], false)
             .expect("should finish the placeholder");
         assert_eq!(second, b"plain", "should restore the captured payload");
+    }
+
+    #[test]
+    fn unresolved_group_bytes_remain_charged_until_release() {
+        let payloads = ["1:T3,ab", "c"];
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, 1024);
+        let state = Arc::clone(&processor.state);
+
+        assert!(
+            processor
+                .process_chunk(placeholders[0].as_bytes(), false)
+                .expect("should hold incomplete group")
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("should lock document state")
+                .captured_payload_bytes,
+            payloads.iter().map(|payload| payload.len()).sum::<usize>(),
+            "held payloads must remain in the request-scoped capture budget"
+        );
+
+        processor
+            .process_chunk(placeholders[1].as_bytes(), false)
+            .expect("should release complete group");
+        assert_eq!(
+            state
+                .lock()
+                .expect("should lock document state")
+                .captured_payload_bytes,
+            0,
+            "released payloads should return their request-scoped budget"
+        );
+    }
+
+    #[test]
+    fn excessive_unresolved_payload_count_falls_back_unchanged() {
+        let payloads = vec!["1:Tffff,x"; MAX_UNRESOLVED_RSC_PAYLOADS + 1];
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, usize::MAX);
+        let input = placeholders.join("");
+
+        let output = processor
+            .process_chunk(input.as_bytes(), false)
+            .expect("should restore excessive unresolved group");
+        assert_eq!(output, payloads.join("").as_bytes());
+        assert!(
+            processor
+                .state
+                .lock()
+                .expect("should lock document state")
+                .bypass_rsc,
+            "excessive segment count should enable document-wide fallback"
+        );
     }
 }
