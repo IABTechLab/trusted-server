@@ -281,12 +281,10 @@ pub(crate) fn generate(
     update: bool,
 ) -> Result<bool, Report<MarkdownError>> {
     let manifest = read_pages_manifest(repository)?;
-    let uses_dynamic_route_regions = manifest.regions.iter().any(|region| {
-        matches!(
-            region.name.as_str(),
-            "api-adapter-support" | "api-route-availability" | "api-integration-route-families"
-        )
-    });
+    let uses_dynamic_route_regions = manifest
+        .regions
+        .iter()
+        .any(|region| crate::routes::documentation_region_path(&region.name).is_some());
     let mut dynamic_regions = if uses_dynamic_route_regions {
         crate::routes::repository_documentation_regions(repository)
             .map_err(|error| generated_error(format!("cannot build route regions: {error}")))?
@@ -301,7 +299,8 @@ pub(crate) fn generate(
         validate_repo_path(&record.path)?;
         let dynamic = dynamic_regions.remove(&record.name);
         if let Some(dynamic) = &dynamic
-            && (record.path != "docs/guide/api-reference.md"
+            && (Some(record.path.as_str())
+                != crate::routes::documentation_region_path(&record.name)
                 || record.columns != dynamic.columns
                 || !record.rows.is_empty())
         {

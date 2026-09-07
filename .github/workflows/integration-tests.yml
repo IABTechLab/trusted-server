@@ -95,8 +95,12 @@ jobs:
         with:
           node-version: ${{ steps.shared-setup.outputs.node-version }}
 
-      - name: Install wrangler
-        run: npm install -g wrangler
+      - name: Install pinned Wrangler
+        run: |
+          WRANGLER_VERSION=$(awk '$1 == "wrangler" { print $2 }' .tool-versions)
+          test -n "$WRANGLER_VERSION"
+          npm install -g "wrangler@$WRANGLER_VERSION"
+          test "$(wrangler --version)" = "$WRANGLER_VERSION"
 
       - name: Run integration tests
         run: >-
@@ -113,6 +117,79 @@ jobs:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           RUST_LOG: info
+
+  adapter-first-success-smokes:
+    name: adapter first success (${{ matrix.adapter }})
+    needs: prepare-artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [axum, fastly, cloudflare]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up smoke runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: "false"
+          build-wasm: "false"
+          build-axum: "false"
+          build-test-images: "false"
+
+      - name: Download integration test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+
+      - name: Prepare Axum artifact
+        if: matrix.adapter == 'axum'
+        run: chmod +x "$AXUM_ARTIFACT_PATH"
+
+      - name: Restore Cloudflare Workers bundle
+        if: matrix.adapter == 'cloudflare'
+        run: |
+          mkdir -p crates/trusted-server-adapter-cloudflare/build
+          cp -r "$CF_BUILD_ARTIFACT_PATH/." crates/trusted-server-adapter-cloudflare/build/
+
+      - name: Set up Node.js
+        if: matrix.adapter == 'cloudflare'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+
+      - name: Install pinned Wrangler
+        if: matrix.adapter == 'cloudflare'
+        run: |
+          WRANGLER_VERSION=$(awk '$1 == "wrangler" { print $2 }' .tool-versions)
+          test -n "$WRANGLER_VERSION"
+          npm install -g "wrangler@$WRANGLER_VERSION"
+          test "$(wrangler --version)" = "$WRANGLER_VERSION"
+
+      - name: Read pinned Fastly tool versions
+        if: matrix.adapter == 'fastly'
+        id: fastly-versions
+        run: |
+          echo "cli=$(awk '$1 == \"fastly\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "viceroy=$(awk '$1 == \"viceroy\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Fastly CLI
+        if: matrix.adapter == 'fastly'
+        uses: fastly/compute-actions/setup@v14
+        with:
+          cli_version: ${{ steps.fastly-versions.outputs.cli }}
+          viceroy_version: ${{ steps.fastly-versions.outputs.viceroy }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run adapter first-success smoke
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}
+        run: ./scripts/smoke-${{ matrix.adapter }}.sh
 
   integration-tests-fastly-ec:
     name: integration tests (Fastly EC lifecycle)

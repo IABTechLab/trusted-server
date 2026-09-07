@@ -1923,7 +1923,15 @@ path = "docs/guide/auction-testing.md"
 kind = "text"
 
 [[files]]
+path = "docs/guide/axum-dev.md"
+kind = "text"
+
+[[files]]
 path = "docs/guide/cli.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/cloudflare.md"
 kind = "text"
 
 [[files]]
@@ -2048,6 +2056,10 @@ kind = "text"
 
 [[files]]
 path = "docs/guide/rsc-hydration.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/spin.md"
 kind = "text"
 
 [[files]]
@@ -2684,6 +2696,26 @@ kind = "text"
 
 [[files]]
 path = "scripts/profile.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/smoke-axum.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/smoke-cloudflare.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/smoke-common.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/smoke-fastly.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/smoke-spin.sh"
 kind = "text"
 
 [[files]]

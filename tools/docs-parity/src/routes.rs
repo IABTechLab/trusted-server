@@ -476,6 +476,23 @@ const API_REFERENCE_PATH: &str = "docs/guide/api-reference.md";
 const API_ROUTE_REGION: &str = "api-route-availability";
 const API_INTEGRATION_REGION: &str = "api-integration-route-families";
 const API_ADAPTER_REGION: &str = "api-adapter-support";
+const GUIDE_FASTLY_REGION: &str = "adapter-support-fastly";
+const GUIDE_AXUM_REGION: &str = "adapter-support-axum";
+const GUIDE_CLOUDFLARE_REGION: &str = "adapter-support-cloudflare";
+const GUIDE_SPIN_REGION: &str = "adapter-support-spin";
+
+/// Return the canonical document for a generated route or adapter region.
+#[must_use]
+pub fn documentation_region_path(name: &str) -> Option<&'static str> {
+    match name {
+        API_ADAPTER_REGION | API_ROUTE_REGION | API_INTEGRATION_REGION => Some(API_REFERENCE_PATH),
+        GUIDE_FASTLY_REGION => Some("docs/guide/fastly.md"),
+        GUIDE_AXUM_REGION => Some("docs/guide/axum-dev.md"),
+        GUIDE_CLOUDFLARE_REGION => Some("docs/guide/cloudflare.md"),
+        GUIDE_SPIN_REGION => Some("docs/guide/spin.md"),
+        _ => None,
+    }
+}
 
 /// Build the API reference's generated regions directly from checked route,
 /// integration, and adapter-support records.
@@ -489,6 +506,10 @@ pub fn documentation_regions(
         adapter_documentation_region(support),
         route_documentation_region(routes, support),
         integration_route_documentation_region(integrations),
+        adapter_guide_documentation_region(support, "fastly", GUIDE_FASTLY_REGION),
+        adapter_guide_documentation_region(support, "axum", GUIDE_AXUM_REGION),
+        adapter_guide_documentation_region(support, "cloudflare", GUIDE_CLOUDFLARE_REGION),
+        adapter_guide_documentation_region(support, "spin", GUIDE_SPIN_REGION),
     ]
 }
 
@@ -518,7 +539,13 @@ pub fn validate_documentation_contract(
         let declaration = declarations
             .get(&expected.name)
             .ok_or_else(|| invalid(format!("missing {} region", expected.name)))?;
-        if declaration.path != API_REFERENCE_PATH || declaration.columns != expected.columns {
+        let Some(expected_path) = documentation_region_path(&expected.name) else {
+            return Err(invalid(format!(
+                "generated documentation region has no canonical path: {}",
+                expected.name
+            )));
+        };
+        if declaration.path != expected_path || declaration.columns != expected.columns {
             return Err(invalid(format!(
                 "{} path or columns differ from the checked record",
                 expected.name
@@ -563,46 +590,71 @@ fn adapter_documentation_region(support: &AdapterSupportManifest) -> GeneratedRe
     let rows = support
         .adapters
         .iter()
-        .map(|adapter| GeneratedRow {
-            key: adapter.id.clone(),
-            cells: vec![
-                format!("`{}`", adapter.id),
-                adapter.release_status.clone(),
-                adapter.health.replace('_', " "),
-                format!("`{}`", adapter.startup_status),
-                if adapter.startup_health { "yes" } else { "no" }.to_owned(),
-                adapter.provider_fanout.clone(),
-                match adapter.trusted_client_ip.as_str() {
-                    "entry_point_resolve_and_sanitize" => "entry-point resolve + sanitize",
-                    "outermost_sanitize" => "outermost sanitize",
-                    _ => "invalid",
-                }
-                .to_owned(),
-                match adapter.request_normalization.as_str() {
-                    "none" => "none",
-                    "innermost_spin_headers" => "innermost Spin-header derivation",
-                    _ => "invalid",
-                }
-                .to_owned(),
-            ],
-        })
+        .map(adapter_documentation_row)
         .collect();
     GeneratedRegion {
         name: API_ADAPTER_REGION.to_owned(),
-        columns: vec![
-            "Adapter",
-            "Release status",
-            "Health",
-            "Startup status",
-            "Startup health",
-            "Provider fan-out",
-            "Trusted-client-IP handling",
-            "Request normalization",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+        columns: adapter_documentation_columns(),
         rows,
+    }
+}
+
+fn adapter_guide_documentation_region(
+    support: &AdapterSupportManifest,
+    adapter_id: &str,
+    region_name: &str,
+) -> GeneratedRegion {
+    let adapter = support
+        .adapters
+        .iter()
+        .find(|adapter| adapter.id == adapter_id)
+        .expect("validated adapter support should include every adapter");
+    GeneratedRegion {
+        name: region_name.to_owned(),
+        columns: adapter_documentation_columns(),
+        rows: vec![adapter_documentation_row(adapter)],
+    }
+}
+
+fn adapter_documentation_columns() -> Vec<String> {
+    [
+        "Adapter",
+        "Release status",
+        "Health",
+        "Startup status",
+        "Startup health",
+        "Provider fan-out",
+        "Trusted-client-IP handling",
+        "Request normalization",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn adapter_documentation_row(adapter: &AdapterSupportRecord) -> GeneratedRow {
+    GeneratedRow {
+        key: adapter.id.clone(),
+        cells: vec![
+            format!("`{}`", adapter.id),
+            adapter.release_status.clone(),
+            adapter.health.replace('_', " "),
+            format!("`{}`", adapter.startup_status),
+            if adapter.startup_health { "yes" } else { "no" }.to_owned(),
+            adapter.provider_fanout.clone(),
+            match adapter.trusted_client_ip.as_str() {
+                "entry_point_resolve_and_sanitize" => "entry-point resolve + sanitize",
+                "outermost_sanitize" => "outermost sanitize",
+                _ => "invalid",
+            }
+            .to_owned(),
+            match adapter.request_normalization.as_str() {
+                "none" => "none",
+                "innermost_spin_headers" => "innermost Spin-header derivation",
+                _ => "invalid",
+            }
+            .to_owned(),
+        ],
     }
 }
 

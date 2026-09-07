@@ -4,9 +4,9 @@ use docs_parity::integrations::IntegrationInventory;
 use docs_parity::markdown::{OwnershipRecord, render_generated_document};
 use docs_parity::routes::{
     AdapterSupportManifest, RouteManifest, RouteRecord, RouteShape, RouteSources, RouteStatus,
-    documentation_regions, extract_cloudflare_routes, extract_named_routes,
-    extract_repository_routes, validate_adapter_support, validate_documentation_contract,
-    validate_middleware_sources, validate_routes,
+    documentation_region_path, documentation_regions, extract_cloudflare_routes,
+    extract_named_routes, extract_repository_routes, validate_adapter_support,
+    validate_documentation_contract, validate_middleware_sources, validate_routes,
 };
 
 fn route(
@@ -293,6 +293,25 @@ fn route_documentation_is_bound_to_checked_route_and_integration_records() {
         .expect("reviewed integration inventory should parse");
     let pages = include_str!("../manifests/pages.toml");
 
+    let regions = documentation_regions(&routes, &support, &integrations);
+    assert_eq!(
+        regions.len(),
+        7,
+        "all reader-facing adapter summaries must be generated"
+    );
+    for (name, path) in [
+        ("adapter-support-fastly", "docs/guide/fastly.md"),
+        ("adapter-support-axum", "docs/guide/axum-dev.md"),
+        ("adapter-support-cloudflare", "docs/guide/cloudflare.md"),
+        ("adapter-support-spin", "docs/guide/spin.md"),
+    ] {
+        assert_eq!(
+            documentation_region_path(name),
+            Some(path),
+            "adapter summary must target its deployment guide"
+        );
+    }
+
     validate_documentation_contract(&routes, &support, &integrations, pages)
         .expect("the API region declarations should match their checked records");
 
@@ -301,12 +320,14 @@ fn route_documentation_is_bound_to_checked_route_and_integration_records() {
         owner: "documentation-maintainers".to_owned(),
     }];
     let api_reference = include_bytes!("../../../docs/guide/api-reference.md");
-    let rendered = render_generated_document(
-        api_reference,
-        &documentation_regions(&routes, &support, &integrations),
-        &ownership,
-    )
-    .expect("checked route regions should render");
+    let api_regions = regions
+        .into_iter()
+        .filter(|region| {
+            documentation_region_path(&region.name) == Some("docs/guide/api-reference.md")
+        })
+        .collect::<Vec<_>>();
+    let rendered = render_generated_document(api_reference, &api_regions, &ownership)
+        .expect("checked route regions should render");
     assert!(
         rendered == api_reference,
         "the reader-facing route tables must match their generated records"
@@ -321,7 +342,12 @@ fn route_documentation_is_bound_to_checked_route_and_integration_records() {
         RouteManifest::parse(&changed_source).expect("changed route fixture should parse");
     let changed_render = render_generated_document(
         api_reference,
-        &documentation_regions(&changed, &support, &integrations),
+        &documentation_regions(&changed, &support, &integrations)
+            .into_iter()
+            .filter(|region| {
+                documentation_region_path(&region.name) == Some("docs/guide/api-reference.md")
+            })
+            .collect::<Vec<_>>(),
         &ownership,
     )
     .expect("changed route fixture should render");

@@ -896,7 +896,7 @@ git push origin spec-docs-refresh
 - Modify: `tools/docs-parity/manifests/retired-identifiers.toml`
 - Modify: `tools/docs-parity/manifests/snippets.toml`
 - Modify: `tools/docs-parity/manifests/pages.toml`
-- Modify: `tools/docs-parity/manifests/orphans.toml`
+- Read/verify: `tools/docs-parity/manifests/orphans.toml`
 - Modify: `tools/docs-parity/src/markdown.rs`
 - Modify/Test: `tools/docs-parity/tests/links.rs`
 
@@ -1107,18 +1107,25 @@ git commit -m "Generate adapter API documentation"
 - Create: `scripts/smoke-cloudflare.sh`
 - Create: `scripts/smoke-spin.sh`
 - Create: `scripts/smoke-axum.sh`
+- Create: `scripts/smoke-common.sh`
 - Modify: `.tool-versions`
 - Modify: `.github/workflows/integration-tests.yml`
-- Modify as fixtures, not operator sources: `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`
-- Modify as needed: `crates/trusted-server-adapter-cloudflare/wrangler.ci.toml`
+- Read/verify as fixtures, not operator sources: `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`
+- Read/verify: `crates/trusted-server-adapter-cloudflare/wrangler.ci.toml`
 - Modify: `tools/docs-parity/manifests/tracked-files.toml`
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
 - Modify: `tools/docs-parity/manifests/pages.toml`
 - Modify: `tools/docs-parity/manifests/orphans.toml`
 - Modify: `tools/docs-parity/manifests/snippets.toml`
+- Modify: `tools/docs-parity/manifests/sensitive-allowlist.toml`
+- Modify: `tools/docs-parity/src/markdown.rs`
+- Modify: `tools/docs-parity/src/routes.rs`
+- Modify/Test: `tools/docs-parity/tests/routes.rs`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
+- Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
 - Modify: PR #1049 description through GitHub API/CLI
 
-- [ ] **Step 1: Write smoke failures before guides**
+- [x] **Step 1: Write smoke failures before guides**
 
 For each adapter, add a clean-state positive scenario with exact status, stub-origin sentinel, and Trusted Server rewrite/header; add independent missing-config and per-required-secret failures with specific diagnostics. Prove health-only/status-only/degraded-router responses do not satisfy the oracle.
 
@@ -1126,19 +1133,19 @@ Select the current stable Wrangler version at implementation time, record its
 source/version, add it to `.tool-versions`, and make the Cloudflare smoke/CI
 fixture fail if that pin is absent or a different executable is used.
 
-- [ ] **Step 2: Implement Axum and Fastly scripts**
+- [x] **Step 2: Implement Axum and Fastly scripts**
 
 Axum exports the exact config/secret bridge and exercises a publisher request. Fastly runs config init/validate/local push, seeds all three `ts_secrets` entries, serves through Viceroy, asserts health plus publisher behavior, and restores `fastly.toml` in a trap.
 
-- [ ] **Step 3: Implement the Cloudflare bridge exactly**
+- [x] **Step 3: Implement the Cloudflare bridge exactly**
 
 Provision/map the selected KV binding before push, run local push, read the envelope with explicit binding/namespace, double-encode with `jq`, write only gitignored generated vars/manifest files, run Wrangler, assert rewritten content, and clean up. Keep local and remote secret instructions separate.
 
-- [ ] **Step 4: Implement the Spin path**
+- [x] **Step 4: Implement the Spin path**
 
 Set the required store mapping to `default`, local-push into `.spin/`, encode/export every secret variable name, run `spin up`, assert a non-health publisher response with the strong oracle, and clean all local state. If CI cannot run Spin, record owner/SHA/tool versions/expiry for recurring manual evidence.
 
-- [ ] **Step 5: Write the guides from the scripts**
+- [x] **Step 5: Write the guides from the scripts**
 
 Every guide command must be copyable and remain in the same order as the recurring script. State maturity, fan-out, health/startup, and unwired-store limitations from `adapter-support.toml`; a successful push is not described as a configured runtime where the bridge is still required.
 
@@ -1146,7 +1153,7 @@ Register the four new public pages immediately. Until Task 14 adds their final
 navigation, give any genuinely unreachable page a typed temporary orphan entry
 owned by WP5 and expiring at Task 14; Task 14 must remove that entry.
 
-- [ ] **Step 6: Wire runnable scripts into integration CI**
+- [x] **Step 6: Wire runnable scripts into integration CI**
 
 Run `chmod +x scripts/smoke-axum.sh scripts/smoke-fastly.sh
 scripts/smoke-cloudflare.sh scripts/smoke-spin.sh`. Run Axum, Fastly, and
@@ -1154,7 +1161,7 @@ Cloudflare smokes in the existing integration workflow after their artifacts
 are prepared. Consume Wrangler from the Task 13 `.tool-versions` pin, not an
 unpinned global latest. Preserve existing integration suites.
 
-- [ ] **Step 7: Verify focused journeys**
+- [x] **Step 7: Verify focused journeys**
 
 ```bash
 bash -n scripts/smoke-axum.sh scripts/smoke-fastly.sh scripts/smoke-cloudflare.sh scripts/smoke-spin.sh
@@ -1171,10 +1178,10 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --
 cd docs && npm run lint && npm run format && npm run build
 ```
 
-- [ ] **Step 8: Commit the deployment half of WP5**
+- [x] **Step 8: Commit the deployment half of WP5**
 
 ```bash
-git add docs/guide/fastly.md docs/guide/cloudflare.md docs/guide/spin.md docs/guide/axum-dev.md scripts/smoke-fastly.sh scripts/smoke-cloudflare.sh scripts/smoke-spin.sh scripts/smoke-axum.sh .tool-versions .github/workflows/integration-tests.yml crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml crates/trusted-server-adapter-cloudflare/wrangler.ci.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md
+git add .github/workflows/integration-tests.yml .tool-versions docs/guide/fastly.md docs/guide/cloudflare.md docs/guide/spin.md docs/guide/axum-dev.md scripts/smoke-fastly.sh scripts/smoke-cloudflare.sh scripts/smoke-spin.sh scripts/smoke-axum.sh scripts/smoke-common.sh tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/src/markdown.rs tools/docs-parity/src/routes.rs tools/docs-parity/tests/routes.rs docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md
 git ls-files --stage scripts/smoke-axum.sh scripts/smoke-fastly.sh scripts/smoke-cloudflare.sh scripts/smoke-spin.sh | awk '$1 != "100755" { bad=1 } END { exit bad }'
 git commit -m "Document adapter deployment journeys"
 ```

@@ -2819,7 +2819,17 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "docs/guide/axum-dev.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "docs/guide/cli.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
+path = "docs/guide/cloudflare.md"
 mode = "whole"
 disposition = "include"
 
@@ -2975,6 +2985,11 @@ disposition = "include"
 
 [[sources]]
 path = "docs/guide/rsc-hydration.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
+path = "docs/guide/spin.md"
 mode = "whole"
 disposition = "include"
 
@@ -3909,6 +3924,31 @@ mode = "comments"
 grammar = "shell"
 
 [[sources]]
+path = "scripts/smoke-axum.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/smoke-cloudflare.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/smoke-common.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/smoke-fastly.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/smoke-spin.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
 path = "scripts/template-cache-local-test.sh"
 mode = "comments"
 grammar = "shell"
@@ -4836,13 +4876,13 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/integration-tests.yml"
-selector = "bytes:4837-4911"
+selector = "bytes:7654-7728"
 fingerprint = "sha256:2330dbe6289b49889b5c6d37991ef8ce3ca761a0fede60b9c7a18d4a098e366e"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/integration-tests.yml"
-selector = "bytes:4918-4966"
+selector = "bytes:7735-7783"
 fingerprint = "sha256:413310b737a2a26ee161a1f960cebc3b707d3e440dc81f35e7679499c04e86ad"
 disposition = "include"
 
@@ -7286,6 +7326,96 @@ disposition = "include"
 path = "scripts/profile.sh"
 selector = "bytes:7970-8002"
 fingerprint = "sha256:8ad3c1be11c6579c68610cf20bffa3527e550306c2d2ece81d3ace5620e3eea4"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-axum.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-axum.sh"
+selector = "bytes:21-82"
+fingerprint = "sha256:6ebbed645622bd05e9a17b8d02298f8ccc40b0d76f60e6fe86fcbec98180320f"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-axum.sh"
+selector = "bytes:146-189"
+fingerprint = "sha256:c313900cecdae4731bbb362c553906d5302a05f75d246112df4472b8a260491d"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-cloudflare.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-cloudflare.sh"
+selector = "bytes:21-99"
+fingerprint = "sha256:b12cf87841ab93a3621b5f563cf2ae7e5e5f0654ee736e3c14e5586a72af6b7a"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-cloudflare.sh"
+selector = "bytes:163-206"
+fingerprint = "sha256:c313900cecdae4731bbb362c553906d5302a05f75d246112df4472b8a260491d"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-common.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-common.sh"
+selector = "bytes:20-47"
+fingerprint = "sha256:327b91a61d0d59d88336518701366fd3ca4cfd7afb2839e8bfaf1db9d537bc81"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-common.sh"
+selector = "bytes:49-116"
+fingerprint = "sha256:7bfac7a3676b3c2549e98a39dc888105bec6d54aa56f043375b88f369ef09f56"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-fastly.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-fastly.sh"
+selector = "bytes:21-102"
+fingerprint = "sha256:f08caa05e1f09e1231dcc3d51e6cdb78a525afe282da7b41f888880d7fd2f4ee"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-fastly.sh"
+selector = "bytes:166-209"
+fingerprint = "sha256:c313900cecdae4731bbb362c553906d5302a05f75d246112df4472b8a260491d"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-spin.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-spin.sh"
+selector = "bytes:21-96"
+fingerprint = "sha256:4fa18bc357dc9ddc9bbbc9de440f8cd6565385acaa50b5a97e3dc3332e46e35b"
+disposition = "include"
+
+[[comments]]
+path = "scripts/smoke-spin.sh"
+selector = "bytes:160-203"
+fingerprint = "sha256:c313900cecdae4731bbb362c553906d5302a05f75d246112df4472b8a260491d"
 disposition = "include"
 
 [[comments]]

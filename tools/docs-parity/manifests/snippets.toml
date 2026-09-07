@@ -2702,6 +2702,30 @@ command = "illustrative-bash"
 fingerprint = "sha256:0c963b7bbe162185c3c3f2b8303a49de7d25d2fd2ea65b26283042a13b17b58b"
 
 [[snippets]]
+path = "docs/guide/fastly.md"
+selector = "fence:14"
+command = "validate-bash"
+fingerprint = "sha256:43774527b01de0a2424d0d30fe134344a000339a1adfe63a96e98a5ea39c43dc"
+
+[[snippets]]
+path = "docs/guide/axum-dev.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:7d06640bf8931bc1cc39556b9e4dd3780a60881bc2a09432e31c166e9e007e39"
+
+[[snippets]]
+path = "docs/guide/cloudflare.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:05694e56f2a12dc8dcfe0dc6f3b5e4fc779fcbf2fae0683c454d85d212e4e75c"
+
+[[snippets]]
+path = "docs/guide/spin.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:d86fc1e4e39cdf4a95a8450c4b53c64945a9fd35490b2dd434a0b844351f1f5b"
+
+[[snippets]]
 path = "docs/guide/first-party-proxy.md"
 selector = "fence:1"
 command = "illustrative-mermaid"

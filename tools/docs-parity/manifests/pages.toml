@@ -41,9 +41,21 @@ navigation = true
 
 [[pages]]
 kind = "live"
+path = "docs/guide/axum-dev.md"
+route = "/guide/axum-dev"
+navigation = false
+
+[[pages]]
+kind = "live"
 path = "docs/guide/cli.md"
 route = "/guide/cli"
 navigation = true
+
+[[pages]]
+kind = "live"
+path = "docs/guide/cloudflare.md"
+route = "/guide/cloudflare"
+navigation = false
 
 [[pages]]
 kind = "live"
@@ -230,6 +242,12 @@ kind = "live"
 path = "docs/guide/rsc-hydration.md"
 route = "/guide/rsc-hydration"
 navigation = true
+
+[[pages]]
+kind = "live"
+path = "docs/guide/spin.md"
+route = "/guide/spin"
+navigation = false
 
 [[pages]]
 kind = "live"
@@ -552,6 +570,26 @@ columns = ["Router", "Path", "Methods", "Shape", "Predicate", "Fastly", "Axum", 
 name = "api-integration-route-families"
 path = "docs/guide/api-reference.md"
 columns = ["Integration", "Registration predicate", "HTTP routes"]
+
+[[regions]]
+name = "adapter-support-fastly"
+path = "docs/guide/fastly.md"
+columns = ["Adapter", "Release status", "Health", "Startup status", "Startup health", "Provider fan-out", "Trusted-client-IP handling", "Request normalization"]
+
+[[regions]]
+name = "adapter-support-axum"
+path = "docs/guide/axum-dev.md"
+columns = ["Adapter", "Release status", "Health", "Startup status", "Startup health", "Provider fan-out", "Trusted-client-IP handling", "Request normalization"]
+
+[[regions]]
+name = "adapter-support-cloudflare"
+path = "docs/guide/cloudflare.md"
+columns = ["Adapter", "Release status", "Health", "Startup status", "Startup health", "Provider fan-out", "Trusted-client-IP handling", "Request normalization"]
+
+[[regions]]
+name = "adapter-support-spin"
+path = "docs/guide/spin.md"
+columns = ["Adapter", "Release status", "Health", "Startup status", "Startup health", "Provider fan-out", "Trusted-client-IP handling", "Request normalization"]
 
 [[ownership]]
 name = "api-contract-details"

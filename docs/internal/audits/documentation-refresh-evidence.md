@@ -284,12 +284,12 @@ no-diff proof is incomplete.
 Every exception requires an owner, narrow rationale, and review or expiry date.
 Expired or ownerless entries fail the checkpoint.
 
-| Type / path                                          | Value classification   | Owner                 | Rationale                                                                                                                                                                              | Review or expiry           | State    |
-| ---------------------------------------------------- | ---------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
-| `fastly.toml` `service_id`                           | Service ID             | `aram356`             | Preserve the existing service binding during this refresh; check mode fails at or after expiry; removal is independent                                                                 | `2026-09-30T00:00:00Z`     | Approved |
-| Deleted placeholder literal in design and Decision 9 | Historical example     | `aram356`             | Preserve the approved audit's exact record; scope is `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md` and `docs/internal/audits/documentation-refresh-decisions.md` | `2027-08-31T00:00:00Z`     | Approved |
-| Task 13 temporary public-page ownership              | Page/orphan transition | Pending Task 13 owner | Page registered before Task 14 final ownership                                                                                                                                         | Expires at Task 14         | Pending  |
-| Spin manual smoke, only if CI cannot run it          | Manual evidence        | Pending               | Runner capability gap                                                                                                                                                                  | Time-bounded date required | Pending  |
+| Type / path                                          | Value classification   | Owner                       | Rationale                                                                                                                                                                              | Review or expiry       | State    |
+| ---------------------------------------------------- | ---------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | -------- |
+| `fastly.toml` `service_id`                           | Service ID             | `aram356`                   | Preserve the existing service binding during this refresh; check mode fails at or after expiry; removal is independent                                                                 | `2026-09-30T00:00:00Z` | Approved |
+| Deleted placeholder literal in design and Decision 9 | Historical example     | `aram356`                   | Preserve the approved audit's exact record; scope is `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md` and `docs/internal/audits/documentation-refresh-decisions.md` | `2027-08-31T00:00:00Z` | Approved |
+| Task 13 temporary public-page ownership              | Page/orphan transition | `documentation-maintainers` | Not required: all four adapter pages are registered and reachable through checked links before Task 14 navigation                                                                      | Not applicable         | Closed   |
+| Spin manual smoke, only if CI cannot run it          | Manual evidence        | `documentation-maintainers` | Spin is absent from the hosted integration runner; the complete local smoke is required until CI gains an owned Spin installation                                                      | `2026-10-07T00:00:00Z` | Active   |
 
 ### Follow-up issues
 
@@ -3535,8 +3535,88 @@ SHA.
 
 #### Task 13 — Add deployment guides and recurring first-success smokes
 
-Pending. Record all four smoke contracts, exact tool versions, cleanup, and
-any time-bounded Spin exception.
+Started from clean SHA `fa4c87bc854f775c5d13782b1b0f12b12c007c93`.
+The immutable `origin/rc/202608` baseline remained
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`; the root and standalone
+lockfile hashes remained, respectively,
+`9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`
+and `234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
+
+- Before the guides existed, the shell-syntax command failed because the four
+  planned smoke paths were absent. The generated-reader contract then failed
+  first at compile time because `documentation_region_path` was absent and,
+  after that seam was added, failed with `missing adapter-support-fastly
+region`. The completed contract renders one canonical adapter-support row in
+  each deployment guide as well as the existing API matrix; a region redirected
+  to another page, given different columns, or populated with copied rows is
+  rejected.
+- The npm registry was queried at implementation time. Its stable `wrangler`
+  record was version `4.129.0`, last modified
+  `2026-09-03T17:50:56.633Z`, tarball
+  `https://registry.npmjs.org/wrangler/-/wrangler-4.129.0.tgz`, and integrity
+  `sha512-PGPvs9UPoFrwxT0VogpESSZGvZIctAuTK3wGsLLPHtHsSgS85kNdvtpa2d14UzG8gwLWD64XUGFPGG9tOXG9VQ==`.
+  `.tool-versions` pins that exact release. The Cloudflare smoke and both
+  integration-workflow installation sites fail if the pin is absent or the
+  executable reports another version.
+- Each script starts a verified loopback stub origin and requires the origin
+  and adapter processes to remain alive through every assertion, so a launcher,
+  origin, or occupied-port failure cannot satisfy a negative case. Every
+  adapter independently omits the app config, `handler_password`,
+  `publisher_proxy_secret`, and `ec_passphrase`. The final oracle requires HTTP
+  200, the exact `SMOKE_ORIGIN_SENTINEL`, a URL rewritten to the adapter
+  listener, and absence of the original-origin URL.
+- Axum pushes into an isolated `.edgezero` directory, reads the envelope, and
+  supplies the exact config and three secret environment variables. Each
+  missing input produced HTTP 500 and the exact startup diagnostic; the final
+  transformed publisher response passed.
+- Fastly first proved that `/health` returns 200 while the unconfigured
+  publisher route returns 500 with the missing config-store key diagnostic.
+  Local push then populated the config store, and each independently removed
+  `ts_secrets` entry produced HTTP 500 with its exact setting path. The final
+  publisher oracle passed. The exit trap restored `fastly.toml` byte for byte,
+  restored or removed `.fastly.toml.edgezero-lock` according to its initial
+  state, and left no temporary process or generated state.
+- Cloudflare mapped the logical store to `TRUSTED_SERVER_KV`, performed local
+  push, read `trusted_server_config` back with the explicit binding and local
+  flags, and nested the serialized envelope as the `app_config` string inside
+  `TRUSTED_SERVER_CONFIG`. Wrangler deliberately redacts Worker startup errors;
+  each HTTP 500 negative therefore matched a normalized diagnostic only after
+  Wrangler's emitted binding inventory proved the intended binding absent and
+  its independent control binding present. The positive publisher oracle then
+  passed. All Wrangler KV state and generated manifests lived under the
+  isolated temporary directory.
+- Spin ran once before config push and once per omitted encoded secret. The
+  listener, config-push phase, and exact one-variable omission were checked for
+  every HTTP 503 negative; this controlled-delta diagnostic does not treat the
+  degraded router's generic 503 as proof. Local push used the `default` mapping
+  and wrote only the isolated `.spin/sqlite_key_value.db`; the subsequent
+  non-health publisher oracle passed. The local receipt used Spin `4.1.0`
+  (`c0b3726`, 2026-08-25) and is owned by
+  `documentation-maintainers` through `2026-10-07T00:00:00Z`. The exact tested
+  implementation SHA is added in the adjacent publication receipt after the
+  candidate is committed.
+- The other local tool identities were Rust `1.95.0` on
+  `aarch64-apple-darwin`, Node `v24.12.0`, Fastly CLI `v16.0.0` with its
+  reported embedded Viceroy `0.21.0`, standalone Viceroy `0.19.0`, Wrangler
+  `4.129.0`, jq `1.7.1`, and Python `3.9.6`. Hosted Fastly execution instead
+  reads the checked pins Fastly CLI `15.1.0` and Viceroy `0.17.0`.
+- `integration-tests.yml` retains the existing integration suites and adds a
+  non-fail-fast Axum/Fastly/Cloudflare matrix after artifact preparation.
+  Fastly CLI and Wrangler installations consume `.tool-versions`; no write
+  credential is exposed. Spin remains the time-bounded manual path above.
+  The existing integration config fixture and `wrangler.ci.toml` were audited
+  but required no change: every generated case is isolated instead of
+  mutating an operator or shared fixture.
+- All four final local smokes passed after process-liveness assertions were
+  added. The first sandboxed rerun failed before adapter startup because local
+  socket binding was denied and Wrangler could not write its user-level log;
+  identical unrestricted reruns passed. `bash -n` and ShellCheck passed for all
+  five scripts. The integration parity target passed all 13 tests. The route
+  suite passed all 70 tests, the generated-Markdown suite passed all 11, and
+  route, generation, classification, local-link, snippet, and workflow checks
+  passed. Documentation ESLint, Prettier, and VitePress build passed. The final
+  all-record check and staged package proof are recorded immediately before the
+  implementation commit.
 
 #### Task 14 — Complete WP5 product coverage and navigation
 
