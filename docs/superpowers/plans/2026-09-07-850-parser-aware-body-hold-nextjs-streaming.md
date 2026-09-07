@@ -182,6 +182,7 @@ git commit -m "Classify bounded Next.js RSC groups"
 - Modify: `crates/trusted-server-core/src/integrations/nextjs/rsc_stream.rs`
 - Modify: `crates/trusted-server-core/src/integrations/nextjs/rsc_placeholders.rs:10-105`
 - Modify: `crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs:14-105`
+- Modify: `crates/trusted-server-core/src/integrations/nextjs/html_post_process.rs:1-240,329-390`
 - Modify fixtures: every `IntegrationScriptContext { ... }` initializer reported by `rg -n "IntegrationScriptContext \\{" crates/trusted-server-core/src`
 - Test: `crates/trusted-server-core/src/integrations/nextjs/rsc_placeholders.rs`
 - Test: `crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs`
@@ -251,6 +252,11 @@ struct NextJsDocumentState {
 
 Generate `namespace` once with `Uuid::new_v4().simple()`. Access it through one helper which calls `document_state.get_or_insert_with`; both parser rewriters and the later output session must receive the same `Arc<Mutex<NextJsDocumentState>>`.
 
+Normalize `max_combined_payload_bytes` through one helper before storing it in this state:
+preserve the existing public behavior in `rsc.rs` where a configured value of `0` means
+`DEFAULT_MAX_COMBINED_PAYLOAD_BYTES`, and use that effective nonzero value for script
+capture, classification, queued payloads, and held output.
+
 - [ ] **Step 5: Move `__NEXT_DATA__` capture out of the registry object**
 
 Remove `NextJsNextDataRewriter::accumulated_text`. Implement the spec's three-state transition table against `NextJsDocumentState::next_data`:
@@ -279,6 +285,13 @@ shared counter only when pushing a captured original; decrement it when the outp
 consumes or restores that entry. This prevents the parser-side FIFO from temporarily
 exceeding the promised group bound.
 
+Keep the Task 2 checkpoint compatible with the registered EOF post-processor. Update
+`NextJsHtmlPostProcessor` to obtain the same namespaced `NextJsDocumentState`, consume its
+captured payload FIFO, and replace only placeholders from that document's namespace. It
+must decrement `captured_payload_bytes` on both rewrite and restoration and reject a
+missing/mismatched placeholder rather than leaking generated text. Do not remove the
+legacy registration or its EOF buffering wrapper until Task 4.
+
 - [ ] **Step 7: Run focused and cross-integration tests**
 
 Run:
@@ -301,7 +314,8 @@ git add crates/trusted-server-core/src/integrations/registry.rs \
   crates/trusted-server-core/src/integrations/google_tag_manager.rs \
   crates/trusted-server-core/src/integrations/nextjs/rsc_stream.rs \
   crates/trusted-server-core/src/integrations/nextjs/rsc_placeholders.rs \
-  crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs
+  crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs \
+  crates/trusted-server-core/src/integrations/nextjs/html_post_process.rs
 git commit -m "Isolate bounded Next.js script capture"
 ```
 
@@ -369,11 +383,14 @@ Add `html_stream_processors` and `with_html_stream_processor`. Initially keep th
 
 - [ ] **Step 5: Compose the request-local processor chain**
 
-Create `HtmlWithStreamingProcessors` in `html_processor.rs`:
+Create `HtmlWithStreamingProcessors` in `html_processor.rs`. At this checkpoint its inner
+processor is the complete existing HTML pipeline, including `HtmlWithPostProcessing` when
+legacy post-processors are registered, so adding streaming infrastructure does not bypass
+Next.js EOF substitution before Task 4:
 
 ```rust
 struct HtmlWithStreamingProcessors {
-    inner: HtmlRewriterAdapter,
+    inner: Box<dyn StreamProcessor>,
     processors: Vec<Box<dyn StreamProcessor>>,
 }
 
@@ -388,7 +405,7 @@ impl StreamProcessor for HtmlWithStreamingProcessors {
 }
 ```
 
-Construct every session once per call to `create_html_processor`, using the same `IntegrationDocumentState` clone supplied to parser callbacks. Do not construct sessions inside `process_chunk`.
+Construct every session once per call to `create_html_processor`, using the same `IntegrationDocumentState` clone supplied to parser callbacks. Do not construct sessions inside `process_chunk`. Build the current rewriter-plus-legacy-postprocessor pipeline first and wrap that pipeline with the new sessions. The fake chain test uses a registration without a legacy post-processor and therefore proves intermediate streaming without changing current Next.js behavior.
 
 - [ ] **Step 6: Run chain tests and target gate**
 
@@ -449,10 +466,12 @@ Use small chunks and small limits so each transition occurs deterministically.
 
 ```bash
 cargo test-fastly integrations::nextjs::rsc_stream::tests -- --nocapture
-cargo test-fastly html_processor::tests::post_processors_accumulate_while_streaming_path_passes_through -- --nocapture
+cargo test-fastly html_processor::tests::nextjs_stream_processor_emits_before_eof -- --nocapture
 ```
 
-Expected: streaming-session tests fail because the production post-processor still waits for EOF; the old accumulation test still demonstrates the behavior being removed.
+Expected: the new Next.js streaming tests fail because production registration still uses
+the EOF post-processor. The named HTML processor test exists in this step and fails by
+observing empty intermediate output; do not target the accumulation test removed in Task 3.
 
 - [ ] **Step 3: Implement the Next.js factory and session**
 
@@ -535,6 +554,10 @@ Add `BodyCloseInjection::DeferredInlineMarker(String)` expectations:
 
 - a structural mixed-case body end receives exactly one token;
 - script/JSON/comment `</body>` text receives none;
+- for a structural close, feed the source HTML with every possible origin-chunk split
+  across `</BoDy>` and assert exactly one token after parser finalization;
+- for each false literal in script, JSON, and comment context, split the source at every
+  byte boundary within `</body>` and assert no token;
 - multiple body elements still inject once;
 - no explicit body end emits no token;
 - deferred mode never reads or injects `ad_bids_state`.
@@ -639,7 +662,10 @@ Use the existing pending-auction/lazy-body fixtures. Feed at least three logical
 
 Poll while the auction remains pending and assert region 2 and its later article bytes are available. Then assert the stream becomes pending only at the parser token. Complete the auction and assert the bid script is immediately before the structural close.
 
-The test must not use elapsed-time thresholds or sleeps.
+The test must not use elapsed-time thresholds or sleeps. For the write-sink path, use an
+observing writer whose `write` and `flush` calls are recorded separately. Before resolving
+the auction, assert that region 2 was written, `flush()` was called after that write, and
+collection has not started.
 
 - [ ] **Step 2: Add EOF and failure-path red tests**
 
@@ -670,7 +696,11 @@ decode -> process -> exact generated seam -> encode
 
 Refactor `hold_step_decoded_chunk`, `hold_collect_close_tail`, `hold_finish_ready_segments`, and `hold_finish_tail_segments` around `InlineBodyCloseSeam`. Keep shared step/finish helpers for the lazy stream and write-sink driver.
 
-The step result must separate ready encoded segments from the seam event. Callers yield/write all ready segments before `collect_stream_auction(...).await`.
+The step result must separate ready encoded segments from the seam event. The lazy caller
+yields every ready segment before `collect_stream_auction(...).await`. A write-sink caller
+writes every ready segment and calls synchronous `Write::flush()` successfully before starting
+collection; propagate a flush failure through the same one-terminal-outcome guard as write,
+decode, process, and encode failures.
 
 At source EOF, first finalize the decoder and HTML processor, feed every final processed
 byte through `InlineBodyCloseSeam`, and expose its ready output. If no token was found,
@@ -728,12 +758,20 @@ Expected: all Fastly/core tests pass before the commit.
 
 - Modify: `crates/trusted-server-core/src/publisher.rs:16650-16895,17130-17690,18035-18430`
 - Modify: `crates/trusted-server-core/src/integrations/nextjs/mod.rs:285-710`
+- Modify: `crates/trusted-server-adapter-axum/tests/routes.rs`
+- Modify: `crates/trusted-server-adapter-cloudflare/tests/routes.rs`
+- Modify: `crates/trusted-server-adapter-spin/tests/routes.rs`
 - Modify: `docs/guide/integrations/nextjs.md`
 - Test: existing adapter/core test modules only
 
 - [ ] **Step 1: Add compressed parser-seam cases**
 
-Extend existing identity/gzip/deflate/Brotli publisher tests so the decoded HTML contains a false script literal before the structural close. For gzip, retain multi-member coverage with the script and close in different members. Assert decoded final bytes, bid placement, and no token leakage.
+Extend existing identity/gzip/deflate/Brotli publisher tests so the decoded HTML contains a
+false script literal before the structural close. For every encoding, keep the auction
+pending, poll the output, and assert that decoded prefix bytes through the false literal are
+observable before collection begins. Then resolve the auction and assert decoded final-byte
+parity, bid placement, valid encoder trailers, and no token leakage. For gzip, retain
+multi-member coverage with the script and close in different members.
 
 - [ ] **Step 2: Add full-pipeline Next.js plus auction coverage**
 
@@ -761,6 +799,12 @@ Document that ordinary HTML streams immediately, unresolved cross-script T-chunk
 
 - [ ] **Step 5: Run adapter parity suites**
 
+First add one buffered route regression in each adapter test module. Feed the same Next.js
+fixture and configuration through Axum, Cloudflare, and Spin, then assert the complete body
+matches the core expected bytes: rewritten RSC URL and length, preserved script order, bid
+markup immediately before structural `</body>`, and no generated seam or RSC placeholder.
+These are final-byte assertions because these adapters collect the core stream.
+
 ```bash
 cargo test-axum
 cargo test-cloudflare
@@ -773,9 +817,12 @@ Expected: native buffered adapters preserve final-byte behavior.
 
 ```bash
 cargo fmt --all -- --check
-cd docs && npm run format
+(cd docs && npm run format)
 git add crates/trusted-server-core/src/publisher.rs \
   crates/trusted-server-core/src/integrations/nextjs/mod.rs \
+  crates/trusted-server-adapter-axum/tests/routes.rs \
+  crates/trusted-server-adapter-cloudflare/tests/routes.rs \
+  crates/trusted-server-adapter-spin/tests/routes.rs \
   docs/guide/integrations/nextjs.md
 git commit -m "Cover streaming seams across encodings and adapters"
 ```
@@ -841,10 +888,10 @@ Expected: all suites pass with zero failures.
 - [ ] **Step 5: Run JS and documentation gates required by repository CI**
 
 ```bash
-cd crates/trusted-server-js/lib && npx vitest run
-cd crates/trusted-server-js/lib && node build-all.mjs
-cd crates/trusted-server-js/lib && npm run format
-cd docs && npm run format
+(cd crates/trusted-server-js/lib && npx vitest run)
+(cd crates/trusted-server-js/lib && node build-all.mjs)
+(cd crates/trusted-server-js/lib && npm run format)
+(cd docs && npm run format)
 ```
 
 Expected: tests/build succeed and both format checks report no changes required.
