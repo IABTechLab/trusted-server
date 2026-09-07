@@ -42,6 +42,7 @@ use crate::settings::Settings;
 use crate::streaming_processor::StreamProcessor;
 use crate::tsjs;
 use lol_html::{HtmlRewriter, Settings as HtmlSettings, element, html_content::ContentType, text};
+use std::fmt::{self, Write as _};
 use std::io;
 
 /// Maximum size of response body that can be buffered for rewriting.
@@ -159,38 +160,66 @@ fn rewrite_style_attribute_urls(settings: &Settings, style: &str, base_origin: &
 
 /// Turns a rejected rewrite into an empty stylesheet, naming what was dropped
 /// so the log says which part of the document lost its styling.
-fn drop_if_rejected(rewritten: Option<String>, dropped: &str) -> String {
-    rewritten.unwrap_or_else(|| {
-        log::warn!("Dropping a {dropped} nested past the supported depth");
+fn drop_if_rejected(rewritten: Result<String, CssRewriteError>, dropped: &str) -> String {
+    rewritten.unwrap_or_else(|error| {
+        log::warn!("Dropping a {dropped}: {error}");
         String::new()
     })
 }
 
-/// Returns the rewritten CSS, or `None` when it nested past
-/// [`MAX_CSS_NESTING_DEPTH`].
+/// Returns rewritten CSS within the nesting and output-size limits.
 fn rewrite_style_urls_in_context(
     settings: &Settings,
     style: &str,
     base_origin: &str,
     allows_import_rules: bool,
-) -> Option<String> {
+) -> Result<String, CssRewriteError> {
     let mut rewriter = CssUrlRewriter {
         settings,
         style,
         base_origin,
         allows_import_rules,
-        out: String::with_capacity(style.len() + 16),
+        out: CssOutput {
+            value: String::with_capacity(style.len().min(MAX_REWRITABLE_BODY_SIZE)),
+            limit: MAX_REWRITABLE_BODY_SIZE,
+        },
         write_pos: 0,
-        depth_exceeded: false,
+        error: None,
     };
     let mut input = cssparser::ParserInput::new(style);
     let mut parser = cssparser::Parser::new(&mut input);
     rewriter.walk(&mut parser, 0, BareStringUrls::Never);
-    if rewriter.depth_exceeded {
-        return None;
+    if let Some(error) = rewriter.error {
+        return Err(error);
     }
-    rewriter.out.push_str(&style[rewriter.write_pos..]);
-    Some(rewriter.out)
+    rewriter
+        .out
+        .write_str(&style[rewriter.write_pos..])
+        .map_err(|_| CssRewriteError::OutputTooLarge)?;
+    Ok(rewriter.out.value)
+}
+
+/// Checks each append before allocating output, including CSS string escapes.
+struct CssOutput {
+    value: String,
+    limit: usize,
+}
+
+impl fmt::Write for CssOutput {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if value.len() > self.limit.saturating_sub(self.value.len()) {
+            return Err(fmt::Error);
+        }
+        let required = self.value.len() + value.len();
+        if required > self.value.capacity() {
+            let capacity = required
+                .max(self.value.capacity().saturating_mul(2))
+                .min(self.limit);
+            self.value.reserve_exact(capacity - self.value.len());
+        }
+        self.value.push_str(value);
+        Ok(())
+    }
 }
 
 /// Splices rewritten `url()` values into a copy of the original CSS.
@@ -200,11 +229,10 @@ struct CssUrlRewriter<'a> {
     base_origin: &'a str,
     /// Whether the outermost scope is a stylesheet that may contain `@import`.
     allows_import_rules: bool,
-    out: String,
+    out: CssOutput,
     write_pos: usize,
-    /// Set when the walk refused to descend further, which invalidates the
-    /// output because a `url()` below the cap was never inspected.
-    depth_exceeded: bool,
+    /// Any refusal invalidates the entire rewrite.
+    error: Option<CssRewriteError>,
 }
 
 impl CssUrlRewriter<'_> {
@@ -212,7 +240,7 @@ impl CssUrlRewriter<'_> {
     /// functions because a `url()` may appear at any depth.
     ///
     /// `depth` is the number of parser scopes already entered; descending past
-    /// [`MAX_CSS_NESTING_DEPTH`] sets `depth_exceeded` instead of recursing.
+    /// [`MAX_CSS_NESTING_DEPTH`] records an error instead of recursing.
     ///
     /// `strings_are_urls` marks a context where a bare quoted string is itself
     /// a URL the browser fetches: an `image-set()` argument list, or an
@@ -235,7 +263,7 @@ impl CssUrlRewriter<'_> {
         loop {
             // The output is already void once a scope was refused, so stop
             // rather than scan the siblings of the one that went too deep.
-            if self.depth_exceeded {
+            if self.error.is_some() {
                 return;
             }
             let token_start = parser.position().byte_index();
@@ -349,7 +377,7 @@ impl CssUrlRewriter<'_> {
         strings_are_urls: BareStringUrls,
     ) {
         if depth >= MAX_CSS_NESTING_DEPTH {
-            self.depth_exceeded = true;
+            self.error = Some(CssRewriteError::NestingTooDeep);
             return;
         }
         self.walk(parser, depth + 1, strings_are_urls);
@@ -368,16 +396,22 @@ impl CssUrlRewriter<'_> {
             return;
         };
         let token_end = parser.position().byte_index();
-        self.out.push_str(&self.style[self.write_pos..token_start]);
-        let proxied = build_proxy_url(self.settings, &absolute, self.base_origin);
-        if let UrlShape::Function(name) = shape {
-            self.out.push_str(name);
-            self.out.push('(');
-        }
-        cssparser::serialize_string(&proxied, &mut self.out)
-            .expect("should write a serialized URL into a String");
-        if matches!(shape, UrlShape::Function(_)) {
-            self.out.push(')');
+        let result = (|| -> fmt::Result {
+            self.out
+                .write_str(&self.style[self.write_pos..token_start])?;
+            let proxied = build_proxy_url(self.settings, &absolute, self.base_origin);
+            if let UrlShape::Function(name) = shape {
+                self.out.write_str(name)?;
+                self.out.write_char('(')?;
+            }
+            cssparser::serialize_string(&proxied, &mut self.out)?;
+            if matches!(shape, UrlShape::Function(_)) {
+                self.out.write_char(')')?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.error = Some(CssRewriteError::OutputTooLarge);
         }
         self.write_pos = token_end;
     }
@@ -715,6 +749,9 @@ pub enum CssRewriteError {
     /// refused rather than left partly applied.
     #[display("CSS nested past the maximum supported depth of {MAX_CSS_NESTING_DEPTH}")]
     NestingTooDeep,
+    /// Rewritten CSS would exceed the response-body output budget.
+    #[display("CSS output exceeds the maximum supported size of {MAX_REWRITABLE_BODY_SIZE} bytes")]
+    OutputTooLarge,
 }
 
 impl core::error::Error for CssRewriteError {}
@@ -732,9 +769,10 @@ impl core::error::Error for CssRewriteError {}
 /// # Errors
 ///
 /// Returns [`CssRewriteError::NestingTooDeep`] when the stylesheet nests past
-/// [`MAX_CSS_NESTING_DEPTH`].
+/// [`MAX_CSS_NESTING_DEPTH`], or [`CssRewriteError::OutputTooLarge`] when the
+/// rewritten output exceeds [`MAX_REWRITABLE_BODY_SIZE`].
 pub fn rewrite_css_body(settings: &Settings, css: &str) -> Result<String, CssRewriteError> {
-    rewrite_style_urls_in_context(settings, css, "", true).ok_or(CssRewriteError::NestingTooDeep)
+    rewrite_style_urls_in_context(settings, css, "", true)
 }
 
 /// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
@@ -1260,7 +1298,7 @@ fn rewrite_creative_html_impl(
                     let s = t.as_str();
                     let rewritten = rewrite_style_urls(settings, s, base_origin);
                     if rewritten != s {
-                        t.replace(&rewritten, ContentType::Text);
+                        t.replace(&rewritten, ContentType::Html);
                     }
                     Ok(())
                 }),
@@ -2806,19 +2844,134 @@ b{background:url(\"https://cdn.example/c.png\")}";
     }
 
     #[test]
+    fn css_output_checks_each_serialized_fragment_before_appending() {
+        let mut out = super::CssOutput {
+            value: String::new(),
+            limit: 8,
+        };
+        assert!(
+            std::fmt::Write::write_str(&mut out, "123456").is_ok(),
+            "should fit a prefix"
+        );
+        assert!(
+            cssparser::serialize_string("x", &mut out).is_err(),
+            "should stop while serializing a quoted value"
+        );
+        assert_eq!(
+            out.value, "123456\"x",
+            "should never append the byte beyond the limit"
+        );
+        assert!(
+            out.value.capacity() <= out.limit,
+            "should bound reserved capacity too"
+        );
+        assert!(
+            std::fmt::Write::write_str(&mut out, "").is_ok(),
+            "should permit an empty append at the limit"
+        );
+    }
+
+    #[test]
+    fn css_output_budget_includes_unchanged_trailing_text() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let reference = "@import \"https://cdn.example.com/a.css\";";
+        let css = format!(
+            "{reference}{}",
+            " ".repeat(super::MAX_REWRITABLE_BODY_SIZE - reference.len())
+        );
+        assert!(
+            matches!(
+                super::rewrite_css_body(&settings, &css),
+                Err(super::CssRewriteError::OutputTooLarge)
+            ),
+            "should reject the expanded output including the unchanged tail"
+        );
+    }
+
+    #[test]
+    fn css_processor_reports_output_expansion_and_accepts_the_exact_limit() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let plain = " ".repeat(super::MAX_REWRITABLE_BODY_SIZE);
+        assert_eq!(
+            super::rewrite_css_body(&settings, &plain)
+                .expect("should accept the exact limit")
+                .len(),
+            plain.len(),
+            "should preserve unchanged CSS"
+        );
+        let reference = "@import \"https://cdn.example.com/a.css\";";
+        let css = format!("{reference}{}", &plain[..plain.len() - reference.len()]);
+        let mut processor = super::CreativeCssProcessor::new(&settings);
+        assert!(
+            super::StreamProcessor::process_chunk(&mut processor, css.as_bytes(), false).is_ok(),
+            "should accept input within the buffer limit"
+        );
+        assert!(
+            super::StreamProcessor::process_chunk(&mut processor, &[], true).is_err(),
+            "should propagate the output refusal"
+        );
+    }
+
+    #[test]
+    fn inline_css_output_uses_the_same_budget() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let reference = "background:image-set(\"https://cdn.example.com/a.png\" 1x);";
+        let css = format!(
+            "{reference}{}",
+            " ".repeat(super::MAX_REWRITABLE_BODY_SIZE - reference.len())
+        );
+        assert!(
+            super::rewrite_style_urls(&settings, &css, "").is_empty(),
+            "should drop oversized temporary style-block output"
+        );
+        assert!(
+            super::rewrite_style_attribute_urls(&settings, &css, "").is_empty(),
+            "should drop oversized temporary attribute output"
+        );
+        let html = "<style>a{background:url(https://cdn.example.com/a.png)}</style><p>kept</p>";
+        assert!(
+            rewrite_creative_html(&settings, html).contains("<p>kept</p>"),
+            "should preserve surrounding markup"
+        );
+    }
+
+    #[test]
+    fn css_output_expansion_is_rejected_before_the_body_limit() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let reference = "@import \"https://cdn.example.com/a.css\";";
+        let css = format!(
+            "{}{reference}",
+            " ".repeat(super::MAX_REWRITABLE_BODY_SIZE - reference.len())
+        );
+        assert!(
+            super::rewrite_css_body(&settings, &css).is_err(),
+            "should reject URL expansion beyond the output budget"
+        );
+    }
+
+    #[test]
     fn rewrites_style_block_url_variants() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = "
-          <style>
-            .a{background:url(https://cdn.example/s1.png)}
-            .b{background-image:url('//cdn.example/s2.jpg')}
-          </style>
-        ";
-        let out = rewrite_creative_html(&settings, html);
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "style block url() not rewritten: {out}"
-        );
+        for css in [
+            "a{background:url(https://cdn.example.com/a.png)}",
+            "a{background:image-set(\"https://cdn.example.com/a.png\" 1x)}",
+            "@font-face{src:src(\"https://cdn.example.com/a.woff2\")}",
+            "@import \"https://cdn.example.com/a.css\";",
+        ] {
+            let out = rewrite_creative_html(&settings, &format!("<style>{css}</style>"));
+            assert!(
+                out.contains("/first-party/proxy?tsurl="),
+                "should rewrite {css}: {out}"
+            );
+            assert!(
+                out.contains("&tstoken="),
+                "should preserve signed query separators: {out}"
+            );
+            assert!(
+                !out.contains("&amp;tstoken="),
+                "should not escape raw CSS text: {out}"
+            );
+        }
     }
 
     #[test]
