@@ -300,6 +300,29 @@ Store that accumulator in the current `IntegrationDocumentState`, keyed separate
 RSC group state. The immutable `NextJsNextDataRewriter` retains only configuration and its
 compiled URL matcher.
 
+Model fragmented-script capture explicitly as:
+
+```text
+Idle -> Buffering -> Idle
+  \         |
+   \        +-> BypassUntilLast -> Idle
+    +----------> BypassUntilLast -> Idle
+```
+
+- `Idle` plus a non-final fragment starts `Buffering` and suppresses the fragment when it
+  fits. A first fragment which already exceeds the bound is emitted unchanged and enters
+  `BypassUntilLast`.
+- `Buffering` appends and suppresses while the next fragment fits. Before overflow, emit
+  the accumulated prefix plus the current fragment unchanged and enter `BypassUntilLast`.
+- `Buffering` plus a final in-bound fragment rewrites the complete script or restores it,
+  then returns to `Idle`.
+- `BypassUntilLast` emits every fragment unchanged. It returns to `Idle` only after seeing
+  `last_in_text_node`.
+
+The RSC script accumulator uses the same state machine with
+`max_combined_payload_bytes`. This prevents a final fragment from being classified or
+rewritten independently after an oversized prefix has already been released.
+
 Change the RSC script rewriter to use the same discipline. For each `script` text node:
 
 - accumulate and suppress fragments until `last_in_text_node`;
@@ -329,7 +352,7 @@ The Next.js session owns:
 - a FIFO of captured original payloads;
 - the output held behind the first unresolved placeholder;
 - the combined payload byte count and total held-output byte count;
-- whether one over-limit/incomplete warning has been emitted for the current group.
+- whether one over-limit/incomplete warning has been emitted for the current group;
 - whether RSC rewriting has entered byte-preserving bypass for the rest of the document.
 
 It scans only for its generated placeholder namespace. Non-candidate output streams with
@@ -340,16 +363,50 @@ at most `longest_placeholder_len - 1` bytes retained for chunk-boundary matching
 When the next placeholder is available in both output and captured state:
 
 1. Append its original payload to the current group.
-2. Test the combined payloads with the existing T-chunk parser.
-3. If every declared T-chunk is complete, run
+2. Feed it to a boundary-aware T-chunk classifier.
+3. If the classifier reports `CompleteRewritable`, run
    `rewrite_rsc_scripts_combined_with_limit`, verify that the output count equals the input
    count, substitute every group placeholder in order, and release the entire held segment.
-4. If a T-chunk is incomplete, retain the group and the following output until another RSC
+4. If it reports `CompleteUnrewritable`, restore all originals, release the complete group,
+   and begin the next group normally.
+5. If it reports `NeedMore`, retain the group and the following output until another RSC
    payload arrives.
+6. If it reports `Invalid`, restore the group and enter byte-preserving bypass for the rest
+   of the document because no safe continuation boundary is known.
 
-A complete single-script payload therefore releases on the same processor call. A
-cross-script payload releases as soon as the script containing its final declared byte has
-been parsed; it does not wait for document EOF.
+Do not use `find_tchunks_impl` or `rewrite_rsc_scripts_combined_with_limit` as the
+completeness oracle. Their header regex recognizes only a complete
+`[hex]+:T[hex]+,` sequence inside the current physical string. `RSC_MARKER` is inserted
+between payloads, so a header split at that boundary is otherwise invisible and an empty
+match set can be mistaken for a complete group.
+
+The classifier consumes the logical concatenation of payloads while retaining physical
+payload boundaries. It uses an incremental state machine with these states:
+
+- `Neutral`: no open header or T-chunk content;
+- `HeaderCandidate`: a suffix is a strict prefix of `[hex]+:T[hex]+,`;
+- `Content { remaining_unescaped_bytes }`: a complete header declared content that has not
+  all arrived;
+- `Invalid`: malformed length, unreasonable declared length, or inconsistent escape data.
+
+At a payload boundary, `HeaderCandidate` and nonzero `Content` both yield `NeedMore`.
+Because a header may start at the end of one payload, a trailing hexadecimal run is treated
+conservatively as a header candidate until the next payload disproves or completes it. The
+classifier must count the same JavaScript escape forms and enforce the same
+`MAX_REASONABLE_TCHUNK_LENGTH` rule as the rewriter.
+
+The current combined rewriter supports a complete header in one payload whose declared
+content crosses later payloads. Such groups are `CompleteRewritable`. A header physically
+split across payloads is `CompleteUnrewritable` once its content is complete: restore that
+group unchanged because inserting `RSC_MARKER` inside the header makes the current rewriter
+unsafe. Supporting rewritten split headers would require a boundary-mapped rewriter and is
+outside #850; safe streaming fallback meets this design's hydration-first contract.
+
+A complete single-script payload in the classifier's `Neutral` state therefore releases on
+the same processor call. A cross-script payload releases as soon as the script containing
+its final declared byte has been parsed and the classifier returns to `Neutral`; it does
+not wait for document EOF. A trailing header candidate may conservatively hold a payload
+until the next RSC payload or EOF, subject to the same hard bounds.
 
 Content between grouped scripts must remain in the held segment. Although that may include
 ordinary HTML, emitting it early would place it before an earlier executable script and
@@ -477,7 +534,9 @@ Add unit and pipeline tests for:
 - input-chunk fragmentation within an RSC script is accumulated and rewritten once;
 - multiple independent payloads release independently in document order;
 - a T-chunk split across two or more scripts updates the original header length and releases
-  immediately when complete;
+  immediately when complete, when the complete header is in the first payload;
+- a T-chunk header split at every payload boundary is detected and restored unchanged,
+  never treated as an independently rewritable payload;
 - non-RSC scripts and interstitial markup retain exact relative order;
 - the payload-byte limit restores a group byte-for-byte;
 - the held-output limit restores a group before exceeding the limit;
@@ -485,6 +544,8 @@ Add unit and pipeline tests for:
 - an incomplete over-limit group forces later continuation scripts to remain unchanged;
 - oversized fragmented `__NEXT_DATA__` and RSC scripts release suppressed text and stream
   the rest unchanged;
+- accumulator overflow followed by multiple fragments remains in `BypassUntilLast`, then a
+  subsequent independent script starts from `Idle` and can be rewritten;
 - two interleaved processor instances never share `__NEXT_DATA__`, RSC payload, namespace,
   or bypass state;
 - rewrite count mismatch and placeholder-remnant safeguards restore originals;
