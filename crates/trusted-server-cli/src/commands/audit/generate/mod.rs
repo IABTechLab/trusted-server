@@ -14,6 +14,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use rand::RngCore as _;
 use serde::Serialize;
 use trusted_server_core::creative_opportunities::{
     CreativeOpportunitiesConfig, validate_page_pattern,
@@ -148,6 +149,49 @@ pub(crate) struct AuditOutputs {
     pub(crate) js_assets_toml: String,
     pub(crate) draft_config_toml: String,
     pub(crate) ad_slot_count: usize,
+    pub(crate) js_asset_proxy_candidate_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DraftConfig {
+    toml: String,
+    js_asset_proxy_candidate_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct JsAssetProxySection {
+    toml: String,
+    candidate_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct JsAssetProxySkipCounts {
+    first_party: usize,
+    malformed_url: usize,
+    non_https: usize,
+    duplicate_url: usize,
+    non_script: usize,
+}
+
+#[derive(Debug)]
+struct JsAssetProxyCandidate<'a> {
+    origin_url: String,
+    integration: Option<&'a str>,
+}
+
+trait OpaqueAssetPathGenerator {
+    fn next_path(&mut self) -> String;
+}
+
+#[derive(Debug, Default)]
+struct RandomOpaqueAssetPathGenerator;
+
+impl OpaqueAssetPathGenerator for RandomOpaqueAssetPathGenerator {
+    fn next_path(&mut self) -> String {
+        let mut bytes = [0_u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        format!("/assets/{}.js", lowercase_hex(&bytes))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,13 +295,19 @@ fn build_audit_outputs(collected: &collector::CollectedPage) -> CliResult<AuditO
         page_has_prebid,
     );
     let ad_slot_count = slots.slots.len();
-    let draft_config_toml = build_draft_config(&final_url, &artifact, &slots)?;
+    let draft = build_draft_config_with_generator(
+        &final_url,
+        &artifact,
+        &slots,
+        &mut RandomOpaqueAssetPathGenerator,
+    )?;
 
     Ok(AuditOutputs {
         artifact,
         js_assets_toml,
-        draft_config_toml,
+        draft_config_toml: draft.toml,
         ad_slot_count,
+        js_asset_proxy_candidate_count: draft.js_asset_proxy_candidate_count,
     })
 }
 
@@ -320,9 +370,19 @@ fn write_success_summary(
     } else {
         ""
     };
+    let asset_proxy_note = if wrote_config && outputs.js_asset_proxy_candidate_count > 0 {
+        format!(
+            "{} disabled entries written to draft config",
+            outputs.js_asset_proxy_candidate_count
+        )
+    } else if wrote_config {
+        "none".to_string()
+    } else {
+        "not written (--no-config)".to_string()
+    };
     writeln!(
         out,
-        "Audited {}\nTitle: {}\nJS assets: {}\nThird-party assets: {}\nAd slots: {}\nDetected integrations: {}\nWrote: {}{}",
+        "Audited {}\nTitle: {}\nJS assets: {}\nThird-party assets: {}\nAd slots: {}\nDetected integrations: {}\nJS asset proxy candidates: {}\nWrote: {}{}",
         outputs.artifact.audited_url,
         outputs
             .artifact
@@ -337,6 +397,7 @@ fn write_success_summary(
         } else {
             integrations.join(", ")
         },
+        asset_proxy_note,
         if written.is_empty() {
             "none".to_string()
         } else {
@@ -347,11 +408,27 @@ fn write_success_summary(
     .map_err(|error| report_error(format!("failed to write command output: {error}")))
 }
 
+#[cfg(test)]
 fn build_draft_config(
     target_url: &Url,
     artifact: &AuditArtifact,
     slots: &gpt_slots::DiscoveredSlots,
 ) -> CliResult<String> {
+    build_draft_config_with_generator(
+        target_url,
+        artifact,
+        slots,
+        &mut RandomOpaqueAssetPathGenerator,
+    )
+    .map(|draft| draft.toml)
+}
+
+fn build_draft_config_with_generator(
+    target_url: &Url,
+    artifact: &AuditArtifact,
+    slots: &gpt_slots::DiscoveredSlots,
+    path_generator: &mut dyn OpaqueAssetPathGenerator,
+) -> CliResult<DraftConfig> {
     let host = target_url
         .host_str()
         .ok_or_else(|| report_error("audited URL is missing a host"))?;
@@ -393,6 +470,9 @@ fn build_draft_config(
         draft =
             replace_key_in_section(&draft, "integrations.datadome", "enabled", "enabled = true")?;
     }
+
+    let asset_proxy_section = build_js_asset_proxy_section(artifact, path_generator)?;
+    draft = replace_js_asset_proxy_section(&draft, &asset_proxy_section.toml)?;
 
     let mut manual_review = Vec::new();
     if detected.contains("google_tag_manager") {
@@ -447,7 +527,251 @@ fn build_draft_config(
         draft.push_str(&render_discovered_slots(target_url, slots));
     }
 
-    Ok(draft)
+    Ok(DraftConfig {
+        toml: draft,
+        js_asset_proxy_candidate_count: asset_proxy_section.candidate_count,
+    })
+}
+
+fn build_js_asset_proxy_section(
+    artifact: &AuditArtifact,
+    path_generator: &mut dyn OpaqueAssetPathGenerator,
+) -> CliResult<JsAssetProxySection> {
+    let (candidates, skipped) = select_js_asset_proxy_candidates(artifact);
+    let mut used_paths = BTreeSet::new();
+    let mut toml = String::new();
+
+    toml.push_str("[integrations.js_asset_proxy]\n");
+    toml.push_str("enabled = false\n");
+    toml.push_str("# Uncomment to override upstream cache headers for every asset below.\n");
+    toml.push_str("# This replaces upstream directives, including private and no-store.\n");
+    toml.push_str("# Use only when each asset's bytes are identical for every visitor.\n");
+    toml.push_str("# cache_ttl_seconds = 3600\n");
+    toml.push_str(
+        "# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets\n",
+    );
+    toml.push_str(
+        "# that vary by browser User-Agent or use integrity hashes for UA-specific bytes.\n\n",
+    );
+    toml.push_str("# Generated by `ts audit`; review before enabling.\n");
+    toml.push_str(
+        "# Audit note: some discovered scripts may be runtime-injected and may not appear\n",
+    );
+    toml.push_str(
+        "# in origin HTML. JS Asset Proxy rewrites only matching script src URLs present in\n",
+    );
+    toml.push_str("# HTML processed by Trusted Server.\n");
+
+    if candidates.is_empty() {
+        toml.push_str(
+            "# No eligible third-party HTTPS script assets were detected by `ts audit`.\n",
+        );
+    }
+
+    for candidate in &candidates {
+        let generated_path = generate_unique_asset_path(path_generator, &mut used_paths)?;
+        toml.push('\n');
+        toml.push_str("# Generated by `ts audit`; review before enabling.\n");
+        if let Some(integration) = candidate.integration {
+            let integration = sanitized_comment_value(integration);
+            toml.push_str(&format!("# Detected integration: {integration}\n"));
+            toml.push_str(&format!(
+                "# Native integration may be preferable: [integrations.{integration}]\n"
+            ));
+        }
+        toml.push_str("[[integrations.js_asset_proxy.assets]]\n");
+        toml.push_str(&format!("path = {}\n", toml_string(&generated_path)));
+        toml.push_str(&format!(
+            "origin_url = {}\n",
+            toml_string(&candidate.origin_url)
+        ));
+        if Url::parse(&candidate.origin_url).is_ok_and(|url| url.query().is_some()) {
+            toml.push_str(
+                "# This URL includes a query string and must remain stable for proxy matching.\n",
+            );
+        }
+        toml.push_str("proxy = \"disabled\"\n");
+    }
+
+    append_js_asset_proxy_skip_comments(&mut toml, &skipped);
+    toml.push('\n');
+
+    Ok(JsAssetProxySection {
+        toml,
+        candidate_count: candidates.len(),
+    })
+}
+
+fn select_js_asset_proxy_candidates(
+    artifact: &AuditArtifact,
+) -> (Vec<JsAssetProxyCandidate<'_>>, JsAssetProxySkipCounts) {
+    let mut candidates = Vec::new();
+    let mut skipped = JsAssetProxySkipCounts::default();
+    let mut seen_origin_urls = BTreeSet::new();
+
+    for asset in &artifact.assets {
+        if asset.kind != "script" {
+            skipped.non_script += 1;
+            continue;
+        }
+        if asset.party != AssetParty::ThirdParty {
+            skipped.first_party += 1;
+            continue;
+        }
+
+        let Ok(url) = Url::parse(&asset.url) else {
+            skipped.malformed_url += 1;
+            continue;
+        };
+        if url.host_str().is_none() {
+            skipped.malformed_url += 1;
+            continue;
+        }
+        if url.scheme() != "https" {
+            skipped.non_https += 1;
+            continue;
+        }
+
+        let origin_url = url.to_string();
+        if !seen_origin_urls.insert(origin_url.clone()) {
+            skipped.duplicate_url += 1;
+            continue;
+        }
+
+        candidates.push(JsAssetProxyCandidate {
+            origin_url,
+            integration: asset.integration.as_deref(),
+        });
+    }
+
+    (candidates, skipped)
+}
+
+fn generate_unique_asset_path(
+    path_generator: &mut dyn OpaqueAssetPathGenerator,
+    used_paths: &mut BTreeSet<String>,
+) -> CliResult<String> {
+    for _ in 0..128 {
+        let path = path_generator.next_path();
+        if !is_valid_generated_asset_path(&path) {
+            return cli_error(format!(
+                "generated JS asset proxy path `{path}` is invalid; expected /assets/<hex>.js"
+            ));
+        }
+        if used_paths.insert(path.clone()) {
+            return Ok(path);
+        }
+    }
+
+    cli_error("failed to generate a unique JS asset proxy path after 128 attempts")
+}
+
+fn is_valid_generated_asset_path(path: &str) -> bool {
+    let Some(opaque_id) = path
+        .strip_prefix("/assets/")
+        .and_then(|value| value.strip_suffix(".js"))
+    else {
+        return false;
+    };
+
+    !opaque_id.is_empty()
+        && opaque_id
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+}
+
+fn replace_js_asset_proxy_section(document: &str, replacement: &str) -> CliResult<String> {
+    let lines = document.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "[integrations.js_asset_proxy]")
+        .ok_or_else(|| {
+            report_error(
+                "failed to update starter config because section `[integrations.js_asset_proxy]` was not found",
+            )
+        })?;
+    let mut end = start + 1;
+
+    while end < lines.len() {
+        let trimmed = lines[end].trim();
+        if trimmed.starts_with('[')
+            && trimmed.ends_with(']')
+            && trimmed != "[[integrations.js_asset_proxy.assets]]"
+        {
+            break;
+        }
+        end += 1;
+    }
+
+    // Blank lines and comments directly above the next section header document
+    // that section, not this one, so leave them in the draft.
+    while end > start + 1 {
+        let trimmed = lines[end - 1].trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut output_lines = Vec::new();
+    output_lines.extend_from_slice(&lines[..start]);
+    output_lines.extend(replacement.trim_end_matches('\n').lines());
+    if end < lines.len() && !lines[end].trim().is_empty() {
+        output_lines.push("");
+    }
+    output_lines.extend_from_slice(&lines[end..]);
+
+    let mut output = output_lines.join("\n");
+    if document.ends_with('\n') {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn append_js_asset_proxy_skip_comments(toml: &mut String, skipped: &JsAssetProxySkipCounts) {
+    if skipped.first_party == 0
+        && skipped.malformed_url == 0
+        && skipped.non_https == 0
+        && skipped.duplicate_url == 0
+        && skipped.non_script == 0
+    {
+        return;
+    }
+
+    toml.push('\n');
+    toml.push_str("# Skipped JS Asset Proxy audit candidates:\n");
+    append_skip_count(toml, skipped.first_party, "first-party script");
+    append_skip_count(toml, skipped.malformed_url, "malformed script URL");
+    append_skip_count(toml, skipped.non_https, "non-HTTPS third-party script");
+    append_skip_count(toml, skipped.duplicate_url, "duplicate script URL");
+    append_skip_count(toml, skipped.non_script, "non-script asset");
+}
+
+fn append_skip_count(toml: &mut String, count: usize, label: &str) {
+    if count == 0 {
+        return;
+    }
+
+    let plural = if count == 1 { "" } else { "s" };
+    toml.push_str(&format!("# - {count} {label}{plural}\n"));
+}
+
+fn sanitized_comment_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 /// Renders discovered GPT slots as appended `[[creative_opportunities.slot]]`
@@ -2006,6 +2330,327 @@ mod tests {
             format!("{error:?}").contains("refusing to overwrite"),
             "should report overwrite conflict"
         );
+    }
+
+    struct FixedPathGenerator {
+        paths: std::collections::VecDeque<String>,
+    }
+
+    impl FixedPathGenerator {
+        fn new(paths: &[&str]) -> Self {
+            Self {
+                paths: paths.iter().map(|path| (*path).to_string()).collect(),
+            }
+        }
+    }
+
+    impl OpaqueAssetPathGenerator for FixedPathGenerator {
+        fn next_path(&mut self) -> String {
+            self.paths
+                .pop_front()
+                .expect("should have a fixed generated asset path")
+        }
+    }
+
+    fn audited_asset(url: &str, party: AssetParty, integration: Option<&str>) -> AuditedAsset {
+        AuditedAsset {
+            kind: "script".to_string(),
+            url: url.to_string(),
+            host: Url::parse(url)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_string))
+                .unwrap_or_default(),
+            party,
+            integration: integration.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn build_draft_config_writes_disabled_js_asset_proxy_candidates() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: Some("Example".to_string()),
+            js_asset_count: 2,
+            third_party_asset_count: 2,
+            detected_integrations: vec![DetectedIntegration {
+                id: "gpt".to_string(),
+                evidence: "https://gpt.example.com/gpt.js".to_string(),
+            }],
+            assets: vec![
+                audited_asset(
+                    "https://cdn.vendor.example.com/sdk.js",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+                audited_asset(
+                    "https://gpt.example.com/gpt.js",
+                    AssetParty::ThirdParty,
+                    Some("gpt"),
+                ),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&[
+            "/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js",
+            "/assets/bbbbbbbbbbbbbbbbbbbbbbbb.js",
+        ]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+
+        assert_eq!(
+            draft.js_asset_proxy_candidate_count, 2,
+            "should report generated disabled entries"
+        );
+        assert!(
+            draft
+                .toml
+                .contains("[integrations.js_asset_proxy]\nenabled = false")
+        );
+        assert!(draft.toml.contains("/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js"));
+        assert!(draft.toml.contains("/assets/bbbbbbbbbbbbbbbbbbbbbbbb.js"));
+        assert!(
+            draft
+                .toml
+                .contains("origin_url = \"https://cdn.vendor.example.com/sdk.js\"")
+        );
+        assert!(draft.toml.contains("proxy = \"disabled\""));
+        assert!(draft.toml.contains("Detected integration: gpt"));
+        assert!(
+            draft
+                .toml
+                .contains("Native integration may be preferable: [integrations.gpt]")
+        );
+        assert!(
+            !draft.toml.contains("example-vendor-loader"),
+            "should remove starter-template placeholder asset"
+        );
+        assert!(
+            draft.toml.contains(
+                "# Proxy behavior and first-party asset routing. Kept active with defaults.\n[proxy]"
+            ),
+            "should preserve documentation for the section following the replaced block"
+        );
+        let parsed =
+            toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
+        assert!(
+            parsed["integrations"]["js_asset_proxy"]
+                .get("cache_ttl_seconds")
+                .is_none(),
+            "generated config should inherit upstream cache headers by default"
+        );
+    }
+
+    #[test]
+    fn generated_asset_proxy_paths_are_opaque() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 1,
+            third_party_asset_count: 1,
+            detected_integrations: Vec::new(),
+            assets: vec![audited_asset(
+                "https://cdn.vendor.example.com/vendor-loader.js",
+                AssetParty::ThirdParty,
+                None,
+            )],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&["/assets/0123456789abcdef01234567.js"]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+        let path_line = draft
+            .toml
+            .lines()
+            .find(|line| line.starts_with("path = ") && line.contains("0123456789abcdef"))
+            .expect("should include generated path");
+
+        assert!(path_line.contains("/assets/0123456789abcdef01234567.js"));
+        assert!(
+            !path_line.contains("vendor")
+                && !path_line.contains("cdn")
+                && !path_line.contains("loader"),
+            "generated path should not include vendor, domain, or filename semantics"
+        );
+    }
+
+    #[test]
+    fn asset_proxy_generation_deduplicates_and_summarizes_skips() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 4,
+            third_party_asset_count: 3,
+            detected_integrations: Vec::new(),
+            assets: vec![
+                audited_asset(
+                    "https://cdn.vendor.example.com/sdk.js",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+                audited_asset(
+                    "https://cdn.vendor.example.com/sdk.js",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+                audited_asset(
+                    "https://publisher.example.com/app.js",
+                    AssetParty::FirstParty,
+                    None,
+                ),
+                audited_asset(
+                    "http://cdn.vendor.example.com/insecure.js",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&["/assets/111111111111111111111111.js"]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+
+        assert_eq!(draft.js_asset_proxy_candidate_count, 1);
+        assert_eq!(
+            draft
+                .toml
+                .matches("[[integrations.js_asset_proxy.assets]]")
+                .count(),
+            1,
+            "should only emit one candidate entry"
+        );
+        assert!(draft.toml.contains("# - 1 first-party script"));
+        assert!(draft.toml.contains("# - 1 non-HTTPS third-party script"));
+        assert!(draft.toml.contains("# - 1 duplicate script URL"));
+    }
+
+    #[test]
+    fn asset_proxy_generation_warns_about_query_string_candidates() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 2,
+            third_party_asset_count: 2,
+            detected_integrations: Vec::new(),
+            assets: vec![
+                audited_asset(
+                    "https://cdn.vendor.example.com/sdk.js?v=one",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+                audited_asset(
+                    "https://cdn.vendor.example.com/sdk.js?v=two",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&[
+            "/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js",
+            "/assets/bbbbbbbbbbbbbbbbbbbbbbbb.js",
+        ]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+
+        assert_eq!(draft.js_asset_proxy_candidate_count, 2);
+        assert_eq!(
+            draft
+                .toml
+                .matches("This URL includes a query string and must remain stable")
+                .count(),
+            2,
+            "each query-string candidate should explain exact-match behavior"
+        );
+    }
+
+    #[test]
+    fn asset_proxy_generation_with_no_candidates_removes_placeholder_asset() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 1,
+            third_party_asset_count: 0,
+            detected_integrations: Vec::new(),
+            assets: vec![audited_asset(
+                "https://publisher.example.com/app.js",
+                AssetParty::FirstParty,
+                None,
+            )],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&[]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+
+        assert_eq!(draft.js_asset_proxy_candidate_count, 0);
+        assert!(
+            draft
+                .toml
+                .contains("No eligible third-party HTTPS script assets")
+        );
+        assert!(
+            !draft
+                .toml
+                .contains("[[integrations.js_asset_proxy.assets]]"),
+            "should not emit asset array entries without candidates"
+        );
+        assert!(
+            !draft.toml.contains("example-vendor-loader"),
+            "should remove starter-template placeholder asset"
+        );
+        toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
+    }
+
+    #[test]
+    fn run_generate_summary_reports_written_asset_proxy_candidates() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config = temp.path().join("trusted-server.toml");
+        let mut args = audit_args("https://publisher.example.com/page");
+        args.config = Some(config);
+        args.no_js_assets = true;
+        let collector = FakeCollector::new(collected_page());
+        let mut out = Vec::new();
+
+        run_generate(&args, &collector, &mut out).expect("should run audit");
+
+        let summary = String::from_utf8(out).expect("summary should be UTF-8");
+        assert!(summary.contains("JS asset proxy candidates:"));
+        assert!(summary.contains("disabled entries written to draft config"));
     }
 
     #[test]

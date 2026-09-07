@@ -24,6 +24,7 @@ futures = { workspace = true }
 glob = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }
