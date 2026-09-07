@@ -4,6 +4,7 @@ import {
   knownUserIdConfigNames,
   resolvePrebidUserIdModulesFromEids,
 } from '../../../src/integrations/prebid/user_id_modules';
+import registry from '../../../src/integrations/prebid/user_id_modules.json';
 
 const sampleEids = [
   { source: 'yahoo.com', uids: [{ id: 'connect-id', atype: 3 }] },
@@ -83,6 +84,21 @@ describe('prebid user ID module registry', () => {
       modules: ['userId', 'pairIdSystem'],
       missingSources: [],
     });
+  });
+
+  it('maps LiveRamp EIDs to identityLinkIdSystem', () => {
+    expect(
+      resolvePrebidUserIdModulesFromEids([
+        { source: 'liveramp.com', uids: [{ id: 'opaque-envelope', atype: 3 }] },
+      ])
+    ).toEqual({
+      modules: ['userId', 'identityLinkIdSystem'],
+      missingSources: [],
+    });
+  });
+
+  it('includes identityLinkIdSystem in the checked-in default preset', () => {
+    expect(registry.defaultPreset).toContain('identityLinkIdSystem');
   });
 
   it('maps unknown LiveIntent provider-backed sources to liveIntentIdSystem', () => {
