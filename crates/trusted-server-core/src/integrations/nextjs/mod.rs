@@ -13,6 +13,11 @@ const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 mod html_post_process;
 mod rsc;
 mod rsc_placeholders;
+#[allow(
+    dead_code,
+    reason = "classifier is consumed by the bounded streaming session introduced with it"
+)]
+mod rsc_stream;
 mod script_rewriter;
 mod shared;
 

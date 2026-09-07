@@ -20,7 +20,7 @@ pub(crate) const DEFAULT_MAX_COMBINED_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum reasonable T-chunk length to prevent `DoS` from malformed input (100 MB).
 /// A `T-chunk` larger than this is almost certainly malformed and would cause excessive
 /// memory allocation or iteration.
-const MAX_REASONABLE_TCHUNK_LENGTH: usize = 100 * 1024 * 1024;
+pub(super) const MAX_REASONABLE_TCHUNK_LENGTH: usize = 100 * 1024 * 1024;
 
 // =============================================================================
 // Escape Sequence Parsing
@@ -189,19 +189,25 @@ fn consume_unescaped_bytes(s: &str, start_pos: usize, byte_count: usize) -> (usi
 // =============================================================================
 
 /// Information about a T-chunk found in the combined RSC content.
-struct TChunkInfo {
+pub(super) struct TChunkInfo {
     /// Position where the T-chunk header starts (e.g., position of "1a:T...").
-    match_start: usize,
+    pub(super) match_start: usize,
     /// Position right after the chunk ID (position of ":T").
-    id_end: usize,
+    pub(super) id_end: usize,
     /// Position right after the comma (where content begins).
-    header_end: usize,
+    pub(super) header_end: usize,
     /// Position where the content ends.
-    content_end: usize,
+    pub(super) content_end: usize,
+}
+
+pub(super) enum TChunkScan {
+    Complete(Vec<TChunkInfo>),
+    NeedMore,
+    Invalid,
 }
 
 /// Find all T-chunks in content, optionally skipping markers.
-fn find_tchunks_impl(content: &str, skip_markers: bool) -> Option<Vec<TChunkInfo>> {
+fn scan_tchunks_impl(content: &str, skip_markers: bool) -> TChunkScan {
     let mut chunks = Vec::new();
     let mut search_pos = 0;
     let marker = skip_markers.then(|| RSC_MARKER.as_bytes());
@@ -215,9 +221,12 @@ fn find_tchunks_impl(content: &str, skip_markers: bool) -> Option<Vec<TChunkInfo
             let id_match = cap.get(1).expect("T-chunk id should exist");
             let id_end = search_pos + id_match.end();
             let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
-            let declared_length = usize::from_str_radix(length_hex, 16)
+            let Some(declared_length) = usize::from_str_radix(length_hex, 16)
                 .ok()
-                .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)?;
+                .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)
+            else {
+                return TChunkScan::Invalid;
+            };
 
             let content_end = if let Some(marker_bytes) = marker {
                 let mut iter = EscapeSequenceIter::from_position_with_marker(
@@ -233,13 +242,13 @@ fn find_tchunks_impl(content: &str, skip_markers: bool) -> Option<Vec<TChunkInfo
                     }
                 }
                 if consumed < declared_length {
-                    return None;
+                    return TChunkScan::NeedMore;
                 }
                 iter.position()
             } else {
                 let (pos, consumed) = consume_unescaped_bytes(content, header_end, declared_length);
                 if consumed < declared_length {
-                    return None;
+                    return TChunkScan::NeedMore;
                 }
                 pos
             };
@@ -257,15 +266,25 @@ fn find_tchunks_impl(content: &str, skip_markers: bool) -> Option<Vec<TChunkInfo
         }
     }
 
-    Some(chunks)
+    TChunkScan::Complete(chunks)
+}
+
+pub(super) fn scan_tchunks(content: &str) -> TChunkScan {
+    scan_tchunks_impl(content, false)
 }
 
 fn find_tchunks(content: &str) -> Option<Vec<TChunkInfo>> {
-    find_tchunks_impl(content, false)
+    match scan_tchunks(content) {
+        TChunkScan::Complete(chunks) => Some(chunks),
+        TChunkScan::NeedMore | TChunkScan::Invalid => None,
+    }
 }
 
 fn find_tchunks_with_markers(content: &str) -> Option<Vec<TChunkInfo>> {
-    find_tchunks_impl(content, true)
+    match scan_tchunks_impl(content, true) {
+        TChunkScan::Complete(chunks) => Some(chunks),
+        TChunkScan::NeedMore | TChunkScan::Invalid => None,
+    }
 }
 
 // =============================================================================
