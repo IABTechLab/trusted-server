@@ -2696,6 +2696,9 @@ mod tests {
         .expect("should insert the creative capability observation");
 
         for (id, config) in task8_builder_fixtures() {
+            if id == "didomi" {
+                continue;
+            }
             task8_insert_capability(
                 &mut observations,
                 task8_builder_capability(id, &config, "enabled=true"),
@@ -2717,6 +2720,7 @@ mod tests {
                 }),
                 "enabled=true;enable_protection=true",
             ),
+            task8_didomi_capability(),
             task8_prebid_capability(),
             task8_aps_capability(ApsRenderingMode::TrustedServer),
             task8_aps_capability(ApsRenderingMode::PublisherNative),
@@ -2781,16 +2785,49 @@ mod tests {
     }
 
     fn task8_prebid_capability() -> Task8Capability {
+        let default_capability = task8_prebid_capability_for_config(&serde_json::json!({
+            "enabled": true,
+            "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+        }));
+        assert_eq!(
+            default_capability.proxy_routes,
+            BTreeSet::from([
+                "GET /integrations/prebid/bundle.js".to_owned(),
+                "GET /prebid.js".to_owned(),
+                "GET /prebid.min.js".to_owned(),
+                "GET /prebidjs.js".to_owned(),
+                "GET /prebidjs.min.js".to_owned(),
+            ]),
+            "omitting Prebid script_patterns must register the reviewed default routes"
+        );
+
+        let mut capability = task8_prebid_capability_for_config(&serde_json::json!({
+            "enabled": true,
+            "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+            "script_patterns": ["/task8-prebid.js", "/assets/prebid/{*rest}"]
+        }));
+        assert_eq!(
+            capability.proxy_routes,
+            BTreeSet::from([
+                "GET /assets/prebid/{*rest}".to_owned(),
+                "GET /integrations/prebid/bundle.js".to_owned(),
+                "GET /task8-prebid.js".to_owned(),
+            ]),
+            "custom Prebid script_patterns must replace the default script routes"
+        );
+        capability.predicate = "enabled=true;script_patterns=config-derived".to_owned();
+        capability.proxy_routes = BTreeSet::from([
+            "GET /integrations/prebid/bundle.js".to_owned(),
+            "GET <integrations.prebid.script_patterns[]>".to_owned(),
+        ]);
+        capability
+    }
+
+    fn task8_prebid_capability_for_config(config: &serde_json::Value) -> Task8Capability {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
-            .insert_config(
-                "prebid",
-                &serde_json::json!({
-                    "enabled": true,
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
-                }),
-            )
+            .insert_config("prebid", config)
             .expect("should insert Task 8 Prebid config");
         let plan = crate::auction::compile_auction_plan(&settings)
             .expect("should compile Task 8 Prebid plan");
@@ -2798,6 +2835,44 @@ mod tests {
             .expect("should run plan-backed Prebid registration")
             .expect("enabled Prebid should register");
         task8_capability(&registration, "enabled=true")
+    }
+
+    fn task8_didomi_capability() -> Task8Capability {
+        let default_capability = task8_builder_capability(
+            "didomi",
+            &serde_json::json!({"enabled": true}),
+            "enabled=true",
+        );
+        assert_eq!(
+            default_capability.proxy_routes,
+            BTreeSet::from([
+                "GET /integrations/didomi/consent/*".to_owned(),
+                "POST /integrations/didomi/consent/*".to_owned(),
+            ]),
+            "omitting Didomi proxy_path must register the reviewed default prefix"
+        );
+
+        let mut capability = task8_builder_capability(
+            "didomi",
+            &serde_json::json!({
+                "enabled": true,
+                "proxy_path": "task8/didomi-consent"
+            }),
+            "enabled=true",
+        );
+        assert_eq!(
+            capability.proxy_routes,
+            BTreeSet::from([
+                "GET /task8/didomi-consent/*".to_owned(),
+                "POST /task8/didomi-consent/*".to_owned(),
+            ]),
+            "custom Didomi proxy_path must replace the default route prefix"
+        );
+        capability.predicate =
+            "enabled=true;prefix=proxy_path||/integrations/didomi/consent".to_owned();
+        capability.proxy_routes =
+            BTreeSet::from(["GET <prefix>/*".to_owned(), "POST <prefix>/*".to_owned()]);
+        capability
     }
 
     fn task8_aps_capability(rendering_mode: ApsRenderingMode) -> Task8Capability {

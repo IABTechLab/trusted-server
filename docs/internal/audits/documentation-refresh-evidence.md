@@ -3625,6 +3625,29 @@ region`. The completed contract renders one canonical adapter-support row in
   backslashes. Local extraction now returns exact pins `15.1.0` and `0.17.0`,
   workflow policy passes, and a fresh hosted run on the correction commit is
   required; the failed setup job is not smoke evidence.
+- Corrected Integration Tests run `34133258001` executed commit
+  `2f1f11c2cf94cf0b5606e107672d6386d283959a`. The preparation job and every
+  retained integration job passed. The new smoke jobs passed for
+  [Axum](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994105),
+  [Fastly](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994046),
+  and
+  [Cloudflare](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994160).
+  These immutable jobs are the hosted adapter receipts for Task 13.
+- Run Tests run `34133257853` on the same commit exposed a pre-existing WP4
+  receipt defect: its Linux and macOS CLI-capture jobs passed, but the root
+  [Cargo test job](https://github.com/IABTechLab/trusted-server/actions/runs/34133257853/job/101778200279)
+  failed because the behavioral capability observer emitted Didomi's and
+  Prebid's concrete default routes while the reviewed manifest intentionally
+  stored their config-derived route families symbolically. The earlier Task 12
+  statement that the complete Fastly suite passed therefore was not a valid
+  receipt for the committed symbolic records. The correction first asserts
+  each integration's concrete default routes, then registers distinct custom
+  paths and asserts that they replace the defaults before canonicalizing only
+  those verified config-derived routes. The focused behavioral test passed,
+  followed by the complete Fastly suite: 175 adapter tests, 2,425 passing core
+  tests with six ignored, two JS tests, 21 OpenRTB tests, and four passing core
+  doctests with four ignored. A fresh successful hosted Run Tests execution is
+  still required before importing its authenticated CLI captures.
 
 #### Task 14 — Complete WP5 product coverage and navigation
 
