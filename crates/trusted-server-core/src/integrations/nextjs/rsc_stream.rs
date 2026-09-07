@@ -251,7 +251,7 @@ impl NextJsRscStreamProcessor {
         }
     }
 
-    fn release_group(&mut self, rewritten: Option<Vec<String>>) -> io::Result<Vec<u8>> {
+    fn release_group(&mut self, rewritten: Option<&[String]>) -> io::Result<Vec<u8>> {
         let replacements: Vec<&str> = match &rewritten {
             Some(rewritten) => rewritten.iter().map(String::as_str).collect(),
             None => self
@@ -292,7 +292,7 @@ impl NextJsRscStreamProcessor {
                         "Next.js RSC rewrite returned a mismatched payload count",
                     ));
                 }
-                self.release_group(Some(rewritten)).map(Some)
+                self.release_group(Some(&rewritten)).map(Some)
             }
             RscGroupStatus::CompleteUnrewritable => self.release_group(None).map(Some),
             RscGroupStatus::Invalid => {
@@ -820,11 +820,11 @@ mod tests {
         let split = placeholder.len() / 2;
 
         let first = processor
-            .process_chunk(placeholder[..split].as_bytes(), false)
+            .process_chunk(&placeholder.as_bytes()[..split], false)
             .expect("should retain a partial placeholder");
         assert!(first.is_empty(), "should retain only the candidate suffix");
         let second = processor
-            .process_chunk(placeholder[split..].as_bytes(), false)
+            .process_chunk(&placeholder.as_bytes()[split..], false)
             .expect("should finish the placeholder");
         assert_eq!(second, b"plain", "should restore the captured payload");
     }

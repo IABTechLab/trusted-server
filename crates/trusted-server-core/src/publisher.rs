@@ -1233,12 +1233,12 @@ async fn hold_finish_ready_segments<P: StreamProcessor>(
     }
     step.close_found = state.hold.as_ref().is_some_and(InlineBodyCloseSeam::found);
 
-    if !step.close_found {
-        if let Some(seam) = state.hold.take() {
-            let encoded = encoder.encode_chunk(seam.finish())?;
-            if !encoded.is_empty() {
-                step.ready.push(bytes::Bytes::from(encoded));
-            }
+    if !step.close_found
+        && let Some(seam) = state.hold.take()
+    {
+        let encoded = encoder.encode_chunk(seam.finish())?;
+        if !encoded.is_empty() {
+            step.ready.push(bytes::Bytes::from(encoded));
         }
     }
     Ok(step)
@@ -3759,6 +3759,10 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
 /// Cloudflare, Spin) never produce `Body::Stream` because the publisher fetch
 /// is gated on `supports_streaming_responses()`. It is groundwork for those
 /// adapters' streaming cutover; Fastly uses the lazy stream instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stream state remains explicit across the shared adapter driver"
+)]
 async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     writer: &mut W,
@@ -17782,7 +17786,18 @@ mod tests {
     fn streaming_finalize_auction_hold_emits_prefix_before_origin_eof() {
         // A body-close literal in script data must not stop streaming. Only the
         // request token emitted by lol_html at the structural end is a seam.
-        let page = b"<html><head></head><body><script>const x = '</body>';</script><article>still streaming</article>";
+        let page = br#"<html><head></head><body><script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","text":"</body>"}'])</script><article>still streaming</article>"#;
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should enable Next.js");
         let params = html_stream_params(
             "",
             Some(DispatchedAuction::empty_for_test(
@@ -17790,16 +17805,21 @@ mod tests {
                 10,
             )),
         );
-        let body = streaming_finalize_response(
+        let body = streaming_finalize_response_with_settings(
             params,
             origin_chunk_then_pending(bytes::Bytes::from(&page[..])),
+            settings,
         );
 
         let first = first_lazy_body_chunk(body);
         let html = String::from_utf8(first.to_vec()).expect("should be valid UTF-8");
         assert!(
-            html.contains("const x = '</body>'") && html.contains("still streaming"),
-            "script data and later article bytes must stream before EOF. Got: {html}"
+            html.contains("</body>") && html.contains("still streaming"),
+            "RSC script data and later article bytes must stream before EOF. Got: {html}"
+        );
+        assert!(
+            html.contains("proxy.example.com/app") && !html.contains("origin.example.com/app"),
+            "Next.js rewriting must complete before the parser seam: {html}"
         );
         assert!(
             html.contains(".adSlots=JSON.parse"),

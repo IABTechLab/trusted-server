@@ -189,6 +189,10 @@ impl HtmlProcessorConfig {
 /// Panics if the `ad_bids_state` `Mutex` is poisoned. This cannot happen in
 /// normal operation since no code holds the lock across a panic boundary.
 #[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the returned processor owns request configuration captured by its handlers"
+)]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let stream_processor_factories = config.integrations.html_stream_processor_factories();
     let document_state = IntegrationDocumentState::default();
