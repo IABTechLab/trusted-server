@@ -5235,14 +5235,24 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy optimized S3 asset request")
-                .into_response()
-                .expect("should return buffered asset response");
+            let (response, stream_body) =
+                handle_asset_proxy_request(&settings, &services, req, &route)
+                    .await
+                    .expect("should proxy optimized S3 asset request")
+                    .into_response_and_body();
 
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response_body_string(response), "optimized");
+            assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
+            let mut output = Vec::new();
+            stream_asset_body(
+                stream_body.expect("should preserve the asset body as a stream"),
+                &mut output,
+            )
+            .await
+            .expect("should stream the asset body");
+            assert_eq!(
+                output, b"optimized",
+                "should forward the complete asset body"
+            );
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["HEAD", "GET"],
@@ -5312,9 +5322,7 @@ mod tests {
                 AssetProxyCachePolicy::NoStorePrivate,
                 "should carry a typed no-store policy for router finalization"
             );
-            let response = asset_response
-                .into_response()
-                .expect("should return buffered asset response");
+            let (response, stream_body) = asset_response.into_response_and_body();
 
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
             assert_eq!(
@@ -5326,7 +5334,14 @@ mod tests {
                 response.headers().get(header::SET_COOKIE).is_none(),
                 "raw S3 error should still strip unsafe response headers"
             );
-            let body = response_body_string(response);
+            let mut output = Vec::new();
+            stream_asset_body(
+                stream_body.expect("should preserve the raw S3 error body as a stream"),
+                &mut output,
+            )
+            .await
+            .expect("should stream the raw S3 error body");
+            let body = String::from_utf8(output).expect("should decode the S3 error body");
             assert!(body.contains("NoSuchKey"), "should return S3 error body");
             assert!(
                 body.contains("image/upload/missing.jpg"),
@@ -5371,13 +5386,21 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy debug S3 asset request")
-                .into_response()
-                .expect("should return buffered asset response");
+            let (response, stream_body) =
+                handle_asset_proxy_request(&settings, &services, req, &route)
+                    .await
+                    .expect("should proxy debug S3 asset request")
+                    .into_response_and_body();
 
-            assert_eq!(response_body_string(response), "raw");
+            assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
+            let mut output = Vec::new();
+            stream_asset_body(
+                stream_body.expect("should preserve the asset body as a stream"),
+                &mut output,
+            )
+            .await
+            .expect("should stream the asset body");
+            assert_eq!(output, b"raw", "should forward the complete asset body");
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["GET"],
