@@ -312,6 +312,15 @@ Idle -> Buffering -> Idle
 - `Idle` plus a non-final fragment starts `Buffering` and suppresses the fragment when it
   fits. A first fragment which already exceeds the bound is emitted unchanged and enters
   `BypassUntilLast`.
+- `Idle` plus a final in-bound fragment is processed directly and remains `Idle`.
+  `__NEXT_DATA__` rewrites or restores it; RSC classifies it and either emits a placeholder
+  or restores it.
+- `Idle` plus a final over-limit fragment is emitted unchanged without first copying it into
+  an accumulator and remains `Idle`. For `__NEXT_DATA__`, the next script may be processed
+  normally. For RSC, inspect the borrowed fragment with the boundary-aware classifier: a
+  neutral, self-contained payload permits the next RSC script to be processed normally;
+  `NeedMore` or `Invalid` also enters document-wide byte-preserving RSC bypass because
+  later scripts may continue data whose header has already been emitted.
 - `Buffering` appends and suppresses while the next fragment fits. Before overflow, emit
   the accumulated prefix plus the current fragment unchanged and enter `BypassUntilLast`.
 - `Buffering` plus a final in-bound fragment rewrites the complete script or restores it,
@@ -322,6 +331,12 @@ Idle -> Buffering -> Idle
 The RSC script accumulator uses the same state machine with
 `max_combined_payload_bytes`. This prevents a final fragment from being classified or
 rewritten independently after an oversized prefix has already been released.
+
+`BypassUntilLast` is per-script capture state. Document-wide RSC bypass is a separate flag:
+an RSC overflow which occurs before the script is complete sets both, the per-script state
+returns to `Idle` at the final fragment, and the document flag remains set through EOF. In
+that mode, later complete RSC scripts are restored immediately rather than captured for
+rewriting. `__NEXT_DATA__` overflow never sets the document-wide RSC flag.
 
 Change the RSC script rewriter to use the same discipline. For each `script` text node:
 
@@ -546,6 +561,10 @@ Add unit and pipeline tests for:
   the rest unchanged;
 - accumulator overflow followed by multiple fragments remains in `BypassUntilLast`, then a
   subsequent independent script starts from `Idle` and can be rewritten;
+- one-fragment over-limit `__NEXT_DATA__` is emitted unchanged and leaves the next script in
+  `Idle`;
+- one-fragment over-limit RSC is emitted without an over-limit copy, and incomplete or
+  invalid content forces later RSC scripts to remain unchanged;
 - two interleaved processor instances never share `__NEXT_DATA__`, RSC payload, namespace,
   or bypass state;
 - rewrite count mismatch and placeholder-remnant safeguards restore originals;
