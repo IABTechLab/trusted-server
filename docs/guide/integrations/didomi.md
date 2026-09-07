@@ -1,138 +1,175 @@
 # Didomi Integration
 
-**Category**: CMP (Consent Management Platform)
+**Category**: Consent Management Platform
+
 **Status**: Production
-**Type**: Reverse Proxy for Consent Management
+
+**Type**: First-party SDK and API reverse proxy
 
 ## Overview
 
-The Didomi integration enables first-party serving of Didomi's consent management platform (CMP) through Trusted Server. By proxying Didomi's SDK and API through your domain, you maintain first-party context for Didomi's GDPR/TCF 2.2 consent flows.
+The Didomi integration serves Didomi SDK assets and API calls through the
+publisher's Trusted Server domain. It proxies SDK requests to
+`sdk.privacy-center.org`, routes `/api/*` requests to `api.privacy-center.org`,
+and injects the configured first-party SDK path into the browser integration.
 
-## What is Didomi?
+Didomi generates notice loaders according to the visitor's country and region.
+On Fastly, Trusted Server can put its trusted platform geo in the loader URL so
+the browser, Fastly cache, and Didomi origin all identify the same geographic
+variant.
 
-Didomi is a Consent Management Platform that manages user consent for data collection and processing under GDPR, CCPA, and other regulations.
-
-**Key Capabilities**:
-
-- TCF 2.2 (Transparency & Consent Framework) compliance
-- Custom consent notices and preferences
-- Vendor management
-- Consent analytics and reporting
-- Multi-regulation support (GDPR, CCPA, LGPD)
-
-## How It Works
-
-```
-┌──────────────────────────────────────────────────┐
-│  Browser Request                                 │
-│  GET /integrations/didomi/consent/loader.js      │
-│  ↓                                               │
-│  Trusted Server (First-Party Domain)             │
-│  ↓                                               │
-│  Proxy to Didomi SDK Origin                      │
-│  https://sdk.privacy-center.org/loader.js        │
-│  ↓                                               │
-│  Return SDK (appears first-party to browser)     │
-└──────────────────────────────────────────────────┘
-```
-
-**Benefits**:
-
-- Didomi SDK loads from your domain (not `privacy-center.org`)
-- First-party cookies for consent storage
-- Improved tracking prevention compatibility
-- Better page load performance
+See [Didomi's reverse-proxy requirements](https://developers.didomi.io/api-and-platform/domains/reverse-proxy)
+for the upstream contract.
 
 ## Configuration
 
-Add Didomi configuration to `trusted-server.toml`:
+Add the integration to the operator-owned `trusted-server.toml`:
 
 ```toml
 [integrations.didomi]
 enabled = true
-sdk_origin = "https://sdk.privacy-center.org"
-api_origin = "https://api.privacy-center.org"
+geo_query_parameters = true
+# proxy_path = "my-custom-consent"
+# sdk_origin = "https://sdk.privacy-center.org"
+# api_origin = "https://api.privacy-center.org"
 ```
 
-### Configuration Options
-
-| Field        | Type    | Required | Default                          | Description                              |
-| ------------ | ------- | -------- | -------------------------------- | ---------------------------------------- |
-| `enabled`    | boolean | No       | `false`                          | Enable/disable integration               |
-| `proxy_path` | string  | No       | `integrations/didomi/consent`    | Custom proxy URL path prefix (see below) |
-| `sdk_origin` | string  | Yes      | `https://sdk.privacy-center.org` | Didomi SDK backend URL                   |
-| `api_origin` | string  | Yes      | `https://api.privacy-center.org` | Didomi API backend URL                   |
-
-### Environment Variables
+Publish application configuration with:
 
 ```bash
-TRUSTED_SERVER__INTEGRATIONS__DIDOMI__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__DIDOMI__PROXY_PATH=my-custom-consent
-TRUSTED_SERVER__INTEGRATIONS__DIDOMI__SDK_ORIGIN=https://sdk.privacy-center.org
-TRUSTED_SERVER__INTEGRATIONS__DIDOMI__API_ORIGIN=https://api.privacy-center.org
+ts config push --adapter fastly
 ```
 
-### Custom Proxy Path
+| Field                  | Type    | Required | Default                               | Description                                             |
+| ---------------------- | ------- | -------- | ------------------------------------- | ------------------------------------------------------- |
+| `enabled`              | boolean | No       | `true` in a present integration block | Enables the integration                                 |
+| `geo_query_parameters` | boolean | No       | `false`                               | Enables trusted geo canonicalization for notice loaders |
+| `proxy_path`           | string  | No       | `integrations/didomi/consent`         | Changes the first-party path prefix                     |
+| `sdk_origin`           | string  | No       | `https://sdk.privacy-center.org`      | Changes the SDK origin, primarily for testing           |
+| `api_origin`           | string  | No       | `https://api.privacy-center.org`      | Changes the API origin, primarily for testing           |
 
-By default, Didomi requests are served at `/integrations/didomi/consent/*`. Since this path is predictable, ad blockers may add it to their block lists. Use `proxy_path` to set a customer-specific path that is harder to target:
+`geo_query_parameters` is disabled by default for compatibility. It currently
+supports Fastly only because Cloudflare does not expose a trusted region through
+the pinned EdgeZero adapter, while Axum and Spin do not provide platform geo.
+
+The normal configuration source is TOML. `TRUSTED_SERVER__...` variables are
+optional overlays applied by `ts config validate` and `ts config push`; they are
+not read by a running deployment. An overlay can replace only a scalar leaf that
+already exists in the TOML input.
+
+### Custom proxy path
+
+`proxy_path` helps avoid a predictable integration path:
 
 ```toml
 [integrations.didomi]
 enabled = true
+geo_query_parameters = true
 proxy_path = "my-custom-consent"
 ```
 
-With this configuration, requests are served at `/my-custom-consent/*` instead of the default.
+This serves Didomi at `/my-custom-consent/*`. The path:
 
-**Format rules:**
+- must not be empty, root-only, or end in `/`;
+- may contain ASCII letters, numbers, `-`, `_`, `.`, `~`, and `/` separators;
+- must not contain `//`, percent escapes, or `.` and `..` path segments; and
+- may start with `/`; Trusted Server normalizes the leading slash.
 
-- Must not be empty or just `/`
-- Must not end with a trailing slash
-- May contain only ASCII letters, numbers, `-`, `_`, `.`, `~`, and `/` path separators
-- Must not contain dot-only path segments (`.` or `..`)
-- Must not contain percent escapes or consecutive slashes (`//`)
-- Leading slash is optional (it is normalized internally)
+Trusted Server passes the resolved path to its browser bundle through
+`window.__tsjs_didomi.proxyPath`.
 
-**Examples of valid values:**
+## Notice-loader geo flow
 
-- `"consent-proxy"` → serves at `/consent-proxy/*`
-- `"privacy/manage"` → serves at `/privacy/manage/*`
-- `"/my-cmp-path"` → serves at `/my-cmp-path/*`
+Geo handling applies only when `geo_query_parameters = true` and the request is
+a `GET` whose path after the proxy prefix is exactly
+`/<public-api-key>/loader.js`.
 
-The custom path is automatically passed to the client-side JavaScript bundle via `window.__tsjs_didomi.proxyPath`, so the Didomi SDK URL rewriting continues to work without additional frontend configuration.
+For example, a California request to:
 
-## Endpoints
-
-### SDK Proxy
-
-**Pattern**: `/integrations/didomi/consent/*` (except `/api/*`)
-
-Proxies Didomi SDK resources through first-party domain.
-
-**Example**:
-
-```
-Original: https://sdk.privacy-center.org/24cd1234/loader.js
-Proxied:  https://your-domain.com/integrations/didomi/consent/24cd1234/loader.js
+```text
+/integrations/didomi/consent/example-key/loader.js?target_type=notice&target=example-notice
 ```
 
-**Headers Forwarded**:
+receives a `307 Temporary Redirect` to:
 
-- `User-Agent`
-- `Accept`
-- `Accept-Language`
-- `Accept-Encoding`
-- `Referer`
-- `Origin`
-- `Authorization`
+```text
+/integrations/didomi/consent/example-key/loader.js?target_type=notice&target=example-notice&country=US&region=CA
+```
 
-**Geo Headers** (SDK only):
+The redirect uses a relative same-origin `Location` and is private and
+non-storable. Trusted Server does not contact Didomi for that request. When the
+browser follows the canonical URL, Trusted Server proxies the same path and query
+to:
 
-- `X-Geo-Country` ← `FastlyGeo-CountryCode`
-- `X-Geo-Region` ← `FastlyGeo-Region`
-- `CloudFront-Viewer-Country` ← `FastlyGeo-CountryCode`
+```text
+https://sdk.privacy-center.org/example-key/loader.js?target_type=notice&target=example-notice&country=US&region=CA
+```
 
-**CORS Headers** (added to SDK responses):
+The final browser URL includes geo, which prevents a loader cached in one
+location from being reused under the same geo-less browser URL after the visitor
+moves or changes network location.
+
+### Trust and precedence
+
+Trusted Server obtains geo from `RuntimeServices.geo()` using the trusted client
+IP. Browser query parameters and request headers are not geo authorities.
+
+For eligible loader URLs, Trusted Server:
+
+- trims ASCII whitespace and uppercases platform country and region;
+- accepts a two-letter ASCII country other than `XX` or `ZZ`;
+- accepts a one-to-three-character ASCII alphanumeric subdivision;
+- converts a matching country-prefixed value such as `US-CA` to `CA`;
+- removes every case-insensitive, URL-decoded `country` and `region` query pair;
+  and
+- appends one authoritative `country` followed by one `region`.
+
+The canonical upstream request also sets `X-Geo-Country`, `X-Geo-Region`, and
+`CloudFront-Viewer-Country` from that same normalized pair. Conflicting caller
+query parameters and Fastly-style geo headers cannot override it.
+
+When geo lookup fails or returns missing or invalid country/region data, the
+eligible loader returns a private, non-storable `503 Service Unavailable` without
+contacting Didomi. This includes locations for which Fastly supplies no region.
+Publishers should verify geo coverage before enabling the option globally.
+
+Other SDK assets and all behavior with `geo_query_parameters = false` retain the
+existing proxy flow.
+
+## Endpoints and caching
+
+### SDK
+
+All paths under the proxy prefix other than `/api/*` use the SDK origin. Trusted
+Server forwards the incoming SDK path and query, except for the authoritative
+notice-loader canonicalization described above.
+
+SDK responses keep Didomi's `Cache-Control`, `Expires`, validators, age, and CDN
+cache headers. Shared caches must include the full path and query in their cache
+key and honor the geo-less redirect's `private, no-store` policy. Trusted Server
+does not replace Didomi's freshness policy with a hard-coded TTL.
+
+### API
+
+Paths under `<proxy-prefix>/api/*` use the API origin. Country and region are not
+appended to API URLs. The incoming API path, query, supported method, headers, and
+body continue through the proxy.
+
+Every API request bypasses the platform outbound cache. Every API response is
+returned with `Cache-Control: private, no-store`; freshness validators and
+independent edge-cache headers are removed.
+
+## Forwarded data
+
+Trusted Server forwards selected HTTP headers needed by Didomi, including
+`Accept`, `Accept-Language`, `Accept-Encoding`, `Content-Type`, `User-Agent`,
+`Referer`, and `Origin`. It derives `X-Forwarded-For` from trusted client info.
+
+Cookies and the publisher's `Authorization` header are not forwarded to Didomi.
+The latter can contain publisher-site credentials and is not a Didomi API
+credential.
+
+SDK responses receive these CORS headers:
 
 ```http
 Access-Control-Allow-Origin: *
@@ -140,257 +177,37 @@ Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With
 Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
 ```
 
-### API Proxy
+## Rollout checks
 
-**Pattern**: `/integrations/didomi/consent/api/*`
+Before enabling `geo_query_parameters`:
 
-Proxies Didomi API requests (consent events, user preferences, etc.).
+1. Confirm the loader redirect remains same-origin and is allowed by the site's
+   Content Security Policy.
+2. Confirm Fastly returns complete country and region values for the publisher's
+   supported traffic.
+3. Confirm every shared cache keys SDK objects by the complete path and query.
+4. Test at least two locations that require different notices.
+5. Verify repeated requests for one country/region reuse the cached SDK response
+   and retain Didomi's freshness and validator headers.
+6. Verify API requests never enter the outbound or downstream cache.
+7. Purge loader and API entries cached before this behavior was enabled.
 
-**Example**:
-
-```
-Original: https://api.privacy-center.org/v1/events
-Proxied:  https://your-domain.com/integrations/didomi/consent/api/v1/events
-```
-
-**Methods**: GET, POST, PUT, DELETE, OPTIONS
-
-**Note**: API requests do NOT receive CORS headers (handled by Didomi API).
-
-## Integration with Trusted Server
-
-### Consent Validation
-
-Consent signals, such as the TCF v2 format string recorded by the Didomi CMP, are checked before:
-
-- Generating EC IDs
-- Syncing with identity partners (Lockr)
-- Activating measurement pixels
-- Sharing data with third parties
-
-```rust
-// Example consent check
-if !tcf_consent.has_purpose_consent(1) {
-    return skip_collection();
-}
-```
-
-### TCF 2.2 Support
-
-Didomi integration supports IAB's Transparency & Consent Framework 2.2:
-
-- TCF consent strings (TC strings)
-- Vendor consent validation
-- Purpose consent enforcement
-- Special feature consent
-
-## Use Cases
-
-### 1. First-Party Consent Management
-
-**Problem**: Third-party consent scripts blocked by tracking prevention.
-
-**Solution**: Serve Didomi SDK from your domain via Trusted Server proxy.
-
-**Benefit**: Consent notice loads reliably and consent collection continues.
-
-### 2. Regional Consent Enforcement
-
-**Problem**: Different consent requirements per region (GDPR, CCPA, LGPD).
-
-**Solution**: Didomi provides region-specific consent flows, Trusted Server forwards geo data.
-
-**Benefit**: Region-appropriate consent flows driven by forwarded geo data.
-
-### 3. Consent-Based Data Activation
-
-**Problem**: Need to enforce consent before activating analytics/advertising.
-
-**Solution**: Check Didomi consent status in Trusted Server before data processing.
-
-**Benefit**: Consent status checked before data processing.
-
-## Implementation
-
-The Didomi integration is implemented in [crates/trusted-server-core/src/integrations/didomi.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/didomi.rs).
-
-### Key Components
-
-**Backend Selection** (line 74-80):
-
-```rust
-fn backend_for_path(&self, consent_path: &str) -> DidomiBackend {
-    if consent_path.starts_with("/api/") {
-        DidomiBackend::Api  // Route to API origin
-    } else {
-        DidomiBackend::Sdk  // Route to SDK origin
-    }
-}
-```
-
-**Header Forwarding** (line 100-127):
-
-- Forwards standard HTTP headers
-- Adds geo headers for SDK requests
-- Preserves client IP via `X-Forwarded-For`
-
-**CORS Management** (line 143-153):
-
-- Adds CORS headers to SDK responses
-- Skips CORS for API requests (Didomi API handles it)
-
-## Frontend Integration
-
-### Load Didomi SDK
-
-Replace your direct Didomi SDK reference with the proxied version:
-
-```html
-<!-- ❌ Old (third-party) -->
-<script src="https://sdk.privacy-center.org/24cd1234/loader.js"></script>
-
-<!-- ✅ New (first-party via Trusted Server) -->
-<script src="/integrations/didomi/consent/24cd1234/loader.js"></script>
-```
-
-### Access Consent Status
-
-Use Didomi's standard JavaScript API:
-
-```javascript
-// Wait for Didomi to load
-window.didomiOnReady = window.didomiOnReady || []
-window.didomiOnReady.push(function (Didomi) {
-  // Check consent for specific purpose
-  if (Didomi.getUserStatus().purposes.consent.enabled.includes('cookies')) {
-    // User consented to cookies
-    initializeAnalytics()
-  }
-
-  // Listen for consent changes
-  Didomi.on('consent.changed', function () {
-    console.log('Consent status changed')
-  })
-})
-```
-
-## Best Practices
-
-### 1. Configure Didomi ID
-
-Ensure your Didomi organization ID is in the SDK path:
-
-```html
-<script src="/integrations/didomi/consent/{YOUR_DIDOMI_ID}/loader.js"></script>
-```
-
-### 2. Preconnect to Proxy
-
-Add DNS preconnect for faster loading:
-
-```html
-<link rel="preconnect" href="https://your-domain.com" />
-<link rel="dns-prefetch" href="https://your-domain.com" />
-```
-
-### 3. Cache SDK Responses
-
-Configure caching headers for Didomi SDK:
-
-```http
-Cache-Control: public, max-age=3600
-```
-
-### 4. Monitor Consent Rate
-
-Track consent acceptance/rejection rates:
-
-- Low acceptance → Review consent notice clarity
-- Regional variations → Adjust messaging
-- Trend analysis → Optimize user experience
+Do not enable `geo_query_parameters` on Cloudflare, Axum, or Spin until those
+adapters provide complete trusted geo and their support is documented.
 
 ## Troubleshooting
 
-### Didomi SDK Not Loading
+If an enabled loader returns `503`, verify that Fastly resolved both a valid
+country and region for the trusted client IP. A country-only result is deliberately
+rejected.
 
-**Symptoms**:
+If the browser redirects repeatedly, inspect the full query at every cache layer.
+A component that drops, reorders, or rewrites the authoritative parameters can
+prevent the URL from reaching its canonical form.
 
-- Consent notice doesn't appear
-- Console errors about missing Didomi
+If the wrong notice appears, verify that the final browser URL contains the
+expected pair and that the cache key includes the full query. Purge stale loader
+entries after correcting cache configuration.
 
-**Solutions**:
-
-- Verify `/integrations/didomi/consent/` path is correct
-- Check `sdk_origin` configuration
-- Ensure Didomi ID in script path is valid
-- Inspect network tab for 404/403 errors
-
-### CORS Errors
-
-**Symptoms**:
-
-- Browser console shows CORS errors
-- SDK requests blocked
-
-**Solutions**:
-
-- Verify integration adds CORS headers for SDK requests
-- Check `Access-Control-Allow-Origin` is present
-- Ensure requests go through proxy (not directly to Didomi)
-
-### API Requests Failing
-
-**Symptoms**:
-
-- Consent events not recording
-- Preference updates failing
-
-**Solutions**:
-
-- Check `/integrations/didomi/consent/api/*` routing
-- Verify `api_origin` configuration
-- Review Authorization headers are forwarded
-- Inspect Didomi API credentials
-
-## Performance
-
-### Typical Latency
-
-- SDK load: 100-200ms (first load)
-- Cached SDK: <50ms
-- API calls: 50-150ms
-- Total overhead: ~20ms (proxy layer)
-
-### Optimization
-
-- Enable HTTP/2 for multiplexing
-- Use CDN caching for SDK files
-- Implement service worker for offline consent
-- Lazy-load consent notice
-
-## Security
-
-### Content Security Policy
-
-Add Didomi to your CSP:
-
-```http
-Content-Security-Policy:
-  script-src 'self' /integrations/didomi/;
-  connect-src 'self' /integrations/didomi/;
-  frame-src 'self' /integrations/didomi/;
-```
-
-### Data Privacy
-
-- Didomi consent data stays first-party
-- Data sharing follows recorded consent status
-- Consent strings stored locally
-- User can withdraw consent anytime
-
-## Next Steps
-
-- Review [GDPR Compliance](/guide/gdpr-compliance) for consent signal handling
-- Explore [Lockr Integration](/guide/integrations/lockr) for consent-based identity
-- Check [Configuration](/guide/configuration) for advanced setup
-- Read [First-Party Proxy](/guide/first-party-proxy) for proxy architecture
+If consent events fail, verify `/api/*` routing and `api_origin`. Publisher basic
+authentication is intentionally removed before the request reaches Didomi.

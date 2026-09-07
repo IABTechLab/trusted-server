@@ -52,6 +52,7 @@ rewrite_scripts = true
 
 [integrations.didomi]
 enabled = false
+geo_query_parameters = false
 sdk_origin = "https://sdk.example.com"
 api_origin = "https://api.example.com"
 
