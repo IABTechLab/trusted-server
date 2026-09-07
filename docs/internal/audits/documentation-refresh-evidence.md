@@ -3649,6 +3649,22 @@ region`. The completed contract renders one canonical adapter-support row in
   doctests with four ignored. A fresh successful hosted Run Tests execution is
   still required before importing its authenticated CLI captures.
 
+The exact Task 13 deployment implementation SHA is
+`2f1f11c2cf94cf0b5606e107672d6386d283959a`; the capability-receipt
+correction was pushed at `552dbeebe63aa6c742f2def95565bfcc80076513`.
+The Spin smoke was repeated successfully from that correction SHA with the
+tool identities and `2026-10-07T00:00:00Z` expiry recorded above. At
+`2026-09-07T21:25:58Z`, the bounded `docs-refresh:adapter-smokes` region was
+appended to PR #1049 and read back. The returned body had SHA-256
+`92c2f06549716cec2d87a76b5f703c0467b0770a1bf1791d1f0995ca43da7d2b`,
+contained exactly one marker pair, and preserved the complete preceding body.
+Its four command fences exactly equal the checked Axum, Fastly, Cloudflare,
+and Spin snippet commands. Its setup order, generated-state/process cleanup,
+strong oracle, independent missing-config and per-secret failures, three
+immutable hosted job receipts, and time-bounded Spin receipt equal the checked
+scripts and evidence above. GitHub reported the correction SHA as the PR head.
+This publication receipt does not include its own commit SHA.
+
 #### Task 14 — Complete WP5 product coverage and navigation
 
 Pending. Record page/orphan ownership, diagram prose equivalents, snippet

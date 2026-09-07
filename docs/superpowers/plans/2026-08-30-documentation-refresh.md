@@ -1186,7 +1186,7 @@ git ls-files --stage scripts/smoke-axum.sh scripts/smoke-fastly.sh scripts/smoke
 git commit -m "Document adapter deployment journeys"
 ```
 
-- [ ] **Step 9: Push and publish exact smoke journeys to #1049**
+- [x] **Step 9: Push and publish exact smoke journeys to #1049**
 
 Push the clean deployment-guide commit to `origin/spec-docs-refresh` and wait for its hosted smoke jobs. Then update only the bounded `<!-- docs-refresh:adapter-smokes:start -->` / `<!-- docs-refresh:adapter-smokes:end -->` region of PR #1049's description. For Axum, Fastly, Cloudflare, and Spin, include the exact command sequence invoked by the recurring script, its generated-state and process cleanup procedure, the strong success oracle, the two independent negative cases, and the immutable run URL or time-bounded Spin receipt. Read the description back and require each script's command and cleanup sequence to match its checked snippet records; preserve every unrelated PR-description section.
 
