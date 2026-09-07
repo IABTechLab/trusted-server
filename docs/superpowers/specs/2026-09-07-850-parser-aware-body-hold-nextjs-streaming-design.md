@@ -338,6 +338,24 @@ returns to `Idle` at the final fragment, and the document flag remains set throu
 that mode, later complete RSC scripts are restored immediately rather than captured for
 rewriting. `__NEXT_DATA__` overflow never sets the document-wide RSC flag.
 
+The RSC output session checks the shared document-wide bypass flag before handling each
+new `lol_html` output chunk. If parser-side overflow sets it while an older unresolved group
+is held, the session must perform one atomic transition before emitting the overflowing
+script's output:
+
+1. append any separately retained partial placeholder-candidate suffix to the held output;
+2. restore every queued placeholder in the held output and current chunk with its exact
+   captured original payload;
+3. release the restored group, interstitial markup, and current chunk in document order;
+4. clear the group FIFO, payload/output counters, T-chunk classifier, and placeholder
+   candidate state;
+5. retain only the document-wide bypass flag through EOF and pass later RSC content through
+   unchanged.
+
+If a generated placeholder has no matching captured original during this transition,
+return a processor error rather than leaking the placeholder or emitting a partially
+restored script. This is an internal state-invariant failure, not malformed publisher data.
+
 Change the RSC script rewriter to use the same discipline. For each `script` text node:
 
 - accumulate and suppress fragments until `last_in_text_node`;
@@ -565,6 +583,9 @@ Add unit and pipeline tests for:
   `Idle`;
 - one-fragment over-limit RSC is emitted without an over-limit copy, and incomplete or
   invalid content forces later RSC scripts to remain unchanged;
+- an unresolved group followed by either fragmented or one-fragment RSC overflow is
+  restored and released in the same output-session call, before the overflowing script,
+  with all group and partial-placeholder state cleared;
 - two interleaved processor instances never share `__NEXT_DATA__`, RSC payload, namespace,
   or bypass state;
 - rewrite count mismatch and placeholder-remnant safeguards restore originals;
