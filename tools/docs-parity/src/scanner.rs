@@ -588,6 +588,9 @@ fn bare_domain_context_allowed(
     domain_context: &DomainContext,
     lexical_context: Option<&SourceLexicalContext>,
 ) -> bool {
+    if placeholder_filename_segment(text, start, end) {
+        return false;
+    }
     if repository_path_token(path, text, start, end, &domain_context.tracked_paths) {
         return false;
     }
@@ -613,6 +616,14 @@ fn bare_domain_context_allowed(
         return false;
     }
     lexical_context.is_none_or(|context| context.allows(start))
+}
+
+fn placeholder_filename_segment(text: &str, start: usize, end: usize) -> bool {
+    text[..start].ends_with('<')
+        && text[end..]
+            .strip_prefix(">.")
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(|character| character.is_ascii_alphanumeric())
 }
 
 fn toml_key_occurrence(text: &str, start: usize, end: usize) -> bool {

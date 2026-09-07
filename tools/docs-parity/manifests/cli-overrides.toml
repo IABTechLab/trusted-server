@@ -1,2 +1,68 @@
 version = 1
 reviewed = true
+
+[[annotations]]
+command_path = "ts dev proxy"
+platform = "macos"
+source_fingerprint = "sha256:f53210ba7fd61b2f97e4e42ceaa68826bebada6604a24b5956e3d862e8ca401b"
+owner = "documentation-maintainers"
+rationale = "The production-hostname development proxy is implemented only on macOS."
+expires_at = "2027-09-01T00:00:00Z"
+
+[[annotations]]
+command_path = "ts dev proxy ca"
+platform = "macos"
+source_fingerprint = "sha256:82e1b2768c927aa7a46f91225f34c370d8e13075e7a36a1144ede215f8e29954"
+owner = "documentation-maintainers"
+rationale = "The development-proxy certificate authority is implemented only on macOS."
+expires_at = "2027-09-01T00:00:00Z"
+
+[[annotations]]
+command_path = "ts dev proxy ca install"
+platform = "macos"
+source_fingerprint = "sha256:7df4ed93e600b3b4e245c88f62418d09be49f7c37c42a9f9ce44067d0805760d"
+owner = "documentation-maintainers"
+rationale = "Development-proxy certificate installation is implemented only on macOS."
+expires_at = "2027-09-01T00:00:00Z"
+
+[[annotations]]
+command_path = "ts dev proxy ca path"
+platform = "macos"
+source_fingerprint = "sha256:b48683b4787afdd41092b0e12d977848a120a6212275edae0675e3300f8ee959"
+owner = "documentation-maintainers"
+rationale = "Development-proxy certificate path lookup is implemented only on macOS."
+expires_at = "2027-09-01T00:00:00Z"
+
+[[annotations]]
+command_path = "ts dev proxy ca regenerate"
+platform = "macos"
+source_fingerprint = "sha256:0191322cc6e7c1d779073b8212f55c3f2ec93e233a97d7e51c979651da95d26c"
+owner = "documentation-maintainers"
+rationale = "Development-proxy certificate regeneration is implemented only on macOS."
+expires_at = "2027-09-01T00:00:00Z"
+
+[[annotations]]
+command_path = "ts dev proxy ca uninstall"
+platform = "macos"
+source_fingerprint = "sha256:f36592e32f23b3901ea7f405eae27c03c224ec06609b832d20937ad15c184b9b"
+owner = "documentation-maintainers"
+rationale = "Development-proxy certificate removal is implemented only on macOS."
+expires_at = "2027-09-01T00:00:00Z"
+
+[[overrides]]
+command_path = "ts dev"
+platform = "linux"
+replacement = "Local developer tools (e.g. the macOS-only production-hostname proxy)\n\nUsage: ts dev\n\nOptions:\n  -h, --help  Print help\n"
+source_fingerprint = "sha256:91d85ed69284b5b25eb201ccb1a14182ff57a776c5ce407423aa6226d314bf76"
+owner = "documentation-maintainers"
+rationale = "Reconcile the shared parent help while macOS-only proxy commands remain annotated separately."
+expires_at = "2027-09-01T00:00:00Z"
+
+[[overrides]]
+command_path = "ts dev"
+platform = "macos"
+replacement = "Local developer tools (e.g. the macOS-only production-hostname proxy)\n\nUsage: ts dev\n\nOptions:\n  -h, --help  Print help\n"
+source_fingerprint = "sha256:c4a7d771b68afa333d58aa1d48cca4add7f8ee3f1ab17dd0dc286eb35b7884be"
+owner = "documentation-maintainers"
+rationale = "Reconcile the shared parent help while macOS-only proxy commands remain annotated separately."
+expires_at = "2027-09-01T00:00:00Z"

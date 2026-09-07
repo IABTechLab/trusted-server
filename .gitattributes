@@ -1,0 +1,2 @@
+# Authenticated CLI-help goldens preserve the runners' exact output bytes.
+tools/docs-parity/goldens/*.txt -whitespace

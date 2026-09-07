@@ -93,6 +93,12 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = ".gitattributes"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = ".github/ISSUE_TEMPLATE/bug_report.yml"
 mode = "comments"
 grammar = "yaml"
@@ -4027,7 +4033,25 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "tools/docs-parity/goldens/cli-linux.txt"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
+path = "tools/docs-parity/goldens/cli-macos.txt"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = "tools/docs-parity/manifests/adapter-support.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
+path = "tools/docs-parity/manifests/cli-captures.toml"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "non_documentation"

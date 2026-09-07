@@ -1,0 +1,250 @@
+version = 1
+reviewed = true
+repository = "IABTechLab/trusted-server"
+source_sha = "8a60b4466a4ba3145012a4444b4328c1311466e9"
+run_id = 34090529367
+run_attempt = 1
+
+[[captures]]
+platform = "linux"
+help_sha256 = "sha256:d1cae561a509fac817befdca1ba733a2582dba87d322cf4c2efccce9729a6786"
+
+[[captures]]
+platform = "macos"
+help_sha256 = "sha256:cecd3a524ff6c50459b446dfe95980be0cdb037e1934ea0ab2a389aa6472f450"
+
+[[sources]]
+path = ".cargo/config.toml"
+blob = "1302091e0be10c1e23180ced4015ba2d96b65f7d"
+
+[[sources]]
+path = ".tool-versions"
+blob = "7581468008b644d7efc32c673b8eb37ac1fa0296"
+
+[[sources]]
+path = "Cargo.lock"
+blob = "ab29df9fa7208444420cb28fc237f897d30185bb"
+
+[[sources]]
+path = "Cargo.toml"
+blob = "57ee2f41b504d9407cf0c2d81e43385874e924f0"
+
+[[sources]]
+path = "crates/trusted-server-cli/Cargo.toml"
+blob = "8cce8fd5a8cf8c4ea76c3ba5c2565428e8ea6628"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/ad_templates/compare.rs"
+blob = "48ab71f3e801f2bb36992b4d1da6ef243198fc4e"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/ad_templates/expected.rs"
+blob = "9392963ff3dd39ab05fc1e8263f30b0f56066357"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/ad_templates/mod.rs"
+blob = "3c26bf1211a6e6cbbfebcee7169e9bb602febf6b"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/ad_templates/output.rs"
+blob = "afcf78ed05b34fa5d162bd5748d138b319d2a8da"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/app_config.rs"
+blob = "bee536146bf69c72f2865bf71ccef3472d4e154f"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/ad_template_collector.js"
+blob = "6938808f543f23ac8064fe8aa9ad4eaa98ee219e"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/ad_templates.rs"
+blob = "0e2b513715b6f6e83a0e9788fffb90b0ce4d304f"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/browser.rs"
+blob = "a4c0514a6c846b00103f910aeec3ed39a81f1cfb"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/browser_scroll.rs"
+blob = "0663b158ba7c0e08325335ea1da0457c8df499f4"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/collector.rs"
+blob = "25aa9236f0a700a1c17a69c4706e2793f73025c5"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/consent_stub.js"
+blob = "27699cd1e51ca300eb0e45b28138715362b5c178"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/analyzer.rs"
+blob = "06d784b7ac4aeb1a7b6a5b64abd6dd185524d054"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/browser_collector.rs"
+blob = "22d42e2511891a516192420a5e2bc6478937f2c3"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/collector.rs"
+blob = "dc23af09cab8b37b97bf479ef8d68d652246e400"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/crawl_plan.rs"
+blob = "76d57cf9e89bb3e7b50a09e6315c7582696be752"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/evidence.rs"
+blob = "0e50b9a83ef7c8bbc1bd89debfefa50a6ad04793"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs"
+blob = "c05e3efbd99bbdb08c951d9bb456bdd87784b224"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/mod.rs"
+blob = "490ccba8085712acdea011dddc3e33a37d7c3fa8"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/page_patterns.rs"
+blob = "740acc86fedf03c25405c3aa1a8593ca056858a5"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/slot_toml.rs"
+blob = "f795ea41b96b715657cce7c39adffa0cfd518a06"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/unit_template.rs"
+blob = "06b7c955d58d0214cea9aba0e17b59c4dc48b6e0"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/generate/validate.rs"
+blob = "36664f273129f41bc753548139b283d17293ae97"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/mod.rs"
+blob = "2110606629727d48a43e9f2d279cb0e09e873552"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/audit/page.rs"
+blob = "31cbf4b1b3ac69847ae68671a1a714d974e92a7f"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/config/ad_templates.rs"
+blob = "59ec2a17424b7dcabdb7eba0bd6784593b099944"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/config/init.rs"
+blob = "f1fa1c0af03d4603ff395be15b7403cf0ea6deab"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/config/mod.rs"
+blob = "77af7de851792e5afaf062206a5abdf9a9388509"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/mod.rs"
+blob = "7a61d769bcca643edea7f63ad231729f2224fd2d"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/browser.rs"
+blob = "4af9b2d3d572ccc7a998964cbe53e292a8806ad7"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/ca.rs"
+blob = "7bc4851e8ea9df8e4d5e3cb85ec2b4141da06276"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/config.rs"
+blob = "d831735c2fe5a37bb7bc9dc755a51eb5fe8f071a"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/metrics.rs"
+blob = "10e352471bff5ee3375340e008cb4963e34e6442"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/mod.rs"
+blob = "1bebd872df7f1b9b7613c3f76b4025a946086ef1"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/prefixed_io.rs"
+blob = "2f022bc92718870922e901577a002822975e0ac4"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/rewrite.rs"
+blob = "cf02db0799e7e8fafce76c53e0f317a441b236b4"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/server.rs"
+blob = "424613638cb49248abbcc63c06edbf268818621f"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/body.rs"
+blob = "44b85db66603f03591f5126f39b03d9d924c28df"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/connect.rs"
+blob = "dd876b31640419317e0f08be1f88d943e11938b6"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/dns.rs"
+blob = "958afe0bb4d3e87b8c2d78d654c9c7f34bb223b4"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/key.rs"
+blob = "02bd08abf1815da2aeee82670cacd6512acc90f7"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/manager.rs"
+blob = "c639998bbfdcc3c9bd50bf78f09de60e05f78436"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/dev/proxy/upstream/mod.rs"
+blob = "77df4c55408cc1e274b557c2da88ba553a214269"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/commands/mod.rs"
+blob = "a01559fd4373f8ed959967c5e2ab4ad94c748bc6"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/error.rs"
+blob = "cdb0a2a9630cc011051960884ba9fa0f440cb932"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/lib.rs"
+blob = "a3352ba9322ccd50c438e36d7b0f7ecd1c8e343c"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/main.rs"
+blob = "0a325bd55c7e918bfe936487fa87fada33687881"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/output.rs"
+blob = "afcfc94ba48d4e7e556ce6a94f4e5da799051aa7"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/prebid_bundle.rs"
+blob = "abc5459268d4be19849219bbdf72c4414d7a4cee"
+
+[[sources]]
+path = "crates/trusted-server-cli/src/run.rs"
+blob = "4d73a2ab52768df446708d8172db1808089d58c8"
+
+[[sources]]
+path = "crates/trusted-server-cli/tests/config_env_overlay.rs"
+blob = "45eab5cc952576b7f7421e40149f3fc8d6fb6566"
+
+[[sources]]
+path = "crates/trusted-server-cli/tests/proxy_e2e.rs"
+blob = "3f3098a197f7519748055c649f240bd4ffc8ebc8"
+
+[[sources]]
+path = "crates/trusted-server-cli/tests/proxy_perf.rs"
+blob = "68c66f23886c3c334f79399532322fe396fa63c9"
+
+[[sources]]
+path = "crates/trusted-server-cli/tests/support/mod.rs"
+blob = "8e8e3e66f35c1568db7ed43c157837c811612d8f"
+
+[[sources]]
+path = "rust-toolchain.toml"
+blob = "e72500aa190a4744fcb7fda5b4ba8e9fbe949c65"

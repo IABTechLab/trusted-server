@@ -774,7 +774,7 @@ identity, `uname -a`, `rustc -vV`, Node/tool versions, run ID and attempt, help
 length, and help SHA-256. Commit and push capture-ready code before requesting
 hosted output.
 
-- [ ] **Step 3: Import authenticated goldens**
+- [x] **Step 3: Import authenticated goldens**
 
 Run `docs-parity cli-help import-hosted --run-id <id>` from the capture-ready
 commit. Through the authenticated `gh` session, require repository
@@ -823,7 +823,7 @@ offline `check --all` aggregate. Do not create `docs-links.yml`, a schedule, a
 manual writer path, or a real gate-consumer manifest in Task 9; Task 17 owns
 their one-time final materialization.
 
-- [ ] **Step 8: Verify and commit in two adjacent checkpoints**
+- [x] **Step 8: Verify and commit in two adjacent checkpoints**
 
 First commit capture-ready sources and offline policy foundations:
 
@@ -851,7 +851,7 @@ them twice and stage only the goldens, capture record, regenerated governance
 manifests, and evidence:
 
 ```bash
-git add docs/internal/audits/documentation-refresh-evidence.md tools/docs-parity/goldens/cli-linux.txt tools/docs-parity/goldens/cli-macos.txt tools/docs-parity/manifests/cli-captures.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml
+git add .gitattributes docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/goldens/cli-linux.txt tools/docs-parity/goldens/cli-macos.txt tools/docs-parity/manifests/cli-captures.toml tools/docs-parity/manifests/cli-overrides.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/scanner.rs tools/docs-parity/tests/scanner.rs
 git diff --cached --check
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all

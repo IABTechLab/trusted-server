@@ -75,6 +75,10 @@ path = ".env.example"
 kind = "text"
 
 [[files]]
+path = ".gitattributes"
+kind = "text"
+
+[[files]]
 path = ".github/ISSUE_TEMPLATE/bug_report.yml"
 kind = "text"
 
@@ -2767,7 +2771,19 @@ path = "tools/docs-parity/README.md"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/goldens/cli-linux.txt"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/goldens/cli-macos.txt"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/manifests/adapter-support.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/cli-captures.toml"
 kind = "text"
 
 [[files]]

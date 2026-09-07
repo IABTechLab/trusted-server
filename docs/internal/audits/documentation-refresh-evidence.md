@@ -3286,6 +3286,49 @@ for the standalone tool.
   inner ZIP. The corrected standalone suite passed all 395 tests, including 25
   CLI and 38 library tests; formatting and all-target, all-feature clippy with
   warnings denied also passed. The failed run is not an import receipt.
+- Authenticated golden receipt: Run Tests run
+  `https://github.com/IABTechLab/trusted-server/actions/runs/34090529367`, attempt
+  1, completed successfully for PR #1049 at exact source SHA
+  `8a60b4466a4ba3145012a4444b4328c1311466e9`. The run used workflow
+  `.github/workflows/test.yml`, event `pull_request`, base SHA
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, and contained exactly two
+  unexpired artifacts. `cli-help-linux` artifact `10006732258` was created at
+  `2026-09-07T06:25:38Z`, had API size 32,770 bytes, and API digest
+  `sha256:85c6f744382eaad9d60c2baee2589dca4cee4eb88dd039b4cf7a110e7a40f57d`.
+  `cli-help-macos` artifact `10006789119` was created at
+  `2026-09-07T06:27:56Z`, had API size 36,281 bytes, and API digest
+  `sha256:4c14329ae73015aca11a5b4897122cd475e289a23e96ad1057114aed5aa6ae72`.
+  Both artifacts expire on 2026-09-14.
+- `cli-help import-hosted --run-id 34090529367` authenticated and installed
+  both captures plus their exact source-blob inventory. A second authenticated
+  import was byte-identical. Installed SHA-256 values are
+  `d1cae561a509fac817befdca1ba733a2582dba87d322cf4c2efccce9729a6786`
+  for `cli-linux.txt`,
+  `cecd3a524ff6c50459b446dfe95980be0cdb037e1934ea0ab2a389aa6472f450`
+  for `cli-macos.txt`, and
+  `038b1537309b727c2528eb2f3b968f870a80cd72901e2de860ec17b9e57d0a59`
+  for `cli-captures.toml`.
+- The first checked union failed on the real platform difference at `ts dev`:
+  macOS exposes `dev proxy` and its five certificate-authority operations,
+  while Linux exposes no `dev` child. Two source-fingerprint-bound `ts dev`
+  replacements preserve the shared parent text, and six macOS-only
+  annotations retain every platform command explicitly. All records are owned
+  by `documentation-maintainers` and expire at
+  `2027-09-01T00:00:00Z`; `cli-help --check` then exited 0.
+- Classifying the imported goldens exposed a bare-domain detector truncation:
+  `<app.name>.toml` was reported as the public host `app.name`. A named
+  regression now rejects only a dotted angle-bracket placeholder immediately
+  followed by a filename suffix while retaining a complete angle-bracketed
+  public host. Regeneration removed the twelve duplicated golden findings and
+  three pre-existing `app.name` false-positive exceptions rather than
+  relabeling them as vendor URLs.
+- The authenticated transcripts retain CLI-produced trailing spaces. A
+  path-scoped `.gitattributes` rule disables Git whitespace diagnostics only
+  for `tools/docs-parity/goldens/*.txt`; it does not normalize or hand-edit the
+  imported bytes. `git diff --cached --check` then passed without changing the
+  recorded golden digests. The final candidate passed all 396 standalone
+  tests, `classify --check`, `scan --check`, `cli-help --check`, and the full
+  offline `check --all` aggregate.
 
 #### Task 10 — Complete WP2 truth pass and dispositions
 

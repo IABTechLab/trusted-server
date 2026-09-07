@@ -438,6 +438,28 @@ fn domain_detector_rejects_template_path_and_code_member_false_positives() {
 }
 
 #[test]
+fn domain_detector_does_not_truncate_placeholder_filename_segments() {
+    let placeholder = TestRepository::new(
+        "notes.txt",
+        b"Use `<app.name>.toml` beside `edgezero.toml`.\n",
+        "text",
+    );
+    assert_eq!(
+        status_code(&placeholder.scan()),
+        SUCCESS,
+        "a dotted placeholder followed by a filename suffix is not a domain"
+    );
+
+    let host = ["crates", ".io"].concat();
+    let autolink = TestRepository::new("notes.txt", format!("See <{host}>.\n").as_bytes(), "text");
+    assert_eq!(
+        status_code(&autolink.scan()),
+        ERROR,
+        "a complete angle-bracketed public host must remain detectable"
+    );
+}
+
+#[test]
 fn domain_detector_rejects_non_code_paths_and_markup_tokens_but_keeps_link_hosts() {
     for (path, contents, references) in [
         (
