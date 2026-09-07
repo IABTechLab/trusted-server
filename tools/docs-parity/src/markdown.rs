@@ -281,24 +281,57 @@ pub(crate) fn generate(
     update: bool,
 ) -> Result<bool, Report<MarkdownError>> {
     let manifest = read_pages_manifest(repository)?;
+    let uses_dynamic_route_regions = manifest.regions.iter().any(|region| {
+        matches!(
+            region.name.as_str(),
+            "api-adapter-support" | "api-route-availability" | "api-integration-route-families"
+        )
+    });
+    let mut dynamic_regions = if uses_dynamic_route_regions {
+        crate::routes::repository_documentation_regions(repository)
+            .map_err(|error| generated_error(format!("cannot build route regions: {error}")))?
+            .into_iter()
+            .map(|region| (region.name.clone(), region))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
     let mut regions_by_path = BTreeMap::<String, Vec<GeneratedRegion>>::new();
     for record in manifest.regions {
         validate_repo_path(&record.path)?;
+        let dynamic = dynamic_regions.remove(&record.name);
+        if let Some(dynamic) = &dynamic
+            && (record.path != "docs/guide/api-reference.md"
+                || record.columns != dynamic.columns
+                || !record.rows.is_empty())
+        {
+            return Err(generated_error(format!(
+                "dynamic route region {} has a mismatched declaration",
+                record.name
+            )));
+        }
         regions_by_path
             .entry(record.path)
             .or_default()
-            .push(GeneratedRegion {
-                name: record.name,
-                columns: record.columns,
-                rows: record
-                    .rows
-                    .into_iter()
-                    .map(|row| GeneratedRow {
-                        key: row.key,
-                        cells: row.cells,
-                    })
-                    .collect(),
-            });
+            .push(dynamic.unwrap_or_else(|| {
+                GeneratedRegion {
+                    name: record.name,
+                    columns: record.columns,
+                    rows: record
+                        .rows
+                        .into_iter()
+                        .map(|row| GeneratedRow {
+                            key: row.key,
+                            cells: row.cells,
+                        })
+                        .collect(),
+                }
+            }));
+    }
+    if let Some(name) = dynamic_regions.keys().next() {
+        return Err(generated_error(format!(
+            "pages manifest is missing dynamic route region {name}"
+        )));
     }
     let mut ownership_by_path = BTreeMap::<String, Vec<OwnershipRecord>>::new();
     for record in manifest.ownership {

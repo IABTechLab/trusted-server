@@ -1051,23 +1051,29 @@ Append the readback timestamp, PR body hash, and equality result to `documentati
 
 - Modify: `docs/guide/api-reference.md`
 - Modify: `tools/docs-parity/manifests/routes.toml`
+- Modify: `tools/docs-parity/manifests/integrations.toml`
 - Modify: `tools/docs-parity/manifests/adapter-support.toml`
 - Modify: `tools/docs-parity/manifests/snippets.toml`
+- Modify: `tools/docs-parity/manifests/sensitive-allowlist.toml`
+- Modify: `tools/docs-parity/manifests/pages.toml`
+- Modify: `tools/docs-parity/src/markdown.rs`
+- Modify: `tools/docs-parity/src/routes.rs`
+- Modify/Test: `tools/docs-parity/tests/routes.rs`
 - Modify/Test only for test seams: the four adapter `src/app.rs` files and route tests from Task 8
 
-- [ ] **Step 1: Make route generation fail on reader drift**
+- [x] **Step 1: Make route generation fail on reader drift**
 
 Temporarily alter one checked record in a test fixture and prove check mode rejects an unregenerated region. Prove an unknown Cloudflare route-builder construct fails parsing.
 
-- [ ] **Step 2: Generate the route/availability regions**
+- [x] **Step 2: Generate the route/availability regions**
 
 Render all adapters, methods, route families, predicates, Fastly-only routes, guarded/unsupported admin behavior, publisher fallback, startup failure, middleware facts, and fan-out support from the checked records.
 
-- [ ] **Step 3: Complete manually owned endpoint contracts**
+- [x] **Step 3: Complete manually owned endpoint contracts**
 
 For every endpoint, cover auth, schemas, status codes, cache/CORS, config gates, rate limits, and examples or mark a typed not-applicable value. Keep minting (`/first-party/sign`) distinct from validation (`/proxy`, `/click`, `/proxy-rebuild`).
 
-- [ ] **Step 4: Verify set equality and rendered prose**
+- [x] **Step 4: Verify set equality and rendered prose**
 
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- routes --check
@@ -1082,10 +1088,10 @@ cd docs && npm run lint && npm run format && npm run build
 
 Expected: no adapter can add/remove/change a route without a record and generated diff; all ownership markers are present.
 
-- [ ] **Step 5: Commit WP4**
+- [x] **Step 5: Commit WP4**
 
 ```bash
-git add docs/guide/api-reference.md tools/docs-parity/manifests/routes.toml tools/docs-parity/manifests/adapter-support.toml tools/docs-parity/manifests/snippets.toml crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-axum/src/app.rs crates/trusted-server-adapter-axum/tests/routes.rs crates/trusted-server-adapter-cloudflare/src/app.rs crates/trusted-server-adapter-cloudflare/tests/routes.rs crates/trusted-server-adapter-spin/src/app.rs crates/trusted-server-adapter-spin/tests/routes.rs docs/internal/audits/documentation-refresh-evidence.md
+git add docs/guide/api-reference.md docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/manifests/adapter-support.toml tools/docs-parity/manifests/integrations.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/src/markdown.rs tools/docs-parity/src/routes.rs tools/docs-parity/tests/routes.rs
 git commit -m "Generate adapter API documentation"
 ```
 

@@ -7,6 +7,8 @@ use serde::Deserialize;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Block, Expr, Item, Lit, Pat, Stmt};
 
+use crate::integrations::IntegrationInventory;
+use crate::markdown::{GeneratedRegion, GeneratedRow};
 use crate::repository::{NormalizedRelativePath, Repository};
 
 const MAX_ROUTE_INPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -294,6 +296,8 @@ pub struct AdapterSupportRecord {
     startup_status: u16,
     startup_health: bool,
     provider_fanout: String,
+    trusted_client_ip: String,
+    request_normalization: String,
 }
 
 /// Checked adapter support records.
@@ -341,6 +345,8 @@ impl AdapterSupportManifest {
                     &record.reviewed_at,
                     &record.health,
                     &record.provider_fanout,
+                    &record.trusted_client_ip,
+                    &record.request_normalization,
                 ]
                 .into_iter()
                 .any(|value| value.len() > MAX_ROUTE_STRING_BYTES)
@@ -355,7 +361,10 @@ impl AdapterSupportManifest {
                 }
                 if record.owner.trim().is_empty()
                     || !is_review_date(&record.reviewed_at)
-                    || !matches!(record.release_status.as_str(), "production" | "development")
+                    || !matches!(
+                        record.release_status.as_str(),
+                        "production" | "development" | "experimental"
+                    )
                 {
                     return Err(invalid(format!(
                         "invalid manual ownership/status for adapter {}",
@@ -389,14 +398,48 @@ pub fn validate_adapter_support(
                 record.startup_status,
                 record.startup_health,
                 record.provider_fanout.as_str(),
+                record.trusted_client_ip.as_str(),
+                record.request_normalization.as_str(),
             )
         })
         .collect::<BTreeSet<_>>();
     let expected = BTreeSet::from([
-        ("axum", "real", 500, false, "multiple"),
-        ("cloudflare", "absent", 500, false, "single"),
-        ("fastly", "pre_router", 500, true, "multiple"),
-        ("spin", "real", 503, true, "single"),
+        (
+            "axum",
+            "real",
+            500,
+            false,
+            "multiple",
+            "outermost_sanitize",
+            "none",
+        ),
+        (
+            "cloudflare",
+            "absent",
+            500,
+            false,
+            "single",
+            "outermost_sanitize",
+            "none",
+        ),
+        (
+            "fastly",
+            "pre_router",
+            500,
+            true,
+            "multiple",
+            "entry_point_resolve_and_sanitize",
+            "none",
+        ),
+        (
+            "spin",
+            "real",
+            503,
+            true,
+            "single",
+            "outermost_sanitize",
+            "innermost_spin_headers",
+        ),
     ]);
     if facts != expected {
         return Err(Report::new(RouteError::Drift {
@@ -404,6 +447,294 @@ pub fn validate_adapter_support(
         }));
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct DocumentationManifest {
+    #[serde(default)]
+    regions: Vec<DocumentationRegion>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentationRegion {
+    name: String,
+    path: String,
+    columns: Vec<String>,
+    #[serde(default)]
+    rows: Vec<DocumentationRow>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentationRow {
+    key: String,
+    cells: Vec<String>,
+}
+
+const API_REFERENCE_PATH: &str = "docs/guide/api-reference.md";
+const API_ROUTE_REGION: &str = "api-route-availability";
+const API_INTEGRATION_REGION: &str = "api-integration-route-families";
+const API_ADAPTER_REGION: &str = "api-adapter-support";
+
+/// Build the API reference's generated regions directly from checked route,
+/// integration, and adapter-support records.
+#[must_use]
+pub fn documentation_regions(
+    routes: &RouteManifest,
+    support: &AdapterSupportManifest,
+    integrations: &IntegrationInventory,
+) -> Vec<GeneratedRegion> {
+    vec![
+        adapter_documentation_region(support),
+        route_documentation_region(routes, support),
+        integration_route_documentation_region(integrations),
+    ]
+}
+
+/// Require the pages manifest to declare each API region exactly once at the
+/// canonical document and with no hand-maintained rows.
+///
+/// # Errors
+///
+/// Returns an error when a required declaration is absent, duplicated,
+/// redirected, has different columns, or contains copied route data.
+pub fn validate_documentation_contract(
+    routes: &RouteManifest,
+    support: &AdapterSupportManifest,
+    integrations: &IntegrationInventory,
+    pages_source: &str,
+) -> Result<(), Report<RouteError>> {
+    ensure_route_input_bound("pages manifest", pages_source)?;
+    let manifest = toml::from_str::<DocumentationManifest>(pages_source)
+        .map_err(|error| invalid(format!("malformed API documentation manifest: {error}")))?;
+    let mut declarations = BTreeMap::new();
+    for region in manifest.regions {
+        if declarations.insert(region.name.clone(), region).is_some() {
+            return Err(invalid("duplicate API documentation region declaration"));
+        }
+    }
+    for expected in documentation_regions(routes, support, integrations) {
+        let declaration = declarations
+            .get(&expected.name)
+            .ok_or_else(|| invalid(format!("missing {} region", expected.name)))?;
+        if declaration.path != API_REFERENCE_PATH || declaration.columns != expected.columns {
+            return Err(invalid(format!(
+                "{} path or columns differ from the checked record",
+                expected.name
+            )));
+        }
+        if !declaration.rows.is_empty() {
+            let first = declaration
+                .rows
+                .first()
+                .map(|row| format!("{} ({} cells)", row.key, row.cells.len()))
+                .unwrap_or_default();
+            return Err(invalid(format!(
+                "{} rows must be generated from checked records, found {first}",
+                expected.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn repository_documentation_regions(
+    repository: &Repository,
+) -> Result<Vec<GeneratedRegion>, Report<RouteError>> {
+    let routes = RouteManifest::parse(&read_utf8(
+        repository,
+        "tools/docs-parity/manifests/routes.toml",
+    )?)?;
+    let support = AdapterSupportManifest::parse(&read_utf8(
+        repository,
+        "tools/docs-parity/manifests/adapter-support.toml",
+    )?)?;
+    validate_adapter_support(&support)?;
+    let integrations = IntegrationInventory::parse(&read_utf8(
+        repository,
+        "tools/docs-parity/manifests/integrations.toml",
+    )?)
+    .map_err(|error| invalid(format!("cannot parse integration routes: {error}")))?;
+    Ok(documentation_regions(&routes, &support, &integrations))
+}
+
+fn adapter_documentation_region(support: &AdapterSupportManifest) -> GeneratedRegion {
+    let rows = support
+        .adapters
+        .iter()
+        .map(|adapter| GeneratedRow {
+            key: adapter.id.clone(),
+            cells: vec![
+                format!("`{}`", adapter.id),
+                adapter.release_status.clone(),
+                adapter.health.replace('_', " "),
+                format!("`{}`", adapter.startup_status),
+                if adapter.startup_health { "yes" } else { "no" }.to_owned(),
+                adapter.provider_fanout.clone(),
+                match adapter.trusted_client_ip.as_str() {
+                    "entry_point_resolve_and_sanitize" => "entry-point resolve + sanitize",
+                    "outermost_sanitize" => "outermost sanitize",
+                    _ => "invalid",
+                }
+                .to_owned(),
+                match adapter.request_normalization.as_str() {
+                    "none" => "none",
+                    "innermost_spin_headers" => "innermost Spin-header derivation",
+                    _ => "invalid",
+                }
+                .to_owned(),
+            ],
+        })
+        .collect();
+    GeneratedRegion {
+        name: API_ADAPTER_REGION.to_owned(),
+        columns: vec![
+            "Adapter",
+            "Release status",
+            "Health",
+            "Startup status",
+            "Startup health",
+            "Provider fan-out",
+            "Trusted-client-IP handling",
+            "Request normalization",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        rows,
+    }
+}
+
+fn route_documentation_region(
+    routes: &RouteManifest,
+    support: &AdapterSupportManifest,
+) -> GeneratedRegion {
+    type RouteKey = (bool, String, BTreeSet<String>, RouteShape, String);
+    let mut grouped = BTreeMap::<RouteKey, BTreeMap<String, RouteStatus>>::new();
+    for route in &routes.routes {
+        grouped
+            .entry((
+                route.startup_router,
+                route.path.clone(),
+                route.methods.clone(),
+                route.shape,
+                route.predicate.clone(),
+            ))
+            .or_default()
+            .insert(route.adapter.clone(), route.status);
+    }
+    let startup_status = support
+        .adapters
+        .iter()
+        .map(|adapter| (adapter.id.as_str(), adapter.startup_status))
+        .collect::<BTreeMap<_, _>>();
+    let rows = grouped
+        .into_iter()
+        .map(|((startup, path, methods, shape, predicate), adapters)| {
+            let key = format!(
+                "{}|{path}|{}|{}|{predicate}",
+                if startup { "startup" } else { "normal" },
+                methods.iter().cloned().collect::<Vec<_>>().join(","),
+                route_shape_name(shape)
+            );
+            let mut cells = vec![
+                if startup { "startup" } else { "normal" }.to_owned(),
+                format!("`{path}`"),
+                methods
+                    .iter()
+                    .map(|method| format!("`{method}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                route_shape_name(shape).to_owned(),
+                format!("`{predicate}`"),
+            ];
+            for adapter in ["fastly", "axum", "cloudflare", "spin"] {
+                cells.push(match adapters.get(adapter) {
+                    Some(RouteStatus::StartupError) => format!(
+                        "startup error (`{}`)",
+                        startup_status
+                            .get(adapter)
+                            .expect("support validation requires every adapter")
+                    ),
+                    Some(status) => route_status_name(*status).to_owned(),
+                    None => "—".to_owned(),
+                });
+            }
+            GeneratedRow { key, cells }
+        })
+        .collect();
+    GeneratedRegion {
+        name: API_ROUTE_REGION.to_owned(),
+        columns: [
+            "Router",
+            "Path",
+            "Methods",
+            "Shape",
+            "Predicate",
+            "Fastly",
+            "Axum",
+            "Cloudflare",
+            "Spin",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        rows,
+    }
+}
+
+fn integration_route_documentation_region(integrations: &IntegrationInventory) -> GeneratedRegion {
+    let rows = integrations
+        .capabilities
+        .iter()
+        .flat_map(|capability| {
+            let routes = if capability.proxy_routes.is_empty() {
+                vec!["None".to_owned()]
+            } else {
+                capability
+                    .proxy_routes
+                    .iter()
+                    .map(|route| format!("`{route}`"))
+                    .collect()
+            };
+            routes.into_iter().map(|route| GeneratedRow {
+                key: format!("{}|{}|{route}", capability.id, capability.predicate),
+                cells: vec![
+                    format!("`{}`", capability.id),
+                    format!("`{}`", capability.predicate),
+                    route,
+                ],
+            })
+        })
+        .collect();
+    GeneratedRegion {
+        name: API_INTEGRATION_REGION.to_owned(),
+        columns: ["Integration", "Registration predicate", "HTTP routes"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        rows,
+    }
+}
+
+const fn route_shape_name(shape: RouteShape) -> &'static str {
+    match shape {
+        RouteShape::Literal => "literal",
+        RouteShape::Template => "template",
+        RouteShape::ConfigDerived => "config derived",
+        RouteShape::Conditional => "conditional",
+    }
+}
+
+const fn route_status_name(status: RouteStatus) -> &'static str {
+    match status {
+        RouteStatus::Real => "real",
+        RouteStatus::Unsupported => "unsupported",
+        RouteStatus::Guarded => "guarded",
+        RouteStatus::PublisherFallback => "publisher fallback",
+        RouteStatus::StartupError => "startup error",
+    }
 }
 
 /// Extract all fixed, fallback, config-derived, and degraded adapter routes.
@@ -590,7 +921,238 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Rou
         spin_app: &spin_app,
     })?;
     validate_routes(route_manifest.routes(), &observed)?;
-    validate_adapter_support(&support_manifest)
+    validate_adapter_support(&support_manifest)?;
+    validate_middleware_sources(&fastly_entrypoint, &axum_app, &cloudflare_app, &spin_app)?;
+    let integrations = IntegrationInventory::parse(&read_utf8(
+        repository,
+        "tools/docs-parity/manifests/integrations.toml",
+    )?)
+    .map_err(|error| invalid(format!("cannot parse integration routes: {error}")))?;
+    let pages = read_utf8(repository, "tools/docs-parity/manifests/pages.toml")?;
+    validate_documentation_contract(&route_manifest, &support_manifest, &integrations, &pages)?;
+    if crate::markdown::generate(repository, false)
+        .map_err(|error| invalid(format!("cannot check generated API reference: {error}")))?
+    {
+        return Err(invalid("generated API reference has drift"));
+    }
+    Ok(())
+}
+
+/// Validate the adapter middleware facts rendered in the API support table.
+///
+/// # Errors
+///
+/// Returns an error when trusted-client-IP sanitization/resolution or Spin
+/// request normalization is missing or ordered differently.
+pub fn validate_middleware_sources(
+    fastly_entrypoint: &str,
+    axum_app: &str,
+    cloudflare_app: &str,
+    spin_app: &str,
+) -> Result<(), Report<RouteError>> {
+    let fastly = parse_route_source("Fastly entrypoint", fastly_entrypoint)?;
+    let fastly_entrypoint = exact_top_function(&fastly, "edgezero_main")?;
+    if !exact_fastly_resolver_source(&fastly_entrypoint.block) {
+        return Err(invalid(
+            "Fastly trusted-client-IP entry-point contract differs",
+        ));
+    }
+    if named_call_occurrences(&fastly_entrypoint.block, "NormalizeMiddleware") != 0 {
+        return Err(invalid("Fastly request normalization contract differs"));
+    }
+
+    for (adapter, source) in [("Axum", axum_app), ("Cloudflare", cloudflare_app)] {
+        let file = parse_route_source(&format!("{adapter} app"), source)?;
+        let build_router = exact_top_function(&file, "build_router")?;
+        if middleware_order(&build_router.block)
+            != [
+                Some("SanitizeRequestMiddleware"),
+                Some("FinalizeResponseMiddleware"),
+                Some("AuthMiddleware"),
+            ]
+            || named_call_occurrences(&build_router.block, "resolve_and_sanitize_client_ip") != 0
+        {
+            return Err(invalid(format!("{adapter} middleware contract differs")));
+        }
+    }
+
+    let spin = parse_route_source("Spin app", spin_app)?;
+    let build_router = exact_top_function(&spin, "build_router")?;
+    let normalize = exact_top_function(&spin, "normalize_spin_request")?;
+    if middleware_order(&build_router.block)
+        != [
+            Some("SanitizeRequestMiddleware"),
+            Some("FinalizeResponseMiddleware"),
+            Some("AuthMiddleware"),
+            Some("NormalizeMiddleware"),
+        ]
+        || named_call_occurrences(&build_router.block, "resolve_and_sanitize_client_ip") != 0
+        || !exact_spin_client_addr_source(&normalize.block)
+    {
+        return Err(invalid("Spin trusted request normalization differs"));
+    }
+    Ok(())
+}
+
+fn middleware_order(block: &Block) -> Vec<Option<&'static str>> {
+    #[derive(Default)]
+    struct MiddlewareOrder {
+        names: Vec<Option<&'static str>>,
+    }
+    impl<'ast> Visit<'ast> for MiddlewareOrder {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            visit::visit_expr_method_call(self, call);
+            if call.method == "middleware" {
+                self.names
+                    .push(call.args.first().and_then(exact_middleware_constructor));
+            }
+        }
+    }
+    let mut order = MiddlewareOrder::default();
+    order.visit_block(block);
+    order.names
+}
+
+fn exact_middleware_constructor(expression: &Expr) -> Option<&'static str> {
+    let Expr::Call(call) = strip_parens(expression) else {
+        return None;
+    };
+    for name in [
+        "SanitizeRequestMiddleware",
+        "FinalizeResponseMiddleware",
+        "AuthMiddleware",
+    ] {
+        if exact_route_call_path(call, &[name, "new"])
+            && call.args.len() == 1
+            && call.args.first().is_some_and(exact_arc_clone_settings)
+        {
+            return Some(name);
+        }
+    }
+    if exact_route_call_path(call, &["NormalizeMiddleware", "new"]) && call.args.is_empty() {
+        return Some("NormalizeMiddleware");
+    }
+    None
+}
+
+fn exact_arc_clone_settings(expression: &Expr) -> bool {
+    matches!(strip_parens(expression), Expr::Call(call)
+        if exact_route_call_path(call, &["Arc", "clone"])
+            && call.args.len() == 1
+            && exact_reference_field(call.args.first(), "state", "settings"))
+}
+
+fn exact_fastly_resolver_source(block: &Block) -> bool {
+    block
+        .stmts
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::Local(local) if exact_local_binding(local, "resolved_client_ip", false) => {
+                local.init.as_ref().map(|init| init.expr.as_ref())
+            }
+            _ => None,
+        })
+        .filter(|expression| {
+            matches!(strip_parens(expression), Expr::Call(call)
+                if matches!(call.func.as_ref(), Expr::Path(path)
+                    if path.qself.is_none()
+                        && path.path.leading_colon.is_none()
+                        && path.path.segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>()
+                            == ["compat", "resolve_and_sanitize_client_ip"])
+                    && call.args.len() == 2
+                    && matches!(call.args.first().map(strip_parens), Some(Expr::Reference(reference))
+                        if reference.mutability.is_some() && is_ident(&reference.expr, "req"))
+                    && call.args.iter().nth(1).is_some_and(|argument| {
+                        is_ident(argument, "trusted_client_ip")
+                    }))
+        })
+        .count()
+        == 1
+}
+
+fn named_call_occurrences(block: &Block, name: &str) -> usize {
+    struct Calls<'a> {
+        name: &'a str,
+        count: usize,
+    }
+    impl<'ast> Visit<'ast> for Calls<'_> {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            self.count += usize::from(matches!(call.func.as_ref(), Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.segments.iter().any(|segment| segment.ident == self.name)));
+            visit::visit_expr_call(self, call);
+        }
+    }
+    let mut calls = Calls { name, count: 0 };
+    calls.visit_block(block);
+    calls.count
+}
+
+fn exact_spin_client_addr_source(block: &Block) -> bool {
+    let candidates = block
+        .stmts
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::Local(local) if exact_local_binding(local, "trusted_client_addr", false) => {
+                local.init.as_ref().map(|init| init.expr.as_ref())
+            }
+            _ => None,
+        })
+        .filter(|expression| exact_spin_client_addr_initializer(expression))
+        .count();
+    candidates == 1
+}
+
+fn exact_spin_client_addr_initializer(expression: &Expr) -> bool {
+    let Expr::MethodCall(parse) = strip_parens(expression) else {
+        return false;
+    };
+    let exact_parser = parse.method == "and_then"
+        && parse.args.len() == 1
+        && parse
+            .args
+            .first()
+            .is_some_and(|argument| is_ident(argument, "parse_client_addr"));
+    let Expr::MethodCall(convert) = strip_parens(&parse.receiver) else {
+        return false;
+    };
+    let exact_conversion = convert.method == "and_then"
+        && convert.args.len() == 1
+        && matches!(convert.args.first().map(strip_parens), Some(Expr::Closure(closure))
+        if matches!(closure.inputs.iter().collect::<Vec<_>>().as_slice(),
+            [Pat::Ident(binding)] if binding.ident == "v" && binding.subpat.is_none())
+            && exact_zero_arg_method(&closure.body, "ok", |receiver| {
+                exact_zero_arg_method(receiver, "to_str", |receiver| is_ident(receiver, "v"))
+            }));
+    let Expr::MethodCall(last) = strip_parens(&convert.receiver) else {
+        return false;
+    };
+    let Expr::MethodCall(iter) = strip_parens(&last.receiver) else {
+        return false;
+    };
+    let Expr::MethodCall(get_all) = strip_parens(&iter.receiver) else {
+        return false;
+    };
+    let Expr::MethodCall(headers) = strip_parens(&get_all.receiver) else {
+        return false;
+    };
+    exact_parser
+        && exact_conversion
+        && last.method == "next_back"
+        && last.args.is_empty()
+        && iter.method == "iter"
+        && iter.args.is_empty()
+        && get_all.method == "get_all"
+        && get_all.args.len() == 1
+        && get_all
+            .args
+            .first()
+            .and_then(literal_string_value)
+            .as_deref()
+            == Some("spin-client-addr")
+        && headers.method == "headers"
+        && headers.args.is_empty()
+        && is_ident(&headers.receiver, "req")
 }
 
 #[allow(clippy::too_many_arguments)]

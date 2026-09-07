@@ -802,176 +802,176 @@ fingerprint = "sha256:1dab3744d983511ec8ce79bc2132c9703b33e036c65d177d3e561867a2
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:8"
-command = "validate-json"
-fingerprint = "sha256:321c21c4476176c7adbe36553e539f2dc8e5b26cdc75600ca552bc1e694503c1"
+command = "validate-bash"
+fingerprint = "sha256:8a2d55b75da032dd32f0ee3f009ef23521608dc2606b10a6500b7fff153b08c5"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:9"
 command = "validate-json"
-fingerprint = "sha256:9c99d3d03810b7996b0c020aca1be9a028c7ffabe6a8b452a9747ee31668d104"
+fingerprint = "sha256:321c21c4476176c7adbe36553e539f2dc8e5b26cdc75600ca552bc1e694503c1"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:10"
 command = "validate-json"
-fingerprint = "sha256:af7966364875e9d1824c87c6445f5a9a800db5e219eda3cc47abfac172fd92d6"
+fingerprint = "sha256:9c99d3d03810b7996b0c020aca1be9a028c7ffabe6a8b452a9747ee31668d104"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:11"
-command = "validate-bash"
-fingerprint = "sha256:648d15790f9515f248a32b2ee0f7eb3651496444a3151672d97dc4c50f960e99"
+command = "validate-json"
+fingerprint = "sha256:af7966364875e9d1824c87c6445f5a9a800db5e219eda3cc47abfac172fd92d6"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:12"
 command = "validate-bash"
-fingerprint = "sha256:31271a7f2dba485309a8460473c76fe364bb8668d824a45432f7e01e2589481d"
+fingerprint = "sha256:648d15790f9515f248a32b2ee0f7eb3651496444a3151672d97dc4c50f960e99"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:13"
 command = "validate-bash"
-fingerprint = "sha256:b6b4d3729a1b059ba08b4a34be111715fddd784f65afa706f356c52e752cb4a5"
+fingerprint = "sha256:31271a7f2dba485309a8460473c76fe364bb8668d824a45432f7e01e2589481d"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:14"
 command = "validate-bash"
-fingerprint = "sha256:4c69ee2b9a7b9bcfced05a1805343b66d35eff22d39c680a49562d17de946e2b"
+fingerprint = "sha256:b6b4d3729a1b059ba08b4a34be111715fddd784f65afa706f356c52e752cb4a5"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:15"
-command = "validate-json"
-fingerprint = "sha256:eaa3908b9ff305c980567371db6bee32f8ccb9bd5eca54a053649e64cb65d002"
+command = "validate-bash"
+fingerprint = "sha256:4c69ee2b9a7b9bcfced05a1805343b66d35eff22d39c680a49562d17de946e2b"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:16"
 command = "validate-json"
-fingerprint = "sha256:0c4112f21ccba1b220ab78b661991cf7707538a3cf3584225165105fb9b82694"
+fingerprint = "sha256:eaa3908b9ff305c980567371db6bee32f8ccb9bd5eca54a053649e64cb65d002"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:17"
 command = "validate-json"
-fingerprint = "sha256:aa486320e0e61a54724059cabf999db89e151dcd2a6ce9bea42d3dd1b7c8a669"
+fingerprint = "sha256:0c4112f21ccba1b220ab78b661991cf7707538a3cf3584225165105fb9b82694"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:18"
 command = "validate-json"
-fingerprint = "sha256:55106ecf398801704ab920cd7f74fbf17cdf664662d11f23ce6de916c06a2043"
+fingerprint = "sha256:aa486320e0e61a54724059cabf999db89e151dcd2a6ce9bea42d3dd1b7c8a669"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:19"
+command = "validate-json"
+fingerprint = "sha256:55106ecf398801704ab920cd7f74fbf17cdf664662d11f23ce6de916c06a2043"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:20"
 command = "validate-bash"
 fingerprint = "sha256:664b9692eabca626528b09ac1d49a3be624a4920c0ba4ec892220894f200512b"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:20"
+selector = "fence:21"
 command = "validate-json"
 fingerprint = "sha256:d81e6f6e0cbc905512b5f9d4a11767c22b3a5a87c5d4e3dc7b3fb9a8942d1ab6"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:21"
+selector = "fence:22"
 command = "validate-json"
 fingerprint = "sha256:7487aa96c87058c91602e4a736e952f06f800a93ca5aa6b32c29182893d39076"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:22"
+selector = "fence:23"
 command = "validate-json"
-fingerprint = "sha256:193eb92412956f3bdda38b0fe43015d7050a2ef31382eba035932ede9435a64e"
+fingerprint = "sha256:bb5fb425d6835f867346306a33d19b1595359471f94da5067b076f94415aa4aa"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:23"
+selector = "fence:24"
 command = "validate-bash"
 fingerprint = "sha256:a7fae8b7e87fd15eeaae4e64647ecc2f41560e5f6f9f623391318155cfc7c287"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:24"
+selector = "fence:25"
 command = "validate-json"
 fingerprint = "sha256:b76f19e03b85d55450a4729a1da639aac25e81badd5ec164316063422aaa0131"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:25"
+selector = "fence:26"
 command = "validate-json"
-fingerprint = "sha256:be4c6cd35d18675f06c5485e1e60f95c335bab2a8120f026e0b5636c7114bd64"
+fingerprint = "sha256:0446d396bc862e8da7a1eb378cf35a69e93353524d8833557224b908ee8f303a"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:26"
+selector = "fence:27"
 command = "validate-bash"
 fingerprint = "sha256:7a2284ad487261173682631b441bd43b7b5f04b88c214837fa111a850be98cf1"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:27"
+selector = "fence:28"
 command = "validate-json"
 fingerprint = "sha256:dab797c4d280e9b853811184231f82532757c5caf28c3d2a1c9436d671c40312"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:28"
-command = "validate-json"
-fingerprint = "sha256:d5273e78c64d6833c9f7ff835b8d7661bf93cb028a942e210321d9a0809deadd"
-
-[[snippets]]
-path = "docs/guide/api-reference.md"
 selector = "fence:29"
-command = "validate-bash"
-fingerprint = "sha256:301762f08cfee88660285b7974a6a2b2df9c3e2d6a3461077e1d57359ce1d18c"
+command = "validate-json"
+fingerprint = "sha256:9aa3db3f9408bcbc459311de9d9627cd1c01a58fee43f8af861919575e280a00"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:30"
 command = "validate-bash"
-fingerprint = "sha256:876d60bd11767c15a91f4eace51e745fa8fcd40a4020d764b02b82fbd160cade"
+fingerprint = "sha256:301762f08cfee88660285b7974a6a2b2df9c3e2d6a3461077e1d57359ce1d18c"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
 selector = "fence:31"
+command = "validate-bash"
+fingerprint = "sha256:876d60bd11767c15a91f4eace51e745fa8fcd40a4020d764b02b82fbd160cade"
+
+[[snippets]]
+path = "docs/guide/api-reference.md"
+selector = "fence:32"
 command = "validate-json"
 fingerprint = "sha256:9ab0788952d95995210fb958b5c15c0eb16a08da1ba0f3eee307466c7908073d"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:32"
+selector = "fence:33"
 command = "validate-bash"
 fingerprint = "sha256:ca2b61fa0c4cd8d605ed9dea6dde9fd0822673130d54c66909a2df120336b638"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:33"
+selector = "fence:34"
 command = "illustrative-html"
 fingerprint = "sha256:89e602f872c3e7735b8e9938a7ff90ddfddeb9e341c291c1b89349d7bbd80001"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:34"
+selector = "fence:35"
 command = "validate-bash"
 fingerprint = "sha256:ac78b0307547adc1661c72a74536c76fbc203f803d3e26521c89595d37827edf"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
-selector = "fence:35"
-command = "validate-json"
-fingerprint = "sha256:042e110feb2bf7c9f4e35cb191d5d1e448badec945cb300cf0c84db9b2299972"
-
-[[snippets]]
-path = "docs/guide/api-reference.md"
 selector = "fence:36"
 command = "validate-json"
-fingerprint = "sha256:26cbd02fb7b44b5d6f871b4a98b1c3997a72c2a7779c9e01c777ea46c07f9a38"
+fingerprint = "sha256:042e110feb2bf7c9f4e35cb191d5d1e448badec945cb300cf0c84db9b2299972"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
@@ -984,12 +984,6 @@ path = "docs/guide/api-reference.md"
 selector = "fence:38"
 command = "validate-bash"
 fingerprint = "sha256:4a9bd5c411760cb9d569566bf27b17d6458c8621585b34ad7baa1e29fa0c24bd"
-
-[[snippets]]
-path = "docs/guide/api-reference.md"
-selector = "fence:39"
-command = "validate-toml"
-fingerprint = "sha256:5ceb806cfa8372538a62180f9c9e6997f8ba1cd9a3c2b84a309b12a3a89d79b6"
 
 [[snippets]]
 path = "docs/guide/architecture.md"

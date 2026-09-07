@@ -10,6 +10,8 @@ health = "pre_router"
 startup_status = 500
 startup_health = true
 provider_fanout = "multiple"
+trusted_client_ip = "entry_point_resolve_and_sanitize"
+request_normalization = "none"
 
 [[adapters]]
 id = "axum"
@@ -20,6 +22,8 @@ health = "real"
 startup_status = 500
 startup_health = false
 provider_fanout = "multiple"
+trusted_client_ip = "outermost_sanitize"
+request_normalization = "none"
 
 [[adapters]]
 id = "cloudflare"
@@ -30,13 +34,17 @@ health = "absent"
 startup_status = 500
 startup_health = false
 provider_fanout = "single"
+trusted_client_ip = "outermost_sanitize"
+request_normalization = "none"
 
 [[adapters]]
 id = "spin"
-release_status = "development"
+release_status = "experimental"
 owner = "aram356"
 reviewed_at = "2026-09-05"
 health = "real"
 startup_status = 503
 startup_health = true
 provider_fanout = "single"
+trusted_client_ip = "outermost_sanitize"
+request_normalization = "innermost_spin_headers"

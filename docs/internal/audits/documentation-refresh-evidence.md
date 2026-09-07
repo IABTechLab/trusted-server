@@ -3477,8 +3477,58 @@ commit SHA.
 
 #### Task 12 — Complete WP4 generated API contracts
 
-Pending. Record route-set equality, adapter predicates, generated no-diff, and
-adapter regression suites for any private seam.
+Started from clean SHA `8dd55dec2409270c11ccba2f5080af031ea3558b`.
+The immutable `origin/rc/202608` baseline remained
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
+
+- The first route-reader test failed to compile because no route-to-Markdown
+  renderer existed. After adding the contract seam, the next run failed on the
+  deliberately absent generated declaration. The completed negative mutates
+  `/verify-signature` in the checked record and proves the unchanged reader page
+  differs; the existing unknown-Cloudflare-builder negative continues to fail
+  closed. Separate middleware negatives remove Fastly's entry-point resolver,
+  reorder Axum middleware, and replace Spin normalization; retained comment
+  decoys do not satisfy the syntax-tree checks, and all mutations are rejected.
+- Three generated regions now render directly from `routes.toml`,
+  `adapter-support.toml`, and `integrations.toml`: adapter startup/maturity,
+  provider fan-out, trusted-client-IP and request-normalization facts; the full
+  normal and degraded route matrix; and every integration route/predicate.
+  Spin's checked release status is `experimental`, matching the deployment
+  evidence instead of implying development maturity.
+  Didomi's configured-prefix family and Prebid's configured script-pattern
+  family are symbolic records rather than frozen copies of their defaults.
+  Region declarations contain no copied rows. Standalone `routes --check` also
+  rejects an unregenerated reader page, and standalone generation rejects an
+  invalid operational-support record before rendering it.
+- The manual ownership region covers every generated route family. It records
+  per-endpoint auth, request/response schemas, status behavior, cache/CORS,
+  configuration gates, rate limiting, and either a concrete example or a typed
+  not-applicable value. It distinguishes `/first-party/sign` minting from the
+  signed validation performed by proxy, click, and rebuild. The former global
+  claims of uniform JSON errors, CORS, and numeric rate limits were removed;
+  the actual endpoint-specific boundaries replace them.
+- Focused route tests passed all 70 cases. `routes --check`,
+  `generate --check`, and `snippets --check` passed, and a second generated run
+  produced no diff. Documentation ESLint, Prettier, and VitePress build passed.
+  Cloudflare passed 46 unit/route tests and Spin passed 88. The first Fastly
+  run was blocked by sandboxed macOS keychain access and the first Axum run by
+  sandboxed loopback binding; identical unsandboxed reruns passed Fastly's
+  175 adapter, 2,425 core, 2 JS, 21 OpenRTB, and 4 executed doctests, and all 43
+  Axum unit/route tests. No adapter source seam required modification.
+- Standalone formatting and all-target, all-feature clippy with warnings denied
+  passed. The complete standalone suite passed all 400 tests. The all-tracked
+  sensitive scan, local-link check, classification check, and full offline
+  `check --all` aggregate passed.
+- The root and standalone lockfile hashes remained, respectively,
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`
+  and `234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
+- Sensitive-value regeneration rebased only exact offsets for the page's
+  already-reviewed public DataDome, advertiser, and Permutive domains and the
+  synthetic `admin_password` secret-store key. No credential, token, or service
+  identifier exception was added.
+
+The exact WP4 commit is recorded immediately after the repository checkpoint;
+no hosted receipt is inferred from local verification.
 
 #### Task 13 — Add deployment guides and recurring first-success smokes
 

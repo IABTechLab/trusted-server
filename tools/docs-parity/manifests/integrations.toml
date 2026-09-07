@@ -99,8 +99,8 @@ js_mode = "bundled"
 
 [[capabilities]]
 id = "didomi"
-predicate = "enabled=true"
-proxy_routes = ["GET /integrations/didomi/consent/*", "POST /integrations/didomi/consent/*"]
+predicate = "enabled=true;prefix=proxy_path||/integrations/didomi/consent"
+proxy_routes = ["GET <prefix>/*", "POST <prefix>/*"]
 head_injectors = ["didomi"]
 js_mode = "bundled"
 
@@ -153,8 +153,8 @@ js_mode = "bundled"
 
 [[capabilities]]
 id = "prebid"
-predicate = "enabled=true"
-proxy_routes = ["GET /integrations/prebid/bundle.js", "GET /prebid.js", "GET /prebid.min.js", "GET /prebidjs.js", "GET /prebidjs.min.js"]
+predicate = "enabled=true;script_patterns=config-derived"
+proxy_routes = ["GET /integrations/prebid/bundle.js", "GET <integrations.prebid.script_patterns[]>"]
 attribute_rewriters = ["prebid"]
 head_injectors = ["prebid"]
 js_mode = "deferred"

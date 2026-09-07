@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
 
+use docs_parity::integrations::IntegrationInventory;
+use docs_parity::markdown::{OwnershipRecord, render_generated_document};
 use docs_parity::routes::{
     AdapterSupportManifest, RouteManifest, RouteRecord, RouteShape, RouteSources, RouteStatus,
-    extract_cloudflare_routes, extract_named_routes, extract_repository_routes,
-    validate_adapter_support, validate_routes,
+    documentation_regions, extract_cloudflare_routes, extract_named_routes,
+    extract_repository_routes, validate_adapter_support, validate_documentation_contract,
+    validate_middleware_sources, validate_routes,
 };
 
 fn route(
@@ -278,6 +281,91 @@ fn cloudflare_unknown_builder_construct_fails_closed() {
             .to_string()
             .contains("unsupported Cloudflare")
     );
+}
+
+#[test]
+fn route_documentation_is_bound_to_checked_route_and_integration_records() {
+    let routes = RouteManifest::parse(include_str!("../manifests/routes.toml"))
+        .expect("reviewed route manifest should parse");
+    let support = AdapterSupportManifest::parse(include_str!("../manifests/adapter-support.toml"))
+        .expect("reviewed adapter support should parse");
+    let integrations = IntegrationInventory::parse(include_str!("../manifests/integrations.toml"))
+        .expect("reviewed integration inventory should parse");
+    let pages = include_str!("../manifests/pages.toml");
+
+    validate_documentation_contract(&routes, &support, &integrations, pages)
+        .expect("the API region declarations should match their checked records");
+
+    let ownership = [OwnershipRecord {
+        name: "api-contract-details".to_owned(),
+        owner: "documentation-maintainers".to_owned(),
+    }];
+    let api_reference = include_bytes!("../../../docs/guide/api-reference.md");
+    let rendered = render_generated_document(
+        api_reference,
+        &documentation_regions(&routes, &support, &integrations),
+        &ownership,
+    )
+    .expect("checked route regions should render");
+    assert!(
+        rendered == api_reference,
+        "the reader-facing route tables must match their generated records"
+    );
+
+    let changed_source = include_str!("../manifests/routes.toml").replacen(
+        "path = \"/verify-signature\"",
+        "path = \"/verify-signature-v2\"",
+        1,
+    );
+    let changed =
+        RouteManifest::parse(&changed_source).expect("changed route fixture should parse");
+    let changed_render = render_generated_document(
+        api_reference,
+        &documentation_regions(&changed, &support, &integrations),
+        &ownership,
+    )
+    .expect("changed route fixture should render");
+    assert_ne!(
+        changed_render, api_reference,
+        "a checked route change must reject an unregenerated API reference"
+    );
+}
+
+#[test]
+fn adapter_middleware_documentation_is_bound_to_source_order() {
+    let fastly = include_str!("../../../crates/trusted-server-adapter-fastly/src/main.rs");
+    let axum = include_str!("../../../crates/trusted-server-adapter-axum/src/app.rs");
+    let cloudflare = include_str!("../../../crates/trusted-server-adapter-cloudflare/src/app.rs");
+    let spin = include_str!("../../../crates/trusted-server-adapter-spin/src/app.rs");
+    validate_middleware_sources(fastly, axum, cloudflare, spin)
+        .expect("checked middleware order should pass");
+
+    let changed_fastly = format!(
+        "{}\n// compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip)\n",
+        fastly.replace(
+            "compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip)",
+            "compat::sanitize_only(&mut req)",
+        )
+    );
+    assert!(validate_middleware_sources(&changed_fastly, axum, cloudflare, spin).is_err());
+
+    let changed_axum = format!(
+        "{}\n// .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))\n// .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))\n// .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))\n",
+        axum.replace(
+            ".middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))\n        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))\n        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))",
+            ".middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))\n        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))\n        .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))",
+        )
+    );
+    assert!(validate_middleware_sources(fastly, &changed_axum, cloudflare, spin).is_err());
+
+    let changed_spin = format!(
+        "{}\n// .middleware(NormalizeMiddleware::new())\n",
+        spin.replace(
+            ".middleware(NormalizeMiddleware::new())",
+            ".middleware(AuthMiddleware::new(Arc::clone(&state.settings)))",
+        )
+    );
+    assert!(validate_middleware_sources(fastly, axum, cloudflare, &changed_spin).is_err());
 }
 
 #[test]
@@ -2155,6 +2243,8 @@ fn route_and_support_manifests_reject_duplicates_unknown_fields_and_bad_ownershi
         startup_status = 500
         startup_health = true
         provider_fanout = "multiple"
+        trusted_client_ip = "entry_point_resolve_and_sanitize"
+        request_normalization = "none"
     "#;
     assert!(
         AdapterSupportManifest::parse(support)
@@ -2168,6 +2258,18 @@ fn route_and_support_manifests_reject_duplicates_unknown_fields_and_bad_ownershi
             .to_string()
             .contains("ownership")
     );
+    let experimental = support
+        .replace("owner = \"\"", "owner = \"reviewer\"")
+        .replace(
+            "reviewed_at = \"2026-99-99\"",
+            "reviewed_at = \"2026-09-07\"",
+        )
+        .replace(
+            "release_status = \"production\"",
+            "release_status = \"experimental\"",
+        );
+    AdapterSupportManifest::parse(&experimental)
+        .expect("experimental is a supported adapter maturity");
 }
 
 #[test]
@@ -2182,6 +2284,8 @@ fn adapter_support_manifest_caps_rows_and_every_string() {
         startup_status = 500
         startup_health = true
         provider_fanout = "multiple"
+        trusted_client_ip = "entry_point_resolve_and_sanitize"
+        request_normalization = "none"
     "#;
     let too_many = format!("version = 1\nreviewed = true\n{}", row.repeat(4097));
     assert!(AdapterSupportManifest::parse(&too_many).is_err());
@@ -2319,6 +2423,8 @@ fn adapter_support_rejects_duplicate_operational_rows() {
         startup_status = 500
         startup_health = true
         provider_fanout = "multiple"
+        trusted_client_ip = "entry_point_resolve_and_sanitize"
+        request_normalization = "none"
     "#;
     let source = format!("version = 1\nreviewed = true\n{row}\n{row}");
     assert!(

@@ -537,3 +537,23 @@ cells = ["`TrustedClientIpConfig.shared_secret`", "canonical", "canonical", "ser
 name = "configuration-reference"
 path = "docs/guide/configuration.md"
 owner = "documentation-maintainers"
+
+[[regions]]
+name = "api-adapter-support"
+path = "docs/guide/api-reference.md"
+columns = ["Adapter", "Release status", "Health", "Startup status", "Startup health", "Provider fan-out", "Trusted-client-IP handling", "Request normalization"]
+
+[[regions]]
+name = "api-route-availability"
+path = "docs/guide/api-reference.md"
+columns = ["Router", "Path", "Methods", "Shape", "Predicate", "Fastly", "Axum", "Cloudflare", "Spin"]
+
+[[regions]]
+name = "api-integration-route-families"
+path = "docs/guide/api-reference.md"
+columns = ["Integration", "Registration predicate", "HTTP routes"]
+
+[[ownership]]
+name = "api-contract-details"
+path = "docs/guide/api-reference.md"
+owner = "documentation-maintainers"
