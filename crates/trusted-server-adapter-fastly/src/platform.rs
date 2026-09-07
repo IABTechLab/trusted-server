@@ -1024,6 +1024,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn edge_request_to_fastly_preserves_canonical_didomi_query() {
+        let expected_query = "space=a+b&plus=%2B&quote=%27&empty=&x=1&x=2&country=US&region=CA";
+        let request = request_builder()
+            .method("GET")
+            .uri(format!(
+                "https://sdk.privacy-center.org/key/loader.js?{expected_query}"
+            ))
+            .body(Body::empty())
+            .expect("should build canonical Didomi request");
+
+        let fastly_req = edge_request_to_fastly(request).expect("should convert request");
+
+        assert_eq!(
+            fastly_req.get_url().query(),
+            Some(expected_query),
+            "should preserve the canonical Didomi query across Fastly conversion"
+        );
+        assert_eq!(
+            fastly_req
+                .get_url()
+                .query_pairs()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("country"))
+                .count(),
+            1,
+            "should retain exactly one country pair"
+        );
+        assert_eq!(
+            fastly_req
+                .get_url()
+                .query_pairs()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("region"))
+                .count(),
+            1,
+            "should retain exactly one region pair"
+        );
+    }
+
     // --- FastlyPlatformBackend::predict_name --------------------------------
 
     #[test]
