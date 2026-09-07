@@ -117,6 +117,17 @@ enum DidomiGeoError {
     InvalidRegion,
 }
 
+impl DidomiGeoError {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::MissingCountry => "missing_country",
+            Self::MissingRegion => "missing_region",
+            Self::InvalidCountry => "invalid_country",
+            Self::InvalidRegion => "invalid_region",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct CanonicalLoaderUrl {
     browser_target: String,
@@ -254,6 +265,7 @@ impl DidomiIntegration {
         client_ip: Option<std::net::IpAddr>,
         original_headers: &HeaderMap<HeaderValue>,
         proxy_headers: &mut HeaderMap<HeaderValue>,
+        authoritative_geo: Option<&DidomiGeo>,
     ) {
         if let Some(ip) = client_ip {
             proxy_headers.insert(
@@ -282,7 +294,24 @@ impl DidomiIntegration {
         }
 
         if matches!(backend, DidomiBackend::Sdk) {
-            Self::copy_geo_headers(original_headers, proxy_headers);
+            if let Some(geo) = authoritative_geo {
+                Self::set_geo_headers(geo, proxy_headers);
+            } else {
+                Self::copy_geo_headers(original_headers, proxy_headers);
+            }
+        }
+    }
+
+    fn set_geo_headers(geo: &DidomiGeo, proxy_headers: &mut HeaderMap<HeaderValue>) {
+        for (name, value) in [
+            ("X-Geo-Country", geo.country.as_str()),
+            ("X-Geo-Region", geo.region.as_str()),
+            ("CloudFront-Viewer-Country", geo.country.as_str()),
+        ] {
+            proxy_headers.insert(
+                name,
+                HeaderValue::from_str(value).expect("should format validated Didomi geo header"),
+            );
         }
     }
 
@@ -323,6 +352,29 @@ impl DidomiIntegration {
         origin: &str,
     ) -> Result<String, Report<TrustedServerError>> {
         ensure_integration_backend(services, origin, DIDOMI_INTEGRATION_ID, None)
+    }
+
+    fn geo_failure_response(reason: &str) -> http::Response<EdgeBody> {
+        log::warn!("Didomi loader geo unavailable: reason={reason}");
+        let mut response = http::Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(EdgeBody::from("Didomi loader unavailable"))
+            .expect("should build static Didomi geo failure response");
+        crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response);
+        response
+    }
+
+    fn redirect_response(
+        location: &str,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let mut response = http::Response::builder()
+            .status(http::StatusCode::TEMPORARY_REDIRECT)
+            .header(header::LOCATION, location)
+            .body(EdgeBody::empty())
+            .change_context(Self::error("Failed to build Didomi geo redirect"))?;
+        crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response);
+        Ok(response)
     }
 }
 
@@ -384,13 +436,41 @@ impl IntegrationProxy for DidomiIntegration {
         let prefix = self.resolved_prefix();
         let consent_path = path.strip_prefix(&prefix).unwrap_or(&path);
         let backend = self.backend_for_path(consent_path);
+        let canonical_loader = if self.config.geo_query_parameters
+            && matches!(backend, DidomiBackend::Sdk)
+            && is_notice_loader(&parts.method, consent_path)
+        {
+            let geo = match services.geo().lookup(services.client_info().client_ip) {
+                Ok(Some(geo)) => match normalize_didomi_geo(&geo) {
+                    Ok(geo) => geo,
+                    Err(error) => return Ok(Self::geo_failure_response(error.reason())),
+                },
+                Ok(None) => return Ok(Self::geo_failure_response("geo_unavailable")),
+                Err(_) => return Ok(Self::geo_failure_response("lookup_failed")),
+            };
+            let canonical = canonical_loader_url(&path, parts.uri.query(), &geo);
+            let incoming_path_and_query = parts
+                .uri
+                .path_and_query()
+                .map_or(path.as_str(), http::uri::PathAndQuery::as_str);
+            if incoming_path_and_query != canonical.browser_target {
+                return Self::redirect_response(&canonical.browser_target);
+            }
+            Some((geo, canonical))
+        } else {
+            None
+        };
         let base_origin = match backend {
             DidomiBackend::Sdk => self.config.sdk_origin.as_str(),
             DidomiBackend::Api => self.config.api_origin.as_str(),
         };
+        let query = canonical_loader.as_ref().map_or_else(
+            || parts.uri.query(),
+            |(_, canonical)| Some(&*canonical.query),
+        );
 
         let target_url = self
-            .build_target_url(base_origin, consent_path, parts.uri.query())
+            .build_target_url(base_origin, consent_path, query)
             .change_context(Self::error("Failed to build Didomi target URL"))?;
         let backend_name = Self::backend_name_for_origin(services, base_origin)
             .change_context(Self::error("Failed to configure Didomi backend"))?;
@@ -414,6 +494,7 @@ impl IntegrationProxy for DidomiIntegration {
             services.client_info().client_ip,
             &parts.headers,
             proxy_req.headers_mut(),
+            canonical_loader.as_ref().map(|(geo, _)| geo),
         );
 
         let mut response = services
@@ -462,15 +543,37 @@ impl IntegrationHeadInjector for DidomiIntegration {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
-    use crate::platform::GeoInfo;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::platform::test_support::{
+        NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient,
+        build_services_with_http_client,
+    };
+    use crate::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use http::Method;
-    use std::net::{IpAddr, Ipv4Addr};
+
+    enum GeoResult {
+        Value(Option<GeoInfo>),
+        Failure,
+    }
+
+    struct StubGeo(GeoResult);
+
+    impl PlatformGeo for StubGeo {
+        fn lookup(
+            &self,
+            _client_ip: Option<IpAddr>,
+        ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            match &self.0 {
+                GeoResult::Value(geo) => Ok(geo.clone()),
+                GeoResult::Failure => Err(Report::new(PlatformError::Geo)),
+            }
+        }
+    }
 
     fn config(enabled: bool) -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
@@ -493,6 +596,31 @@ mod tests {
             region: region.map(str::to_string),
             asn: None,
         }
+    }
+
+    fn config_with_geo_query_parameters() -> DidomiIntegrationConfig {
+        DidomiIntegrationConfig {
+            geo_query_parameters: true,
+            ..config(true)
+        }
+    }
+
+    fn services_with_geo(
+        http_client: Arc<StubHttpClient>,
+        geo_result: GeoResult,
+    ) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(StubBackend))
+            .http_client(http_client)
+            .geo(Arc::new(StubGeo(geo_result)))
+            .client_info(ClientInfo {
+                client_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+                ..ClientInfo::default()
+            })
+            .build()
     }
 
     #[test]
@@ -651,6 +779,194 @@ mod tests {
     }
 
     #[test]
+    fn enabled_geo_redirects_noncanonical_loader_without_upstream_call() {
+        let stub = Arc::new(StubHttpClient::new());
+        let services = services_with_geo(
+            Arc::clone(&stub),
+            GeoResult::Value(Some(geo_info("us", Some("ca")))),
+        );
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/integrations/didomi/consent/key/loader.js?target_type=notice&Country=GB&region=LND")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should return redirect");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::TEMPORARY_REDIRECT,
+            "should redirect to the canonical loader URL"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(
+                "/integrations/didomi/consent/key/loader.js?target_type=notice&country=US&region=CA"
+            ),
+            "should use a relative target with authoritative geo"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store, private"),
+            "should make the redirect private and non-storable"
+        );
+        assert!(
+            stub.recorded_backend_names().is_empty(),
+            "should not contact Didomi before canonical redirect"
+        );
+    }
+
+    #[test]
+    fn enabled_geo_proxies_canonical_loader_with_authoritative_headers() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"loader".to_vec());
+        let services = services_with_geo(
+            Arc::clone(&stub),
+            GeoResult::Value(Some(geo_info("us", Some("us-ca")))),
+        );
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/integrations/didomi/consent/key/loader.js?target_type=notice&country=US&region=CA")
+            .header("FastlyGeo-CountryCode", "GB")
+            .header("FastlyGeo-Region", "LND")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should proxy canonical loader");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec![
+                "https://sdk.privacy-center.org/key/loader.js?target_type=notice&country=US&region=CA"
+            ],
+            "should send the canonical query to Didomi"
+        );
+        let headers = stub.recorded_request_headers();
+        for (name, expected) in [
+            ("x-geo-country", "US"),
+            ("x-geo-region", "CA"),
+            ("cloudfront-viewer-country", "US"),
+        ] {
+            assert!(
+                headers[0]
+                    .iter()
+                    .any(|(actual_name, value)| actual_name == name && value == expected),
+                "should set {name} from authoritative geo"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_geo_preserves_existing_loader_behavior() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"loader".to_vec());
+        let services = services_with_geo(
+            Arc::clone(&stub),
+            GeoResult::Value(Some(geo_info("US", Some("CA")))),
+        );
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/integrations/didomi/consent/key/loader.js?target_type=notice")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should proxy loader");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://sdk.privacy-center.org/key/loader.js?target_type=notice"],
+            "should not add geo when the option is disabled"
+        );
+    }
+
+    #[test]
+    fn enabled_geo_leaves_unrelated_sdk_assets_unchanged() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"sdk".to_vec());
+        let services = services_with_geo(Arc::clone(&stub), GeoResult::Failure);
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/integrations/didomi/consent/sdk/v1/core.js?v=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should proxy unrelated SDK asset");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://sdk.privacy-center.org/sdk/v1/core.js?v=1"],
+            "should not apply loader geo behavior to other SDK assets"
+        );
+    }
+
+    #[test]
+    fn enabled_geo_fails_closed_without_complete_geo() {
+        for geo_result in [
+            GeoResult::Value(None),
+            GeoResult::Value(Some(geo_info("US", None))),
+            GeoResult::Value(Some(geo_info("XX", Some("CA")))),
+            GeoResult::Failure,
+        ] {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_geo(Arc::clone(&stub), geo_result);
+            let settings = create_test_settings();
+            let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
+            let request = http::Request::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/integrations/didomi/consent/key/loader.js")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let response =
+                futures::executor::block_on(integration.handle(&settings, &services, request))
+                    .expect("should return controlled geo failure");
+
+            assert_eq!(
+                response.status(),
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "should fail closed without complete trusted geo"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store, private"),
+                "should make geo failures private and non-storable"
+            );
+            assert!(
+                stub.recorded_backend_names().is_empty(),
+                "should not contact Didomi on geo failure"
+            );
+        }
+    }
+
+    #[test]
     fn selects_api_backend_for_api_paths() {
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         assert!(matches!(
@@ -707,6 +1023,7 @@ mod tests {
             client_ip,
             original_req.headers(),
             proxy_req.headers_mut(),
+            None,
         );
 
         assert_eq!(
@@ -743,6 +1060,7 @@ mod tests {
             None,
             original_req.headers(),
             proxy_req.headers_mut(),
+            None,
         );
 
         assert!(
@@ -867,6 +1185,7 @@ mod tests {
             None,
             original_req.headers(),
             proxy_req.headers_mut(),
+            None,
         );
 
         assert!(
