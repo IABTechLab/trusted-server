@@ -870,8 +870,9 @@ git push origin spec-docs-refresh
 - Modify: `docs/guide/creative-processing.md`
 - Modify: `docs/guide/error-reference.md`
 - Modify: `docs/guide/integration-guide.md`
-- Modify: `docs/guide/roadmap.md`
+- Modify: `docs/roadmap.md`
 - Modify: `docs/guide/integrations/gam.md`
+- Modify: `docs/guide/integrations/gpt.md`
 - Modify: `docs/guide/integrations/kargo.md`
 - Modify: `docs/.vitepress/config.mts`
 - Create: `docs/guide/auction-testing.md`
@@ -896,20 +897,22 @@ git push origin spec-docs-refresh
 - Modify: `tools/docs-parity/manifests/snippets.toml`
 - Modify: `tools/docs-parity/manifests/pages.toml`
 - Modify: `tools/docs-parity/manifests/orphans.toml`
+- Modify: `tools/docs-parity/src/markdown.rs`
+- Modify/Test: `tools/docs-parity/tests/links.rs`
 
-- [ ] **Step 1: Generate and fail the initial disposition inventory**
+- [x] **Step 1: Generate and fail the initial disposition inventory**
 
 Run the inventory command over all three active sets. Expected: check mode fails for every missing whole-file/region disposition and records the audited merge-base SHA plus candidate source anchors.
 
-- [ ] **Step 2: Disposition every candidate before rewriting**
+- [x] **Step 2: Disposition every candidate before rewriting**
 
 Choose verified/rewrite/retire/create for each file and region. Manually review semantic sensitivity beyond scanner patterns. The inventory is complete only when set equality holds; do not use a wildcard disposition.
 
-- [ ] **Step 3: Remove the named fabricated/retired content**
+- [x] **Step 3: Remove the named fabricated/retired content**
 
 Replace `RequestWrapper` with real platform traits; remove Equativ, `.with_asset`, `npm run type-check`, `settings_data::get_settings`, dead `SEQUENCE.md`, APS `mock`, stale auction provider layout/routes, and retired env overlay keys. Fix only `request_ext` reserved-field protection in docs and record the `imp_ext` code follow-up.
 
-- [ ] **Step 4: Resolve FAQ and tombstones**
+- [x] **Step 4: Resolve FAQ and tombstones**
 
 The selected FAQ branch is **archive**: move `FAQ_POC.md` to
 `docs/superpowers/archive/FAQ_POC.md`. The retire and rewrite instructions
@@ -918,42 +921,47 @@ reopened and this plan is amended and re-approved. The rejected retire and rewri
 tombstones, remove sidebar reachability, and add old-route/tombstone smokes to
 `pages.toml`.
 
-- [ ] **Step 5: Rewrite testing and operator records**
+- [x] **Step 5: Rewrite testing and operator records**
 
 Make root `TESTING.md` the test-matrix index, move the verified auction runbook into `docs/guide/auction-testing.md`, normalize the deterministic no-release CHANGELOG form, distinguish runtime env from CLI overlay, fix roadmap status, and repair the three known workflow/script comments.
 
 Record whether operator-visible CHANGELOG entries are complete for the audited range; if an entry is intentionally omitted, record the exact exclusion and source anchor. Formatting alone does not satisfy this check.
 
-- [ ] **Step 6: Reverify rc-delta content instead of blindly changing it**
+- [x] **Step 6: Reverify rc-delta content instead of blindly changing it**
 
 Check allowed-domain semantics, `/first-party/sign` 403 plus `href`/`base`, proxy-signing recommendation, and `--staging` limitation against code. Mark verified with anchors when correct; edit only proven drift.
 
-- [ ] **Step 7: Run full-set acceptance**
+- [x] **Step 7: Run full-set acceptance**
 
 ```bash
-cargo run --manifest-path tools/docs-parity/Cargo.toml -- inventory --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
-cargo run --manifest-path tools/docs-parity/Cargo.toml -- retired --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
-cargo run --manifest-path tools/docs-parity/Cargo.toml -- pages --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --local --check
 cd docs && npm run lint && npm run format && npm run build
 ```
+
+`classify --check` is the disposition-inventory gate, `scan --check` includes
+the retired-identifier denylist, and `links --local --check` includes the
+page/navigation/orphan/tombstone contract. These are the consolidated CLI
+surfaces implemented by Tasks 5, 6, and 9; no duplicate `inventory`, `retired`,
+or `pages` aliases are required.
 
 Assert that `docs/.vitepress/dist/guide/faq.html` and `/guide/faq` navigation are absent on the selected archive path.
 
 Expected: set equality passes; retired terms are absent from active sets with only the spec-defined historical exceptions; every executable fence has a valid manifest entry and diagnostic.
 
-- [ ] **Step 8: Run regression tests for any non-doc fixture changed**
+- [x] **Step 8: Run regression tests for any non-doc fixture changed**
 
 If `html_processor.test.html` changes, run `cargo test-fastly html_processor`. Run focused tests for every other non-Markdown fixture touched.
 
-- [ ] **Step 9: Commit WP2**
+- [x] **Step 9: Commit WP2**
 
 Stage the common WP2 paths first, then the selected archive branch and only the
 conditional fixture paths that actually changed:
 
 ```bash
-git add docs/internal/audits/documentation-refresh-inventory.toml docs/internal/audits/documentation-refresh-evidence.md docs/guide/ad-serving.md docs/guide/architecture.md docs/guide/configuration.md docs/guide/creative-processing.md docs/guide/error-reference.md docs/guide/integration-guide.md docs/guide/roadmap.md docs/guide/integrations/gam.md docs/guide/integrations/kargo.md docs/guide/auction-testing.md docs/.vitepress/config.mts TESTING.md CHANGELOG.md .env.example .env.dev .claude/agents/code-architect.md .claude/agents/issue-creator.md .github/workflows/test.yml scripts/test-cli.sh crates/trusted-server-core/src/auction/README.md crates/trusted-server-openrtb/generate.sh tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/retired-identifiers.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/orphans.toml
+git add docs/internal/audits/documentation-refresh-inventory.toml docs/internal/audits/documentation-refresh-evidence.md docs/guide/ad-serving.md docs/guide/architecture.md docs/guide/configuration.md docs/guide/creative-processing.md docs/guide/error-reference.md docs/guide/integration-guide.md docs/roadmap.md docs/guide/integrations/gam.md docs/guide/integrations/gpt.md docs/guide/integrations/kargo.md docs/guide/auction-testing.md docs/.vitepress/config.mts TESTING.md CHANGELOG.md .env.example .env.dev .claude/agents/code-architect.md .claude/agents/issue-creator.md .github/workflows/test.yml scripts/test-cli.sh crates/trusted-server-core/src/auction/README.md crates/trusted-server-openrtb/generate.sh tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/retired-identifiers.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/src/markdown.rs tools/docs-parity/tests/links.rs
 git add -A -- FAQ_POC.md docs/superpowers/archive/FAQ_POC.md
 # Only when the scanner required this fixture edit:
 git add crates/trusted-server-core/src/html_processor.test.html

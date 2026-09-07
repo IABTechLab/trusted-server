@@ -799,33 +799,17 @@ The Trusted Server JavaScript (TSJS) library is automatically injected:
 
 **Timing**: Injected **once per HTML response** before any other scripts.
 
-### Integration Bundles
+### Integration bundles
 
-Integrations can request additional bundles:
+The integration registry selects TSJS modules by enabled integration ID. A
+registered ID with a compiled module is included in the immediate unified
+bundle unless its builder calls `.with_deferred_js()`; deferred modules are
+served separately as `/static/tsjs=tsjs-<id>.min.js`. Builders can call
+`.without_js()` when the Rust integration must not select a TSJS module.
 
-```rust
-IntegrationRegistration::builder("my_integration")
-    .with_asset("my_integration")  // Requests tsjs-my_integration.min.js
-    .build()
-```
-
-**Result**:
-
-```html
-<head>
-  <script
-    async
-    src="/static/tsjs-core.min.js"
-    data-tsjs-integration="core"
-  ></script>
-  <script
-    async
-    src="/static/tsjs-my_integration.min.js"
-    data-tsjs-integration="my_integration"
-  ></script>
-  <!-- Rest of head content -->
-</head>
-```
+The always-present `creative` module and all immediate integration modules are
+served through `/static/tsjs=tsjs-unified.min.js`. Trusted Server does not
+accept an arbitrary asset name from an integration registration.
 
 ### Bundle Types
 

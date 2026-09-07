@@ -2079,17 +2079,23 @@ fn swapping_mermaid_content_between_selectors_reopens_review() {
 #[test]
 fn typed_page_tombstones_are_exact_and_require_live_replacements() {
     let repository = PublicationRepository::new();
+    write_file(repository.path(), "README.md", "# Repository\n[home](/)\n");
+    write_file(repository.path(), "docs/index.md", "# Home\n");
     let pages_path = repository
         .path()
         .join("tools/docs-parity/manifests/pages.toml");
     let pages = fs::read_to_string(&pages_path).expect("should read pages manifest");
-    let typed_pages = pages
-        + concat!(
-            "\n[[pages]]\n",
-            "kind = \"tombstone\"\n",
-            "route = \"/retired\"\n",
-            "replacement = \"/guide/\"\n",
-        );
+    let typed_pages = pages.replace(
+        concat!(
+            "[[pages]]\nkind = \"live\"\npath = \"docs/guide/index.md\"\n",
+            "route = \"/guide/\"\nnavigation = false\n",
+        ),
+        concat!(
+            "[[pages]]\nkind = \"tombstone\"\n",
+            "path = \"docs/guide/index.md\"\nroute = \"/guide/\"\n",
+            "replacement = \"/\"\n",
+        ),
+    );
     fs::write(&pages_path, typed_pages).expect("should write typed page manifest");
     write_file(
         repository.path(),
@@ -2098,8 +2104,8 @@ fn typed_page_tombstones_are_exact_and_require_live_replacements() {
             "version = 1\nreviewed = true\n\n",
             "[[exceptions]]\n",
             "kind = \"tombstone\"\n",
-            "route = \"/retired\"\n",
-            "replacement = \"/guide/\"\n",
+            "route = \"/guide/\"\n",
+            "replacement = \"/\"\n",
             "owner = \"docs-team\"\n",
             "reason = \"Route retained for a bounded migration.\"\n",
             "expires_at = \"2099-01-01T00:00:00Z\"\n",
@@ -2118,7 +2124,7 @@ fn typed_page_tombstones_are_exact_and_require_live_replacements() {
         .path()
         .join("tools/docs-parity/manifests/orphans.toml");
     let orphans = fs::read_to_string(&orphans_path).expect("should read orphans");
-    fs::write(&orphans_path, orphans.replace("/retired", "/extra-retired"))
+    fs::write(&orphans_path, orphans.replace("/guide/", "/extra-retired"))
         .expect("should make tombstone inventories differ");
     let mismatch = repository.check();
     assert_eq!(status_code(&mismatch), ERROR);
@@ -2126,11 +2132,50 @@ fn typed_page_tombstones_are_exact_and_require_live_replacements() {
 }
 
 #[test]
+fn a_tombstone_keeps_its_built_route_without_navigation_or_reachability() {
+    let repository = PublicationRepository::new();
+    write_file(repository.path(), "README.md", "# Repository\n[home](/)\n");
+    write_file(repository.path(), "docs/index.md", "# Home\n");
+    write_file(
+        repository.path(),
+        "tools/docs-parity/manifests/pages.toml",
+        concat!(
+            "version = 1\nreviewed = true\nsite_root = \"docs\"\n",
+            "vitepress_config = \"docs/.vitepress/config.mts\"\n\n",
+            "[[pages]]\nkind = \"live\"\npath = \"docs/index.md\"\n",
+            "route = \"/\"\nnavigation = true\n\n",
+            "[[pages]]\nkind = \"tombstone\"\n",
+            "path = \"docs/guide/index.md\"\nroute = \"/guide/\"\n",
+            "replacement = \"/\"\n",
+        ),
+    );
+    write_file(
+        repository.path(),
+        "tools/docs-parity/manifests/orphans.toml",
+        concat!(
+            "version = 1\nreviewed = true\n\n",
+            "[[exceptions]]\nkind = \"tombstone\"\nroute = \"/guide/\"\n",
+            "replacement = \"/\"\nowner = \"docs-team\"\n",
+            "reason = \"The old route explains its replacement.\"\n",
+            "expires_at = \"2099-01-01T00:00:00Z\"\n",
+        ),
+    );
+
+    let clean = repository.check();
+    assert_eq!(
+        status_code(&clean),
+        SUCCESS,
+        "a built tombstone should remain available without navigation: {}",
+        diagnostic(&clean)
+    );
+}
+
+#[test]
 fn tombstones_reject_live_collisions_missing_replacements_and_stale_targets() {
     for tombstone in [
-        "kind = \"tombstone\"\nroute = \"/guide/\"\nreplacement = \"/\"\n",
-        "kind = \"tombstone\"\nroute = \"/retired\"\n",
-        "kind = \"tombstone\"\nroute = \"/retired\"\nreplacement = \"/missing\"\n",
+        "kind = \"tombstone\"\npath = \"docs/guide/index.md\"\nroute = \"/guide/\"\nreplacement = \"/\"\n",
+        "kind = \"tombstone\"\npath = \"docs/retired.md\"\nroute = \"/retired\"\n",
+        "kind = \"tombstone\"\npath = \"docs/retired.md\"\nroute = \"/retired\"\nreplacement = \"/missing\"\n",
     ] {
         let repository = PublicationRepository::new();
         let pages_path = repository
@@ -2153,9 +2198,11 @@ fn tombstones_reject_live_collisions_missing_replacements_and_stale_targets() {
         &pages_path,
         pages
             + concat!(
-                "\n[[pages]]\nkind = \"tombstone\"\nroute = \"/retired\"\n",
+                "\n[[pages]]\nkind = \"tombstone\"\npath = \"docs/retired.md\"\n",
+                "route = \"/retired\"\n",
                 "replacement = \"/\"\n\n",
-                "[[pages]]\nkind = \"tombstone\"\nroute = \"/retired\"\n",
+                "[[pages]]\nkind = \"tombstone\"\npath = \"docs/retired.md\"\n",
+                "route = \"/retired\"\n",
                 "replacement = \"/guide/\"\n",
             ),
     )
@@ -2163,7 +2210,7 @@ fn tombstones_reject_live_collisions_missing_replacements_and_stale_targets() {
     let duplicate = repository.check();
     assert_eq!(status_code(&duplicate), ERROR);
     assert!(
-        diagnostic(&duplicate).contains("duplicate tombstone page"),
+        diagnostic(&duplicate).contains("duplicate page path"),
         "duplicate routes must fail before inventory comparison: {}",
         diagnostic(&duplicate)
     );

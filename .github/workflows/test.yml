@@ -223,15 +223,9 @@ jobs:
         run: cargo check-spin
 
       - name: Build Spin adapter release WASM
-        # Mirror the Fastly release-build overrides so the artifact embeds usable
-        # settings instead of the trusted-server.toml placeholders, which startup
-        # rejects (falling back to the generic 503 router). This proves the
-        # documented Spin artifact can boot, not just compile.
-        env:
-          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
-          TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
-          TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+        # This verifies the release artifact compiles. Spin loads runtime
+        # settings from its configured KV store; boot behavior is covered by a
+        # separately provisioned smoke test.
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -265,11 +259,9 @@ jobs:
         run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings
 
   test-cli:
-    # `trusted-server-cli` is a workspace member, but the workspace default target
-    # is wasm32-wasip1 (see .cargo/config.toml), where the crate is an empty shell
-    # — so the wasm workspace jobs do not exercise its real code. `ts dev proxy` is
-    # a macOS tool (Safari/keychain/networksetup), so validate the crate on macOS
-    # with an explicit native --target that overrides the wasm default.
+    # Adapter jobs set their WASM targets explicitly and do not exercise the
+    # CLI's native code. `ts dev proxy` is macOS-only, so this job validates the
+    # CLI with the runner's explicit native target.
     name: cargo test (ts CLI, native)
     runs-on: macos-latest
     steps:

@@ -3332,8 +3332,73 @@ for the standalone tool.
 
 #### Task 10 — Complete WP2 truth pass and dispositions
 
-Pending. Record full source/disposition equality, scanner results, tombstone
-smokes, and the selected archive move.
+Started from clean SHA `41df18044614ad94365c5e12b39d4e9d7c33c1cf`.
+The immutable `origin/rc/202608` baseline remained
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`; the root and standalone
+lockfile hashes remained, respectively,
+`9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`
+and `234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
+
+- The initial staged `classify --check` failed on the newly created
+  `docs/guide/auction-testing.md` because it had no disposition. The reviewed
+  inventory now names all 82 active-set whole files selected for the WP2 truth
+  pass without a wildcard: 63 verified, 17 rewritten, and two created paths.
+  The maintained-source manifest is the exhaustive candidate record: it
+  dispositions 703 whole-file candidates as 82 included and 621 typed-excluded,
+  and separately dispositions all 570 extracted comment regions as included
+  with no excluded comment region.
+  `FAQ_POC.md` moved to the VitePress-excluded historical archive at
+  `docs/superpowers/archive/FAQ_POC.md` and is not counted as an active source.
+- The semantic pass removed the fabricated `RequestWrapper`, Equativ,
+  `.with_asset`, `npm run type-check`, `settings_data::get_settings`,
+  `SEQUENCE.md`, APS `mock`, retired synthetic-overlay, and unsupported
+  GAM/Kargo claims. It documents the implemented `request_ext` reserved-member
+  guard without claiming a corresponding `imp_ext` guard. The scanner found no
+  real value requiring an edit to
+  `crates/trusted-server-core/src/html_processor.test.html`, so that fixture
+  remains unchanged.
+- GAM and Kargo remain at their old built routes as concise status tombstones,
+  are absent from navigation, and point to the live integrations overview.
+  The live GPT guide no longer directs readers to the retired GAM route.
+  The first path-bearing tombstone test failed because the closed page schema
+  rejected `path` as an unknown field. The implementation now includes
+  tombstone paths in exact built-route equality while excluding them from
+  navigation reachability and orphan calculation. The focused regression and
+  all 62 link integration tests passed.
+- Root `TESTING.md` is now the target-specific matrix index; the verified
+  auction procedure lives at `docs/guide/auction-testing.md`. The roadmap has
+  shipped, active-engineering, and unshipped sections without release dates.
+  Environment examples distinguish non-secret CLI overlays from runtime
+  secret-store material. The three stale workflow/script target comments were
+  corrected. CHANGELOG breaking-marker punctuation was normalized, the
+  unpublished `v1.2.0` comparison was removed, and the historical heading now
+  states that the tag was never published.
+- The audited range `origin/rc/202608..41df18044614ad94365c5e12b39d4e9d7c33c1cf`
+  contains documentation-program records, checks, generated inventories,
+  test-only visibility seams, and corrections to those checks; it introduces
+  no operator-visible product behavior requiring another Unreleased entry.
+  Existing operator-visible entries were retained. The exact source anchors
+  for allowed-domain matching, signing rejection and `href`/`base` handling,
+  proxy-signing guidance, the Fastly staging limitation, and FAQ exclusion are
+  recorded in `documentation-refresh-inventory.toml`.
+- The initial snippet check failed with the new auction-testing fence unlisted
+  and the removed third `TESTING.md` fence stale. Reconciliation preserved
+  commands for byte-identical fences, removed retired fences, and classified
+  each new Bash/TOML fence with its syntax validator. `snippets --check` then
+  passed.
+
+- Final acceptance passed `classify --check`, `scan --check`,
+  `snippets --check`, `links --local --check`, and the complete offline
+  `check --all` aggregate. Documentation ESLint, Prettier, and VitePress build
+  passed; the build emitted neither a FAQ artifact nor a FAQ navigation link
+  and did emit both status-tombstone artifacts. Shell syntax checks passed for
+  the two edited scripts. Standalone formatting and all-target, all-feature
+  clippy with warnings denied passed. All 397 standalone tests passed,
+  including all 62 link tests. No product fixture changed, so no additional
+  adapter regression target was required.
+
+The exact WP2 commit is recorded after creation; no receipt is inferred from
+the passing local checks.
 
 #### Task 11 — Complete WP3 configuration reference and template
 

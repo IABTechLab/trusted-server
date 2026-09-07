@@ -35,6 +35,12 @@ navigation = true
 
 [[pages]]
 kind = "live"
+path = "docs/guide/auction-testing.md"
+route = "/guide/auction-testing"
+navigation = true
+
+[[pages]]
+kind = "live"
 path = "docs/guide/cli.md"
 route = "/guide/cli"
 navigation = true
@@ -136,10 +142,10 @@ route = "/guide/integrations/didomi"
 navigation = true
 
 [[pages]]
-kind = "live"
+kind = "tombstone"
 path = "docs/guide/integrations/gam.md"
 route = "/guide/integrations/gam"
-navigation = true
+replacement = "/guide/integrations-overview"
 
 [[pages]]
 kind = "live"
@@ -160,10 +166,10 @@ route = "/guide/integrations/gpt"
 navigation = false
 
 [[pages]]
-kind = "live"
+kind = "tombstone"
 path = "docs/guide/integrations/kargo.md"
 route = "/guide/integrations/kargo"
-navigation = true
+replacement = "/guide/integrations-overview"
 
 [[pages]]
 kind = "live"

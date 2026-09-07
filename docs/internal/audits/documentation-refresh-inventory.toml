@@ -1,0 +1,148 @@
+version = 1
+reviewed = true
+audited_merge_base = "07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf"
+candidate_manifest = "tools/docs-parity/manifests/maintained-sources.toml"
+tracked_manifest = "tools/docs-parity/manifests/tracked-files.toml"
+
+# Every active-set whole file selected for the WP2 truth pass is named exactly
+# once below. The candidate manifest carries the exhaustive include or
+# typed-exclude disposition for all tracked text files and individually binds
+# every extracted comment by selector and fingerprint; region_rewrites names
+# the WP2 comment corrections.
+[whole_files]
+verified = [
+  ".claude/agents/build-validator.md",
+  ".claude/agents/code-simplifier.md",
+  ".claude/agents/pr-creator.md",
+  ".claude/agents/pr-reviewer.md",
+  ".claude/agents/repo-explorer.md",
+  ".claude/agents/verify-app.md",
+  ".claude/commands/check-ci.md",
+  ".claude/commands/review-changes.md",
+  ".claude/commands/test-all.md",
+  ".claude/commands/test-crate.md",
+  ".claude/commands/verify.md",
+  ".claude/skills/deploying-trusted-server-to-fastly/SKILL.md",
+  ".github/pull_request_template.md",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "CONTRIBUTING.md",
+  "ProjectGovernance.md",
+  "README.md",
+  "crates/trusted-server-core/README.md",
+  "crates/trusted-server-integration-tests/README.md",
+  "crates/trusted-server-openrtb/README.md",
+  "docs/README.md",
+  "docs/business-use-cases.md",
+  "docs/epics/revenue-operations-dashboard.md",
+  "docs/guide/api-reference.md",
+  "docs/guide/asset-routes.md",
+  "docs/guide/auction-orchestration.md",
+  "docs/guide/cli.md",
+  "docs/guide/collective-sync.md",
+  "docs/guide/ec-setup-guide.md",
+  "docs/guide/edge-cookies.md",
+  "docs/guide/fastly.md",
+  "docs/guide/first-party-proxy.md",
+  "docs/guide/gdpr-compliance.md",
+  "docs/guide/getting-started.md",
+  "docs/guide/index.md",
+  "docs/guide/integrations-overview.md",
+  "docs/guide/integrations/aps.md",
+  "docs/guide/integrations/datadome.md",
+  "docs/guide/integrations/didomi.md",
+  "docs/guide/integrations/google_tag_manager.md",
+  "docs/guide/integrations/gpt-diagnostics.md",
+  "docs/guide/integrations/lockr.md",
+  "docs/guide/integrations/nextjs.md",
+  "docs/guide/integrations/osano.md",
+  "docs/guide/integrations/permutive.md",
+  "docs/guide/integrations/prebid.md",
+  "docs/guide/integrations/sourcepoint.md",
+  "docs/guide/key-rotation.md",
+  "docs/guide/proxy-signing.md",
+  "docs/guide/request-signing.md",
+  "docs/guide/rsc-hydration.md",
+  "docs/guide/testing.md",
+  "docs/guide/ts-dev-proxy.md",
+  "docs/guide/what-is-trusted-server.md",
+  "docs/index.md",
+  "docs/internal/EDGEZERO_MIGRATION.md",
+  "docs/internal/audits/documentation-refresh-decisions.md",
+  "docs/internal/audits/documentation-refresh-evidence.md",
+  "docs/internal/onboarding.md",
+  "edgezero.toml",
+  "tools/docs-parity/README.md",
+  "trusted-server.example.toml",
+]
+rewrite = [
+  ".claude/agents/code-architect.md",
+  ".claude/agents/issue-creator.md",
+  ".env.dev",
+  ".env.example",
+  "CHANGELOG.md",
+  "TESTING.md",
+  "crates/trusted-server-core/src/auction/README.md",
+  "docs/guide/ad-serving.md",
+  "docs/guide/architecture.md",
+  "docs/guide/configuration.md",
+  "docs/guide/creative-processing.md",
+  "docs/guide/error-reference.md",
+  "docs/guide/integration-guide.md",
+  "docs/guide/integrations/gam.md",
+  "docs/guide/integrations/gpt.md",
+  "docs/guide/integrations/kargo.md",
+  "docs/roadmap.md",
+]
+created = [
+  "docs/guide/auction-testing.md",
+  "docs/internal/audits/documentation-refresh-inventory.toml",
+]
+archived = ["FAQ_POC.md -> docs/superpowers/archive/FAQ_POC.md"]
+
+[comment_regions]
+manifest = "tools/docs-parity/manifests/maintained-sources.toml"
+whole_file_dispositions = 82
+included_comment_regions = 570
+excluded_comment_regions = 0
+disposition = "Every checked comment selector is explicitly included or typed-excluded; no wildcard selector is accepted."
+region_rewrites = [
+  ".github/workflows/test.yml",
+  "crates/trusted-server-openrtb/generate.sh",
+  "scripts/test-cli.sh",
+]
+
+[[verifications]]
+claim = "Wildcard rewrite exclusions match the apex host and its subdomains."
+documentation = ["docs/guide/configuration.md", "docs/guide/first-party-proxy.md"]
+source_anchors = ["crates/trusted-server-core/src/settings.rs::Rewrite::is_excluded"]
+
+[[verifications]]
+claim = "The signing endpoint returns HTTP 403 for disallowed targets, and the creative runtime keeps href and base handling fail-closed."
+documentation = ["docs/guide/api-reference.md", "docs/guide/first-party-proxy.md"]
+source_anchors = [
+  "crates/trusted-server-core/src/publisher.rs::handle_first_party_proxy_sign",
+  "crates/trusted-server-js/lib/src/integrations/creative/proxy_sign.ts",
+  "crates/trusted-server-js/lib/src/integrations/creative/click.ts",
+]
+
+[[verifications]]
+claim = "Proxy signing remains recommended for dynamic creative resources rather than mandatory for all proxy use."
+documentation = ["docs/guide/proxy-signing.md"]
+source_anchors = [
+  "crates/trusted-server-core/src/publisher.rs::handle_first_party_proxy_sign",
+  "crates/trusted-server-core/src/creative.rs",
+]
+
+[[verifications]]
+claim = "Fastly staging deployment still loads the production app-config blob."
+documentation = ["docs/guide/cli.md"]
+source_anchors = ["crates/trusted-server-cli/src/commands/deploy.rs"]
+
+[[verifications]]
+claim = "The historical FAQ is excluded from the built and maintained active sets."
+documentation = ["docs/superpowers/archive/FAQ_POC.md"]
+source_anchors = [
+  "docs/.vitepress/config.mts::srcExclude",
+  "tools/docs-parity/manifests/maintained-sources.toml",
+]

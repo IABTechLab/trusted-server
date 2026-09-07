@@ -81,7 +81,6 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
             .with_attribute_rewriter(integration.clone())
             .with_script_rewriter(integration.clone())
             .with_head_injector(integration)
-            .with_asset("my_integration")
             .build(),
     )
 }
@@ -245,7 +244,11 @@ Add the module to `crates/trusted-server-core/src/integrations/mod.rs`'s builder
 - `crates/trusted-server-adapter-fastly/src/main.rs` automatically exposes the declared route(s).
 - `handle_publisher_request` receives the same registry so HTML responses get integration shims without further code changes.
 - `IntegrationRegistry::registered_integrations()` exposes a machine-readable summary of hooks for tests, tooling, or diagnostics.
-- Declared assets are injected automatically into `<head>`; the runtime emits `<script async data-tsjs-integration="<name>">` tags for every bundle discovered through `.with_asset(...)`.
+- If an enabled integration has a compiled TSJS module with the same ID, the
+  registry includes it in the immediate unified bundle by default. Use
+  `.with_deferred_js()` only when that registered module must load through its
+  separate deferred script, or `.without_js()` when Rust-side registration
+  must not select a TSJS module.
 
 ### 7. Provide Static Assets (If Needed)
 

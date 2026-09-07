@@ -605,121 +605,13 @@ fingerprint = "sha256:7975237cb3942e7487085db14e255bfde12b884d021d724e1e2f58c6f2
 path = "TESTING.md"
 selector = "fence:1"
 command = "validate-bash"
-fingerprint = "sha256:27e7383df1f4a402e36ccc0dc2c87bc1c28329773552d6e2d76b95c0346d3685"
+fingerprint = "sha256:a2609037cc495b76587c8cc879c73faf33879bf46661a34e0ad449ea0e60efa5"
 
 [[snippets]]
 path = "TESTING.md"
 selector = "fence:2"
 command = "validate-bash"
-fingerprint = "sha256:92bd1b3579b550ba4536785ebce2cc9e5cf1f4079d1dcb59c6dfc649bbb103b1"
-
-[[snippets]]
-path = "TESTING.md"
-selector = "fence:3"
-command = "validate-toml"
-fingerprint = "sha256:395620c048b6fc84a568f9ce02105da30a8f385e07c528c023719ea5acd2064e"
-
-[[snippets]]
-path = "TESTING.md"
-selector = "fence:4"
-command = "validate-toml"
-fingerprint = "sha256:d00c9fa2ce12907affc5569d0a10eefb18a5e1989735857a52d8f39635490a9a"
-
-[[snippets]]
-path = "TESTING.md"
-selector = "fence:5"
-command = "validate-toml"
-fingerprint = "sha256:30edf58148da9134f5f9ea4c2a1dde57b674eb91612ef389d2ab080eb90f411b"
-
-[[snippets]]
-path = "TESTING.md"
-selector = "fence:6"
-command = "validate-toml"
-fingerprint = "sha256:14d2154cfc55d0aaac2b4e15d3d280be6482dcebc2d1dea961623401a7571848"
-
-[[snippets]]
-path = "TESTING.md"
-selector = "fence:7"
-command = "illustrative-plain"
-fingerprint = "sha256:322edcb804a5ade117a3507865ff34ea49968486e0b5b765d5a5da32cea63c98"
-
-[[snippets]]
-path = "TESTING.md"
-selector = "fence:8"
-command = "illustrative-plain"
-fingerprint = "sha256:c1cea405679b0269274eaf08f3826744518cdf2aca77ceb9cf41c84db6a7c15f"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:1"
-command = "illustrative-plain"
-fingerprint = "sha256:df71cb3dde7ed207d76339e7f4f59194598a04c2d38fb8543f5d701b0ffd1084"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:2"
-command = "illustrative-plain"
-fingerprint = "sha256:fea7f23c768e3bd014d49b40669478428e07eccc4da1dfa26d80e8265299faa6"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:3"
-command = "validate-json"
-fingerprint = "sha256:e7f92458690361d5de59e4bc04a9e71f54aea21f82d0c5fe6d1816b8ded3e649"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:4"
-command = "illustrative-rust"
-fingerprint = "sha256:e7e87a4533b51388b8f438fb507d9ca5cc85dcc3f4755d8ef92efc43127a04ed"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:5"
-command = "validate-rust"
-fingerprint = "sha256:262698e9243c142c6b53ef4dd3bd730b06730a1c1059e39ae1bc4320eb7a8bf3"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:6"
-command = "validate-json"
-fingerprint = "sha256:a903219c97ea7c4dc5bb3727169b206c16753d35a78a24f99942bdcaea47b0b0"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:7"
-command = "illustrative-rust"
-fingerprint = "sha256:c3b819709599def50b9d60d1d61ad5b675c141d37e100bbdfe18d4c90e12e758"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:8"
-command = "validate-rust"
-fingerprint = "sha256:3b349b19a7b28c7540f91e6a6022db78b38f33e906266d06b50939c5649199de"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:9"
-command = "illustrative-json"
-fingerprint = "sha256:2a0bdffd6a15fb4e2bfaef0e6ff694b783154c0623be75cc6edf6a81d59a33a0"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:10"
-command = "validate-json"
-fingerprint = "sha256:483f3a6188aa9269997f526b6c2422cd6a584e8d540567f209cea534c8bf1fcb"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:11"
-command = "validate-toml"
-fingerprint = "sha256:946414782759ffda6c4795f32b647e19f870ed71d047426cca594a1d38150415"
-
-[[snippets]]
-path = "crates/trusted-server-core/src/auction/README.md"
-selector = "fence:12"
-command = "validate-toml"
-fingerprint = "sha256:47bda951602930eb19276a638f6e0a52d4676d814c5663d934013f9e687de298"
+fingerprint = "sha256:4790bf9898e42b65d89eecae1bea746aa4be0e543c02ed6fbe94d1c7d1b121fb"
 
 [[snippets]]
 path = "crates/trusted-server-integration-tests/README.md"
@@ -863,13 +755,7 @@ fingerprint = "sha256:9f0b60925f3405a9ba887c709d38fce80cbe5e0b8271930b217329b187
 path = "docs/guide/ad-serving.md"
 selector = "fence:1"
 command = "validate-toml"
-fingerprint = "sha256:24418142967972c008e794086cdd50992f32c2e6b7348528f66bfd2328b17ffa"
-
-[[snippets]]
-path = "docs/guide/ad-serving.md"
-selector = "fence:2"
-command = "validate-javascript"
-fingerprint = "sha256:7ecca0f73c58b54ef7387a4de7d2d84edcf2535295b12616d3a8c2d4777991ff"
+fingerprint = "sha256:7f7defccdc6a1f6d0c68b699aadf3808c7c9869067678903204cedc26f6499ac"
 
 [[snippets]]
 path = "docs/guide/api-reference.md"
@@ -1118,12 +1004,6 @@ command = "validate-bash"
 fingerprint = "sha256:46e87ce0a890a8506aa37cb73f857e8a311f83d7bf0e39f209aa6d6db76e2d6a"
 
 [[snippets]]
-path = "docs/guide/architecture.md"
-selector = "fence:3"
-command = "validate-rust"
-fingerprint = "sha256:494c152ef1edccb0f84281887f8fc9dfe15cb19bd2b8f6fdc4d0cea925358205"
-
-[[snippets]]
 path = "docs/guide/asset-routes.md"
 selector = "fence:1"
 command = "validate-toml"
@@ -1296,6 +1176,30 @@ path = "docs/guide/auction-orchestration.md"
 selector = "fence:22"
 command = "validate-bash"
 fingerprint = "sha256:e8e18e37971b473e43fefb9167fe3ab952a9c075a73fbf22121504096eec7996"
+
+[[snippets]]
+path = "docs/guide/auction-testing.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:f3e310d18c1bc1a217a02c20bda22c66e6405b664cb44fdbff999bfa7b7b3b4b"
+
+[[snippets]]
+path = "docs/guide/auction-testing.md"
+selector = "fence:2"
+command = "validate-bash"
+fingerprint = "sha256:237c5bdecca0d8241fb1c8f7ffcc75e08a5b1ed39558212fd4a15c7c93f7d26c"
+
+[[snippets]]
+path = "docs/guide/auction-testing.md"
+selector = "fence:3"
+command = "validate-bash"
+fingerprint = "sha256:07f6c2876a10bd8b1886d13a909164e7113c1ddfdc5b35fb0bcfb8ea50ea8a85"
+
+[[snippets]]
+path = "docs/guide/auction-testing.md"
+selector = "fence:4"
+command = "validate-bash"
+fingerprint = "sha256:d345f0d76765cedfde01ac387dc5b624af5156dcde82d51b4aea6a1bc3bd11b3"
 
 [[snippets]]
 path = "docs/guide/cli.md"
@@ -1996,18 +1900,12 @@ fingerprint = "sha256:7366b06e4126ff3170f2b2715d25d3ae5ca25fa4650788a5c171c11cb3
 [[snippets]]
 path = "docs/guide/configuration.md"
 selector = "fence:74"
-command = "illustrative-rust"
-fingerprint = "sha256:d0322f0dda2c8610338a07d3ca0ea13f05672c4044d9054adc3100ecfb42650a"
-
-[[snippets]]
-path = "docs/guide/configuration.md"
-selector = "fence:75"
 command = "validate-bash"
 fingerprint = "sha256:88b50a4adbd4dcd56c38f8a7e3f2a52d69aa374e669e622b13d3ac5bbfe731ad"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
-selector = "fence:76"
+selector = "fence:75"
 command = "validate-bash"
 fingerprint = "sha256:dd5111ee740e613440010e73138558d1ea2d5b81c48f33ea397beb6f5144d398"
 
@@ -2212,54 +2110,42 @@ fingerprint = "sha256:e4515ac7cc79554d6803f8abf52fd2880acb01260ee832145be191ecd4
 [[snippets]]
 path = "docs/guide/creative-processing.md"
 selector = "fence:34"
-command = "illustrative-rust"
-fingerprint = "sha256:bfd7d401535a0027dba249cab15e6443413ae53f81b058f72bd32a927212da94"
-
-[[snippets]]
-path = "docs/guide/creative-processing.md"
-selector = "fence:35"
-command = "illustrative-html"
-fingerprint = "sha256:c361154d194f7308f4be1be287fc70fc83e951cbc5ced289b4a5eb143d2600bd"
-
-[[snippets]]
-path = "docs/guide/creative-processing.md"
-selector = "fence:36"
 command = "illustrative-plain"
 fingerprint = "sha256:9f65efdd7900ef0acdbed0dcd8316056156a96e5169051b856241f0bc89a0a20"
 
 [[snippets]]
 path = "docs/guide/creative-processing.md"
-selector = "fence:37"
+selector = "fence:35"
 command = "illustrative-plain"
 fingerprint = "sha256:7aa49975fbef7338784c0b9e5e780ac8a53cedac3428812e97592c63c68be801"
 
 [[snippets]]
 path = "docs/guide/creative-processing.md"
-selector = "fence:38"
+selector = "fence:36"
 command = "illustrative-http"
 fingerprint = "sha256:4d0b5149bd5f983e05ec2cdb8394acd688a8433d3c1e6707c3e2286ae9a138fe"
 
 [[snippets]]
 path = "docs/guide/creative-processing.md"
-selector = "fence:39"
+selector = "fence:37"
 command = "validate-rust"
 fingerprint = "sha256:15d19327854539ce55b2a173470244bd8248318616296003d022c2f9c635bdbd"
 
 [[snippets]]
 path = "docs/guide/creative-processing.md"
-selector = "fence:40"
+selector = "fence:38"
 command = "illustrative-rust"
 fingerprint = "sha256:3e1c5e0e97608242aeca65234f64db4826a6ade3655506e26e4f52f2d8215fae"
 
 [[snippets]]
 path = "docs/guide/creative-processing.md"
-selector = "fence:41"
+selector = "fence:39"
 command = "validate-rust"
 fingerprint = "sha256:1b7dda1c0eb1c9ec2358255be22a8708000fbc84fc64449cdc314377fdadaebe"
 
 [[snippets]]
 path = "docs/guide/creative-processing.md"
-selector = "fence:42"
+selector = "fence:40"
 command = "illustrative-http"
 fingerprint = "sha256:1038650eb79f74bda67442e9645c0f1298e1e8b540a26dd8fa447cb8a7109170"
 
@@ -2675,7 +2561,7 @@ fingerprint = "sha256:dae58de3ddfde95b066b259e24d83e50d15aedeafb58b0b20d7b26dd32
 path = "docs/guide/error-reference.md"
 selector = "fence:49"
 command = "validate-bash"
-fingerprint = "sha256:bb6c63ed2350bc0c85efcade606ea97c5aa07f6cc33f0fca96d54842e8cf9f35"
+fingerprint = "sha256:e0a1269b2e4d205c62633a290c1332cc527fb7923b1a83acfb61b5168be396ac"
 
 [[snippets]]
 path = "docs/guide/error-reference.md"
@@ -3125,7 +3011,7 @@ fingerprint = "sha256:52c46f4010fa14c5054e558df6ae8f655ad3eeefa1e420d92358cd61d0
 path = "docs/guide/integration-guide.md"
 selector = "fence:3"
 command = "validate-rust"
-fingerprint = "sha256:ff31cab8873e20a1c06f17cf2014f7e1d3d25ff5573146be4f583a35ff17d49f"
+fingerprint = "sha256:aff2d2e19dab56c9762b12397186e0726bcc8df93f630ce8d9aab3e069b71b86"
 
 [[snippets]]
 path = "docs/guide/integration-guide.md"
@@ -3458,12 +3344,6 @@ command = "illustrative-http"
 fingerprint = "sha256:8fd7e5ace6ffe3a33041cd7d395d0821f0ab25ac36466ddb25398ec88fc9e151"
 
 [[snippets]]
-path = "docs/guide/integrations/gam.md"
-selector = "fence:1"
-command = "validate-toml"
-fingerprint = "sha256:56820318263204cb4f7ef1d101a19f86dc7a1fafacb340b997f1b3fae079818f"
-
-[[snippets]]
 path = "docs/guide/integrations/google_tag_manager.md"
 selector = "fence:1"
 command = "validate-toml"
@@ -3564,12 +3444,6 @@ path = "docs/guide/integrations/gpt.md"
 selector = "fence:2"
 command = "validate-toml"
 fingerprint = "sha256:747e1162502b915c2b4c3a1f1e889b30f9e234deb1c41bec2c654c35e7135353"
-
-[[snippets]]
-path = "docs/guide/integrations/kargo.md"
-selector = "fence:1"
-command = "validate-toml"
-fingerprint = "sha256:fc8c02fb550ccb97341c1c8920ed3435964d76a89b73032f9d740ff8e5c33b7f"
 
 [[snippets]]
 path = "docs/guide/integrations/lockr.md"

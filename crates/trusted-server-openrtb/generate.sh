@@ -20,7 +20,7 @@ if ! command -v protoc &>/dev/null; then
     exit 1
 fi
 
-# Build as a native binary (the repo's .cargo/config.toml defaults to wasm32).
+# Build for the detected host explicitly; the workspace has no global target.
 NATIVE_TARGET="$(rustc -vV | grep '^host:' | cut -d' ' -f2)"
 
 echo "protoc version: $(protoc --version)"

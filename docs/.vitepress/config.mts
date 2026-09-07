@@ -115,6 +115,7 @@ export default withMermaid(
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'CLI', link: '/guide/cli' },
             { text: 'Testing', link: '/guide/testing' },
+            { text: 'Auction Testing', link: '/guide/auction-testing' },
             { text: 'Integration Guide', link: '/guide/integration-guide' },
             { text: 'Dev Proxy', link: '/guide/ts-dev-proxy' },
           ],
@@ -163,7 +164,6 @@ export default withMermaid(
             {
               text: 'Ad Serving',
               items: [
-                { text: 'GAM', link: '/guide/integrations/gam' },
                 {
                   text: 'GPT Runtime Diagnostics',
                   link: '/guide/integrations/gpt-diagnostics',
@@ -176,10 +176,6 @@ export default withMermaid(
                 { text: 'Prebid', link: '/guide/integrations/prebid' },
                 { text: 'APS', link: '/guide/integrations/aps' },
               ],
-            },
-            {
-              text: 'SSP',
-              items: [{ text: 'Kargo', link: '/guide/integrations/kargo' }],
             },
             {
               text: 'Framework Support',

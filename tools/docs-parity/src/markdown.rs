@@ -109,6 +109,7 @@ enum PageRecord {
         navigation: bool,
     },
     Tombstone {
+        path: String,
         route: String,
         replacement: String,
     },
@@ -2037,8 +2038,12 @@ pub(crate) fn check_local_repository(repository: &Repository) -> Result<(), Repo
     validate_manifest_attestation(orphans.version, orphans.reviewed, "orphans")?;
     validate_manifest_attestation(diagrams.version, diagrams.reviewed, "diagrams")?;
 
-    let intended_paths = live_pages(&pages.pages)
-        .map(|page| page.path.clone())
+    let intended_paths = pages
+        .pages
+        .iter()
+        .map(|page| match page {
+            PageRecord::Live { path, .. } | PageRecord::Tombstone { path, .. } => path.clone(),
+        })
         .collect::<BTreeSet<_>>();
     let loaded = load_link_sources(repository, &intended_paths)?;
 
@@ -2073,11 +2078,7 @@ pub(crate) fn check_local_repository(repository: &Repository) -> Result<(), Repo
                 .find(|entry| !page_inventory.tombstones.contains(*entry))
         )));
     }
-    let intended = page_inventory
-        .live
-        .iter()
-        .map(|page| page.path.clone())
-        .collect::<Vec<_>>();
+    let intended = page_inventory.paths.iter().cloned().collect::<Vec<_>>();
     check_local_links_with_known(
         &loaded.sources,
         &intended,
@@ -2095,6 +2096,7 @@ pub(crate) fn check_local_repository(repository: &Repository) -> Result<(), Repo
         &loaded.sources,
         &page_inventory.live,
         &orphan_inventory.manual,
+        &page_inventory.tombstone_paths,
     )?;
     validate_diagrams(&loaded.sources, &diagrams)?;
     Ok(())
@@ -2188,6 +2190,8 @@ struct LivePage {
 
 struct PageInventory {
     live: Vec<LivePage>,
+    paths: BTreeSet<String>,
+    tombstone_paths: BTreeSet<String>,
     tombstones: BTreeSet<(String, String)>,
 }
 
@@ -2458,13 +2462,30 @@ fn validate_page_inventory(
         }
     }
     let mut tombstone_routes = BTreeSet::new();
+    let mut tombstone_paths = BTreeSet::new();
     let mut tombstones = BTreeSet::new();
     for page in &manifest.pages {
-        let PageRecord::Tombstone { route, replacement } = page else {
+        let PageRecord::Tombstone {
+            path,
+            route,
+            replacement,
+        } = page
+        else {
             continue;
         };
+        validate_repo_path(path)?;
         let route = normalize_route(route)?;
         let replacement = normalize_route(replacement)?;
+        let expected_route = public_route(path)?;
+        if route != expected_route {
+            return Err(local_error(format!(
+                "tombstone {path} route {route} does not match {expected_route}"
+            )));
+        }
+        if !manifest_paths.insert(path.clone()) {
+            return Err(local_error(format!("duplicate page path: {path}")));
+        }
+        tombstone_paths.insert(path.clone());
         if manifest_routes.contains(&route) {
             return Err(local_error(format!(
                 "tombstone route collides with live page: {route}"
@@ -2525,7 +2546,12 @@ fn validate_page_inventory(
             manifest_paths.difference(&built_paths).next()
         )));
     }
-    Ok(PageInventory { live, tombstones })
+    Ok(PageInventory {
+        live,
+        paths: manifest_paths,
+        tombstone_paths,
+        tombstones,
+    })
 }
 
 fn matches_src_exclude(path: &str, pattern: &str) -> bool {
@@ -2598,6 +2624,7 @@ fn validate_reachability(
     sources: &[LinkSource],
     pages: &[LivePage],
     manual_orphans: &BTreeSet<String>,
+    tombstone_paths: &BTreeSet<String>,
 ) -> Result<(), Report<MarkdownError>> {
     let public = sources
         .iter()
@@ -2630,7 +2657,7 @@ fn validate_reachability(
     }
     let actual_orphans = public
         .keys()
-        .filter(|path| !reachable.contains(*path))
+        .filter(|path| !reachable.contains(*path) && !tombstone_paths.contains(*path))
         .cloned()
         .collect::<BTreeSet<_>>();
     if &actual_orphans != manual_orphans {

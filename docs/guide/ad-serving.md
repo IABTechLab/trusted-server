@@ -1,121 +1,75 @@
 # Ad Serving
 
-Learn how Trusted Server handles consent-aware ad serving.
+Trusted Server supports two shipped ad-delivery paths: a direct server-side
+auction API and publisher-page processing at the edge. Both paths use the same
+validated settings and compiled auction plan.
 
-## Overview
+## Request flow
 
-Trusted Server provides edge-based ad serving with consent signal enforcement and real-time bidding support.
+For ordinary publisher requests, the selected adapter fetches the configured
+publisher origin. Eligible HTML responses pass through the shared processing
+pipeline, which can rewrite first-party URLs, inject Trusted Server JavaScript,
+and place configured ad opportunities. Non-HTML responses remain on the
+publisher proxy path.
 
-## Supported Integrations
+`POST /auction` accepts the documented auction request shape. When
+`[auction].enabled = true`, the compiled `AuctionPlan` selects configured
+providers, routes bidder codes, executes supported provider fan-out, applies an
+optional mediator, and returns the winning bids. When auctions are disabled,
+the endpoint returns a no-bid response without contacting a provider.
 
-### Equativ
+## Shipped demand and mediation
 
-Primary ad server integration with support for:
+Provider instances are declared under `[auction.providers.<id>]`. The shipped
+profiles are:
 
-- Direct ad requests
-- Creative proxying
-- Click tracking
-- Impression tracking
+- `standard` for a generic OpenRTB 2.6 endpoint;
+- `prebid-server` for Prebid Server request controls; and
+- `aps` for the APS OpenRTB contract and typed renderer response.
 
-### Prebid
-
-Real-time bidding integration:
-
-- Header bidding support
-- Bid caching
-- Timeout management
-- Winner selection
-
-## Ad Request Flow
-
-1. Request validation
-2. Consent signal check
-3. EC ID generation (when the consent evaluation permits)
-4. Ad server request
-5. Response processing
-6. Creative delivery
-
-## Configuration
-
-Configure ad servers in `trusted-server.toml`:
+Browser-visible bidder codes are mapped separately under
+`[auction.bidders.<id>]`. `adserver_mock` is the only registered mediator; it
+is optional and is configured under `[integrations.adserver_mock]`.
 
 ```toml
-[ad_servers.equativ]
-endpoint = "https://ad-server.example.com"
-timeout_ms = 1000
+[auction]
 enabled = true
 
-[prebid]
-timeout_ms = 1500
-cache_ttl = 300
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.bidders.example-bidder]
+provider = "pbs-main"
 ```
 
-## Creative Handling
+Deploy validation compiles this configuration before publication. Adapter
+startup adds target-specific provider-count and backend-name checks; see
+[Auction orchestration](/guide/auction-orchestration) for the complete schema
+and adapter limits.
 
-### Proxy Mode
+## Creative delivery
 
-Creatives can be proxied through Trusted Server for:
+Winning OpenRTB markup can be rewritten through the first-party proxy and can
+be sanitized when the corresponding auction settings are enabled. The default
+is rewriting enabled and sanitization disabled. APS winners use the typed
+renderer contract instead of exposing raw `adm`.
 
-- Security scanning
-- Content modification
-- Click tracking injection
-- Consent signal enforcement
+Publisher HTML uses the integration registry to contribute head markup and to
+select embedded TSJS modules. The registry does not fetch arbitrary integration
+assets at runtime.
 
-### Direct Mode
+## Operational checks
 
-Creatives served directly from ad server:
+- Validate configuration with `ts config validate` before deployment.
+- Use the [auction test runbook](/guide/auction-testing) for focused and
+  end-to-end checks.
+- Confirm provider authorization and test inventory with each upstream before
+  enabling traffic.
+- Treat provider timeout values as logical budgets; no adapter currently
+  promises an abortable provider-wide wall-clock deadline.
 
-- Lower latency
-- Reduced edge load
-- Less control over content
-
-## Tracking
-
-### Impression Tracking
-
-```javascript
-// Placeholder example
-trustedServer.trackImpression({
-  adId: 'ad-123',
-  ecId: 'ec-xyz',
-  consent: true,
-})
-```
-
-### Click Tracking
-
-Click tracking via first-party context:
-
-- URLs carry no name, email, or account identifier fields supplied by the user
-- EC ID when issued under the consent gate
-- Encrypted parameters
-
-## Performance
-
-### Edge Caching
-
-- Bid responses cached at edge
-- Creative assets cached
-- Configuration cached
-- Reduced origin requests
-
-### Timeouts
-
-Configurable timeouts for:
-
-- Ad server requests
-- Prebid auctions
-- Creative fetching
-
-## Best Practices
-
-1. Set appropriate timeouts for your use case
-2. Enable caching for frequently requested ads
-3. Monitor ad server response times
-4. Use proxy mode for security-sensitive content
-5. Implement fallback ads
-
-## Next Steps
-
-- Review [Architecture](/guide/architecture)
-- Configure [Testing](/guide/testing)
+See also [Creative processing](/guide/creative-processing) and the
+[Integrations overview](/guide/integrations-overview).

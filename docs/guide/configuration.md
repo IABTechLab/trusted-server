@@ -1747,8 +1747,9 @@ exact ID `trustedServer`. Browser `trustedServer.bidderParams` accepts at most
 
 For the `standard` profile, `profile_config.request_ext` and `imp_ext` must be
 JSON objects. Each object is limited to 16 KiB serialized, eight container
-levels, and 256 keys at any one object level. Reserved driver, profile, and
-signing fields cannot be overwritten.
+levels, and 256 keys at any one object level. Within `request_ext`, the
+`trusted_server` member is reserved and cannot be overwritten. `imp_ext` has no
+reserved-member guard in the current implementation.
 
 Common notification suppression uses exact returned OpenRTB seat values, not
 bidder route IDs:
@@ -2295,14 +2296,10 @@ trusted-server.dev.toml      # Development overrides
 
 ### Debug Configuration
 
-**Print Loaded Config** (test only):
-
-```rust
-use trusted_server_core::settings_data::get_settings;
-
-let settings = get_settings()?;
-println!("{:#?}", settings);
-```
+Runtime adapters load the app-config envelope with
+`get_settings_from_config_store` from the `trusted_server_core::settings_data`
+module. For a source file or local fixture, use `Settings::from_toml`; there is
+no process-global settings accessor.
 
 **Check Environment**:
 

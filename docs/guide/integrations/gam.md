@@ -1,58 +1,13 @@
-# Google Ad Manager (GAM) Integration
+# Google Ad Manager integration status
 
-**Category**: Ad Serving
-**Status**: Planned for 2026
-**Type**: Ad Server
+Trusted Server does not ship a direct Google Ad Manager integration or an
+`[integrations.gam]` configuration section.
 
-## Overview
+The TSJS GPT module can place server-side auction results into publisher-owned
+GPT slots, including APS renderer winners. That browser handoff is not a GAM
+API integration and does not provide campaign management, reporting, or direct
+GAM demand.
 
-The Google Ad Manager (GAM) integration will enable direct integration with Google's ad serving platform, providing first-party ad delivery and reporting.
-
-## Planned Features
-
-- **Direct GAM Integration**: Native support for GAM ad requests
-- **Dynamic Ad Slots**: Programmatic slot management
-- **Programmatic Guaranteed**: Direct deals and PG support
-- **First-Party Reporting**: Ad performance metrics
-- **Secure Signals**: Encoded audience signals shared with publisher-selected partners
-- **Creative Rendering**: First-party creative delivery
-
-## Expected Configuration
-
-```toml
-[integrations.gam]
-enabled = true
-publisher_id = "your-publisher-id"
-network_code = "your-network-code"
-endpoint = "https://securepubads.g.doubleclick.net"
-```
-
-## Use Cases
-
-### Header Bidding + Direct
-
-Combine header bidding (Prebid) with GAM direct campaigns for optimal yield.
-
-### Programmatic Guaranteed
-
-Manage PG deals with deterministic delivery.
-
-### Unified Reporting
-
-Consolidated reporting across all monetization channels.
-
-## Status
-
-This integration is currently in the planning phase. See the [Roadmap](/roadmap) for timeline and progress updates.
-
-**Target Release**: Q1 2026
-
-## Get Involved
-
-Interested in contributing to the GAM integration? Check out the [GitHub issue](https://github.com/IABTechLab/trusted-server/issues) or join the discussion.
-
-## Next Steps
-
-- Review [Roadmap](/roadmap) for latest status
-- Check [Prebid Integration](/guide/integrations/prebid) for current header bidding support
-- Explore [Ad Serving Guide](/guide/ad-serving) for general ad serving concepts
+Use the [Integrations overview](/guide/integrations-overview) for the current
+integration inventory and [Auction orchestration](/guide/auction-orchestration)
+for shipped provider profiles.

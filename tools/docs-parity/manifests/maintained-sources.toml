@@ -204,11 +204,6 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
-path = "FAQ_POC.md"
-mode = "whole"
-disposition = "include"
-
-[[sources]]
 path = "LICENSE"
 mode = "whole"
 disposition = "exclude"
@@ -2819,6 +2814,11 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "docs/guide/auction-testing.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "docs/guide/cli.md"
 mode = "whole"
 disposition = "include"
@@ -3014,6 +3014,11 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "docs/internal/audits/documentation-refresh-inventory.toml"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "docs/internal/onboarding.md"
 mode = "whole"
 disposition = "include"
@@ -3061,6 +3066,12 @@ exclude_kind = "historical"
 
 [[sources]]
 path = "docs/superpowers/archive/2026-08-10-1009-esi-validation-spike.md"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "historical"
+
+[[sources]]
+path = "docs/superpowers/archive/FAQ_POC.md"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "historical"
@@ -4903,79 +4914,61 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:7908-7981"
-fingerprint = "sha256:8974a9e0f79b30eaafe4754b6e51037c7d8169f81e77a359e12c3c9f790abd41"
+selector = "bytes:7908-7973"
+fingerprint = "sha256:88df77c5db6a7f2cbb73be4b132220411d81e47ca4894576da3cea3951283b9b"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:7990-8063"
-fingerprint = "sha256:380a9741132d67dc7a1145ca3a1288615e54708bfe8f34ec358e112c3505b5a6"
+selector = "bytes:7982-8052"
+fingerprint = "sha256:d7656dc0938f3c1e666de37d1b72f4f332f331b0379c8715bce51b0266f49b26"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:8072-8139"
-fingerprint = "sha256:bccb1320a64134df7139a0055c838787b2fa48c193d3ba7f9ba1a34f04a9f7cd"
+selector = "bytes:8061-8097"
+fingerprint = "sha256:32e847ef9cec555409bd5c556669261bccf67e6ddc999c27587ecf60b5da4b5f"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:8148-8202"
-fingerprint = "sha256:139e535c32794ec9fb2b1939699f36b6ff18345b6eff7a6332fa4794d7723e55"
+selector = "bytes:9352-9424"
+fingerprint = "sha256:0a7c8a2ecb3d3f52df5a03f1c5bb4b33952c8032276aa25a4e242a6cecb850cd"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:9761-9839"
-fingerprint = "sha256:b06c5338992f1662d3abae13e3984faf95b1ef3442b91efeefb7fceb267a7775"
+selector = "bytes:9429-9505"
+fingerprint = "sha256:69d945daea35888666d4044680771fe484e6ab5874a933724388deabc7357892"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:9844-9922"
-fingerprint = "sha256:3f442a0ccb751273c537b03424f8eb1aee472049d49a3ef51ab8241b43ab60d0"
+selector = "bytes:9510-9557"
+fingerprint = "sha256:863bda41d4205b066f4c6f2735d6825fa67dbad8f4289a586cdb8e0f575999db"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:9927-10008"
-fingerprint = "sha256:9e45c88657f733c83e78f5f2c4570b6358794b5790139ac07a3f0903a371618a"
-disposition = "include"
-
-[[comments]]
-path = ".github/workflows/test.yml"
-selector = "bytes:10013-10090"
-fingerprint = "sha256:bc25867ab4fd5236382749d0bbabbd00976c739dac3f2c2e408d3513a5430bb6"
-disposition = "include"
-
-[[comments]]
-path = ".github/workflows/test.yml"
-selector = "bytes:10095-10162"
-fingerprint = "sha256:a264bf6ac101c168dae446940ca42facf19ac94a3b065b6f23ad76a8d3f23723"
-disposition = "include"
-
-[[comments]]
-path = ".github/workflows/test.yml"
-selector = "bytes:10733-10808"
+selector = "bytes:10128-10203"
 fingerprint = "sha256:da8b34b5c8e2c1a3bf6a08d682555a1fcbff653614bee41ae48a9d9c51e2fd35"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:10815-10891"
+selector = "bytes:10210-10286"
 fingerprint = "sha256:b895c72a0578ff3ae34474218aa8e7b684c31a786b18d8070ff1b1f2940307ab"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:10898-10974"
+selector = "bytes:10293-10369"
 fingerprint = "sha256:e5dda19814742b949f9ac09203ffae37f43165b5b1470a650dd04be857431ad0"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:10981-11060"
+selector = "bytes:10376-10455"
 fingerprint = "sha256:c2d2731be2dc78c9c5bb1ac73695c63a420e52c587346c0a6f7d52e08a17c91c"
 disposition = "include"
 
@@ -5863,8 +5856,8 @@ disposition = "include"
 
 [[comments]]
 path = "crates/trusted-server-openrtb/generate.sh"
-selector = "bytes:734-812"
-fingerprint = "sha256:6467659af62d644b73ec349723954f29ddc878da82d2d993c2a33b897d058e75"
+selector = "bytes:734-811"
+fingerprint = "sha256:a73d4ced67b48ea8ac9ee892200a49773a171f65e5541d992cc67f599afb8c9a"
 disposition = "include"
 
 [[comments]]
@@ -7731,4 +7724,10 @@ disposition = "include"
 path = "scripts/test-cli.sh"
 selector = "bytes:0-19"
 fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/test-cli.sh"
+selector = "bytes:39-118"
+fingerprint = "sha256:9fa3e9e54af7a4e352498bcc51bb7c0b265555c412a121faa360189e680d3922"
 disposition = "include"

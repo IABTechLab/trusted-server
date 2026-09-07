@@ -223,4 +223,3 @@ treated as invalid for experiment reporting.
 - Review [Integrations Overview](/guide/integrations-overview) for comparison with other integrations
 - Check [Configuration Reference](/guide/configuration) for advanced options
 - Learn about [First-Party Proxy](/guide/first-party-proxy) architecture
-- See [Google Ad Manager](/guide/integrations/gam) for the planned direct GAM integration

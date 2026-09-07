@@ -159,10 +159,6 @@ path = "Cargo.toml"
 kind = "text"
 
 [[files]]
-path = "FAQ_POC.md"
-kind = "text"
-
-[[files]]
 path = "LICENSE"
 kind = "text"
 
@@ -1923,6 +1919,10 @@ path = "docs/guide/auction-orchestration.md"
 kind = "text"
 
 [[files]]
+path = "docs/guide/auction-testing.md"
+kind = "text"
+
+[[files]]
 path = "docs/guide/cli.md"
 kind = "text"
 
@@ -2079,6 +2079,10 @@ path = "docs/internal/audits/documentation-refresh-evidence.md"
 kind = "text"
 
 [[files]]
+path = "docs/internal/audits/documentation-refresh-inventory.toml"
+kind = "text"
+
+[[files]]
 path = "docs/internal/onboarding.md"
 kind = "text"
 
@@ -2116,6 +2120,10 @@ kind = "text"
 
 [[files]]
 path = "docs/superpowers/archive/2026-08-10-1009-esi-validation-spike.md"
+kind = "text"
+
+[[files]]
+path = "docs/superpowers/archive/FAQ_POC.md"
 kind = "text"
 
 [[files]]
