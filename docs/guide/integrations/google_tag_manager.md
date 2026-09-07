@@ -45,21 +45,21 @@ container_id = "GTM-XXXXXX"
 
 ### Configuration Options
 
-| Field                  | Type    | Required | Description                                                                        |
-| ---------------------- | ------- | -------- | ---------------------------------------------------------------------------------- |
-| `enabled`              | boolean | No       | Enable/disable integration (default: `false`)                                      |
-| `container_id`         | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                                         |
-| `upstream_url`         | string  | No       | Custom upstream URL, must be `https` (default: `https://www.googletagmanager.com`) |
-| `allowed_tag_ids`      | array   | No       | Extra tag ids servable on `gtag/js` besides `container_id` (default: none)         |
-| `cache_max_age`        | number  | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)                    |
-| `max_beacon_body_size` | number  | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`)            |
+| Field                  | Type    | Required | Description                                                                                                                                                                  |
+| ---------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`              | boolean | No       | Enable/disable integration (default: `false`)                                                                                                                                |
+| `container_id`         | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                                                                                                                                   |
+| `upstream_url`         | string  | No       | Custom upstream, as a credential-free `https` bare origin with a literal host — no path, query, fragment, userinfo or wildcard (default: `https://www.googletagmanager.com`) |
+| `allowed_tag_ids`      | array   | No       | Extra tag ids servable on `gtag/js` besides `container_id` (default: none)                                                                                                   |
+| `cache_max_age`        | number  | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)                                                                                                              |
+| `max_beacon_body_size` | number  | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`)                                                                                                      |
 
 ### Upgrading: check `allowed_tag_ids`
 
 Only `container_id` and the ids listed in `allowed_tag_ids` are served from your
 own origin. If your pages load `gtag/js` with a measurement id different from
-your container — a GA4 `G-` id or an Ads `AW-` id, for example — add those ids
-here.
+your container — a GA4 `G-` id, an Ads `AW-` id or a Merchant Center `MC-` id,
+for example — add those ids here.
 
 Missing one does not break the page, but it does degrade the tag, and on some
 sites it stops the tag loading altogether:
@@ -82,6 +82,32 @@ To find the ids your pages use, look for `gtag/js?id=` in your rendered HTML:
 ```bash
 curl -s https://www.example.com/ | grep -oE 'gtag/js\?id=[A-Za-z0-9-]+'
 ```
+
+### Upgrading: `upstream_url` must now be a bare origin
+
+`upstream_url` was previously checked only for being a well-formed URL. It is
+now required to be a credential-free `https` bare origin with a literal host,
+and these values are rejected:
+
+| Rejected value                       | Reason                                            |
+| ------------------------------------ | ------------------------------------------------- |
+| `https://tags.example.com/gateway`   | Path — targets are built by appending `/gtm.js`   |
+| `https://tags.example.com?env=stage` | Query — same, the appended path lands after it    |
+| `https://tags.example.com#anchor`    | Fragment — the appended path is swallowed by it   |
+| `https://user:pw@tags.example.com`   | Userinfo — echoed to the client in a tag redirect |
+| `https://*.example.com`              | Wildcard host — widens the proxy allowlist        |
+
+A trailing slash is still accepted; it is trimmed before targets are built.
+
+**This is a breaking change.** A path-based value such as
+`https://tags.example.com/gateway` passed validation before this release and
+produced targets below that path, so an enabled deployment using one now fails
+config validation. `ts config push` rejects it, which is where you should expect
+to see this. Validation is fail-closed rather than skip-the-integration: a
+config that reaches the runtime without having been pushed through that check
+fails building the integration registry, so every integration is affected, not
+just this one. If your upstream serves tags below a path, front it with a
+hostname that serves them at the root instead.
 
 ## How It Works
 

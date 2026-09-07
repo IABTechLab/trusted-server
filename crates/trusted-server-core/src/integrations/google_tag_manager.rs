@@ -68,12 +68,19 @@ static GTM_CONTAINER_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// Regex pattern for tag IDs accepted in [`GoogleTagManagerConfig::allowed_tag_ids`].
 ///
 /// Covers the prefixes Google serves from `/gtag/js`: GA4 (`G-`), Google Tag
-/// (`GT-`), Tag Manager (`GTM-`), Google Ads (`AW-`), Floodlight (`DC-`) and
-/// legacy Analytics (`UA-`, which carries a property suffix). The pattern
-/// guards against typos in operator config; it is not a security boundary,
-/// because the allowlist itself decides which IDs may be served.
+/// (`GT-`), Tag Manager (`GTM-`), Google Ads (`AW-`), Floodlight (`DC-`),
+/// Merchant Center (`MC-`) and legacy Analytics (`UA-`, which carries a
+/// property suffix). The pattern guards against typos in operator config; it
+/// is not a security boundary, because the allowlist itself decides which IDs
+/// may be served.
+///
+/// `MC-` is absent from Google's published prefix tables but is served from
+/// `/gtag/js` in practice: Merchant Center conversion tracking uses it, and
+/// storefront platforms inject it. Omitting it here would leave an operator
+/// unable to allowlist a tag their pages already load, so the request would be
+/// redirected off-origin and refused by a `script-src` that lists only `'self'`.
 static GTM_TAG_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:G|GT|GTM|AW|DC|UA)-[A-Za-z0-9-]{1,30}$")
+    Regex::new(r"^(?:G|GT|GTM|AW|DC|MC|UA)-[A-Za-z0-9-]{1,30}$")
         .expect("GTM tag ID regex should compile")
 });
 
@@ -262,7 +269,8 @@ fn validate_allowed_tag_ids(values: &[String]) -> Result<(), ValidationError> {
             let mut err = ValidationError::new("invalid_tag_id");
             err.add_param("value".into(), value);
             err.message = Some(
-                "allowed_tag_ids entries must be G-, GT-, GTM-, AW-, DC- or UA- tag IDs".into(),
+                "allowed_tag_ids entries must be G-, GT-, GTM-, AW-, DC-, MC- or UA- tag IDs"
+                    .into(),
             );
             return Err(err);
         }
@@ -1460,6 +1468,7 @@ mod tests {
                 "GTM-OTHER1",
                 "AW-123456",
                 "DC-9999",
+                "MC-ABCD1234",
                 "UA-123456-1",
             ],
         );
@@ -1467,6 +1476,28 @@ mod tests {
         assert!(
             config.validate().is_ok(),
             "should accept the tag id prefixes Google serves"
+        );
+    }
+
+    #[test]
+    fn gtag_js_serves_an_allowlisted_merchant_center_tag_first_party() {
+        // Merchant Center tags are served from `/gtag/js` even though `MC-` is
+        // absent from Google's published prefix tables. Rejecting the prefix in
+        // config would leave this request redirected off-origin, where a
+        // `script-src 'self'` refuses it and the tag never runs.
+        let integration =
+            GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &["MC-ABCD1234"]));
+
+        let target = resolve_target(
+            &integration,
+            "https://edge.example.com/integrations/google_tag_manager/gtag/js?id=MC-ABCD1234",
+        )
+        .expect("should resolve a gtag target");
+
+        assert_eq!(
+            target,
+            GtmTarget::Proxy("https://www.googletagmanager.com/gtag/js?id=MC-ABCD1234".to_string()),
+            "an allowlisted Merchant Center tag should be served from this origin"
         );
     }
 
