@@ -641,18 +641,13 @@ impl KvIdentityGraph {
         )))
     }
 
-    /// Whether `ec_id` names a key this store actually holds.
-    ///
-    /// Reads the key itself, so the answer is about that identity and no
-    /// other: counting keys by prefix would let a longer key carrying this one
-    /// as a prefix answer in its place. One round trip, and no bound on the
-    /// identifier is needed because nothing is scanned.
+    /// Checks exact existence against strongly consistent store state.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::KvStore`] on store error.
+    /// Returns [`TrustedServerError::KvStore`] if existence cannot be confirmed.
     fn key_exists_confirmed(&self, ec_id: &str) -> Result<bool, Report<TrustedServerError>> {
-        Ok(self.lookup_raw(ec_id)?.is_some())
+        self.store.key_exists(ec_id)
     }
 
     /// Writes a withdrawal tombstone for consent enforcement.
@@ -669,8 +664,8 @@ impl KvIdentityGraph {
     /// was never issued enforces nothing while still consuming a write and a
     /// row; the identifier in a request is chosen by the client, so that write
     /// would be the client's to trigger at will. Existence is confirmed with
-    /// [`Self::key_exists_confirmed`], which reads the key itself, so no
-    /// neighbouring key can answer for it.
+    /// [`Self::key_exists_confirmed`], which checks exact equality against
+    /// strongly consistent state, so no neighbouring key can answer for it.
     ///
     /// The check and the write are not one atomic operation: an entry that
     /// expires between them is still tombstoned, briefly restoring a row that
@@ -679,11 +674,10 @@ impl KvIdentityGraph {
     /// create an identity, because the entry must have existed to pass the
     /// check at all.
     ///
-    /// The read may lag the write that issued the identity, so an identity
-    /// created and withdrawn inside that window is reported as unknown and no
-    /// tombstone is written. The browser cookie is expired either way, which is
-    /// the primary enforcement; the residual exposure is a batch-sync client
-    /// that already holds an identifier issued that recently.
+    /// An eventually consistent lookup miss cannot establish absence: a
+    /// recently issued identity may already have been shared with a partner.
+    /// The strong check prevents that replication gap from losing withdrawal.
+    /// An inconclusive check is reported as an error without a lookup fallback.
     ///
     /// # Errors
     ///
@@ -1020,6 +1014,10 @@ mod tests {
 
         fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
         }
 
         fn insert(
@@ -1503,10 +1501,39 @@ mod tests {
     }
 
     #[test]
-    fn a_withdrawal_costs_one_read_whether_or_not_the_identity_is_held() {
-        // The gate sits on the withdrawal response path, so it must not double
-        // the reads a withdrawal already pays for.
+    fn withdrawal_does_not_lose_a_new_identity_to_lookup_lag() {
+        let (mut store, _) = CountingEcKv::new();
+        store.lag_live_entries = true;
+        let kv = KvIdentityGraph::new(store);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry())
+            .expect("should issue an identity");
+        assert!(
+            kv.lookup_raw(&ec_id)
+                .expect("should read lagging replica")
+                .is_none(),
+            "should model the issuance replication gap"
+        );
+        assert_eq!(
+            kv.write_withdrawal_tombstone(&ec_id)
+                .expect("should process withdrawal"),
+            TombstoneOutcome::Written,
+            "should tombstone an issued identity despite a lagging lookup"
+        );
+        assert_eq!(
+            kv.upsert_partner_id_if_exists(&ec_id, "partner", "uid")
+                .expect("should check batch-sync eligibility"),
+            UpsertResult::ConsentWithdrawn,
+            "should not revive the withdrawn identity through batch sync"
+        );
+    }
+
+    #[test]
+    fn a_withdrawal_checks_strong_existence_once_without_eventual_lookup() {
+        // One existence operation may page at the backend, but must not be
+        // followed by an eventually consistent lookup.
         let (store, reads) = CountingEcKv::new();
+        let lookups = std::sync::Arc::clone(&store.lookups);
         let kv = KvIdentityGraph::new(store);
         let count = || *reads.lock().expect("should lock the read counter");
 
@@ -1532,6 +1559,11 @@ mod tests {
             count() - before,
             1,
             "a held identity is checked once, then written"
+        );
+        assert_eq!(
+            *lookups.lock().expect("should lock lookup counter"),
+            0,
+            "should not use an eventual lookup for withdrawal"
         );
     }
 
@@ -1561,6 +1593,8 @@ mod tests {
     struct CountingEcKv {
         inner: super::super::kv_backend::test_support::InMemoryEcKv,
         reads: std::sync::Arc<std::sync::Mutex<usize>>,
+        lag_live_entries: bool,
+        lookups: std::sync::Arc<std::sync::Mutex<usize>>,
     }
 
     impl CountingEcKv {
@@ -1572,6 +1606,8 @@ mod tests {
                 Self {
                     inner: super::super::kv_backend::test_support::InMemoryEcKv::new("test_store"),
                     reads: std::sync::Arc::clone(&counter),
+                    lag_live_entries: false,
+                    lookups: std::sync::Arc::new(std::sync::Mutex::new(0)),
                 },
                 counter,
             )
@@ -1584,8 +1620,24 @@ mod tests {
         }
 
         fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            *self.lookups.lock().expect("should lock the lookup counter") += 1;
+            let found = self.inner.lookup(key)?;
+            if self.lag_live_entries
+                && found.as_ref().is_some_and(|entry| {
+                    serde_json::from_slice::<KvEntry>(&entry.body)
+                        .expect("should decode test entry")
+                        .consent
+                        .ok
+                })
+            {
+                return Ok(None);
+            }
+            Ok(found)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
             *self.reads.lock().expect("should lock the read counter") += 1;
-            self.inner.lookup(key)
+            self.inner.key_exists(key)
         }
 
         fn insert(
@@ -1632,6 +1684,10 @@ mod tests {
                 store_name: "test_store".to_owned(),
                 message: "reads unavailable".to_owned(),
             }))
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.lookup(key).map(|entry| entry.is_some())
         }
 
         fn insert(

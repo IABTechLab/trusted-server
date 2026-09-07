@@ -83,6 +83,18 @@ pub trait EcKvStore {
     /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
     fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>>;
 
+    /// Checks exact-key existence against strongly consistent store state.
+    ///
+    /// A completed issuance must be visible even when [`Self::lookup`] lags.
+    /// Prefix matches are insufficient and an inconclusive check is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store failure or when a
+    /// bounded check cannot determine existence. Never falls back to an
+    /// eventually consistent read.
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>>;
+
     /// Writes an entry according to the requested precondition mode.
     ///
     /// # Errors
@@ -155,6 +167,11 @@ pub(crate) mod test_support {
                 metadata: stored.metadata.clone(),
                 generation: stored.generation,
             }))
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            let entries = self.entries.lock().expect("should lock in-memory store");
+            Ok(entries.contains_key(key))
         }
 
         fn insert(
@@ -238,6 +255,11 @@ pub(crate) mod test_support {
 
         fn lookup(&self, _key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             Err(self.error("lookup"))
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            let _ = key;
+            Err(self.error("key_exists"))
         }
 
         fn insert(
