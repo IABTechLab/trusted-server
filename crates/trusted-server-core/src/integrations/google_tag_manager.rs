@@ -80,8 +80,6 @@ static GTM_TAG_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// Host alternation shared by the URL patterns below.
 const GTM_URL_HOSTS: &str =
     r"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)";
-/// The paths this integration actually routes, mirroring
-/// [`GoogleTagManagerIntegration::is_rewritable_url`].
 /// The paths this integration routes, plus the empty path.
 ///
 /// A script may hold an origin and build the path later
@@ -571,12 +569,17 @@ impl GoogleTagManagerIntegration {
     /// Resolves a `gtm.js` request, which is always answered with the
     /// configured container.
     ///
-    /// The id the client names is not consulted at all. `container_id` is the
-    /// container this origin serves, and `allowed_tag_ids` widens `gtag/js`
-    /// only, so serving a second container here would quietly extend a setting
-    /// documented for the other endpoint. A page that needs another container
-    /// is a configuration change rather than a request parameter.
+    /// The id the client names never selects the container served; it is read
+    /// only to log a mismatch. `container_id` is the container this origin
+    /// serves, and `allowed_tag_ids` widens `gtag/js` only, so serving a
+    /// second container here would quietly extend a setting documented for
+    /// the other endpoint. A page that needs another container is a
+    /// configuration change rather than a request parameter.
     fn container_target(&self, base: &str, query: Option<&str>) -> GtmTarget {
+        if Self::requested_tag_id(query).is_some_and(|tag_id| tag_id != self.config.container_id) {
+            // The id value is client-controlled, so it is not echoed here.
+            log::warn!("Ignoring a gtm.js id that differs from the configured container");
+        }
         GtmTarget::Proxy(Self::with_query(
             base.to_owned(),
             &Self::canonical_query(query, Some(&self.config.container_id)),
@@ -1970,6 +1973,30 @@ mod tests {
                 "should refuse {host}: {domains:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_proxy_allowlist_permits_a_custom_upstream_host() {
+        // A custom tagging domain has to be fetchable, or every proxied script
+        // request fails closed. The Google script host is not carried over: an
+        // operator who repoints the upstream is stating which host serves the
+        // script, so a redirect back to Google is refused by design.
+        let integration = GoogleTagManagerIntegration::new(GoogleTagManagerConfig {
+            upstream_url: "https://tags.example.com".to_string(),
+            ..tag_config("GTM-CONFIGURED", &[])
+        });
+        let domains = &integration.proxy_allowed_domains;
+
+        assert!(
+            domains.iter().any(|domain| domain == "tags.example.com"),
+            "should permit the configured upstream host: {domains:?}"
+        );
+        assert!(
+            !domains
+                .iter()
+                .any(|pattern| crate::proxy::is_host_allowed("www.googletagmanager.com", pattern)),
+            "a custom upstream replaces the Google script host: {domains:?}"
+        );
     }
 
     #[test]
