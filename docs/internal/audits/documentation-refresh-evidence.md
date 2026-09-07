@@ -3617,6 +3617,14 @@ region`. The completed contract renders one canonical adapter-support row in
   passed. Documentation ESLint, Prettier, and VitePress build passed. The final
   all-record check and staged package proof are recorded immediately before the
   implementation commit.
+- Hosted run `34131720943` exposed a workflow-only quoting defect at
+  `https://github.com/IABTechLab/trusted-server/actions/runs/34131720943/job/101775834152`:
+  the checked YAML preserved backslashes inside two single-quoted `awk`
+  programs, both version outputs were empty, the Fastly setup action rejected
+  them, and the smoke step was skipped. The correction removes only those four
+  backslashes. Local extraction now returns exact pins `15.1.0` and `0.17.0`,
+  workflow policy passes, and a fresh hosted run on the correction commit is
+  required; the failed setup job is not smoke evidence.
 
 #### Task 14 — Complete WP5 product coverage and navigation
 

@@ -174,8 +174,8 @@ jobs:
         if: matrix.adapter == 'fastly'
         id: fastly-versions
         run: |
-          echo "cli=$(awk '$1 == \"fastly\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "viceroy=$(awk '$1 == \"viceroy\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "cli=$(awk '$1 == "fastly" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "viceroy=$(awk '$1 == "viceroy" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
       - name: Install pinned Fastly CLI
         if: matrix.adapter == 'fastly'

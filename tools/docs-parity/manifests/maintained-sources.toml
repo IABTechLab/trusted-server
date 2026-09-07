@@ -4876,13 +4876,13 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/integration-tests.yml"
-selector = "bytes:7654-7728"
+selector = "bytes:7650-7724"
 fingerprint = "sha256:2330dbe6289b49889b5c6d37991ef8ce3ca761a0fede60b9c7a18d4a098e366e"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/integration-tests.yml"
-selector = "bytes:7735-7783"
+selector = "bytes:7731-7779"
 fingerprint = "sha256:413310b737a2a26ee161a1f960cebc3b707d3e440dc81f35e7679499c04e86ad"
 disposition = "include"
 
