@@ -6,8 +6,8 @@ Get up and running with Trusted Server quickly.
 
 Before you begin, ensure you have the following installed (versions are pinned in `.tool-versions`):
 
-- Rust 1.98.1 (see `.tool-versions`)
-- NodeJS 24.20.0
+- Rust {{RUST_VERSION}} (see `.tool-versions`)
+- NodeJS {{NODEJS_VERSION}}
 - Basic familiarity with Rust and WebAssembly
 
 **For Fastly deployment** (optional for local dev):
