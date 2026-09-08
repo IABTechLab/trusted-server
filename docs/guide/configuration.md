@@ -1926,9 +1926,10 @@ enabling one does not enable the other.
 
 ### `[observability]`
 
-| Field                   | Type    | Required | Default | Description                                                         |
-| ----------------------- | ------- | -------- | ------- | ------------------------------------------------------------------- |
-| `server_timing_enabled` | Boolean | No       | `false` | Append request-phase timings to the `Server-Timing` response header |
+| Field                   | Type     | Required | Default | Description                                                                                               |
+| ----------------------- | -------- | -------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `server_timing_enabled` | Boolean  | No       | `false` | Append request-phase timings to the `Server-Timing` response header                                       |
+| `route_sections`        | String[] | No       | `[]`    | Section names kept as publisher route templates (`/{section}/*`) in access telemetry; empty collapses all |
 
 **Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
 phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
@@ -1956,6 +1957,12 @@ send access-telemetry rows.
 [observability]
 server_timing_enabled = true
 ```
+
+::: tip The Axum dev server reads this flag once at startup
+Unlike the Fastly adapter, which reads settings per request, the Axum dev
+server bakes `server_timing_enabled` into its service when it starts.
+Flipping the flag there requires a restart to take effect.
+:::
 
 ::: warning Client-visible latency disclosure
 The `Server-Timing` header is sent to every client on eligible responses,
@@ -1993,12 +2000,15 @@ independent emitters: auction telemetry (`auction_dataset`,
 `auction_token_secret`) and access telemetry. The keys below cover the
 access-telemetry sink and the shared enable flags.
 
-| Field                | Type    | Required                             | Default | Description                                                                     |
-| -------------------- | ------- | ------------------------------------ | ------- | ------------------------------------------------------------------------------- |
-| `enabled`            | Boolean | Yes, when `access_enabled`           | `false` | Master switch for the shared Tinybird transport (host, store, credentials)      |
-| `auction_enabled`    | Boolean | No                                   | `true`  | Independently gates auction telemetry emission, decoupled from access telemetry |
-| `access_enabled`     | Boolean | No                                   | `false` | Enables the sampled access-telemetry row sent after each response is delivered  |
-| `access_sample_rate` | Float   | Yes (`> 0.0`), when `access_enabled` | `0.0`   | Fraction (`0.0`-`1.0`) of requests to emit an access-telemetry row for          |
+| Field                 | Type    | Required                             | Default                        | Description                                                                     |
+| --------------------- | ------- | ------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------- |
+| `enabled`             | Boolean | Yes, when `access_enabled`           | `false`                        | Master switch for the shared Tinybird transport (host, store, credentials)      |
+| `auction_enabled`     | Boolean | No                                   | `true`                         | Independently gates auction telemetry emission, decoupled from access telemetry |
+| `access_enabled`      | Boolean | No                                   | `false`                        | Enables the sampled access-telemetry row sent after each response is delivered  |
+| `access_dataset`      | String  | Yes, when `access_enabled`           | `access_logs_raw`              | Access-log Events API datasource name                                           |
+| `access_token_secret` | String  | Yes, when `access_enabled`           | `tinybird_access_append_token` | Secret Store key holding the access APPEND token                                |
+| `max_body_bytes`      | Integer | No                                   | `1048576`                      | Maximum NDJSON request body size; must be at least 1024                         |
+| `access_sample_rate`  | Float   | Yes (`> 0.0`), when `access_enabled` | `0.0`                          | Fraction (`0.0`-`1.0`) of requests to emit an access-telemetry row for          |
 
 **Purpose**: `access_enabled` and `auction_enabled` gate the two Tinybird
 sinks separately so that turning on one does not silently turn on (or leave
@@ -2007,8 +2017,8 @@ Setting `access_enabled = true` with `access_sample_rate = 0.0` is rejected at
 config load as an armed-but-silent configuration; use `access_enabled` itself
 to turn the sink off, not the sample rate. Enabling `access_enabled` also
 requires the shared transport fields (`enabled`, non-empty `api_host`,
-`secret_store`, `access_dataset`, `access_token_secret`, and a positive
-`max_body_bytes`) to already be set.
+`secret_store`, `access_dataset`, `access_token_secret`, and a
+`max_body_bytes` of at least 1024) to already be set.
 
 **Example**:
 
@@ -2041,18 +2051,23 @@ the response the reader sees.
 
 ### Deploy and rollback ordering
 
-::: warning `Settings` rejects unknown fields; order matters
-Both `[observability].server_timing_enabled` and the new `[tinybird]` access
-keys are new fields on a config schema that uses `deny_unknown_fields`, so an
-older binary fails to load a config that carries them.
+::: warning Push a compatibility config before rolling back
+The compatibility boundary is uneven. The top-level `Settings` schema uses
+`deny_unknown_fields`, so an older binary rejects a config carrying the
+`[observability]` table. The nested `[tinybird]` table does not: an older
+binary accepts unknown keys there, rejects `access_enabled = true` through
+validation, ignores `auction_enabled` entirely, and reads `enabled = true`
+as "auction telemetry on".
 
 **Deploying**: upgrade the binary first, then push a config containing the
 new fields second. Never push a config with these fields while a
 pre-observability binary can still receive it.
 
-**Rolling back**: reverse the order. Remove the `[observability]` table and
-any new `[tinybird]` access keys from the config and push that first, then
-roll back the binary second.
+**Rolling back**: push a compatibility config first, then roll the binary
+back. The compatibility config removes the `[observability]` table, sets
+`access_enabled = false`, and, for a deployment that only used the access
+sink, sets `enabled = false` as well; otherwise the older binary would
+interpret the leftover `enabled = true` as enabling auction telemetry.
 :::
 
 ## Validation

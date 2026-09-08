@@ -881,9 +881,16 @@ async fn dispatch_fallback(
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
         // publisher-specific streaming finalizer instead.
+        // The matched route pattern is an integration-defined literal
+        // (bounded and content-free by construction), so telemetry keeps it
+        // verbatim instead of running the request path through the lossy
+        // publisher classifier.
         route_metadata = Some(RouteMetadata {
             route_class: RouteClass::IntegrationProxy,
-            route_template: publisher_route_template(&path),
+            route_template: state
+                .registry
+                .matched_route_pattern(&method, &path)
+                .map_or_else(|| "/other/*".to_owned(), str::to_owned),
         });
         state
             .registry
@@ -934,7 +941,10 @@ async fn dispatch_fallback(
 
         route_metadata = Some(RouteMetadata {
             route_class: RouteClass::PublisherHtml,
-            route_template: publisher_route_template(&path),
+            route_template: publisher_route_template(
+                &path,
+                &state.settings.observability.route_sections,
+            ),
         });
 
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
@@ -1517,7 +1527,7 @@ mod tests {
         NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RouteClass, RouteMetadata,
         TSJS_ROUTE_TEMPLATE, TrustedServerApp, build_per_request_services,
         build_state_from_settings, handle_publisher_request,
-        publisher_response_into_streaming_response, publisher_route_template, startup_error_router,
+        publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -2451,8 +2461,8 @@ mod tests {
             .expect("integration-proxy fallback responses should carry RouteMetadata");
         assert_eq!(metadata.route_class, RouteClass::IntegrationProxy);
         assert_eq!(
-            metadata.route_template,
-            publisher_route_template("/integrations/prebid/bundle.js")
+            metadata.route_template, "/integrations/prebid/bundle.js",
+            "should carry the registered route pattern verbatim, not a classifier output"
         );
     }
 
@@ -2466,7 +2476,10 @@ mod tests {
             .get::<RouteMetadata>()
             .expect("publisher fallback responses should carry RouteMetadata");
         assert_eq!(metadata.route_class, RouteClass::PublisherHtml);
-        assert_eq!(metadata.route_template, "/news/*");
+        assert_eq!(
+            metadata.route_template, "/other/*",
+            "the default empty section allowlist should collapse publisher paths"
+        );
     }
 
     #[test]
@@ -3850,6 +3863,22 @@ mod tests {
         assert!(
             !recovery_eligible_of(&response),
             "a short-circuit filter response must not authorize orphan recovery"
+        );
+    }
+
+    #[test]
+    fn server_timing_absent_when_no_cache_control_header_exists() {
+        // The fail-closed case: absence of Cache-Control is not evidence of
+        // privacy, so emission must be suppressed rather than defaulted on.
+        let mut response = response_builder()
+            .body(Body::empty())
+            .expect("should build a response with no cache-control header");
+
+        crate::apply_server_timing_header(&mut response, &RequestTimings::new(), true);
+
+        assert!(
+            response_header(&response, "server-timing").is_none(),
+            "should not emit when the response carries no Cache-Control at all"
         );
     }
 

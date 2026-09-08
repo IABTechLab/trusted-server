@@ -12,20 +12,6 @@ use serde_json::json;
 
 use crate::request_timing::{AuctionWaitPlacement, TimingSnapshot};
 
-/// Maximum length of a publisher path's first segment before
-/// [`publisher_route_template`] rejects it to `/other/*`. Longer segments
-/// are opaque-identifier or slug shaped (a UUID is 36 characters), and a
-/// truncated prefix of either would still be identifying, so the segment
-/// is rejected whole rather than truncated.
-const MAX_SEGMENT_LEN: usize = 32;
-
-/// Maximum number of ASCII digits in a publisher path's first segment
-/// before [`publisher_route_template`] rejects it to `/other/*`. Hex ids,
-/// base36 ids, and reset tokens are digit-heavy; real section names carry
-/// at most a year (`2026`) or a small version number, so a segment with
-/// more digits than this is treated as an identifier, not a name.
-const MAX_SEGMENT_DIGITS: usize = 7;
-
 /// Normalizes an HTTP method token into the bounded set of values stored in
 /// the `method` `LowCardinality` column.
 ///
@@ -127,46 +113,43 @@ pub struct RouteMetadata {
 }
 
 /// Normalizes a publisher-fallback request path into a bounded,
-/// content-free route template.
+/// content-free route template using an operator-configured allowlist of
+/// section names.
 ///
-/// Returns `/` plus the first path segment, lowercased and restricted to
-/// `[a-z0-9_-]`, plus `/*`, only when the path has at least two segments:
-/// depth is what makes the first segment a section name (`/news/*`) rather
-/// than the document itself. The root path `/` maps to itself. Everything
-/// else is rejected to `/other/*` — outright, never filtered or truncated,
-/// so no fragment of a rejected path ever reaches the row:
+/// The root path `/` maps to itself. A path whose first segment matches an
+/// entry in `sections` (ASCII case-insensitive) and that has at least one
+/// further segment maps to `/{section}/*`, emitting the lowercased
+/// allowlist entry rather than anything taken from the request. Every
+/// other path maps to `/other/*`.
 ///
-/// - single-segment paths (`/my-post-title` under a `/%postname%/`
-///   permalink structure is a per-article slug that no shape heuristic
-///   can separate from a section name);
-/// - an empty first segment, or one containing any character outside the
-///   allowlist after lowercasing (an email address, a search phrase);
-/// - a first segment longer than [`MAX_SEGMENT_LEN`] characters (a
-///   truncated prefix of a UUID or token would still be identifying); or
-/// - a first segment with more than [`MAX_SEGMENT_DIGITS`] ASCII digits
-///   (hex ids, base36 ids, and reset tokens are digit-heavy; section
-///   names carry at most a year or a version number).
-///
-/// This is deliberately coarser than the auction-telemetry path
-/// normalizer, which redacts long tokens but preserves short identifiers
-/// and arbitrary slugs; that normalizer is not sufficient for a dataset
-/// this broad.
+/// This construction makes the template content-free by definition: the
+/// set of emitted values is exactly `{"/", "/other/*"}` plus one
+/// `/{section}/*` per configured entry, so no request-derived byte ever
+/// reaches the row and cardinality is bounded by operator configuration.
+/// With the default empty allowlist, every publisher path collapses to
+/// `/other/*`. Depth alone was rejected as a signal in review: under
+/// `/{username}/posts` shapes the first segment is user data, and under
+/// single-segment permalink structures it is the document itself.
 ///
 /// # Examples
 ///
 /// ```
 /// use trusted_server_core::access_telemetry::publisher_route_template;
 ///
-/// assert_eq!(publisher_route_template("/news/some-article-slug"), "/news/*");
-/// assert_eq!(publisher_route_template("/"), "/");
-/// assert_eq!(publisher_route_template("/user@example.com/profile"), "/other/*");
+/// let sections = vec!["news".to_owned()];
 /// assert_eq!(
-///     publisher_route_template("/550e8400-e29b-41d4-a716-446655440000"),
+///     publisher_route_template("/news/some-article-slug", &sections),
+///     "/news/*"
+/// );
+/// assert_eq!(publisher_route_template("/", &sections), "/");
+/// assert_eq!(
+///     publisher_route_template("/alice/orders", &sections),
 ///     "/other/*"
 /// );
+/// assert_eq!(publisher_route_template("/news/x", &[]), "/other/*");
 /// ```
 #[must_use]
-pub fn publisher_route_template(path: &str) -> String {
+pub fn publisher_route_template(path: &str, sections: &[String]) -> String {
     if path == "/" {
         return "/".to_owned();
     }
@@ -178,31 +161,18 @@ pub fn publisher_route_template(path: &str) -> String {
     };
     let has_more_depth = !rest.is_empty();
 
-    let lowered = first_segment.to_ascii_lowercase();
-    let is_allowlisted = !lowered.is_empty()
-        && lowered
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-    let within_length = lowered.chars().count() <= MAX_SEGMENT_LEN;
-    let digit_count = lowered.chars().filter(char::is_ascii_digit).count();
-
-    if !is_allowlisted || !within_length || digit_count > MAX_SEGMENT_DIGITS {
-        return "/other/*".to_owned();
-    }
-
-    if has_more_depth {
-        format!("/{lowered}/*")
-    } else {
-        // A single-segment path's first segment is the document, not a
-        // section: `/my-post-title` under WordPress `/%postname%/` is a
-        // per-article slug, and no shape heuristic can separate it from a
-        // section name. Only depth >= 2 makes the first segment a section.
-        "/other/*".to_owned()
+    let matched_section = sections
+        .iter()
+        .find(|section| section.eq_ignore_ascii_case(first_segment));
+    match matched_section {
+        Some(section) if has_more_depth => format!("/{}/*", section.to_ascii_lowercase()),
+        _ => "/other/*".to_owned(),
     }
 }
 
 /// A point-in-time view of the access-log dimensions for one response,
-/// captured unconditionally at the `Server-Timing` freeze point.
+/// captured at the `Server-Timing` freeze point when access telemetry is
+/// enabled (a disabled deployment skips the build entirely).
 ///
 /// Built from typed response extensions ([`RouteMetadata`], the geo
 /// lookup state, and the template-cache response state) plus adapter-owned
@@ -358,120 +328,84 @@ mod tests {
     }
 
     #[test]
-    fn publisher_paths_normalize_to_coarse_templates() {
+    fn publisher_route_template_emits_only_allowlisted_sections() {
+        let sections = vec!["news".to_owned(), "Sports".to_owned()];
         assert_eq!(
-            publisher_route_template("/news/some-article-slug"),
+            publisher_route_template("/news/some-article-slug", &sections),
             "/news/*"
         );
-        assert_eq!(publisher_route_template("/"), "/");
         assert_eq!(
-            publisher_route_template("/user@example.com/profile"),
-            "/other/*",
-            "should reject non-allowlisted characters"
-        );
-        assert_eq!(
-            publisher_route_template(&format!("/{}", "a".repeat(500))),
-            "/other/*",
-            "should reject overlong segments whole rather than truncate"
-        );
-        assert_eq!(publisher_route_template("/search terms here"), "/other/*");
-    }
-
-    #[test]
-    fn publisher_route_template_rejects_opaque_identifier_segments() {
-        // Every row here passes the character allowlist (`[a-z0-9_-]` is
-        // exactly what UUIDs, hex ids, and tokens are built from) and must
-        // be caught by the length and digit-count bounds instead. A
-        // truncated prefix of any of these would still be identifying, so
-        // rejection must be whole-segment.
-        assert_eq!(
-            publisher_route_template("/550e8400-e29b-41d4-a716-446655440000"),
-            "/other/*",
-            "should reject a UUID (36 chars) by length"
-        );
-        assert_eq!(
-            publisher_route_template("/550e8400-e29b-41d4-a716-446655440000/profile"),
-            "/other/*",
-            "should reject a UUID first segment on deeper paths too"
-        );
-        assert_eq!(
-            publisher_route_template("/8f3a9c2b1d4e5f6a7b8c9d0e1f2a3b4c"),
-            "/other/*",
-            "should reject a 32-char hex id by digit count"
-        );
-        assert_eq!(
-            publisher_route_template(&format!("/{}", "a1".repeat(32))),
-            "/other/*",
-            "should reject a 64-char token by length"
-        );
-        assert_eq!(
-            publisher_route_template("/reset-password-token-9f2b1c7d4e8a"),
-            "/other/*",
-            "should reject a reset token by length"
-        );
-        assert_eq!(
-            publisher_route_template("/how-to-treat-my-recent-hiv-diagnosis"),
-            "/other/*",
-            "should reject a full article slug by length"
-        );
-    }
-
-    #[test]
-    fn publisher_route_template_keeps_digit_light_section_names() {
-        assert_eq!(
-            publisher_route_template("/2026/08/some-article"),
-            "/2026/*",
-            "a year archive segment should pass the digit bound"
-        );
-        assert_eq!(
-            publisher_route_template("/wp-content/themes/site/app.css"),
-            "/wp-content/*",
-            "a hyphenated section name should pass"
-        );
-    }
-
-    #[test]
-    fn publisher_route_template_rejects_empty_first_segment() {
-        assert_eq!(
-            publisher_route_template("//double-slash"),
-            "/other/*",
-            "an empty first segment should not be treated as allowlisted"
-        );
-    }
-
-    #[test]
-    fn publisher_route_template_rejects_single_segment_paths() {
-        // A single-segment path's first segment is the document itself
-        // (WordPress `/%postname%/` puts every article at depth 1), so no
-        // shape heuristic can separate a slug from a section name; depth
-        // is the only safe signal. Root-level landing pages pay for this
-        // deliberately.
-        assert_eq!(publisher_route_template("/my-post-title"), "/other/*");
-        assert_eq!(
-            publisher_route_template("/my-post-title/"),
-            "/other/*",
-            "a trailing slash should not count as depth"
-        );
-        assert_eq!(
-            publisher_route_template("/1234567"),
-            "/other/*",
-            "a numeric post id at the digit boundary should still reject"
-        );
-        assert_eq!(publisher_route_template("/user-8f3a9c2b"), "/other/*");
-        assert_eq!(
-            publisher_route_template("/about"),
-            "/other/*",
-            "root-level landing pages reject too; only depth makes a section"
-        );
-    }
-
-    #[test]
-    fn publisher_route_template_lowercases_before_allowlisting() {
-        assert_eq!(
-            publisher_route_template("/News/Article"),
+            publisher_route_template("/NEWS/some-article-slug", &sections),
             "/news/*",
-            "should lowercase before validating"
+            "matching should be case-insensitive on the request side"
         );
+        assert_eq!(
+            publisher_route_template("/sports/scores/today", &sections),
+            "/sports/*",
+            "the emitted value should be the lowercased allowlist entry"
+        );
+        assert_eq!(publisher_route_template("/", &sections), "/");
+        assert_eq!(
+            publisher_route_template("/news", &sections),
+            "/other/*",
+            "an allowlisted section with no further depth is the document, not a section"
+        );
+        assert_eq!(
+            publisher_route_template("/opinion/some-slug", &sections),
+            "/other/*",
+            "a section absent from the allowlist should collapse"
+        );
+    }
+
+    #[test]
+    fn publisher_route_template_collapses_everything_by_default() {
+        // The default allowlist is empty, so no request-derived byte can
+        // reach the row: the only emitted values are `/` and `/other/*`.
+        let empty: Vec<String> = Vec::new();
+        for path in [
+            "/news/some-article-slug",
+            "/alice/orders",
+            "/jane-doe/posts",
+            "/johnsmith1985/settings",
+            "/how-to-treat-my-hiv-today/comments",
+            "/abcdefabcdefabcdefabcdefabcdefab/x",
+            "/8f3a9c2b/x",
+            "/my-post-title",
+            "/user@example.com/profile",
+            "/search terms here",
+            "//double-slash",
+            "/550e8400-e29b-41d4-a716-446655440000/profile",
+        ] {
+            assert_eq!(
+                publisher_route_template(path, &empty),
+                "/other/*",
+                "should collapse with an empty allowlist: {path}"
+            );
+        }
+        assert_eq!(publisher_route_template("/", &empty), "/");
+    }
+
+    #[test]
+    fn publisher_route_template_never_emits_user_data_even_when_allowlisted() {
+        // Adversarial depth-2 shapes from review: even with sections
+        // configured, a first segment that is not an exact allowlist match
+        // collapses, and the emitted value on a match is the allowlist
+        // entry itself, never request bytes.
+        let sections = vec!["news".to_owned()];
+        for path in [
+            "/jane-doe/posts",
+            "/johnsmith1985/settings",
+            "/how-to-treat-my-hiv-today/comments",
+            "/abcdefabcdefabcdefabcdefabcdefab/x",
+            "/8f3a9c2b/x",
+            "/newsy/article",
+        ] {
+            assert_eq!(
+                publisher_route_template(path, &sections),
+                "/other/*",
+                "should collapse non-allowlisted first segments: {path}"
+            );
+        }
     }
 
     #[test]
