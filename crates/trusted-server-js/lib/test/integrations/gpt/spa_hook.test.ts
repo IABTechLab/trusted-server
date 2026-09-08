@@ -61,7 +61,7 @@ describe('installSpaAuctionHook', () => {
     // Drop any ad containers inserted by a test so DOM state does not leak.
     document.body.innerHTML = '';
     // Remove this test's popstate listener(s) so they do not fire in later tests.
-    popstateHandlers.forEach((handler) => window.removeEventListener('popstate', handler));
+    popstateHandlers.forEach((handler) => window.removeEventListener('popstate', handler, true));
     popstateHandlers = [];
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -237,9 +237,9 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).not.toHaveBeenCalled();
   });
 
-  it('runs adInit on an empty page-bids response when prior TS state exists', async () => {
-    // When TS touched slots on a previous navigation, an empty response still
-    // needs adInit() to sweep the stale TS targeting from those slots.
+  it('does not defer cleanup to adInit when an empty response has only prior targeting', async () => {
+    // Navigation clears prior targeting synchronously, so an empty response
+    // does not need adInit when TS owns no slots that still require destruction.
     fetchStub.mockResolvedValue({
       ok: true,
       json: async () => ({ slots: [], bids: {} }),
@@ -255,7 +255,103 @@ describe('installSpaAuctionHook', () => {
     await flushAsync();
 
     expect(ts.adSlots).toEqual([]);
-    expect(adInit).toHaveBeenCalledTimes(1);
+    expect(adInit).not.toHaveBeenCalled();
+  });
+
+  it('clears prior targeting before page-bids resolves without touching new publisher targeting', async () => {
+    let resolveFetch: ((response: Response) => void) | undefined;
+    fetchStub.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+    const element = document.createElement('div');
+    element.id = 'div-route-slot';
+    document.body.appendChild(element);
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      addService: vi.fn().mockReturnThis(),
+      clearTargeting,
+      getSlotElementId: vi.fn().mockReturnValue(element.id),
+      getTargeting: vi.fn().mockReturnValue([]),
+      setTargeting: vi.fn().mockReturnThis(),
+    };
+    const pubads = {
+      addEventListener: vi.fn(),
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([gptSlot]),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(gptSlot),
+      destroySlots: vi.fn(),
+      display: vi.fn(),
+      enableServices: vi.fn(),
+      pubads: vi.fn().mockReturnValue(pubads),
+    };
+
+    const { installSpaAuctionHook, installTsAdInit } = await importGptModule();
+    installTsAdInit();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    ts.prevSlotTargetingKeys = { [element.id]: ['ts_route'] };
+    ts.divToSlotId = { [element.id]: 'route_slot' };
+
+    history.pushState({}, '', '/publisher-route');
+
+    expect(clearTargeting.mock.calls.map(([key]) => key)).toEqual([
+      'hb_pb',
+      'hb_bidder',
+      'hb_adid',
+      'hb_cache_host',
+      'hb_cache_path',
+      'ts_initial',
+      'ts_route',
+    ]);
+    expect(ts.prevSlotTargetingKeys).toEqual({});
+    expect(ts.divToSlotId).toEqual({});
+    const cleanupCallCount = clearTargeting.mock.calls.length;
+
+    ts.firstImpression = {
+      generation: 1,
+      nextToken: 0,
+      fallbackSlots: {},
+      slots: {
+        [element.id]: {
+          generation: 1,
+          slotElementId: element.id,
+          element,
+          owner: 'publisher',
+          phase: 'auctioning',
+          expiresAt: Date.now() + 5000,
+          publisherAuctions: {},
+        },
+      },
+    };
+    gptSlot.setTargeting('hb_adid', 'publisher-current');
+    resolveFetch!(
+      new Response(
+        JSON.stringify({
+          slots: [
+            {
+              id: 'route_slot',
+              gam_unit_path: '/123/route',
+              div_id: element.id,
+              formats: [[300, 250]],
+              targeting: {},
+            },
+          ],
+          bids: {},
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    await flushAsync();
+
+    expect(clearTargeting).toHaveBeenCalledTimes(cleanupCallCount);
+    expect(gptSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'publisher-current');
   });
 
   it('defers applying bids until the route ad container is inserted', async () => {
