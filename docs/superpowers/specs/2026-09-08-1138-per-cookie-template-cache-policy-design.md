@@ -219,8 +219,13 @@ For the named-policy path:
 - Any repeated cookie name anywhere in the request causes bypass, even when the
   values match or the cookie is unlisted. Different origins can interpret
   duplicates differently; this design does not choose first or last wins.
-- Malformed input or an unsupported byte sequence causes cache bypass, not a new
-  request rejection. Preserve the existing request and origin handling.
+- For requests reaching this evaluator, malformed input or an unsupported byte
+  sequence causes cache bypass. The evaluator introduces no new request error.
+  Existing earlier validation errors remain unchanged: the publisher calls
+  `handle_request_cookies` before the cache gate, and failure of `to_str()` on its
+  selected header still returns the existing `InvalidHeaderValue` error. An
+  invalid later field that earlier parsing does not inspect must cause bypass
+  when the policy evaluator inspects all fields.
 
 Parsing may conservatively reduce cache hits for nonconforming clients. This is
 intentional only when a named policy is active; the no-list compatibility path
@@ -308,8 +313,10 @@ async runtime, or platform-specific implementation is needed. The Fastly adapter
 continues consuming the shared opaque key; other adapters retain their current
 cache capabilities.
 
-Follow existing error-stack conventions for configuration errors. Runtime
-classification failure is a normal cache bypass, not an exceptional page error.
+Follow existing error-stack conventions at the configuration error boundary;
+retain the existing `validate_runtime` string-error interface. Cookie policy
+classification failure is a normal cache bypass, not a new page error. It does
+not suppress errors raised by request handling before the evaluator runs.
 Retain `X-TS-Template-Cache: bypass-request` and existing bounded diagnostics;
 this change does not require a new public diagnostic value or metrics subsystem.
 
@@ -325,6 +332,9 @@ this change does not require a new public diagnostic value or metrics subsystem.
 - Valid token names, including distinct case variants, are accepted.
 - Empty/invalid names, duplicate entries, and cross-list overlap fail validation.
 - Raw `Cookie` and `Authorization` remain prohibited header dimensions.
+- Test key-only, bypass-only, and both-list configurations, with the unused list
+  either omitted or explicitly empty. Both lists empty select the legacy path;
+  either list nonempty activates the named policy.
 
 ### 10.2 Parsing and key isolation
 
@@ -339,10 +349,11 @@ this change does not require a new public diagnostic value or metrics subsystem.
 - Empty bypass values disqualify. A bypass cookie in a later header also
   disqualifies; it must not be hidden by first-header extraction.
 - Duplicate names with equal or different values, across pairs or fields, bypass.
-- Bare names, invalid names, empty pairs/fields, invalid quoting, forbidden value
-  bytes, and non-ASCII input bypass under a named policy.
-- Preserve legacy boolean decisions for those same malformed headers when both
-  lists are empty.
+- At the evaluator level, bare names, invalid names, empty pairs/fields, invalid
+  quoting, forbidden value bytes, and non-ASCII input bypass under a named policy.
+- At the evaluator level, preserve legacy boolean decisions for those same
+  malformed headers when both lists are empty. This does not imply that every
+  such request reaches the evaluator through the publisher handler.
 - Pin the unchanged backend key for an existing fixture with empty cookie
   dimensions, and verify surrogate keys remain common to all URL variants.
 
@@ -365,8 +376,11 @@ lookup/reservation/store counts, origin requests, and rendered response content:
 4. A missing experiment cookie and an explicitly empty one cannot reuse each
    other's template. A request carrying only ignored cookies uses the missing-arm
    template when independence is true.
-5. Ambiguous/malformed cookie requests bypass an already warm cache and cannot
-   store on a cold cache under a named policy.
+5. Ambiguous/malformed cookie requests that reach the policy evaluator bypass an
+   already warm cache and cannot store on a cold cache under a named policy.
+   Separately preserve the existing error for a selected header that fails
+   `to_str()`, and prove that invalid bytes in a later field bypass rather than
+   being ignored by the evaluator. Neither path may access or store a template.
 6. `Vary: Cookie` refuses storage under the new policy, including combined header
    lists. An uncovered downstream header still refuses storage even with a
    configured cookie dimension.
@@ -375,6 +389,11 @@ lookup/reservation/store counts, origin requests, and rendered response content:
    fresh on warm hits and is not captured in the shared template.
 8. Changing a configured cookie policy changes the fingerprint/key and prevents
    reuse of entries created under the previous policy.
+9. Exercise each list independently: a bypass-only configuration shares anonymous
+   traffic and excludes session traffic with independence true; a key-only
+   configuration separates experiment arms and admits only listed cookies with
+   independence false. Repeat with the unused list explicitly empty to verify
+   that it does not disable the named policy.
 
 For the eventual implementation, run target-matched tests after runtime changes
 and the full CI gates documented in `CLAUDE.md` before PR handoff, including
