@@ -274,9 +274,9 @@ pub(crate) async fn set_browser_cookies(
 ) -> Result<(), String> {
     for (name, value) in cookies {
         let cookie = host_cookie(name, value, url)?;
-        browser
-            .set_cookies(vec![cookie])
+        tokio::time::timeout(CDP_OPERATION_TIMEOUT, browser.set_cookies(vec![cookie]))
             .await
+            .map_err(|_| format!("timed out setting cookie `{name}`"))?
             .map_err(|error| format_cookie_install_error(name, error))?;
     }
     Ok(())
@@ -441,9 +441,11 @@ async fn collect(
         user_agent,
     })?;
 
-    let (mut browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|error| format!("failed to launch browser: {error}"))?;
+    let (mut browser, mut handler) =
+        tokio::time::timeout(NAVIGATION_TIMEOUT, Browser::launch(config))
+            .await
+            .map_err(|_| "timed out launching browser".to_string())?
+            .map_err(|error| format!("failed to launch browser: {error}"))?;
 
     // Drive the CDP event loop for the duration of the session.
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -478,9 +480,9 @@ async fn collect_with_browser(
 
     // Open a blank page first so init scripts are installed before the real
     // document loads (evaluate-on-new-document applies to subsequent navigations).
-    let page = browser
-        .new_page("about:blank")
+    let page = tokio::time::timeout(CDP_OPERATION_TIMEOUT, browser.new_page("about:blank"))
         .await
+        .map_err(|_| "timed out opening browser page".to_string())?
         .map_err(|error| format!("failed to open browser page: {error}"))?;
 
     let result = collect_open_page(&page, &request, settle_config, assume_consent).await;
@@ -517,22 +519,34 @@ async fn collect_open_page(
     let mut warnings = Vec::new();
 
     if assume_consent {
-        page.evaluate_on_new_document(CONSENT_STUB_SCRIPT)
-            .await
-            .map_err(|error| format!("failed to install consent init script: {error}"))?;
+        tokio::time::timeout(
+            CDP_OPERATION_TIMEOUT,
+            page.evaluate_on_new_document(CONSENT_STUB_SCRIPT),
+        )
+        .await
+        .map_err(|_| "timed out installing consent init script".to_string())?
+        .map_err(|error| format!("failed to install consent init script: {error}"))?;
         warnings.push(Warning {
             code: "consent_stub_active".to_string(),
             message: "audit consent APIs were stubbed; re-run with --no-assume-consent to observe the publisher CMP without substitution".to_string(),
         });
     }
-    page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)")
-        .await
-        .map_err(|error| format!("failed to increase resource timing buffer: {error}"))?;
+    tokio::time::timeout(
+        CDP_OPERATION_TIMEOUT,
+        page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)"),
+    )
+    .await
+    .map_err(|_| "timed out increasing resource timing buffer".to_string())?
+    .map_err(|error| format!("failed to increase resource timing buffer: {error}"))?;
 
     for script in &request.init_scripts {
-        page.evaluate_on_new_document(script.clone())
-            .await
-            .map_err(|error| format!("failed to install init script: {error}"))?;
+        tokio::time::timeout(
+            CDP_OPERATION_TIMEOUT,
+            page.evaluate_on_new_document(script.clone()),
+        )
+        .await
+        .map_err(|_| "timed out installing audit init script".to_string())?
+        .map_err(|error| format!("failed to install init script: {error}"))?;
     }
 
     tokio::time::timeout(NAVIGATION_TIMEOUT, page.goto(request.url.as_str()))

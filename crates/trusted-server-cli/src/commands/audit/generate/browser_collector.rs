@@ -38,6 +38,7 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// soft bound: the settle loop is the real readiness signal and the scrape reads
 /// whatever rendered by then.
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Size the page's resource-timing buffer is raised to before navigation, and
@@ -412,11 +413,14 @@ async fn with_browser(
     .map_err(report_error)?;
 
     on_progress(CollectionProgress::Launching)?;
-    let (mut browser, mut handler) = Browser::launch(config).await.map_err(|error| {
-        report_error(format!(
-            "failed to launch Chrome/Chromium for audit: {error}"
-        ))
-    })?;
+    let (mut browser, mut handler) = timeout(BROWSER_LAUNCH_TIMEOUT, Browser::launch(config))
+        .await
+        .map_err(|_| report_error("timed out launching Chrome/Chromium for audit"))?
+        .map_err(|error| {
+            report_error(format!(
+                "failed to launch Chrome/Chromium for audit: {error}"
+            ))
+        })?;
 
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
     let page_settings = PageCollectionSettings {
@@ -551,9 +555,9 @@ async fn collect_page_from_browser(
     // duplicate in the middle of progress output.
     set_browser_cookies(browser, cookies, target_url).await?;
 
-    let page = browser
-        .new_page("about:blank")
+    let page = timeout(PAGE_OPERATION_TIMEOUT, browser.new_page("about:blank"))
         .await
+        .map_err(|_| "timed out creating browser page for audit".to_string())?
         .map_err(|error| format!("failed to create browser page for audit: {error}"))?;
 
     let result = collect_open_page(&page, target_url, discover_sitemap, settings).await;
@@ -590,15 +594,23 @@ async fn collect_open_page(
     // Must run before any page script, so the consent platform finds the APIs
     // already answered rather than installing its own gate.
     if settings.assume_consent {
-        page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT)
-            .await
-            .map_err(|error| format!("failed to install the consent stub: {error}"))?;
+        timeout(
+            PAGE_OPERATION_TIMEOUT,
+            page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT),
+        )
+        .await
+        .map_err(|_| "timed out installing the consent stub".to_string())?
+        .map_err(|error| format!("failed to install the consent stub: {error}"))?;
         warnings.push(CONSENT_STUB_WARNING.to_string());
     }
-    page.evaluate_on_new_document(format!(
-        "performance.setResourceTimingBufferSize({RESOURCE_TIMING_BUFFER_SIZE})"
-    ))
+    timeout(
+        PAGE_OPERATION_TIMEOUT,
+        page.evaluate_on_new_document(format!(
+            "performance.setResourceTimingBufferSize({RESOURCE_TIMING_BUFFER_SIZE})"
+        )),
+    )
     .await
+    .map_err(|_| "timed out increasing the resource timing buffer".to_string())?
     .map_err(|error| format!("failed to increase the resource timing buffer: {error}"))?;
 
     // Navigate, but don't hard-fail when the `load` event never fires. Ad-heavy
@@ -1103,6 +1115,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::Arc;
+    use std::time::Instant;
 
     use chromiumoxide::cdp::browser_protocol::network::{Headers, RequestId, Response};
     use chromiumoxide::cdp::browser_protocol::security::SecurityState;
@@ -1145,28 +1158,64 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
         let address = listener.local_addr().expect("should read fixture address");
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("should accept browser request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("should set fixture read timeout");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut chunk = [0_u8; 1024];
-                let chunk_len = stream.read(&mut chunk).expect("should read HTTP request");
-                assert!(chunk_len > 0, "request should contain complete headers");
-                request.extend_from_slice(&chunk[..chunk_len]);
-                assert!(
-                    request.len() <= 16 * 1024,
-                    "request headers should be bounded"
-                );
+            listener
+                .set_nonblocking(true)
+                .expect("should make fixture listener nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            while Instant::now() < deadline && served < 4 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("should accept browser request: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("should make fixture stream blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("should set fixture read timeout");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut chunk = [0_u8; 1024];
+                    let chunk_len = match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(chunk_len) => chunk_len,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => panic!("should read HTTP request: {error}"),
+                    };
+                    request.extend_from_slice(&chunk[..chunk_len]);
+                    assert!(
+                        request.len() <= 16 * 1024,
+                        "request headers should be bounded"
+                    );
+                }
+                if !request.ends_with(b"\r\n\r\n") {
+                    continue;
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    LAZY_GPT_FIXTURE.len(),
+                    LAZY_GPT_FIXTURE,
+                )
+                .expect("should write fixture response");
+                served += 1;
             }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                LAZY_GPT_FIXTURE.len(),
-                LAZY_GPT_FIXTURE,
-            )
-            .expect("should write fixture response");
+            assert!(
+                served > 0,
+                "fixture should serve at least one browser request"
+            );
         });
         Url::parse(&format!("http://{address}/")).expect("should parse fixture URL")
     }
