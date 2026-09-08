@@ -157,11 +157,18 @@ only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- Ad server integrations
-- KV store mappings
-- EC configuration
-- Consent settings (`[gdpr]`)
-- Stable key names for `trusted_server_secrets`
+- browser integrations under `[integrations.*]`;
+- server auction providers under map-shaped `[auction.providers.<id>]`;
+- server bidder routes under `[auction.bidders.<id>]`;
+- KV store mappings;
+- EC configuration;
+- consent settings (`[gdpr]`); and
+- stable key names for `trusted_server_secrets`.
+
+Do not put a Prebid Server URL or server bidder list under
+`[integrations.prebid]`, and do not put APS account/endpoint/timeout fields under
+`[integrations.aps]`. Those server values belong to auction provider common
+fields and `profile_config`.
 
 Before the first push, provision the physical store mapped from logical
 `trusted_server_secrets` with the credential values referenced by the config.
@@ -172,6 +179,11 @@ and push:
 ts config validate
 ts config push --adapter fastly
 ```
+
+This command performs target-independent plan validation. Each adapter performs
+mandatory target-aware fan-out and backend-name validation at startup. The
+EdgeZero callback needed for target-aware pre-write push validation is not yet
+available in this tree, so startup remains the final target gate.
 
 Restart or redeploy instances after secret rotation. See
 [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
