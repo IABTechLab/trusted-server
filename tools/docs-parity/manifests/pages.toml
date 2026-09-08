@@ -43,7 +43,7 @@ navigation = true
 kind = "live"
 path = "docs/guide/axum-dev.md"
 route = "/guide/axum-dev"
-navigation = false
+navigation = true
 
 [[pages]]
 kind = "live"
@@ -55,7 +55,7 @@ navigation = true
 kind = "live"
 path = "docs/guide/cloudflare.md"
 route = "/guide/cloudflare"
-navigation = false
+navigation = true
 
 [[pages]]
 kind = "live"
@@ -89,6 +89,12 @@ navigation = true
 
 [[pages]]
 kind = "live"
+path = "docs/guide/edgezero.md"
+route = "/guide/edgezero"
+navigation = true
+
+[[pages]]
+kind = "live"
 path = "docs/guide/error-reference.md"
 route = "/guide/error-reference"
 navigation = true
@@ -97,7 +103,7 @@ navigation = true
 kind = "live"
 path = "docs/guide/fastly.md"
 route = "/guide/fastly"
-navigation = false
+navigation = true
 
 [[pages]]
 kind = "live"
@@ -143,6 +149,12 @@ navigation = true
 
 [[pages]]
 kind = "live"
+path = "docs/guide/integrations/adserver_mock.md"
+route = "/guide/integrations/adserver_mock"
+navigation = true
+
+[[pages]]
+kind = "live"
 path = "docs/guide/integrations/datadome.md"
 route = "/guide/integrations/datadome"
 navigation = true
@@ -163,7 +175,7 @@ replacement = "/guide/integrations-overview"
 kind = "live"
 path = "docs/guide/integrations/google_tag_manager.md"
 route = "/guide/integrations/google_tag_manager"
-navigation = false
+navigation = true
 
 [[pages]]
 kind = "live"
@@ -175,7 +187,7 @@ navigation = true
 kind = "live"
 path = "docs/guide/integrations/gpt.md"
 route = "/guide/integrations/gpt"
-navigation = false
+navigation = true
 
 [[pages]]
 kind = "tombstone"
@@ -217,7 +229,13 @@ navigation = true
 kind = "live"
 path = "docs/guide/integrations/sourcepoint.md"
 route = "/guide/integrations/sourcepoint"
-navigation = false
+navigation = true
+
+[[pages]]
+kind = "live"
+path = "docs/guide/integrations/testlight.md"
+route = "/guide/integrations/testlight"
+navigation = true
 
 [[pages]]
 kind = "live"
@@ -247,7 +265,13 @@ navigation = true
 kind = "live"
 path = "docs/guide/spin.md"
 route = "/guide/spin"
-navigation = false
+navigation = true
+
+[[pages]]
+kind = "live"
+path = "docs/guide/telemetry.md"
+route = "/guide/telemetry"
+navigation = true
 
 [[pages]]
 kind = "live"
@@ -259,6 +283,12 @@ navigation = true
 kind = "live"
 path = "docs/guide/ts-dev-proxy.md"
 route = "/guide/ts-dev-proxy"
+navigation = true
+
+[[pages]]
+kind = "live"
+path = "docs/guide/tsjs.md"
+route = "/guide/tsjs"
 navigation = true
 
 [[pages]]
@@ -359,7 +389,7 @@ columns = ["Section", "Reference"]
 
 [[regions.rows]]
 key = "adserver_mock"
-cells = ["`[integrations.adserver_mock]`", "Mediator settings on this page"]
+cells = ["`[integrations.adserver_mock]`", "[Ad Server Mock](/guide/integrations/adserver_mock)"]
 
 [[regions.rows]]
 key = "aps"
@@ -411,7 +441,7 @@ cells = ["`[integrations.sourcepoint]`", "[Sourcepoint](/guide/integrations/sour
 
 [[regions.rows]]
 key = "testlight"
-cells = ["`[integrations.testlight]`", "Test integration settings on this page"]
+cells = ["`[integrations.testlight]`", "[Testlight](/guide/integrations/testlight)"]
 
 [[regions]]
 name = "provider-profile-fields"
@@ -560,6 +590,21 @@ owner = "documentation-maintainers"
 name = "api-adapter-support"
 path = "docs/guide/api-reference.md"
 columns = ["Adapter", "Release status", "Health", "Startup status", "Startup health", "Provider fan-out", "Trusted-client-IP handling", "Request normalization"]
+
+[[regions]]
+name = "cli-command-union"
+path = "docs/guide/cli.md"
+columns = ["Command", "Availability", "Summary", "Usage"]
+
+[[regions]]
+name = "product-adapter-support"
+path = "docs/guide/integrations-overview.md"
+columns = ["Adapter", "Release status", "Health", "Startup status", "Startup health", "Provider fan-out", "Trusted-client-IP handling", "Request normalization"]
+
+[[regions]]
+name = "product-integration-inventory"
+path = "docs/guide/integrations-overview.md"
+columns = ["Integration", "Operational status", "Deploy ID", "Registration", "Browser loading"]
 
 [[regions]]
 name = "api-route-availability"

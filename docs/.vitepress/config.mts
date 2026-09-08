@@ -5,8 +5,12 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+const buildSha = process.env.GITHUB_SHA?.trim()
 
-// Parse .tool-versions file to extract version numbers
+if (buildSha && !/^[0-9a-f]{40}$/.test(buildSha)) {
+  throw new Error('GITHUB_SHA must be a lowercase 40-character commit SHA')
+}
+
 function getToolVersions(): Record<string, string> {
   const toolVersionsPath = resolve(__dirname, '../../.tool-versions')
   const versions: Record<string, string> = {}
@@ -22,22 +26,29 @@ function getToolVersions(): Record<string, string> {
         }
       }
     }
-  } catch (e) {
-    console.warn('Could not read .tool-versions file:', e)
+  } catch (error) {
+    console.warn('Could not read .tool-versions file:', error)
   }
 
   return versions
 }
 
+function provenanceBanner(): string {
+  const source = buildSha
+    ? `Built from commit \`${buildSha}\`.`
+    : 'Built from a local checkout; no immutable commit SHA was supplied.'
+  return `::: info Rolling main documentation\n${source} Content may describe unreleased behavior.\n:::`
+}
+
 const toolVersions = getToolVersions()
 
-// https://vitepress.dev/reference/site-config
 export default withMermaid(
   defineConfig({
     title: 'Trusted Server',
     description:
       'Edge computing for ad serving, consent signal handling, and edge cookie (EC) generation',
     base: '/trusted-server',
+    lastUpdated: true,
     srcExclude: [
       'superpowers/**',
       'internal/**',
@@ -47,7 +58,6 @@ export default withMermaid(
       'business-use-cases.md',
     ],
 
-    // Replace version placeholders like {{NODEJS_VERSION}} with values from .tool-versions
     markdown: {
       config: (md) => {
         const originalParse = md.parse.bind(md)
@@ -57,19 +67,20 @@ export default withMermaid(
             const placeholder = `{{${tool.toUpperCase()}_VERSION}}`
             processed = processed.replaceAll(placeholder, version)
           }
-          return originalParse(processed, env)
+          return originalParse(`${provenanceBanner()}\n\n${processed}`, env)
         }
       },
     },
 
     themeConfig: {
-      // https://vitepress.dev/reference/default-theme-config
+      search: {
+        provider: 'local',
+      },
       nav: [
         { text: 'Home', link: '/' },
         { text: 'Guide', link: '/guide/' },
         { text: 'Roadmap', link: '/roadmap' },
       ],
-
       sidebar: [
         {
           text: 'Introduction',
@@ -82,10 +93,21 @@ export default withMermaid(
           ],
         },
         {
-          text: 'Core Concepts',
+          text: 'Operator',
+          items: [
+            { text: 'EdgeZero Lifecycle', link: '/guide/edgezero' },
+            { text: 'Configuration', link: '/guide/configuration' },
+            { text: 'CLI', link: '/guide/cli' },
+            { text: 'Dev Proxy', link: '/guide/ts-dev-proxy' },
+            { text: 'Testing', link: '/guide/testing' },
+            { text: 'Auction Testing', link: '/guide/auction-testing' },
+          ],
+        },
+        {
+          text: 'Product',
           items: [
             { text: 'Edge Cookies', link: '/guide/edge-cookies' },
-            { text: 'EC Setup Guide', link: '/guide/ec-setup-guide' },
+            { text: 'EC Setup', link: '/guide/ec-setup-guide' },
             { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
             { text: 'Ad Serving', link: '/guide/ad-serving' },
             {
@@ -95,120 +117,84 @@ export default withMermaid(
             { text: 'First-Party Proxy', link: '/guide/first-party-proxy' },
             { text: 'Asset Routes', link: '/guide/asset-routes' },
             { text: 'Creative Processing', link: '/guide/creative-processing' },
-            {
-              text: 'Integrations Overview',
-              link: '/guide/integrations-overview',
-            },
-          ],
-        },
-        {
-          text: 'Security',
-          items: [
-            { text: 'Request Signing', link: '/guide/request-signing' },
-            { text: 'Key Rotation', link: '/guide/key-rotation' },
-          ],
-        },
-        {
-          text: 'Development',
-          items: [
-            { text: 'Architecture', link: '/guide/architecture' },
-            { text: 'Configuration', link: '/guide/configuration' },
-            { text: 'CLI', link: '/guide/cli' },
-            { text: 'Testing', link: '/guide/testing' },
-            { text: 'Auction Testing', link: '/guide/auction-testing' },
-            { text: 'Integration Guide', link: '/guide/integration-guide' },
-            { text: 'Dev Proxy', link: '/guide/ts-dev-proxy' },
-          ],
-        },
-        {
-          text: 'Advanced',
-          items: [
+            { text: 'Trusted Server JavaScript', link: '/guide/tsjs' },
+            { text: 'Auction Telemetry', link: '/guide/telemetry' },
             { text: 'RSC Hydration', link: '/guide/rsc-hydration' },
-            {
-              text: 'Proxy Signing',
-              link: '/guide/proxy-signing',
-            },
             {
               text: 'Edge Cookie External Sync',
               link: '/guide/collective-sync',
             },
+            { text: 'Request Signing', link: '/guide/request-signing' },
+            { text: 'Key Rotation', link: '/guide/key-rotation' },
+            { text: 'Proxy Signing', link: '/guide/proxy-signing' },
+          ],
+        },
+        {
+          text: 'Deployment',
+          items: [
+            { text: 'Fastly', link: '/guide/fastly' },
+            { text: 'Axum Development', link: '/guide/axum-dev' },
+            { text: 'Cloudflare Workers', link: '/guide/cloudflare' },
+            { text: 'Fermyon Spin', link: '/guide/spin' },
+          ],
+        },
+        {
+          text: 'Integrations',
+          items: [
+            {
+              text: 'Integration Inventory',
+              link: '/guide/integrations-overview',
+            },
+            { text: 'Development Guide', link: '/guide/integration-guide' },
+            {
+              text: 'Ad Server Mock',
+              link: '/guide/integrations/adserver_mock',
+            },
+            { text: 'APS', link: '/guide/integrations/aps' },
+            { text: 'DataDome', link: '/guide/integrations/datadome' },
+            { text: 'Didomi', link: '/guide/integrations/didomi' },
+            {
+              text: 'Google Tag Manager',
+              link: '/guide/integrations/google_tag_manager',
+            },
+            { text: 'GPT', link: '/guide/integrations/gpt' },
+            {
+              text: 'GPT Runtime Diagnostics',
+              link: '/guide/integrations/gpt-diagnostics',
+            },
+            { text: 'Lockr', link: '/guide/integrations/lockr' },
+            { text: 'Next.js', link: '/guide/integrations/nextjs' },
+            { text: 'Osano', link: '/guide/integrations/osano' },
+            { text: 'Permutive', link: '/guide/integrations/permutive' },
+            { text: 'Prebid', link: '/guide/integrations/prebid' },
+            { text: 'Sourcepoint', link: '/guide/integrations/sourcepoint' },
+            { text: 'Testlight', link: '/guide/integrations/testlight' },
           ],
         },
         {
           text: 'Reference',
           items: [
+            { text: 'Architecture', link: '/guide/architecture' },
             { text: 'API Reference', link: '/guide/api-reference' },
             { text: 'Error Reference', link: '/guide/error-reference' },
           ],
         },
-        {
-          text: 'Partner Integrations',
-          items: [
-            {
-              text: 'Identity',
-              items: [{ text: 'Lockr', link: '/guide/integrations/lockr' }],
-            },
-            {
-              text: 'CMP',
-              items: [
-                { text: 'Didomi', link: '/guide/integrations/didomi' },
-                { text: 'Osano', link: '/guide/integrations/osano' },
-              ],
-            },
-            {
-              text: 'Data',
-              items: [
-                { text: 'Permutive', link: '/guide/integrations/permutive' },
-              ],
-            },
-            {
-              text: 'Ad Serving',
-              items: [
-                {
-                  text: 'GPT Runtime Diagnostics',
-                  link: '/guide/integrations/gpt-diagnostics',
-                },
-              ],
-            },
-            {
-              text: 'Demand Wrapper',
-              items: [
-                { text: 'Prebid', link: '/guide/integrations/prebid' },
-                { text: 'APS', link: '/guide/integrations/aps' },
-              ],
-            },
-            {
-              text: 'Framework Support',
-              items: [{ text: 'Next.js', link: '/guide/integrations/nextjs' }],
-            },
-            {
-              text: 'Security',
-              items: [
-                { text: 'DataDome', link: '/guide/integrations/datadome' },
-              ],
-            },
-          ],
-        },
       ],
-
       socialLinks: [
         {
           icon: 'github',
           link: 'https://github.com/IABTechLab/trusted-server',
         },
       ],
-
       footer: {
         message: 'Released under the Apache License 2.0.',
         copyright: 'Copyright © 2018-present IAB Technology Laboratory',
       },
     },
-    // Mermaid configuration
     mermaid: {
       flowchart: {
         useMaxWidth: true,
       },
-      // https://mermaid.js.org/config/setup/modules/mermaidAPI.html#mermaidapi-configuration-defaults
     },
     mermaidPlugin: {
       class: 'mermaid',

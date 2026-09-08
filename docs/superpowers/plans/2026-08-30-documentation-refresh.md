@@ -1221,27 +1221,27 @@ Append the readback timestamp, PR body hash, run URLs or Spin receipt, and equal
 - Modify: `tools/docs-parity/manifests/diagrams.toml`
 - Modify: `tools/docs-parity/manifests/orphans.toml`
 
-- [ ] **Step 1: Generate the support matrix and inventory regions**
+- [x] **Step 1: Generate the support matrix and inventory regions**
 
 Render adapter status/fan-out/startup rows and all 14 deploy IDs plus creative from checked records. Prove repeated status prose cannot diverge from the matrix.
 
-- [ ] **Step 2: Add missing platform/system pages**
+- [x] **Step 2: Add missing platform/system pages**
 
 Write EdgeZero lifecycle/store/blob flow, telemetry plus `browser_family`/Tinybird/Fastly-only emission, tsjs 12-module/13-bundle/three-loading-mode model (including the standalone `gpt_diagnostics` tag), and adserver-mock mediator semantics from their truth sources. Render `docs/guide/cli.md` from the checked two-platform help union while preserving owned explanatory prose outside the generated region.
 
-- [ ] **Step 3: Complete integration journeys**
+- [x] **Step 3: Complete integration journeys**
 
 Document GPT slot handoff, script guards, and Testlight. Replace broken integration-guide snippets with one compiling, core-neutral fixture using complete `RuntimeServices`; register every fence and expected diagnostic.
 
-- [ ] **Step 4: Restructure discoverability**
+- [x] **Step 4: Restructure discoverability**
 
 Create Operator/Deployment/Reference navigation groups, make every ID reachable, enable local search and `lastUpdated`, and add prose equivalents for every diagram. Keep tombstones out of navigation and containment exclusions intact.
 
-- [ ] **Step 5: Add rolling-main provenance**
+- [x] **Step 5: Add rolling-main provenance**
 
 Inject `GITHUB_SHA` into the build without exposing secrets, render a rolling-main banner, and make deploy-docs paths include `.tool-versions`. Add a built-output assertion for the exact supplied SHA.
 
-- [ ] **Step 6: Verify journeys, snippets, and publication**
+- [x] **Step 6: Verify journeys, snippets, and publication**
 
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- integrations --check
@@ -1254,7 +1254,7 @@ cd docs && npm run lint && npm run format && GITHUB_SHA="$(git rev-parse HEAD)" 
 
 Expected: nav/page set equality passes, banner contains the current SHA, excluded pages remain absent, all journeys/diagrams have owners, and the compiling fixture passes.
 
-- [ ] **Step 7: Commit the remaining WP5 checkpoint**
+- [x] **Step 7: Commit the remaining WP5 checkpoint**
 
 ```bash
 git add docs/guide/edgezero.md docs/guide/telemetry.md docs/guide/tsjs.md docs/guide/cli.md docs/guide/integrations/adserver_mock.md docs/guide/integrations/gpt.md docs/guide/integrations/testlight.md docs/guide/integrations-overview.md docs/guide/integration-guide.md tinybird/README.md docs/.vitepress/config.mts docs/package.json .github/workflows/deploy-docs.yml crates/trusted-server-integration-tests/tests/documentation_snippets.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/integrations.toml tools/docs-parity/manifests/adapter-support.toml tools/docs-parity/manifests/cli-overrides.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/orphans.toml docs/internal/audits/documentation-refresh-evidence.md

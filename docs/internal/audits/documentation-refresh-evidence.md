@@ -257,12 +257,12 @@ Task 17 records that disposition instead of fabricating an owner or URL.
 
 ### First-success adapter smokes
 
-| Surface    | Exact commit/ref | Command or operation                                    | Expected oracle                                                       | Receipt / result |
-| ---------- | ---------------- | ------------------------------------------------------- | --------------------------------------------------------------------- | ---------------- |
-| Axum       | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-axum.sh` | Non-health publisher response satisfies the documented strong oracle | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994105), passed |
-| Fastly     | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-fastly.sh` | Local push and required secrets yield a non-health publisher response | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994046), passed |
-| Cloudflare | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-cloudflare.sh` | Envelope transfer yields a non-health publisher response | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994160), passed |
-| Spin       | `552dbeebe63aa6c742f2def95565bfcc80076513` | `./scripts/smoke-spin.sh` | Local push and variables yield a non-health publisher response | Local Spin 4.1.0 receipt, passed; expires `2026-10-07T00:00:00Z` |
+| Surface    | Exact commit/ref                           | Command or operation            | Expected oracle                                                       | Receipt / result                                                                                             |
+| ---------- | ------------------------------------------ | ------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Axum       | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-axum.sh`       | Non-health publisher response satisfies the documented strong oracle  | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994105), passed |
+| Fastly     | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-fastly.sh`     | Local push and required secrets yield a non-health publisher response | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994046), passed |
+| Cloudflare | `2f1f11c2cf94cf0b5606e107672d6386d283959a` | `./scripts/smoke-cloudflare.sh` | Envelope transfer yields a non-health publisher response              | [Hosted job](https://github.com/IABTechLab/trusted-server/actions/runs/34133258001/job/101780994160), passed |
+| Spin       | `552dbeebe63aa6c742f2def95565bfcc80076513` | `./scripts/smoke-spin.sh`       | Local push and variables yield a non-health publisher response        | Local Spin 4.1.0 receipt, passed; expires `2026-10-07T00:00:00Z`                                             |
 
 ### Generated-diff proof
 
@@ -3678,8 +3678,44 @@ This publication receipt does not include its own commit SHA.
 
 #### Task 14 — Complete WP5 product coverage and navigation
 
-Pending. Record page/orphan ownership, diagram prose equivalents, snippet
-checks, and removal of the Task 13 transition exception.
+Complete for the WP5 checkpoint. The checked product-support region renders
+all four adapter records, and the checked integration inventory renders all 14
+deployment IDs plus the creative subsystem. The CLI region renders the union
+of the authenticated Linux and macOS captures: 38 commands, with platform-only
+commands labeled explicitly. Re-rendering the generated regions produced no
+diff, and a route fixture that changes Didomi's support status is rejected
+against the checked page bytes.
+
+The public set now includes EdgeZero lifecycle and store behavior, Fastly-only
+Tinybird auction telemetry and `browser_family`, the 12-module/13-bundle tsjs
+model, Ad Server Mock, and Testlight. GPT documents server/browser slot
+ownership, the shared script-guard dispatcher, bounded refresh behavior, and
+the SPA page-bids path. The integration guide contains one core-neutral
+`RuntimeServices` fixture; the integration-test target extracts that exact
+fence into an isolated crate and compiles it offline. Every registered snippet
+and local link passed.
+
+VitePress navigation exposes every checked live public page through
+Introduction, Operator, Product, Deployment, Integrations, or Reference.
+Tombstones and containment exclusions remain absent from navigation. The page
+checker verified page/navigation equality, orphan dispositions, and diagram
+prose anchors; no Task 13 transition exception remains. Local search and
+`lastUpdated` are enabled. The build prepends a rolling-main banner containing
+only a validated lowercase 40-hex `GITHUB_SHA`; a build with
+`93375a20c55ebed9c93f28de3abef47b45e94c60` passed, and the exact value was
+present in the built output. The deploy workflow watches `.tool-versions` and
+asserts the supplied SHA in the artifact.
+
+The WP5 acceptance commands passed: integration, snippet, page, route,
+CLI-help, generated-region, classification, and local-link checks; all
+docs-parity tests and warning-denying Clippy; the exact-fence integration test;
+documentation ESLint and Prettier; and the VitePress production build. The
+build first rejected angle-bracket placeholders in `edgezero.md` as Vue tags;
+replacing them with literal uppercase metavariables corrected the source, and
+the exact rerun passed. `integrations.toml`, `adapter-support.toml`,
+`cli-overrides.toml`, `diagrams.toml`, and `orphans.toml` were verified without
+content changes because their checked records already expressed the required
+truth.
 
 #### Task 15 — Complete WP6 root and crate documentation
 

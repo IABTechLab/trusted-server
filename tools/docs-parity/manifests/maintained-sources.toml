@@ -1869,6 +1869,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "crates/trusted-server-integration-tests/tests/documentation_snippets.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "crates/trusted-server-integration-tests/tests/environments/axum.rs"
 mode = "whole"
 disposition = "exclude"
@@ -2859,6 +2865,11 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "docs/guide/edgezero.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "docs/guide/error-reference.md"
 mode = "whole"
 disposition = "include"
@@ -2895,6 +2906,11 @@ disposition = "include"
 
 [[sources]]
 path = "docs/guide/integrations-overview.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
+path = "docs/guide/integrations/adserver_mock.md"
 mode = "whole"
 disposition = "include"
 
@@ -2969,6 +2985,11 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "docs/guide/integrations/testlight.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "docs/guide/key-rotation.md"
 mode = "whole"
 disposition = "include"
@@ -2994,12 +3015,22 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "docs/guide/telemetry.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "docs/guide/testing.md"
 mode = "whole"
 disposition = "include"
 
 [[sources]]
 path = "docs/guide/ts-dev-proxy.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
+path = "docs/guide/tsjs.md"
 mode = "whole"
 disposition = "include"
 
@@ -3031,7 +3062,8 @@ disposition = "include"
 [[sources]]
 path = "docs/internal/audits/documentation-refresh-inventory.toml"
 mode = "whole"
-disposition = "include"
+disposition = "exclude"
+exclude_kind = "non_documentation"
 
 [[sources]]
 path = "docs/internal/onboarding.md"
@@ -3959,6 +3991,11 @@ mode = "comments"
 grammar = "shell"
 
 [[sources]]
+path = "tinybird/README.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "tinybird/datasources/access_logs_raw.datasource"
 mode = "whole"
 disposition = "exclude"
@@ -4828,25 +4865,25 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/deploy-docs.yml"
-selector = "bytes:156-179"
+selector = "bytes:181-204"
 fingerprint = "sha256:a31fc74c7723e4d54dafce45beb3e47fd1057171fa5b13e8b91066d2aa69fdfc"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/deploy-docs.yml"
-selector = "bytes:181-227"
+selector = "bytes:206-252"
 fingerprint = "sha256:a2072be327f2f8d14d3eadcf830c548c8bb90d668728b069696ff065b5ea4635"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/deploy-docs.yml"
-selector = "bytes:292-324"
+selector = "bytes:317-349"
 fingerprint = "sha256:7f1e2c1b723980c65a5c0db8b40c92028a809507c075cdbb90869cc83af44714"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/deploy-docs.yml"
-selector = "bytes:531-556"
+selector = "bytes:556-581"
 fingerprint = "sha256:804beb579f1c80f65289ffc86eac2c6e941b5908036f232e1ecdc9ecd0740cc9"
 disposition = "include"
 

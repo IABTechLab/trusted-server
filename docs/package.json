@@ -10,6 +10,7 @@
     "dev": "vitepress dev",
     "build": "vitepress build",
     "preview": "vitepress preview",
+    "check": "npm run lint && npm run format && npm run build",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "lint": "eslint .",

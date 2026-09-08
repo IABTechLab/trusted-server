@@ -92,6 +92,8 @@ enum Command {
     Generate(GenerateArguments),
     /// Check local or explicitly requested external Markdown links.
     Links(LinksArguments),
+    /// Check the public page, navigation, orphan, and diagram inventories.
+    Pages(PagesArguments),
     /// Check extracted settings semantics and the source-template contract.
     Settings(SettingsArguments),
     /// Check integration inventories and behavioral receipt domains.
@@ -137,6 +139,13 @@ enum CliHelpAction {
 #[derive(Args, Debug)]
 struct SnippetsArguments {
     /// Validate all classified fences without changing repository bytes.
+    #[arg(long, required = true)]
+    check: bool,
+}
+
+#[derive(Args, Debug)]
+struct PagesArguments {
+    /// Validate publication inventories without changing repository bytes.
     #[arg(long, required = true)]
     check: bool,
 }
@@ -311,6 +320,7 @@ pub fn run_from_env() -> Result<Outcome, Report<DocsParityError>> {
         Command::Scan(arguments) => scan(&repository, &arguments),
         Command::Generate(arguments) => generate(&repository, &arguments),
         Command::Links(arguments) => links(&repository, &arguments),
+        Command::Pages(arguments) => pages(&repository, &arguments),
         Command::Settings(arguments) => settings(&repository, &arguments),
         Command::Integrations(arguments) => integrations(&repository, &arguments),
         Command::Routes(arguments) => routes(&repository, &arguments),
@@ -319,6 +329,15 @@ pub fn run_from_env() -> Result<Outcome, Report<DocsParityError>> {
         Command::Workflow(arguments) => workflow(&repository, &arguments),
         Command::DependencySnapshot(arguments) => dependency_snapshot(&repository, &arguments),
     }
+}
+
+fn pages(
+    repository: &Repository,
+    arguments: &PagesArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    debug_assert!(arguments.check, "clap should require page check mode");
+    markdown::check_local_repository(repository).change_context(DocsParityError::Markdown)?;
+    Ok(Outcome::Clean)
 }
 
 fn cli_help(

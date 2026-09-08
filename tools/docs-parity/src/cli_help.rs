@@ -18,6 +18,8 @@ use sha2::{Digest as _, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::markdown::{GeneratedRegion, GeneratedRow};
+
 use crate::repository::{NormalizedRelativePath, Repository};
 
 const MAXIMUM_OUTER_BYTES: usize = 4 * 1024 * 1024;
@@ -31,6 +33,8 @@ const REPOSITORY: &str = "IABTechLab/trusted-server";
 const WORKFLOW_PATH: &str = ".github/workflows/test.yml";
 const CAPTURE_MANIFEST: &str = "tools/docs-parity/manifests/cli-captures.toml";
 const OVERRIDES_MANIFEST: &str = "tools/docs-parity/manifests/cli-overrides.toml";
+const DOCUMENTATION_REGION: &str = "cli-command-union";
+const DOCUMENTATION_PATH: &str = "docs/guide/cli.md";
 const LINUX_GOLDEN: &str = "tools/docs-parity/goldens/cli-linux.txt";
 const MACOS_GOLDEN: &str = "tools/docs-parity/goldens/cli-macos.txt";
 
@@ -344,6 +348,75 @@ pub struct CheckedHelp {
     pub records: Vec<CheckedHelpRecord>,
     /// Stable annotated transcript derived from `records`.
     pub rendered: String,
+}
+
+/// Return the canonical document for the generated CLI command union.
+#[must_use]
+pub fn documentation_region_path(name: &str) -> Option<&'static str> {
+    (name == DOCUMENTATION_REGION).then_some(DOCUMENTATION_PATH)
+}
+
+/// Render the checked two-platform command union as a reader-facing table.
+#[must_use]
+pub fn documentation_region(checked: &CheckedHelp) -> GeneratedRegion {
+    let rows = checked
+        .records
+        .iter()
+        .map(|record| {
+            let summary = record
+                .help
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("—");
+            let usage = record
+                .help
+                .lines()
+                .find_map(|line| line.strip_prefix("Usage: "))
+                .unwrap_or("—");
+            let availability = match record.availability {
+                HelpAvailability::Both => "Linux + macOS",
+                HelpAvailability::LinuxOnly => "Linux only",
+                HelpAvailability::MacosOnly => "macOS only",
+            };
+            GeneratedRow {
+                key: record.command_path.clone(),
+                cells: vec![
+                    format!("`{}`", record.command_path),
+                    availability.to_owned(),
+                    summary.to_owned(),
+                    format!("`{usage}`"),
+                ],
+            }
+        })
+        .collect();
+    GeneratedRegion {
+        name: DOCUMENTATION_REGION.to_owned(),
+        columns: ["Command", "Availability", "Summary", "Usage"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        rows,
+    }
+}
+
+pub(crate) fn repository_documentation_region(
+    repository: &Repository,
+) -> Result<GeneratedRegion, Report<CliHelpError>> {
+    let linux = read_required(repository, LINUX_GOLDEN, MAXIMUM_HELP_BYTES)?;
+    let macos = read_required(repository, MACOS_GOLDEN, MAXIMUM_HELP_BYTES)?;
+    let overrides = read_overrides(repository)?;
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_error| cli_error("system clock precedes Unix epoch"))?
+        .as_secs();
+    let checked = render_checked_help(
+        core::str::from_utf8(&linux).map_err(|_error| cli_error("Linux golden is not UTF-8"))?,
+        core::str::from_utf8(&macos).map_err(|_error| cli_error("macOS golden is not UTF-8"))?,
+        &overrides,
+        now_seconds,
+    )?;
+    Ok(documentation_region(&checked))
 }
 
 /// Fingerprint one exact command record rather than an entire platform transcript.

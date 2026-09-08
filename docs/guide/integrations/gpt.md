@@ -116,6 +116,38 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 - Consent gating of ad requests
 - Ad-unit path rewriting for A/B testing
 
+### Server slot handoff
+
+For the initial server-rendered auction, the head bootstrap installs
+`window.tsjs.adInit` before the compiled bundle arrives. It reads the
+server-injected slot and bid state synchronously, defines a fallback GPT slot
+on the actual inner div, and records the slot in `gptSlotHandoffs`. It never
+defines a competing slot on an outer `-container` element. When publisher code
+later calls `googletag.defineSlot` for the same placement, the idempotent wrapper
+hands the existing inner-div binding back to GPT.
+
+The bootstrap observes modern `googletag.setConfig({ disableInitialLoad: ... })`
+and the legacy `pubads().disableInitialLoad()` call. If initial load is
+disabled, it refreshes only the newly defined Trusted Server slots. It never
+calls an unbounded `refresh()` that could refresh publisher-owned inventory.
+
+`adInit` owns the initial document only. Server-side targeting and the Trusted
+Server render bridge own the initial bid handoff and proven win/billing beacon
+path. After load, the slim Prebid module owns scroll-triggered and refresh
+auctions. SPA navigation obtains page bids through `GET /_ts/page-bids` (the
+legacy `GET /__ts/page-bids` alias remains available); it does not use
+`POST /auction` for that navigation flow.
+
+### Shared script-guard dispatcher
+
+GPT's six interception layers register with the shared DOM insertion
+dispatcher used by integration guards. Installation is idempotent. A candidate
+URL is rewritten only when it matches GPT's accepted host/path rules; an
+unmatched URL continues through the native DOM operation. If a descriptor or
+prototype hook cannot be installed, the remaining layers still run, but the
+integration does not claim complete interception for browser behavior outside
+those guarded seams.
+
 ### GAM Treatment Attribution
 
 Setting `gam_attribution_enabled = true` adds the fixed page-level GPT targeting

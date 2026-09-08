@@ -285,6 +285,10 @@ pub(crate) fn generate(
         .regions
         .iter()
         .any(|region| crate::routes::documentation_region_path(&region.name).is_some());
+    let uses_dynamic_cli_region = manifest
+        .regions
+        .iter()
+        .any(|region| crate::cli_help::documentation_region_path(&region.name).is_some());
     let mut dynamic_regions = if uses_dynamic_route_regions {
         crate::routes::repository_documentation_regions(repository)
             .map_err(|error| generated_error(format!("cannot build route regions: {error}")))?
@@ -294,18 +298,27 @@ pub(crate) fn generate(
     } else {
         BTreeMap::new()
     };
+    if uses_dynamic_cli_region {
+        let region = crate::cli_help::repository_documentation_region(repository)
+            .map_err(|error| generated_error(format!("cannot build CLI region: {error}")))?;
+        if dynamic_regions
+            .insert(region.name.clone(), region)
+            .is_some()
+        {
+            return Err(generated_error("duplicate dynamic documentation region"));
+        }
+    }
     let mut regions_by_path = BTreeMap::<String, Vec<GeneratedRegion>>::new();
     for record in manifest.regions {
         validate_repo_path(&record.path)?;
         let dynamic = dynamic_regions.remove(&record.name);
         if let Some(dynamic) = &dynamic
-            && (Some(record.path.as_str())
-                != crate::routes::documentation_region_path(&record.name)
+            && (Some(record.path.as_str()) != dynamic_documentation_region_path(&record.name)
                 || record.columns != dynamic.columns
                 || !record.rows.is_empty())
         {
             return Err(generated_error(format!(
-                "dynamic route region {} has a mismatched declaration",
+                "dynamic region {} has a mismatched declaration",
                 record.name
             )));
         }
@@ -329,7 +342,7 @@ pub(crate) fn generate(
     }
     if let Some(name) = dynamic_regions.keys().next() {
         return Err(generated_error(format!(
-            "pages manifest is missing dynamic route region {name}"
+            "pages manifest is missing dynamic region {name}"
         )));
     }
     let mut ownership_by_path = BTreeMap::<String, Vec<OwnershipRecord>>::new();
@@ -388,6 +401,11 @@ pub(crate) fn generate(
         }
     }
     Ok(drift)
+}
+
+fn dynamic_documentation_region_path(name: &str) -> Option<&'static str> {
+    crate::routes::documentation_region_path(name)
+        .or_else(|| crate::cli_help::documentation_region_path(name))
 }
 
 /// One deterministic row within a generated Markdown table.

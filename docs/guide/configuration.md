@@ -1488,7 +1488,7 @@ disabled stub.
 
 | Section                             | Reference                                                    |
 | ----------------------------------- | ------------------------------------------------------------ |
-| `[integrations.adserver_mock]`      | Mediator settings on this page                               |
+| `[integrations.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)          |
 | `[integrations.aps]`                | [APS](/guide/integrations/aps)                               |
 | `[integrations.datadome]`           | [DataDome](/guide/integrations/datadome)                     |
 | `[integrations.didomi]`             | [Didomi](/guide/integrations/didomi)                         |
@@ -1501,7 +1501,7 @@ disabled stub.
 | `[integrations.permutive]`          | [Permutive](/guide/integrations/permutive)                   |
 | `[integrations.prebid]`             | [Prebid](/guide/integrations/prebid)                         |
 | `[integrations.sourcepoint]`        | [Sourcepoint](/guide/integrations/sourcepoint)               |
-| `[integrations.testlight]`          | Test integration settings on this page                       |
+| `[integrations.testlight]`          | [Testlight](/guide/integrations/testlight)                   |
 
 <!-- docs-parity:end integration-configurations -->
 

@@ -266,6 +266,21 @@ fn capture_and_artifact_modes_are_not_reachable_from_check_all_syntax() {
     }
 }
 
+#[test]
+fn pages_command_tree_is_constructible() {
+    let help = output(
+        command_in(
+            env::current_dir()
+                .expect("should read current directory")
+                .as_path(),
+        )
+        .args(["pages", "--help"]),
+    );
+
+    assert_eq!(status_code(&help), SUCCESS);
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--check"));
+}
+
 #[cfg(unix)]
 #[test]
 fn check_all_executes_clean_with_external_sentinel_and_without_repository_writes() {
@@ -285,6 +300,7 @@ fn check_all_executes_clean_with_external_sentinel_and_without_repository_writes
         command_in(repository)
             .env_clear()
             .env("PATH", restricted.path())
+            .env("TMPDIR", restricted.path())
             .env("DOCS_PARITY_TEST_EXTERNAL_SENTINEL", &sentinel)
             .args(["check", "--all"]),
     );

@@ -1279,6 +1279,10 @@ path = "crates/trusted-server-integration-tests/tests/common/runtime.rs"
 kind = "text"
 
 [[files]]
+path = "crates/trusted-server-integration-tests/tests/documentation_snippets.rs"
+kind = "text"
+
+[[files]]
 path = "crates/trusted-server-integration-tests/tests/environments/axum.rs"
 kind = "text"
 
@@ -1955,6 +1959,10 @@ path = "docs/guide/edge-cookies.md"
 kind = "text"
 
 [[files]]
+path = "docs/guide/edgezero.md"
+kind = "text"
+
+[[files]]
 path = "docs/guide/error-reference.md"
 kind = "text"
 
@@ -1984,6 +1992,10 @@ kind = "text"
 
 [[files]]
 path = "docs/guide/integrations-overview.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/integrations/adserver_mock.md"
 kind = "text"
 
 [[files]]
@@ -2043,6 +2055,10 @@ path = "docs/guide/integrations/sourcepoint.md"
 kind = "text"
 
 [[files]]
+path = "docs/guide/integrations/testlight.md"
+kind = "text"
+
+[[files]]
 path = "docs/guide/key-rotation.md"
 kind = "text"
 
@@ -2063,11 +2079,19 @@ path = "docs/guide/spin.md"
 kind = "text"
 
 [[files]]
+path = "docs/guide/telemetry.md"
+kind = "text"
+
+[[files]]
 path = "docs/guide/testing.md"
 kind = "text"
 
 [[files]]
 path = "docs/guide/ts-dev-proxy.md"
+kind = "text"
+
+[[files]]
+path = "docs/guide/tsjs.md"
 kind = "text"
 
 [[files]]
@@ -2724,6 +2748,10 @@ kind = "text"
 
 [[files]]
 path = "scripts/test-cli.sh"
+kind = "text"
+
+[[files]]
+path = "tinybird/README.md"
 kind = "text"
 
 [[files]]

@@ -296,10 +296,18 @@ fn route_documentation_is_bound_to_checked_route_and_integration_records() {
     let regions = documentation_regions(&routes, &support, &integrations);
     assert_eq!(
         regions.len(),
-        7,
-        "all reader-facing adapter summaries must be generated"
+        9,
+        "all reader-facing adapter and integration summaries must be generated"
     );
     for (name, path) in [
+        (
+            "product-adapter-support",
+            "docs/guide/integrations-overview.md",
+        ),
+        (
+            "product-integration-inventory",
+            "docs/guide/integrations-overview.md",
+        ),
         ("adapter-support-fastly", "docs/guide/fastly.md"),
         ("adapter-support-axum", "docs/guide/axum-dev.md"),
         ("adapter-support-cloudflare", "docs/guide/cloudflare.md"),
@@ -354,6 +362,44 @@ fn route_documentation_is_bound_to_checked_route_and_integration_records() {
     assert_ne!(
         changed_render, api_reference,
         "a checked route change must reject an unregenerated API reference"
+    );
+
+    let overview = include_bytes!("../../../docs/guide/integrations-overview.md");
+    let overview_regions = documentation_regions(&routes, &support, &integrations)
+        .into_iter()
+        .filter(|region| {
+            documentation_region_path(&region.name) == Some("docs/guide/integrations-overview.md")
+        })
+        .collect::<Vec<_>>();
+    let rendered = render_generated_document(overview, &overview_regions, &[])
+        .expect("checked product regions should render");
+    assert_eq!(
+        rendered, overview,
+        "reader-facing support and integration inventories must match checked records"
+    );
+
+    let changed_integrations = include_str!("../manifests/integrations.toml").replacen(
+        "id = \"didomi\"\nstatus = \"production\"",
+        "id = \"didomi\"\nstatus = \"development\"",
+        1,
+    );
+    let changed_integrations = IntegrationInventory::parse(&changed_integrations)
+        .expect("changed integration fixture should parse");
+    let changed_render = render_generated_document(
+        overview,
+        &documentation_regions(&routes, &support, &changed_integrations)
+            .into_iter()
+            .filter(|region| {
+                documentation_region_path(&region.name)
+                    == Some("docs/guide/integrations-overview.md")
+            })
+            .collect::<Vec<_>>(),
+        &[],
+    )
+    .expect("changed integration fixture should render");
+    assert_ne!(
+        changed_render, overview,
+        "checked integration status drift must reject the rendered inventory"
     );
 }
 

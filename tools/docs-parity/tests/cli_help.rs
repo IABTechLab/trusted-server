@@ -2,9 +2,57 @@ use std::io::{Cursor, Write as _};
 
 use docs_parity::cli_help::{
     CaptureContext, HelpAvailability, HelpRunner, HostedArtifact, HostedClient, HostedRun,
-    Platform, capture_archive, import_authenticated, render_checked_help,
+    Platform, capture_archive, documentation_region, import_authenticated, render_checked_help,
     transcript_record_fingerprint, validate_capture_archive,
 };
+
+#[test]
+fn checked_help_renders_a_complete_reader_facing_command_union() {
+    let linux = concat!(
+        "=== ts ===\nTrusted Server CLI\n\nUsage: ts <COMMAND>\n\nCommands:\n  serve  Serve\n\n",
+        "=== ts serve ===\nServe locally\n\nUsage: ts serve --adapter <ADAPTER>\n\n",
+    );
+    let macos = concat!(
+        "=== ts ===\nTrusted Server CLI\n\nUsage: ts <COMMAND>\n\nCommands:\n  serve  Serve\n\n",
+        "=== ts proxy ===\nRun the macOS proxy\n\nUsage: ts proxy\n\n",
+        "=== ts serve ===\nServe locally\n\nUsage: ts serve --adapter <ADAPTER>\n\n",
+    );
+    let proxy_fingerprint =
+        transcript_record_fingerprint("ts proxy", "Run the macOS proxy\n\nUsage: ts proxy\n");
+    let manifest = format!(
+        concat!(
+            "version = 1\nreviewed = true\n\n",
+            "[[annotations]]\ncommand_path = \"ts proxy\"\nplatform = \"macos\"\n",
+            "source_fingerprint = \"{}\"\nowner = \"docs\"\n",
+            "rationale = \"platform command\"\nexpires_at = \"2026-10-31T00:00:00Z\"\n",
+        ),
+        proxy_fingerprint,
+    );
+    let checked = render_checked_help(linux, macos, manifest.as_bytes(), 1_780_000_000)
+        .expect("checked help should reconcile");
+    let region = documentation_region(&checked);
+
+    assert_eq!(region.name, "cli-command-union");
+    assert_eq!(region.rows.len(), 3);
+    assert_eq!(
+        region.rows[1].cells,
+        [
+            "`ts proxy`",
+            "macOS only",
+            "Run the macOS proxy",
+            "`ts proxy`"
+        ]
+    );
+    assert_eq!(
+        region.rows[2].cells,
+        [
+            "`ts serve`",
+            "Linux + macOS",
+            "Serve locally",
+            "`ts serve --adapter <ADAPTER>`",
+        ]
+    );
+}
 use sha2::{Digest as _, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};

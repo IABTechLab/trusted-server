@@ -480,12 +480,16 @@ const GUIDE_FASTLY_REGION: &str = "adapter-support-fastly";
 const GUIDE_AXUM_REGION: &str = "adapter-support-axum";
 const GUIDE_CLOUDFLARE_REGION: &str = "adapter-support-cloudflare";
 const GUIDE_SPIN_REGION: &str = "adapter-support-spin";
+const PRODUCT_OVERVIEW_PATH: &str = "docs/guide/integrations-overview.md";
+const PRODUCT_ADAPTER_REGION: &str = "product-adapter-support";
+const PRODUCT_INTEGRATION_REGION: &str = "product-integration-inventory";
 
 /// Return the canonical document for a generated route or adapter region.
 #[must_use]
 pub fn documentation_region_path(name: &str) -> Option<&'static str> {
     match name {
         API_ADAPTER_REGION | API_ROUTE_REGION | API_INTEGRATION_REGION => Some(API_REFERENCE_PATH),
+        PRODUCT_ADAPTER_REGION | PRODUCT_INTEGRATION_REGION => Some(PRODUCT_OVERVIEW_PATH),
         GUIDE_FASTLY_REGION => Some("docs/guide/fastly.md"),
         GUIDE_AXUM_REGION => Some("docs/guide/axum-dev.md"),
         GUIDE_CLOUDFLARE_REGION => Some("docs/guide/cloudflare.md"),
@@ -506,6 +510,8 @@ pub fn documentation_regions(
         adapter_documentation_region(support),
         route_documentation_region(routes, support),
         integration_route_documentation_region(integrations),
+        product_adapter_documentation_region(support),
+        product_integration_documentation_region(integrations),
         adapter_guide_documentation_region(support, "fastly", GUIDE_FASTLY_REGION),
         adapter_guide_documentation_region(support, "axum", GUIDE_AXUM_REGION),
         adapter_guide_documentation_region(support, "cloudflare", GUIDE_CLOUDFLARE_REGION),
@@ -597,6 +603,90 @@ fn adapter_documentation_region(support: &AdapterSupportManifest) -> GeneratedRe
         columns: adapter_documentation_columns(),
         rows,
     }
+}
+
+fn product_adapter_documentation_region(support: &AdapterSupportManifest) -> GeneratedRegion {
+    GeneratedRegion {
+        name: PRODUCT_ADAPTER_REGION.to_owned(),
+        columns: adapter_documentation_columns(),
+        rows: support
+            .adapters
+            .iter()
+            .map(adapter_documentation_row)
+            .collect(),
+    }
+}
+
+fn product_integration_documentation_region(
+    integrations: &IntegrationInventory,
+) -> GeneratedRegion {
+    let rows = integrations
+        .operational
+        .iter()
+        .map(|record| {
+            let mut registrations = Vec::new();
+            if integrations.builder_ids.contains(&record.id) {
+                registrations.push("settings builder");
+            }
+            if integrations.plan_registration_ids.contains(&record.id) {
+                registrations.push("auction plan");
+            }
+            if integrations.mediator_ids.contains(&record.id) {
+                registrations.push("auction mediator");
+            }
+            if registrations.is_empty() {
+                registrations.push("browser capability");
+            }
+            let loading = integrations
+                .loading_modes
+                .get(&record.id)
+                .map(|mode| match mode {
+                    crate::integrations::LoadingMode::Bundled => "bundled",
+                    crate::integrations::LoadingMode::Deferred => "deferred",
+                    crate::integrations::LoadingMode::Standalone => "standalone",
+                })
+                .unwrap_or("none");
+            GeneratedRow {
+                key: record.id.clone(),
+                cells: vec![
+                    product_integration_link(&record.id),
+                    record.status.clone(),
+                    if integrations.deploy_ids.contains(&record.id) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                    .to_owned(),
+                    registrations.join(" + "),
+                    loading.to_owned(),
+                ],
+            }
+        })
+        .collect();
+    GeneratedRegion {
+        name: PRODUCT_INTEGRATION_REGION.to_owned(),
+        columns: [
+            "Integration",
+            "Operational status",
+            "Deploy ID",
+            "Registration",
+            "Browser loading",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        rows,
+    }
+}
+
+fn product_integration_link(id: &str) -> String {
+    let route = match id {
+        "adserver_mock" => "/guide/integrations/adserver_mock",
+        "creative" => "/guide/creative-processing",
+        "gpt_diagnostics" => "/guide/integrations/gpt-diagnostics",
+        other => return format!("[`{other}`](/guide/integrations/{other})"),
+    };
+    format!("[`{id}`]({route})")
 }
 
 fn adapter_guide_documentation_region(
