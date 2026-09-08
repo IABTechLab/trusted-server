@@ -256,7 +256,9 @@ When the identity graph contains a UID for every pull-enabled partner, Trusted S
 
 A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, generation, and detected orphan recovery continue to use KV. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and fall back to the normal KV path. The one-hour bound also limits how long deletion of a previously complete row can go undetected.
 
-Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and `ts-ec-pull-complete` even when KV is unavailable.
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker even when KV is unavailable.
+
+Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
 
 ## Configuration
 
