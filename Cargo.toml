@@ -51,6 +51,7 @@ clap = { version = "4", features = ["derive"] }
 config = "0.15.19"
 cookie = "0.18.1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+cssparser = "0.36"
 derive_more = { version = "2.0", features = ["display", "error"] }
 directories = "5"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
