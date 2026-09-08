@@ -88,6 +88,21 @@ pub trait EcKvStore {
     /// A completed issuance must be visible even when [`Self::lookup`] lags.
     /// Prefix matches are insufficient and an inconclusive check is an error.
     ///
+    /// # Implementing this method
+    ///
+    /// Strong consistency is a contract this signature cannot express, so a
+    /// new backend has to establish it deliberately. An implementation whose
+    /// listing or point read is eventually consistent must not answer from it:
+    /// doing so reintroduces the bug this check exists to prevent, where a
+    /// replication lag reports a recently issued identity as absent and its
+    /// withdrawal is silently discarded while the identity stays live for
+    /// batch sync. If the platform offers no strongly consistent read, return
+    /// an error rather than a `false` the caller will trust.
+    ///
+    /// The in-memory double used across the core tests is trivially strong, so
+    /// those tests cannot catch a backend that breaks this. Cover a new backend
+    /// against its own platform.
+    ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store failure or when a
