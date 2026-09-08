@@ -458,8 +458,12 @@ async fn collect(
     // Best-effort teardown; ignore errors since we already have a result, but
     // bound it so a Chrome that ignores `close` cannot hang the command.
     let _ = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.close()).await;
-    let _ = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.wait()).await;
+    let wait_result = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.wait()).await;
+    if !matches!(wait_result, Ok(Ok(_))) {
+        let _ = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.kill()).await;
+    }
     handler_task.abort();
+    let _ = handler_task.await;
 
     Ok(results)
 }
