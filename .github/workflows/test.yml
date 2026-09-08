@@ -345,6 +345,10 @@ jobs:
         run: ./scripts/test-cli.sh
         env:
           CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
+          # Chrome for Testing can stall target creation inside the nested macOS
+          # runner sandbox. This affects fixtures only; production builds retain
+          # Chromium's sandbox.
+          TS_AUDIT_BROWSER_FIXTURE_NO_SANDBOX: "1"
 
   test-typescript:
     name: vitest
