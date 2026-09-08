@@ -1025,22 +1025,22 @@ mod tests {
     }
 
     #[test]
-    fn edge_request_to_fastly_preserves_canonical_didomi_query() {
+    fn edge_request_to_fastly_preserves_query_encoding_order_and_duplicates() {
         let expected_query = "space=a+b&plus=%2B&quote=%27&empty=&x=1&x=2&country=US&region=CA";
         let request = request_builder()
             .method("GET")
             .uri(format!(
-                "https://sdk.privacy-center.org/key/loader.js?{expected_query}"
+                "https://sdk.example.com/key/loader.js?{expected_query}"
             ))
             .body(Body::empty())
-            .expect("should build canonical Didomi request");
+            .expect("should build request with encoded query");
 
         let fastly_req = edge_request_to_fastly(request).expect("should convert request");
 
         assert_eq!(
             fastly_req.get_url().query(),
             Some(expected_query),
-            "should preserve the canonical Didomi query across Fastly conversion"
+            "should preserve query encoding and order across Fastly conversion"
         );
         assert_eq!(
             fastly_req

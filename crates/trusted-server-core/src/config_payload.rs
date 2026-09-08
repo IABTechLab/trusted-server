@@ -111,8 +111,8 @@ mod tests {
                     enabled: true,
                     geo_query_parameters: true,
                     proxy_path: None,
-                    sdk_origin: "https://sdk.privacy-center.org".to_string(),
-                    api_origin: "https://api.privacy-center.org".to_string(),
+                    sdk_origin: "https://sdk.example.com".to_string(),
+                    api_origin: "https://api.example.com".to_string(),
                 },
             )
             .expect("should insert Didomi configuration");

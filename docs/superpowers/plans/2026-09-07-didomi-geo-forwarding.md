@@ -237,7 +237,7 @@ Add a unit test that builds an EdgeZero request with the canonical URI emitted b
 Run:
 
 ```bash
-cargo test-fastly edge_request_to_fastly_preserves_canonical_didomi_query
+cargo test-fastly edge_request_to_fastly_preserves_query_encoding_order_and_duplicates
 ```
 
 Expected: pass if the existing adapter conversion is transparent. If it fails, first add a regression assertion showing the exact normalization difference, then make the smallest adapter correction that preserves existing request semantics.
