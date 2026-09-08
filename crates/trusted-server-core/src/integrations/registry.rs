@@ -688,7 +688,17 @@ impl IntegrationRegistrationBuilder {
     }
 }
 
-type RouteValue = (Arc<dyn IntegrationProxy>, &'static str);
+/// Proxy handler, integration id, and the registered route pattern (kept so
+/// telemetry can label responses with the integration-defined literal, e.g.
+/// `/integrations/prebid/*`, instead of deriving anything from the request
+/// path).
+type RouteValue = (Arc<dyn IntegrationProxy>, &'static str, String);
+
+/// A test-constructor route entry: method, path pattern, and the proxy with
+/// its integration id ([`IntegrationRegistry::from_routes`] fills the
+/// pattern into [`RouteValue`] itself).
+#[cfg(test)]
+type RouteEntry<'a> = (Method, &'a str, (Arc<dyn IntegrationProxy>, &'static str));
 
 struct IntegrationRegistryInner {
     // Method-specific routers for O(log n) lookups
@@ -805,7 +815,11 @@ impl IntegrationRegistry {
 
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
-                        let value = (proxy.clone(), registration.integration_id);
+                        let value = (
+                            proxy.clone(),
+                            registration.integration_id,
+                            route.path.clone(),
+                        );
 
                         // Convert /* wildcard to matchit's {*rest} syntax
                         let matchit_path = if route.path.ends_with("/*") {
@@ -894,6 +908,27 @@ impl IntegrationRegistry {
         self.find_route(method, path).is_some()
     }
 
+    /// The registered route pattern matched by `method` and `path`, if any.
+    ///
+    /// Patterns are integration-defined literals (for example
+    /// `/integrations/prebid/*`), so they are bounded and content-free and
+    /// safe to store as a telemetry dimension, unlike the request path.
+    #[must_use]
+    pub fn matched_route_pattern(&self, method: &Method, path: &str) -> Option<&str> {
+        self.find_route(method, path).map(|value| value.2.as_str())
+    }
+
+    /// Return true when at least one integration request filter is
+    /// registered.
+    ///
+    /// Adapters use this to decide whether to record a request-filter phase
+    /// timing span, so unconfigured deployments (no request filters) omit
+    /// that entry from observability output entirely.
+    #[must_use]
+    pub fn has_request_filters(&self) -> bool {
+        !self.inner.request_filters.is_empty()
+    }
+
     /// Run pre-routing request filters.
     ///
     /// Request header mutations are applied immediately so later filters and
@@ -969,7 +1004,7 @@ impl IntegrationRegistry {
             services,
             mut req,
         } = input;
-        if let Some((proxy, _)) = self.find_route(method, path) {
+        if let Some((proxy, _, _)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
@@ -1285,7 +1320,7 @@ impl IntegrationRegistry {
     /// # Panics
     ///
     /// Panics if route registration fails due to duplicate or invalid paths.
-    pub fn from_routes(routes: Vec<(Method, &str, RouteValue)>) -> Self {
+    pub fn from_routes(routes: Vec<RouteEntry<'_>>) -> Self {
         let mut get_router = Router::new();
         let mut post_router = Router::new();
         let mut put_router = Router::new();
@@ -1294,7 +1329,8 @@ impl IntegrationRegistry {
         let mut head_router = Router::new();
         let mut options_router = Router::new();
 
-        for (method, path, value) in routes {
+        for (method, path, (proxy, integration_id)) in routes {
+            let value: RouteValue = (proxy, integration_id, path.to_owned());
             // Convert /* wildcard to matchit's {*rest} syntax
             let matchit_path = if path.ends_with("/*") {
                 format!(

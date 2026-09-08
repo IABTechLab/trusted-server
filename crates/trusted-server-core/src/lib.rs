@@ -31,6 +31,7 @@
     )
 )]
 
+pub mod access_telemetry;
 pub(crate) mod asset_image_optimizer;
 pub mod auction;
 pub mod auction_config_types;
@@ -61,6 +62,7 @@ pub mod proxy;
 pub mod publisher;
 pub mod redacted;
 pub mod request_signing;
+pub mod request_timing;
 pub mod response_privacy;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;
