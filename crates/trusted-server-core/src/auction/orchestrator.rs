@@ -762,7 +762,6 @@ impl AuctionOrchestratorHarness {
             (None, local_winners())
         };
         let unroutable_bidder_count = routed.diagnostics().unroutable_bidder_count();
-        // lgtm[rust/cleartext-logging]
         // This logs only a bounded routing count, never request data or secrets.
         log::info!(
             "Auction routing diagnostics: unroutable_bidder_count={}",
@@ -1160,7 +1159,6 @@ impl AuctionOrchestrator {
             let provider = match self.providers.get(*provider_name) {
                 Some(p) => p,
                 None => {
-                    // lgtm[rust/cleartext-logging]
                     // This logs a configured provider identifier, not request data or secrets.
                     log::warn!("Provider '{}' not registered, skipping", provider_name);
                     continue;
@@ -1216,7 +1214,6 @@ impl AuctionOrchestrator {
                 services: context.services,
             };
 
-            // lgtm[rust/cleartext-logging]
             // This logs a configured provider identifier and timeout, not request data or secrets.
             log::info!(
                 "Launching bid request to '{}' with a {}ms budget",
@@ -1401,7 +1398,6 @@ impl AuctionOrchestrator {
                                 responses.push(auction_response);
                             }
                             Err(e) => {
-                                // lgtm[rust/cleartext-logging]
                                 // This warning reports provider parse failures only; no secret values are logged.
                                 log::warn!(
                                     "Provider '{}' failed to parse response: {:?}",
@@ -1913,7 +1909,6 @@ impl AuctionOrchestrator {
             let provider = match self.providers.get(*provider_name) {
                 Some(p) => p,
                 None => {
-                    // lgtm[rust/cleartext-logging]
                     // The provider name is a static config identifier (e.g. "prebid"), not a secret.
                     log::warn!("Provider '{}' not registered, skipping", provider_name);
                     continue;
@@ -1937,7 +1932,6 @@ impl AuctionOrchestrator {
             // Match the synchronous path's strict deadline semantics: do not
             // invoke even an immediate provider after the budget reaches zero.
             if effective_timeout == 0 {
-                // lgtm[rust/cleartext-logging]
                 // This logs a configured provider identifier and timeout, not request data or secrets.
                 log::warn!(
                     "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
@@ -2012,7 +2006,6 @@ impl AuctionOrchestrator {
                         ));
                         continue;
                     }
-                    // lgtm[rust/cleartext-logging]
                     // This logs configured provider and backend identifiers plus a timeout, not request data or secrets.
                     log::info!(
                         "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
@@ -2065,7 +2058,6 @@ impl AuctionOrchestrator {
             };
         }
 
-        // lgtm[rust/cleartext-logging]
         // This logs bounded request counts and a timeout, not request data or secrets.
         log::info!(
             "Dispatched {} SSP request(s) with {} immediate response(s) (timeout: {}ms)",
@@ -2390,7 +2382,6 @@ impl AuctionOrchestrator {
                     };
                 }
                 let mediator_start = Instant::now();
-                // lgtm[rust/cleartext-logging]
                 // This logs a configured mediator identifier and timeout values, not request data or secrets.
                 log::info!(
                     "Running mediator '{}' with {}ms logical budget and {}ms transport timeout (A_deadline remaining: {}ms, configured: {}ms)",
