@@ -1,15 +1,3 @@
-use docs_parity::workflow::{
-    WorkflowScope, validate_action_references, validate_release_runbook, validate_workflow,
-};
-
-const CHECKOUT_SHA: &str = "3d3c42e5aac5ba805825da76410c181273ba90b1";
-const SETUP_RUST_SHA: &str = "166cdcfd11aee3cb47222f9ddb555ce30ddb9659";
-const SETUP_NODE_SHA: &str = "820762786026740c76f36085b0efc47a31fe5020";
-const UPLOAD_SHA: &str = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
-const DOWNLOAD_SHA: &str = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
-
-fn final_fixture() -> String {
-    r#"
 name: Documentation automation
 permissions: {}
 on:
@@ -29,7 +17,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@__CHECKOUT_SHA__
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: "${{ github.event.pull_request.head.sha }}"
           persist-credentials: false
@@ -37,11 +25,11 @@ jobs:
       - name: Read pinned Node version
         id: node-version
         run: echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-      - uses: actions-rust-lang/setup-rust-toolchain@__SETUP_RUST_SHA__
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
         with:
           toolchain: "1.95.0"
           cache: false
-      - uses: actions/setup-node@__SETUP_NODE_SHA__
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "${{ steps.node-version.outputs.node }}"
       - name: Install JSDoc lint dependencies
@@ -58,12 +46,12 @@ jobs:
     outputs:
       artifact-sha256: "${{ steps.digest.outputs.sha256 }}"
     steps:
-      - uses: actions/checkout@__CHECKOUT_SHA__
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: "${{ github.sha }}"
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions-rust-lang/setup-rust-toolchain@__SETUP_RUST_SHA__
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
         with:
           toolchain: "1.95.0"
           cache: false
@@ -74,7 +62,7 @@ jobs:
       - name: Record link artifact digest
         id: digest
         run: echo "sha256=$(sha256sum "$RUNNER_TEMP/link-results.zip" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@__UPLOAD_SHA__
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: link-results
           path: "${{ runner.temp }}/link-results.zip"
@@ -90,7 +78,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - uses: actions/download-artifact@__DOWNLOAD_SHA__
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: link-results
           path: "${{ runner.temp }}/link-results"
@@ -202,12 +190,12 @@ jobs:
     outputs:
       artifact-sha256: "${{ steps.digest.outputs.sha256 }}"
     steps:
-      - uses: actions/checkout@__CHECKOUT_SHA__
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: "${{ github.sha }}"
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions-rust-lang/setup-rust-toolchain@__SETUP_RUST_SHA__
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
         with:
           toolchain: "1.95.0"
           cache: false
@@ -216,7 +204,7 @@ jobs:
       - name: Record dependency artifact digest
         id: digest
         run: echo "sha256=$(sha256sum "$RUNNER_TEMP/dependency-snapshot.zip" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@__UPLOAD_SHA__
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: dependency-snapshot
           path: "${{ runner.temp }}/dependency-snapshot.zip"
@@ -232,7 +220,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@__DOWNLOAD_SHA__
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: dependency-snapshot
           path: "${{ runner.temp }}/dependency-snapshot"
@@ -262,302 +250,3 @@ jobs:
           jq -e --arg ref "$EXPECTED_REF" --arg sha "$EXPECTED_SOURCE_SHA" --arg id "$EXPECTED_RUN_ID.$EXPECTED_RUN_ATTEMPT" 'def package($key): keys == ["package_url", "relationship", "scope"] and .package_url == ("pkg:cargo/" + $key) and ($key | test("^[A-Za-z0-9._+-]+@[A-Za-z0-9._+-]+$")) and (.relationship == "direct" or .relationship == "indirect") and (.scope == "runtime" or .scope == "development"); keys == ["detector", "job", "manifests", "ref", "sha", "version"] and .version == 0 and .sha == $sha and .ref == $ref and .job == {"correlator":"trusted-server-docs-parity-v1","id":$id} and .detector == {"name":"trusted-server-docs-parity","url":"https://github.com/IABTechLab/trusted-server/tree/main/tools/docs-parity","version":"0.1.0"} and (.manifests | keys == ["Cargo.lock", "tools/docs-parity/Cargo.lock"]) and all(.manifests | to_entries[]; (.value | keys == ["file", "name", "resolved"]) and .value.name == .key and .value.file == {"source_location":.key} and (.value.resolved | type == "object") and all(.value.resolved | to_entries[]; .key as $key | .value | package($key))) and ([.manifests[].resolved | length] | add <= 5000) and all(.. | strings; utf8bytelength <= 2048)' "$json" >/dev/null
           status="$(gh api --include --method POST "repos/IABTechLab/trusted-server/dependency-graph/snapshots" --input "$json" | sed -n '1s/.* \([0-9][0-9][0-9]\).*/\1/p')"
           test "$status" = 201
-"#
-    .replace("__CHECKOUT_SHA__", CHECKOUT_SHA)
-    .replace("__SETUP_RUST_SHA__", SETUP_RUST_SHA)
-    .replace("__SETUP_NODE_SHA__", SETUP_NODE_SHA)
-    .replace("__UPLOAD_SHA__", UPLOAD_SHA)
-    .replace("__DOWNLOAD_SHA__", DOWNLOAD_SHA)
-}
-
-#[test]
-fn final_policy_accepts_read_only_reader_and_no_checkout_writer() {
-    validate_workflow(final_fixture().as_bytes(), WorkflowScope::Final)
-        .expect("closed final workflow fixture should pass");
-}
-
-#[test]
-fn release_runbook_requires_post_main_boundary_owner_sla_and_receipts() {
-    let fixture =
-        include_str!("../../../docs/internal/runbooks/documentation-automation-release.md");
-    validate_release_runbook(fixture.as_bytes()).expect("complete release runbook should pass");
-
-    for required in [
-        "only after PR #1049 has reached `main`",
-        "The release owner is `aram356`.",
-        "within one business day",
-        "canonical capture destination",
-        "HTTP 201 response",
-        "No branch-protection change is selected",
-    ] {
-        let invalid = fixture.replace(required, "omitted");
-        assert!(
-            validate_release_runbook(invalid.as_bytes()).is_err(),
-            "missing runbook contract should fail: {required}"
-        );
-    }
-}
-
-#[test]
-fn workflow_policy_rejects_untrusted_events_actions_permissions_and_writers() {
-    let fixture = final_fixture();
-    let safe_local_action = fixture.replacen(
-        "      - name: Read pinned Node version",
-        "      - uses: ./.github/actions/setup-integration-test-env\n      - name: Read pinned Node version",
-        1,
-    );
-    validate_workflow(safe_local_action.as_bytes(), WorkflowScope::Final)
-        .expect("a normalized local action should be permitted in the read-only PR job");
-    let node_step = format!(
-        "      - uses: actions/setup-node@{SETUP_NODE_SHA}\n        with:\n          node-version: \"${{{{ steps.node-version.outputs.node }}}}\"\n"
-    );
-    let missing_node = fixture.replacen(&node_step, "", 1);
-
-    for (case, invalid) in [
-        fixture.replace("pull_request:", "pull_request_target:"),
-        fixture.replace("  schedule:\n", "  merge_group:\n  schedule:\n"),
-        fixture.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n  push:\n"),
-        fixture.replace(
-            "  workflow_dispatch:\n",
-            "  workflow_dispatch:\n    inputs:\n      sha:\n        required: true\n",
-        ),
-        fixture.replacen(
-            &format!("actions/checkout@{CHECKOUT_SHA}"),
-            "actions/checkout@v4",
-            1,
-        ),
-        fixture.replacen(
-            &format!("actions-rust-lang/setup-rust-toolchain@{SETUP_RUST_SHA}"),
-            "example/unknown@0123456789abcdef0123456789abcdef01234567",
-            1,
-        ),
-        fixture.replacen(
-            &format!("actions/setup-node@{SETUP_NODE_SHA}"),
-            "actions/setup-node@0123456789abcdef0123456789abcdef01234567",
-            1,
-        ),
-        missing_node,
-        fixture.replacen(
-            "node-version: \"${{ steps.node-version.outputs.node }}\"",
-            "node-version: \"20\"",
-            1,
-        ),
-        fixture.replacen("contents: read", "statuses: write", 1),
-        fixture.replacen(
-            "if: github.repository == 'IABTechLab/trusted-server'",
-            "if: always() && github.repository == 'IABTechLab/trusted-server'",
-            1,
-        ),
-        fixture.replacen(
-            "ref: \"${{ github.sha }}\"",
-            "ref: \"${{ github.event.pull_request.head.sha }}\"",
-            1,
-        ),
-        fixture.replacen(
-            "          name: link-results\n          path:",
-            "          name: link-results\n          run-id: \"${{ github.run_id }}\"\n          path:",
-            1,
-        ),
-        fixture.replacen(
-            "    steps:\n      - uses: actions/download-artifact@",
-            &format!(
-                "    steps:\n      - uses: actions/checkout@{CHECKOUT_SHA}\n        with:\n          ref: \"${{{{ github.sha }}}}\"\n          persist-credentials: false\n          fetch-depth: 0\n      - uses: actions/download-artifact@"
-            ),
-            1,
-        ),
-        safe_local_action.replace(
-            "./.github/actions/setup-integration-test-env",
-            "./.github/actions/../outside",
-        ),
-        fixture.replacen(
-            "      - run: cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all",
-            "      - uses: actions/cache@0123456789abcdef0123456789abcdef01234567\n      - run: cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all",
-            1,
-        ),
-        fixture.replacen(
-            "    timeout-minutes: 30\n    permissions:",
-            "    services:\n      database:\n        image: example.invalid/db\n    timeout-minutes: 30\n    permissions:",
-            1,
-        ),
-        fixture.replacen("link-results.json", "unexpected.json", 1),
-        fixture.replacen("EXPECTED_SOURCE_SHA: \"${{ github.sha }}\"", "EXPECTED_SOURCE_SHA: stale", 1),
-        fixture.replacen(".schema_version == 1", ".schema_version == 2", 1),
-        fixture.replacen("assert finding[\"diagnostic\"].strip()", "assert True", 1),
-        fixture.replacen("parsed.scheme == \"https\"", "parsed.scheme in (\"http\", \"https\")", 1),
-        fixture.replacen("-le 2097152", "-le 2097153", 1),
-        fixture.replacen("test ! -L \"$archive\"", "test -L \"$archive\"", 1),
-        fixture.replacen("-rw-r--r--", "-rwxr-xr-x", 1),
-        fixture.replacen("gh issue create", "true # gh issue create", 1),
-        fixture.replacen("gh issue close", "true # gh issue close", 1),
-        fixture.replacen("<!-- docs-parity:external-links:v1 -->", "<!-- unowned -->", 1),
-        fixture.replacen("gh api --paginate --slurp", "gh api", 1),
-        fixture.replacen(
-            " > \"$issues_json\"",
-            " || true > \"$issues_json\"",
-            1,
-        ),
-        fixture.replacen("dependency-snapshot.json", "extra.json", 1),
-        fixture.replacen(".version == 0", ".version == 1", 1),
-        fixture.replacen("--input \"$json\"", "--input \"$archive\"", 1),
-        fixture.replacen(
-            "status=\"$(gh api",
-            "cargo run --manifest-path tools/docs-parity/Cargo.toml -- submit\n          status=\"$(gh api",
-            1,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert_ne!(invalid, fixture, "negative fixture case {case} must mutate input");
-        assert!(
-            validate_workflow(invalid.as_bytes(), WorkflowScope::Final).is_err(),
-            "unsafe workflow fixture case {case} should fail"
-        );
-    }
-}
-
-#[test]
-fn capture_scope_requires_exact_read_only_head_checkout_and_artifact_shape() {
-    let fixture = format!(
-        r#"
-name: Capture
-permissions: {{}}
-on: [pull_request]
-jobs:
-  cli-help-capture:
-    name: Capture CLI help (${{{{ matrix.platform }}}})
-    if: github.event_name == 'pull_request'
-    runs-on: "${{{{ matrix.os }}}}"
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux
-          - os: macos-latest
-            platform: macos
-    steps:
-      - uses: actions/checkout@{CHECKOUT_SHA}
-        with:
-          ref: "${{{{ github.event.pull_request.head.sha }}}}"
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Assert exact pull-request head
-        run: test "$(git rev-parse HEAD)" = "${{{{ github.event.pull_request.head.sha }}}}"
-      - name: Read tool versions
-        id: tool-versions
-        run: |
-          echo "rust=$(awk '$1 == \"rust\" {{ print $2 }}' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "node=$(awk '$1 == \"nodejs\" {{ print $2 }}' .tool-versions)" >> "$GITHUB_OUTPUT"
-      - uses: actions-rust-lang/setup-rust-toolchain@{SETUP_RUST_SHA}
-        with:
-          toolchain: "${{{{ steps.tool-versions.outputs.rust }}}}"
-          cache: false
-      - uses: actions/setup-node@{SETUP_NODE_SHA}
-        with:
-          node-version: "${{{{ steps.tool-versions.outputs.node }}}}"
-      - name: Build Trusted Server JavaScript
-        working-directory: crates/trusted-server-js/lib
-        run: |
-          npm ci
-          npm run build
-      - name: Capture recursive native CLI help
-        env:
-          TSJS_SKIP_BUILD: "1"
-        run: |
-          cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture --output "${{{{ runner.temp }}}}/cli-help-${{{{ matrix.platform }}}}.zip"
-      - uses: actions/upload-artifact@{UPLOAD_SHA}
-        with:
-          name: cli-help-${{{{ matrix.platform }}}}
-          path: "${{{{ runner.temp }}}}/cli-help-${{{{ matrix.platform }}}}.zip"
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
-"#
-    );
-    validate_workflow(fixture.as_bytes(), WorkflowScope::CaptureJob)
-        .expect("capture job should satisfy the narrow policy");
-
-    for (case, invalid) in [
-        fixture.replace("persist-credentials: false", "persist-credentials: true"),
-        fixture.replace("fetch-depth: 0", "fetch-depth: 1"),
-        fixture.replace("cli-help-${{ matrix.platform }}.zip", "*.zip"),
-        fixture.replace("compression-level: 0", "compression-level: 6"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert!(
-            validate_workflow(invalid.as_bytes(), WorkflowScope::CaptureJob).is_err(),
-            "capture policy should reject drift case {case}"
-        );
-    }
-
-    let decoy_checkout = fixture
-        .replace("persist-credentials: false", "persist-credentials: true")
-        .replace(
-            "      - run: cargo run --manifest-path",
-            "      - name: persist-credentials: false\n        run: cargo run --manifest-path",
-        );
-    let duplicate_checkout = fixture.replace(
-        "      - name: Assert exact pull-request head",
-        &format!(
-            "      - uses: actions/checkout@{CHECKOUT_SHA}\n        with:\n          ref: \"${{{{ github.event.pull_request.head.sha }}}}\"\n          persist-credentials: false\n          fetch-depth: 0\n      - name: Assert exact pull-request head"
-        ),
-    );
-    let extra_event = fixture.replace(
-        "on: [pull_request]",
-        "on: [pull_request, workflow_dispatch]",
-    );
-    let arbitrary_action = fixture.replace(
-        "      - name: Assert exact pull-request head",
-        "      - uses: example/unknown@0123456789abcdef0123456789abcdef01234567\n      - name: Assert exact pull-request head",
-    );
-    let traversing_local_action = fixture.replace(
-        "      - name: Assert exact pull-request head",
-        "      - uses: ./../outside\n      - name: Assert exact pull-request head",
-    );
-    for (case, invalid) in [
-        decoy_checkout,
-        duplicate_checkout,
-        extra_event,
-        arbitrary_action,
-        traversing_local_action,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert!(
-            validate_workflow(invalid.as_bytes(), WorkflowScope::CaptureJob).is_err(),
-            "capture policy must reject structural or trust-boundary drift case {case}"
-        );
-    }
-}
-
-#[test]
-fn repository_action_references_require_immutable_external_pins() {
-    let pinned = format!(
-        "jobs:\n  check:\n    steps:\n      - uses: actions/checkout@{CHECKOUT_SHA}\n      - uses: ./.github/actions/setup-integration-test-env\n"
-    );
-    validate_action_references(pinned.as_bytes()).expect("immutable and local actions should pass");
-
-    for invalid in [
-        pinned.replace(CHECKOUT_SHA, "v7"),
-        pinned.replace(
-            &format!("actions/checkout@{CHECKOUT_SHA}"),
-            "actions/checkout@ABCDEF0123456789ABCDEF0123456789ABCDEF01",
-        ),
-        pinned.replace(
-            "./.github/actions/setup-integration-test-env",
-            "./.github/actions/../outside",
-        ),
-    ] {
-        assert!(
-            validate_action_references(invalid.as_bytes()).is_err(),
-            "mutable, uppercase, or traversing action references must fail"
-        );
-    }
-}

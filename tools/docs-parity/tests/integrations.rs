@@ -179,8 +179,8 @@ fn source_inventory_resolves_the_exact_owner_and_rejects_ambiguous_production_sy
 
     let mut impl_decoy = closed_grammar_sources("fn validate_enabled_integrations() {}");
     impl_decoy.plan_registrations = concat!(
-        "impl Decoy { fn with_plan() { bad::register_for_plan()?; } }\n",
-        include_str!("../../../crates/trusted-server-core/src/integrations/registry.rs")
+        include_str!("../../../crates/trusted-server-core/src/integrations/registry.rs"),
+        "\nimpl Decoy { fn with_plan() { bad::register_for_plan()?; } }"
     );
     assert_eq!(
         extract_source_inventory(&impl_decoy)

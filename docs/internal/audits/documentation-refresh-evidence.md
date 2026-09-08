@@ -243,12 +243,12 @@ the durable capture contract, including the actual redacted bodies, byte
 lengths, and SHA-256 hashes. Local builds, CI simulations, fixtures, and mocked
 API output cannot complete a row.
 
-| Surface                     | Required real external capture                                                                                                             | Capture owner                 | Canonical capture destination | State                       |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------- | ----------------------------- | --------------------------- |
-| Pages and CNAME             | Deployed `main` SHA; live URL/content/header matrix; project-path asset behavior; observed CNAME and canonical-URL behavior                | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
-| First scheduled link run    | Default-branch run ID, attempt, jobs, URLs, app identities, bounded artifact, concurrency/timeout result, and issue-reconciliation outcome | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
-| Dependency submission/graph | Authenticated `main` SHA; submission request and response; 201 result; detector/correlator; graph API body; triage owner and SLA           | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
-| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies, and planted-failure block                          | Pending if selected — Task 17 | Pending if selected — Task 17 | `release-pending`, optional |
+| Surface                     | Required real external capture                                                                                                             | Capture owner                                    | Canonical capture destination                                       | State                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------- | --------------------------- |
+| Pages and CNAME             | Deployed `main` SHA; live URL/content/header matrix; project-path asset behavior; observed CNAME and canonical-URL behavior                | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
+| First scheduled link run    | Default-branch run ID, attempt, jobs, URLs, app identities, bounded artifact, concurrency/timeout result, and issue-reconciliation outcome | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
+| Dependency submission/graph | Authenticated `main` SHA; submission request and response; 201 result; detector/correlator; graph API body; triage owner and SLA           | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
+| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies, and planted-failure block                          | Not selected; no owner unless maintainers opt in | No capture destination unless maintainers opt in                    | `release-pending`, optional |
 
 Before Task 17 commits, it must replace every applicable pending owner with a
 named owner and every applicable pending destination with the authoritative
@@ -296,20 +296,20 @@ Expired or ownerless entries fail the checkpoint.
 Each row requires a deduplicated issue URL or explicit existing-issue
 disposition, owner, and labels. Do not replace these rows with umbrella issues.
 
-| Finding                                            | Issue or disposition URL | Owner   | Labels  | State   |
-| -------------------------------------------------- | ------------------------ | ------- | ------- | ------- |
-| Adapter `Hooks::stores()` and dead store manifests | Pending                  | Pending | Pending | Pending |
-| Cloudflare config-store / CLI envelope bridge      | Pending                  | Pending | Pending | Pending |
-| Axum local config-store / env bridge               | Pending                  | Pending | Pending | Pending |
-| Cross-adapter health and startup-failure contract  | Pending                  | Pending | Pending | Pending |
-| `imp_ext` reserved-field protection                | Pending                  | Pending | Pending | Pending |
-| Partner pull-token placeholder rejection           | Pending                  | Pending | Pending | Pending |
-| Inline `trusted_client_ip.shared_secret`           | Pending                  | Pending | Pending | Pending |
-| Deploy-ID constant and set equality                | Pending                  | Pending | Pending | Pending |
-| Vendored CLI help internal references              | Pending                  | Pending | Pending | Pending |
-| Tinybird telemetry runtime support                 | Pending                  | Pending | Pending | Pending |
-| `.env.dev` undeclared `opid_store`                 | Pending                  | Pending | Pending | Pending |
-| Fastly staging config-blob selection               | Pending                  | Pending | Pending | Pending |
+| Finding                                            | Issue or disposition URL                                                                              | Owner     | Labels                     | State  |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------- | -------------------------- | ------ |
+| Adapter `Hooks::stores()` and dead store manifests | [#1139](https://github.com/IABTechLab/trusted-server/issues/1139)                                     | `aram356` | `bug`, `rust`              | Open   |
+| Cloudflare config-store / CLI envelope bridge      | [#1140](https://github.com/IABTechLab/trusted-server/issues/1140)                                     | `aram356` | `bug`, `rust`              | Open   |
+| Axum local config-store / env bridge               | [#1141](https://github.com/IABTechLab/trusted-server/issues/1141)                                     | `aram356` | `bug`, `rust`              | Open   |
+| Cross-adapter health and startup-failure contract  | [#1142](https://github.com/IABTechLab/trusted-server/issues/1142)                                     | `aram356` | `enhancement`, `rust`      | Open   |
+| `imp_ext` reserved-field protection                | [#1143](https://github.com/IABTechLab/trusted-server/issues/1143)                                     | `aram356` | `bug`, `rust`              | Open   |
+| Partner pull-token placeholder rejection           | [#1144](https://github.com/IABTechLab/trusted-server/issues/1144)                                     | `aram356` | `bug`, `rust`              | Open   |
+| Inline `trusted_client_ip.shared_secret`           | [#1145](https://github.com/IABTechLab/trusted-server/issues/1145)                                     | `aram356` | `question`, `rust`         | Open   |
+| Deploy-ID constant and set equality                | [#1146](https://github.com/IABTechLab/trusted-server/issues/1146)                                     | `aram356` | `bug`, `rust`              | Open   |
+| Vendored CLI help internal references              | [#1147](https://github.com/IABTechLab/trusted-server/issues/1147)                                     | `aram356` | `bug`, `vendor dependency` | Open   |
+| Tinybird telemetry runtime support                 | [#1148](https://github.com/IABTechLab/trusted-server/issues/1148)                                     | `aram356` | `bug`, `rust`              | Open   |
+| `.env.dev` undeclared `opid_store`                 | [#1149](https://github.com/IABTechLab/trusted-server/issues/1149)                                     | `aram356` | `bug`                      | Open   |
+| Fastly staging config-blob selection               | Existing [#1082](https://github.com/IABTechLab/trusted-server/issues/1082) exactly covers the finding | `aram356` | None                       | Closed |
 
 ### Package sections
 
@@ -3815,9 +3815,118 @@ hosted run is retained as negative evidence and is not the capture source.
 
 #### Task 17 — Activate final CI and release-pending controls
 
-Pending. Record workflow negative fixtures, generated consumer proof,
-follow-up issue rows, and the release runbook. Real release receipts remain in
-the release-pending table until observed after the result reaches `main`.
+- Package start HEAD:
+  `b8b6e22a5864b5e8693392cd1d7fd76d8b9502b6`.
+- The successful Task 16 Run Tests execution is
+  [run 34198747383](https://github.com/IABTechLab/trusted-server/actions/runs/34198747383),
+  attempt 1, at that exact SHA. It completed successfully. The native capture
+  jobs were
+  [Linux job 101972422480](https://github.com/IABTechLab/trusted-server/actions/runs/34198747383/job/101972422480)
+  and
+  [macOS job 101972422468](https://github.com/IABTechLab/trusted-server/actions/runs/34198747383/job/101972422468),
+  both successful.
+- Hosted artifact `cli-help-linux` had artifact ID `10045006288`, 32,788
+  transport bytes, and GitHub artifact digest
+  `sha256:444bb180b534e0a3a3d9257faa34f0e6a4da6600509d233f5c8ec6ce24e0a1da`.
+  Hosted artifact `cli-help-macos` had artifact ID `10045081201`, 36,299
+  transport bytes, and GitHub artifact digest
+  `sha256:92aedc56df8848ba8a851ab1759bc719df7a065799f8b941d60408e62b207803`.
+- `cli-help import-hosted --run-id 34198747383` authenticated the run, attempt,
+  exact PR source SHA, artifact names, closed archives, and the 60-file CLI
+  source/blob set. Installed help SHA-256 values are
+  `d1cae561a509fac817befdca1ba733a2582dba87d322cf4c2efccce9729a6786`
+  for Linux and
+  `cecd3a524ff6c50459b446dfe95980be0cdb037e1934ea0ab2a389aa6472f450`
+  for macOS. The capture manifest SHA-256 is
+  `f739030d3515b626bd1b75fb939f6f72d6219bab33eca99bf94290cdbddea171`.
+  A second authenticated import exited 0 and retained all three exact hashes.
+- The final documentation workflow has an ordinary read-only PR validator and
+  a guarded weekly/default-branch automation path. Link and dependency readers
+  produce bounded same-run artifacts; their writers have only the specific
+  write permission, never check out repository code, revalidate schema,
+  provenance, permissions, sizes, names, modes, and digests, and submit or
+  reconcile only unchanged validated data. The workflow validator rejects
+  untrusted triggers, inputs, mutable actions, unknown actions, unsafe local
+  paths, expanded permissions, caller-selected refs, cross-run artifacts,
+  writer checkout, unchecked bodies, and altered dependency identity.
+- The release-runbook validator has negative fixtures for the post-`main`
+  boundary, named owner, SLA, canonical capture destination, HTTP 201 receipt,
+  and explicit no-protection disposition. The committed runbook keeps Pages,
+  the first real schedule, dependency submission/graph visibility, and optional
+  protection evidence `release-pending`; no rc or local result fills them.
+- `gates.toml` is the canonical source for four generated consumers. The first
+  update changed only the bounded regions in `CLAUDE.md`, `AGENTS.md`,
+  `TESTING.md`, and `docs/guide/testing.md`; `generate --check` then exited 0.
+  `CONTRIBUTING.md`, the PR template, and the five command files remain
+  link-only. Removing the obsolete second `TESTING.md` fence record restored
+  exact snippet classification after the generated list replaced the prior
+  fenced command table.
+- All tracked workflow and composite-action YAML now uses normalized local
+  actions or immutable lowercase 40-hex external revisions. Reviewed pins:
+  [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1)
+  `3d3c42e5aac5ba805825da76410c181273ba90b1`;
+  [setup-rust-toolchain v1.17.0](https://github.com/actions-rust-lang/setup-rust-toolchain/releases/tag/v1.17.0)
+  `166cdcfd11aee3cb47222f9ddb555ce30ddb9659`;
+  [rustfmt v1.1.2](https://github.com/actions-rust-lang/rustfmt/releases/tag/v1.1.2)
+  `4066006ec54a31931b9b1fddfd38f2fdf2d27143`;
+  [setup-node v7.0.0](https://github.com/actions/setup-node/releases/tag/v7.0.0)
+  `820762786026740c76f36085b0efc47a31fe5020`;
+  [cache v6.1.0](https://github.com/actions/cache/releases/tag/v6.1.0)
+  `55cc8345863c7cc4c66a329aec7e433d2d1c52a9`;
+  [upload-artifact v7.0.1](https://github.com/actions/upload-artifact/releases/tag/v7.0.1)
+  `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`; and
+  [download-artifact v8.0.1](https://github.com/actions/download-artifact/releases/tag/v8.0.1)
+  `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`.
+- Additional reviewed pins:
+  [Fastly compute setup v14](https://github.com/fastly/compute-actions/releases/tag/v14)
+  `a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786`;
+  [setup-chrome v2.2.0](https://github.com/browser-actions/setup-chrome/releases/tag/v2.2.0)
+  `48ad923757ca74d66703209fe939badbdf80f2f4`;
+  [CodeQL bundle v2.26.4](https://github.com/github/codeql-action/releases/tag/codeql-bundle-v2.26.4)
+  action-v4 commit `cdf488f595d80d6e07e03d4674febd5ab45fa938`;
+  [configure-pages v6.0.0](https://github.com/actions/configure-pages/releases/tag/v6.0.0)
+  `45bfe0192ca1faeb007ade9deae92b16b8254a0d`;
+  [upload-pages-artifact v5.0.0](https://github.com/actions/upload-pages-artifact/releases/tag/v5.0.0)
+  `fc324d3547104276b827a68afc52ff2a11cc49c9`; and
+  [deploy-pages v5.0.1](https://github.com/actions/deploy-pages/releases/tag/v5.0.1)
+  `368f82528645a54fb793d4d04e342629a3f51346`.
+- Dependabot now covers exactly seven roots, all weekly and targeting `main`:
+  GitHub Actions; root Cargo; docs-parity Cargo; JavaScript library; browser
+  tests; Next.js fixture; and docs. Node cache inputs name lockfiles, Rust jobs
+  that invoke JavaScript have the pinned Node runtime, deploy changes observe
+  `.tool-versions`, Wrangler remains `4.129.0`, CodeQL covers `rc/*` pull
+  requests, and OpenRTB codegen inherits workspace lints.
+- The tracker was searched in both open and closed states for every distinct
+  source finding. Eleven exact new issues were necessary and are #1139 through
+  #1149; existing closed issue #1082 exactly covers staging blob selection.
+  The authoritative owner, label, URL, and state readback is in the follow-up
+  table above. No umbrella issue or auxiliary PR was created.
+- The first full docs-parity test run exposed two fixture-only assumptions from
+  the newly activated gates. `integrations.rs` had placed a decoy item before a
+  production file whose Task 16 module docs are valid only at the file start;
+  the fixture now keeps the production source first. `markdown.rs` constructed
+  temporary repositories without the new gate manifest and consumers; those
+  fixtures now supply the complete generated-input contract. Focused reruns
+  passed before the final full invocation.
+- Final `cargo test --manifest-path tools/docs-parity/Cargo.toml` passed in one
+  invocation: 38 library, 35 classification, 26 CLI, 13 CLI-help, four
+  dependency-snapshot, six gate, 33 integration, two JSDoc, 62 link, 11
+  Markdown, two README, 70 route, 73 scanner, 24 settings, five snippet, five
+  workflow, and zero doctests all passed. Its real-repository `check --all`
+  fixture passed after 1,072.60 seconds.
+- `cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check`, tool
+  Clippy with all targets/features and warnings denied, `cargo fmt --all --
+--check`, `classify --check`, `snippets --check`, `generate --check`,
+  `workflow --check`, standalone `check --all`, and `git diff --check` all
+  passed. Two consecutive `generate --update` invocations retained identical
+  bytes in all four gate consumers. The reviewed sensitive scan passed with
+  5,475 exact governed occurrences; new records are public domains in the final
+  workflow and evidence URLs, plus selector movement from the workflow and Task
+  16 comment edits.
+- From `docs`, `npm run lint`, the repository-wide `npm run format`, and
+  `npm run build` passed. VitePress 1.6.4 completed in 166.88 seconds with only
+  the existing non-failing `vcl` syntax-highlighting fallback. The generated
+  untracked `.vitepress/.temp` directory was removed after the build.
 
 #### Task 18 — Close PR #1049 implementation
 

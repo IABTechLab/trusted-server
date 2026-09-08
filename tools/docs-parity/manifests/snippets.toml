@@ -593,12 +593,6 @@ fingerprint = "sha256:abb67e2e782598e333ebe4793be1d0fb017717b307f9aa108371286026
 path = "TESTING.md"
 selector = "fence:1"
 command = "validate-bash"
-fingerprint = "sha256:a2609037cc495b76587c8cc879c73faf33879bf46661a34e0ad449ea0e60efa5"
-
-[[snippets]]
-path = "TESTING.md"
-selector = "fence:2"
-command = "validate-bash"
 fingerprint = "sha256:4790bf9898e42b65d89eecae1bea746aa4be0e543c02ed6fbe94d1c7d1b121fb"
 
 [[snippets]]

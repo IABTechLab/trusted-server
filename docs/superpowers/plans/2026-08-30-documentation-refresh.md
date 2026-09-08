@@ -1480,11 +1480,11 @@ git commit -m "Complete in-code documentation"
 - Modify: `tools/docs-parity/manifests/{tracked-files,maintained-sources,sensitive-allowlist,snippets}.toml`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [ ] **Step 1: Write failing automation fixtures**
+- [x] **Step 1: Write failing automation fixtures**
 
 Assert missing rc CodeQL triggers, docs-parity jobs, rustdoc/doctest jobs, nested lockfile cache inputs, Node pins, Dependabot roots, Wrangler pin, generated gate equality, action SHA pins, final `main` targets, reader/writer separation, closed manual refresh, and release-pending runbook fields.
 
-- [ ] **Step 2: Import the final CLI recapture**
+- [x] **Step 2: Import the final CLI recapture**
 
 Require Task 16 to be committed and pushed. Select the one successful native
 Linux/macOS capture run at that exact Task 16 head, import it through
@@ -1492,7 +1492,7 @@ Linux/macOS capture run at that exact Task 16 head, import it through
 the authenticated run, attempt, artifacts, digests, source SHA, and CLI-source
 set. The remaining Task 17 changes must not alter the CLI source/blob set.
 
-- [ ] **Step 3: Wire blocking deterministic checks**
+- [x] **Step 3: Wire blocking deterministic checks**
 
 Add host docs-parity fmt/clippy/test/check, generated no-diff,
 settings/examples/inventory/snippets/scanner/local links/readmes/JSDoc/workflow
@@ -1501,7 +1501,7 @@ regression jobs. CLI-capture and final docs-parity jobs use `fetch-depth: 0` so
 the recorded capture commit is available for ancestry and blob comparison.
 External network links remain scheduled, not a PR dependency.
 
-- [ ] **Step 4: Normalize existing automation**
+- [x] **Step 4: Normalize existing automation**
 
 Add CodeQL `rc/*` PR triggers, `.tool-versions` deploy paths, exact setup-node
 lockfile paths, pinned Wrangler, all approved Dependabot roots targeting `main`,
@@ -1510,7 +1510,7 @@ tracked workflow and composite-action YAML to a lowercase 40-hex SHA; permit
 normalized `./...` local actions only in read-only checkout jobs. Record each
 pin's release version and primary release URL in evidence.
 
-- [ ] **Step 5: Finalize `docs-links.yml`**
+- [x] **Step 5: Finalize `docs-links.yml`**
 
 Create `docs-links.yml` once in final form: ordinary read-only pull-request
 validation; weekly `17 9 * * 1` default-branch schedule; input-free manual
@@ -1523,22 +1523,22 @@ unchanged-body submission after revalidation. Reject `pull_request_target`,
 artifact selection, caller-selected refs/tools/SHAs, writer checkout, and writer
 execution of checked-out repository code.
 
-- [ ] **Step 6: Write the release-pending runbook**
+- [x] **Step 6: Write the release-pending runbook**
 
 Document exact post-main Pages/CNAME smoke, first scheduled link run, first dependency submission and 201/graph proof, Dependabot/action-pin inspection, alert owner/SLA, and optional branch-protection activation only after contexts report from expected apps. Mark every receipt release-pending; do not create another PR or claim execution from rc.
 
-- [ ] **Step 7: Generate all gate consumers**
+- [x] **Step 7: Generate all gate consumers**
 
 Create `gates.toml`, regenerate CLAUDE/AGENTS/TESTING/guide testing from it,
 prove command files, CONTRIBUTING, and the PR template remain link-only,
 register gate equality in `check --all`, and prove a second generation produces
 no diff.
 
-- [ ] **Step 8: Deduplicate all code follow-ups**
+- [x] **Step 8: Deduplicate all code follow-ups**
 
 Search the tracker for every item in the spec. File or record an exact existing-issue disposition for all twelve, with URL, owner, and labels. Do not collapse distinct adapter-store, config-bridge, health, reserved-field, placeholder, inline-secret, deploy-ID, CLI-help, telemetry, env-store, or staging-blob findings.
 
-- [ ] **Step 9: Run WP8 acceptance and commit**
+- [x] **Step 9: Run WP8 acceptance and commit**
 
 ```bash
 cargo test --manifest-path tools/docs-parity/Cargo.toml

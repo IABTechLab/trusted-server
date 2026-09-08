@@ -1,5 +1,6 @@
 use docs_parity::gates::{
-    check_link_only_consumer, check_owned_region, parse_manifest, render_region,
+    check_link_only_consumer, check_owned_region, parse_manifest, render_owned_document,
+    render_region,
 };
 
 const MANIFEST: &str = r#"
@@ -144,4 +145,28 @@ fn owned_gate_region_requires_exact_unique_markers_and_generated_bytes() {
             "missing, moved, duplicate, or drifted owned regions must fail"
         );
     }
+}
+
+#[test]
+fn owned_gate_generation_repairs_only_the_bounded_region() {
+    let manifest = parse_manifest(MANIFEST.as_bytes()).expect("should parse gate fixture");
+    let anchor = "# Development gates\n\n";
+    let stale = concat!(
+        "Preamble.\n\n# Development gates\n\n",
+        "<!-- docs-parity:gates:start -->\n",
+        "stale\n",
+        "<!-- docs-parity:gates:end -->\n",
+        "\nManual tail.\n",
+    );
+
+    let rendered = render_owned_document(stale, &manifest, anchor)
+        .expect("should replace the bounded gate region");
+    check_owned_region(&rendered, &manifest, anchor).expect("rendered region should be exact");
+    assert!(rendered.starts_with("Preamble.\n\n# Development gates\n\n"));
+    assert!(rendered.ends_with("\nManual tail.\n"));
+    assert_eq!(
+        render_owned_document(&rendered, &manifest, anchor).expect("should rerender exact region"),
+        rendered,
+        "a second render must be byte-identical"
+    );
 }

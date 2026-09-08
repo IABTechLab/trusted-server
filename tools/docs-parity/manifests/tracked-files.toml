@@ -115,6 +115,10 @@ path = ".github/workflows/deploy-docs.yml"
 kind = "text"
 
 [[files]]
+path = ".github/workflows/docs-links.yml"
+kind = "text"
+
+[[files]]
 path = ".github/workflows/format.yml"
 kind = "text"
 
@@ -2151,6 +2155,10 @@ path = "docs/internal/onboarding.md"
 kind = "text"
 
 [[files]]
+path = "docs/internal/runbooks/documentation-automation-release.md"
+kind = "text"
+
+[[files]]
 path = "docs/package-lock.json"
 kind = "text"
 
@@ -2892,6 +2900,10 @@ kind = "text"
 
 [[files]]
 path = "tools/docs-parity/manifests/diagrams.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/gates.toml"
 kind = "text"
 
 [[files]]

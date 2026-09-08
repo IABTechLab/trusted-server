@@ -37,6 +37,48 @@ impl TestRepository {
             "tools/docs-parity/manifests/pages.toml",
             &manifest,
         );
+        write(
+            directory.path(),
+            "tools/docs-parity/manifests/gates.toml",
+            concat!(
+                "version = 1\nreviewed = true\n\n",
+                "[[gates]]\nid = \"fixture\"\ntitle = \"Fixture\"\n",
+                "owner = \"docs-team\"\ncommands = [\"cargo test\"]\n",
+            ),
+        );
+        for (path, heading) in [
+            ("CLAUDE.md", "## CI Gates"),
+            ("AGENTS.md", "## CI Gates"),
+            ("TESTING.md", "## Required local gates"),
+            ("docs/guide/testing.md", "## Required gates"),
+        ] {
+            write(
+                directory.path(),
+                path,
+                &format!(
+                    "{heading}\n\n<!-- docs-parity:gates:start -->\nold\n<!-- docs-parity:gates:end -->\n"
+                ),
+            );
+        }
+        write(
+            directory.path(),
+            "CONTRIBUTING.md",
+            "See [testing](TESTING.md).\n",
+        );
+        for path in [
+            ".github/pull_request_template.md",
+            ".claude/commands/check-ci.md",
+            ".claude/commands/review-changes.md",
+            ".claude/commands/test-all.md",
+            ".claude/commands/test-crate.md",
+            ".claude/commands/verify.md",
+        ] {
+            write(
+                directory.path(),
+                path,
+                "See [CI gates](/CLAUDE.md#ci-gates).\n",
+            );
+        }
         run_git(directory.path(), &["add", "--all"]);
         Self { directory }
     }

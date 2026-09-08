@@ -1,18 +1,38 @@
 //! Canonical development-gate schema and deterministic rendering.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use error_stack::Report;
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
+use crate::repository::{NormalizedRelativePath, Repository};
+
 const MANIFEST_VERSION: u32 = 1;
 const MAXIMUM_MANIFEST_BYTES: usize = 256 * 1024;
 const MAXIMUM_GATES: usize = 64;
 const MAXIMUM_COMMANDS: usize = 256;
+const MAXIMUM_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 const MAXIMUM_STRING_BYTES: usize = 2_048;
 const START_MARKER: &str = "<!-- docs-parity:gates:start -->";
 const END_MARKER: &str = "<!-- docs-parity:gates:end -->";
+const MANIFEST_PATH: &str = "tools/docs-parity/manifests/gates.toml";
+const OWNED_CONSUMERS: [(&str, &str); 4] = [
+    ("CLAUDE.md", "## CI Gates\n\n"),
+    ("AGENTS.md", "## CI Gates\n\n"),
+    ("TESTING.md", "## Required local gates\n\n"),
+    ("docs/guide/testing.md", "## Required gates\n\n"),
+];
+const LINK_ONLY_CONSUMERS: [(&str, &str); 7] = [
+    ("CONTRIBUTING.md", "TESTING.md"),
+    (".github/pull_request_template.md", "/CLAUDE.md#ci-gates"),
+    (".claude/commands/check-ci.md", "/CLAUDE.md#ci-gates"),
+    (".claude/commands/review-changes.md", "/CLAUDE.md#ci-gates"),
+    (".claude/commands/test-all.md", "/CLAUDE.md#ci-gates"),
+    (".claude/commands/test-crate.md", "/CLAUDE.md#ci-gates"),
+    (".claude/commands/verify.md", "/CLAUDE.md#ci-gates"),
+];
 
 /// Failure while parsing or comparing canonical gates.
 #[derive(Debug, derive_more::Display)]
@@ -91,6 +111,57 @@ pub fn render_region(manifest: &GateManifest) -> Result<String, Report<GateError
     Ok(output)
 }
 
+/// Replace one existing owned gate region while preserving all other bytes.
+///
+/// # Errors
+///
+/// Returns an error for an oversized document, an invalid or non-unique
+/// placement anchor, malformed ownership markers, or an invalid manifest.
+pub fn render_owned_document(
+    contents: &str,
+    manifest: &GateManifest,
+    placement_anchor: &str,
+) -> Result<String, Report<GateError>> {
+    if contents.len() > MAXIMUM_DOCUMENT_BYTES {
+        return Err(consumer_error("gate consumer exceeds 2097152 bytes"));
+    }
+    validate_placement(contents, placement_anchor)?;
+    let starts = contents.match_indices(START_MARKER).collect::<Vec<_>>();
+    let ends = contents.match_indices(END_MARKER).collect::<Vec<_>>();
+    let start = starts[0].0;
+    if start >= ends[0].0 {
+        return Err(consumer_error("gate ownership markers are reordered"));
+    }
+    let end = ends[0]
+        .0
+        .checked_add(END_MARKER.len())
+        .ok_or_else(|| consumer_error("gate ownership marker position overflowed"))?;
+    let region_end = if contents.as_bytes().get(end) == Some(&b'\n') {
+        end + 1
+    } else {
+        end
+    };
+    let expected = render_region(manifest)?;
+    let mut rendered = String::with_capacity(
+        contents
+            .len()
+            .saturating_sub(region_end.saturating_sub(start))
+            .saturating_add(expected.len()),
+    );
+    rendered.push_str(
+        contents
+            .get(..start)
+            .ok_or_else(|| consumer_error("gate region start is invalid"))?,
+    );
+    rendered.push_str(&expected);
+    rendered.push_str(
+        contents
+            .get(region_end..)
+            .ok_or_else(|| consumer_error("gate region end is invalid"))?,
+    );
+    Ok(rendered)
+}
+
 /// Require the unique owned region in a Markdown document to equal the render
 /// immediately after one exact placement anchor.
 ///
@@ -104,6 +175,34 @@ pub fn check_owned_region(
     placement_anchor: &str,
 ) -> Result<(), Report<GateError>> {
     let expected = render_region(manifest)?;
+    validate_placement(contents, placement_anchor)?;
+    let starts = contents.match_indices(START_MARKER).collect::<Vec<_>>();
+    let ends = contents.match_indices(END_MARKER).collect::<Vec<_>>();
+    let start = starts[0].0;
+    let end = ends[0]
+        .0
+        .checked_add(END_MARKER.len())
+        .ok_or_else(|| consumer_error("gate ownership marker position overflowed"))?;
+    if start >= ends[0].0 {
+        return Err(consumer_error("gate ownership markers are reordered"));
+    }
+    let region_end = if contents.as_bytes().get(end) == Some(&b'\n') {
+        end + 1
+    } else {
+        end
+    };
+    if contents.get(start..region_end) != Some(expected.as_str()) {
+        return Err(consumer_error(
+            "owned gate region differs from canonical render",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_placement(contents: &str, placement_anchor: &str) -> Result<(), Report<GateError>> {
+    if contents.len() > MAXIMUM_DOCUMENT_BYTES {
+        return Err(consumer_error("gate consumer exceeds 2097152 bytes"));
+    }
     if placement_anchor.is_empty()
         || placement_anchor.len() > MAXIMUM_STRING_BYTES
         || placement_anchor.contains('\0')
@@ -135,22 +234,8 @@ pub fn check_owned_region(
             "owned gate region is not at its unique placement anchor",
         ));
     }
-    let end = ends[0]
-        .0
-        .checked_add(END_MARKER.len())
-        .ok_or_else(|| consumer_error("gate ownership marker position overflowed"))?;
     if start >= ends[0].0 {
         return Err(consumer_error("gate ownership markers are reordered"));
-    }
-    let region_end = if contents.as_bytes().get(end) == Some(&b'\n') {
-        end + 1
-    } else {
-        end
-    };
-    if contents.get(start..region_end) != Some(expected.as_str()) {
-        return Err(consumer_error(
-            "owned gate region differs from canonical render",
-        ));
     }
     Ok(())
 }
@@ -201,6 +286,103 @@ pub fn check_link_only_consumer(
         }
     }
     Ok(())
+}
+
+/// Check every generated and link-only gate consumer in the repository.
+///
+/// # Errors
+///
+/// Returns an error when the reviewed manifest or any declared consumer is
+/// missing, unsafe, oversized, malformed, or different from its canonical
+/// content.
+pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<GateError>> {
+    let manifest = read_repository_manifest(repository)?;
+    let commands = canonical_commands(&manifest);
+    for (path, anchor) in OWNED_CONSUMERS {
+        let contents = read_repository_text(repository, path)?;
+        check_owned_region(&contents, &manifest, anchor)?;
+    }
+    for (path, destination) in LINK_ONLY_CONSUMERS {
+        let contents = read_repository_text(repository, path)?;
+        check_link_only_consumer(&contents, destination, &commands)?;
+    }
+    Ok(())
+}
+
+/// Check or atomically update every generated gate consumer.
+///
+/// All target documents are validated and rendered before the first write.
+/// The return value is `true` when at least one document differs.
+///
+/// # Errors
+///
+/// Returns an error for an invalid manifest or consumer, or when a bounded
+/// replacement cannot be committed atomically.
+pub(crate) fn generate_repository(
+    repository: &Repository,
+    update: bool,
+) -> Result<bool, Report<GateError>> {
+    let manifest = read_repository_manifest(repository)?;
+    let mut updates = Vec::new();
+    for (path_text, anchor) in OWNED_CONSUMERS {
+        let path = normalized_path(path_text)?;
+        let original = repository
+            .read_tracked_bounded(&path, MAXIMUM_DOCUMENT_BYTES)
+            .map_err(|_error| consumer_error(format!("cannot read gate consumer: {path_text}")))?;
+        let text = core::str::from_utf8(&original)
+            .map_err(|_error| consumer_error(format!("gate consumer is not UTF-8: {path_text}")))?;
+        let rendered = render_owned_document(text, &manifest, anchor)?.into_bytes();
+        if rendered != original {
+            updates.push((path, original, rendered));
+        }
+    }
+    let drift = !updates.is_empty();
+    if update {
+        for (path, original, rendered) in updates {
+            repository
+                .replace_atomically_after_precommit_validation(&path, Some(&original), &rendered)
+                .map_err(|_error| {
+                    consumer_error(format!(
+                        "cannot update gate consumer: {}",
+                        path.as_path().display()
+                    ))
+                })?;
+        }
+    }
+    Ok(drift)
+}
+
+fn read_repository_manifest(repository: &Repository) -> Result<GateManifest, Report<GateError>> {
+    let path = normalized_path(MANIFEST_PATH)?;
+    let bytes = repository
+        .read_tracked_bounded(&path, MAXIMUM_MANIFEST_BYTES)
+        .map_err(|_error| manifest_error("cannot read gate manifest"))?;
+    parse_manifest(&bytes)
+}
+
+fn read_repository_text(
+    repository: &Repository,
+    path_text: &str,
+) -> Result<String, Report<GateError>> {
+    let path = normalized_path(path_text)?;
+    let bytes = repository
+        .read_tracked_bounded(&path, MAXIMUM_DOCUMENT_BYTES)
+        .map_err(|_error| consumer_error(format!("cannot read gate consumer: {path_text}")))?;
+    String::from_utf8(bytes)
+        .map_err(|_error| consumer_error(format!("gate consumer is not UTF-8: {path_text}")))
+}
+
+fn normalized_path(path: &str) -> Result<NormalizedRelativePath, Report<GateError>> {
+    NormalizedRelativePath::new(Path::new(path))
+        .map_err(|_error| consumer_error(format!("unsafe gate path: {path}")))
+}
+
+fn canonical_commands(manifest: &GateManifest) -> Vec<&str> {
+    manifest
+        .gates
+        .iter()
+        .flat_map(|gate| gate.commands.iter().map(String::as_str))
+        .collect()
 }
 
 fn validate_manifest(manifest: &GateManifest) -> Result<(), Report<GateError>> {

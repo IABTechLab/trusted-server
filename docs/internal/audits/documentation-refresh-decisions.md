@@ -154,12 +154,12 @@ receipt, and this record claims none.
 These rows require real post-`main` external captures under the evidence
 ledger's durable hashed-body contract.
 
-| Surface                     | Required external evidence                                                                                                    | Capture owner                 | Canonical capture destination | State                       |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------- | ----------------------------- | --------------------------- |
-| Pages and CNAME             | Deployed `main` SHA, live response matrix and headers, project-path assets, and observed CNAME behavior                       | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
-| First scheduled link run    | Default-branch run, attempt, jobs, URLs, app identities, bounded artifact, and resulting issue-reconciliation state           | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
-| Dependency submission/graph | Authenticated `main` SHA, redacted submission and response bodies with hashes, detector/correlator, and graph API JSON        | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
-| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies with hashes, and planted-failure proof | Pending if selected — Task 17 | Pending if selected — Task 17 | `release-pending`, optional |
+| Surface                     | Required external evidence                                                                                                    | Capture owner                                    | Canonical capture destination                                       | State                       |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------- | --------------------------- |
+| Pages and CNAME             | Deployed `main` SHA, live response matrix and headers, project-path assets, and observed CNAME behavior                       | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
+| First scheduled link run    | Default-branch run, attempt, jobs, URLs, app identities, bounded artifact, and resulting issue-reconciliation state           | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
+| Dependency submission/graph | Authenticated `main` SHA, redacted submission and response bodies with hashes, detector/correlator, and graph API JSON        | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
+| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies with hashes, and planted-failure proof | Not selected; no owner unless maintainers opt in | No capture destination unless maintainers opt in                    | `release-pending`, optional |
 
 Local builds, CI simulations, mocked API responses, and fixture output cannot
 complete any release-pending row.

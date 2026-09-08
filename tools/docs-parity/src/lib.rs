@@ -63,6 +63,8 @@ pub enum DocsParityError {
     Snippets,
     #[display("workspace README semantics failed")]
     Readmes,
+    #[display("canonical development-gate semantics failed")]
+    Gates,
     #[display("JSDoc fixture semantics failed")]
     Jsdoc,
     #[display("documentation workflow policy failed")]
@@ -423,7 +425,7 @@ fn workflow(
     arguments: &WorkflowArguments,
 ) -> Result<Outcome, Report<DocsParityError>> {
     debug_assert!(arguments.check, "clap should require workflow check mode");
-    workflow::check_capture_repository(repository).change_context(DocsParityError::Workflow)?;
+    workflow::check_repository(repository).change_context(DocsParityError::Workflow)?;
     Ok(Outcome::Clean)
 }
 
@@ -513,8 +515,11 @@ fn generate(
     repository: &Repository,
     arguments: &GenerateArguments,
 ) -> Result<Outcome, Report<DocsParityError>> {
-    let drift = markdown::generate(repository, arguments.update)
+    let markdown_drift = markdown::generate(repository, arguments.update)
         .change_context(DocsParityError::Markdown)?;
+    let gate_drift = gates::generate_repository(repository, arguments.update)
+        .change_context(DocsParityError::Gates)?;
+    let drift = markdown_drift || gate_drift;
     if arguments.check && drift {
         Ok(Outcome::Drift)
     } else {
@@ -590,15 +595,17 @@ type OfflineCheckFunction = fn(&Repository) -> Result<bool, Report<DocsParityErr
 enum OfflineCheckKind {
     Classification,
     CliHelp,
+    Gates,
     Generated,
     Integrations,
+    Jsdoc,
     LocalLinks,
     Readmes,
     Routes,
     Scanner,
     Settings,
     Snippets,
-    WorkflowCapture,
+    Workflow,
 }
 
 impl OfflineCheckKind {
@@ -606,15 +613,17 @@ impl OfflineCheckKind {
         match self {
             Self::Classification => "classification",
             Self::CliHelp => "cli-help",
+            Self::Gates => "gates",
             Self::Generated => "generated",
             Self::Integrations => "integrations",
+            Self::Jsdoc => "jsdoc",
             Self::LocalLinks => "local-links",
             Self::Readmes => "readmes",
             Self::Routes => "routes",
             Self::Scanner => "scanner",
             Self::Settings => "settings",
             Self::Snippets => "snippets",
-            Self::WorkflowCapture => "workflow-capture",
+            Self::Workflow => "workflow",
         }
     }
 }
@@ -625,7 +634,7 @@ struct OfflineCheckEntry {
     run: OfflineCheckFunction,
 }
 
-const OFFLINE_CHECKS: [OfflineCheckEntry; 11] = [
+const OFFLINE_CHECKS: [OfflineCheckEntry; 13] = [
     OfflineCheckEntry {
         kind: OfflineCheckKind::Classification,
         run: offline_classification,
@@ -635,12 +644,20 @@ const OFFLINE_CHECKS: [OfflineCheckEntry; 11] = [
         run: offline_cli_help,
     },
     OfflineCheckEntry {
+        kind: OfflineCheckKind::Gates,
+        run: offline_gates,
+    },
+    OfflineCheckEntry {
         kind: OfflineCheckKind::Generated,
         run: offline_generated,
     },
     OfflineCheckEntry {
         kind: OfflineCheckKind::Integrations,
         run: offline_integrations,
+    },
+    OfflineCheckEntry {
+        kind: OfflineCheckKind::Jsdoc,
+        run: offline_jsdoc,
     },
     OfflineCheckEntry {
         kind: OfflineCheckKind::LocalLinks,
@@ -667,8 +684,8 @@ const OFFLINE_CHECKS: [OfflineCheckEntry; 11] = [
         run: offline_snippets,
     },
     OfflineCheckEntry {
-        kind: OfflineCheckKind::WorkflowCapture,
-        run: offline_workflow_capture,
+        kind: OfflineCheckKind::Workflow,
+        run: offline_workflow,
     },
 ];
 
@@ -710,12 +727,26 @@ fn offline_cli_help(repository: &Repository) -> Result<bool, Report<DocsParityEr
     Ok(false)
 }
 
+fn offline_gates(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
+    gates::check_repository(repository).change_context(DocsParityError::Gates)?;
+    Ok(false)
+}
+
 fn offline_generated(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
-    markdown::generate(repository, false).change_context(DocsParityError::Markdown)
+    let markdown_drift =
+        markdown::generate(repository, false).change_context(DocsParityError::Markdown)?;
+    let gate_drift =
+        gates::generate_repository(repository, false).change_context(DocsParityError::Gates)?;
+    Ok(markdown_drift || gate_drift)
 }
 
 fn offline_integrations(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
     integrations::check_repository(repository).change_context(DocsParityError::Integrations)?;
+    Ok(false)
+}
+
+fn offline_jsdoc(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
+    jsdoc::check_repository(repository).change_context(DocsParityError::Jsdoc)?;
     Ok(false)
 }
 
@@ -749,8 +780,8 @@ fn offline_snippets(repository: &Repository) -> Result<bool, Report<DocsParityEr
     Ok(false)
 }
 
-fn offline_workflow_capture(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
-    workflow::check_capture_repository(repository).change_context(DocsParityError::Workflow)?;
+fn offline_workflow(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
+    workflow::check_repository(repository).change_context(DocsParityError::Workflow)?;
     Ok(false)
 }
 
@@ -853,15 +884,17 @@ mod tests {
         let expected_kinds = [
             OfflineCheckKind::Classification,
             OfflineCheckKind::CliHelp,
+            OfflineCheckKind::Gates,
             OfflineCheckKind::Generated,
             OfflineCheckKind::Integrations,
+            OfflineCheckKind::Jsdoc,
             OfflineCheckKind::LocalLinks,
             OfflineCheckKind::Readmes,
             OfflineCheckKind::Routes,
             OfflineCheckKind::Scanner,
             OfflineCheckKind::Settings,
             OfflineCheckKind::Snippets,
-            OfflineCheckKind::WorkflowCapture,
+            OfflineCheckKind::Workflow,
         ];
         let registered_kinds = OFFLINE_CHECKS
             .iter()
@@ -878,15 +911,17 @@ mod tests {
             [
                 "classification",
                 "cli-help",
+                "gates",
                 "generated",
                 "integrations",
+                "jsdoc",
                 "local-links",
                 "readmes",
                 "routes",
                 "scanner",
                 "settings",
                 "snippets",
-                "workflow-capture",
+                "workflow",
             ]
         );
         assert_eq!(

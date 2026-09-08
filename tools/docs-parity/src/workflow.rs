@@ -195,6 +195,119 @@ pub fn validate_workflow(bytes: &[u8], scope: WorkflowScope) -> Result<(), Repor
     }
 }
 
+/// Require every YAML `uses:` value to be a normalized local action or an
+/// external action pinned to a lowercase 40-hex commit.
+///
+/// # Errors
+///
+/// Returns an error for malformed or oversized YAML, mutable or abbreviated
+/// external references, and unsafe local-action paths.
+pub fn validate_action_references(bytes: &[u8]) -> Result<(), Report<WorkflowError>> {
+    if bytes.len() > MAXIMUM_WORKFLOW_BYTES {
+        return Err(workflow_error("workflow exceeds 524288 bytes"));
+    }
+    let text =
+        core::str::from_utf8(bytes).map_err(|_error| workflow_error("workflow is not UTF-8"))?;
+    let root = serde_yaml::from_str::<Value>(text)
+        .map_err(|_error| workflow_error("workflow YAML cannot be parsed"))?;
+    visit_action_references(&root)
+}
+
+/// Validate the committed post-merge documentation-automation runbook.
+///
+/// # Errors
+///
+/// Returns an error when the runbook is oversized, non-UTF-8, or omits a
+/// required release boundary, owner, SLA, capture rule, or verification step.
+pub fn validate_release_runbook(bytes: &[u8]) -> Result<(), Report<WorkflowError>> {
+    if bytes.len() > MAXIMUM_WORKFLOW_BYTES {
+        return Err(workflow_error("release runbook exceeds 524288 bytes"));
+    }
+    let text = core::str::from_utf8(bytes)
+        .map_err(|_error| workflow_error("release runbook is not UTF-8"))?;
+    for fragment in [
+        "only after PR #1049 has reached `main`",
+        "The release owner is `aram356`.",
+        "within one business day",
+        "within two business days",
+        "canonical capture destination",
+        "UTF-8 byte length and SHA-256",
+        "State remains `release-pending`",
+        "HTTP 201 response",
+        "expected GitHub App",
+        "No branch-protection change is selected",
+    ] {
+        if !text.contains(fragment) {
+            return Err(workflow_error(format!(
+                "release runbook is missing `{fragment}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn visit_action_references(value: &Value) -> Result<(), Report<WorkflowError>> {
+    match value {
+        Value::Mapping(mapping) => {
+            for (key, child) in mapping {
+                if scalar_string(key) == Some("uses") {
+                    let action = scalar_string(child)
+                        .ok_or_else(|| workflow_error("uses value must be a string"))?;
+                    validate_action_reference(action)?;
+                }
+                visit_action_references(child)?;
+            }
+        }
+        Value::Sequence(sequence) => {
+            for child in sequence {
+                visit_action_references(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_action_reference(action: &str) -> Result<(), Report<WorkflowError>> {
+    if let Some(relative) = action.strip_prefix("./") {
+        if relative.is_empty()
+            || relative.contains(['\\', '@'])
+            || relative
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(workflow_error("local action path is not normalized"));
+        }
+        return Ok(());
+    }
+    let (name, revision) = action
+        .split_once('@')
+        .ok_or_else(|| workflow_error("external action lacks an immutable revision"))?;
+    if action.matches('@').count() != 1
+        || !lower_hex_sha(revision)
+        || name.split('/').count() < 2
+        || name.split('/').any(|component| {
+            component.is_empty()
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(workflow_error(
+            "external action must use a normalized lowercase 40-hex pin",
+        ));
+    }
+    Ok(())
+}
+
+fn lower_hex_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 pub(crate) fn check_capture_repository(
     repository: &Repository,
 ) -> Result<(), Report<WorkflowError>> {
@@ -204,6 +317,117 @@ pub(crate) fn check_capture_repository(
         .read_tracked_bounded(&path, MAXIMUM_WORKFLOW_BYTES)
         .map_err(|_error| workflow_error("cannot read test workflow"))?;
     validate_workflow(&bytes, WorkflowScope::CaptureJob)
+}
+
+/// Validate the final documentation workflow and repository automation pins.
+///
+/// # Errors
+///
+/// Returns an error when a required workflow, action, tool pin, cache input,
+/// Dependabot root, or workspace lint declaration is absent or unsafe.
+pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<WorkflowError>> {
+    check_capture_repository(repository)?;
+    let final_workflow = read_repository_file(repository, ".github/workflows/docs-links.yml")?;
+    validate_workflow(&final_workflow, WorkflowScope::Final)?;
+    let release_runbook = read_repository_file(
+        repository,
+        "docs/internal/runbooks/documentation-automation-release.md",
+    )?;
+    validate_release_runbook(&release_runbook)?;
+
+    for path in repository
+        .tracked_paths()
+        .map_err(|_error| workflow_error("cannot enumerate tracked automation files"))?
+    {
+        let text = path
+            .as_utf8()
+            .map_err(|_error| workflow_error("automation path is not UTF-8"))?;
+        if is_automation_yaml(text) {
+            let bytes = repository
+                .read_tracked_bounded(&path, MAXIMUM_WORKFLOW_BYTES)
+                .map_err(|_error| workflow_error(format!("cannot read automation file: {text}")))?;
+            validate_action_references(&bytes)?;
+        }
+    }
+
+    for (path, fragments) in [
+        (
+            ".github/workflows/codeql.yml",
+            &["branches: [\"main\", \"rc/*\"]"][..],
+        ),
+        (
+            ".github/workflows/deploy-docs.yml",
+            &["- \".tool-versions\"", "docs/package-lock.json"][..],
+        ),
+        (
+            ".github/workflows/format.yml",
+            &[
+                "documentation-parity:",
+                "tools/docs-parity -> tools/docs-parity/target",
+                "crates/trusted-server-js/lib/package-lock.json",
+                "docs/package-lock.json",
+            ][..],
+        ),
+        (
+            ".github/workflows/test.yml",
+            &[
+                "documentation-rustdoc:",
+                "fetch-depth: 0",
+                "crates/trusted-server-js/lib/package-lock.json",
+            ][..],
+        ),
+        (
+            ".github/workflows/integration-tests.yml",
+            &[
+                "crates/trusted-server-integration-tests/browser/package-lock.json",
+                "crates/trusted-server-js/lib/package-lock.json",
+                "wrangler@$WRANGLER_VERSION",
+            ][..],
+        ),
+        (
+            ".github/dependabot.yml",
+            &[
+                "package-ecosystem: \"github-actions\"",
+                "directory: \"/tools/docs-parity\"",
+                "directory: \"/crates/trusted-server-integration-tests/browser\"",
+                "directory: \"/crates/trusted-server-integration-tests/fixtures/frameworks/nextjs\"",
+                "target-branch: \"main\"",
+            ][..],
+        ),
+        (".tool-versions", &["wrangler 4.129.0"][..]),
+        (
+            "crates/trusted-server-openrtb-codegen/Cargo.toml",
+            &["[lints]", "workspace = true"][..],
+        ),
+    ] {
+        let bytes = read_repository_file(repository, path)?;
+        let text = core::str::from_utf8(&bytes)
+            .map_err(|_error| workflow_error(format!("automation file is not UTF-8: {path}")))?;
+        for fragment in fragments {
+            if !text.contains(fragment) {
+                return Err(workflow_error(format!(
+                    "automation contract is missing `{fragment}` in {path}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_repository_file(
+    repository: &Repository,
+    path_text: &str,
+) -> Result<Vec<u8>, Report<WorkflowError>> {
+    let path = NormalizedRelativePath::new(Path::new(path_text))
+        .map_err(|_error| workflow_error(format!("automation path is invalid: {path_text}")))?;
+    repository
+        .read_tracked_bounded(&path, MAXIMUM_WORKFLOW_BYTES)
+        .map_err(|_error| workflow_error(format!("cannot read automation file: {path_text}")))
+}
+
+fn is_automation_yaml(path: &str) -> bool {
+    (path.starts_with(".github/workflows/") || path.starts_with(".github/actions/"))
+        && (path.ends_with(".yml") || path.ends_with(".yaml"))
 }
 
 fn validate_final(root: &Mapping, jobs: &Mapping) -> Result<(), Report<WorkflowError>> {
@@ -302,13 +526,13 @@ fn validate_pull_request_job(job: &Mapping) -> Result<(), Report<WorkflowError>>
         "read",
     )?;
     let steps = steps(job, "pull-request")?;
-    if !matches!(steps.len(), 5 | 6) {
+    if !matches!(steps.len(), 6 | 7) {
         return Err(workflow_error(
-            "pull-request job must contain five steps and at most one local action",
+            "pull-request job must contain six steps and at most one local action",
         ));
     }
     validate_checkout_step(&steps[0], "${{ github.event.pull_request.head.sha }}")?;
-    let read_node_index = if steps.len() == 6 {
+    let read_node_index = if steps.len() == 7 {
         validate_local_action_step(&steps[1])?;
         2
     } else {
@@ -332,6 +556,13 @@ fn validate_pull_request_job(job: &Mapping) -> Result<(), Report<WorkflowError>>
     )?;
     validate_run_step(
         &steps[read_node_index + 3],
+        Some("Install JSDoc lint dependencies"),
+        None,
+        Some("crates/trusted-server-js/lib"),
+        "npm ci",
+    )?;
+    validate_run_step(
+        &steps[read_node_index + 4],
         None,
         None,
         None,
