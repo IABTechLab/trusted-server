@@ -493,20 +493,32 @@ async fn with_browser(
     // Reap the child even when the CDP close request failed or timed out. Give
     // waiting its own budget so a slow close cannot consume the entire teardown
     // window and leave chromiumoxide's drop handler to kill the process.
-    let wait_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.wait())
-        .await
-        .map_err(|_| report_error("timed out waiting for browser process to exit after audit"))
-        .and_then(|waited| {
-            waited.map(|_| ()).map_err(|error| {
-                report_error(format!(
-                    "failed waiting for browser process to exit after audit: {error}"
-                ))
-            })
-        });
+    let wait_result = reap_browser(&mut browser).await;
     handler_task.abort();
     let _ = handler_task.await;
 
     combine_browser_run_results(result, finalization_result, close_result, wait_result)
+}
+
+/// Waits for graceful browser exit, then forcibly reaps a process that outlives
+/// the close deadline.
+async fn reap_browser(browser: &mut Browser) -> CliResult<()> {
+    match timeout(BROWSER_CLOSE_TIMEOUT, browser.wait()).await {
+        Ok(waited) => waited.map(|_| ()).map_err(|error| {
+            report_error(format!(
+                "failed waiting for browser process to exit after audit: {error}"
+            ))
+        }),
+        Err(_) => timeout(BROWSER_CLOSE_TIMEOUT, browser.kill())
+            .await
+            .map_err(|_| report_error("timed out killing browser process after audit"))
+            .and_then(|killed| match killed {
+                Some(Ok(())) | None => Ok(()),
+                Some(Err(error)) => Err(report_error(format!(
+                    "failed to kill browser process after audit: {error}"
+                ))),
+            }),
+    }
 }
 
 /// Combines already-attempted browser phases, preserving the first error.

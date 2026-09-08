@@ -42,6 +42,11 @@ fn integration_guide_runtime_services_fixture_compiles() {
     );
     fs::write(fixture_root.join("Cargo.toml"), manifest)
         .expect("should write isolated fixture manifest");
+    fs::copy(
+        repository_root.join("Cargo.lock"),
+        fixture_root.join("Cargo.lock"),
+    )
+    .expect("should seed the fixture with the repository dependency resolution");
     fs::write(source_dir.join("lib.rs"), source).expect("should write exact documented source");
 
     let output = Command::new("cargo")

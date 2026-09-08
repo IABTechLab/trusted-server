@@ -2430,7 +2430,10 @@ mod tests {
 
         let started = Instant::now();
         let mut deadline = Command::new("/bin/sh");
-        deadline.args(["-c", "sleep 5"]);
+        // Replace the shell so killing the bounded child also closes both
+        // inherited output pipes; this test measures child cleanup, not shell
+        // process-tree cleanup.
+        deadline.args(["-c", "exec sleep 5"]);
         assert!(
             run_bounded_command(&mut deadline, 4, 4, Duration::from_millis(50)).is_err(),
             "deadline must fail and reap the child"
