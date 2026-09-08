@@ -22,7 +22,6 @@ use crate::settings::Settings;
 use super::generation::{ec_hash, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
-use super::pull_sync_marker::entry_is_pull_complete;
 use super::rate_limiter::RateLimiter;
 use super::registry::{PartnerConfig, PartnerRegistry};
 
@@ -286,6 +285,17 @@ pub fn dispatch_pull_sync(
             );
         }
     }
+}
+
+/// Returns whether a live entry contains every pull-enabled partner ID.
+#[must_use]
+pub(crate) fn entry_is_pull_complete(entry: &KvEntry, registry: &PartnerRegistry) -> bool {
+    let pull_partners = registry.pull_enabled_partners();
+    !pull_partners.is_empty()
+        && entry.consent.ok
+        && pull_partners
+            .iter()
+            .all(|partner| !is_partner_pull_eligible(partner, Some(entry)))
 }
 
 fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>) -> bool {
@@ -636,6 +646,33 @@ mod tests {
         assert!(
             !is_partner_pull_eligible(&partner, Some(&entry)),
             "should skip dispatch when partner already has a stored UID"
+        );
+    }
+
+    #[test]
+    fn completeness_requires_all_pull_partner_ids() {
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("a.example.com"),
+            pull_enabled_ec_partner("b.example.com"),
+        ])
+        .expect("should build registry");
+        let mut entry = KvEntry::minimal("a.example.com", "uid-a", 1_000);
+
+        assert!(
+            !entry_is_pull_complete(&entry, &registry),
+            "entry missing a pull partner ID should be incomplete"
+        );
+
+        entry.ids.insert(
+            "b.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "uid-b".to_owned(),
+            },
+        );
+
+        assert!(
+            entry_is_pull_complete(&entry, &registry),
+            "entry with every pull partner ID should be complete"
         );
     }
 

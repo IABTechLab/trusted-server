@@ -11,7 +11,7 @@ use crate::constants::COOKIE_TS_EC_PULL_COMPLETE;
 use crate::redacted::Redacted;
 use crate::settings::Settings;
 
-use super::kv_types::KvEntry;
+use super::pull_sync::entry_is_pull_complete;
 use super::registry::PartnerRegistry;
 use super::{EcKvSnapshot, current_timestamp};
 
@@ -135,7 +135,7 @@ pub(crate) fn reconcile_marker(
                 .expect("snapshot binding should be checked before marker reconciliation");
             if !entry.consent.ok {
                 expire_if_present(state, response);
-            } else if entry_has_all_pull_partner_ids(entry, &pull_partners) {
+            } else if entry_is_pull_complete(entry, registry) {
                 if !state.is_valid() {
                     set_marker(settings, registry, ec_id, state, response);
                 }
@@ -158,20 +158,6 @@ pub(crate) fn reconcile_marker(
 pub(crate) fn expire_marker(state: &mut PullSyncMarkerState, response: &mut Response<EdgeBody>) {
     append_cookie(response, &format_marker_cookie("", 0));
     *state = PullSyncMarkerState::Absent;
-}
-
-/// Returns whether a live entry contains every pull-enabled partner ID.
-#[must_use]
-pub(crate) fn entry_is_pull_complete(entry: &KvEntry, registry: &PartnerRegistry) -> bool {
-    let pull_partners = sorted_pull_partner_domains(registry);
-    !pull_partners.is_empty() && entry_has_all_pull_partner_ids(entry, &pull_partners)
-}
-
-fn entry_has_all_pull_partner_ids(entry: &KvEntry, pull_partners: &[String]) -> bool {
-    entry.consent.ok
-        && pull_partners
-            .iter()
-            .all(|source_domain| entry.ids.contains_key(source_domain))
 }
 
 fn set_marker(
@@ -656,20 +642,5 @@ mod tests {
             "ts-ec-pull-complete=value; Path=/; Secure; SameSite=Lax; Max-Age=3600; HttpOnly"
         );
         assert!(!cookie.contains("Domain="), "marker should be host-only");
-    }
-
-    #[test]
-    fn completeness_requires_all_pull_partner_ids() {
-        let (_, registry) = settings_and_registry(&["a.example.com", "b.example.com"]);
-        let mut entry = KvEntry::minimal("a.example.com", "uid-a", 1_000);
-        assert!(!entry_is_pull_complete(&entry, &registry));
-
-        entry.ids.insert(
-            "b.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "uid-b".to_owned(),
-            },
-        );
-        assert!(entry_is_pull_complete(&entry, &registry));
     }
 }
