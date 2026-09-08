@@ -403,7 +403,7 @@ describe('installTsAdInit', () => {
     );
   });
 
-  it('forwards SPA auction classification without inventing a winner', async () => {
+  it('does not infer an SPA auction from navigation generation alone', async () => {
     const recordTrustedServerOpportunity = vi.fn();
     const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
     (window as TestWindow).tsjs!.navGeneration = 1;
@@ -417,8 +417,7 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      undefined,
-      { auctionType: 'trusted_server' }
+      undefined
     );
   });
 

@@ -2477,6 +2477,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.removeAdUnit = mockRemoveAdUnit;
     delete (mockPbjs as unknown as Record<string, unknown>).__tsRemoveAdUnitWrapped;
+    delete (mockPbjs as unknown as Record<string, unknown>).__tsDiagnosticsBidWonInstalled;
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
@@ -2559,6 +2560,80 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     testWindow.tsjs = { gptDiagnosticsRecorder: { recordPrebidRefresh } };
     return recordPrebidRefresh;
   }
+
+  it('leaves Prebid auction identity and event listeners unchanged when diagnostics is inactive', () => {
+    const getTargeting = vi.fn(() => []);
+    const slot = {
+      getSlotElementId: () => 'example-inactive-slot',
+      getTargeting,
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    mockPbjs.setTargetingForGPTAsync = vi.fn();
+    mockRequestBids.mockImplementation((opts) => {
+      opts.bidsBackHandler?.({}, false, 'example-inactive-auction');
+    });
+
+    pubads.refresh([slot]);
+
+    const request = mockRequestBids.mock.calls[0][0];
+    expect(request).not.toHaveProperty('auctionId');
+    expect(mockOnEvent).not.toHaveBeenCalledWith('bidWon', expect.any(Function));
+    expect(getTargeting).not.toHaveBeenCalledWith('hb_bidder');
+    expect(getTargeting).not.toHaveBeenCalledWith('hb_pb');
+    expect(getTargeting).not.toHaveBeenCalledWith('hb_cur');
+  });
+
+  it('records completed client auction evidence only for the exact Prebid attempt', () => {
+    const slot = {
+      getSlotElementId: () => 'example-client-slot',
+      getTargeting: (key: string) =>
+        key === 'hb_bidder' ? ['example-client'] : key === 'hb_pb' ? ['2.40'] : [],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = vi.fn();
+    const recordPrebidAuction = vi.fn();
+    const recordPrebidWin = vi.fn();
+    testWindow.tsjs = {
+      gptDiagnosticsRecorder: {
+        recordPrebidRefresh,
+        recordPrebidAuction,
+        recordPrebidWin,
+      },
+    };
+    const { pubads } = installGpt([slot]);
+    mockPbjs.setTargetingForGPTAsync = vi.fn();
+    mockRequestBids.mockImplementation((opts) => {
+      opts.bidsBackHandler?.({}, false, 'example-client-auction');
+    });
+
+    pubads.refresh([slot]);
+
+    expect(mockRequestBids.mock.calls[0][0]).not.toHaveProperty('auctionId');
+    expect(mockOnEvent).toHaveBeenCalledWith('bidWon', expect.any(Function));
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidAuction).toHaveBeenCalledWith(slot, 'example-client-auction', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+    const bidWon = mockOnEvent.mock.calls.find(([event]) => event === 'bidWon')?.[1];
+    expect(bidWon).toBeTypeOf('function');
+    bidWon?.({
+      auctionId: 'other-auction',
+      adUnitCode: 'example-client-slot',
+      adserverTargeting: { hb_bidder: 'wrong-client', hb_pb: '9.99' },
+    });
+    expect(recordPrebidWin).not.toHaveBeenCalled();
+    bidWon?.({
+      auctionId: 'example-client-auction',
+      adUnitCode: 'example-client-slot',
+      adserverTargeting: { hb_bidder: 'example-client', hb_pb: '2.40' },
+    });
+    expect(recordPrebidWin).toHaveBeenCalledWith(slot, 'example-client-auction', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+  });
 
   it('records a publisher delivery refresh immediately before its GPT request', () => {
     const slot = {
@@ -3955,11 +4030,16 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     }
   });
 
-  it('completes a synthetic refresh when targeting throws', () => {
+  it('completes a synthetic refresh without recording auction evidence when targeting throws', () => {
     const slot = {
       getSlotElementId: () => 'example-throwing-targeting',
       getTargeting: () => [],
       clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = vi.fn();
+    const recordPrebidAuction = vi.fn();
+    testWindow.tsjs = {
+      gptDiagnosticsRecorder: { recordPrebidRefresh, recordPrebidAuction },
     };
     const { originalRefresh, pubads } = installGpt([slot]);
     mockPbjs.setTargetingForGPTAsync = vi.fn(() => {
@@ -3970,6 +4050,8 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
 
     pubads.refresh([slot]);
 
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidAuction).not.toHaveBeenCalled();
     expect(originalRefresh).toHaveBeenCalledTimes(1);
     expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
   });

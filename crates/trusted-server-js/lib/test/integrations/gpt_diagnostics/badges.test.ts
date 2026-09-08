@@ -116,6 +116,42 @@ describe('GptDiagnosticsBadgeManager', () => {
     manager.destroy();
   });
 
+  it('renders an accessible request-scoped control and activates its exact request', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const element = document.createElement('div');
+    document.body.append(element);
+    vi.spyOn(element, 'getBoundingClientRect').mockReturnValue(rectangle(10, 100, 300, 250));
+    const observedSlot = slot('accessible');
+    store.recordSlotRequested(observedSlot);
+    store.recordSlotRequested(observedSlot);
+    bindings.set(1, { status: 'bound' }, element, true);
+    const activate = vi.fn();
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+      onActivate: activate,
+    });
+    manager.setLayer(layer);
+    runFrame(frames);
+
+    const badge = layer.querySelector<HTMLButtonElement>('.tsgd-badge');
+    expect(badge).toBeInstanceOf(HTMLButtonElement);
+    expect(badge?.textContent).toContain('Ad #1 · Request #2');
+    expect(badge?.getAttribute('aria-label')).toContain('Ad #1, Request #2');
+    badge?.click();
+    expect(activate).toHaveBeenCalledWith(1, 2);
+
+    const highlight = document.createElement('div');
+    highlight.className = 'tsgd-highlight';
+    layer.append(highlight);
+    manager.update();
+    expect(layer.querySelector('.tsgd-highlight')).toBe(highlight);
+    manager.destroy();
+  });
+
   it('labels the delivery state the store derived rather than raw timestamps', () => {
     // The store owns the delivery ladder; a badge that re-derived it from these
     // timestamps could contradict the panel and the export.

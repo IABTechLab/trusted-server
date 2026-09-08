@@ -3148,10 +3148,6 @@ impl BrowserAuctionDiagnostics {
     }
 }
 
-fn elapsed_millis(started: &web_time::Instant) -> u32 {
-    started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct AdBidsState {
     /// Rendered bids `<script>`. Shared with the HTML processor's `</body>` handler,
@@ -6545,6 +6541,14 @@ pub async fn handle_page_bids(
     ec_context: &EcContext,
     mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    // Adapters install the request-scoped collector before routing. Focused
+    // direct-handler tests fall back to a collector whose T0 is this entry seam.
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
+
     // Adapter fallbacks prepare this before routing. Keep this idempotent call as
     // a direct-handler safety net and retain the session decision after the
     // private activation cookie is stripped.
@@ -6744,29 +6748,24 @@ pub async fn handle_page_bids(
                 provider_responses: None,
                 services,
             };
-            let timing_started = web_time::Instant::now();
-            let auction_dispatched_ms = elapsed_millis(&timing_started);
-            let result = auction
+            match auction
                 .orchestrator
-                .run_auction(&auction_request, &auction_context)
-                .await;
-            let auction_resolved_ms = elapsed_millis(&timing_started);
-            match result {
-                Ok(result) => {
-                    // A successful result proves at least one pending or immediate
-                    // provider outcome. Failures can occur before any request leaves
-                    // the edge, so they must not fabricate dispatch timing evidence.
-                    if gpt_diagnostics.browser_session_active() {
-                        auction_diagnostics = Some(BrowserAuctionDiagnostics {
-                            auction_dispatched_ms: Some(auction_dispatched_ms),
-                            auction_resolved_ms: Some(auction_resolved_ms),
-                            auction_committed_ms: None,
-                            auction_wait_ms: Some(
-                                auction_resolved_ms.saturating_sub(auction_dispatched_ms),
-                            ),
-                            auction_wait_placement: Some("pre_header"),
-                        });
-                    }
+                .dispatch_auction(&auction_request, &auction_context)
+                .await
+            {
+                DispatchAuctionOutcome::Dispatched(dispatched) => {
+                    timings.mark_auction_dispatched(observation.auction_id.to_string());
+                    let wait_started = web_time::Instant::now();
+                    let result = auction
+                        .orchestrator
+                        .collect_dispatched_auction(dispatched, services, &auction_context)
+                        .await;
+                    timings.record_auction_wait(
+                        AuctionWaitPlacement::PreHeader,
+                        wait_started.elapsed(),
+                    );
+                    timings.mark_auction_resolved();
+
                     let winning_bids = result.winning_bids.clone();
                     let auction_id = diagnostics_auction_id(settings);
                     let bid_map = build_bid_map_with_auction_id(
@@ -6777,8 +6776,10 @@ pub async fn handle_page_bids(
                         settings.debug.inject_adm_for_testing,
                         auction_id.as_deref(),
                     );
-                    if let Some(diagnostics) = auction_diagnostics.as_mut() {
-                        diagnostics.auction_committed_ms = Some(elapsed_millis(&timing_started));
+                    timings.mark_auction_committed();
+                    if gpt_diagnostics.browser_session_active() {
+                        auction_diagnostics =
+                            BrowserAuctionDiagnostics::from_request_timings(&timings);
                     }
                     let delivered_winner_slots = bid_map.keys().cloned().collect();
                     emit_auction_events_best_effort_lazy(services, || {
@@ -6794,16 +6795,34 @@ pub async fn handle_page_bids(
                     .await;
                     (winning_bids, Some(bid_map))
                 }
-                Err(e) => {
-                    log::warn!("page-bids auction failed: {e:?}");
+                DispatchAuctionOutcome::DispatchFailed {
+                    request,
+                    provider_responses,
+                    elapsed_ms,
+                } => {
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::DispatchFailed {
+                                request: &request,
+                                provider_responses: &provider_responses,
+                                reason: "dispatch_failed",
+                                elapsed_ms,
+                            },
+                        )
+                    })
+                    .await;
+                    (std::collections::HashMap::new(), None)
+                }
+                DispatchAuctionOutcome::NotStarted => {
                     let elapsed_ms = observation.elapsed_ms();
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
                             observation,
-                            AuctionTerminalOutcome::ExecutionFailed {
-                                request: Some(&auction_request),
+                            AuctionTerminalOutcome::DispatchFailed {
+                                request: &auction_request,
                                 provider_responses: &[],
-                                reason: "execution_failed",
+                                reason: "no_provider_dispatched",
                                 elapsed_ms,
                             },
                         )
@@ -20192,6 +20211,15 @@ mod tests {
                 },
             );
 
+            let mut winning_page_bids_request =
+                make_active_page_bids_request("/2024/01/my-article/");
+            winning_page_bids_request
+                .extensions_mut()
+                .insert(RequestTimings::new());
+            let preparation_delay = web_time::Instant::now();
+            while preparation_delay.elapsed() < std::time::Duration::from_millis(2) {
+                core::hint::spin_loop();
+            }
             let winning_response = handle_page_bids(
                 &settings,
                 &winning_services,
@@ -20202,7 +20230,7 @@ mod tests {
                     registry: None,
                 },
                 &ec_context,
-                make_active_page_bids_request("/2024/01/my-article/"),
+                winning_page_bids_request,
             )
             .await
             .expect("should return winning page-bids response");
@@ -20245,6 +20273,12 @@ mod tests {
                 );
             }
             assert_eq!(auction_diagnostics["auctionWaitPlacement"], "pre_header");
+            assert!(
+                auction_diagnostics["auctionDispatchedMs"]
+                    .as_u64()
+                    .is_some_and(|offset| offset > 0),
+                "request-relative dispatch should include pre-handler preparation delay"
+            );
             assert!(
                 winning_auction_id.starts_with("ts-auc-"),
                 "page-bids should expose a freshly minted diagnostics token, got `{winning_auction_id}`"
