@@ -125,20 +125,21 @@ capture, not a permanent final SHA.
 
 | Implementation PR                                      | Target      | Audited base                               | Captured remote head                       | Capture time         | State       |
 | ------------------------------------------------------ | ----------- | ------------------------------------------ | ------------------------------------------ | -------------------- | ----------- |
-| https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | `01bf84a4beb4a1be4f26965478a0211f59392962` | 2026-09-01T07:35:08Z | OPEN, draft |
+| https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | 2026-09-08T15:56:32Z | OPEN, draft |
 
 ### PR #1049 metadata capture
 
-- Capture timestamp: 2026-09-01T07:35:08Z.
+- Capture timestamp: 2026-09-08T15:56:32Z.
 - URL: https://github.com/IABTechLab/trusted-server/pull/1049.
 - State: OPEN, draft.
 - Base: ref `rc/202608`, SHA
   `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
 - Remote head: ref `spec-docs-refresh`, captured SHA
-  `01bf84a4beb4a1be4f26965478a0211f59392962`.
+  `bbfd078b4f4d04eeba39560dc485bf72993ccc60`.
 
-This capture does not assert the eventual final head. Refresh it after package
-commits are pushed and before using PR #1049 as a hosted validation input.
+This is the final pre-record implementation checkpoint. The acceptance-record
+commit necessarily advances the PR head; PR #1049's bounded final-acceptance
+region records and validates that exact later head.
 
 ### Superseded reviewed source
 
@@ -164,7 +165,7 @@ ledger's durable hashed-body contract.
 Local builds, CI simulations, mocked API responses, and fixture output cannot
 complete any release-pending row.
 
-Before Task 17 commits, it must replace every applicable pending owner with a
-named owner and every applicable pending destination with the authoritative
-external capture or comment location. If optional protection is not selected,
-Task 17 records that disposition instead of fabricating an owner or URL.
+Task 17 replaced every applicable pending owner with `aram356` and every
+applicable pending destination with a new append-only PR #1049 comment under
+the durable capture contract. Optional protection was not selected, so it has
+no fabricated owner or destination.

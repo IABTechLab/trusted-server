@@ -1,8 +1,8 @@
 version = 1
 reviewed = true
 repository = "IABTechLab/trusted-server"
-source_sha = "b8b6e22a5864b5e8693392cd1d7fd76d8b9502b6"
-run_id = 34198747383
+source_sha = "bbfd078b4f4d04eeba39560dc485bf72993ccc60"
+run_id = 34245970937
 run_attempt = 1
 
 [[captures]]
@@ -67,7 +67,7 @@ blob = "0e2b513715b6f6e83a0e9788fffb90b0ce4d304f"
 
 [[sources]]
 path = "crates/trusted-server-cli/src/commands/audit/browser.rs"
-blob = "a4c0514a6c846b00103f910aeec3ed39a81f1cfb"
+blob = "d2a94208b36dd465829d278ab935594aff3a85fa"
 
 [[sources]]
 path = "crates/trusted-server-cli/src/commands/audit/browser_scroll.rs"
@@ -87,7 +87,7 @@ blob = "f83f400885f91e23549553892ecb3cb4dcfc1ecd"
 
 [[sources]]
 path = "crates/trusted-server-cli/src/commands/audit/generate/browser_collector.rs"
-blob = "fe6b12470c0f8d045f019c0ea66f82895e0ca31f"
+blob = "a6727dcb9d3f637dc74ab819bef4ef597a0faa7c"
 
 [[sources]]
 path = "crates/trusted-server-cli/src/commands/audit/generate/collector.rs"

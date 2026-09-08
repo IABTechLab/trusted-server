@@ -211,18 +211,19 @@ of the named observation only, not a permanent final SHA.
 
 | Implementation PR                                      | Target      | Audited base                               | Captured remote head                       | Capture time         | State       |
 | ------------------------------------------------------ | ----------- | ------------------------------------------ | ------------------------------------------ | -------------------- | ----------- |
-| https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | `01bf84a4beb4a1be4f26965478a0211f59392962` | 2026-09-01T07:35:08Z | OPEN, draft |
+| https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | 2026-09-08T15:56:32Z | OPEN, draft |
 
 #### PR #1049 live metadata capture
 
-- Capture timestamp: 2026-09-01T07:35:08Z.
+- Capture timestamp: 2026-09-08T15:56:32Z.
 - Command:
   `gh pr view 1049 --json url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid`.
 - Result:
-  `{"baseRefName":"rc/202608","baseRefOid":"07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf","headRefName":"spec-docs-refresh","headRefOid":"01bf84a4beb4a1be4f26965478a0211f59392962","isDraft":true,"state":"OPEN","url":"https://github.com/IABTechLab/trusted-server/pull/1049"}`.
+  `{"baseRefName":"rc/202608","baseRefOid":"07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf","headRefName":"spec-docs-refresh","headRefOid":"bbfd078b4f4d04eeba39560dc485bf72993ccc60","isDraft":true,"state":"OPEN","url":"https://github.com/IABTechLab/trusted-server/pull/1049"}`.
 
-Refresh this capture after package commits are pushed and before using PR #1049
-as a hosted validation input.
+This is the final pre-record implementation checkpoint. The acceptance-record
+commit necessarily advances the PR head; the bounded final-acceptance region
+in PR #1049 records and validates that exact later head.
 
 ### Superseded reviewed source PR
 
@@ -250,10 +251,10 @@ API output cannot complete a row.
 | Dependency submission/graph | Authenticated `main` SHA; submission request and response; 201 result; detector/correlator; graph API body; triage owner and SLA           | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
 | Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies, and planted-failure block                          | Not selected; no owner unless maintainers opt in | No capture destination unless maintainers opt in                    | `release-pending`, optional |
 
-Before Task 17 commits, it must replace every applicable pending owner with a
-named owner and every applicable pending destination with the authoritative
-external capture or comment location. If optional protection is not selected,
-Task 17 records that disposition instead of fabricating an owner or URL.
+Task 17 replaced every applicable pending owner with `aram356` and every
+applicable pending destination with a new append-only PR #1049 comment under
+the durable capture contract. Optional protection was not selected, so it has
+no fabricated owner or destination.
 
 ### First-success adapter smokes
 
@@ -270,14 +271,14 @@ Each generator records its command, first-run changed paths, second-run exit
 status, and exact clean-diff assertion. “Generated” without a second-run
 no-diff proof is incomplete.
 
-| Generator / region            | Source SHA | First-run output | Second-run command | Clean-diff assertion | Result  |
-| ----------------------------- | ---------- | ---------------- | ------------------ | -------------------- | ------- |
-| Tracked/source classification | Pending    | Pending          | Pending            | Pending              | Pending |
-| Settings reference            | Pending    | Pending          | Pending            | Pending              | Pending |
-| Route/API reference           | Pending    | Pending          | Pending            | Pending              | Pending |
-| Integration/support matrix    | Pending    | Pending          | Pending            | Pending              | Pending |
-| CLI help goldens              | Pending    | Pending          | Pending            | Pending              | Pending |
-| Gate consumers                | Pending    | Pending          | Pending            | Pending              | Pending |
+| Generator / region            | Source SHA                                 | First-run output                                                                                                           | Second-run command                                                                                      | Clean-diff assertion                                                                                      | Result |
+| ----------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------ |
+| Tracked/source classification | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | `maintained-sources.toml` only: four reviewed workflow comments plus deterministic selector movement                       | `cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --update`                           | Second candidate was byte-identical; `classify --check` exited 0                                          | Pass   |
+| Settings reference            | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | No paths changed                                                                                                           | `cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --update`                           | Second update changed no paths; `generate --check` exited 0                                               | Pass   |
+| Route/API reference           | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | No paths changed                                                                                                           | `cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --update`                           | Second update changed no paths; route equality passed in `check --all`                                    | Pass   |
+| Integration/support matrix    | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | No paths changed                                                                                                           | `cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --update`                           | Second update changed no paths; integration equality passed in `check --all`                              | Pass   |
+| CLI help goldens              | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | Authenticated run `34245970937`; help goldens unchanged; capture SHA/run and two changed CLI-source blob records refreshed | `cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help import-hosted --run-id 34245970937` | Both imports produced manifest SHA-256 `fb51762ee6aba92240e0d4544065a9efb00ef8a3ccd5ba81830912237fb7a581` | Pass   |
+| Gate consumers                | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | No paths changed in `CLAUDE.md`, `AGENTS.md`, `TESTING.md`, or `docs/guide/testing.md`                                     | `cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --update`; then `generate --check`  | Second update and check changed no consumer bytes                                                         | Pass   |
 
 ### Exceptions and waivers
 
@@ -3757,7 +3758,7 @@ fallback warning.
 
 #### Task 16 — Complete WP7 rustdoc and JSDoc
 
-In progress. The warning-denied baseline produced 31 broken or private
+Is complete. The warning-denied baseline produced 31 broken or private
 intra-doc links: 24 in the combined core/JS/OpenRTB target, three in Fastly,
 two in Spin, and two in the host CLI target. Cloudflare and Axum passed. Native
 core doctests passed (four run and four ignored). JavaScript lint passed before
@@ -3930,6 +3931,95 @@ hosted run is retained as negative evidence and is not the capture source.
 
 #### Task 18 — Close PR #1049 implementation
 
-Pending. Record the exact final rc baseline, full local and hosted gates,
-generated no-diff, smokes, follow-up dispositions, clean package shape, final
-PR head, and implementation approval without claiming release-pending effects.
+The final pre-record implementation checkpoint is
+`bbfd078b4f4d04eeba39560dc485bf72993ccc60`. A fresh fetch at
+`2026-09-08T15:56:32Z` proved that `origin/rc/202608` still equals immutable
+target `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, that the target is an
+ancestor of the checkpoint, and that `origin/spec-docs-refresh` equals the
+checkpoint. GitHub reported PR #1049 open and draft from
+`spec-docs-refresh` to that exact rc SHA. The only pre-record worktree changes
+were this ledger and the authenticated CLI-capture manifest. The root
+`Cargo.lock` SHA-256 remained
+`9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`;
+the independent docs-parity lock remained
+`234a21b4831ec92fca081bc389dad6bdff1bc18d3a715f41831e2067a95e2ffb`.
+
+The complete local acceptance matrix passed on 2026-09-08. Tool versions were
+Rust/Cargo 1.95.0 on `aarch64-apple-darwin`, Node 24.12.0, npm 11.6.2,
+Fastly CLI 16.0.0, Viceroy 0.21.0, and Spin 4.1.0. Workspace formatting and
+all seven adapter/host Clippy commands passed; measured Clippy durations were
+268.13 seconds for Fastly, 224.55 for Axum, 119.08 for Cloudflare native,
+83.36 for Cloudflare WASM, 18.29 for Spin native, 89.82 for Spin WASM, 21.08
+for the final native CLI rerun, and 1.44 for OpenRTB codegen. All six Task 16
+warning-denied rustdoc commands and native core doctests passed. Fastly ran
+175 adapter, 2,425 core, two JavaScript, and 21 OpenRTB tests; Axum ran 15
+library, one binary, and 27 route tests; Cloudflare ran 23 library and 23 route
+tests; Spin ran 50 library and 38 route tests. The 13 cross-adapter parity,
+documentation-snippet, seven codegen, four adapter-smoke, and exact CLI suites
+passed. Fastly and Spin release WASM builds passed in 233.50 and 225.90
+seconds. The JavaScript package passed clean install, lint, 45 files/949 tests
+with type checking, format, and all 13 builds. The docs package passed clean
+install, lint, format, and production build with only the accepted `vcl`
+grammar fallback.
+
+The docs-parity package passed format, warnings-denied Clippy, all tests, and
+the real-repository `check --all`. Its one full invocation passed 38 library,
+35 classification, 26 CLI, 13 CLI-help, four dependency, six gate, 33
+integration, two JSDoc, 62 link, 11 Markdown, two README, 70 route, 73 scanner,
+24 settings, five snippet, and five workflow tests. The exact route, settings,
+integration, source-classification, retired-identifier, privacy, README,
+JSDoc, rustdoc, snippet, Pages/CNAME artifact, and generated-consumer checks
+therefore passed. The generated-diff table above records the two-run no-diff
+proofs. First-success adapter smokes and all follow-up issue dispositions are
+recorded in their authoritative tables; the four post-`main` operations remain
+explicitly `release-pending`.
+
+Browser-fixture validation found two platform constraints and retained them as
+negative evidence rather than weakening coverage. Hosted macOS could not
+finish Chrome page setup even with bounded 30-second setup operations, so its
+blocking CLI job now owns macOS-only native coverage without browser fixtures.
+Hosted Ubuntu's downloaded Chrome reported that its sandbox could not use the
+runner's disabled user namespace. The final correction permits `--no-sandbox`
+only in a `cfg(test)` build when both fixture-specific environment flags equal
+`1`; production CLI builds cannot select it. The Ubuntu Axum job owns the full
+`./scripts/test-cli.sh` browser suite with pinned Chrome.
+
+[Run Tests 34245970937](https://github.com/IABTechLab/trusted-server/actions/runs/34245970937),
+attempt 1, completed successfully at the exact checkpoint. Its decisive
+[Ubuntu job 102127909676](https://github.com/IABTechLab/trusted-server/actions/runs/34245970937/job/102127909676)
+passed in 8 minutes 8 seconds, including the full CLI/browser suite. The
+[macOS native CLI job 102127909728](https://github.com/IABTechLab/trusted-server/actions/runs/34245970937/job/102127909728)
+passed in 1 minute 35 seconds. Capture jobs
+[Linux 102127909530](https://github.com/IABTechLab/trusted-server/actions/runs/34245970937/job/102127909530)
+and
+[macOS 102127909861](https://github.com/IABTechLab/trusted-server/actions/runs/34245970937/job/102127909861)
+passed in 2 minutes 47 seconds and 4 minutes 52 seconds. Linux artifact
+`10064098001` was 32,788 transport bytes with digest
+`sha256:295d8558efb2e45be3799858a619f83b3b0a441b41ec7f6f048a5259b33bedfe`;
+macOS artifact `10064186071` was 36,299 bytes with digest
+`sha256:7be275c7db7a546b0676109bbf640e74b1a496c281433839f4e37cfc074ca071`.
+Two authenticated imports retained Linux help SHA-256
+`d1cae561a509fac817befdca1ba733a2582dba87d322cf4c2efccce9729a6786`,
+macOS help SHA-256
+`cecd3a524ff6c50459b446dfe95980be0cdb037e1934ea0ab2a389aa6472f450`,
+and identical capture-manifest SHA-256
+`fb51762ee6aba92240e0d4544065a9efb00ef8a3ccd5ba81830912237fb7a581`.
+
+The base-to-checkpoint review contains 100 unsquashed package commits and 259
+paths: 139,799 insertions and 3,307 deletions. The path review found no
+unrelated runtime feature. Runtime-adjacent changes are the documented narrow
+test seams and browser operation bounds required to exercise existing
+behavior; the only sandbox bypass is fixture-only as described above. Public
+onboarding was intentionally moved to `docs/internal/onboarding.md` as part of
+the approved containment package, while the public guide was substantively
+rewritten and expanded across configuration, routes, integrations, all four
+adapters, testing, telemetry, TSJS, architecture, and deployment. This is a
+documentation refresh plus deterministic parity enforcement, not a
+tooling-only change.
+
+The acceptance-record commit necessarily advances the checkpoint using only
+records and generated manifest selectors. PR #1049's bounded
+`docs-refresh:final-acceptance` region records that exact final head, the final
+hosted checks and app identities, and the preserved Appendix B and adapter
+smoke regions. No rc result is represented as a live deployment, first
+schedule, dependency submission, graph receipt, or `main` protection change.

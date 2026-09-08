@@ -91,7 +91,7 @@ Composite parser, scanner, workflow, settings, route, and smoke tasks are packag
 - Modify: `docs/internal/audits/documentation-refresh-decisions.md`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [ ] **Step 1: Revalidate PR #1049 and the immutable target**
+- [x] **Step 1: Revalidate PR #1049 and the immutable target**
 
 Run:
 
@@ -104,19 +104,19 @@ gh pr view 1049 --json url,state,isDraft,baseRefName,baseRefOid,headRefName,head
 
 Expected: exact target SHA, ancestry success, and PR #1049 open from `spec-docs-refresh` to `rc/202608`. Record the current remote head as a timestamped capture, not as a permanent final SHA.
 
-- [ ] **Step 2: Replace obsolete delivery records**
+- [x] **Step 2: Replace obsolete delivery records**
 
 Make #1049 the only implementation row. Record PR #1104 as closed/superseded with its two reviewed source commits and no live merge/deploy receipt. Remove executable fields for PRs (b), (c), (d), (c2), and (e), all Epoch terminology, temporary protection/status changes, snapshot retirement, and cross-worktree import blocks.
 
-- [ ] **Step 3: Define release-pending evidence**
+- [x] **Step 3: Define release-pending evidence**
 
 Keep the durable hashed-body schema, but use it only for real external captures. Add explicit `release-pending` rows for Pages/CNAME, first schedule, dependency submission/graph, and optional `main` protection. State that local/fixture output cannot complete those rows.
 
-- [ ] **Step 4: Mark the reviewed spec executable**
+- [x] **Step 4: Mark the reviewed spec executable**
 
 Change the spec status to approved for implementation and record the written-spec approval date and owner. Do not change WP scope.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run `cd docs && npm run format && npm run lint && npm run build`, remove only generated VitePress temp output, then run `git diff --check`.
 
@@ -137,11 +137,11 @@ git commit -m "Align documentation refresh records to one PR"
 - Create: `docs/internal/onboarding.md`
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [ ] **Step 1: Authenticate the closed source PR and commits**
+- [x] **Step 1: Authenticate the closed source PR and commits**
 
 Require PR #1104 closed, base `d516a9e94249e10cbc36e41beb4269f9255cf407`, and source commits `34b0613dc603ba6529396dad4dd4b7e68b1e11a9` and `e6554f24f58f6122fb806ce25432f66033765c65`. Verify their combined base-to-head path set is exactly the four paths above.
 
-- [ ] **Step 2: Transfer the two commits**
+- [x] **Step 2: Transfer the two commits**
 
 Cherry-pick the commits in order. Any conflict outside the four authorized paths stops execution. Resolve an authorized-path conflict only by preserving the reviewed containment behavior on the rc version; record the conflict and resulting blob comparison.
 
@@ -152,11 +152,11 @@ git cherry-pick e6554f24f58f6122fb806ce25432f66033765c65
 
 Expected commit subjects: `Contain internal documentation pages` and `Fix internal onboarding links`.
 
-- [ ] **Step 3: Reprove containment on rc**
+- [x] **Step 3: Reprove containment on rc**
 
 Run `cd docs && npm ci && npm run lint && npm run format && npm run build`. Assert no output for the six excluded families, required Home/Guide/API artifacts with expected content, no excluded hrefs, and every repository-relative onboarding target exists.
 
-- [ ] **Step 4: Record the transfer**
+- [x] **Step 4: Record the transfer**
 
 Append source PR URL/state, source base/head, original and resulting commit SHAs, exact path set, commands, and local-only status. Commit only the evidence ledger:
 
@@ -185,11 +185,11 @@ git commit -m "Record documentation containment transfer"
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 - Modify: `docs/internal/audits/documentation-refresh-decisions.md`
 
-- [ ] **Step 1: Add failing policy assertions**
+- [x] **Step 1: Add failing policy assertions**
 
 Prove the banner, package privacy/license, empty authors, fixture labels, KV comments, canonical gate link, generated AGENTS region, exception taxonomy, and CNAME deletion are absent or stale.
 
-- [ ] **Step 2: Delete the selected CNAME**
+- [x] **Step 2: Delete the selected CNAME**
 
 Remove `docs/public/CNAME` and retain `base: '/trusted-server'`. Assert no tracked placeholder remains and build assets use the project path. Commit the exact deletion:
 
@@ -199,15 +199,15 @@ git diff --cached --check
 git commit -m "Resolve documentation site domain"
 ```
 
-- [ ] **Step 3: Apply policy and hygiene edits**
+- [x] **Step 3: Apply policy and hygiene edits**
 
 Add the unverified marketing banner; scrub `fastly.toml` while preserving only the expiring service-ID record; set docs package private/Apache-2.0 and refresh lock metadata; add the typed exception taxonomy to CLAUDE; make command files and PR template link-only; generate the AGENTS fallback region.
 
-- [ ] **Step 4: Prove privacy and policy state**
+- [x] **Step 4: Prove privacy and policy state**
 
 Search all tracked files for removed contacts, handles, channels, access phrases, placeholder CNAME, and prohibited exception shapes. Expected: no match outside a typed, unexpired decision entry.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run `cd docs && npm ci && npm run lint && npm run format && npm run build`, exact included/excluded artifact assertions, `git diff --check`, and the package checkpoint checks. Record live Pages/CNAME as release-pending.
 
@@ -229,19 +229,19 @@ git commit -m "Clean documentation publishing policy"
 - Create: `tools/docs-parity/src/repository.rs`
 - Create/Test: `tools/docs-parity/tests/cli.rs`
 
-- [ ] **Step 1: Write the failing CLI contract tests**
+- [x] **Step 1: Write the failing CLI contract tests**
 
 Cover repository-root discovery from nested directories, `--help`, unknown subcommands, check-vs-update exit codes, paths outside the repository, unsafe relative paths, atomic-update interruption, and stable ordering. Expect the binary to be absent.
 
-- [ ] **Step 2: Create the independent Cargo root**
+- [x] **Step 2: Create the independent Cargo root**
 
 Add `[workspace]`, package metadata, the repository's lint policy, `error-stack` error flow, and only the dependencies required by the checked formats. Do not add the tool to root `workspace.members`.
 
-- [ ] **Step 3: Implement the minimal shared model and repository boundary**
+- [x] **Step 3: Implement the minimal shared model and repository boundary**
 
 The model must make ownership and expiry structurally mandatory where the spec requires them. Repository APIs accept normalized relative paths, reject symlink escapes/unsafe modes, enumerate Git-tracked paths, and write generated files atomically.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 ```bash
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli
@@ -251,7 +251,7 @@ cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D wa
 
 Expected: all pass, `tools/docs-parity/Cargo.lock` exists, and root `Cargo.lock` is unchanged.
 
-- [ ] **Step 5: Document the update/check contract and commit the foundation**
+- [x] **Step 5: Document the update/check contract and commit the foundation**
 
 ```bash
 git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/tests/cli.rs docs/internal/audits/documentation-refresh-evidence.md
@@ -278,27 +278,27 @@ git commit -m "Add documentation parity tool foundation"
 - Create/Test: `tools/docs-parity/tests/scanner.rs`
 - Modify: `tools/docs-parity/README.md`
 
-- [ ] **Step 1: Write exhaustive-classification failures**
+- [x] **Step 1: Write exhaustive-classification failures**
 
 Add synthesized repositories proving each of these fails: an unknown text extension, an unknown binary, invalid UTF-8 in an expected-text file, oversized expected text, a new Dockerfile, a `.mjs` file, a `.proto` file, a human-facing comment outside an existing selector, a comment syntax without an extractor, a symlink escape, and an unclassified extracted comment span.
 
-- [ ] **Step 2: Implement the checked classification contract**
+- [x] **Step 2: Implement the checked classification contract**
 
 Start from `git ls-files -z`; classify every path as text or binary without treating content sniffing as the authority. Require each text path to have a whole-file include/exclude or comment-region selector and each extracted comment span to have a disposition. Fail closed on new paths, selectors, or comment syntaxes.
 
-- [ ] **Step 3: Write scanner detector and allowlist tests**
+- [x] **Step 3: Write scanner detector and allowlist tests**
 
 For domain, email, credential shape, service ID, encoded token, binary strings, lockfile structured fields, media metadata, and identifier/access-phrase denylist, add both a positive fixture and an owner/rationale/expiry allowlisted fixture. Prove expired entries, stale hashes, renamed files, and broad domain exemptions fail. Encode the `fastly.toml` exception expiry as `2026-09-30T00:00:00Z`; check mode must fail at or after that instant. Renewal requires a reviewed, committed replacement before expiry and is independent of the ops migration deadline.
 
-- [ ] **Step 4: Implement deterministic scanning**
+- [x] **Step 4: Implement deterministic scanning**
 
 Scan all tracked files. Parse lockfile source/registry/URL fields structurally, inspect binary strings and media metadata, and support only the five typed exception classes approved in WP1. Report semantic sensitivity outside detector classes as a required human disposition, not as a scanner guarantee.
 
-- [ ] **Step 5: Bootstrap and review the real manifests**
+- [x] **Step 5: Bootstrap and review the real manifests**
 
 Generate candidate entries, then manually disposition every path and comment span. Seed the identifier denylist from the WP1/WP2 removals. Record the `fastly.toml` exception owner/date from Task 1; do not enable check mode if that entry is incomplete.
 
-- [ ] **Step 6: Run the negative matrix and real scan**
+- [x] **Step 6: Run the negative matrix and real scan**
 
 Add each scanner/classification dependency only in the standalone manifest and
 regenerate its lockfile. Require `git diff --quiet -- Cargo.lock` so the root
@@ -315,7 +315,7 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
 
 Expected: synthesized violations fail for the intended diagnostic; the repository scan passes only with typed, unexpired entries.
 
-- [ ] **Step 7: Commit the closed universe**
+- [x] **Step 7: Commit the closed universe**
 
 ```bash
 git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/classification.rs tools/docs-parity/src/scanner.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/retired-identifiers.toml tools/docs-parity/tests/classification.rs tools/docs-parity/tests/scanner.rs docs/internal/audits/documentation-refresh-evidence.md
@@ -347,7 +347,7 @@ git commit -m "Enforce documentation source classification"
 - Create/Test: `tools/docs-parity/tests/links.rs`
 - Create/Test: `tools/docs-parity/tests/markdown.rs`
 
-- [ ] **Step 1: Write generated-region failure tests**
+- [x] **Step 1: Write generated-region failure tests**
 
 Cover duplicate/missing markers, unknown record names, hand-edited output,
 unstable ordering, update mode changing bytes outside markers, interrupted
@@ -356,7 +356,7 @@ documented final-syscall window, restrictive-umask mode preservation, unique
 owned-stage cleanup, untouched peer stages, and a second update producing no
 diff.
 
-- [ ] **Step 2: Implement deterministic region updates**
+- [x] **Step 2: Implement deterministic region updates**
 
 Require named start/end markers, render from typed records, compare expected
 bytes and file identity immediately before a portable atomic rename, and make
@@ -367,7 +367,7 @@ after unique-stage creation, fsync the staged file and parent, and clean only
 owned stages. Manual endpoint prose must carry ownership markers that are
 separately checked.
 
-- [ ] **Step 3: Write set-specific Markdown tests**
+- [x] **Step 3: Write set-specific Markdown tests**
 
 Add one dead-link fixture for each active set; include missing relative files,
 missing anchors, duplicate headings, contextual Unicode lowercasing, exact
@@ -377,7 +377,7 @@ excluded source, and bounded typed VitePress frontmatter with hero/action/
 feature targets, string/src/light-and-dark image variants, and configured/
 default public-asset resolution.
 
-- [ ] **Step 4: Implement local and external link contracts**
+- [x] **Step 4: Implement local and external link contracts**
 
 Local checks cover active repo/maintained-internal path and anchor links.
 External checks cover all active sets with final HTTPS/status validation, at
@@ -399,14 +399,14 @@ an explicit stricter security policy against repeated Transfer-Encoding or
 Content-Encoding, validates every proxy/1xx header block, and selects only the
 final response for policy.
 
-- [ ] **Step 5: Check page/nav/orphan/diagram records**
+- [x] **Step 5: Check page/nav/orphan/diagram records**
 
 Make `pages.toml` the intended VitePress publication/nav inventory,
 `orphans.toml` carry only typed tombstone/manual exceptions, and
 `diagrams.toml` require a prose equivalent, owner, and exact semantic-content
 SHA-256 for every diagram. Content edits and selector-order swaps reopen review.
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 Add each Markdown/link dependency only in the standalone manifest, regenerate
 its lockfile, and require `git diff --quiet -- Cargo.lock` before the commands
@@ -431,7 +431,7 @@ Expected: focused tests and current local repository checks pass; the final
 name-only output equals the Task 6 **Files** list exactly. External network
 checks remain scheduled/manual, not a required per-PR network gate.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add docs/guide/error-reference.md docs/internal/audits/documentation-refresh-evidence.md docs/superpowers/plans/2026-08-30-documentation-refresh.md tools/docs-parity/Cargo.lock tools/docs-parity/Cargo.toml tools/docs-parity/README.md tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/src/classification.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/markdown.rs tools/docs-parity/src/repository.rs tools/docs-parity/src/scanner.rs tools/docs-parity/tests/cli.rs tools/docs-parity/tests/links.rs tools/docs-parity/tests/markdown.rs
@@ -1568,11 +1568,11 @@ git commit -m "Activate documentation enforcement gates"
 - Modify: `docs/internal/audits/documentation-refresh-decisions.md`
 - Modify: PR #1049 description through GitHub API/CLI
 
-- [ ] **Step 1: Reassert immutable state**
+- [x] **Step 1: Reassert immutable state**
 
 Fetch and require `origin/rc/202608` still equals `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, the branch contains it, PR #1049 targets rc from `spec-docs-refresh`, and the worktree has no unrelated bytes.
 
-- [ ] **Step 2: Run the complete local matrix**
+- [x] **Step 2: Run the complete local matrix**
 
 ```bash
 cargo fmt --all -- --check
@@ -1605,11 +1605,11 @@ cd docs && npm ci && npm run lint && npm run format && npm run build
 
 Also run Task 16 rustdoc commands and all four Task 13 smoke/evidence paths. Record exact commands, tool versions, durations, and results.
 
-- [ ] **Step 3: Prove every acceptance surface**
+- [x] **Step 3: Prove every acceptance surface**
 
 Record generated no-diff; classification/disposition equality; retired/privacy scans; route/settings/integration equality; snippet diagnostics; README/JSDoc/rustdoc gates; local Pages/CNAME artifact proof; first-success smokes; all follow-up issue URLs/dispositions; package commit/path review; and release-pending fields without fabricated receipts. Read PR #1049's description back through the GitHub API/CLI and require the bounded settings-parity region to equal the Appendix B checklist and the bounded adapter-smokes region to contain each of the four exact script command/cleanup sequences plus its immutable run evidence.
 
-- [ ] **Step 4: Commit final records**
+- [x] **Step 4: Commit final records**
 
 ```bash
 git add docs/internal/audits/documentation-refresh-evidence.md docs/internal/audits/documentation-refresh-decisions.md
