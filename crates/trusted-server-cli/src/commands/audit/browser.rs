@@ -38,6 +38,8 @@ pub(crate) const CHROME_NAMES: &[&str] = &[
 const SETTLE_POLL_MS: u64 = 250;
 /// Hard cap on page navigation so a stalled load cannot hang the audit.
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound for CDP setup operations performed before page navigation.
+const PRE_NAVIGATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound for each CDP operation after navigation.
 const CDP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard cap per decoded evidence list, so a hostile page cannot inflate CLI
@@ -274,10 +276,13 @@ pub(crate) async fn set_browser_cookies(
 ) -> Result<(), String> {
     for (name, value) in cookies {
         let cookie = host_cookie(name, value, url)?;
-        tokio::time::timeout(CDP_OPERATION_TIMEOUT, browser.set_cookies(vec![cookie]))
-            .await
-            .map_err(|_| format!("timed out setting cookie `{name}`"))?
-            .map_err(|error| format_cookie_install_error(name, error))?;
+        tokio::time::timeout(
+            PRE_NAVIGATION_OPERATION_TIMEOUT,
+            browser.set_cookies(vec![cookie]),
+        )
+        .await
+        .map_err(|_| format!("timed out setting cookie `{name}`"))?
+        .map_err(|error| format_cookie_install_error(name, error))?;
     }
     Ok(())
 }
@@ -480,10 +485,13 @@ async fn collect_with_browser(
 
     // Open a blank page first so init scripts are installed before the real
     // document loads (evaluate-on-new-document applies to subsequent navigations).
-    let page = tokio::time::timeout(CDP_OPERATION_TIMEOUT, browser.new_page("about:blank"))
-        .await
-        .map_err(|_| "timed out opening browser page".to_string())?
-        .map_err(|error| format!("failed to open browser page: {error}"))?;
+    let page = tokio::time::timeout(
+        PRE_NAVIGATION_OPERATION_TIMEOUT,
+        browser.new_page("about:blank"),
+    )
+    .await
+    .map_err(|_| "timed out opening browser page".to_string())?
+    .map_err(|error| format!("failed to open browser page: {error}"))?;
 
     let result = collect_open_page(&page, &request, settle_config, assume_consent).await;
     let close_result = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, page.close()).await;
@@ -520,7 +528,7 @@ async fn collect_open_page(
 
     if assume_consent {
         tokio::time::timeout(
-            CDP_OPERATION_TIMEOUT,
+            PRE_NAVIGATION_OPERATION_TIMEOUT,
             page.evaluate_on_new_document(CONSENT_STUB_SCRIPT),
         )
         .await
@@ -532,7 +540,7 @@ async fn collect_open_page(
         });
     }
     tokio::time::timeout(
-        CDP_OPERATION_TIMEOUT,
+        PRE_NAVIGATION_OPERATION_TIMEOUT,
         page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)"),
     )
     .await
@@ -541,7 +549,7 @@ async fn collect_open_page(
 
     for script in &request.init_scripts {
         tokio::time::timeout(
-            CDP_OPERATION_TIMEOUT,
+            PRE_NAVIGATION_OPERATION_TIMEOUT,
             page.evaluate_on_new_document(script.clone()),
         )
         .await

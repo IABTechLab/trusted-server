@@ -39,6 +39,7 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// whatever rendered by then.
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+const PRE_NAVIGATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Size the page's resource-timing buffer is raised to before navigation, and
@@ -555,10 +556,13 @@ async fn collect_page_from_browser(
     // duplicate in the middle of progress output.
     set_browser_cookies(browser, cookies, target_url).await?;
 
-    let page = timeout(PAGE_OPERATION_TIMEOUT, browser.new_page("about:blank"))
-        .await
-        .map_err(|_| "timed out creating browser page for audit".to_string())?
-        .map_err(|error| format!("failed to create browser page for audit: {error}"))?;
+    let page = timeout(
+        PRE_NAVIGATION_OPERATION_TIMEOUT,
+        browser.new_page("about:blank"),
+    )
+    .await
+    .map_err(|_| "timed out creating browser page for audit".to_string())?
+    .map_err(|error| format!("failed to create browser page for audit: {error}"))?;
 
     let result = collect_open_page(&page, target_url, discover_sitemap, settings).await;
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, page.close()).await;
@@ -595,7 +599,7 @@ async fn collect_open_page(
     // already answered rather than installing its own gate.
     if settings.assume_consent {
         timeout(
-            PAGE_OPERATION_TIMEOUT,
+            PRE_NAVIGATION_OPERATION_TIMEOUT,
             page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT),
         )
         .await
@@ -604,7 +608,7 @@ async fn collect_open_page(
         warnings.push(CONSENT_STUB_WARNING.to_string());
     }
     timeout(
-        PAGE_OPERATION_TIMEOUT,
+        PRE_NAVIGATION_OPERATION_TIMEOUT,
         page.evaluate_on_new_document(format!(
             "performance.setResourceTimingBufferSize({RESOURCE_TIMING_BUFFER_SIZE})"
         )),
