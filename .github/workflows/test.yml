@@ -169,8 +169,16 @@ jobs:
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
         run: cargo bench -p trusted-server-core --bench html_processor_bench -- --test
 
+      # The separate macOS job covers macOS-only CLI code without duplicating
+      # these cross-platform browser fixtures.
+      - name: Set up Chrome for browser fixture tests
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4
+
       - name: Run host-target CLI tests
         run: ./scripts/test-cli.sh
+        env:
+          CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
 
       # The codegen crate is not a default member and no adapter alias builds it,
       # so its tests only run if invoked explicitly on the host target.
@@ -337,18 +345,9 @@ jobs:
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
-      - name: Set up Chrome for browser fixture tests
-        id: setup-chrome
-        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4
-
-      - name: cargo test
-        run: ./scripts/test-cli.sh
-        env:
-          CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
-          # Chrome for Testing can stall target creation inside the nested macOS
-          # runner sandbox. This affects fixtures only; production builds retain
-          # Chromium's sandbox.
-          TS_AUDIT_BROWSER_FIXTURE_NO_SANDBOX: "1"
+      - name: Run native CLI tests
+        run: |
+          cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/host: //p')"
 
   test-typescript:
     name: vitest

@@ -156,12 +156,6 @@ pub(crate) fn build_browser_config(
     let mut builder = BrowserConfig::builder()
         .chrome_executable(options.chrome)
         .user_data_dir(options.profile_dir);
-    #[cfg(test)]
-    if std::env::var("TS_AUDIT_BROWSER_TESTS").as_deref() == Ok("1")
-        && std::env::var("TS_AUDIT_BROWSER_FIXTURE_NO_SANDBOX").as_deref() == Ok("1")
-    {
-        builder = builder.no_sandbox();
-    }
     if !options.accept_invalid_certs {
         builder = builder.respect_https_errors();
     }
