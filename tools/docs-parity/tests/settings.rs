@@ -111,8 +111,7 @@ fn cargo_check_serde_fixture(source: &str) -> Output {
             edition = "2024"
 
             [dependencies]
-            serde = { version = "=1.0.228", features = ["derive"] }
-            serde_derive = "=1.0.228"
+            serde = { version = "=1.0.229", features = ["derive"] }
         "#,
     )
     .expect("should write fixture manifest");

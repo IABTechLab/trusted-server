@@ -1620,11 +1620,11 @@ git status --porcelain
 
 If records do not change, omit the empty commit but still require clean status.
 
-- [ ] **Step 5: Push and verify hosted checks on the exact head**
+- [x] **Step 5: Push and verify hosted checks on the exact head**
 
 Push to `origin/spec-docs-refresh`. Update only the bounded `<!-- docs-refresh:final-acceptance:start -->` / `<!-- docs-refresh:final-acceptance:end -->` region of PR #1049's description with the exact final head/base, run URLs, job/app identities, local evidence, and release-pending operations. Preserve every unrelated region. Read the final PR description back and revalidate the settings-parity and adapter-smokes regions after the final-acceptance update. Require every expected hosted job green on that SHA; a prior head does not count.
 
-- [ ] **Step 6: Mark implementation complete**
+- [x] **Step 6: Mark implementation complete**
 
 Review `git diff origin/rc/202608...HEAD` path by path, require no unrelated runtime change, keep package commits unsquashed, and mark PR #1049 ready for review without opening or requesting approval on any other PR. Completion means repository implementation is finished; merge and release-pending operations remain outside this plan.
 
