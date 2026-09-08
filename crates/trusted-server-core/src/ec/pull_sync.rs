@@ -518,7 +518,7 @@ mod tests {
     fn pull_partner(ttl_sec: u64) -> PartnerConfig {
         PartnerConfig {
             name: "SSP X".to_owned(),
-            api_key_hash: "deadbeef".to_owned(),
+            api_key_hash: Some("deadbeef".to_owned()),
             bidstream_enabled: true,
             source_domain: "ssp.example.com".to_owned(),
             openrtb_atype: 3,
@@ -792,7 +792,9 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(format!("{source_domain}-api-token-32-bytes-minimum")),
+            api_token: Some(Redacted::new(format!(
+                "{source_domain}-api-token-32-bytes-minimum"
+            ))),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,
             pull_sync_url: Some(format!("https://{source_domain}/sync")),

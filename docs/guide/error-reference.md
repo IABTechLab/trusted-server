@@ -61,8 +61,12 @@ Missing required field: publisher.domain
 [publisher]
 domain = "your-publisher-domain.com"
 origin_url = "https://origin.your-publisher-domain.com"
-proxy_secret = "change-me-to-random-string"
+proxy_secret = "publisher_proxy_secret"
 ```
+
+`proxy_secret` names an entry in the Trusted Server secret store. Provision a
+high-entropy value under `publisher_proxy_secret`; do not put that value in the
+TOML file.
 
 **Required Fields:**
 
@@ -141,18 +145,22 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `passphrase` is set in `trusted-server.toml`:
+1. Ensure `passphrase` names a secret-store entry in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "ec_passphrase"
 ```
 
-2. Or set via environment variable:
+2. If using a typed CLI environment override, set the key name rather than the
+   passphrase value:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
+TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 ```
+
+3. Provision a high-entropy value of at least 32 characters under
+   `ec_passphrase` in the Trusted Server secret store.
 
 ---
 

@@ -642,9 +642,9 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: crate::redacted::Redacted::new(format!(
+            api_token: Some(crate::redacted::Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
-            )),
+            ))),
             batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
