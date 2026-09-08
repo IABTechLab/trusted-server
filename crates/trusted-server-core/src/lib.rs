@@ -19,7 +19,7 @@
 //! - Request and client context: [`constants`], [`geo`], [`host_header`],
 //!   [`http_util`], [`models`].
 //! - Integration registry and browser bundles: [`integrations`], [`tsjs`].
-//! - OpenRTB transport types: [`openrtb`].
+//! - `OpenRTB` transport types: [`openrtb`].
 //! - Platform service contracts and persistence: [`platform`], [`storage`].
 //! - Publisher and first-party proxy routes: [`proxy`], [`publisher`].
 //! - Response transformation: [`html_processor`], [`rsc_flight`],

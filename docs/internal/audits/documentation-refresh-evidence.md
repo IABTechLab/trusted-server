@@ -3805,6 +3805,14 @@ exceptions, and their sorted non-selector content had identical SHA-256
 `f587bd9b52983c594dd904bc8629dc0ebab4bfd798545e92729e2b0128abfd6e`.
 The refreshed manifest was reviewed before the final scanner check.
 
+The first hosted Task 16 head then exposed five `clippy::doc_markdown`
+diagnostics not exercised by the rustdoc matrix: one crate-index reference and
+four `openrtb.rs` comments used `OpenRTB` as plain text. The comment-only
+correction wrapped those identifiers in code formatting. The exact native CLI
+Clippy command and the integration-test-crate Clippy command that had failed in
+CI both passed locally before the corrective checkpoint was pushed. The first
+hosted run is retained as negative evidence and is not the capture source.
+
 #### Task 17 — Activate final CI and release-pending controls
 
 Pending. Record workflow negative fixtures, generated consumer proof,

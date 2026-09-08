@@ -1,4 +1,4 @@
-//! OpenRTB aliases and Trusted Server extension payloads.
+//! `OpenRTB` aliases and Trusted Server extension payloads.
 //!
 //! Base protocol types come from `trusted-server-openrtb`; this module adds the
 //! request and response extensions used by auction orchestration.
@@ -8,11 +8,11 @@ use serde_json::Value;
 
 use crate::auction::types::{BidRenderer, OrchestratorExt};
 
-/// Canonical OpenRTB bid-request type.
+/// Canonical `OpenRTB` bid-request type.
 pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
-/// Canonical OpenRTB bid-response type.
+/// Canonical `OpenRTB` bid-response type.
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
-/// Canonical OpenRTB bid type.
+/// Canonical `OpenRTB` bid type.
 pub type OpenRtbBid = trusted_server_openrtb::Bid;
 
 pub use trusted_server_openrtb::{
