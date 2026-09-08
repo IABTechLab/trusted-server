@@ -8,7 +8,7 @@
 //!
 //! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
 //! protocol or cipher metadata. `edgezero_main` injects a trusted `fastly-ssl`
-//! header after stripping client-spoofable headers, so [`detect_request_scheme`]
+//! header after stripping client-spoofable headers, so `detect_request_scheme`
 //! in `http_util` can still derive the correct scheme for HTTPS traffic.
 //! It also captures the full [`ClientInfo`] (TLS, JA4, H2 fingerprint, server
 //! metadata) into the request extensions, which [`build_per_request_services`]
@@ -999,7 +999,7 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
 // ---------------------------------------------------------------------------
 
 /// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
-/// mirroring [`crate::http_error_response`] exactly.
+/// mirroring the legacy `http_error_response` helper exactly.
 ///
 /// The near-identical function in `main.rs` is intentional: the legacy path
 /// uses fastly HTTP types while this path uses `edgezero_core` types.

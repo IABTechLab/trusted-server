@@ -1,3 +1,5 @@
+//! Trusted Server-specific CLI command namespaces.
+
 pub(crate) mod audit;
 pub(crate) mod config;
 // `dev` is `pub` so the macOS-gated `tests/proxy_e2e.rs` suite can reach

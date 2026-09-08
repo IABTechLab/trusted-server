@@ -1,3 +1,8 @@
+//! Upstream request forwarding and connection reuse for the dev proxy.
+//!
+//! Request bodies remain streaming, hop-by-hop headers are sanitized at the
+//! boundary, and response-body completion controls whether a lease is reusable.
+
 /// Streaming upload and pooled response-body adapters.
 pub mod body;
 /// DNS/TCP/TLS/HTTP connection establishment.

@@ -4287,6 +4287,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/src/jsdoc.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "tools/docs-parity/src/lib.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4377,6 +4383,66 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/alignment.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/default-export.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-class.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-function.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-interface.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-type-alias.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-variable.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/file-overview.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/re-export.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/types.ts"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "test_fixture"
+
+[[sources]]
 path = "tools/docs-parity/tests/gates.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4384,6 +4450,12 @@ exclude_kind = "source_code"
 
 [[sources]]
 path = "tools/docs-parity/tests/integrations.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/jsdoc.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"
@@ -5727,26 +5799,50 @@ disposition = "include"
 
 [[comments]]
 path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
-selector = "bytes:0-292"
-fingerprint = "sha256:215d35950ff0611ea6fc764f384a83d4bfef92fce1d1c7549069b29fbfbc51c8"
+selector = "bytes:0-298"
+fingerprint = "sha256:2f193e9b4c9e90287ec9d720ec5820ccfd0dc8bb39cbc7e859dda15ca34abef0"
 disposition = "include"
 
 [[comments]]
 path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
-selector = "bytes:4303-4804"
+selector = "bytes:1495-1564"
+fingerprint = "sha256:5acc766cfdaaa088b9c89ce6baab0539d0285e88a1a79d92c45b68e1751623bd"
+disposition = "include"
+
+[[comments]]
+path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
+selector = "bytes:4220-4294"
+fingerprint = "sha256:41b78a52fbfb738c84e5df7dc7e4236525dfbdf2df82b88b87a250188cda95ef"
+disposition = "include"
+
+[[comments]]
+path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
+selector = "bytes:4454-4955"
 fingerprint = "sha256:4b0f35b99b8cdaa0bbcb3c9a16489eefa45574cc94cb467f2fc643473e68f1f5"
 disposition = "include"
 
 [[comments]]
 path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
-selector = "bytes:5128-5202"
+selector = "bytes:5279-5353"
 fingerprint = "sha256:cf0b02553c10fd9fabebd07d6ebd3bc104284ec77d0c39b0e13f183c3fc1404e"
 disposition = "include"
 
 [[comments]]
 path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
-selector = "bytes:5209-5276"
+selector = "bytes:5360-5427"
 fingerprint = "sha256:6ab7e7f4d2fe02e2bc2af15b666e4adbe77f7615aa8aef5fc13d81a2ffa77cf4"
+disposition = "include"
+
+[[comments]]
+path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
+selector = "bytes:10306-10382"
+fingerprint = "sha256:4372f443b2217194a386ecf56ddcc335ee0ecc2c3d6b8b9ad4f5200badef8c4c"
+disposition = "include"
+
+[[comments]]
+path = "crates/trusted-server-js/lib/build-prebid-external.mjs"
+selector = "bytes:13106-13193"
+fingerprint = "sha256:e59509864cd9f546ea5271430f76dcbc9da2583b699bcae8e42ff47b16f6fe90"
 disposition = "include"
 
 [[comments]]

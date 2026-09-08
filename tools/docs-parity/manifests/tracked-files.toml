@@ -2955,6 +2955,10 @@ path = "tools/docs-parity/src/integrations.rs"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/src/jsdoc.rs"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/src/lib.rs"
 kind = "text"
 
@@ -3015,11 +3019,55 @@ path = "tools/docs-parity/tests/dependency_snapshot.rs"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/alignment.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/default-export.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-class.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-function.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-interface.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-type-alias.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/exported-variable.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/file-overview.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/re-export.ts"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/fixtures/jsdoc/types.ts"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/tests/gates.rs"
 kind = "text"
 
 [[files]]
 path = "tools/docs-parity/tests/integrations.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/jsdoc.rs"
 kind = "text"
 
 [[files]]

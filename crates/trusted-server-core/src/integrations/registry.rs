@@ -1,3 +1,8 @@
+//! Runtime registry for enabled integrations and their rewrite hooks.
+//!
+//! Registration collects routes, request filters, auction hooks, script and
+//! attribute rewriters, and HTML post-processors in deterministic order.
+
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

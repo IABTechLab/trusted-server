@@ -1,3 +1,8 @@
+//! Edge-terminated HTTP Basic authentication for protected routes.
+//!
+//! Successful checks attach a digest-bound marker used by cache policy. Failed
+//! checks return a challenge without removing the original authorization value.
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
@@ -58,7 +63,7 @@ impl EdgeTerminatedAuthorization {
 ///
 /// # Request mutation
 ///
-/// Takes `req` mutably because it owns [`EdgeTerminatedAuthorization`]. Any
+/// Takes `req` mutably because it owns the `EdgeTerminatedAuthorization` marker. Any
 /// inherited marker is cleared on entry, and a fresh one is inserted only on the
 /// success path, so the marker present after this call always describes this
 /// call's own decision. Nothing else about the request is touched — in

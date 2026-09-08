@@ -1,3 +1,8 @@
+//! Trusted Server application configuration and validation.
+//!
+//! Deserialization is only the first phase: runtime preparation validates
+//! cross-field contracts and compiles reusable matchers before request handling.
+
 #[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
@@ -86,7 +91,7 @@ fn default_max_buffered_body_bytes() -> usize {
 
 impl Default for Publisher {
     /// Hand-written so `max_buffered_body_bytes` matches the serde default
-    /// ([`default_max_buffered_body_bytes`]) instead of `usize`'s `0`. A derived
+    /// (`default_max_buffered_body_bytes`) instead of `usize`'s `0`. A derived
     /// `Default` would set a zero-byte cap, which fails buffered post-processing
     /// immediately when `Publisher::default()` / `Settings::default()` are used
     /// programmatically (tests, helpers) rather than deserialized from TOML.
@@ -620,7 +625,7 @@ impl Ec {
     /// # Errors
     ///
     /// Returns a validation error if the passphrase is empty or shorter
-    /// than [`Self::MIN_PASSPHRASE_LENGTH`] characters.
+    /// than the private `MIN_PASSPHRASE_LENGTH` limit.
     pub fn validate_passphrase(passphrase: &Redacted<String>) -> Result<(), ValidationError> {
         if passphrase.expose().is_empty() {
             return Err(ValidationError::new("empty_passphrase"));
@@ -2540,7 +2545,7 @@ pub struct DebugConfig {
     ///
     /// Note: the sanitized winning `adm` is now injected **unconditionally** for
     /// production inline rendering through the pbRender bridge (see
-    /// [`crate::publisher::build_bid_map`]); this flag no longer gates `adm`.
+    /// the publisher bid-map builder); this flag no longer gates `adm`.
     /// What it still gates is the client-side `debug_bid` signal that turns on
     /// the direct GAM-creative replacement (`injectAdmIntoSlot`), which bypasses
     /// GAM entirely — useful for validating the auction→creative pipeline while
@@ -2614,11 +2619,11 @@ pub struct AuctionDebugCommentOptions {
     #[serde(default = "default_true")]
     pub include_bids: bool,
 
-    /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
+    /// Subset of the fixed internal metadata allowlist to surface in
     /// [`AuctionDebugCommentVerbosity::Redacted`] mode. This selector cannot
     /// unlock provider diagnostics, and entries outside the fixed allowlist are
     /// rejected at config load by
-    /// [`validate_metadata_keys`](Self::validate_metadata_keys).
+    /// the private `validate_metadata_keys` validator.
     ///
     /// [`AuctionDebugCommentVerbosity::Upstream`] builds on the redacted
     /// metadata, so this subset still gates those three keys there; the six

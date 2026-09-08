@@ -1,3 +1,8 @@
+//! Next.js script-element rewriting.
+//!
+//! This module rewrites origin URLs in `__NEXT_DATA__` and buffers text-node
+//! fragments only until `lol_html` signals the element is complete.
+
 use std::sync::{Arc, Mutex};
 
 use error_stack::Report;

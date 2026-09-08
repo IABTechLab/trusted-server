@@ -1,23 +1,31 @@
-//! Common functionality for the trusted server.
+//! Platform-neutral request handling for Trusted Server.
 //!
-//! This crate provides shared types, utilities, and abstractions used by both
-//! the Fastly edge implementation and local development/testing environments.
+//! Adapter crates supply stores, outbound HTTP, geo data, and other runtime
+//! services through [`platform::RuntimeServices`]. This crate owns routing,
+//! policy, integrations, and response transformation without depending on a
+//! specific edge provider.
 //!
 //! # Modules
 //!
-//! - [`auth`]: Basic authentication enforcement helpers
-//! - [`constants`]: Application-wide constants and configuration values
-//! - [`cookies`]: Cookie parsing and generation utilities
-//! - [`error`]: Error types and error handling utilities
-//! - [`consent`]: Consent signal extraction and logging
-//! - [`geo`]: Geographic location utilities and DMA code extraction
-//! - [`models`]: Data models for ad serving and callbacks
-//! - [`integrations::prebid`]: Prebid integration and real-time bidding support
-//! - [`settings`]: Configuration management and validation
-//! - [`streaming_replacer`]: Streaming URL replacement for large responses
-//! - [`ec`]: Edge Cookie (EC) identity subsystem — ID generation, consent gating, lifecycle
-//! - [`test_support`]: Testing utilities and mocks
-//! - [`tester_cookie`]: Optional tester-cookie endpoint helpers
+//! - Auction planning and execution: [`auction`], [`auction_config_types`].
+//! - Authentication and signing: [`auth`], [`request_signing`].
+//! - Configuration loading and validation: [`config`], [`config_payload`],
+//!   [`secret_resolution`], [`settings`], [`settings_data`].
+//! - Cache and privacy policy: [`cache_policy`], [`response_privacy`].
+//! - Consent, cookies, and identity: [`consent`], [`consent_config`],
+//!   [`cookies`], [`ec`], [`tester_cookie`].
+//! - Creative selection and rendering: [`creative`], [`creative_opportunities`],
+//!   [`price_bucket`].
+//! - Request and client context: [`constants`], [`geo`], [`host_header`],
+//!   [`http_util`], [`models`].
+//! - Integration registry and browser bundles: [`integrations`], [`tsjs`].
+//! - OpenRTB transport types: [`openrtb`].
+//! - Platform service contracts and persistence: [`platform`], [`storage`].
+//! - Publisher and first-party proxy routes: [`proxy`], [`publisher`].
+//! - Response transformation: [`html_processor`], [`rsc_flight`],
+//!   [`streaming_processor`], [`streaming_replacer`].
+//! - Shared support types and test helpers: [`error`], [`redacted`],
+//!   [`test_support`].
 
 #![cfg_attr(
     test,

@@ -1,4 +1,8 @@
 //! Fermyon Spin adapter for Trusted Server.
+//!
+//! The component entry point delegates HTTP dispatch to `EdgeZero`. Platform
+//! services translate Spin HTTP and variable APIs while unsupported request-
+//! time stores fail closed.
 
 pub mod app;
 pub mod middleware;

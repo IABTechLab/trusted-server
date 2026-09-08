@@ -15,13 +15,11 @@
 //! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
 //! - [`PlatformTemplateCache`] — shared transformed-template caching
 //!
-//! ## Platform-Agnostic Components
+//! ## Platform-agnostic components
 //!
-//! The following components were evaluated for platform-specific behavior
-//! (verified 2026-03-31; see `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`)
-//! and found to have a platform-agnostic rewriting pipeline. No
-//! platform trait is required; future adapters (Cloudflare Workers, Axum, Spin) need not provide
-//! any content-rewriting implementation:
+//! Content rewriting remains in core rather than behind an adapter trait.
+//! Cloudflare Workers, Axum, Spin, and Fastly all use the same processing
+//! implementation:
 //!
 //! - **Content rewriting** — `html_processor`, `streaming_processor`,
 //!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
@@ -29,8 +27,7 @@
 //!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
 //!   accepts any reader that implements `std::io::Read`.
 //!
-//!   No `PlatformContentRewriter` trait exists or is needed.
-//!
+//! No `PlatformContentRewriter` trait exists or is needed.
 
 use std::time::Duration;
 

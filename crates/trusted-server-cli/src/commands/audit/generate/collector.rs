@@ -1,3 +1,8 @@
+//! Collector-neutral audit evidence and progress contracts.
+//!
+//! Traits in this module isolate crawl planning and analysis from Chromium so
+//! deterministic tests can supply synthesized pages.
+
 use serde::{Deserialize, Serialize};
 use url::Url;
 

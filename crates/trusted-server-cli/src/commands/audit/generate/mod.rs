@@ -1,3 +1,8 @@
+//! `ts audit generate` orchestration and artifact serialization.
+//!
+//! This module coordinates collection, analysis, slot inference, validation,
+//! and bounded writes to the requested output files.
+
 mod analyzer;
 pub(crate) mod browser_collector;
 pub(crate) mod collector;

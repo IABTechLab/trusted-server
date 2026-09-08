@@ -73,7 +73,8 @@ fn generate_random_suffix(length: usize) -> String {
 /// the client IP address, then appends a random suffix for additional
 /// uniqueness. The resulting format is `{64hex}.{6alnum}`.
 ///
-/// **Important:** `client_ip` must be pre-normalized via [`extract_client_ip`].
+/// **Important:** `client_ip` must be pre-normalized via the internal
+/// `normalize_ip` helper.
 /// Raw IPv6 addresses produce different hashes than their normalized /64
 /// form, which would create duplicate identity graph entries.
 ///

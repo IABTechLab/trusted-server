@@ -453,6 +453,9 @@ git commit -m "Close documentation execution quality gaps"
 - Modify: `tools/docs-parity/manifests/tracked-files.toml`
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
 - Modify: `tools/docs-parity/manifests/sensitive-allowlist.toml`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
+- Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
+- Modify: `tools/docs-parity/manifests/sensitive-allowlist.toml`
 - Create/Test: `tools/docs-parity/tests/settings.rs`
 - Modify/Test: `tools/docs-parity/tests/scanner.rs`
 - Modify/Test: `crates/trusted-server-core/src/config.rs`
@@ -1353,7 +1356,19 @@ git commit -m "Refresh contributor and crate documentation"
 - Modify: `crates/trusted-server-adapter-axum/src/lib.rs` when the checked WP7 inventory marks its existing crate header incomplete
 - Modify: `crates/trusted-server-cli/src/lib.rs`
 - Modify: `crates/trusted-server-cli/src/run.rs`
-- Modify: undocumented CLI command modules recorded by the exact WP2 inventory before this task starts
+- Modify: the 18 undocumented CLI command modules recorded at Task 16 start:
+  `commands/mod.rs`, `commands/audit/generate/{analyzer,browser_collector,collector,mod}.rs`,
+  `commands/config/{ad_templates,init,mod}.rs`, `commands/dev/mod.rs`,
+  `commands/dev/proxy/{metrics,mod,prefixed_io}.rs`, and
+  `commands/dev/proxy/upstream/{body,connect,dns,key,manager,mod}.rs`
+- Modify: baseline rustdoc-link repairs in
+  `crates/trusted-server-core/src/auction/{endpoints,formats,types}.rs`,
+  `crates/trusted-server-core/src/{creative,creative_opportunities,publisher}.rs`,
+  `crates/trusted-server-core/src/ec/{admin,generation,kv,mod}.rs`,
+  `crates/trusted-server-core/src/request_signing/endpoints.rs`,
+  `crates/trusted-server-adapter-fastly/src/{app,backend}.rs`,
+  `crates/trusted-server-adapter-spin/src/middleware.rs`, and
+  `crates/trusted-server-cli/src/commands/dev/proxy/browser.rs`
 - Modify: `crates/trusted-server-js/src/lib.rs`
 - Modify: `crates/trusted-server-js/lib/src/core/{registry,render,types}.ts`
 - Modify: `crates/trusted-server-js/lib/src/shared/globals.ts`
@@ -1370,26 +1385,30 @@ git commit -m "Refresh contributor and crate documentation"
 - Create/Test: `tools/docs-parity/tests/fixtures/jsdoc/re-export.ts`
 - Create/Test: `tools/docs-parity/tests/fixtures/jsdoc/alignment.ts`
 - Create/Test: `tools/docs-parity/tests/fixtures/jsdoc/types.ts`
+- Create/Test: `tools/docs-parity/src/jsdoc.rs`
+- Create/Test: `tools/docs-parity/tests/jsdoc.rs`
+- Modify: `tools/docs-parity/src/lib.rs`
+- Modify: `tools/docs-parity/Cargo.toml`
 - Modify: `tools/docs-parity/manifests/tracked-files.toml`
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
 
-- [ ] **Step 1: Capture failing rustdoc/JSDoc evidence**
+- [x] **Step 1: Capture failing rustdoc/JSDoc evidence**
 
 Run the complete rustdoc matrix with `RUSTDOCFLAGS="-D warnings"`, native core doctests, and current JS lint. Record every existing failure; do not suppress a warning solely to get green.
 
-- [ ] **Step 2: Complete the exact Rust worklist**
+- [x] **Step 2: Complete the exact Rust worklist**
 
 Add crate/module/item docs with correct errors/panics/examples only where they earn their keep. Repair Cloudflare/Spin store claims to state the unwired reality and link the follow-up. Keep test-only modules excluded from coverage counts.
 
-- [ ] **Step 3: Activate scoped JSDoc rules test-first**
+- [x] **Step 3: Activate scoped JSDoc rules test-first**
 
 Add separate synthesized failures for file overview, exported function/class/interface/type alias/variable/default export/re-export, alignment, and types. Configure paths relative to `crates/trusted-server-js/lib`; do not accidentally impose this scope on generated/vendor files.
 
-- [ ] **Step 4: Document the scoped TS/MJS files**
+- [x] **Step 4: Document the scoped TS/MJS files**
 
 Add file headers and declaration docs, especially complete `core/types.ts`; document behavior, not TypeScript syntax. Keep runtime code unchanged.
 
-- [ ] **Step 5: Run the exact rustdoc matrix**
+- [x] **Step 5: Run the exact rustdoc matrix**
 
 ```bash
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features -p trusted-server-core -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1
@@ -1403,7 +1422,7 @@ cargo test --doc -p trusted-server-core
 
 Expected: warning-free docs and passing native doctests with Node available for the JS build script.
 
-- [ ] **Step 6: Run JSDoc and target regression suites**
+- [x] **Step 6: Run JSDoc and target regression suites**
 
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- jsdoc-fixtures --check
@@ -1416,7 +1435,7 @@ cargo test-spin
 
 Expected: all pass with no runtime behavior diff.
 
-- [ ] **Step 7: Commit WP7**
+- [x] **Step 7: Commit WP7**
 
 Stage only the exact modified paths enumerated in this task plus the ten named
 JSDoc fixtures and the evidence ledger. The WP2 inventory may add individual
@@ -1425,8 +1444,10 @@ Directory-wide `git add crates` is forbidden.
 
 ```bash
 git add crates/trusted-server-core/src/lib.rs crates/trusted-server-core/src/platform/backend_naming.rs crates/trusted-server-core/src/platform/error.rs crates/trusted-server-core/src/platform/http.rs crates/trusted-server-core/src/platform/image_optimizer.rs crates/trusted-server-core/src/platform/kv.rs crates/trusted-server-core/src/platform/mod.rs crates/trusted-server-core/src/platform/template_assembly.rs crates/trusted-server-core/src/platform/template_cache.rs crates/trusted-server-core/src/platform/traits.rs crates/trusted-server-core/src/platform/types.rs crates/trusted-server-core/src/auth.rs crates/trusted-server-core/src/constants.rs crates/trusted-server-core/src/host_rewrite.rs crates/trusted-server-core/src/html_processor.rs crates/trusted-server-core/src/http_util.rs crates/trusted-server-core/src/openrtb.rs crates/trusted-server-core/src/price_bucket.rs crates/trusted-server-core/src/proxy.rs crates/trusted-server-core/src/rsc_flight.rs crates/trusted-server-core/src/settings.rs crates/trusted-server-core/src/settings_data.rs crates/trusted-server-core/src/tsjs.rs crates/trusted-server-core/src/storage/kv_store.rs crates/trusted-server-core/src/storage/mod.rs crates/trusted-server-core/src/integrations/datadome.rs crates/trusted-server-core/src/integrations/prebid.rs crates/trusted-server-core/src/integrations/registry.rs crates/trusted-server-core/src/integrations/nextjs/html_post_process.rs crates/trusted-server-core/src/integrations/nextjs/mod.rs crates/trusted-server-core/src/integrations/nextjs/rsc.rs crates/trusted-server-core/src/integrations/nextjs/rsc_placeholders.rs crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs crates/trusted-server-core/src/integrations/nextjs/shared.rs crates/trusted-server-adapter-fastly/src/main.rs crates/trusted-server-adapter-cloudflare/src/lib.rs crates/trusted-server-adapter-cloudflare/src/platform.rs crates/trusted-server-adapter-spin/src/lib.rs crates/trusted-server-adapter-spin/src/platform.rs crates/trusted-server-cli/src/lib.rs crates/trusted-server-cli/src/run.rs crates/trusted-server-js/src/lib.rs crates/trusted-server-js/lib/src/core/registry.ts crates/trusted-server-js/lib/src/core/render.ts crates/trusted-server-js/lib/src/core/types.ts crates/trusted-server-js/lib/src/shared/globals.ts crates/trusted-server-js/lib/src/integrations/creative/click.ts crates/trusted-server-js/lib/src/integrations/creative/dynamic_src_guard.ts crates/trusted-server-js/lib/src/integrations/creative/iframe.ts crates/trusted-server-js/lib/src/integrations/creative/image.ts crates/trusted-server-js/lib/src/integrations/creative/index.ts crates/trusted-server-js/lib/src/integrations/creative/proxy_sign.ts crates/trusted-server-js/lib/build-prebid-external.mjs crates/trusted-server-js/lib/eslint.config.js tools/docs-parity/tests/fixtures/jsdoc/file-overview.ts tools/docs-parity/tests/fixtures/jsdoc/exported-function.ts tools/docs-parity/tests/fixtures/jsdoc/exported-class.ts tools/docs-parity/tests/fixtures/jsdoc/exported-interface.ts tools/docs-parity/tests/fixtures/jsdoc/exported-type-alias.ts tools/docs-parity/tests/fixtures/jsdoc/exported-variable.ts tools/docs-parity/tests/fixtures/jsdoc/default-export.ts tools/docs-parity/tests/fixtures/jsdoc/re-export.ts tools/docs-parity/tests/fixtures/jsdoc/alignment.ts tools/docs-parity/tests/fixtures/jsdoc/types.ts tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml docs/internal/audits/documentation-refresh-evidence.md
-# Append `crates/trusted-server-adapter-axum/src/lib.rs` only if selected and
-# each exact CLI command-module path named by the WP2 inventory.
+git add crates/trusted-server-core/src/auction/endpoints.rs crates/trusted-server-core/src/auction/formats.rs crates/trusted-server-core/src/auction/types.rs crates/trusted-server-core/src/creative.rs crates/trusted-server-core/src/creative_opportunities.rs crates/trusted-server-core/src/publisher.rs crates/trusted-server-core/src/ec/admin.rs crates/trusted-server-core/src/ec/generation.rs crates/trusted-server-core/src/ec/kv.rs crates/trusted-server-core/src/ec/mod.rs crates/trusted-server-core/src/request_signing/endpoints.rs crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-fastly/src/backend.rs crates/trusted-server-adapter-spin/src/middleware.rs crates/trusted-server-cli/src/commands/dev/proxy/browser.rs
+git add crates/trusted-server-cli/src/commands/mod.rs crates/trusted-server-cli/src/commands/audit/generate/analyzer.rs crates/trusted-server-cli/src/commands/audit/generate/browser_collector.rs crates/trusted-server-cli/src/commands/audit/generate/collector.rs crates/trusted-server-cli/src/commands/audit/generate/mod.rs crates/trusted-server-cli/src/commands/config/ad_templates.rs crates/trusted-server-cli/src/commands/config/init.rs crates/trusted-server-cli/src/commands/config/mod.rs crates/trusted-server-cli/src/commands/dev/mod.rs crates/trusted-server-cli/src/commands/dev/proxy/metrics.rs crates/trusted-server-cli/src/commands/dev/proxy/mod.rs crates/trusted-server-cli/src/commands/dev/proxy/prefixed_io.rs crates/trusted-server-cli/src/commands/dev/proxy/upstream/body.rs crates/trusted-server-cli/src/commands/dev/proxy/upstream/connect.rs crates/trusted-server-cli/src/commands/dev/proxy/upstream/dns.rs crates/trusted-server-cli/src/commands/dev/proxy/upstream/key.rs crates/trusted-server-cli/src/commands/dev/proxy/upstream/manager.rs crates/trusted-server-cli/src/commands/dev/proxy/upstream/mod.rs
+git add tools/docs-parity/Cargo.toml tools/docs-parity/src/jsdoc.rs tools/docs-parity/src/lib.rs tools/docs-parity/tests/jsdoc.rs tools/docs-parity/manifests/sensitive-allowlist.toml docs/superpowers/plans/2026-08-30-documentation-refresh.md
+# Append `crates/trusted-server-adapter-axum/src/lib.rs` only if selected.
 git commit -m "Complete in-code documentation"
 ```
 

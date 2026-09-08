@@ -6,16 +6,19 @@
 //!
 //! # Storage layout
 //!
-//! Each entry uses a single JSON body ([`KvConsentEntry`]) containing the raw
+//! Each entry uses a single JSON body
+//! ([`KvConsentEntry`](crate::storage::kv_store::KvConsentEntry)) containing the raw
 //! consent strings, context flags, and a fingerprint for write-on-change
 //! detection.
 //!
 //! # Change detection
 //!
 //! Writes only occur when consent signals have actually changed.
-//! [`consent_fingerprint`] hashes the raw strings into a compact fingerprint
+//! [`consent_fingerprint`](crate::storage::kv_store::consent_fingerprint) hashes
+//! the raw strings into a compact fingerprint
 //! stored in the body's `fp` field. On the next request, the existing
-//! fingerprint is compared before writing.
+//! fingerprint is compared before writing. All operations use the
+//! platform-neutral [`PlatformKvStore`](crate::platform::PlatformKvStore) contract.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

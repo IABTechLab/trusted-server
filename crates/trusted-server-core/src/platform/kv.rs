@@ -1,3 +1,5 @@
+//! Fail-closed fallback for an unavailable platform KV store.
+
 use bytes::Bytes;
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore as PlatformKvStore};
 

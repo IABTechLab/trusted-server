@@ -1,4 +1,7 @@
-// Click guard runtime: detects mutated click URLs and rebuilds signed first-party clicks.
+/**
+ * @file Detects creative click mutations and rebuilds signed first-party
+ * destinations before navigation.
+ */
 import { log } from '../../core/log';
 import { creativeGlobal } from '../../shared/globals';
 import { delay, queueTask } from '../../shared/async';
@@ -487,7 +490,7 @@ function monitorAnchorMutations(): void {
   });
 }
 
-// Wire up capture-phase click handlers + mutation observers to protect clicks.
+/** Install capture-phase click handlers and mutation repair for signed clicks. */
 export function installClickGuard(): void {
   if (log.getLevel && log.getLevel() === 'warn') {
     log.setLevel('info');

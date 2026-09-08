@@ -269,7 +269,7 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
 }
 
 /// Returns whether `kid` satisfies the create/rotate portable-KID contract
-/// enforced by [`validate_kid`].
+/// enforced by the internal `validate_kid` helper.
 ///
 /// Exposed so platform adapter crates can assert their key-name encoder accepts
 /// every kid this validation admits, pinning the cross-adapter contract against

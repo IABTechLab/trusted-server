@@ -1,3 +1,5 @@
+//! Errors shared by the platform-neutral service contracts.
+
 use derive_more::Display;
 
 /// Root error type for platform service operations.

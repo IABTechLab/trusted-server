@@ -1,3 +1,8 @@
+//! DNS, TCP, TLS, and HTTP/1 connection establishment for the dev proxy.
+//!
+//! A connection is published to the pool only after its driver is ready, and
+//! all failure paths release the manager reservation.
+
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;

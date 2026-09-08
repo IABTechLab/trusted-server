@@ -1,4 +1,7 @@
-//! Shared utilities for Next.js integration modules.
+//! Shared parsing and boundary-safe URL rewriting for Next.js integration modules.
+//!
+//! These helpers identify RSC push payloads, decode JavaScript string escapes,
+//! and delegate bare-host replacement to the core boundary matcher.
 
 use std::borrow::Cow;
 use std::cell::RefCell;

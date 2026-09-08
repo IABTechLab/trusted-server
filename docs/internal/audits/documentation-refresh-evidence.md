@@ -3757,7 +3757,53 @@ fallback warning.
 
 #### Task 16 — Complete WP7 rustdoc and JSDoc
 
-Pending. Record the rustdoc matrix, doctests, JSDoc fixtures, and JS checks.
+In progress. The warning-denied baseline produced 31 broken or private
+intra-doc links: 24 in the combined core/JS/OpenRTB target, three in Fastly,
+two in Spin, and two in the host CLI target. Cloudflare and Axum passed. Native
+core doctests passed (four run and four ignored). JavaScript lint passed before
+JSDoc enforcement, confirming that the documentation rules were previously
+inert. Activating the scoped rules then produced 72 errors: 11 missing file
+overviews and 61 undocumented exports.
+
+All 43 planned Rust files were reviewed. The 18 CLI command modules without a
+module header at Task 16 start were
+`commands/mod.rs`, the four `commands/audit/generate` files, the three
+`commands/config` files, `commands/dev/mod.rs`, the three selected
+`commands/dev/proxy` files, and the six `commands/dev/proxy/upstream` files.
+The crate/module worklist and all public constants now have responsibility-
+focused docs. The 31 baseline links were corrected without warning
+suppression. Cloudflare and Spin now state that request-time config and KV
+handles are absent until their applications implement `Hooks::stores()`;
+their retained handle adapters do not imply that the declared stores are open.
+
+The JSDoc gate was added test-first. Its initial test failed because the
+checker module did not exist. Ten tracked, bounded fixtures now prove file
+overview, exported function/class/interface/type alias/variable/default
+export/re-export, alignment, and canonical type spelling independently. Three
+in-memory controls prove that generated, non-creative integration, and vendor
+paths remain outside the JSDoc scope. Production lint is green after documenting
+the selected TS/MJS declarations, including every exported declaration in
+`core/types.ts`.
+
+The 2026-09-08 acceptance pass completed the exact Task 16 matrix. All six
+warning-denied rustdoc commands passed. Native core doctests passed with four
+tests run and four intentionally ignored. The JSDoc fixture command and its two
+Rust integration tests passed. JavaScript lint and Prettier checks passed; all
+45 Vitest files and 949 tests passed with no type errors; and the build emitted
+all 13 expected bundles. The target regressions passed: Fastly ran 175 adapter,
+2,425 core, two JS, and 21 OpenRTB tests plus the core doctests; Axum ran 15
+library, one binary, and 27 route tests; Cloudflare ran 23 library and 23 route
+tests; and Spin ran 50 library and 38 route tests. Viceroy required host
+keychain access and three Axum tests required host loopback binding; their
+unchanged host-access reruns passed. Workspace and docs-parity formatting,
+docs-parity Clippy with warnings denied, its 38 library tests, classification,
+and snippet validation also passed.
+
+The sensitive-data bootstrap changed only exact byte selectors after inserted
+documentation shifted existing source values: both manifests contained 5,438
+exceptions, and their sorted non-selector content had identical SHA-256
+`f587bd9b52983c594dd904bc8629dc0ebab4bfd798545e92729e2b0128abfd6e`.
+The refreshed manifest was reviewed before the final scanner check.
 
 #### Task 17 — Activate final CI and release-pending controls
 

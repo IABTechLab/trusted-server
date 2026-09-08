@@ -1,3 +1,8 @@
+//! Chromium-backed evidence collector for generated audits.
+//!
+//! The collector owns browser startup, navigation limits, progress events,
+//! consent stubbing, and guaranteed process/profile cleanup.
+
 use std::path::PathBuf;
 use std::time::Duration;
 

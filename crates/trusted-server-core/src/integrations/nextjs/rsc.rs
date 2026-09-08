@@ -1,3 +1,8 @@
+//! Escape-aware rewriting of combined Next.js RSC script payloads.
+//!
+//! The rewriter preserves JavaScript escapes and recalculates Flight `T`-chunk
+//! byte lengths after origin URLs change.
+
 use std::sync::LazyLock;
 
 use regex::Regex;

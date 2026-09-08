@@ -76,7 +76,7 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ## Context passthrough (`config`)
 ///
 /// The optional `config` object is filtered through
-/// [`auction.allowed_context_keys`][`crate::settings::AuctionConfig::allowed_context_keys`].
+/// [`auction.allowed_context_keys`][`crate::auction_config_types::AuctionConfig::allowed_context_keys`].
 /// Only keys listed there reach the auction providers (e.g. `"permutive_segments"`).
 /// All other keys are silently dropped. Values must be either strings or arrays of
 /// strings.

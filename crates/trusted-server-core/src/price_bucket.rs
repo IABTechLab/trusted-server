@@ -1,13 +1,24 @@
+//! Prebid-compatible CPM price bucketing.
+//!
+//! Buckets are computed in whole cents to avoid binary floating-point drift at
+//! cent boundaries and are capped according to the selected granularity.
+
 use serde::{Deserialize, Serialize};
 
+/// Named price-bucketing schedule used for ad-server targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PriceGranularity {
+    /// Coarse buckets up to a low maximum CPM.
     Low,
+    /// Medium-width buckets over a broader CPM range.
     Medium,
+    /// Dense buckets; the default schedule.
     #[default]
     Dense,
+    /// Fine-grained buckets over a high CPM range.
     High,
+    /// Prebid's automatic mixed-width schedule.
     Auto,
 }
 
@@ -25,6 +36,9 @@ fn cpm_to_cents(cpm: f64) -> u64 {
 }
 
 #[must_use]
+/// Return the floor bucket for `cpm` under `granularity` as a two-decimal string.
+///
+/// Non-finite and non-positive values return `"0.00"`.
 pub fn price_bucket(cpm: f64, granularity: PriceGranularity) -> String {
     // Reject NaN / Inf early so the cast in `cpm_to_cents` can never see a
     // non-finite value (the cast's behaviour for NaN/Inf is implementation-

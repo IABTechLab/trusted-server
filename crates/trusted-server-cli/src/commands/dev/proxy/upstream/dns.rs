@@ -1,3 +1,5 @@
+//! Bounded DNS cache with TTL expiry and concurrent-miss coalescing.
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;

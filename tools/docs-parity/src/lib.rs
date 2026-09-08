@@ -19,6 +19,7 @@ pub mod cli_help;
 pub mod dependency_snapshot;
 pub mod gates;
 pub mod integrations;
+pub mod jsdoc;
 pub mod markdown;
 pub mod model;
 pub mod readmes;
@@ -62,6 +63,8 @@ pub enum DocsParityError {
     Snippets,
     #[display("workspace README semantics failed")]
     Readmes,
+    #[display("JSDoc fixture semantics failed")]
+    Jsdoc,
     #[display("documentation workflow policy failed")]
     Workflow,
     #[display("dependency snapshot semantics failed")]
@@ -109,6 +112,8 @@ enum Command {
     Snippets(SnippetsArguments),
     /// Check package-to-README equality for every workspace member.
     Readmes(ReadmesArguments),
+    /// Prove each scoped `JSDoc` rule with an isolated negative fixture.
+    JsdocFixtures(JsdocArguments),
     /// Check the currently activated repository workflow policy.
     Workflow(WorkflowArguments),
     /// Generate or validate a bounded dependency snapshot artifact.
@@ -158,6 +163,13 @@ struct PagesArguments {
 #[derive(Args, Debug)]
 struct ReadmesArguments {
     /// Validate workspace README equality without changing repository bytes.
+    #[arg(long, required = true)]
+    check: bool,
+}
+
+#[derive(Args, Debug)]
+struct JsdocArguments {
+    /// Validate all synthesized negative fixtures without changing repository bytes.
     #[arg(long, required = true)]
     check: bool,
 }
@@ -339,6 +351,7 @@ pub fn run_from_env() -> Result<Outcome, Report<DocsParityError>> {
         Command::CliHelp(arguments) => cli_help(&repository, &arguments),
         Command::Snippets(arguments) => snippets(&repository, &arguments),
         Command::Readmes(arguments) => readmes(&repository, &arguments),
+        Command::JsdocFixtures(arguments) => jsdoc(&repository, &arguments),
         Command::Workflow(arguments) => workflow(&repository, &arguments),
         Command::DependencySnapshot(arguments) => dependency_snapshot(&repository, &arguments),
     }
@@ -359,6 +372,15 @@ fn readmes(
 ) -> Result<Outcome, Report<DocsParityError>> {
     debug_assert!(arguments.check, "clap should require README check mode");
     readmes::check_repository(repository).change_context(DocsParityError::Readmes)?;
+    Ok(Outcome::Clean)
+}
+
+fn jsdoc(
+    repository: &Repository,
+    arguments: &JsdocArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    debug_assert!(arguments.check, "clap should require JSDoc check mode");
+    jsdoc::check_repository(repository).change_context(DocsParityError::Jsdoc)?;
     Ok(Outcome::Clean)
 }
 

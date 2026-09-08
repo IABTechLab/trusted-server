@@ -1,4 +1,4 @@
-// Dynamic image proxy guard: intercepts <img> sources and routes them via first-party proxy.
+/** @file Routes dynamic creative image sources through the first-party proxy. */
 import { createDynamicSrcProxy } from './dynamic_src_guard';
 import { shouldProxyExternalUrl, signProxyUrl } from './proxy_sign';
 
@@ -19,7 +19,7 @@ const installProxy = createDynamicSrcProxy<HTMLImageElement>({
   signProxy: (raw) => signProxyUrl(raw),
 });
 
-// Prepare global hooks so every img.src assignment flows through Trusted Server first.
+/** Install the idempotent image source guard, including the global `Image` factory. */
 export function installDynamicImageProxy(): void {
   installProxy();
 }

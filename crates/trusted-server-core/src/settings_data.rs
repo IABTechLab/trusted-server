@@ -1,3 +1,8 @@
+//! Loading signed application configuration from platform stores.
+//!
+//! Fastly's entry-size limit is handled through a checked chunk envelope; all
+//! paths verify lengths and SHA-256 digests before parsing settings.
+
 use edgezero_core::env_config::EnvConfig;
 use error_stack::{Report, ResultExt};
 use serde::Deserialize;
