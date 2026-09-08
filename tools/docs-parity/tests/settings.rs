@@ -130,6 +130,8 @@ fn cargo_check_serde_fixture(source: &str) -> Output {
                 .expect("fixture manifest path should be UTF-8"),
         ])
         .env("CARGO_TARGET_DIR", directory.path().join("target"))
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .output()
         .expect("should execute compiled Serde fixture")
 }
