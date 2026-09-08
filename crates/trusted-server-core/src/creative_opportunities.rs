@@ -331,21 +331,29 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_max_age_seconds: Option<u32>,
-    /// Operator assertion that the origin's HTML does not depend on request cookies.
+    /// Named bounded cookie variants whose raw values enter the shared-template key.
     ///
-    /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
-    /// template cache, in both directions. That is safe and it is also very nearly a
-    /// disable switch: Trusted Server sets its own identity cookie, so essentially every
-    /// repeat visitor carries one. Left at the default, the cache can only ever serve
-    /// first-ever page views and cookie-less clients.
+    /// Cookie names are case-sensitive. Use experiment arms or region buckets, never
+    /// session tokens or reader IDs. Missing cookies and present-empty values differ.
+    /// Unset or empty adds no cookie dimensions and preserves the legacy policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_key_cookies: Option<Vec<String>>,
+    /// Cookie names whose presence forces inline processing, with no lookup or store.
     ///
-    /// Setting `true` asserts the origin serves the same HTML with or without cookies.
-    /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
-    /// response is refused regardless of this flag or the configured key. So a wrong
-    /// assertion is caught whenever the origin is honest about it, and this only widens
-    /// the window where the origin personalizes *silently*.
+    /// Empty values still count as present. Names must be unique and must not overlap
+    /// [`Self::template_cache_key_cookies`]. Unset or empty names no bypass cookies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_bypass_cookies: Option<Vec<String>>,
+    /// Assertion that cookies outside the key and bypass lists do not affect origin HTML.
     ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Defaults to false: any unlisted cookie disqualifies both lookup and storage.
+    /// With both lists empty, this retains the original all-cookie behavior. TS mints
+    /// its own identity cookie, so most repeat visitors bypass unless the operator can
+    /// safely assert independence. No identity or consent cookie is implicitly exempt.
+    ///
+    /// Named bypass cookies always disqualify, and origin `Vary: Cookie` always refuses
+    /// storage regardless of this assertion or the configured key. The origin must
+    /// still authorize positive shared freshness and pass every other response guard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.
@@ -360,14 +368,29 @@ impl CreativeOpportunitiesConfig {
         self.assembly_mode.unwrap_or_default()
     }
 
-    /// Whether a cookie-bearing request may participate in the shared cache.
+    /// Whether unlisted request cookies are asserted irrelevant to origin HTML.
     ///
-    /// Defaults to `false`, which is the conservative reading and also the one that
-    /// makes the cache almost inert on real traffic. See
-    /// [`Self::origin_is_cookie_independent`].
+    /// Defaults to false. Named key cookies remain variant dimensions, and named
+    /// bypass cookies remain disqualifying regardless of this assertion.
     #[must_use]
     pub fn origin_is_cookie_independent(&self) -> bool {
         self.origin_is_cookie_independent.unwrap_or(false)
+    }
+
+    /// Exact cookie names included as bounded shared-template key dimensions.
+    #[must_use]
+    pub fn template_cache_key_cookies(&self) -> &[String] {
+        self.template_cache_key_cookies
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Exact cookie names whose presence disqualifies shared-template caching.
+    #[must_use]
+    pub fn template_cache_bypass_cookies(&self) -> &[String] {
+        self.template_cache_bypass_cookies
+            .as_deref()
+            .unwrap_or_default()
     }
 
     /// Headers the cache key covers, per operator config.
@@ -455,11 +478,16 @@ impl CreativeOpportunitiesConfig {
     /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
     /// blank but consumed by a default path or `{network_id}` template; when a
     /// slot has an invalid identifier, page pattern set, format list, or
-    /// dimensions; when `template_cache_max_age_seconds` falls outside 1–86,400;
+    /// dimensions; when cookie policy names are invalid, duplicated, or overlapping;
+    /// when `template_cache_max_age_seconds` falls outside 1–86,400;
     /// when a `{section}` template lacks a valid
     /// [`section_root`](Self::section_root); or when configured values make a
     /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
+        crate::cookies::template_cache_policy::validate_cookie_names(
+            self.template_cache_key_cookies(),
+            self.template_cache_bypass_cookies(),
+        )?;
         if self
             .template_cache_max_age_seconds
             .is_some_and(|seconds| !(1..=MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS).contains(&seconds))
@@ -1353,6 +1381,8 @@ mod tests {
             assembly_mode: None,
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
+            template_cache_key_cookies: None,
+            template_cache_bypass_cookies: None,
             origin_is_cookie_independent: None,
             section_segment: None,
             slot: vec![slot],
@@ -1755,6 +1785,8 @@ mod tests {
             assembly_mode: None,
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
+            template_cache_key_cookies: None,
+            template_cache_bypass_cookies: None,
             origin_is_cookie_independent: None,
             section_segment: None,
             slot: Vec::new(),
@@ -2130,6 +2162,83 @@ mod tests {
                 .expect_err("authorization must not enter shared-template cache keys");
             assert!(err.contains("Authorization"), "unexpected error: {err}");
         }
+    }
+
+    #[test]
+    fn template_cookie_config_accepts_independent_lists_and_preserves_omission() {
+        for policy in [
+            "",
+            "template_cache_key_cookies = []\ntemplate_cache_bypass_cookies = []",
+            "template_cache_key_cookies = [\"ab_bucket\"]",
+            "template_cache_bypass_cookies = [\"session\"]",
+            "template_cache_key_cookies = [\"ab_bucket\"]\ntemplate_cache_bypass_cookies = []",
+            "template_cache_key_cookies = []\ntemplate_cache_bypass_cookies = [\"session\"]",
+            "template_cache_key_cookies = [\"ab_bucket\", \"Session\"]\ntemplate_cache_bypass_cookies = [\"session\"]",
+        ] {
+            let config: CreativeOpportunitiesConfig =
+                toml::from_str(&format!("gam_network_id = \"99999\"\n{policy}"))
+                    .expect("should deserialize optional cookie policies");
+            config
+                .validate_runtime()
+                .expect("should accept valid cookie names");
+            assert!(
+                !config.origin_is_cookie_independent(),
+                "should retain conservative default"
+            );
+            let serialized = serde_json::to_value(&config).expect("should serialize configuration");
+            for field in [
+                "template_cache_key_cookies",
+                "template_cache_bypass_cookies",
+            ] {
+                assert_eq!(
+                    serialized.get(field).is_some(),
+                    policy.contains(field),
+                    "should preserve omitted fields"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn template_cookie_config_rejects_invalid_duplicate_and_overlapping_names() {
+        for field in [
+            "template_cache_key_cookies",
+            "template_cache_bypass_cookies",
+        ] {
+            for names in [
+                vec![""],
+                vec!["bad name"],
+                vec!["a=b"],
+                vec!["a;b"],
+                vec!["é"],
+                vec!["a\t"],
+                vec!["a", "a"],
+            ] {
+                let value = serde_json::json!({"gam_network_id": "99999", (field): names});
+                let config: CreativeOpportunitiesConfig = serde_json::from_value(value)
+                    .expect("should deserialize names before validation");
+                let error = config
+                    .validate_runtime()
+                    .expect_err("should reject invalid or repeated cookie names");
+                assert!(
+                    error.contains(field),
+                    "should identify invalid policy field"
+                );
+            }
+        }
+        let config: CreativeOpportunitiesConfig = serde_json::from_value(serde_json::json!({
+            "gam_network_id": "99999",
+            "template_cache_key_cookies": ["session"],
+            "template_cache_bypass_cookies": ["session"]
+        }))
+        .expect("should deserialize overlapping lists before validation");
+        assert!(
+            config
+                .validate_runtime()
+                .expect_err("should reject overlapping policies")
+                .contains("session"),
+            "should identify overlapping name"
+        );
     }
 
     #[test]

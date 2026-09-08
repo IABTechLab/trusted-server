@@ -1,6 +1,6 @@
 # Per-cookie Template Cache Policy Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Separate bounded cookie-selected HTML variants in the shared template cache and route session-bearing requests inline while preserving conservative defaults.
 
@@ -19,13 +19,52 @@
 - Read `CLAUDE.md` before implementation. Use @superpowers:test-driven-development
   for behavior changes and @superpowers:verification-before-completion before
   success claims or commits. Use @superpowers:systematic-debugging for failures.
-- This document is a plan, not evidence that code or tests have run. All checkboxes
-  start unchecked. Proposed Rust below must receive normal imports, documentation,
-  formatting, and verification when installed in source.
+- The task text records the implementation steps; the execution record below
+  reports actual validation. Completed steps are checked. Rust sketches retain
+  their planning form; source contains the reviewed implementation with imports,
+  documentation, and formatting.
 - Only the completed feature is deployable. Intermediate commits may introduce
   configuration or data types before the runtime consumer is connected.
 - Do not change unrelated cookie helpers, error types, cache backends, origin
   request headers, template schema version, or final-response privacy behavior.
+
+## Execution record
+
+Implemented on `feature/1138-per-cookie-template-cache-policy` and independently
+reviewed for specification compliance and code quality. Runtime, tests, and docs
+are committed together after full verification, consolidating the task-level
+commit suggestions above. Fingerprint assertions live alongside the cookie-policy
+publisher regressions so they also verify cache invalidation across settings.
+
+The existing diagnostics preparation was found to sanitize Cookie fields before
+both generic parsing and the policy gate. Its behavior is preserved; raw parser
+and evaluator regressions explicitly enter the already-prepared request boundary,
+with a separate regression for normal preparation. The specification and Task 6
+record this boundary. Cookie values are also redacted from `Debug` output.
+
+Verification completed:
+
+| Check                                           | Result                                                                                                                       |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Initial key isolation regression                | Failed with cookie encoding absent, then passed with encoding                                                                |
+| Initial configuration and evaluator regressions | Failed before implementation, then passed                                                                                    |
+| Initial key-only publisher regression           | Failed under the old blanket gate, then passed                                                                               |
+| A/B mutation removing cookie key dimensions     | Failed when arm B incorrectly hit arm A; implementation restored                                                             |
+| New cookie-policy tests                         | 20 passed                                                                                                                    |
+| `cargo test-fastly`                             | Passed: 170 Fastly adapter, 2,476 core, 2 JS Rust, 21 OpenRTB tests; doc tests passed; existing ignored tests remain ignored |
+| `cargo test-axum`                               | Passed: 38 tests                                                                                                             |
+| `cargo test-cloudflare`                         | Passed: 40 tests                                                                                                             |
+| `cargo test-spin`                               | Passed: 80 tests                                                                                                             |
+| Integration parity                              | 13 passed                                                                                                                    |
+| Six target-specific Clippy aliases              | All passed                                                                                                                   |
+| Rust formatting                                 | Passed                                                                                                                       |
+| JS build, Vitest, JS formatting                 | Passed; 45 test files, 893 tests                                                                                             |
+| Docs formatting and diff whitespace             | Passed                                                                                                                       |
+
+Viceroy required access to the macOS certificate keychain, and two Axum tests
+required loopback socket binding. Initial sandbox restrictions were resolved by
+rerunning those commands with the required access; no product changes were made
+for the environment. No merge, push, or deployment is part of this implementation.
 
 ## File map
 
@@ -70,7 +109,7 @@ After each completed runtime task, run the relevant target-matched suite; run
 `crates/trusted-server-core/src/publisher.rs`, and
 `crates/trusted-server-adapter-fastly/src/template_cache.rs`.
 
-- [ ] **1.1 Verify the pre-change key contract.** Reuse the existing
+- [x] **1.1 Verify the pre-change key contract.** Reuse the existing
       `rendered_key_is_fixed_size_and_contains_no_request_material` test beside
       `platform::template_cache::tests::key`. Its pinned literal is
       `ts-template-cache-v4-54431eb4ea82644d6378717a8c3f18302fafbf739e684598da79e392b16900a6`.
@@ -78,13 +117,13 @@ After each completed runtime task, run the relevant target-matched suite; run
       and verify it passes on the old code. Keep the same expected value after adding
       empty cookie dimensions; do not duplicate the fixture or derive the expected
       key with the new implementation under test.
-- [ ] **1.2 Add failing key-isolation tests.** Use the common prefix
+- [x] **1.2 Add failing key-isolation tests.** Use the common prefix
       `template_cookie_key_` for tests comparing changed values/names, absent versus
       present-empty, quoted versus unquoted values, and two cookie dimensions. Verify
       adding a dimension changes the key, while URL/global surrogate keys stay equal.
       Run `cargo test-fastly template_cookie_key_` and confirm failure before the
       encoder is extended.
-- [ ] **1.3 Add the public domain type and field.** Follow existing platform API
+- [x] **1.3 Add the public domain type and field.** Follow existing platform API
       visibility and documentation conventions:
 
   ```rust
@@ -101,7 +140,7 @@ After each completed runtime task, run the relevant target-matched suite; run
   publisher/evaluator owns sorting; the encoder consumes the supplied order as
   the existing header encoder does.
 
-- [ ] **1.4 Extend canonical encoding after the complete existing header section.**
+- [x] **1.4 Extend canonical encoding after the complete existing header section.**
       Reuse the existing length-prefix `push` helper:
 
   ```rust
@@ -128,11 +167,11 @@ After each completed runtime task, run the relevant target-matched suite; run
   unchanged. Distinct framing of names and values must prevent concatenation
   collisions; add a test with differently partitioned names/values.
 
-- [ ] **1.5 Update every literal with `cookie_values: Vec::new()`.** Locate them
+- [x] **1.5 Update every literal with `cookie_values: Vec::new()`.** Locate them
       with `rg -n 'TemplateCacheKey \{' crates --glob '*.rs'`. This includes the
       current publisher production constructor temporarily; Task 4 replaces its empty
       value with evaluated dimensions. Do not change adapter algorithms.
-- [ ] **1.6 Verify and commit.** Run `cargo test-fastly template_cookie_key_`,
+- [x] **1.6 Verify and commit.** Run `cargo test-fastly template_cookie_key_`,
       `cargo test-fastly rendered_key_is_fixed_size_and_contains_no_request_material`,
       `cargo test-fastly`, and
       `cargo fmt --all -- --check`. Expected: isolation tests and legacy fixture pass,
@@ -146,7 +185,7 @@ After each completed runtime task, run the relevant target-matched suite; run
 `crates/trusted-server-core/src/cookies/template_cache_policy.rs`, and explicit
 configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
 
-- [ ] **2.1 Add config tests with prefix `template_cookie_config_`.** Deserialize
+- [x] **2.1 Add config tests with prefix `template_cookie_config_`.** Deserialize
       TOML with omitted fields, explicit empty fields, each list independently, and
       both lists. Verify missing fields serialize without either new JSON key and
       that `origin_is_cookie_independent` still defaults false. Reject empty names,
@@ -154,7 +193,7 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
       exact-name overlap. Accept `session` and `Session` as distinct names. Retain the
       existing header `Cookie`/`Authorization` rejection tests. Run
       `cargo test-fastly template_cookie_config_` and confirm the pre-feature failure.
-- [ ] **2.2 Add fields and borrowed accessors.** Place them alongside the current
+- [x] **2.2 Add fields and borrowed accessors.** Place them alongside the current
       template cache fields and update boolean documentation to scoped semantics:
 
   ```rust
@@ -170,7 +209,7 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
   materialize absent options. Add `None` fields to existing struct literals;
   locate them with `rg -n 'CreativeOpportunitiesConfig \{' crates`.
 
-- [ ] **2.3 Create shared name validation.** Add
+- [x] **2.3 Create shared name validation.** Add
       `pub(crate) mod template_cache_policy;` to `cookies.rs`. In that child module,
       define the reusable predicate below and a validation entry point:
 
@@ -212,7 +251,7 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
   `Settings::validate` conversion into `Report<TrustedServerError>`; do not invent
   a new error stack for this helper. Expand the validation method's error docs.
 
-- [ ] **2.4 Verify and commit.** Run
+- [x] **2.4 Verify and commit.** Run
       `cargo test-fastly template_cookie_config_`,
       `cargo test-fastly template_cache_vary_rejects_invalid_header_names`,
       `cargo test-fastly`, and `cargo fmt --all -- --check`.
@@ -223,14 +262,14 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
 
 **File:** `crates/trusted-server-core/src/cookies/template_cache_policy.rs`.
 
-- [ ] **3.1 Add decision-matrix tests before implementation.** Use prefix
+- [x] **3.1 Add decision-matrix tests before implementation.** Use prefix
       `template_cookie_policy_` and raw `http::HeaderMap` fixtures. Cover both boolean
       states; both lists empty; either list alone with the other omitted/resolved
       empty; both lists active; key-only requests; unknown cookies; empty bypass
       cookies; bypass mixed with a key cookie; and case-sensitive names. Test the
       evaluator directly so early publisher validation cannot mask a parser test.
       Run `cargo test-fastly template_cookie_policy_` to observe the missing behavior.
-- [ ] **3.2 Implement an admitted/bypassed result.** Keep it internal:
+- [x] **3.2 Implement an admitted/bypassed result.** Keep it internal:
 
   ```rust
   pub(crate) enum TemplateCookieDecision {
@@ -325,14 +364,14 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
   every admitted request must have validated every field. Only key-cookie values
   are owned in the result; parsed unlisted values remain borrowed and temporary.
 
-- [ ] **3.3 Add malformed/ambiguous-input tests.** Cover repeated fields, duplicate
+- [x] **3.3 Add malformed/ambiguous-input tests.** Cover repeated fields, duplicate
       names across/within fields (equal and different values), empty fields/pairs,
       trailing semicolons, bare names, bad quoting, forbidden bytes, additional `=`,
       percent escapes, and quoted/unquoted representations. Assert `name= ` becomes
       present-empty, while `name =A` and `name= A` bypass. Input ordering and header
       splitting must not change eligible sorted dimensions. Under an empty policy,
       all of these inputs retain the old header-presence/boolean decision.
-- [ ] **3.4 Run evaluator tests and the Fastly suite.** Run
+- [x] **3.4 Run evaluator tests and the Fastly suite.** Run
       `cargo test-fastly template_cookie_policy_` then `cargo test-fastly`. Expected:
       policy matrix and raw-byte cases pass. Finish Task 4 before committing this
       runtime helper so production consumes it without unused-code lint allowances.
@@ -341,7 +380,7 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
 
 **File:** `crates/trusted-server-core/src/publisher.rs`.
 
-- [ ] **4.1 Add failing key-only and bypass-only integration tests.** Use prefix
+- [x] **4.1 Add failing key-only and bypass-only integration tests.** Use prefix
       `template_cookie_publisher_` inside `template_cache_end_to_end_tests`. Reuse
       `settings_with_mode`, `navigation_request`, `MemoryTemplateCache`, and `run_via`.
       A key-only request with independence false must be eligible, which fails under
@@ -349,7 +388,7 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
       lookup or store, which fails under the old gate. Repeat with the unused list
       explicitly empty. Run `cargo test-fastly template_cookie_publisher_` before
       replacing the gate and confirm these behavioral failures.
-- [ ] **4.2 Replace the blanket cookie check at the existing pre-fetch point.**
+- [x] **4.2 Replace the blanket cookie check at the existing pre-fetch point.**
       Obtain list slices and the boolean from `settings.creative_opportunities`, using
       `&[]`, `&[]`, and false when the table is absent. Call the evaluator exactly once:
 
@@ -372,14 +411,14 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
   key inside `request_can_use_shared_template.then(...)`. Leave all other gate
   predicates and the earlier `handle_request_cookies(&req)?` call untouched.
 
-- [ ] **4.3 Verify cache-call and inline behavior.** For both cold and warm cache,
+- [x] **4.3 Verify cache-call and inline behavior.** For both cold and warm cache,
       compare `lookups`, `stored_keys`, and origin-request counts before/after the
       session request. The warm test must first prove the anonymous response actually
       stored a template. Bypass adds zero lookups/reservations/stores and one origin
       request. Inspect `X-TS-Template-Cache`, `X-TS-Assembly`, and finalized body to
       prove existing inline/private behavior. Run both `Finalizer::Streaming` and
       `Finalizer::Buffered` for representative bypass cases.
-- [ ] **4.4 Verify and commit Tasks 3–4 together.** Run
+- [x] **4.4 Verify and commit Tasks 3–4 together.** Run
       `cargo test-fastly template_cookie_policy_`,
       `cargo test-fastly template_cookie_publisher_`, `cargo test-fastly`, and
       `cargo fmt --all -- --check`. Commit only the parser and publisher changes as
@@ -389,7 +428,7 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
 
 **File:** `crates/trusted-server-core/src/publisher.rs`.
 
-- [ ] **5.1 Reproduce the original header-only failure in a regression.** Configure
+- [x] **5.1 Reproduce the original header-only failure in a regression.** Configure
       key cookie `ab_bucket`, header dimension `x-exp-variant`, and independence true.
       Keep that header absent on every incoming request. Queue distinguishable
       shareable HTML bodies `arm-A` and `arm-B`, both declaring
@@ -399,24 +438,24 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
       Briefly run the test with cookie dimensions omitted from key construction to
       prove it detects cross-serving, then restore the implementation and rerun.
       Do not commit the deliberate regression.
-- [ ] **5.2 Cover absence, empty values, and unknown-cookie policy.** Missing
+- [x] **5.2 Cover absence, empty values, and unknown-cookie policy.** Missing
       `ab_bucket` and `ab_bucket=` store/hit separate bodies. With independence false,
       a configured key cookie alone shares, while adding an unknown cookie bypasses.
       With independence true, unknown cookie changes do not fragment a variant.
       Repeat meaningful cases with both lists configured to prove session bypass wins.
-- [ ] **5.3 Cover response refusal under the new configuration.** With valid keyed
+- [x] **5.3 Cover response refusal under the new configuration.** With valid keyed
       requests and otherwise public fresh HTML, verify no store for `Vary: Cookie`
       (case variations and repeated fields), `Vary: *`, uncovered
       `X-Exp-Variant`, and origin `Set-Cookie`. A cookie dimension alone must not count
       as header coverage. Preserve the existing gate tests for authorization,
       freshness, GET-only admission, and inline mode; do not duplicate their complete
       matrices unnecessarily.
-- [ ] **5.4 Verify readers remain separate after a warm hit.** Adapt the existing
+- [x] **5.4 Verify readers remain separate after a warm hit.** Adapt the existing
       bidding/finalization tests to run two readers in the same keyed variant and
       prove shared stored bytes remain reader-neutral while final output is private
       and uses per-request assembly. At least the A/B test must run through both
       `run_via` finalizers so storage and warm-hit rendering are exercised.
-- [ ] **5.5 Verify and commit.** Name the new tests with the
+- [x] **5.5 Verify and commit.** Name the new tests with the
       `template_cookie_publisher_` prefix, then run
       `cargo test-fastly template_cookie_publisher_`,
       `cargo test-fastly template_cache_gate_tests`, `cargo test-fastly`, and
@@ -427,30 +466,36 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
 **Files:** `crates/trusted-server-core/src/publisher.rs` and
 `crates/trusted-server-core/src/creative_opportunities.rs` tests.
 
-- [ ] **6.1 Preserve the selected-header error.** Build a Cookie `HeaderValue` from
+- [x] **6.1 Preserve the selected-header error.** Build a Cookie `HeaderValue` from
       raw bytes that `to_str()` rejects, place it in the selected field, and assert the
-      publisher retains `InvalidHeaderValue`. Use a narrow fallible test runner or
+      publisher retains `InvalidHeaderValue` at the already-prepared request boundary.
+      Set the existing default `GptDiagnosticsRequestDecision` extension in a narrow
+      test helper to exercise the idempotent preparation path: ordinary preparation
+      otherwise removes unsupported fields before generic cookie parsing. Use a narrow fallible test runner or
       call the handler with the existing harness setup; the current `run` helper
       expects success and must not be used to assert an error. Do not change its
       behavior for existing tests. Assert no cache call occurs and no template stores.
-- [ ] **6.2 Distinguish later-field input.** Send a valid selected field followed
+- [x] **6.2 Distinguish later-field input.** Send a valid selected field followed
       by a later field with the same unsupported bytes. Under a named policy, the
       request reaching the evaluator must bypass and use existing inline processing.
       Test a warm and cold cache, and prove the later field is not silently ignored.
       Separately test ASCII malformed pairs and duplicate names that reach the gate.
-- [ ] **6.3 Pin policy fingerprinting.** Extend `template_fingerprint_tests` to
+      Use the same prepared-request helper for raw-field cases, then add a normal
+      preparation test proving that existing removal of invalid fields/empty pairs
+      remains unchanged and identical forwarded cookie inputs share a template.
+- [x] **6.3 Pin policy fingerprinting.** Extend `template_fingerprint_tests` to
       show that adding/changing either cookie list changes the fingerprint. Compare
       serialization of omitted-field fixtures against their pre-change shape, and
       verify explicit-empty versus omitted fields have equal runtime decisions even
       if fingerprints differ. Reuse one memory cache across two settings snapshots to
       show a changed key/bypass policy cannot read an old template under the old key.
-- [ ] **6.4 Verify default compatibility.** Retain existing
+- [x] **6.4 Verify default compatibility.** Retain existing
       `by_default_a_cookie_bearing_request_uses_no_shared_cache` and
       `a_declared_cookie_independent_origin_lets_repeat_visitors_share` tests. Test
       both lists explicitly empty under both boolean values and assert old behavior.
       Raw unsupported bytes belong in evaluator tests for legacy policy decisions;
       they do not imply the publisher bypasses its earlier validation.
-- [ ] **6.5 Verify and commit.** Run
+- [x] **6.5 Verify and commit.** Run
       `cargo test-fastly template_cookie_publisher_`,
       `cargo test-fastly template_fingerprint_tests`,
       `cargo test-fastly template_cookie_config_`, `cargo test-fastly`, and
@@ -461,23 +506,23 @@ configuration fixtures in `crates/trusted-server-core/src/publisher.rs`.
 **Files:** `docs/guide/configuration.md`, `trusted-server.example.toml`, and the
 spec/plan status checkboxes when appropriate.
 
-- [ ] **7.1 Update operator examples.** Add commented optional lists alongside
+- [x] **7.1 Update operator examples.** Add commented optional lists alongside
       existing template cache settings. Describe bounded values, exact-case names,
       bypass-on-presence including empty values, unlisted-cookie boolean behavior,
       and conservative opt-in parsing. Include key-only A/B and bypass-only session
       examples, using fictional values and domains only.
-- [ ] **7.2 Explain the downstream header contract.** Show why a header created
+- [x] **7.2 Explain the downstream header contract.** Show why a header created
       after TS cannot alone distinguish variants. The example must include both
       `ab_bucket` and `x-exp-variant` in their respective lists. Explain that
       `Vary: Cookie` always refuses storage and that cookie configuration does not
       automatically cover a named header. Avoid implying the drift guard verifies
       downstream transformations or checks cached hits against current origin policy.
-- [ ] **7.3 Document safe rollback.** Add both fields to the existing list that
+- [x] **7.3 Document safe rollback.** Add both fields to the existing list that
       must be removed before loading configuration into older binaries. Even empty
       fields are unknown to those binaries. When removing policies for a
       cookie-dependent origin, set independence false or disable ESI. Explain
       fingerprint invalidation and existing purge tools without adding new tooling.
-- [ ] **7.4 Verify and commit.** Run `npm run format` from `docs`, and
+- [x] **7.4 Verify and commit.** Run `npm run format` from `docs`, and
       `git diff --check` from root. If formatting fails, use the installed Prettier on
       only changed Markdown files and rerun the check. Commit
       `Document per-cookie template cache policy and rollback`.
@@ -486,11 +531,11 @@ spec/plan status checkboxes when appropriate.
 
 **Files:** Only fixes directly required by the feature and validation evidence.
 
-- [ ] **8.1 Inspect the final diff against the feature base.** Check that no raw
+- [x] **8.1 Inspect the final diff against the feature base.** Check that no raw
       cookie values enter logging, metric labels, diagnostics, or cache Debug output.
       Verify the full Cookie header is never a dimension, no origin headers are
       mutated, and no user-shaped identity field is introduced as an implicit key.
-- [ ] **8.2 Run the full repository CI command set.** Execute each command and
+- [x] **8.2 Run the full repository CI command set.** Execute each command and
       record its actual result. Independent target commands may run concurrently if
       Cargo locking/resource usage is acceptable; do not mistake a queued build for
       a passing check.
@@ -528,11 +573,11 @@ spec/plan status checkboxes when appropriate.
   failures, record the exact command and error. Do not claim the full gate passed.
   Use target-specific aliases; do not substitute all-feature workspace commands.
 
-- [ ] **8.3 Request an independent implementation review.** Use
+- [x] **8.3 Request an independent implementation review.** Use
       @superpowers:requesting-code-review with this plan, the spec, the base commit,
       final diff, and actual validation results. Resolve concrete findings and rerun
       affected checks; repeat broader checks only when the changes justify it.
-- [ ] **8.4 Mark completed tasks and report evidence.** Summarize variant isolation,
+- [x] **8.4 Mark completed tasks and report evidence.** Summarize variant isolation,
       session bypass, unchanged defaults/response guards, and any validation limits.
       Commit only intended changes. Confirm branch and working-tree state with
       `git status --short --branch`. Publishing a PR or deploying follows the user's

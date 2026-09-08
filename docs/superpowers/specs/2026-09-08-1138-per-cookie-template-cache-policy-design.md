@@ -1,6 +1,6 @@
 # Per-cookie shared-template cache policy
 
-Status: Proposed specification for review; implementation will follow on the same feature branch.
+Status: Implemented and independently reviewed; validation results are recorded in the implementation plan.
 
 Issue: [#1138](https://github.com/IABTechLab/trusted-server/issues/1138).
 
@@ -140,6 +140,13 @@ fragment the cache; this change does not add admission or cardinality controls.
 Evaluate the policy at the existing pre-fetch request gate, against all `Cookie`
 fields in the request that is about to be forwarded to the publisher origin.
 
+Preserve existing request preparation. In particular, GPT diagnostics preparation
+removes its reserved cookie, drops fields that fail `to_str()`, removes empty
+pairs, and combines retained pairs before generic cookie handling. The policy
+classifies the resulting origin inputs; it does not recover or classify removed
+browser bytes. Raw-header tests must also exercise the already-prepared request
+boundary so earlier sanitization does not mask evaluator coverage.
+
 When both configured lists are empty, retain the exact existing decision:
 
 ```text
@@ -221,7 +228,8 @@ For the named-policy path:
   duplicates differently; this design does not choose first or last wins.
 - For requests reaching this evaluator, malformed input or an unsupported byte
   sequence causes cache bypass. The evaluator introduces no new request error.
-  Existing earlier validation errors remain unchanged: the publisher calls
+  Existing earlier validation errors remain unchanged for fields surviving
+  preparation: the publisher calls
   `handle_request_cookies` before the cache gate, and failure of `to_str()` on its
   selected header still returns the existing `InvalidHeaderValue` error. An
   invalid later field that earlier parsing does not inspect must cause bypass
@@ -381,6 +389,9 @@ lookup/reservation/store counts, origin requests, and rendered response content:
    Separately preserve the existing error for a selected header that fails
    `to_str()`, and prove that invalid bytes in a later field bypass rather than
    being ignored by the evaluator. Neither path may access or store a template.
+   Exercise these raw-field cases at the already-prepared request boundary, and
+   separately verify that normal diagnostics preparation retains its existing
+   sanitization and keys the actual forwarded cookies.
 6. `Vary: Cookie` refuses storage under the new policy, including combined header
    lists. An uncovered downstream header still refuses storage even with a
    configured cookie dimension.

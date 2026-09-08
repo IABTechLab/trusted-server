@@ -1679,9 +1679,9 @@ the mode but safely fall back to the inline transform on every request. This is
 not a top-level HTTP cache hit: Compute still runs and the final assembled
 response is always `Cache-Control: private, no-store`.
 
-All four keys below belong directly under `[creative_opportunities]`. They are
+All keys below belong directly under `[creative_opportunities]`. They are
 one feature contract: `assembly_mode` selects how creative-opportunity state is
-delivered, while the other three constrain when and how long that mode may share
+delivered, while the other keys constrain when and how long that mode may share
 its template.
 They are not a general top-level HTTP-cache configuration.
 
@@ -1702,8 +1702,12 @@ template_cache_vary = [
 # The origin's remaining edge freshness may make the actual lifetime shorter.
 template_cache_max_age_seconds = 1200
 
-# Default false. Enable only after proving publisher HTML ignores Cookie.
-origin_is_cookie_independent = true
+# Optional bounded variant and personal-session policies; omitted means empty.
+template_cache_key_cookies = ["ab_bucket"]
+template_cache_bypass_cookies = ["session"]
+
+# Default false. Enable only after proving unlisted cookies do not change HTML.
+origin_is_cookie_independent = false
 ```
 
 The cache fails closed. A template is stored only for a `GET` with a processable
@@ -1748,12 +1752,79 @@ for each reader with `Vary: Accept-Encoding`. This assumes the origin's
 compression negotiation does. Do not enable ESI for an origin that changes the
 document's meaning based on `Accept-Encoding`. Never put `Cookie` or
 `Authorization` in `template_cache_vary`; startup rejects both because raw cookie
-or credential values are not reader-neutral template dimensions. With
-`origin_is_cookie_independent = false` (the safe default), all cookie-bearing
-requests bypass. With it set to `true`, an origin `Vary: Cookie` still overrides
-the assertion and refuses storage. Every other name the origin emits in `Vary`
+or credential values are not reader-neutral template dimensions. An origin
+`Vary: Cookie` always refuses storage, including when a named cookie policy is
+configured or `origin_is_cookie_independent` is `true`.
+Every other name the origin emits in `Vary`
 must appear in the configured list; an uncovered name safely refuses template
 storage.
+
+The optional cookie lists control both template lookup and storage:
+
+- `template_cache_key_cookies` includes each named cookie's presence and value in
+  the template key. Use bounded, reader-neutral variants such as experiment arms
+  or region buckets, never account IDs, session tokens, or TS identity IDs. Missing
+  and empty values select different variants. Multiple names form a combined variant.
+- `template_cache_bypass_cookies` forces inline processing whenever any named
+  cookie is present, including an empty value such as `session=`. This applies
+  regardless of the independence assertion or any key cookies in the request.
+- When either list is nonempty, `origin_is_cookie_independent` applies only to
+  unlisted cookies. The safe default, `false`, bypasses requests containing any
+  unlisted cookie; `true` asserts that those cookies do not change origin HTML.
+  TS identity and consent cookies have no implicit exception.
+- When both lists are omitted or empty, the existing all-cookie behavior remains:
+  `false` bypasses every request carrying a `Cookie` header; `true` asserts that
+  all cookies are irrelevant to origin HTML.
+
+Cookie names match exactly and case-sensitively: `session` and `Session` are
+different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
+non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
+within a list, and overlap between lists. Wildcards, prefixes, and regular
+expressions are not supported. With either list nonempty, strict parsing of all
+`Cookie` fields after existing request preparation also bypasses ambiguous or nonconforming inputs, including
+duplicate cookie names or malformed values. Cookie values are not exposed in
+cache diagnostics. There is no value allowlist or cardinality limit, so operators
+must ensure keyed values stay bounded and account for every origin HTML dependency.
+
+If a downstream CDN translates `ab_bucket=A` into `X-Exp-Variant: A` after the
+request passes TS, configure both dimensions:
+
+```toml
+[creative_opportunities]
+assembly_mode = "esi"
+# Retain any other header dimensions required by the origin.
+template_cache_vary = ["x-exp-variant"]
+template_cache_key_cookies = ["ab_bucket"]
+template_cache_bypass_cookies = ["session"]
+# Only after verifying that all remaining cookies leave origin HTML unchanged.
+origin_is_cookie_independent = true
+```
+
+The cookie dimension separates experiment arms at TS even when the header is
+absent there; the header dimension covers the origin's `Vary: X-Exp-Variant`.
+Configuring the header alone cannot distinguish these readers. TS cannot verify
+the downstream mapping or discover other inputs selecting origin HTML. During a
+canary, check correct content for each arm, absent and empty experiment values,
+and session-bearing requests, as well as cache diagnostics.
+
+The lists can also be used independently within `[creative_opportunities]`. For
+experiment-only HTML, omit the bypass list:
+
+```toml
+template_cache_vary = ["x-exp-variant"]
+template_cache_key_cookies = ["ab_bucket"]
+origin_is_cookie_independent = true
+```
+
+For anonymous sharing with a logged-in population, omit the key list:
+
+```toml
+template_cache_bypass_cookies = ["session"]
+origin_is_cookie_independent = true
+```
+
+Both examples require the same assertion that unlisted cookies do not change
+origin HTML and retain all other ESI eligibility and header-coverage requirements.
 
 For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
 `miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
@@ -1777,9 +1848,14 @@ Rollback must preserve configuration compatibility:
 
 1. Change `assembly_mode` to `inline` and deploy/push that configuration.
 2. Before rolling back to a binary that predates these fields, remove
-   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`,
+   `template_cache_key_cookies`, `template_cache_bypass_cookies`, and
    `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
-   use `deny_unknown_fields` and intentionally reject unknown keys.
+   use `deny_unknown_fields` and intentionally reject unknown keys, even empty lists.
+   When rolling back only the named-cookie feature to a binary that supports ESI,
+   remove both cookie-list fields and keep `origin_is_cookie_independent = false`
+   or disable ESI if the origin depends on cookies. Keeping `true` after removing
+   the lists loses variant separation and session bypass.
 3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
    tooling, or wait for the bounded origin-derived lifetime to expire.
 

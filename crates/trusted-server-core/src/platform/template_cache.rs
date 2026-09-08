@@ -67,6 +67,8 @@ pub struct TemplateCacheKey {
     /// order the origin listed them. Not a fixed list: the origin is authoritative,
     /// and hard-coding one here would silently drift when the origin's changes.
     pub vary_values: Vec<VaryHeaderValues>,
+    /// Bounded cookie variants, sorted by exact case-sensitive name. Never reader IDs.
+    pub cookie_values: Vec<TemplateCookieValue>,
     /// Digest of every setting that can shape the transformed template plus the tsjs
     /// bundle. Over-invalidating is safe; omitting a shaping input cross-serves bytes.
     pub template_fingerprint: String,
@@ -121,6 +123,24 @@ impl TemplateCacheKey {
             }
         }
 
+        if !self.cookie_values.is_empty() {
+            push(&mut canonical, b"cookie-variants-v1");
+            push(
+                &mut canonical,
+                &(self.cookie_values.len() as u64).to_be_bytes(),
+            );
+            for cookie in &self.cookie_values {
+                push(&mut canonical, cookie.name.as_bytes());
+                match &cookie.value {
+                    None => push(&mut canonical, b"absent"),
+                    Some(value) => {
+                        push(&mut canonical, b"present");
+                        push(&mut canonical, value);
+                    }
+                }
+            }
+        }
+
         let digest = sha2::Sha256::digest(canonical);
         format!(
             "ts-template-cache-v{}-{}",
@@ -154,6 +174,27 @@ impl TemplateCacheKey {
 fn digest_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
     hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// One bounded cookie variant selecting a reader-neutral template.
+///
+/// Names are case-sensitive. Values preserve raw bytes and quotes; `None` is absent,
+/// while `Some(Vec::new())` is present-empty. Debug output deliberately omits values.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TemplateCookieValue {
+    /// Exact configured cookie name.
+    pub name: String,
+    /// Raw cookie value, or `None` when absent.
+    pub value: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for TemplateCookieValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TemplateCookieValue")
+            .field("name", &self.name)
+            .field("present", &self.value.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// One configured `Vary` input exactly as it appeared on the request.
@@ -743,6 +784,7 @@ mod tests {
                 name: "rsc".to_string(),
                 values: Some(vec![b"1".to_vec()]),
             }],
+            cookie_values: Vec::new(),
             template_fingerprint: "abc123".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
         }
@@ -891,6 +933,70 @@ mod tests {
                 "key leaked `{sensitive}`: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn template_cookie_key_separates_names_presence_and_raw_values() {
+        let base = key();
+        let variants = [
+            ("ab_bucket", None),
+            ("ab_bucket", Some(b"".as_slice())),
+            ("ab_bucket", Some(b"A".as_slice())),
+            ("ab_bucket", Some(b"B".as_slice())),
+            ("ab_bucket", Some(b"\"A\"".as_slice())),
+            ("AB_bucket", Some(b"A".as_slice())),
+            ("ab", Some(b"bucketA".as_slice())),
+        ];
+        let mut keys = HashSet::from([base.to_cache_key()]);
+        for (name, value) in variants {
+            let mut variant = base.clone();
+            variant.cookie_values.push(TemplateCookieValue {
+                name: name.to_string(),
+                value: value.map(<[u8]>::to_vec),
+            });
+            assert!(
+                keys.insert(variant.to_cache_key()),
+                "should distinguish cookie dimensions"
+            );
+            assert_eq!(
+                variant.surrogate_keys(),
+                base.surrogate_keys(),
+                "should purge all URL variants together"
+            );
+        }
+        let mut combined = base.clone();
+        combined.cookie_values = vec![
+            TemplateCookieValue {
+                name: "ab_bucket".to_string(),
+                value: Some(b"A".to_vec()),
+            },
+            TemplateCookieValue {
+                name: "region".to_string(),
+                value: Some(b"west".to_vec()),
+            },
+        ];
+        assert!(
+            keys.insert(combined.to_cache_key()),
+            "should include every cookie dimension"
+        );
+        combined.cookie_values[1].value = Some(b"east".to_vec());
+        assert!(
+            keys.insert(combined.to_cache_key()),
+            "should distinguish secondary variants"
+        );
+    }
+
+    #[test]
+    fn template_cookie_key_debug_redacts_values() {
+        let cookie = TemplateCookieValue {
+            name: "ab_bucket".to_string(),
+            value: Some(b"private-value".to_vec()),
+        };
+        assert_eq!(
+            format!("{cookie:?}"),
+            "TemplateCookieValue { name: \"ab_bucket\", present: true, .. }",
+            "should expose no cookie values in diagnostics"
+        );
     }
 
     #[test]

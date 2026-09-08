@@ -301,7 +301,7 @@ auction_timeout_ms = 500
 # Initial-page delivery mode (spike/experimental). `inline` is the default and
 # current production behaviour; `esi` is an opt-in Fastly Core Cache experiment
 # storing an inert comment in a shared, reader-neutral template cache. See
-# docs/guide/configuration.md before enabling. This and the three cache-safety
+# docs/guide/configuration.md before enabling. This and the cache-safety
 # keys below belong in this [creative_opportunities] table.
 # assembly_mode = "inline"
 # Request headers (besides Accept-Encoding) the origin may name in Vary. Every
@@ -316,10 +316,23 @@ auction_timeout_ms = 500
 # Safety ceiling (seconds) for one shared template; TS uses the smaller of this
 # and the origin-authorized remaining edge freshness. Default 60; range 1-86400.
 # template_cache_max_age_seconds = 1200
-# Unsafe unless independently verified: excludes cookie-bearing requests from the
-# template cache by default. Set true only when origin HTML is byte-independent
-# of Cookie; an origin `Vary: Cookie` is still refused.
+# Optional exact, case-sensitive cookie names; omitted and empty lists are equal.
+# Key bounded variants only, never account, session, or TS identity IDs.
+# Absent and empty values select different variants. No cardinality limit exists.
+# template_cache_key_cookies = ["ab_bucket"]
+# Presence, including session=, bypasses template lookup and storage.
+# template_cache_bypass_cookies = ["session"]
+# With either list nonempty, false bypasses unlisted cookies; true asserts those
+# cookies do not change origin HTML. No identity or consent cookie is exempt.
+# With both lists empty, false bypasses all Cookie headers, as before.
+# An origin `Vary: Cookie` is always refused, regardless of these settings.
 # origin_is_cookie_independent = false
+# Invalid names, duplicates, and cross-list overlap reject configuration.
+# Named policies bypass ambiguous/nonconforming Cookie fields, including duplicates.
+# If a downstream CDN maps ab_bucket to X-Exp-Variant, also add x-exp-variant to
+# template_cache_vary; that header alone cannot separate arms at TS.
+# Rollback: older binaries reject both new fields even as empty lists. Remove
+# both fields AND restore independence=false or disable ESI when HTML uses cookies.
 #
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id

@@ -57,6 +57,7 @@ use crate::cache_policy::{
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
+use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
 use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
@@ -4279,20 +4280,27 @@ pub async fn handle_publisher_request(
             .is_none_or(|marker| !marker.matches(req.headers())),
         _ => true,
     };
-    let request_had_cookie = req.headers().contains_key(header::COOKIE);
-    // Whether carrying a cookie is itself disqualifying. Computed once and used for both
-    // the lookup and the store, so the two cannot drift apart.
-    //
-    // The conservative default disqualifies every cookie-bearing request, which is very
-    // nearly a disable switch — TS sets its own identity cookie, so essentially every
-    // repeat visitor carries one. An operator who knows their origin ignores cookies can
-    // say so; the `Vary: Cookie` drift guard still refuses the response if the origin
-    // ever contradicts them.
-    let cookie_disqualifies = request_had_cookie
-        && !settings
-            .creative_opportunities
-            .as_ref()
-            .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
+    // Classify cookies once before the origin consumes the request. The same decision
+    // governs lookup and storage, so a bypass cookie can never read a warm template.
+    let (key_cookie_names, bypass_cookie_names, cookie_independent) = settings
+        .creative_opportunities
+        .as_ref()
+        .map_or((&[][..], &[][..], false), |config| {
+            (
+                config.template_cache_key_cookies(),
+                config.template_cache_bypass_cookies(),
+                config.origin_is_cookie_independent(),
+            )
+        });
+    let (cookie_disqualifies, cookie_values) = match evaluate_cookie_policy(
+        req.headers(),
+        key_cookie_names,
+        bypass_cookie_names,
+        cookie_independent,
+    ) {
+        TemplateCookieDecision::Bypass => (true, Vec::new()),
+        TemplateCookieDecision::Eligible(values) => (false, values),
+    };
     let suppress_datadome_client_side_tag = req
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
@@ -4379,6 +4387,7 @@ pub async fn handle_publisher_request(
                 .map(CreativeOpportunitiesConfig::template_cache_vary)
                 .unwrap_or_else(|| VarySpec::new([]))
                 .values_from(req.headers()),
+            cookie_values,
             template_fingerprint: template_fingerprint(settings),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
@@ -5696,14 +5705,11 @@ pub(crate) enum TemplateCacheBypassReason {
     /// `Content-Encoding` while returning the untouched bytes on the fallback route.
     #[display("origin content encoding is not supported by the template transform")]
     UnsupportedContentEncoding,
-    /// The request carried a `Cookie`, which TS forwards to origin unchanged — there
-    /// is no `Cookie` strip on the publisher path. Cookie-personalized HTML is
-    /// therefore cross-servable unless the origin declares `Vary: Cookie` or marks
-    /// those responses private, and a response can be personalized without carrying
-    /// `Set-Cookie` itself when the session was established earlier. Named in §4 of
-    /// the design doc; disqualifying until the origin's `Vary` is verified to cover
-    /// it.
-    #[display("request carried Cookie and the origin's Vary does not cover it")]
+    /// The prepared request's cookies are disqualified by the configured policy.
+    ///
+    /// Named bypass cookies, unlisted cookies without an independence assertion,
+    /// or ambiguous input under a named policy prohibit both lookup and storage.
+    #[display("request cookies disqualified by template cache policy")]
     CookieForwarded,
     /// The origin varies on a header the cache key does not cover.
     ///
@@ -8850,6 +8856,7 @@ mod tests {
                 origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
                 assembly_mode: AssemblyMode::Esi,
                 vary_values: vec![],
+                cookie_values: Vec::new(),
                 template_fingerprint: "fp".to_string(),
                 schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
             }
@@ -11435,6 +11442,667 @@ mod tests {
                 .expect("should build cookie-bearing request")
         }
 
+        fn cookie_policy_settings(
+            key_names: Option<&[&str]>,
+            bypass_names: Option<&[&str]>,
+            independent: bool,
+        ) -> Arc<Settings> {
+            let mut settings = settings_with_mode("esi");
+            let config = settings
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure opportunities");
+            config.template_cache_key_cookies =
+                key_names.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            config.template_cache_bypass_cookies =
+                bypass_names.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            config.origin_is_cookie_independent = Some(independent);
+            config
+                .validate_runtime()
+                .expect("should validate cookie policy fixture");
+            Arc::new(settings)
+        }
+
+        fn cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            for field in fields {
+                request.headers_mut().append(
+                    header::COOKIE,
+                    HeaderValue::from_bytes(field).expect("should build cookie field"),
+                );
+            }
+            request
+        }
+
+        // Exercise raw fields at the prepared-request boundary. Ordinary diagnostics
+        // preparation removes invalid fields/empty pairs before generic cookie handling.
+        fn prepared_cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
+            let mut request = cookie_policy_request(fields);
+            request.extensions_mut().insert(
+                crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::default(),
+            );
+            request
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_key_only_admits_listed_cookies() {
+            for unused in [None, Some([].as_slice())] {
+                let settings = cookie_policy_settings(Some(&["ab_bucket"]), unused, false);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                queue_shareable_html(&stub);
+                queue_shareable_html(&stub);
+                for _ in 0..2 {
+                    let _ = body_of(
+                        run(
+                            &settings,
+                            &services,
+                            cookie_policy_request(&[b"ab_bucket=A"]),
+                        )
+                        .await,
+                    )
+                    .await;
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "should share a listed-only variant even with independence false"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should store one variant"
+                );
+                let lookups = looked_up_cache_keys(&cache).len();
+                let _ = body_of(
+                    run(
+                        &settings,
+                        &services,
+                        cookie_policy_request(&[b"ab_bucket=A; unknown=1"]),
+                    )
+                    .await,
+                )
+                .await;
+                assert_eq!(
+                    looked_up_cache_keys(&cache).len(),
+                    lookups,
+                    "should bypass for any unlisted cookie"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should not store an unlisted-cookie response"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "should fetch unlisted-cookie origin HTML"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_session_bypasses_warm_and_cold_cache() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                for unused in [None, Some([].as_slice()), Some(["ab_bucket"].as_slice())] {
+                    for warm in [false, true] {
+                        let settings = cookie_policy_settings(unused, Some(&["session"]), true);
+                        let stub = Arc::new(StubHttpClient::new());
+                        let cache = Arc::new(MemoryTemplateCache::default());
+                        let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                        if warm {
+                            queue_shareable_html(&stub);
+                            let _ = body_of(
+                                run_via(
+                                    &settings,
+                                    &services,
+                                    cookie_policy_request(&[b"ab_bucket=A; ts-ec=reader"]),
+                                    finalizer,
+                                )
+                                .await,
+                            )
+                            .await;
+                            assert_eq!(
+                                stored_cache_keys(&cache).len(),
+                                1,
+                                "should warm an anonymous template first"
+                            );
+                        }
+                        let lookups = looked_up_cache_keys(&cache).len();
+                        let stores = stored_cache_keys(&cache).len();
+                        for session in [b"session=".as_slice(), b"session=token".as_slice()] {
+                            stub.push_response_with_headers(
+                                200,
+                                b"<html><head></head><body>personal-account</body></html>".to_vec(),
+                                vec![
+                                    ("content-type", "text/html"),
+                                    ("cache-control", "public, max-age=300"),
+                                ],
+                            );
+                            let response = run_via(
+                                &settings,
+                                &services,
+                                cookie_policy_request(&[b"ab_bucket=A; ts-ec=reader", session]),
+                                finalizer,
+                            )
+                            .await;
+                            assert_eq!(
+                                response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                                "bypass-request",
+                                "should report request bypass"
+                            );
+                            assert!(
+                                !response.headers().contains_key(HEADER_X_TS_ASSEMBLY),
+                                "should omit shared-assembly diagnostics on inline responses"
+                            );
+                            assert!(
+                                String::from_utf8(body_of(response).await)
+                                    .expect("should decode HTML")
+                                    .contains("personal-account"),
+                                "should render this request's origin HTML"
+                            );
+                        }
+                        assert_eq!(
+                            looked_up_cache_keys(&cache).len(),
+                            lookups,
+                            "should never look up or reserve for session requests"
+                        );
+                        assert_eq!(
+                            stored_cache_keys(&cache).len(),
+                            stores,
+                            "should never store session HTML"
+                        );
+                        assert_eq!(
+                            stub.recorded_request_uris().len(),
+                            usize::from(warm) + 2,
+                            "should fetch every session request"
+                        );
+                        assert!(
+                            cache
+                                .entries
+                                .lock()
+                                .expect("should lock templates")
+                                .values()
+                                .all(|entry| !String::from_utf8_lossy(&entry.body)
+                                    .contains("personal-account")),
+                            "should keep personal bytes out of templates"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_downstream_variants_remain_separate() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let mut settings =
+                    cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+                Arc::make_mut(&mut settings)
+                    .creative_opportunities
+                    .as_mut()
+                    .expect("should configure opportunities")
+                    .template_cache_vary = Some(vec!["x-exp-variant".to_string()]);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                for arm in ["A", "B"] {
+                    stub.push_response_with_headers(
+                        200,
+                        format!("<html><head></head><body>arm-{arm}</body></html>").into_bytes(),
+                        vec![
+                            ("content-type", "text/html"),
+                            ("cache-control", "public, max-age=300"),
+                            ("vary", "X-Exp-Variant"),
+                        ],
+                    );
+                }
+                for (index, arm) in ["A", "B", "A", "B"].iter().enumerate() {
+                    let cookies = format!("ab_bucket={arm}; ts-ec=reader{index}");
+                    let request = cookie_policy_request(&[cookies.as_bytes()]);
+                    assert!(
+                        !request.headers().contains_key("x-exp-variant"),
+                        "should reproduce downstream-only header topology"
+                    );
+                    let response = run_via(&settings, &services, request, finalizer).await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        if index < 2 { "miss-stored" } else { "hit" },
+                        "should share within each arm"
+                    );
+                    assert!(
+                        response.headers()[header::CACHE_CONTROL]
+                            .to_str()
+                            .expect("should read cache control")
+                            .contains("private"),
+                        "should keep assembled output private"
+                    );
+                    let html =
+                        String::from_utf8(body_of(response).await).expect("should decode HTML");
+                    assert!(
+                        html.contains(&format!("arm-{arm}")),
+                        "should render the correct experiment arm"
+                    );
+                    assert!(
+                        !html.contains(if *arm == "A" { "arm-B" } else { "arm-A" }),
+                        "should never cross-serve arms"
+                    );
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "should skip origin on both warm arms"
+                );
+                let stored = stored_cache_keys(&cache);
+                assert_eq!(stored.len(), 2, "should store two variants");
+                assert_ne!(stored[0], stored[1], "should distinguish arms in the key");
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_absent_and_empty_are_separate() {
+            let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for variant in ["absent", "empty"] {
+                stub.push_response_with_headers(
+                    200,
+                    format!("<html><head></head><body>variant-{variant}</body></html>")
+                        .into_bytes(),
+                    vec![
+                        ("content-type", "text/html"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+            }
+            for (field, expected) in [
+                (b"ts-ec=reader1".as_slice(), "absent"),
+                (b"ab_bucket=".as_slice(), "empty"),
+                (b"ts-ec=reader2".as_slice(), "absent"),
+                (b"ab_bucket=; ts-ec=reader3".as_slice(), "empty"),
+            ] {
+                let html = String::from_utf8(
+                    body_of(run(&settings, &services, cookie_policy_request(&[field])).await).await,
+                )
+                .expect("should decode HTML");
+                assert!(
+                    html.contains(&format!("variant-{expected}")),
+                    "should preserve absent versus empty variants"
+                );
+            }
+            assert_eq!(
+                stored_cache_keys(&cache).len(),
+                2,
+                "should store both presence variants"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "should hit both variants without origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_response_guards_remain_effective() {
+            for guard in [
+                vec![("vary", "Cookie")],
+                vec![("vary", "X-Exp-Variant"), ("vary", "cOoKiE")],
+                vec![("vary", "X-Exp-Variant, Cookie")],
+                vec![("vary", "*")],
+                vec![("vary", "uncovered-header")],
+                vec![("set-cookie", "origin=value")],
+            ] {
+                let mut settings =
+                    cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+                Arc::make_mut(&mut settings)
+                    .creative_opportunities
+                    .as_mut()
+                    .expect("should configure opportunities")
+                    .template_cache_vary = Some(vec!["x-exp-variant".to_string()]);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let mut response_headers = vec![
+                    ("content-type", "text/html"),
+                    ("cache-control", "public, max-age=300"),
+                ];
+                response_headers.extend(guard);
+                for _ in 0..2 {
+                    stub.push_response_with_headers(
+                        200,
+                        b"<html><head></head><body>origin</body></html>".to_vec(),
+                        response_headers.clone(),
+                    );
+                    let response = run(
+                        &settings,
+                        &services,
+                        cookie_policy_request(&[b"ab_bucket=A"]),
+                    )
+                    .await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        "bypass-response",
+                        "should preserve origin response restrictions"
+                    );
+                    let _ = body_of(response).await;
+                }
+                assert!(
+                    stored_cache_keys(&cache).is_empty(),
+                    "should never store a disqualified response"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "should fetch each disqualified response"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_malformed_later_fields_and_duplicates_bypass() {
+            for fields in [
+                vec![b"ab_bucket=A".as_slice(), b"unknown=\xff".as_slice()],
+                vec![b"ab_bucket=A".as_slice(), b"ab_bucket=B".as_slice()],
+                vec![b"ab_bucket=A; unknown=1; unknown=1".as_slice()],
+                vec![b"ab_bucket=A; broken".as_slice()],
+                vec![b"ab_bucket=A;".as_slice()],
+                vec![b"ab_bucket=A".as_slice(), b"".as_slice()],
+            ] {
+                for warm in [false, true] {
+                    let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+                    let stub = Arc::new(StubHttpClient::new());
+                    let cache = Arc::new(MemoryTemplateCache::default());
+                    let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                    if warm {
+                        queue_shareable_html(&stub);
+                        let _ = body_of(
+                            run(
+                                &settings,
+                                &services,
+                                cookie_policy_request(&[b"ab_bucket=A"]),
+                            )
+                            .await,
+                        )
+                        .await;
+                        assert_eq!(
+                            stored_cache_keys(&cache).len(),
+                            1,
+                            "should warm cache before malformed input"
+                        );
+                    }
+                    let lookups = looked_up_cache_keys(&cache).len();
+                    let stores = stored_cache_keys(&cache).len();
+                    queue_shareable_html(&stub);
+                    let response = run(
+                        &settings,
+                        &services,
+                        prepared_cookie_policy_request(&fields),
+                    )
+                    .await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        "bypass-request",
+                        "should bypass malformed fields reaching the evaluator"
+                    );
+                    let _ = body_of(response).await;
+                    assert_eq!(
+                        looked_up_cache_keys(&cache).len(),
+                        lookups,
+                        "should never look up ambiguous input"
+                    );
+                    assert_eq!(
+                        stored_cache_keys(&cache).len(),
+                        stores,
+                        "should never store ambiguous input"
+                    );
+                    assert_eq!(
+                        stub.recorded_request_uris().len(),
+                        usize::from(warm) + 1,
+                        "should forward requests accepted by earlier validation"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_selected_invalid_header_keeps_existing_error() {
+            let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut ec_context =
+                EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+            let error = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                prepared_cookie_policy_request(&[b"ab_bucket=\xff"]),
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .err()
+            .expect("should retain the existing selected-header error");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::InvalidHeaderValue { .. }
+                ),
+                "should preserve the existing error type"
+            );
+            assert!(
+                looked_up_cache_keys(&cache).is_empty(),
+                "should not reach shared lookup"
+            );
+            assert!(
+                stored_cache_keys(&cache).is_empty(),
+                "should not store invalid requests"
+            );
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "should retain earlier rejection before origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_uses_cookies_after_existing_preparation() {
+            let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, false);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            // Normal preparation strips invalid fields and empty pairs before origin
+            // forwarding. Preserve it; the cache policy sees the prepared request.
+            let cold = run(
+                &settings,
+                &services,
+                cookie_policy_request(&[b"ab_bucket=A;", b"unknown=\xff"]),
+            )
+            .await;
+            assert_eq!(
+                cold.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                "miss-stored",
+                "should classify the cookies actually forwarded"
+            );
+            let _ = body_of(cold).await;
+            let warm = run(
+                &settings,
+                &services,
+                cookie_policy_request(&[b"ab_bucket=A"]),
+            )
+            .await;
+            assert_eq!(
+                warm.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                "hit",
+                "should share identical prepared origin inputs"
+            );
+            let _ = body_of(warm).await;
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should preserve existing request preparation"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_empty_lists_keep_legacy_behavior() {
+            for independent in [false, true] {
+                let settings = cookie_policy_settings(Some(&[]), Some(&[]), independent);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                for _ in 0..2 {
+                    queue_shareable_html(&stub);
+                    let _ =
+                        body_of(run(&settings, &services, cookie_navigation_request()).await).await;
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    if independent { 1 } else { 2 },
+                    "should retain legacy boolean eligibility"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    usize::from(independent),
+                    "should preserve legacy storage"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_policy_changes_invalidate_templates() {
+            let first = cookie_policy_settings(None, None, true);
+            let second = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            let third = cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+            assert_ne!(
+                template_fingerprint(&first),
+                template_fingerprint(&second),
+                "should fingerprint the key policy"
+            );
+            assert_ne!(
+                template_fingerprint(&second),
+                template_fingerprint(&third),
+                "should fingerprint the bypass policy"
+            );
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for settings in [&first, &second, &third] {
+                queue_shareable_html(&stub);
+                let _ = body_of(
+                    run(
+                        settings,
+                        &services,
+                        cookie_policy_request(&[b"ab_bucket=A"]),
+                    )
+                    .await,
+                )
+                .await;
+            }
+            let keys = stored_cache_keys(&cache);
+            assert_eq!(
+                keys.len(),
+                3,
+                "should store a fresh entry under each policy"
+            );
+            assert_ne!(keys[0], keys[1], "should not reuse pre-policy templates");
+            assert_ne!(
+                keys[1], keys[2],
+                "should not reuse entries admitted under another bypass policy"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                3,
+                "should fetch after each policy change"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_warm_variant_runs_fresh_reader_assembly() {
+            let mut raw = settings_with_bidder("esi");
+            let config = raw
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure opportunities");
+            config.template_cache_key_cookies = Some(vec!["ab_bucket".to_string()]);
+            config.origin_is_cookie_independent = Some(true);
+            let settings = Arc::new(raw);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for (index, field) in [
+                b"ab_bucket=A; ts-ec=reader1".as_slice(),
+                b"ab_bucket=A; ts-ec=reader2".as_slice(),
+            ]
+            .iter()
+            .enumerate()
+            {
+                queue_bid_response(&stub);
+                if index == 0 {
+                    queue_shareable_html(&stub);
+                }
+                let response =
+                    run_bidding(&settings, &services, cookie_policy_request(&[field])).await;
+                assert!(
+                    response.headers()[header::CACHE_CONTROL]
+                        .to_str()
+                        .expect("should read cache policy")
+                        .contains("private"),
+                    "should keep reader output private"
+                );
+                let document =
+                    String::from_utf8(body_of(response).await).expect("should decode document");
+                assert_eq!(
+                    seam_bids(&document)
+                        .get("test-slot")
+                        .and_then(|bid| bid.get("hb_pb"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("3.50"),
+                    "should assemble this request's winning bid"
+                );
+            }
+            let requests = stub.recorded_request_uris();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|uri| uri.contains("/article"))
+                    .count(),
+                1,
+                "should fetch one shared origin template"
+            );
+            assert_eq!(
+                requests.len(),
+                3,
+                "should run a fresh auction on each reader request"
+            );
+            let entries = cache.entries.lock().expect("should lock templates");
+            assert_eq!(entries.len(), 1, "should share within a variant");
+            let stored = String::from_utf8_lossy(
+                &entries
+                    .values()
+                    .next()
+                    .expect("should store a template")
+                    .body,
+            );
+            assert!(
+                stored.contains(AD_ASSEMBLY_SEAM),
+                "should keep the unresolved reader assembly marker"
+            );
+            for reader_bytes in ["reader1", "reader2", "window.tsjs", "hb_pb"] {
+                assert!(
+                    !stored.contains(reader_bytes),
+                    "should exclude per-reader state from stored bytes"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn by_default_a_cookie_bearing_request_uses_no_shared_cache() {
             // The shipped default, and the reason the cache is nearly inert on real
@@ -13234,6 +13902,8 @@ mod tests {
                 assembly_mode: None,
                 template_cache_vary: None,
                 template_cache_max_age_seconds: None,
+                template_cache_key_cookies: None,
+                template_cache_bypass_cookies: None,
                 origin_is_cookie_independent: None,
                 section_segment: None,
                 slot: vec![slot()],
@@ -18451,6 +19121,8 @@ mod tests {
                 assembly_mode: None,
                 template_cache_vary: None,
                 template_cache_max_age_seconds: None,
+                template_cache_key_cookies: None,
+                template_cache_bypass_cookies: None,
                 origin_is_cookie_independent: None,
                 section_segment: None,
                 slot: Vec::new(),

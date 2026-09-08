@@ -64,8 +64,8 @@ pub use template_cache::{
     PlatformTemplateCache, PlatformTemplateCacheReservation, REPLAYABLE_POLICY_HEADERS,
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
     TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
-    TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
-    VaryHeaderValues, VarySpec,
+    TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
+    UnavailableTemplateCache, VaryHeaderValues, VarySpec,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
