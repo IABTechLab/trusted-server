@@ -162,6 +162,20 @@ pull_sync_concurrency = 3
 # mode = "restrictive"            # "restrictive" | "newest" | "permissive"
 # freshness_threshold_days = 30
 
+[integrations.js_asset_proxy]
+enabled = false
+# Uncomment to override upstream cache headers for every asset below.
+# This replaces upstream directives, including private and no-store.
+# Use only when each asset's bytes are identical for every visitor.
+# cache_ttl_seconds = 3600
+# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets
+# that vary by browser User-Agent or use integrity hashes for UA-specific bytes.
+
+[[integrations.js_asset_proxy.assets]]
+path = "/assets/example-vendor-loader.js"
+origin_url = "https://cdn.example.com/vendor-loader.js"
+proxy = "enabled"
+
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
 # Verify TLS certs when proxying to HTTPS origins (default true; false only for
@@ -566,7 +580,21 @@ enabled = false
 # Invalid placeholder on purpose: enabling GTM without a real GTM-XXXXXX id
 # fails validation. `ts audit` overwrites this when it detects a real container.
 container_id = "GTM-REPLACE-ME"
+# Must be a credential-free https bare origin with a literal host: no path,
+# query, fragment, `user:pass@` or wildcard. Targets are built by appending a
+# rooted path to this value, so anything beyond an origin corrupts them.
 # upstream_url = "https://tags.example.com"
+# Tag ids the `gtag/js` path may serve from your own origin, in addition to
+# `container_id`. A request naming any other tag id is redirected to the
+# upstream instead, so this origin never serves a container you did not
+# choose. The visitor loads that tag from the upstream directly, which a
+# `script-src` that does not list the upstream origin will block.
+#
+# Set this if your pages load gtag with a measurement id separate from the
+# container above (a GA4 `G-`, Ads `AW-` or Merchant Center `MC-` id). A tag
+# that is missing here also loses the ad-blocker resilience this integration
+# provides. Find the ids by grepping your rendered HTML for `gtag/js?id=`.
+# allowed_tag_ids = ["G-EXAMPLE1", "AW-000000", "MC-EXAMPLE1"]
 
 # Mock ad server used for auction mediation in dev/testing.
 # [integrations.adserver_mock]

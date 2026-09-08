@@ -90,8 +90,9 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -140,7 +141,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
+    config_key, config_store_name, get_settings_from_config_store,
 };
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
@@ -172,14 +173,16 @@ pub(crate) struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
-pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(load_settings_from_config_store()?)
+pub(crate) fn build_state(env: &EnvConfig) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_from_settings(load_settings_from_config_store(env)?)
 }
 
-pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
+pub(crate) fn load_settings_from_config_store(
+    env: &EnvConfig,
+) -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = config_store_name(env);
+    let key = config_key(env);
+    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &key)
 }
 
 pub(crate) fn build_state_from_settings(
@@ -457,6 +460,13 @@ fn build_ec_request_state(
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
+                // Orphan-recovery eligibility is intentionally left false here.
+                // Authorizing it during generic pre-routing would let named
+                // routes and request-filter short circuits (e.g. a DataDome
+                // challenge) reach EC finalization and rotate an identity off a
+                // non-publisher response. It is granted only inside the
+                // publisher fallback, after filters pass and the origin start
+                // succeeds — see `dispatch_fallback`.
                 (context, None)
             }
             Err(report) => (EcContext::default(), Some(report)),
@@ -715,7 +725,7 @@ async fn run_named_route(
                 &state.orchestrator,
                 ec.kv_graph.as_ref(),
                 registry_ref,
-                &ec.ec_context,
+                &mut ec.ec_context,
                 &consent_services,
                 req,
             )
@@ -754,7 +764,7 @@ async fn run_named_route(
                 &consent_services,
                 ec.kv_graph.as_ref(),
                 auction,
-                &ec.ec_context,
+                &mut ec.ec_context,
                 req,
             )
             .await
@@ -930,8 +940,8 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        if ec.is_real_browser
-            && is_navigation_request(&req)
+        let is_publisher_navigation = ec.is_real_browser && is_navigation_request(&req);
+        if is_publisher_navigation
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -975,6 +985,14 @@ async fn dispatch_fallback(
                         .await
                         {
                             Ok(pub_response) => {
+                                // Origin start succeeded on the sole publisher-
+                                // page path: authorize orphan recovery now, and
+                                // only for real-browser document navigations.
+                                // Restricting it here keeps identity rotation
+                                // within the publisher-navigation boundary —
+                                // named routes, integration proxies, and filter
+                                // short circuits never reach this point.
+                                ec.ec_context.set_recovery_eligible(is_publisher_navigation);
                                 publisher_response_into_streaming_response(
                                     pub_response,
                                     &method,
@@ -1402,15 +1420,15 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
-    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
-        let (router, state) = Self::router_with_state();
+    pub(crate) fn build_app_with_state(env: &EnvConfig) -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state(env);
         let mut app = App::with_name(router, Self::name());
         Self::configure(&mut app);
         (app, state)
     }
 
-    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
-        let state = match build_state() {
+    fn router_with_state(env: &EnvConfig) -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state(env) {
             Ok(state) => state,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
@@ -1473,7 +1491,17 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        Self::router_with_state().0
+        Self::router_with_state(&EnvConfig::from_env()).0
+    }
+
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: "trusted_server_config",
+                ids: &["trusted_server_config"],
+            }),
+            ..StoresMetadata::default()
+        }
     }
 }
 
@@ -1493,6 +1521,7 @@ mod tests {
     };
     use base64::Engine as _;
     use bytes::Bytes;
+    use edgezero_core::app::{Hooks as _, StoreMetadata};
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::{
@@ -1636,6 +1665,21 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn trusted_server_app_declares_config_store_metadata() {
+        let stores = TrustedServerApp::stores();
+
+        assert_eq!(
+            stores.config,
+            Some(StoreMetadata {
+                default: "trusted_server_config",
+                ids: &["trusted_server_config"],
+            })
+        );
+        assert_eq!(stores.kv, None);
+        assert_eq!(stores.secrets, None);
     }
 
     #[test]
@@ -3721,6 +3765,49 @@ mod tests {
         );
     }
 
+    fn recovery_eligible_of(response: &Response) -> bool {
+        response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("response should carry EcFinalizeState")
+            .ec_context
+            .recovery_eligible()
+    }
+
+    fn browser_navigation_request(path: &str) -> edgezero_core::http::Request {
+        let uri = format!("https://test-publisher.com{path}");
+        let mut req = request_builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("sec-fetch-dest", "document")
+            .body(Body::empty())
+            .expect("should build request");
+        req.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        req
+    }
+
+    #[test]
+    fn named_route_response_is_not_recovery_eligible() {
+        // Orphan recovery must never be authorized on a named route: it is not a
+        // publisher-page navigation, so a missing KV row must not rotate the
+        // identity there.
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "named-route responses must not authorize orphan recovery"
+        );
+    }
+
     #[test]
     fn server_timing_absent_on_cacheable_responses() {
         // tsjs route policy: public, long max-age, immutable.
@@ -3748,6 +3835,25 @@ mod tests {
     }
 
     #[test]
+    fn filter_short_circuit_response_is_not_recovery_eligible() {
+        // A request-filter short circuit (e.g. a DataDome challenge/block) must
+        // not authorize orphan recovery even for a would-be publisher
+        // navigation: no publisher page was served.
+        let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
+        let response = route(&router, browser_navigation_request("/some-page"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the challenge filter should short-circuit routing"
+        );
+        assert!(
+            !recovery_eligible_of(&response),
+            "a short-circuit filter response must not authorize orphan recovery"
+        );
+    }
+
+    #[test]
     fn preexisting_server_timing_values_survive() {
         let mut response = response_builder()
             .header("cache-control", "private, no-store")
@@ -3767,6 +3873,20 @@ mod tests {
         assert!(
             header.contains("ts-total"),
             "should append the TS-owned set: {header}"
+        );
+    }
+
+    #[test]
+    fn publisher_navigation_origin_start_failure_is_not_recovery_eligible() {
+        // Recovery is authorized only after a successful origin start. With no
+        // live backend the publisher origin fails, so even a real-browser
+        // document navigation must leave recovery unauthorized.
+        let router = test_router();
+        let response = route(&router, browser_navigation_request("/some-page"));
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "an origin-start failure must not authorize orphan recovery"
         );
     }
 }
