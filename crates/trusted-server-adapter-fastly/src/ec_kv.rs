@@ -100,7 +100,7 @@ impl EcKvStore for FastlyEcKvStore {
                 return Err(
                     Report::new(err).change_context(TrustedServerError::KvStore {
                         store_name: self.store_name.clone(),
-                        message: format!("Failed to read key '{}'", log_id(key),),
+                        message: format!("Failed to read key '{}'", log_id(key)),
                     }),
                 );
             }
@@ -173,7 +173,7 @@ impl EcKvStore for FastlyEcKvStore {
             .execute()
             .change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to list keys with prefix '{}'", log_id(prefix),),
+                message: format!("Failed to list keys with prefix '{}'", log_id(prefix)),
             })?;
 
         #[allow(clippy::cast_possible_truncation)]
