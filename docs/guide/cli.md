@@ -574,14 +574,21 @@ host-only, root-path cookies; HTTPS targets also mark them Secure. Verification
 refuses cookies when URLs span multiple origins. The quiet settle window must
 not exceed the maximum.
 
-The settle window bounds each wait phase rather than the whole page, so
-`--settle-max-ms` is paid once for the initial settle, again for the optional
-post-scroll settle, and again in generation for a final wait that lets the GPT
-slot registry stop changing before it is read. Verification performs no such
-GPT wait: its evidence collector is injected ahead of publisher scripts and
-records each slot as it is defined, so it has nothing to wait for. Lowering
-`--settle-max-ms` shortens every phase; raising it is what to reach for when
-generation warns that slot registration was still changing.
+Generation shares one `--settle-max-ms` budget across the initial settle,
+optional post-scroll settle, and final GPT registry wait. The clock starts after
+navigation, immediately before the initial settle; scrolling and evidence reads
+also consume the remaining budget. Navigation and browser operations have their
+own timeouts, and an in-flight operation can finish after the settle budget, so
+this is not a total page deadline. Even when the budget is exhausted, generation
+takes one GPT snapshot and reports partial non-empty evidence. Two consecutive
+empty GPT polls end the wait early regardless of the budget, so increasing
+`--settle-max-ms` cannot extend that empty-registry wait; slots registered later
+may be missed. Increase the budget when generation warns that a non-empty
+registry did not stabilize.
+
+Verification applies `--settle-max-ms` separately to its initial and optional
+post-scroll settle phases. It performs no GPT wait: its evidence collector is
+injected ahead of publisher scripts and records each slot as it is defined.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform

@@ -616,7 +616,16 @@ async fn collect_open_page(
         )),
     }
 
-    if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
+    // All settle phases share one clock. Navigation has its own timeout;
+    // scrolling and evidence reads also consume the remaining settle budget.
+    let settle_start = std::time::Instant::now();
+    if !wait_for_page_settle(
+        page,
+        settings.settle_quiet,
+        settings.settle_max.saturating_sub(settle_start.elapsed()),
+    )
+    .await?
+    {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
                 .to_string(),
@@ -630,7 +639,13 @@ async fn collect_open_page(
                 .into_iter()
                 .map(|failure| failure.to_string()),
         );
-        if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
+        if !wait_for_page_settle(
+            page,
+            settings.settle_quiet,
+            settings.settle_max.saturating_sub(settle_start.elapsed()),
+        )
+        .await?
+        {
             warnings.push(
                 "browser audit timed out while waiting for the page to settle after scroll; \
                  results may be partial"
@@ -710,7 +725,7 @@ async fn collect_open_page(
     let gpt_slots = collect_stable_gpt_slots(
         page,
         settings.settle_quiet,
-        settings.settle_max,
+        settings.settle_max.saturating_sub(settle_start.elapsed()),
         &mut warnings,
     )
     .await;
@@ -1008,9 +1023,10 @@ fn gpt_registry_reading(
 /// batching, consent-gated definitions, lazy slots), so two consecutive reads
 /// can both observe the same burst and miss the next. Requiring the reading to
 /// repeat for a dwell window mirrors [`wait_for_page_settle`], and taking both
-/// the dwell and the budget from the operator's settle flags puts this phase
-/// under the same `--settle-max-ms` control as that loop — including the same
-/// tolerance, since an in-flight read may overrun the budget by its own bound.
+/// the dwell from the operator's quiet flag and the remaining shared settle
+/// budget keeps this phase under the same `--settle-max-ms` control. An
+/// in-flight read may overrun the budget by its own bound. Even an exhausted
+/// budget takes one snapshot; two consecutive empty polls end the wait early.
 ///
 /// The latest non-empty snapshot is retained, with a warning, if registration
 /// keeps changing through the budget. An empty result stays silent and
@@ -1428,30 +1444,30 @@ mod tests {
     impl Drop for GptFixtureServer {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::Relaxed);
+            // Wake the blocking accept so shutdown can join the listener thread.
+            let _ = TcpStream::connect(self.address);
             if let Some(acceptor) = self.acceptor.take() {
                 let _ = acceptor.join();
             }
         }
     }
 
-    /// Serves `html` for every request until the returned server is dropped.
+    /// Serves `html` for `GET /` until the returned server is dropped.
     fn gpt_fixture_server(html: &'static str) -> GptFixtureServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
         let address = listener.local_addr().expect("should read fixture address");
-        listener
-            .set_nonblocking(true)
-            .expect("should poll the fixture listener without blocking");
         let shutdown = Arc::new(AtomicBool::new(false));
         let acceptor_shutdown = Arc::clone(&shutdown);
         let acceptor = std::thread::spawn(move || {
             while !acceptor_shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        if acceptor_shutdown.load(Ordering::Relaxed) {
+                            return;
+                        }
                         std::thread::spawn(move || serve_gpt_fixture_connection(stream, html));
                     }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     Err(_) => return,
                 }
             }
@@ -1467,11 +1483,6 @@ mod tests {
 
     /// Answers one fixture connection, ignoring sockets that carry no request.
     fn serve_gpt_fixture_connection(mut stream: TcpStream, html: &'static str) {
-        // An accepted socket inherits the listener's non-blocking mode on some
-        // platforms; the bounded blocking read below needs it cleared.
-        if stream.set_nonblocking(false).is_err() {
-            return;
-        }
         if stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .is_err()
@@ -1493,6 +1504,14 @@ mod tests {
             }
         }
 
+        if !request.starts_with(b"GET / HTTP") {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            return;
+        }
+
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1501,16 +1520,19 @@ mod tests {
         );
     }
 
-    /// Requests `/` from a fixture server, failing if no response arrives in time.
-    fn fixture_document(address: SocketAddr) -> String {
+    /// Requests a path from a fixture server, failing if no response arrives in time.
+    fn fixture_response(address: SocketAddr, path: &str) -> String {
         let mut stream = TcpStream::connect(address).expect("should connect to the fixture server");
         // A fixture that stalls behind another connection must fail this read
         // rather than deliver the document late.
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("should bound the fixture client read");
-        write!(stream, "GET / HTTP/1.1\r\nHost: fixture.test\r\n\r\n")
-            .expect("should send the fixture request");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: fixture.example.com\r\n\r\n"
+        )
+        .expect("should send the fixture request");
         let mut response = String::new();
         stream
             .read_to_string(&mut response)
@@ -1526,7 +1548,7 @@ mod tests {
         // sending anything, and it can win the accept race with the navigation.
         drop(TcpStream::connect(fixture.address()).expect("should open a preconnect socket"));
 
-        let response = fixture_document(fixture.address());
+        let response = fixture_response(fixture.address(), "/");
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
             "should still answer the document request: {response}"
@@ -1545,7 +1567,7 @@ mod tests {
         // block the document request behind this socket's read timeout.
         let _silent = TcpStream::connect(fixture.address()).expect("should open a silent socket");
 
-        let response = fixture_document(fixture.address());
+        let response = fixture_response(fixture.address(), "/");
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
             "should answer the document request without waiting for the silent socket: {response}"
@@ -1558,13 +1580,19 @@ mod tests {
 
         // Chrome follows the document with /favicon.ico, /robots.txt and
         // /sitemap.xml probes on separate connections.
-        for _ in 0..4 {
-            let response = fixture_document(fixture.address());
-            assert!(
-                response.starts_with("HTTP/1.1 200 OK"),
-                "should answer repeated fixture connections: {response}"
+        for path in ["/favicon.ico", "/robots.txt", "/sitemap.xml"] {
+            let response = fixture_response(fixture.address(), path);
+            assert_eq!(
+                response,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "should return an empty 404 for {path}"
             );
         }
+        let response = fixture_response(fixture.address(), "/");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK") && response.ends_with(LAZY_GPT_FIXTURE),
+            "should still serve the document after speculative requests"
+        );
     }
 
     fn gpt_slot(unit_path: &str, div_id: &str) -> CollectedGptSlot {
@@ -2060,6 +2088,41 @@ mod tests {
             ],
             "collector should wait for stable registration without reordering slots"
         );
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn exhausted_page_settle_budget_still_collects_one_gpt_snapshot() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        for scroll in [false, true] {
+            let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+            let options = GenerateBrowserOpts {
+                settle_quiet_ms: 600,
+                settle_max_ms: 600,
+                ..GenerateBrowserOpts::default()
+            };
+            let collected = BrowserAuditCollector::default()
+                .with_browser_options(&options)
+                .with_scroll(scroll)
+                .collect_page(fixture.url(), &[])
+                .expect("should collect a snapshot after the shared budget expires");
+
+            assert_eq!(
+                collected.gpt_slots,
+                [gpt_slot("/123/first-batch", "ad-first-batch-0")],
+                "should take one snapshot without restarting the GPT budget (scroll={scroll})"
+            );
+            assert!(
+                collected
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("within the 0ms budget")),
+                "should report exhausted remaining GPT budget (scroll={scroll})"
+            );
+        }
     }
 
     #[test]
