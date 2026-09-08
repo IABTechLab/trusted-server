@@ -1780,9 +1780,17 @@ Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
 within a list, and overlap between lists. Wildcards, prefixes, and regular
-expressions are not supported. With either list nonempty, strict parsing of all
-`Cookie` fields after existing request preparation also bypasses ambiguous or nonconforming inputs, including
-duplicate cookie names or malformed values. Cookie values are not exposed in
+expressions are not supported. With either list nonempty, parsing of all
+`Cookie` fields after existing request preparation bypasses duplicate names,
+invalid names, and malformed key-cookie values. When independence is `true`,
+unlisted values may also contain commas and balanced double quotes, supporting
+compact JSON cookies such as `g_state` and comma-separated experiment metadata.
+Unmatched quotes, whitespace within values, backslashes, controls, non-ASCII bytes,
+and comma-separated fragments resembling another `name=value` cookie still bypass.
+The origin must parse semicolon-separated cookies independently and treat these
+unlisted values as opaque. If its parser stops at a nonstandard value or changes
+how later key cookies are interpreted, the independence assertion is not valid.
+Cookies are forwarded unchanged by this policy; their values are not exposed in
 cache diagnostics. There is no value allowlist or cardinality limit, so operators
 must ensure keyed values stay bounded and account for every origin HTML dependency.
 

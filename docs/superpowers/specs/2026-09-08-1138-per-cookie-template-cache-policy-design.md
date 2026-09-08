@@ -214,11 +214,22 @@ For the named-policy path:
   immediately before it. A bare name or remaining whitespace in the name or value
   is malformed and bypasses. Pair trimming happens first: `ab_bucket= ` becomes
   an accepted empty value, while `ab_bucket =A` and `ab_bucket= A` bypass.
-- Accept an empty value. Otherwise accept unquoted cookie-octet bytes, or a value
+- For key cookies, accept an empty value. Otherwise accept unquoted cookie-octet bytes, or a value
   enclosed by exactly one matching pair of double quotes containing cookie-octet
   bytes. Cookie-octet bytes are hexadecimal `21`, `23–2B`, `2D–3A`, `3C–5B`, and
   `5D–7E`. This excludes whitespace, controls, comma, semicolon, double quote,
   backslash, and non-ASCII bytes from the value payload.
+- For unlisted cookies only when independence is true, additionally accept commas
+  and balanced double quotes. This admits compact JSON and comma/colon lists seen
+  in browser cookies. Continue rejecting whitespace, backslashes, controls,
+  non-ASCII bytes, unmatched quotes, and comma-delimited fragments whose prefix
+  before `=` is a valid cookie name. Quotes cannot span semicolon-delimited pairs.
+  Bypass-cookie presence remains unconditional; unlisted cookies with independence
+  false still bypass regardless of value. This assumes origin cookie parsing
+  treats unlisted values as opaque and parses each semicolon-separated pair
+  independently. An origin parser that stops at nonstandard JSON could observe
+  different key cookies depending on order; that deployment cannot assert this
+  independence. The evaluator does not normalize or remove the ignored values.
 - Preserve the original value bytes, including allowed `=` characters, case,
   percent escapes, and any surrounding quotes. Do not URL-decode, unquote, or
   otherwise normalize values. Quoted and unquoted representations may use

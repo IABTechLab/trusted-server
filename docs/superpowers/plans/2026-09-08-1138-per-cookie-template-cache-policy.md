@@ -582,3 +582,21 @@ spec/plan status checkboxes when appropriate.
       Commit only intended changes. Confirm branch and working-tree state with
       `git status --short --branch`. Publishing a PR or deploying follows the user's
       subsequent instruction; neither is part of writing this plan.
+
+## Browser-cookie compatibility follow-up
+
+Live browser verification found that an unlisted compact JSON `g_state` cookie
+prevented sharing despite the independence assertion. The original Task 3 parser
+above is superseded for unlisted values by the updated spec section 6:
+
+- Keep strict key values, exact names, duplicate rejection, bypass presence, and
+  the legacy empty-policy behavior.
+- With independence enabled, tolerate commas and balanced quotes in ignored
+  values. Reject whitespace, backslashes, unsafe bytes, unmatched quotes, and
+  comma-delimited fragments resembling additional cookie assignments.
+- Document the origin-parser assumption: ignored values must not affect how
+  later configured cookies are interpreted.
+- Add evaluator coverage and publisher cold/warm coverage through both finalizers,
+  including exact origin cookie forwarding and session lookup/store bypass.
+- Verify focused regressions fail before the fix, then run the Fastly suite,
+  relevant formatting/lint checks, and repeat headless browser verification.

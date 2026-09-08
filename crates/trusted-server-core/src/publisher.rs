@@ -11924,6 +11924,77 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn template_cookie_publisher_ignores_json_without_changing_origin_cookies() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let settings =
+                    cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let cold_cookie = r#"ab_bucket=A; g_state={"enabled":true,"count":1}"#;
+                queue_shareable_html(&stub);
+                for (cookie, state) in [
+                    (cold_cookie, "miss-stored"),
+                    (r#"ab_bucket=A; g_state={"enabled":false,"count":2}"#, "hit"),
+                ] {
+                    let response = run_via(
+                        &settings,
+                        &services,
+                        cookie_policy_request(&[cookie.as_bytes()]),
+                        finalizer,
+                    )
+                    .await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        state,
+                        "should share the template despite unrelated JSON cookie changes"
+                    );
+                    let _ = body_of(response).await;
+                }
+                let forwarded = stub.recorded_request_headers();
+                assert_eq!(
+                    forwarded.len(),
+                    1,
+                    "should fetch origin only for the cold request"
+                );
+                assert_eq!(
+                    forwarded[0]
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str()))
+                        .map(|(_, value)| value.as_str())
+                        .collect::<Vec<_>>(),
+                    [cold_cookie],
+                    "should preserve the ignored cookie when forwarding to origin"
+                );
+                let lookups = looked_up_cache_keys(&cache).len();
+                queue_shareable_html(&stub);
+                let response = run_via(
+                    &settings,
+                    &services,
+                    cookie_policy_request(&[br#"ab_bucket=A; g_state={"enabled":true}; session="#]),
+                    finalizer,
+                )
+                .await;
+                assert_eq!(
+                    response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                    "bypass-request",
+                    "should honor bypass cookie presence alongside ignored JSON"
+                );
+                let _ = body_of(response).await;
+                assert_eq!(
+                    looked_up_cache_keys(&cache).len(),
+                    lookups,
+                    "should skip shared lookup for session requests"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should not store session responses"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn template_cookie_publisher_uses_cookies_after_existing_preparation() {
             let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, false);
             let stub = Arc::new(StubHttpClient::new());

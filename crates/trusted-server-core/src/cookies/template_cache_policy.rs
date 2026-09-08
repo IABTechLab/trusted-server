@@ -1,4 +1,4 @@
-//! Strict request-cookie classification for shared template caching.
+//! Request-cookie classification for shared template caching.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,7 +67,7 @@ pub(crate) fn evaluate_cookie_policy(
             };
             let (name, rest) = pair.split_at(separator);
             let value = &rest[1..];
-            if !is_cookie_name(name) || !is_cookie_value(value) {
+            if !is_cookie_name(name) {
                 return TemplateCookieDecision::Bypass;
             }
             if parsed.insert(name, value).is_some() {
@@ -76,7 +76,12 @@ pub(crate) fn evaluate_cookie_policy(
             if bypass_names.iter().any(|item| item.as_bytes() == name) {
                 return TemplateCookieDecision::Bypass;
             }
-            if !independent && !key_names.iter().any(|item| item.as_bytes() == name) {
+            let keyed = key_names.iter().any(|item| item.as_bytes() == name);
+            if keyed {
+                if !is_cookie_value(value) {
+                    return TemplateCookieDecision::Bypass;
+                }
+            } else if !independent || !is_ignored_cookie_value(value) {
                 return TemplateCookieDecision::Bypass;
             }
         }
@@ -113,6 +118,31 @@ fn trim_pair(mut pair: &[u8]) -> &[u8] {
         pair = &pair[..pair.len() - 1];
     }
     pair
+}
+
+// Unlisted cookies may use compact JSON or comma lists in real browsers. Keep
+// framing checks even though their values do not enter the key. The independence
+// assertion includes the origin parsing these ignored values as opaque: parsers
+// that stop at nonstandard values cannot safely use this assertion.
+fn is_ignored_cookie_value(value: &[u8]) -> bool {
+    let mut quoted = false;
+    for byte in value {
+        match byte {
+            b'"' => quoted = !quoted,
+            b',' => {}
+            0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e => {}
+            _ => return false,
+        }
+    }
+    if quoted {
+        return false;
+    }
+    // Do not hide another cookie from origins that also split on commas.
+    !value.split(|byte| *byte == b',').skip(1).any(|part| {
+        part.iter()
+            .position(|byte| *byte == b'=')
+            .is_some_and(|separator| is_cookie_name(&part[..separator]))
+    })
 }
 
 fn is_cookie_value(value: &[u8]) -> bool {
@@ -310,6 +340,71 @@ mod tests {
     }
 
     #[test]
+    fn template_cookie_policy_ignores_nonstandard_values_only_for_unlisted_cookies() {
+        for value in [
+            r#"{"enabled":true,"nested":{"count":1}}"#,
+            "g=16/e:experiment,s:a,ex:123",
+        ] {
+            for field in [
+                format!("ab_bucket=A; g_state={value}"),
+                format!("g_state={value}; ab_bucket=A"),
+            ] {
+                assert_eq!(
+                    evaluate_cookie_policy(
+                        &headers(&[field.as_bytes()]),
+                        &names(&["ab_bucket"]),
+                        &names(&["session"]),
+                        true
+                    ),
+                    TemplateCookieDecision::Eligible(vec![dimension("ab_bucket", Some(b"A"))]),
+                    "should ignore unrelated browser cookie values when independence is asserted"
+                );
+                for (key, bypass, independent) in [
+                    (names(&["ab_bucket"]), names(&["session"]), false),
+                    (names(&["ab_bucket", "g_state"]), names(&["session"]), true),
+                    (names(&["ab_bucket"]), names(&["g_state"]), true),
+                ] {
+                    assert_eq!(
+                        evaluate_cookie_policy(
+                            &headers(&[field.as_bytes()]),
+                            &key,
+                            &bypass,
+                            independent
+                        ),
+                        TemplateCookieDecision::Bypass,
+                        "should retain strict key values, bypass presence, and conservative independence"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn template_cookie_policy_rejects_ambiguous_ignored_values() {
+        for field in [
+            r#"ignored=x,session=login; ab_bucket=A"#,
+            r#"ignored=x,ab_bucket=B; ab_bucket=A"#,
+            r#"ignored=x,other=value; ab_bucket=A"#,
+            r#"ignored=x session=login; ab_bucket=A"#,
+            r#"ignored="; ab_bucket=A"#,
+            r#"ignored={"value":"x;session=login"}; ab_bucket=A"#,
+            r#"ignored={"value":"x\y"}; ab_bucket=A"#,
+            r#"ignored={"value":1}; ignored={"value":2}; ab_bucket=A"#,
+        ] {
+            assert_eq!(
+                evaluate_cookie_policy(
+                    &headers(&[field.as_bytes()]),
+                    &names(&["ab_bucket"]),
+                    &names(&["session"]),
+                    true
+                ),
+                TemplateCookieDecision::Bypass,
+                "should not tolerate values that obscure cookie boundaries"
+            );
+        }
+    }
+
+    #[test]
     fn template_cookie_policy_rejects_malformed_and_duplicate_fields() {
         for fields in [
             vec![b"".as_slice()],
@@ -328,7 +423,7 @@ mod tests {
             vec![b"a=\"x\"y\""],
             vec![b"a=x y"],
             vec![b"a=x\ty"],
-            vec![b"a=x,y"],
+            vec![b"ab_bucket=x,y"],
             vec![b"a=x\\y"],
             vec![b"a=\xff"],
             vec![b"\xff=1"],
