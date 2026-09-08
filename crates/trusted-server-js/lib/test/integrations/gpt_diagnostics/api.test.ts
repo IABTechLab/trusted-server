@@ -92,7 +92,9 @@ describe('GptDiagnosticsApiController', () => {
       'subscribe',
     ]);
     expect(Object.keys(controller.recorder).sort()).toEqual([
+      'recordPrebidAuction',
       'recordPrebidRefresh',
+      'recordPrebidWin',
       'recordTrustedServerCreativeFailure',
       'recordTrustedServerCreativeRequest',
       'recordTrustedServerCreativeResponse',

@@ -71,12 +71,13 @@ function diagnosticsAuctionFacts(
   generation: number,
   auctionDiagnostics: AuctionDiagnosticsData | undefined,
   bid: AuctionBidData
-): GptDiagnosticsAuctionFacts {
+): GptDiagnosticsAuctionFacts | undefined {
   const isSpaAuction = generation > 0;
   const winner =
     isNonEmptyString(bid.hb_bidder) && isNonEmptyString(bid.hb_pb)
       ? { bidder: bid.hb_bidder, priceBucket: bid.hb_pb }
       : undefined;
+  if (!winner && auctionDiagnostics === undefined) return undefined;
 
   return {
     auctionType: isSpaAuction ? 'trusted_server' : 'ssat',
@@ -1110,14 +1111,25 @@ export function installTsAdInit(): void {
           const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
           const auctionFacts = diagnosticsAuctionFacts(generation, auctionDiagnostics, bid);
-          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-            gptSlot,
-            slot.id,
-            opportunity,
-            bid.hb_auction_id,
-            requestedSlotSizes,
-            auctionFacts
-          );
+          const recorder = ts.gptDiagnosticsRecorder;
+          if (auctionFacts) {
+            recorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity,
+              bid.hb_auction_id,
+              requestedSlotSizes,
+              auctionFacts
+            );
+          } else {
+            recorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity,
+              bid.hb_auction_id,
+              requestedSlotSizes
+            );
+          }
         } catch {
           // Diagnostics must not alter ad delivery.
         }
@@ -1426,9 +1438,6 @@ export function installSpaAuctionHook(): void {
     if (path === currentPath) return;
     currentPath = path;
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
-    // Server timings belong to the route that produced them. Clear them before
-    // page-bids starts so failure or supersession cannot relabel stale offsets.
-    ts.auctionDiagnostics = undefined;
     // A route change invalidates hydration aliases before the new route's
     // publisher can define a same-prefix slot while page-bids is in flight.
     for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {

@@ -161,6 +161,10 @@ export default withMermaid(
                   text: 'GPT Runtime Diagnostics',
                   link: '/guide/integrations/gpt-diagnostics',
                 },
+                {
+                  text: 'GPT Diagnostics Label Dictionary',
+                  link: '/guide/integrations/gpt-diagnostics-dictionary',
+                },
               ],
             },
             {
