@@ -1134,6 +1134,73 @@ mod tests {
     }
 
     #[test]
+    fn finalize_rotates_when_only_a_longer_key_shares_the_orphan_prefix() {
+        // `key_exists_confirmed` gates orphan recovery as well as withdrawal.
+        // It matches whole keys, so a neighbouring key that merely starts with
+        // the orphaned ID cannot answer for it. Under the prefix count this
+        // path used before, that neighbour reported the orphan as still held
+        // and suppressed a rotation the visitor needed — the same collision
+        // this PR closes on the withdrawal path.
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("prefix");
+        let neighbour = format!("{orphan}-longer");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&neighbour, &live)
+            .expect("should seed the neighbouring row");
+        assert!(
+            !graph
+                .key_exists_confirmed(&orphan)
+                .expect("should confirm against the store"),
+            "a longer key sharing the prefix must not prove the orphan exists"
+        );
+        let mut ec_context = returning_user_context(
+            &orphan,
+            EcKvSnapshot::Missing {
+                ec_id: orphan.clone(),
+            },
+            true,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let replacement = ec_context.ec_value().expect("should rotate the orphan");
+        assert_ne!(
+            replacement, orphan,
+            "a proven-absent orphan must rotate even with a prefix neighbour present"
+        );
+        assert!(
+            graph
+                .get(replacement)
+                .expect("should read the replacement")
+                .is_some(),
+            "the replacement cookie should have a backing row"
+        );
+        assert!(
+            graph
+                .get(&neighbour)
+                .expect("should read the neighbour")
+                .is_some(),
+            "the neighbouring identity must be left untouched"
+        );
+    }
+
+    #[test]
     fn finalize_does_not_rotate_when_the_existence_check_fails() {
         // Absence is unprovable when the list itself errors. Rotation abandons a
         // year-lived identity, so it must not run on an unproven miss.
