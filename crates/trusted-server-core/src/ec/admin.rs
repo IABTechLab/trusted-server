@@ -1123,7 +1123,7 @@ mod tests {
             &KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000),
         );
         assert_eq!(
-            kv.write_withdrawal_tombstone(&ec_id)
+            kv.write_withdrawal_tombstone(&ec_id, drop)
                 .expect("should write tombstone"),
             TombstoneOutcome::Written,
             "should tombstone the seeded identity"

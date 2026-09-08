@@ -313,23 +313,16 @@ fn finalize_unusable_consent(
     // for subsequent EC behavior.
     if let Some(graph) = kv {
         apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
-            let outcome = graph.write_withdrawal_tombstone(ec_id);
-            if ec_context.ec_value() == Some(ec_id) {
-                let snapshot = match &outcome {
-                    Ok(TombstoneOutcome::Written) => EcKvSnapshot::Present {
-                        ec_id: ec_id.to_owned(),
-                        entry: Box::new(KvEntry::tombstone(current_timestamp())),
-                        generation: None,
-                    },
-                    Ok(TombstoneOutcome::UnknownIdentity) => EcKvSnapshot::Missing {
-                        ec_id: ec_id.to_owned(),
-                    },
-                    Err(_) => EcKvSnapshot::Failed {
-                        ec_id: ec_id.to_owned(),
-                    },
-                };
-                ec_context.set_kv_snapshot(snapshot);
-            }
+            // The graph hands back the post-withdrawal snapshot rather than
+            // leaving the caller to rebuild it, so post-send work that reads
+            // the context — pull sync discloses the raw EC ID to partners —
+            // sees the tombstone that was just written. Only the active ID has
+            // a snapshot in the context to correct.
+            let outcome = graph.write_withdrawal_tombstone(ec_id, |snapshot| {
+                if ec_context.ec_value() == Some(ec_id) {
+                    ec_context.set_kv_snapshot(snapshot);
+                }
+            });
             log_tombstone_outcome(ec_id, outcome);
         });
     }

@@ -134,6 +134,7 @@ impl fmt::Debug for KvIdentityGraph {
 
 /// Result of [`KvIdentityGraph::write_withdrawal_tombstone`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
 pub enum TombstoneOutcome {
     /// The identity was found and is now tombstoned.
     Written,
@@ -890,41 +891,88 @@ impl KvIdentityGraph {
     /// The strong check prevents that replication gap from losing withdrawal.
     /// An inconclusive check is reported as an error without a lookup fallback.
     ///
+    /// # Propagating the result
+    ///
+    /// A withdrawal is only half-enforced by the store write. Post-send work in
+    /// the same request — pull sync in particular — decides what to disclose to
+    /// partners from the in-request snapshot, not from a fresh read, so a
+    /// tombstone that never reaches that snapshot still leaks the identity it
+    /// just withdrew. `record_snapshot` is therefore a parameter rather than
+    /// something the caller may remember to do afterwards: every path out of
+    /// this method, including the error path, hands back the state the caller
+    /// must now hold, and a caller that drops it cannot compile.
+    ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] when the tombstone write fails,
     /// and when it cannot be determined whether the identity exists — in that
-    /// case nothing is written. Callers on the browser path should log at
+    /// case nothing is written and the recorded snapshot is
+    /// [`EcKvSnapshot::Failed`]. Callers on the browser path should log at
     /// `error` level and continue: cookie deletion is the primary enforcement
     /// mechanism.
     pub fn write_withdrawal_tombstone(
         &self,
         ec_id: &str,
+        record_snapshot: impl FnOnce(EcKvSnapshot),
     ) -> Result<TombstoneOutcome, Report<TrustedServerError>> {
+        let written = self.tombstone_held_identity(ec_id);
+
+        record_snapshot(match &written {
+            Ok(Some(entry)) => EcKvSnapshot::Present {
+                ec_id: ec_id.to_owned(),
+                entry: Box::new(entry.clone()),
+                generation: None,
+            },
+            Ok(None) => EcKvSnapshot::Missing {
+                ec_id: ec_id.to_owned(),
+            },
+            Err(_) => EcKvSnapshot::Failed {
+                ec_id: ec_id.to_owned(),
+            },
+        });
+
+        written.map(|entry| {
+            if entry.is_some() {
+                TombstoneOutcome::Written
+            } else {
+                TombstoneOutcome::UnknownIdentity
+            }
+        })
+    }
+
+    /// Tombstones a held identity, returning the entry written.
+    ///
+    /// `Ok(None)` means the store does not hold the identity, so nothing was
+    /// written.
+    fn tombstone_held_identity(
+        &self,
+        ec_id: &str,
+    ) -> Result<Option<KvEntry>, Report<TrustedServerError>> {
         // A store failure is an error, not a third outcome: writing blind
         // would restore the unconditional write whenever the store can be made
         // to fail, and an extra `Ok` variant would be discarded in silence by a
         // caller that only inspects the error case.
         if !self.key_exists_confirmed(ec_id)? {
-            return Ok(TombstoneOutcome::UnknownIdentity);
+            return Ok(None);
         }
 
         let entry = KvEntry::tombstone(current_timestamp());
         let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
 
-        match self.write_entry(
+        self.write_entry(
             ec_id,
             &body,
             &meta_str,
             TOMBSTONE_TTL,
             EcKvWriteMode::Overwrite,
-        ) {
-            Ok(_) => Ok(TombstoneOutcome::Written),
-            Err(report) => Err(report.change_context(TrustedServerError::KvStore {
+        )
+        .map(|_| Some(entry))
+        .map_err(|report| {
+            report.change_context(TrustedServerError::KvStore {
                 store_name: self.store_name().to_owned(),
                 message: format!("Failed to write tombstone for key '{}'", log_id(ec_id)),
-            })),
-        }
+            })
+        })
     }
 
     /// Counts the number of keys sharing the same EC hash prefix.
@@ -1656,7 +1704,7 @@ mod tests {
         kv.create(&ec_id, &live_entry()).expect("should create");
 
         assert_eq!(
-            kv.write_withdrawal_tombstone(&ec_id)
+            kv.write_withdrawal_tombstone(&ec_id, drop)
                 .expect("should write tombstone"),
             TombstoneOutcome::Written,
             "should tombstone an identity the store holds"
@@ -2109,8 +2157,12 @@ mod tests {
             )
             .expect_err("a batched upsert on a missing key should be refused");
         let withdrawn = {
-            kv.write_withdrawal_tombstone(&ec_id)
-                .expect("should tombstone");
+            assert_eq!(
+                kv.write_withdrawal_tombstone(&ec_id, drop)
+                    .expect("should tombstone"),
+                TombstoneOutcome::Written,
+                "should tombstone the seeded identity"
+            );
             kv.upsert_partner_id(&ec_id, "partner", "uid")
                 .expect_err("an upsert on a withdrawn key should be refused")
         };
@@ -2174,7 +2226,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "b".repeat(64));
 
         assert_eq!(
-            kv.write_withdrawal_tombstone(&ec_id)
+            kv.write_withdrawal_tombstone(&ec_id, drop)
                 .expect("should resolve the withdrawal"),
             TombstoneOutcome::UnknownIdentity,
             "an identity that was never issued has nothing to withdraw"
@@ -2194,7 +2246,7 @@ mod tests {
         // enough to have a row written under it.
         for suffix in ["aaaaaa", "bbbbbb", "cccccc", "dddddd"] {
             assert_eq!(
-                kv.write_withdrawal_tombstone(&format!("{hash}.{suffix}"))
+                kv.write_withdrawal_tombstone(&format!("{hash}.{suffix}"), drop)
                     .expect("should resolve the withdrawal"),
                 TombstoneOutcome::UnknownIdentity,
                 "suffix `{suffix}` was never issued"
@@ -2224,7 +2276,7 @@ mod tests {
             "should model the issuance replication gap"
         );
         assert_eq!(
-            kv.write_withdrawal_tombstone(&ec_id)
+            kv.write_withdrawal_tombstone(&ec_id, drop)
                 .expect("should process withdrawal"),
             TombstoneOutcome::Written,
             "should tombstone an issued identity despite a lagging lookup"
@@ -2248,7 +2300,7 @@ mod tests {
 
         let absent = format!("{}.ABC123", "e".repeat(64));
         assert_eq!(
-            kv.write_withdrawal_tombstone(&absent)
+            kv.write_withdrawal_tombstone(&absent, drop)
                 .expect("should resolve the withdrawal"),
             TombstoneOutcome::UnknownIdentity,
             "an absent identity is not held"
@@ -2259,7 +2311,7 @@ mod tests {
         kv.create(&held, &live_entry()).expect("should create");
         let before = count();
         assert_eq!(
-            kv.write_withdrawal_tombstone(&held)
+            kv.write_withdrawal_tombstone(&held, drop)
                 .expect("should resolve the withdrawal"),
             TombstoneOutcome::Written,
             "a held identity is tombstoned"
@@ -2283,7 +2335,7 @@ mod tests {
             .expect("should create");
 
         assert_eq!(
-            kv.write_withdrawal_tombstone("")
+            kv.write_withdrawal_tombstone("", drop)
                 .expect("should resolve the withdrawal"),
             TombstoneOutcome::UnknownIdentity,
             "an empty identifier names no key and must not withdraw anything"
@@ -2432,7 +2484,7 @@ mod tests {
         let ec_id = format!("{hash}.ABC123");
 
         assert!(
-            kv.write_withdrawal_tombstone(&ec_id).is_err(),
+            kv.write_withdrawal_tombstone(&ec_id, drop).is_err(),
             "a check that cannot answer is a fault, so a caller inspecting only \
              the error case still reports it"
         );
@@ -2454,7 +2506,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "6".repeat(64));
 
         let mut reported = false;
-        if let Err(_err) = kv.write_withdrawal_tombstone(&ec_id) {
+        if let Err(_err) = kv.write_withdrawal_tombstone(&ec_id, drop) {
             reported = true;
         }
 
@@ -2475,7 +2527,7 @@ mod tests {
             "a longer key is a different identity"
         );
         assert_eq!(
-            kv.write_withdrawal_tombstone(&ec_id)
+            kv.write_withdrawal_tombstone(&ec_id, drop)
                 .expect("should resolve the withdrawal"),
             TombstoneOutcome::UnknownIdentity,
             "should not tombstone an identity the store never held"
