@@ -37,20 +37,77 @@ Add the GTM configuration to `trusted-server.toml`:
 [integrations.google_tag_manager]
 enabled = true
 container_id = "GTM-XXXXXX"
-# upstream_url = "https://www.googletagmanager.com" # Optional override
+# upstream_url = "https://www.googletagmanager.com" # Optional override (must be https)
+# allowed_tag_ids = ["G-XXXXXXXX"] # Tag ids besides container_id that gtag/js may serve first-party
 # cache_max_age = 900 # Optional: Cache duration in seconds (default: 900)
 # max_beacon_body_size = 65536 # Optional: Max POST body size in bytes (default: 65536 / 64KB)
 ```
 
 ### Configuration Options
 
-| Field                  | Type    | Required | Description                                                             |
-| ---------------------- | ------- | -------- | ----------------------------------------------------------------------- |
-| `enabled`              | boolean | No       | Enable/disable integration (default: `false`)                           |
-| `container_id`         | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                              |
-| `upstream_url`         | string  | No       | Custom upstream URL (default: `https://www.googletagmanager.com`)       |
-| `cache_max_age`        | number  | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)         |
-| `max_beacon_body_size` | number  | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`) |
+| Field                  | Type    | Required | Description                                                                                                                                                                  |
+| ---------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`              | boolean | No       | Enable/disable integration (default: `false`)                                                                                                                                |
+| `container_id`         | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                                                                                                                                   |
+| `upstream_url`         | string  | No       | Custom upstream, as a credential-free `https` bare origin with a literal host — no path, query, fragment, userinfo or wildcard (default: `https://www.googletagmanager.com`) |
+| `allowed_tag_ids`      | array   | No       | Extra tag ids servable on `gtag/js` besides `container_id` (default: none)                                                                                                   |
+| `cache_max_age`        | number  | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)                                                                                                              |
+| `max_beacon_body_size` | number  | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`)                                                                                                      |
+
+### Upgrading: check `allowed_tag_ids`
+
+Only `container_id` and the ids listed in `allowed_tag_ids` are served from your
+own origin. If your pages load `gtag/js` with a measurement id different from
+your container — a GA4 `G-` id, an Ads `AW-` id or a Merchant Center `MC-` id,
+for example — add those ids here.
+
+Missing one does not break the page, but it does degrade the tag, and on some
+sites it stops the tag loading altogether:
+
+- It is served third-party, losing the ad-blocker resilience this integration
+  exists to provide.
+- A `<link rel="preload">` for it pays an extra round trip.
+- **A strict `script-src` blocks it.** A redirect does not make the upstream
+  origin satisfy `'self'`, so unless your policy lists that origin explicitly,
+  the redirected script is refused and the tag does not run at all. The origin
+  to allow is whatever `upstream_url` points at — `https://www.googletagmanager.com`
+  by default, or your own tagging domain if you have overridden it.
+
+Standard `gtag.js` installations use a product tag ID that is usually not the
+`GTM-` container ID, so most deployments that load `gtag/js` will have at least
+one ID to add here.
+
+To find the ids your pages use, look for `gtag/js?id=` in your rendered HTML:
+
+```bash
+curl -s https://www.example.com/ | grep -oE 'gtag/js\?id=[A-Za-z0-9-]+'
+```
+
+### Upgrading: `upstream_url` must now be a bare origin
+
+`upstream_url` was previously checked only for being a well-formed URL. It is
+now required to be a credential-free `https` bare origin with a literal host,
+and these values are rejected:
+
+| Rejected value                       | Reason                                            |
+| ------------------------------------ | ------------------------------------------------- |
+| `https://tags.example.com/gateway`   | Path — targets are built by appending `/gtm.js`   |
+| `https://tags.example.com?env=stage` | Query — same, the appended path lands after it    |
+| `https://tags.example.com#anchor`    | Fragment — the appended path is swallowed by it   |
+| `https://user:pw@tags.example.com`   | Userinfo — echoed to the client in a tag redirect |
+| `https://*.example.com`              | Wildcard host — widens the proxy allowlist        |
+
+A trailing slash is still accepted; it is trimmed before targets are built.
+
+**This is a breaking change.** A path-based value such as
+`https://tags.example.com/gateway` passed validation before this release and
+produced targets below that path, so an enabled deployment using one now fails
+config validation. `ts config push` rejects it, which is where you should expect
+to see this. Validation is fail-closed rather than skip-the-integration: a
+config that reaches the runtime without having been pushed through that check
+fails building the integration registry, so every integration is affected, not
+just this one. If your upstream serves tags below a path, front it with a
+hostname that serves them at the root instead.
 
 ## How It Works
 
@@ -111,12 +168,16 @@ Proxies the Google Tag Manager library.
 **Request**:
 
 ```
-GET /integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX
+GET /integrations/google_tag_manager/gtm.js
 ```
 
 **Behavior**:
 
 - Proxies to `https://www.googletagmanager.com/gtm.js`
+- Uses the configured `container_id`. A client-supplied `id` parameter is
+  ignored, so this endpoint only ever serves your own container. Other
+  parameters (`l`, `gtm_auth`, `gtm_preview`, `gtm_cookies_win`) are forwarded,
+  so container environments and preview mode keep working.
 - Rewrites internal URLs to use the first-party proxy
 - Sets `Accept-Encoding: identity` during fetch to ensure rewriteable text response
 
@@ -135,6 +196,15 @@ GET /integrations/google_tag_manager/gtag/js?id=G-XXXXXXXX
 - Proxies to `https://www.googletagmanager.com/gtag/js`
 - Rewrites internal URLs to use the first-party proxy
 - Sets `Accept-Encoding: identity` during fetch to ensure rewriteable text response
+
+Only `container_id` and any `allowed_tag_ids` are served from your origin, and
+they are matched exactly — a tag id spelled with different capitalization is
+treated as unconfigured. A
+request naming a different tag id is answered with a redirect to the upstream,
+so your origin serves only containers you configured. The visitor then loads
+that tag from the upstream directly, which a `script-src` that does not list
+the upstream origin will block. Upstream answers `200` for tag ids that do not exist, so it
+cannot be relied on to reject an unknown tag.
 
 ### `GET/POST .../collect` - Analytics Beacon
 
