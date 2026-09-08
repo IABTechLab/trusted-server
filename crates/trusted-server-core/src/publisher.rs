@@ -4454,11 +4454,16 @@ pub async fn handle_publisher_request(
         // trusted-server edge host, so using it here would attribute navigation
         // rows to the edge/staging domain while `/auction` rows (built from
         // `AuctionRequest::publisher.domain`) use the configured domain.
+        let user_agent = auction_client_request
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok());
         let observation = AuctionObservationContext::from_parts(
             AuctionSource::InitialNavigation,
             &settings.publisher.domain,
             &request_path,
             matched_slots.len(),
+            user_agent,
             ec_context,
         );
 
@@ -4473,10 +4478,7 @@ pub async fn handle_publisher_request(
                 &consent_context,
                 &request_info,
                 &settings.publisher.domain,
-                auction_client_request
-                    .headers()
-                    .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
+                user_agent,
             );
             apply_auction_eids_and_device(
                 &mut auction_request,
@@ -6588,11 +6590,16 @@ pub async fn handle_page_bids(
     } else {
         // Same publisher identity as the outbound bid request — see the
         // matching note on the initial-navigation observation above.
+        let user_agent = req
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok());
         let observation = AuctionObservationContext::from_parts(
             AuctionSource::SpaNavigation,
             &settings.publisher.domain,
             &path_param,
             matched_slots.len(),
+            user_agent,
             ec_context,
         );
         if ad_stack_enabled && !is_bot && !is_prefetch {
@@ -6622,9 +6629,7 @@ pub async fn handle_page_bids(
                 &consent_context,
                 &request_info,
                 &settings.publisher.domain,
-                req.headers()
-                    .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
+                user_agent,
             );
             apply_auction_eids_and_device(
                 &mut auction_request,
@@ -18120,6 +18125,7 @@ mod tests {
                     "proxy.example.com",
                     "/article",
                     1,
+                    Some("FictionalBrowser/123.4"),
                     &ec_context,
                 )),
                 auction_request: Some(test_auction_request()),
