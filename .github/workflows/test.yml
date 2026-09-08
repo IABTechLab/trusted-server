@@ -179,6 +179,9 @@ jobs:
         run: ./scripts/test-cli.sh
         env:
           CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
+          # Hosted Ubuntu disables the user namespace required by the downloaded
+          # browser's sandbox. Only the ignored fixture test build reads this.
+          TS_AUDIT_BROWSER_FIXTURE_NO_SANDBOX: "1"
 
       # The codegen crate is not a default member and no adapter alias builds it,
       # so its tests only run if invoked explicitly on the host target.
