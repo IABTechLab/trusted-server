@@ -7008,11 +7008,13 @@ mod tests {
 
     fn scheduling_settings() -> Settings {
         let toml = format!(
-            "{}\n[auction]\nenabled = true\nproviders = [\"{SCHEDULING_PROVIDER}\"]\n\n\
+            "{}\n[auction]\nenabled = true\n\n\
              [creative_opportunities]\ngam_network_id = \"12345\"\n",
             crate_test_settings_str()
         );
         let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
+        settings.auction.providers =
+            crate::auction::AuctionConfig::legacy_provider_map(&[SCHEDULING_PROVIDER]);
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         settings
             .integrations

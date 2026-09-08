@@ -237,6 +237,8 @@ pub(crate) struct StubHttpClient {
     select_errors: Mutex<VecDeque<bool>>,
     // Queued direct wait() errors for pending-stream failure-path tests.
     wait_errors: Mutex<VecDeque<()>>,
+    // Test-only wall-clock delays applied before each direct wait result.
+    wait_delays: Mutex<VecDeque<Duration>>,
     // Test-only overrides for backend metadata on returned pending handles.
     pending_backend_name_overrides: Mutex<VecDeque<Option<String>>>,
     // Test-only wall-clock delays applied before each select result is returned.
@@ -276,6 +278,7 @@ impl StubHttpClient {
             request_header_bytes: Mutex::new(Vec::new()),
             select_errors: Mutex::new(VecDeque::new()),
             wait_errors: Mutex::new(VecDeque::new()),
+            wait_delays: Mutex::new(VecDeque::new()),
             pending_backend_name_overrides: Mutex::new(VecDeque::new()),
             select_delays: Mutex::new(VecDeque::new()),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
@@ -391,6 +394,14 @@ impl StubHttpClient {
         self.select_delays
             .lock()
             .expect("should lock select_delays")
+            .push_back(delay);
+    }
+
+    /// Queue a wall-clock delay before the next direct pending-request `wait()`.
+    pub(crate) fn push_wait_delay(&self, delay: Duration) {
+        self.wait_delays
+            .lock()
+            .expect("should lock wait_delays")
             .push_back(delay);
     }
 
@@ -791,6 +802,15 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         pending: PlatformPendingRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let delay = self
+            .wait_delays
+            .lock()
+            .expect("should lock wait_delays")
+            .pop_front();
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+
         if self
             .wait_errors
             .lock()

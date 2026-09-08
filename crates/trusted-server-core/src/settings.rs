@@ -2914,17 +2914,6 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the JSON value is invalid or missing required fields
     pub fn from_json_value(value: JsonValue) -> Result<Self, Report<TrustedServerError>> {
-        if value
-            .get("auction")
-            .and_then(JsonValue::as_object)
-            .and_then(|auction| auction.get("providers"))
-            .is_some_and(JsonValue::is_array)
-        {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: "Configuration field `auction.providers` uses the removed list schema; migrate to `[auction.providers.<id>]` map entries as described in the CHANGELOG.md breaking migration".to_string(),
-            }));
-        }
-
         let settings: Self =
             serde_json::from_value(value).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize JSON configuration".to_string(),
@@ -4226,6 +4215,26 @@ mod tests {
         value["auction"]["providers"] = json!(["prebid"]);
 
         let error = Settings::from_json_value(value)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("auction.providers"),
+            "error should identify the removed field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "error should direct operators to the migration guidance, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn toml_settings_reject_legacy_auction_provider_list_with_migration_guidance() {
+        let toml = format!(
+            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml)
             .expect_err("should reject the removed auction provider list schema");
         let rendered = format!("{error:?}");
         assert!(

@@ -58,7 +58,10 @@ endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```
 
-The optional browser integration table controls rendering ownership:
+The optional browser integration table controls rendering ownership. An absent
+or `enabled = false` block keeps the default trusted-server rendering. The
+renderer route stays registered while an APS provider is in the auction plan,
+and a `rendering_mode` inside a disabled block is ignored:
 
 ```toml
 [integrations.aps]

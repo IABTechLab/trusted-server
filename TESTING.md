@@ -146,7 +146,8 @@ npx vitest run
 ```
 
 The template-cache harness exercises plan compilation, HTTPS backend naming,
-provider dispatch, mediation, and both ESI and inline delivery modes:
+provider dispatch, local highest-bid winner selection, and both ESI and inline
+delivery modes:
 
 ```bash
 ./scripts/template-cache-local-test.sh esi

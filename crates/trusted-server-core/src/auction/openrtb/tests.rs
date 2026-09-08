@@ -1016,6 +1016,161 @@ fn standard_response_infers_only_unambiguous_missing_dimensions() {
 }
 
 #[test]
+fn standard_response_infers_dimensions_from_partial_unique_matches() {
+    let formats = vec![
+        AdFormat {
+            media_type: MediaType::Banner,
+            width: 300,
+            height: 250,
+        },
+        AdFormat {
+            media_type: MediaType::Banner,
+            width: 320,
+            height: 50,
+        },
+    ];
+    let (_plan, routed, _request) = standard_fixture_with_formats(formats);
+
+    let response = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid": [{"bid": [
+            {"id":"width-only","impid":"fictional-slot","price":1.0,"adm":"width","w":300},
+            {"id":"height-only","impid":"fictional-slot","price":2.0,"adm":"height","h":50}
+        ]}]}),
+        0,
+    );
+
+    assert_eq!(
+        response.status,
+        BidStatus::Success,
+        "should admit both bids"
+    );
+    assert_eq!(response.bids.len(), 2, "should retain both unique matches");
+    assert_eq!(
+        (response.bids[0].width, response.bids[0].height),
+        (300, 250),
+        "should infer height from a unique width"
+    );
+    assert_eq!(
+        (response.bids[1].width, response.bids[1].height),
+        (320, 50),
+        "should infer width from a unique height"
+    );
+}
+
+#[test]
+fn standard_response_accepts_null_and_integral_float_dimensions() {
+    let (_plan, routed, _request) = standard_fixture();
+
+    let response = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid": [{"bid": [
+            {"id":"null","impid":"fictional-slot","price":1.0,"adm":"null","w":null,"h":null},
+            {"id":"integral-float","impid":"fictional-slot","price":2.0,"adm":"float","w":300.0,"h":250.0}
+        ]}]}),
+        0,
+    );
+
+    assert_eq!(
+        response.status,
+        BidStatus::Success,
+        "should admit both bids"
+    );
+    assert_eq!(
+        response.bids.len(),
+        2,
+        "should retain both tolerated shapes"
+    );
+    assert!(
+        response
+            .bids
+            .iter()
+            .all(|bid| (bid.width, bid.height) == (300, 250)),
+        "should resolve both bids to the requested format"
+    );
+}
+
+#[test]
+fn standard_response_rejects_partial_dimension_mismatch_and_ambiguity() {
+    let formats = vec![
+        AdFormat {
+            media_type: MediaType::Banner,
+            width: 300,
+            height: 250,
+        },
+        AdFormat {
+            media_type: MediaType::Banner,
+            width: 300,
+            height: 600,
+        },
+        AdFormat {
+            media_type: MediaType::Banner,
+            width: 320,
+            height: 50,
+        },
+    ];
+    let (_plan, routed, _request) = standard_fixture_with_formats(formats);
+
+    let response = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid": [{"bid": [
+            {"id":"ambiguous","impid":"fictional-slot","price":1.0,"adm":"ambiguous","w":300},
+            {"id":"mismatch","impid":"fictional-slot","price":2.0,"adm":"mismatch","w":999}
+        ]}]}),
+        0,
+    );
+
+    assert_eq!(
+        response.status,
+        BidStatus::NoBid,
+        "should reject both partial dimensions"
+    );
+    assert_eq!(
+        response.metadata["response_admission"]["rejection_reasons"]["ambiguous_dimensions"], 1,
+        "should report the width matching multiple formats"
+    );
+    assert_eq!(
+        response.metadata["response_admission"]["rejection_reasons"]["dimension_mismatch"], 1,
+        "should report the width matching no formats"
+    );
+}
+
+#[test]
+fn standard_response_rejects_invalid_numeric_dimension_shapes() {
+    let (_plan, routed, _request) = standard_fixture();
+
+    let response = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid": [{"bid": [
+            {"id":"fractional","impid":"fictional-slot","price":1.0,"adm":"bad","w":300.5},
+            {"id":"zero","impid":"fictional-slot","price":1.0,"adm":"bad","w":0},
+            {"id":"negative","impid":"fictional-slot","price":1.0,"adm":"bad","w":-1},
+            {"id":"large","impid":"fictional-slot","price":1.0,"adm":"bad","w":4294967296.0},
+            {"id":"string","impid":"fictional-slot","price":1.0,"adm":"bad","w":"300"}
+        ]}]}),
+        0,
+    );
+
+    assert_eq!(
+        response.status,
+        BidStatus::NoBid,
+        "should reject all invalid numeric shapes"
+    );
+    assert_eq!(
+        response.metadata["response_admission"]["rejected_bid_count"], 5,
+        "should report every invalid bid"
+    );
+    assert_eq!(
+        response.metadata["response_admission"]["rejection_reasons"]["invalid_bid"], 5,
+        "should classify every invalid dimension as an invalid bid"
+    );
+}
+
+#[test]
 fn notification_suppression_matrix_uses_only_exact_valid_returned_seat() {
     let (_plan, routed, _request) = standard_fixture();
     let response = extract_standard_response(

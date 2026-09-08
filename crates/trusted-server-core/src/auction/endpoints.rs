@@ -710,7 +710,7 @@ mod tests {
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
-            providers: vec!["eid_capturing_provider".to_string()],
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
@@ -963,7 +963,7 @@ mod tests {
         orchestrator.register_provider(Arc::new(PanicOnBidProvider));
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -983,7 +983,7 @@ mod tests {
             &orchestrator,
             None,
             None,
-            &ec_context,
+            &mut ec_context,
             &services,
             request,
         )
@@ -1026,7 +1026,7 @@ mod tests {
         let orchestrator = AuctionOrchestrator::from_plan(plan, None);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -1046,7 +1046,7 @@ mod tests {
             &orchestrator,
             None,
             None,
-            &ec_context,
+            &mut ec_context,
             &services,
             request,
         )

@@ -652,15 +652,16 @@ Cache-Control = "public, max-age=3600"
 
 **Environment Override**:
 
-Use a JSON object to preserve header name casing and hyphens:
+Override an existing header leaf by preserving its TOML key punctuation in the
+environment path. Shell assignment syntax cannot contain hyphens, so use `env`:
 
 ```bash
-TRUSTED_SERVER__RESPONSE_HEADERS='{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}'
+env 'TRUSTED_SERVER__RESPONSE_HEADERS__X-CUSTOM-HEADER=updated value' \
+  ts config validate
 ```
 
-::: tip Why JSON?
-Individual env var keys like `TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER` lose hyphens and casing (becoming `x_custom_header`). The JSON format preserves exact header names.
-:::
+The overlay cannot add a header or replace the whole `response_headers` table.
+Edit TOML, validate, and push again for those changes.
 
 **Use Cases**:
 
@@ -905,17 +906,8 @@ exclude_domains = [
 
 **Environment Override**:
 
-```bash
-# JSON array
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS='["*.cdn.example.com","localhost"]'
-
-# Indexed
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS__0="*.cdn.example.com"
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS__1="localhost"
-
-# Comma-separated
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS="*.cdn.example.com,localhost"
-```
+EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
+`exclude_domains` in TOML, then validate and push the file again.
 
 ### Pattern Matching
 
@@ -996,17 +988,8 @@ allowed_domains = [
 
 **Environment Override**:
 
-```bash
-# JSON array
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["assets.example.com","*.cdn.example.com"]'
-
-# Indexed
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="assets.example.com"
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.cdn.example.com"
-
-# Comma-separated
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="assets.example.com,*.cdn.example.com"
-```
+EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
+`allowed_domains` in TOML, then validate and push the file again.
 
 ### Field Details
 
@@ -1474,9 +1457,10 @@ max_combined_payload_bytes = 10485760
 
 ```bash
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES=href,link,url,src
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
+
+Edit `rewrite_attributes` in TOML because the overlay cannot replace arrays.
 
 ### Osano Integration
 
@@ -1669,6 +1653,7 @@ protocol = "openrtb-2.6"
 profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
+timeout_ms = 1200
 
 [auction.providers.pbs-main.profile_config]
 debug = false

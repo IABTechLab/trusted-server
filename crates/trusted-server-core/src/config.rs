@@ -912,6 +912,26 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn wrapper_rejects_legacy_auction_provider_list_with_migration_guidance() {
+        let toml = format!(
+            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            crate_test_settings_str()
+        );
+
+        let error = toml::from_str::<TrustedServerAppConfig>(&toml)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("auction.providers"),
+            "should identify the removed field: {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "should direct operators to migration guidance: {rendered}"
+        );
+    }
+
+    #[test]
     fn static_gam_unit_template_is_accepted_by_legacy_schema() {
         let creative_opportunities = serialized_creative_opportunities(Some("/99999/example/home"));
 
@@ -1181,6 +1201,33 @@ password = "production-admin-password-32-bytes"
 
         validate_settings_for_deploy(&settings).expect(
             "should skip field validation for integrations that resolve to disabled via default",
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_retired_aps_fields_when_explicitly_disabled() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({
+                    "enabled": false,
+                    "endpoint": "https://aps.example.com/e/pb/bid"
+                }),
+            )
+            .expect("should insert disabled APS config with a retired field");
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject retired APS server fields when explicitly disabled");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("Integration 'aps' configuration could not be parsed"),
+            "should identify the APS configuration: {rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint"),
+            "should identify the retired APS field: {rendered}"
         );
     }
 
