@@ -100,17 +100,10 @@ impl Middleware for FinalizeResponseMiddleware {
             })
         });
 
-        // Write the resolved outcome back so a downstream access-telemetry
-        // snapshot (built from response extensions after finalize) sees
-        // what was actually looked up here rather than the stale carried-in
-        // state — mirrors the entry-point finalize site in `main.rs`
-        // (`apply_entry_point_finalize_headers`), which writes back for the
-        // same reason.
-        let resolved_state = match &geo_info {
-            Some(geo) => GeoLookupState::Resolved(geo.clone()),
-            None => GeoLookupState::Attempted,
-        };
-        response.extensions_mut().insert(resolved_state);
+        // Mirrors the entry-point finalize site in `main.rs`
+        // (`apply_entry_point_finalize_headers`); 401 handling lives in the
+        // shared helper.
+        write_back_geo_lookup_state(&mut response, geo_info.as_ref());
 
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
         response
@@ -193,6 +186,26 @@ impl Middleware for AuthMiddleware {
 /// is intentionally more conservative: geo data is not sent to any
 /// unauthenticated caller regardless of whether the 401 originated from this
 /// server or the upstream origin.
+/// Writes the resolved geo outcome back onto the response as a
+/// [`GeoLookupState`] extension, so a downstream access-telemetry snapshot
+/// sees what was actually looked up rather than the stale carried-in state.
+///
+/// Skips the write on a 401: [`resolve_geo_for_response`] returns `None`
+/// for unauthorized responses before consulting the carried state, so
+/// writing `Attempted` there would overwrite a carried `Resolved` with a
+/// value that was never looked up, and the row would lose a country it
+/// legitimately had.
+pub(crate) fn write_back_geo_lookup_state(response: &mut Response, geo_info: Option<&GeoInfo>) {
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return;
+    }
+    let resolved_state = match geo_info {
+        Some(geo) => GeoLookupState::Resolved(geo.clone()),
+        None => GeoLookupState::Attempted,
+    };
+    response.extensions_mut().insert(resolved_state);
+}
+
 pub(crate) fn resolve_geo_for_response<F>(
     response: &Response,
     carried: &GeoLookupState,
@@ -284,6 +297,51 @@ pub(crate) use trusted_server_core::response_privacy::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geo_write_back_preserves_resolved_state_on_401() {
+        // A 401 short-circuits geo resolution before the carried state is
+        // consulted, so the write-back must not downgrade a carried
+        // Resolved to Attempted (which would cost the row its country).
+        let mut response = response_builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::empty())
+            .expect("should build a 401 response");
+        response
+            .extensions_mut()
+            .insert(GeoLookupState::Resolved(sample_geo_info()));
+
+        write_back_geo_lookup_state(&mut response, None);
+
+        match response.extensions().get::<GeoLookupState>() {
+            Some(GeoLookupState::Resolved(geo)) => {
+                assert_eq!(
+                    geo.country,
+                    sample_geo_info().country,
+                    "should keep the carried country"
+                );
+            }
+            other => panic!("should keep the Resolved state on a 401, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geo_write_back_records_attempted_on_non_401_miss() {
+        let mut response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("should build a 200 response");
+
+        write_back_geo_lookup_state(&mut response, None);
+
+        assert!(
+            matches!(
+                response.extensions().get::<GeoLookupState>(),
+                Some(GeoLookupState::Attempted)
+            ),
+            "should record an attempted-but-missed lookup on ordinary responses"
+        );
+    }
 
     use std::collections::HashMap;
     use std::net::IpAddr;
