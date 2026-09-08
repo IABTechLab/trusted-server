@@ -9311,7 +9311,7 @@ mod tests {
         /// Name of the bidding test double, matched by `[auction].providers`.
         const STUB_BIDDER: &str = "stub-bidder";
 
-        /// The CPM the stub bids. Chosen so its price bucket (`"3.50"`) is a distinctive
+        /// The default CPM the stub bids. Its price bucket (`"3.50"`) is a distinctive
         /// string that cannot appear in the fixture page by accident.
         const STUB_BID_CPM: f64 = 3.5;
 
@@ -9320,7 +9320,9 @@ mod tests {
         /// Every other fixture in this file leaves the orchestrator with no providers, so
         /// every auction resolves to an empty bid map. That is exactly why a defect that
         /// discarded *non-empty* maps survived: no test ever produced one.
-        struct WinningBidProvider;
+        struct WinningBidProvider {
+            price: f64,
+        }
 
         #[async_trait::async_trait(?Send)]
         impl crate::auction::provider::AuctionProvider for WinningBidProvider {
@@ -9363,7 +9365,7 @@ mod tests {
                     STUB_BIDDER,
                     vec![Bid {
                         slot_id: "test-slot".to_string(),
-                        price: Some(STUB_BID_CPM),
+                        price: Some(self.price),
                         currency: "USD".to_string(),
                         creative: None,
                         adomain: None,
@@ -9469,8 +9471,18 @@ mod tests {
             services: &RuntimeServices,
             request: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
+            run_bidding_at_price(settings, services, request, STUB_BID_CPM).await
+        }
+
+        /// [`run_bidding`], with a distinct winning CPM for this request.
+        async fn run_bidding_at_price(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+            price: f64,
+        ) -> Response<EdgeBody> {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(WinningBidProvider));
+            orchestrator.register_provider(Arc::new(WinningBidProvider { price }));
             run_with_orchestrator(
                 settings,
                 services,
@@ -11949,6 +11961,18 @@ mod tests {
                 1,
                 "should preserve existing request preparation"
             );
+            let forwarded = stub.recorded_request_headers();
+            assert_eq!(forwarded.len(), 1, "should record one origin request");
+            let forwarded_cookies = forwarded[0]
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str()))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                forwarded_cookies,
+                ["ab_bucket=A"],
+                "should forward exactly the prepared cookie represented by the cache key"
+            );
         }
 
         #[tokio::test]
@@ -12048,8 +12072,18 @@ mod tests {
                 if index == 0 {
                     queue_shareable_html(&stub);
                 }
-                let response =
-                    run_bidding(&settings, &services, cookie_policy_request(&[field])).await;
+                let response = run_bidding_at_price(
+                    &settings,
+                    &services,
+                    cookie_policy_request(&[field]),
+                    if index == 0 { 3.5 } else { 7.5 },
+                )
+                .await;
+                assert_eq!(
+                    response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                    if index == 0 { "miss-stored" } else { "hit" },
+                    "should serve the second reader from the shared template"
+                );
                 assert!(
                     response.headers()[header::CACHE_CONTROL]
                         .to_str()
@@ -12064,7 +12098,7 @@ mod tests {
                         .get("test-slot")
                         .and_then(|bid| bid.get("hb_pb"))
                         .and_then(serde_json::Value::as_str),
-                    Some("3.50"),
+                    Some(if index == 0 { "3.50" } else { "7.50" }),
                     "should assemble this request's winning bid"
                 );
             }
