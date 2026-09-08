@@ -556,22 +556,19 @@ mod tests {
 
     #[test]
     fn pull_sync_noop_states_skip_post_send_graph_factory() {
-        for reason in ["no partners", "complete snapshot", "unread marker state"] {
-            let calls = std::cell::Cell::new(0);
-            let result = prepare_pull_sync_after_send(None, || {
-                calls.set(calls.get() + 1);
-                Err(Report::new(TrustedServerError::KvStore {
-                    store_name: "unexpected".to_owned(),
-                    message: "graph factory should not run".to_owned(),
-                }))
-            });
-            assert!(result.is_none(), "{reason} preparation should return none");
-            assert_eq!(
-                calls.get(),
-                0,
-                "{reason} should not invoke the graph factory"
-            );
-        }
+        let calls = std::cell::Cell::new(0);
+        let result = prepare_pull_sync_after_send(None, || {
+            calls.set(calls.get() + 1);
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: "unexpected".to_owned(),
+                message: "graph factory should not run".to_owned(),
+            }))
+        });
+        assert!(
+            result.is_none(),
+            "a skipped pull-sync plan should return none"
+        );
+        assert_eq!(calls.get(), 0, "should not invoke the graph factory");
     }
 
     #[test]

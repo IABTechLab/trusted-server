@@ -60,8 +60,8 @@ path instead eliminates the entire post-send pull-sync graph/operation path.
   actually observed, the marker cannot suppress PR #885's recovery flow.
 - An authoritative partial, missing, or tombstoned snapshot disproves the
   marker and clears it.
-- Explicit consent withdrawal clears both `ts-ec` and the completeness marker,
-  regardless of KV success.
+- Explicit consent withdrawal clears both `ts-ec` and any present completeness
+  marker, regardless of KV success.
 - A post-send pull result cannot mutate the already-delivered response. If pull
   sync fills the final missing UID, a later request must verify completeness
   pre-send before issuing the marker.
@@ -202,12 +202,12 @@ logic sees the same decision. Refreshing is allowed only after a current
 snapshot again proves completeness; a skipped request must not slide the marker
 expiration indefinitely.
 
-On every explicit withdrawal, append the host-only marker-expiration cookie
-before KV work, even when no usable `ts-ec` cookie is present. Keep EC-cookie
-expiration and tombstone creation under their existing cookie/valid-ID gates.
-KV failure remains best-effort and cannot prevent either applicable browser
-cookie deletion. Do not change PR #885's existing-key-only conditional tombstone
-operation.
+On explicit withdrawal, append the host-only marker-expiration cookie before KV
+work when the request carried a marker, even when no usable `ts-ec` cookie is
+present. Keep EC-cookie expiration and tombstone creation under their existing
+cookie/valid-ID gates. KV failure remains best-effort and cannot prevent either
+applicable browser cookie deletion. Do not change PR #885's existing-key-only
+conditional tombstone operation.
 
 ### 5. Plan pull sync before constructing the post-send graph
 
@@ -432,9 +432,11 @@ check must be reported accurately rather than marked complete.
   and cannot slide on a skipped request.
 - **Marker cannot help every request:** Auction EIDs and request EID ingestion
   still require actual row contents. Tests and docs must avoid broader claims.
-- **Cookie churn and cache privacy:** Set the marker only when absent/invalid or
-  newly proven; existing cache-privacy middleware already downgrades responses
-  carrying `Set-Cookie`.
+- **Cookie churn and cache privacy:** Issuing or expiring a marker adds
+  `Set-Cookie`, so cache-privacy middleware makes an otherwise shareable
+  response private. Set the marker only when absent/invalid or newly proven,
+  and expire it only when the request carried one. This trades those occasional
+  private responses for avoided KV reads on later requests.
 - **Host-only scope:** Different serving hostnames establish independent
   markers. This is conservative and avoids widening cookie reach.
 - **Partner configuration changes:** Source-set changes invalidate immediately;
