@@ -60,7 +60,7 @@ pub fn ec_finalize_response(
     if !consent_allows_ec {
         // Expire the request-local marker independently of the EC cookie: a
         // withdrawal must stop any pending pull-sync disclosure window.
-        if consent_withdrawn {
+        if consent_withdrawn && ec_context.pull_sync_marker().was_present() {
             expire_marker(ec_context.pull_sync_marker_mut(), response);
         }
 
@@ -1606,6 +1606,34 @@ mod tests {
                 .iter()
                 .any(|cookie| cookie.starts_with("ts-ec-pull-complete=v1.")),
             "complete snapshot should issue the marker"
+        );
+    }
+
+    #[test]
+    fn explicit_withdrawal_without_marker_or_ec_cookie_does_not_set_cookie() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            response.headers().get(http::header::SET_COOKIE).is_none(),
+            "withdrawal without browser identity state should not add a cookie"
         );
     }
 
