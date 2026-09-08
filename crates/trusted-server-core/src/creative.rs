@@ -145,7 +145,7 @@ const MAX_CSS_NESTING_DEPTH: usize = 64;
 /// caller so the response carries it.
 pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: &str) -> String {
     drop_if_rejected(
-        rewrite_style_urls_in_context(settings, style, base_origin, true),
+        rewrite_style_urls_in_context(settings, style, base_origin, true, MAX_REWRITABLE_BODY_SIZE),
         "<style> block",
     )
 }
@@ -153,7 +153,13 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: 
 /// Rewrites a style attribute, where `@import` is ordinary declaration data.
 fn rewrite_style_attribute_urls(settings: &Settings, style: &str, base_origin: &str) -> String {
     drop_if_rejected(
-        rewrite_style_urls_in_context(settings, style, base_origin, false),
+        rewrite_style_urls_in_context(
+            settings,
+            style,
+            base_origin,
+            false,
+            MAX_REWRITABLE_BODY_SIZE,
+        ),
         "style attribute",
     )
 }
@@ -173,6 +179,7 @@ fn rewrite_style_urls_in_context(
     style: &str,
     base_origin: &str,
     allows_import_rules: bool,
+    output_limit: usize,
 ) -> Result<String, CssRewriteError> {
     let mut rewriter = CssUrlRewriter {
         settings,
@@ -180,8 +187,8 @@ fn rewrite_style_urls_in_context(
         base_origin,
         allows_import_rules,
         out: CssOutput {
-            value: String::with_capacity(style.len().min(MAX_REWRITABLE_BODY_SIZE)),
-            limit: MAX_REWRITABLE_BODY_SIZE,
+            value: String::with_capacity(style.len().min(output_limit)),
+            limit: output_limit,
         },
         write_pos: 0,
         error: None,
@@ -772,7 +779,7 @@ impl core::error::Error for CssRewriteError {}
 /// [`MAX_CSS_NESTING_DEPTH`], or [`CssRewriteError::OutputTooLarge`] when the
 /// rewritten output exceeds [`MAX_REWRITABLE_BODY_SIZE`].
 pub fn rewrite_css_body(settings: &Settings, css: &str) -> Result<String, CssRewriteError> {
-    rewrite_style_urls_in_context(settings, css, "", true)
+    rewrite_style_urls_in_context(settings, css, "", true, MAX_REWRITABLE_BODY_SIZE)
 }
 
 /// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
@@ -2873,15 +2880,15 @@ b{background:url(\"https://cdn.example/c.png\")}";
 
     #[test]
     fn css_output_budget_includes_unchanged_trailing_text() {
+        let limit = 256;
         let settings = crate::test_support::tests::create_test_settings();
         let reference = "@import \"https://cdn.example.com/a.css\";";
-        let css = format!(
-            "{reference}{}",
-            " ".repeat(super::MAX_REWRITABLE_BODY_SIZE - reference.len())
-        );
+        super::rewrite_style_urls_in_context(&settings, reference, "", true, limit)
+            .expect("should fit the rewritten reference before appending the tail");
+        let css = format!("{reference}{}", " ".repeat(limit - reference.len()));
         assert!(
             matches!(
-                super::rewrite_css_body(&settings, &css),
+                super::rewrite_style_urls_in_context(&settings, &css, "", true, limit),
                 Err(super::CssRewriteError::OutputTooLarge)
             ),
             "should reject the expanded output including the unchanged tail"
@@ -2914,20 +2921,28 @@ b{background:url(\"https://cdn.example/c.png\")}";
 
     #[test]
     fn inline_css_output_uses_the_same_budget() {
+        let limit = 256;
         let settings = crate::test_support::tests::create_test_settings();
         let reference = "background:image-set(\"https://cdn.example.com/a.png\" 1x);";
-        let css = format!(
-            "{reference}{}",
-            " ".repeat(super::MAX_REWRITABLE_BODY_SIZE - reference.len())
-        );
-        assert!(
-            super::rewrite_style_urls(&settings, &css, "").is_empty(),
-            "should drop oversized temporary style-block output"
-        );
-        assert!(
-            super::rewrite_style_attribute_urls(&settings, &css, "").is_empty(),
-            "should drop oversized temporary attribute output"
-        );
+        let css = format!("{reference}{}", " ".repeat(limit - reference.len()));
+        for (allows_import_rules, context) in [(true, "<style> block"), (false, "style attribute")]
+        {
+            let rewritten = super::rewrite_style_urls_in_context(
+                &settings,
+                &css,
+                "",
+                allows_import_rules,
+                limit,
+            );
+            assert!(
+                matches!(rewritten, Err(super::CssRewriteError::OutputTooLarge)),
+                "should reject oversized output in {context}"
+            );
+            assert!(
+                super::drop_if_rejected(rewritten, context).is_empty(),
+                "should drop oversized output in {context}"
+            );
+        }
         let html = "<style>a{background:url(https://cdn.example.com/a.png)}</style><p>kept</p>";
         assert!(
             rewrite_creative_html(&settings, html).contains("<p>kept</p>"),
@@ -2937,14 +2952,12 @@ b{background:url(\"https://cdn.example/c.png\")}";
 
     #[test]
     fn css_output_expansion_is_rejected_before_the_body_limit() {
+        let limit = 256;
         let settings = crate::test_support::tests::create_test_settings();
         let reference = "@import \"https://cdn.example.com/a.css\";";
-        let css = format!(
-            "{}{reference}",
-            " ".repeat(super::MAX_REWRITABLE_BODY_SIZE - reference.len())
-        );
+        let css = format!("{}{reference}", " ".repeat(limit - reference.len()));
         assert!(
-            super::rewrite_css_body(&settings, &css).is_err(),
+            super::rewrite_style_urls_in_context(&settings, &css, "", true, limit).is_err(),
             "should reject URL expansion beyond the output budget"
         );
     }
