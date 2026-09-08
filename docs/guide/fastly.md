@@ -97,7 +97,7 @@ Prefer header names that nothing else in the fronting service uses:
 [trusted_client_ip]
 ip_header = "x-ts-client-ip"
 auth_header = "x-ts-client-ip-auth"
-shared_secret = "replace-with-a-random-shared-secret"
+shared_secret = "trusted_client_ip_shared_secret"
 ```
 
 `ip_header` may also be
@@ -139,8 +139,11 @@ sub vcl_recv {
 Attach an edge dictionary named `ts_private_config` to the fronting service and
 store the secret under the key `trusted_client_ip_secret`. Create the dictionary
 as write-only so the value cannot be read back through the API or the web
-interface. If the key is absent, the lookup yields no matching value, the
-authentication check fails, and Trusted Server falls back to the peer address.
+interface. Store the identical value in the physical store mapped from
+`trusted_server_secrets`, under the key named by
+`trusted_client_ip.shared_secret` (`trusted_client_ip_shared_secret` above). If
+either key is absent, authentication cannot succeed and Trusted Server falls
+back to the peer address.
 
 Four details in that example carry weight:
 
@@ -166,18 +169,17 @@ Four details in that example carry weight:
   different backend. On the ordinary path the host is unchanged and re-running
   writes the same values.
 
-Configure the identical header names and secret in Trusted Server. The
-`shared_secret` shown above is an intentionally invalid placeholder that
-Trusted Server rejects at startup; replace it with the exact value stored in
-the dictionary. Use a cryptographically random value of at least 32 ASCII
-graphic bytes, encoded as hex or base64url with no whitespace.
+Configure the identical header names and the secret-store key name in Trusted
+Server. Use a cryptographically random value of at least 32 ASCII graphic bytes,
+encoded as hex or base64url with no whitespace, for the two store entries. The
+app-config blob contains only `trusted_client_ip_shared_secret`, not that value.
 
 ### What Trusted Server does with the result
 
 Trusted Server accepts the forwarded address only when the request carries
-exactly one authentication value matching `shared_secret` byte for byte and
-exactly one IP value that parses directly as IPv4 or IPv6. Values are not
-trimmed. Both headers are removed before routing.
+exactly one authentication value matching the resolved shared secret byte for
+byte and exactly one IP value that parses directly as IPv4 or IPv6. Values are
+not trimmed. Both headers are removed before routing.
 
 | Request state                                                     | Address used     |
 | ----------------------------------------------------------------- | ---------------- |
@@ -258,15 +260,43 @@ Used for storing public configuration (e.g., public keys, key metadata):
 fastly config-store create --name jwks_store
 ```
 
-### Secret Store
+### Secret Stores
 
-Used for storing sensitive data (e.g., private signing keys):
+Trusted Server keeps static app-config credentials under logical store ID
+`trusted_server_secrets`. The physical Fastly store can use another name, such
+as `ts_secrets`. Request-signing private keys remain in their separate,
+runtime-managed store.
+
+Set the physical mapping before provisioning:
+
+```bash
+export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
+ts provision --adapter fastly
+```
+
+Provisioning creates or reuses the physical store and persists this runtime
+mapping in Fastly Config Store `edgezero_runtime_env`, scoped to the current
+Fastly service:
+
+```text
+EDGEZERO__SERVICES__<SERVICE_ID>__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
+```
+
+The runtime ignores legacy unscoped entries. The Fastly service must link both
+`ts_secrets` and `edgezero_runtime_env` to the active service version. The
+custom streaming entry point reads the service-scoped mapping before loading
+app config, so every startup and reload resolves static credentials from
+`ts_secrets` while the portable manifest continues to declare
+`trusted_server_secrets`.
+
+Create the separate request-signing store when that feature is enabled:
 
 ```bash
 fastly secret-store create --name signing_keys
 ```
 
-Note the store IDs - you'll need them for your `trusted-server.toml` configuration.
+Do not copy the same app credential store under a second hardcoded
+`trusted_server_secrets` Fastly link. Configure the mapping instead.
 
 ## Create EC KV Store
 
@@ -282,12 +312,23 @@ Create it:
 fastly kv-store create --name ec_identity_store
 ```
 
-Configure in `trusted-server.toml`:
+Configure the secret-store key name in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
+```
+
+Store the high-entropy passphrase under that key in `ts_secrets`. The resolved
+value, rather than the key name, must contain at least 32 characters. Pipe the
+value over standard input so it never appears in the process argument list:
+
+```bash
+openssl rand -hex 32 | tr -d '\n' | fastly secret-store-entry create \
+  --store-id=<ts-secrets-store-id> \
+  --name=ec_passphrase \
+  --stdin
 ```
 
 Verify stores exist:
