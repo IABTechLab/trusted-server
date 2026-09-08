@@ -1,6 +1,6 @@
 # Didomi loader geo forwarding — issue 85
 
-Status: Revised design for publisher review. No runtime implementation is included.
+Status: Implemented by this change.
 
 ## Outcome
 

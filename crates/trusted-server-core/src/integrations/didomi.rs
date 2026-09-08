@@ -588,8 +588,8 @@ mod tests {
             enabled,
             geo_query_parameters: false,
             proxy_path: None,
-            sdk_origin: default_sdk_origin(),
-            api_origin: default_api_origin(),
+            sdk_origin: "https://sdk.example.com".to_string(),
+            api_origin: "https://api.example.com".to_string(),
         }
     }
 
@@ -898,9 +898,7 @@ mod tests {
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
             stub.recorded_request_uris(),
-            vec![
-                "https://sdk.privacy-center.org/key/loader.js?target_type=notice&country=US&region=CA"
-            ],
+            vec!["https://sdk.example.com/key/loader.js?target_type=notice&country=US&region=CA"],
             "should send the canonical query to Didomi"
         );
         let headers = stub.recorded_request_headers();
@@ -941,7 +939,7 @@ mod tests {
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
             stub.recorded_request_uris(),
-            vec!["https://sdk.privacy-center.org/key/loader.js?target_type=notice"],
+            vec!["https://sdk.example.com/key/loader.js?target_type=notice"],
             "should not add geo when the option is disabled"
         );
     }
@@ -966,7 +964,7 @@ mod tests {
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
             stub.recorded_request_uris(),
-            vec!["https://sdk.privacy-center.org/sdk/v1/core.js?v=1"],
+            vec!["https://sdk.example.com/sdk/v1/core.js?v=1"],
             "should not apply loader geo behavior to other SDK assets"
         );
     }
