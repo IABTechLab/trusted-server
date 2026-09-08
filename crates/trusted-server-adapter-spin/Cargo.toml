@@ -1,6 +1,7 @@
 [package]
 name = "trusted-server-adapter-spin"
 description = "Fermyon Spin entry point for Trusted Server."
+readme = "README.md"
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

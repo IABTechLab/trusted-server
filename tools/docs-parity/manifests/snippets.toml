@@ -539,7 +539,7 @@ fingerprint = "sha256:b494183dba64e9f77b19b85e69c787e5f5cdf564ef9bcfb32bb8382135
 path = "CLAUDE.md"
 selector = "fence:1"
 command = "illustrative-plain"
-fingerprint = "sha256:660a6da789fb58ec054157a6e4a874bc3becb9c5e9b0b25f835136d9e18debdd"
+fingerprint = "sha256:5c99e88ac851712fdf6c06db076d3d5b7dbc3895998960d2a1d27ee0d82a9219"
 
 [[snippets]]
 path = "CLAUDE.md"
@@ -551,7 +551,7 @@ fingerprint = "sha256:d4fb51e947b44319e975087c60cfe748db09d8ababd6aa49a30f0a9e74
 path = "CLAUDE.md"
 selector = "fence:3"
 command = "illustrative-bash"
-fingerprint = "sha256:463e145cdd9a8df5abdae512a6b7f5b1f7a69c3fefdff0496323ca85ff1c8a9b"
+fingerprint = "sha256:1f1d7d44c1f3d9bc18207282772a69dc73b34e2e710f7b7499bd6505ecfac41b"
 
 [[snippets]]
 path = "CLAUDE.md"
@@ -578,28 +578,16 @@ command = "illustrative-rust"
 fingerprint = "sha256:1977cba09378d87fc4f50c849bebeb18c9736b29d9968aecc82abbafc9d539a2"
 
 [[snippets]]
-path = "CONTRIBUTING.md"
-selector = "fence:1"
-command = "illustrative-plain"
-fingerprint = "sha256:ec1160aedd5a6f8874cd005174891688ae0da590c480444af34bc3cc7c1e73c5"
-
-[[snippets]]
-path = "CONTRIBUTING.md"
-selector = "fence:2"
-command = "illustrative-rust"
-fingerprint = "sha256:29d58510f883df1ae2931d6ccd05385b5bc8250467d97f31ce4e8e7bae0ddf7d"
-
-[[snippets]]
 path = "README.md"
 selector = "fence:1"
 command = "validate-bash"
-fingerprint = "sha256:e99fc9d9795f28a97bcd3f6ff51a7b1f22e642e95777dbe266ada4767ac2ee21"
+fingerprint = "sha256:7d06640bf8931bc1cc39556b9e4dd3780a60881bc2a09432e31c166e9e007e39"
 
 [[snippets]]
 path = "README.md"
 selector = "fence:2"
 command = "validate-bash"
-fingerprint = "sha256:7975237cb3942e7487085db14e255bfde12b884d021d724e1e2f58c6f2ce6a2a"
+fingerprint = "sha256:abb67e2e782598e333ebe4793be1d0fb017717b307f9aa108371286026fb84c3"
 
 [[snippets]]
 path = "TESTING.md"
@@ -614,64 +602,64 @@ command = "validate-bash"
 fingerprint = "sha256:4790bf9898e42b65d89eecae1bea746aa4be0e543c02ed6fbe94d1c7d1b121fb"
 
 [[snippets]]
+path = "crates/trusted-server-adapter-axum/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:5f775bc42e0a87261eccdc85cd39e6ea3b5b707f8c73c476be75e706cb18ded6"
+
+[[snippets]]
+path = "crates/trusted-server-adapter-cloudflare/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:6f8824ef608b6fb1804082b2b2a1ca9d82caac8c577fdf38050f7122c749405e"
+
+[[snippets]]
+path = "crates/trusted-server-adapter-fastly/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:eae0ded7fda2c84fdb0ceededa0053a800bfa352daa80c751e4e3169b605318b"
+
+[[snippets]]
+path = "crates/trusted-server-adapter-spin/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:0bb99801d7e166ffcb9a2dc4703daf9f502dce276069f809ec4e4ea92fee9dd0"
+
+[[snippets]]
+path = "crates/trusted-server-cli/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:537da4e1c6412d9d4979db72cc9b3578952b325bb7fbdbfcf85d9535bd60ad27"
+
+[[snippets]]
+path = "crates/trusted-server-core/README.md"
+selector = "fence:1"
+command = "validate-bash"
+fingerprint = "sha256:eae0ded7fda2c84fdb0ceededa0053a800bfa352daa80c751e4e3169b605318b"
+
+[[snippets]]
 path = "crates/trusted-server-integration-tests/README.md"
 selector = "fence:1"
 command = "validate-bash"
-fingerprint = "sha256:4bc64fcd6b17d074079c87d6be0b0c7ff61dd86c8362b13dc9a56506f83e2ffb"
+fingerprint = "sha256:6d55f73df8c521e623a2804632952e8a7e84200388b1ebe6257cd469f60c9592"
 
 [[snippets]]
-path = "crates/trusted-server-integration-tests/README.md"
-selector = "fence:2"
+path = "crates/trusted-server-js/README.md"
+selector = "fence:1"
 command = "validate-bash"
-fingerprint = "sha256:502f7cfcbaa48b8fb84473b9f36693fd7395d935a2f9130f38451c605a98d58d"
+fingerprint = "sha256:29a2a40a482a149447119d7487c956383ad2373265e14f1ece0e858f0fdc0d46"
 
 [[snippets]]
-path = "crates/trusted-server-integration-tests/README.md"
-selector = "fence:3"
+path = "crates/trusted-server-openrtb-codegen/README.md"
+selector = "fence:1"
 command = "validate-bash"
-fingerprint = "sha256:94a17b77f5a3b5936a5c14a5fc1787c991f578169075dfd5b07323afd89c7e7b"
-
-[[snippets]]
-path = "crates/trusted-server-integration-tests/README.md"
-selector = "fence:4"
-command = "validate-bash"
-fingerprint = "sha256:75b7f769cde7b938efe6908d7ce0df19cb9ccd0c12d12ad4f4a57071f545a1fb"
-
-[[snippets]]
-path = "crates/trusted-server-integration-tests/README.md"
-selector = "fence:5"
-command = "validate-bash"
-fingerprint = "sha256:3d86b69f7951271852d9e88ec02fbf4e7cae2a39963665a3b9802c2131b90933"
-
-[[snippets]]
-path = "crates/trusted-server-integration-tests/README.md"
-selector = "fence:6"
-command = "validate-bash"
-fingerprint = "sha256:e356a7d232eeb5d5b3f7907bc6fb35048567cce576acb6dc86b0091babd48577"
-
-[[snippets]]
-path = "crates/trusted-server-integration-tests/README.md"
-selector = "fence:7"
-command = "illustrative-plain"
-fingerprint = "sha256:fb5d90b1e565b4d4420e3a7e3ef73e263fcbea1b06764c9c5c581ba5f4a95b8e"
+fingerprint = "sha256:3afdeb3c9c966d1b2f491fe69ccce5bbdc2b9a602a6ad0e6c7719d70c35c33f7"
 
 [[snippets]]
 path = "crates/trusted-server-openrtb/README.md"
 selector = "fence:1"
-command = "validate-sh"
+command = "validate-bash"
 fingerprint = "sha256:531754ea90eda1474e535020aa2313a21c306f51c9ce55633a58c00c7504329b"
-
-[[snippets]]
-path = "crates/trusted-server-openrtb/README.md"
-selector = "fence:2"
-command = "validate-rust"
-fingerprint = "sha256:2cd4fd57f7118f55d23cda5043b574549664cb6187614c2712a46bb881099fb4"
-
-[[snippets]]
-path = "crates/trusted-server-openrtb/README.md"
-selector = "fence:3"
-command = "illustrative-rust"
-fingerprint = "sha256:3d002d17565f88ac421c160876f9c5d478e5d223c7ecc49a9f812070d0e3f6b7"
 
 [[snippets]]
 path = "docs/README.md"

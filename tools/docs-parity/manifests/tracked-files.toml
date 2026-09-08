@@ -183,6 +183,10 @@ path = "crates/trusted-server-adapter-axum/Cargo.toml"
 kind = "text"
 
 [[files]]
+path = "crates/trusted-server-adapter-axum/README.md"
+kind = "text"
+
+[[files]]
 path = "crates/trusted-server-adapter-axum/axum.toml"
 kind = "text"
 
@@ -216,6 +220,10 @@ kind = "text"
 
 [[files]]
 path = "crates/trusted-server-adapter-cloudflare/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-cloudflare/README.md"
 kind = "text"
 
 [[files]]
@@ -256,6 +264,10 @@ kind = "text"
 
 [[files]]
 path = "crates/trusted-server-adapter-fastly/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-adapter-fastly/README.md"
 kind = "text"
 
 [[files]]
@@ -327,6 +339,10 @@ path = "crates/trusted-server-adapter-spin/Cargo.toml"
 kind = "text"
 
 [[files]]
+path = "crates/trusted-server-adapter-spin/README.md"
+kind = "text"
+
+[[files]]
 path = "crates/trusted-server-adapter-spin/spin.toml"
 kind = "text"
 
@@ -352,6 +368,10 @@ kind = "text"
 
 [[files]]
 path = "crates/trusted-server-cli/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-cli/README.md"
 kind = "text"
 
 [[files]]
@@ -1331,6 +1351,10 @@ path = "crates/trusted-server-js/Cargo.toml"
 kind = "text"
 
 [[files]]
+path = "crates/trusted-server-js/README.md"
+kind = "text"
+
+[[files]]
 path = "crates/trusted-server-js/build.rs"
 kind = "text"
 
@@ -1828,6 +1852,10 @@ kind = "text"
 
 [[files]]
 path = "crates/trusted-server-openrtb-codegen/Cargo.toml"
+kind = "text"
+
+[[files]]
+path = "crates/trusted-server-openrtb-codegen/README.md"
 kind = "text"
 
 [[files]]
@@ -2699,6 +2727,10 @@ path = "rust-toolchain.toml"
 kind = "text"
 
 [[files]]
+path = "scripts/README.md"
+kind = "text"
+
+[[files]]
 path = "scripts/batch-sync.sh"
 kind = "text"
 
@@ -2939,6 +2971,10 @@ path = "tools/docs-parity/src/model.rs"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/src/readmes.rs"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/src/repository.rs"
 kind = "text"
 
@@ -2992,6 +3028,10 @@ kind = "text"
 
 [[files]]
 path = "tools/docs-parity/tests/markdown.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/readmes.rs"
 kind = "text"
 
 [[files]]

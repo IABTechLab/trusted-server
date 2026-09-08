@@ -5,10 +5,10 @@
 
 ## Project Overview
 
-Rust-based edge computing application targeting **Fastly Compute**. Handles
-Edge Cookie (EC) ID generation, ad serving with consent signal extraction
-and enforcement, real-time bidding integration, and publisher-side
-JavaScript injection.
+Rust-based publisher edge application with a portable core and adapters for
+Fastly Compute, Cloudflare Workers, Fermyon Spin, and native Axum development.
+It handles Edge Cookie (EC) ID generation, consent-aware ad serving, auction
+orchestration, first-party proxying, and publisher-side JavaScript injection.
 
 ## Workspace Layout
 
@@ -22,6 +22,9 @@ crates/
   trusted-server-cli/                   # Host-target `ts` operator CLI
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
+  trusted-server-integration-tests/     # Native parity, end-to-end, and documentation tests
+  trusted-server-openrtb/               # Checked-in OpenRTB JSON model
+  trusted-server-openrtb-codegen/       # Host-only manual OpenRTB generator
 ```
 
 Supporting files: `edgezero.toml`, `fastly.toml`,
@@ -99,7 +102,7 @@ cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
 
-# Run host-target CLI tests (workspace default target is wasm32-wasip1)
+# Run host-target CLI tests (the workspace has no global target)
 # Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
 # or aarch64-apple-darwin on Apple Silicon macOS.
 # Use the local helper (recommended):
@@ -253,7 +256,8 @@ impl core::error::Error for MyError {}
 - Always use intra-doc links (`[`Item`]`) for referenced types.
 - Document errors with `# Errors` section for all fallible functions.
 - Document panics with `# Panics` section.
-- Add `# Examples` sections for public API functions.
+- Add `# Examples` sections when an example proves behavior or prevents a
+  likely misuse; do not add ceremonial examples that restate the signature.
 - Add `# Performance` sections for performance-critical functions.
 - Skip documentation for standard trait implementations unless behavior is unique.
 - Use `cargo doc --no-deps --all-features` to verify.
@@ -269,11 +273,12 @@ impl core::error::Error for MyError {}
 
 ## Other guidelines
 
-- Use only example or fictional information in comments, tests, docs, examples,
-  and similar non-runtime materials. (eg. for urls use: example.com domains only)
-- Do not write or commit real domains, customer names, credentials,
-  configuration values, or other potentially sensitive real-world information in
-  comments, tests, docs, or examples.
+- Use example or fictional information by default in comments, tests, docs,
+  examples, and similar non-runtime materials. Use `example.com` domains for
+  invented URLs.
+- Do not write or commit customer names, credentials, private configuration, or
+  other sensitive real-world information. A necessary public vendor endpoint is
+  permitted only through the exact, typed, owned, expiring exception below.
 - Sensitive-data exceptions are limited to these types: vendor URL,
   hash-pinned fake-credential fixture, historical example, service ID, and
   project-owned public domain.
@@ -309,9 +314,16 @@ IntegrationRegistration::builder(ID)
     .build()
 ```
 
-- Integration IDs match JS directory names: `prebid` (deferred), `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
-- `creative` is JS-only (no Rust registration); `nextjs`, `aps`, `adserver_mock` are Rust-only.
-- Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
+- The checked integration inventory contains 14 deployment IDs. Registration
+  can come from a settings builder, auction plan, or auction mediator; a deploy
+  ID does not imply that all three exist.
+- Twelve browser integration entries produce bundles alongside `core`.
+  `creative` is browser-only; `nextjs` and `adserver_mock` have no browser
+  module; APS rendering uses a dedicated asset rather than an integration
+  bundle.
+- Immediate modules are concatenated into the unified bundle. Prebid opts into
+  deferred loading through `.with_deferred_js()`. `gpt_diagnostics` is excluded
+  from both registry lists and uses a request-gated standalone tag.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
 
 ## JS Build Pipeline
@@ -326,14 +338,14 @@ IntegrationRegistration::builder(ID)
 
 ## Configuration Files
 
-| File                  | Purpose                                                    |
-| --------------------- | ---------------------------------------------------------- |
-| `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
-| `fastly.toml`                   | Fastly service configuration and build settings                 |
-| `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
-| `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
-| `.env.dev`                      | Local development environment variables                         |
+| File                          | Purpose                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                 |
+| `fastly.toml`                 | Fastly service configuration and build settings                                                   |
+| `trusted-server.example.toml` | Source-controlled Trusted Server app-config template                                              |
+| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
+| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                       |
+| `.env.dev`                    | Local development environment variables                                                           |
 
 ---
 
@@ -436,18 +448,18 @@ both runtime behavior and build/tooling changes.
 
 ## Key Files
 
-| File                                         | Purpose                                           |
-| -------------------------------------------- | ------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
-| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
-| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
-| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
+| File                                                      | Purpose                                              |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`               |
+| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs                |
+| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start                 |
+| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules        |
 | `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
-| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
-| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
-| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
-| `crates/trusted-server-js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
-| `crates/trusted-server-js/src/bundle.rs`                    | Module map, concatenation, hashing                |
+| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                      |
+| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management                  |
+| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities              |
+| `crates/trusted-server-js/build.rs`                       | Discovers dist files, generates `tsjs_modules.rs`    |
+| `crates/trusted-server-js/src/bundle.rs`                  | Module map, concatenation, hashing                   |
 
 ---
 

@@ -1286,23 +1286,23 @@ git commit -m "Add full documentation product coverage"
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
 - Modify: `tools/docs-parity/manifests/snippets.toml`
 
-- [ ] **Step 1: Add the failing README equality test**
+- [x] **Step 1: Add the failing README equality test**
 
-Use `cargo metadata --no-deps` to enumerate every package. Expected before edits: seven missing README files and ten package manifests missing `readme =` metadata. Include an extra/unlisted README negative fixture.
+Use `cargo metadata --no-deps` to enumerate every package. Expected before edits: seven missing README files and ten package manifests missing explicit `readme =` metadata. Include an extra/unlisted README negative fixture.
 
-- [ ] **Step 2: Correct canonical contributor/operator prose**
+- [x] **Step 2: Correct canonical contributor/operator prose**
 
 Make root quick starts satisfy the first-success scripts; make contributing link to canonical gates; correct target/integration-model/example policy in CLAUDE; apply the selected factual-governance fallback.
 
-- [ ] **Step 3: Write responsibility-focused READMEs**
+- [x] **Step 3: Write responsibility-focused READMEs**
 
 Each crate README states purpose, runtime/target, important boundaries, build/test command, and links to canonical guides without copying volatile matrices. Rewrite core as an actual module overview and correct integration-test scope. Add a scripts index with inputs/side effects/cleanup.
 
-- [ ] **Step 4: Connect Cargo metadata**
+- [x] **Step 4: Connect Cargo metadata**
 
 Add exact `readme = "README.md"` entries to the seven new crate manifests and any existing package missing the metadata. Do not alter dependency or feature resolution.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- readmes --check
@@ -1314,7 +1314,7 @@ cd docs && npm run lint && npm run format && npm run build
 
 Expected: every package maps to an existing README and all active root/crate/skill/agent dispositions remain closed.
 
-- [ ] **Step 6: Commit WP6**
+- [x] **Step 6: Commit WP6**
 
 ```bash
 git add README.md CONTRIBUTING.md CLAUDE.md ProjectGovernance.md crates/trusted-server-core/README.md crates/trusted-server-core/Cargo.toml crates/trusted-server-integration-tests/README.md crates/trusted-server-integration-tests/Cargo.toml crates/trusted-server-adapter-axum/README.md crates/trusted-server-adapter-cloudflare/README.md crates/trusted-server-adapter-fastly/README.md crates/trusted-server-adapter-spin/README.md crates/trusted-server-cli/README.md crates/trusted-server-js/README.md crates/trusted-server-openrtb-codegen/README.md crates/trusted-server-openrtb/Cargo.toml crates/trusted-server-adapter-axum/Cargo.toml crates/trusted-server-adapter-cloudflare/Cargo.toml crates/trusted-server-adapter-fastly/Cargo.toml crates/trusted-server-adapter-spin/Cargo.toml crates/trusted-server-cli/Cargo.toml crates/trusted-server-js/Cargo.toml crates/trusted-server-openrtb-codegen/Cargo.toml scripts/README.md tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md

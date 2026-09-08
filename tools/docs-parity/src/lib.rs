@@ -21,6 +21,7 @@ pub mod gates;
 pub mod integrations;
 pub mod markdown;
 pub mod model;
+pub mod readmes;
 mod repository;
 pub mod routes;
 pub mod scanner;
@@ -59,6 +60,8 @@ pub enum DocsParityError {
     CliHelp,
     #[display("documentation snippet semantics failed")]
     Snippets,
+    #[display("workspace README semantics failed")]
+    Readmes,
     #[display("documentation workflow policy failed")]
     Workflow,
     #[display("dependency snapshot semantics failed")]
@@ -104,6 +107,8 @@ enum Command {
     CliHelp(CliHelpArguments),
     /// Check classified Markdown snippets in isolated modes.
     Snippets(SnippetsArguments),
+    /// Check package-to-README equality for every workspace member.
+    Readmes(ReadmesArguments),
     /// Check the currently activated repository workflow policy.
     Workflow(WorkflowArguments),
     /// Generate or validate a bounded dependency snapshot artifact.
@@ -146,6 +151,13 @@ struct SnippetsArguments {
 #[derive(Args, Debug)]
 struct PagesArguments {
     /// Validate publication inventories without changing repository bytes.
+    #[arg(long, required = true)]
+    check: bool,
+}
+
+#[derive(Args, Debug)]
+struct ReadmesArguments {
+    /// Validate workspace README equality without changing repository bytes.
     #[arg(long, required = true)]
     check: bool,
 }
@@ -326,6 +338,7 @@ pub fn run_from_env() -> Result<Outcome, Report<DocsParityError>> {
         Command::Routes(arguments) => routes(&repository, &arguments),
         Command::CliHelp(arguments) => cli_help(&repository, &arguments),
         Command::Snippets(arguments) => snippets(&repository, &arguments),
+        Command::Readmes(arguments) => readmes(&repository, &arguments),
         Command::Workflow(arguments) => workflow(&repository, &arguments),
         Command::DependencySnapshot(arguments) => dependency_snapshot(&repository, &arguments),
     }
@@ -337,6 +350,15 @@ fn pages(
 ) -> Result<Outcome, Report<DocsParityError>> {
     debug_assert!(arguments.check, "clap should require page check mode");
     markdown::check_local_repository(repository).change_context(DocsParityError::Markdown)?;
+    Ok(Outcome::Clean)
+}
+
+fn readmes(
+    repository: &Repository,
+    arguments: &ReadmesArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    debug_assert!(arguments.check, "clap should require README check mode");
+    readmes::check_repository(repository).change_context(DocsParityError::Readmes)?;
     Ok(Outcome::Clean)
 }
 
@@ -549,6 +571,7 @@ enum OfflineCheckKind {
     Generated,
     Integrations,
     LocalLinks,
+    Readmes,
     Routes,
     Scanner,
     Settings,
@@ -564,6 +587,7 @@ impl OfflineCheckKind {
             Self::Generated => "generated",
             Self::Integrations => "integrations",
             Self::LocalLinks => "local-links",
+            Self::Readmes => "readmes",
             Self::Routes => "routes",
             Self::Scanner => "scanner",
             Self::Settings => "settings",
@@ -579,7 +603,7 @@ struct OfflineCheckEntry {
     run: OfflineCheckFunction,
 }
 
-const OFFLINE_CHECKS: [OfflineCheckEntry; 10] = [
+const OFFLINE_CHECKS: [OfflineCheckEntry; 11] = [
     OfflineCheckEntry {
         kind: OfflineCheckKind::Classification,
         run: offline_classification,
@@ -599,6 +623,10 @@ const OFFLINE_CHECKS: [OfflineCheckEntry; 10] = [
     OfflineCheckEntry {
         kind: OfflineCheckKind::LocalLinks,
         run: offline_local_links,
+    },
+    OfflineCheckEntry {
+        kind: OfflineCheckKind::Readmes,
+        run: offline_readmes,
     },
     OfflineCheckEntry {
         kind: OfflineCheckKind::Routes,
@@ -671,6 +699,11 @@ fn offline_integrations(repository: &Repository) -> Result<bool, Report<DocsPari
 
 fn offline_local_links(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
     markdown::check_local_repository(repository).change_context(DocsParityError::Markdown)?;
+    Ok(false)
+}
+
+fn offline_readmes(repository: &Repository) -> Result<bool, Report<DocsParityError>> {
+    readmes::check_repository(repository).change_context(DocsParityError::Readmes)?;
     Ok(false)
 }
 
@@ -801,6 +834,7 @@ mod tests {
             OfflineCheckKind::Generated,
             OfflineCheckKind::Integrations,
             OfflineCheckKind::LocalLinks,
+            OfflineCheckKind::Readmes,
             OfflineCheckKind::Routes,
             OfflineCheckKind::Scanner,
             OfflineCheckKind::Settings,
@@ -825,6 +859,7 @@ mod tests {
                 "generated",
                 "integrations",
                 "local-links",
+                "readmes",
                 "routes",
                 "scanner",
                 "settings",

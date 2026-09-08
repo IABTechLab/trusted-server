@@ -237,6 +237,11 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "crates/trusted-server-adapter-axum/README.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "crates/trusted-server-adapter-axum/axum.toml"
 mode = "comments"
 grammar = "toml"
@@ -288,6 +293,11 @@ path = "crates/trusted-server-adapter-cloudflare/Cargo.toml"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "non_documentation"
+
+[[sources]]
+path = "crates/trusted-server-adapter-cloudflare/README.md"
+mode = "whole"
+disposition = "include"
 
 [[sources]]
 path = "crates/trusted-server-adapter-cloudflare/build.sh"
@@ -344,6 +354,11 @@ path = "crates/trusted-server-adapter-fastly/Cargo.toml"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "non_documentation"
+
+[[sources]]
+path = "crates/trusted-server-adapter-fastly/README.md"
+mode = "whole"
+disposition = "include"
 
 [[sources]]
 path = "crates/trusted-server-adapter-fastly/src/app.rs"
@@ -448,6 +463,11 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "crates/trusted-server-adapter-spin/README.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "crates/trusted-server-adapter-spin/spin.toml"
 mode = "comments"
 grammar = "toml"
@@ -487,6 +507,11 @@ path = "crates/trusted-server-cli/Cargo.toml"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "non_documentation"
+
+[[sources]]
+path = "crates/trusted-server-cli/README.md"
+mode = "whole"
+disposition = "include"
 
 [[sources]]
 path = "crates/trusted-server-cli/src/ad_templates/compare.rs"
@@ -1947,6 +1972,11 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "crates/trusted-server-js/README.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "crates/trusted-server-js/build.rs"
 mode = "whole"
 disposition = "exclude"
@@ -2691,6 +2721,11 @@ path = "crates/trusted-server-openrtb-codegen/Cargo.toml"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "non_documentation"
+
+[[sources]]
+path = "crates/trusted-server-openrtb-codegen/README.md"
+mode = "whole"
+disposition = "include"
 
 [[sources]]
 path = "crates/trusted-server-openrtb-codegen/src/main.rs"
@@ -3926,6 +3961,11 @@ disposition = "exclude"
 exclude_kind = "non_documentation"
 
 [[sources]]
+path = "scripts/README.md"
+mode = "whole"
+disposition = "include"
+
+[[sources]]
 path = "scripts/batch-sync.sh"
 mode = "comments"
 grammar = "shell"
@@ -4271,6 +4311,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/src/readmes.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "tools/docs-parity/src/repository.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4350,6 +4396,12 @@ exclude_kind = "source_code"
 
 [[sources]]
 path = "tools/docs-parity/tests/markdown.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/readmes.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"

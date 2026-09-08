@@ -3719,7 +3719,41 @@ truth.
 
 #### Task 15 — Complete WP6 root and crate documentation
 
-Pending. Apply and verify the factual-governance fallback.
+Complete for the WP6 checkpoint. `cargo metadata --no-deps --format-version 1`
+enumerated ten workspace packages. Before the edit, seven packages had no
+README file and all ten package manifests lacked an explicit `readme` key;
+Cargo inferred `README.md` only for the three directories where the file
+already existed. Every package now has a tracked, nonempty `README.md` and an
+exact `readme = "README.md"` declaration. The deterministic README checker
+parses the checked workspace and package manifests without invoking Cargo,
+requires set equality for top-level crate manifests and READMEs, and rejects a
+specific extra/unlisted README fixture.
+
+The root README's shortest local path is the checked Axum first-success smoke,
+and it links each other adapter to the exact recurring smoke and deployment
+guide. The four scripts and their cleanup/oracle contracts were already proven
+in Task 13; this docs-and-metadata checkpoint does not change their behavior.
+`CONTRIBUTING.md` references the canonical gate surface without copying its
+command list. `CLAUDE.md` now states that the workspace has no global target,
+describes the complete integration/browser loading model, limits examples to
+ones that prove behavior or prevent misuse, and permits necessary public vendor
+endpoints only through the checked exception process.
+
+All seven missing crate READMEs and `scripts/README.md` were added. The core,
+integration-test, and OpenRTB READMEs now state responsibility, runtime target,
+important boundaries, exact build/test entry points, and canonical guide
+links. The scripts index records inputs, persistent side effects, and cleanup
+for every checked shell script. The factual-governance fallback is applied:
+`ProjectGovernance.md` does not claim that repository meeting minutes exist or
+that releases are continuous, does not invent current role holders, and does
+not create a `CODEOWNERS` commitment.
+
+The checkpoint verification passed on 2026-09-07: the README equality,
+snippet, local-link, classification, and sensitive-data checks; the ten-package
+`cargo metadata` assertion; workspace and docs-parity formatting; docs-parity
+Clippy with warnings denied; documentation ESLint and Prettier checks; and the
+VitePress production build. The build emitted only the accepted `vcl` grammar
+fallback warning.
 
 #### Task 16 — Complete WP7 rustdoc and JSDoc
 

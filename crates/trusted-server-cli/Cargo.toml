@@ -1,6 +1,7 @@
 [package]
 name = "trusted-server-cli"
 description = "Operator CLI (`ts`) for Trusted Server."
+readme = "README.md"
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

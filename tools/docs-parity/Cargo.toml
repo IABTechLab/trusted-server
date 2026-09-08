@@ -90,6 +90,10 @@ path = "tests/snippets.rs"
 name = "cli_help"
 path = "tests/cli_help.rs"
 
+[[test]]
+name = "readmes"
+path = "tests/readmes.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 derive_more = { version = "2.0", features = ["display"] }
