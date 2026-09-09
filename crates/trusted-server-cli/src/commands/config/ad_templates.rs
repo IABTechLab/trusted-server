@@ -187,7 +187,14 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
         if loaded.settings.auction.providers.is_empty() {
             "(none)".to_string()
         } else {
-            escape_terminal_text(&loaded.settings.auction.providers.join(", ")).into_owned()
+            loaded
+                .settings
+                .auction
+                .providers
+                .keys()
+                .map(|id| escape_terminal_text(id.as_str()).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     )
     .map_err(output_error)?;
@@ -663,8 +670,16 @@ mod tests {
 
     #[test]
     fn explain_keeps_provider_state_separate_from_runtime_verdict() {
+        let mut config_value: toml::Value =
+            toml::from_str(&config_with_slots()).expect("should parse the fixture config");
+        let auction = config_value["auction"]
+            .as_table_mut()
+            .expect("should find the auction table");
+        auction.insert("enabled".to_string(), toml::Value::Boolean(true));
+        auction.remove("providers");
+        auction.remove("bidders");
         let config_text =
-            config_with_slots().replace("[auction]\nenabled = false", "[auction]\nenabled = true");
+            toml::to_string(&config_value).expect("should serialize the fixture config");
         let (_temp, config) = project_with_config(&config_text);
         let mut out = Vec::new();
 
@@ -712,6 +727,10 @@ mod tests {
         assert!(
             output.contains("auction.enabled:"),
             "should report the auction kill-switch state"
+        );
+        assert!(
+            output.contains("auction.providers: pbs-main"),
+            "should report provider map identifiers: {output}"
         );
         assert!(!output.contains("legacy fallback"));
     }

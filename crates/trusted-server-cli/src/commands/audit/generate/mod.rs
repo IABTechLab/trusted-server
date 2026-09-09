@@ -3702,21 +3702,27 @@ mod tests {
         toml::from_str::<toml::Value>(&written).expect("rewritten config is valid TOML");
     }
 
-    /// A full, loadable config with real secrets substituted, so the write-side
-    /// validation gate is live rather than downgraded by a broken baseline.
+    /// A config with fictional resolved secrets and non-placeholder publisher
+    /// values, so both source validation and runtime loading can be exercised.
     fn loadable_config() -> String {
         EXAMPLE_CONFIG
             .replace(
-                "replace-with-admin-password-32-bytes",
-                "test-admin-password-32-bytes-minimum",
+                "password = \"handler_password\"",
+                "password = \"test-admin-password-32-bytes-minimum\"",
             )
             .replace(
-                "trusted-server-placeholder-secret",
-                "test-ec-passphrase-32-bytes-minimum",
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
             )
             .replace(
-                "change-me-proxy-secret",
-                "test-proxy-secret-32-bytes-minimum",
+                "proxy_secret = \"publisher_proxy_secret\"",
+                "proxy_secret = \"test-proxy-secret-32-bytes-minimum\"",
+            )
+            .replace("\"example.com\"", "\"publisher.example.com\"")
+            .replace("\".example.com\"", "\".publisher.example.com\"")
+            .replace(
+                "https://origin.example.com",
+                "https://origin.publisher.example.com",
             )
     }
 
@@ -4147,16 +4153,16 @@ mod tests {
             .expect("should write manifest");
         let config = EXAMPLE_CONFIG
             .replace(
-                "replace-with-admin-password-32-bytes",
-                "test-admin-password-32-bytes-minimum",
+                "password = \"handler_password\"",
+                "password = \"test-admin-password-32-bytes-minimum\"",
             )
             .replace(
-                "trusted-server-placeholder-secret",
-                "test-ec-passphrase-32-bytes-minimum",
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
             )
             .replace(
-                "change-me-proxy-secret",
-                "test-proxy-secret-32-bytes-minimum",
+                "proxy_secret = \"publisher_proxy_secret\"",
+                "proxy_secret = \"test-proxy-secret-32-bytes-minimum\"",
             );
         let config = format!(
             "{config}\n\
