@@ -4,11 +4,12 @@ use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
-use super::rsc::{DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, TChunkScan, scan_tchunks};
+use super::rsc::DEFAULT_MAX_COMBINED_PAYLOAD_BYTES;
 #[cfg(test)]
 pub(super) use super::rsc_stream::RSC_PAYLOAD_PLACEHOLDER_PREFIX;
 use super::rsc_stream::{
-    CapturedPayload, FragmentCapture, capture_fragment, document_state, rsc_payload_placeholder,
+    CapturedPayload, FragmentCapture, RscGroupStatus, capture_fragment, classify_rsc_group,
+    document_state, rsc_payload_placeholder,
 };
 use super::shared::find_rsc_push_payload_range;
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
@@ -108,12 +109,14 @@ impl NextJsRscPlaceholderRewriter {
             FragmentCapture::PassThrough => {
                 if is_last && content.len() > limit && content.contains("__next_f") {
                     let unsafe_continuation = find_rsc_push_payload_range(content)
-                        .map(|(start, end)| match scan_tchunks(&content[start..end]) {
-                            TChunkScan::Complete(_) => false,
-                            TChunkScan::NeedMore | TChunkScan::Invalid => true,
+                        .map(|(start, end)| {
+                            matches!(
+                                classify_rsc_group(&[&content[start..end]], usize::MAX),
+                                RscGroupStatus::NeedMore | RscGroupStatus::Invalid
+                            )
                         })
                         .unwrap_or(true);
-                    state.bypass_rsc |= unsafe_continuation;
+                    state.bypass_rsc |= unsafe_continuation || state.captured_payload_bytes > 0;
                 } else if !is_last && content.len() > limit {
                     state.bypass_rsc = true;
                 }
@@ -319,6 +322,28 @@ mod tests {
     }
 
     #[test]
+    fn captures_initializer_push_at_every_fragment_boundary() {
+        let script = r#"(self.__next_f=self.__next_f||[]).push([1,"1:T3,ab"])"#;
+        for split in 1..script.len() {
+            let state = IntegrationDocumentState::default();
+            let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+            let _ = rewriter.rewrite(&script[..split], &ctx(false, &state));
+            let _ = rewriter.rewrite(&script[split..], &ctx(true, &state));
+            let shared = document_state(&state);
+            let guard = shared.lock().expect("should lock document state");
+            assert_eq!(
+                guard.captured_payloads.len(),
+                1,
+                "should capture initializer split at byte {split}"
+            );
+            assert_eq!(
+                guard.captured_payloads[0].original, "1:T3,ab",
+                "should capture complete payload"
+            );
+        }
+    }
+
+    #[test]
     fn overflowing_fragmented_rsc_restores_prefix_and_bypasses_later_rsc() {
         let state = IntegrationDocumentState::default();
         let rewriter = NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
@@ -362,6 +387,58 @@ mod tests {
             action,
             ScriptRewriteAction::Keep,
             "Non-RSC scripts should be kept unchanged"
+        );
+    }
+
+    #[test]
+    fn oversized_partial_header_bypasses_later_continuation() {
+        for suffix in ["1", "1:", "1:T", "1:T2"] {
+            let state = IntegrationDocumentState::default();
+            let rewriter = NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+                max_combined_payload_bytes: 100,
+                ..(*test_config()).clone()
+            }));
+            let script = format!("self.__next_f.push([1,\"{}{suffix}\"])", "x".repeat(100),);
+            assert_eq!(
+                rewriter.rewrite(&script, &ctx(true, &state)),
+                ScriptRewriteAction::Keep,
+                "should pass through an oversized script",
+            );
+            let continuation = r#"self.__next_f.push([1,"a,https://origin.example.com/path"] )"#;
+            assert_eq!(
+                rewriter.rewrite(continuation, &ctx(true, &state)),
+                ScriptRewriteAction::Keep,
+                "should preserve later payloads after oversized header prefix {suffix}",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_continuation_bypasses_an_unresolved_group() {
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+            max_combined_payload_bytes: 100,
+            ..(*test_config()).clone()
+        }));
+        let first = r#"self.__next_f.push([1,"1:T200,start"])"#;
+        assert!(
+            matches!(
+                rewriter.rewrite(first, &ctx(true, &state)),
+                ScriptRewriteAction::Replace(_)
+            ),
+            "should capture incomplete group"
+        );
+        let oversized = format!("self.__next_f.push([1,\"{}\"])", "x".repeat(101));
+        assert_eq!(
+            rewriter.rewrite(&oversized, &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should pass through oversized continuation"
+        );
+        let later = r#"self.__next_f.push([1,"https://origin.example.com/path/"])"#;
+        assert_eq!(
+            rewriter.rewrite(later, &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should preserve later continuation of bypassed group"
         );
     }
 }

@@ -286,6 +286,10 @@ impl NextJsRscStreamProcessor {
         // well as its bytes so adversarial tiny scripts cannot amplify that
         // work quadratically; the hydration-safe fallback restores originals.
         if self.group.len() > MAX_UNRESOLVED_RSC_PAYLOADS {
+            log::warn!(
+                "Next.js RSC fallback: segment limit, {} payloads",
+                self.group.len()
+            );
             self.state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -309,14 +313,27 @@ impl NextJsRscStreamProcessor {
                     self.limit,
                 );
                 if rewritten.len() != self.group.len() {
-                    return Err(io::Error::other(
-                        "Next.js RSC rewrite returned a mismatched payload count",
-                    ));
+                    log::warn!(
+                        "Next.js RSC fallback: rewrite count mismatch, {} payloads",
+                        self.group.len()
+                    );
+                    return self.release_group(None).map(Some);
                 }
+                log::debug!("Next.js RSC group completes: {} payloads", self.group.len());
                 self.release_group(Some(&rewritten)).map(Some)
             }
-            RscGroupStatus::CompleteUnrewritable => self.release_group(None).map(Some),
+            RscGroupStatus::CompleteUnrewritable => {
+                log::warn!(
+                    "Next.js RSC fallback: split header, {} payloads",
+                    self.group.len()
+                );
+                self.release_group(None).map(Some)
+            }
             RscGroupStatus::Invalid => {
+                log::warn!(
+                    "Next.js RSC fallback: invalid group, {} payloads",
+                    self.group.len()
+                );
                 self.state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -327,6 +344,12 @@ impl NextJsRscStreamProcessor {
     }
 
     fn release_bypass(&mut self, current: &[u8]) -> io::Result<Vec<u8>> {
+        if !self.group.is_empty() || self.next_captured().is_some() {
+            log::warn!(
+                "Next.js RSC fallback: capture or output limit, {} held payloads",
+                self.group.len()
+            );
+        }
         let mut output = self.release_group(None)?;
         output.extend_from_slice(&self.pending_candidate);
         self.pending_candidate.clear();
@@ -451,6 +474,10 @@ impl StreamProcessor for NextJsRscStreamProcessor {
                 }
             }
             if !self.group.is_empty() {
+                log::warn!(
+                    "Next.js RSC fallback: incomplete group at EOF, {} payloads",
+                    self.group.len()
+                );
                 output.extend(self.release_group(None)?);
             }
             if self.next_captured().is_some() {
@@ -613,6 +640,9 @@ fn inspect_non_chunk_segment(segment: &str, terminal: bool) -> HeaderSuffixStatu
                 HeaderSuffixStatus::Complete
             };
         }
+        if terminal && &bytes[cursor..] == b":" {
+            return HeaderSuffixStatus::NeedMore;
+        }
         if bytes.get(cursor..cursor + 2) != Some(b":T") {
             index = cursor + 1;
             continue;
@@ -698,6 +728,18 @@ mod tests {
                 classify_rsc_group(&payloads, usize::MAX),
                 RscGroupStatus::NeedMore,
                 "should retain an incomplete T-chunk candidate",
+            );
+        }
+    }
+
+    #[test]
+    fn retains_every_incomplete_header_prefix() {
+        let header = "1a:T3e,";
+        for split in 1..header.len() {
+            assert_eq!(
+                classify_rsc_group(&[&header[..split]], usize::MAX),
+                RscGroupStatus::NeedMore,
+                "should retain the header prefix split at byte {split}",
             );
         }
     }
@@ -800,6 +842,39 @@ mod tests {
                 .expect("should process ordinary HTML"),
             b"<html><body>ordinary",
             "should not wait for EOF without an unresolved RSC group",
+        );
+    }
+
+    #[test]
+    fn stream_processor_restores_header_split_after_colon() {
+        let payloads = ["1:", "T25,https://origin.example.com/longer-path!"];
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, 1024);
+        let first = processor
+            .process_chunk(placeholders[0].as_bytes(), false)
+            .expect("should retain partial header");
+        assert!(first.is_empty(), "should wait for the rest of the header");
+
+        let second = processor
+            .process_chunk(placeholders[1].as_bytes(), true)
+            .expect("should restore a physically split header");
+        assert_eq!(
+            second,
+            payloads.concat().as_bytes(),
+            "should preserve URL and declared length together",
+        );
+    }
+
+    #[test]
+    fn stream_processor_restores_payloads_on_rewrite_count_mismatch() {
+        let payloads = ["1:T3,ab", "c\n\0SPLIT\0https://origin.example.com/path/"];
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, 1024);
+        let output = processor
+            .process_chunk(placeholders.concat().as_bytes(), true)
+            .expect("should restore originals when the rewrite count differs");
+        assert_eq!(
+            output,
+            payloads.concat().as_bytes(),
+            "should preserve all original bytes"
         );
     }
 

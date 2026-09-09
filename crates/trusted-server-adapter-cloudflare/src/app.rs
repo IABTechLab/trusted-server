@@ -56,6 +56,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -113,6 +114,13 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_services(settings, None)
+}
+
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -120,16 +128,21 @@ fn build_state_with_settings(
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        services,
     }))
+}
+
+impl AppState {
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        self.services
+            .clone()
+            .unwrap_or_else(|| build_runtime_services(ctx))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
-
-fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx)
-}
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
@@ -178,7 +191,7 @@ where
         let s = Arc::clone(&state);
         let f = f.clone();
         Box::pin(async move {
-            let services = build_per_request_services(&ctx);
+            let services = s.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
@@ -365,6 +378,30 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
@@ -376,7 +413,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_per_request_services(&ctx);
+            let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);

@@ -10,6 +10,42 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-07-850-parser-aware-body-hold-nextjs-streaming-design.md`
 
+## Completion review — 2026-09-09
+
+The implementation is complete. The step checkboxes below preserve the original
+execution recipe; they are not an outstanding-work list.
+
+- Completed the missing combined Next.js/auction streaming regression for
+  identity, gzip, deflate, and Brotli, including concatenated gzip members. It
+  verifies early output with a pending auction, corrected T-chunk length, final
+  bid placement, and removal of generated markers.
+- Added deterministic final-output parity coverage through the Axum, Cloudflare,
+  and Spin routers. The service injection seam uses an optional service override
+  in each existing application state instead of threading a separate source enum
+  through every handler. Production routers still construct services per request.
+  The shared fixture lives in the existing cross-adapter parity suite.
+- Fixed missing terminal telemetry on asynchronous sink write/flush failures,
+  partial T headers ending after a colon, oversized unsafe RSC continuations,
+  fragmented initializer-form pushes, and rewrite-count mismatch restoration.
+  Added focused regressions and fallback diagnostics without payload contents.
+- An independent subagent reviewed the entire branch and the follow-up fixes.
+  Its final review reported no remaining correctness findings. Findings stayed
+  local; nothing was posted to GitHub.
+
+Final verification passed:
+
+- `cargo test-fastly`, `cargo test-axum`, `cargo test-cloudflare`, and
+  `cargo test-spin`.
+- Cross-adapter parity suite: 14 tests passed.
+- All six target-specific Clippy aliases and `cargo fmt --all -- --check`.
+- JS suite: 893 tests passed with the pinned Node 24.12.0 on `PATH`. The earlier
+  CommonJS/ESM failure came from the local shell selecting Node 20 when entering
+  the JS directory; no dependency change was needed.
+- JS and documentation formatting checks.
+- Fastly release WASM build and `fastly compute serve` smoke test against a local
+  fixture origin: HTTP 200, preserved false body-close literal, rewritten RSC URL,
+  and no generated markers. The temporary server was stopped after the check.
+
 ---
 
 ## File structure
