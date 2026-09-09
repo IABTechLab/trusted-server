@@ -590,9 +590,9 @@ impl KvIdentityGraph {
     ///
     /// Browser cookies do not carry a value-owned version, so a different
     /// existing value has unknown freshness and is always deferred. After a CAS
-    /// conflict this method never writes again: one follow-up read reports either
-    /// [`EidCookieSyncOutcome::ConflictMatched`] or
-    /// [`EidCookieSyncOutcome::DeferredConflict`].
+    /// conflict this method never writes again. A live follow-up becomes the
+    /// authoritative snapshot; a missing or failed follow-up retains the live
+    /// pre-write snapshot as proof and defers the update.
     pub(crate) fn sync_eid_cookie_updates_from_snapshot(
         &self,
         ec_id: &str,
@@ -689,22 +689,19 @@ impl KvIdentityGraph {
             ),
             Ok(EcKvWriteOutcome::PreconditionFailed) => {
                 let refreshed = self.load_snapshot(ec_id);
-                if refreshed
-                    .entry_for(ec_id)
-                    .is_some_and(|entry| !entry.consent.ok)
-                {
+                let Some(refreshed_entry) = refreshed.entry_for(ec_id) else {
+                    let kept = Self::keep_proven(ec_id, refreshed, Some(&current));
+                    return (kept, EidCookieSyncOutcome::DeferredConflict);
+                };
+                if !refreshed_entry.consent.ok {
                     return (refreshed, EidCookieSyncOutcome::ConsentWithdrawn);
                 }
-                let outcome = if refreshed
-                    .entry_for(ec_id)
-                    .is_some_and(|entry| partner_id_updates_match(entry, updates))
-                {
+                let outcome = if partner_id_updates_match(refreshed_entry, updates) {
                     EidCookieSyncOutcome::ConflictMatched
                 } else {
                     EidCookieSyncOutcome::DeferredConflict
                 };
-                let kept = Self::keep_proven(ec_id, refreshed, proven.as_ref());
-                (kept, outcome)
+                (refreshed, outcome)
             }
             Err(_err) => {
                 log::warn!("EID cookie sync write failed");
@@ -1906,6 +1903,8 @@ mod tests {
         concurrent_entry: KvEntry,
         lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         conditional_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        follow_up_miss: bool,
+        miss_next_lookup: std::sync::atomic::AtomicBool,
     }
 
     impl EidConflictEcKv {
@@ -1919,7 +1918,14 @@ mod tests {
                 concurrent_entry,
                 lookups,
                 conditional_writes,
+                follow_up_miss: false,
+                miss_next_lookup: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        fn with_follow_up_miss(mut self) -> Self {
+            self.follow_up_miss = true;
+            self
         }
 
         fn seed_live(&self, ec_id: &str) {
@@ -1948,6 +1954,12 @@ mod tests {
         fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             self.lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .miss_next_lookup
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(None);
+            }
             self.inner.lookup(key)
         }
 
@@ -1979,6 +1991,10 @@ mod tests {
                         },
                     )
                     .expect("should write concurrent entry");
+                if self.follow_up_miss {
+                    self.miss_next_lookup
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Ok(EcKvWriteOutcome::PreconditionFailed);
             }
             self.inner.insert(key, write)
@@ -2159,13 +2175,21 @@ mod tests {
         let graph = KvIdentityGraph::new(store);
         let snapshot = graph.load_snapshot(&ec_id);
 
-        let (_, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+        let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
             &ec_id,
             &[PartnerIdUpdate::new("ssp_x", "desired-uid")],
             snapshot,
         );
 
         assert_eq!(outcome, EidCookieSyncOutcome::ConflictMatched);
+        assert_eq!(
+            snapshot
+                .entry_for(&ec_id)
+                .and_then(|entry| entry.ids.get("ssp_x"))
+                .map(|id| id.uid.as_str()),
+            Some("desired-uid"),
+            "the authoritative follow-up snapshot should replace stale request state"
+        );
         assert_eq!(
             lookups.load(std::sync::atomic::Ordering::Relaxed),
             2,
@@ -2175,6 +2199,45 @@ mod tests {
             writes.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "a conflict must not trigger another conditional write"
+        );
+    }
+
+    #[test]
+    fn eid_cookie_sync_keeps_live_proof_when_conflict_follow_up_misses() {
+        let ec_id = snapshot_ec_id();
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = EidConflictEcKv::new(
+            live_entry(),
+            std::sync::Arc::clone(&lookups),
+            std::sync::Arc::clone(&writes),
+        )
+        .with_follow_up_miss();
+        store.seed_live(&ec_id);
+        let graph = KvIdentityGraph::new(store);
+
+        let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "desired-uid")],
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert_eq!(outcome, EidCookieSyncOutcome::DeferredConflict);
+        assert!(
+            snapshot.entry_for(&ec_id).is_some(),
+            "the live pre-write row should prevent conflict deferral from entering orphan recovery"
+        );
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the initial refresh and conflict follow-up should be the only reads"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the conflict must remain the request's only conditional write"
         );
     }
 

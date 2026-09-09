@@ -87,6 +87,9 @@ use self::kv_types::KvEntry;
 use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
 /// Bounded request classifications that may persist browser EID cookies.
+///
+/// Adapters assign a source only after pre-route filters allow dispatch.
+/// Challenged or blocked requests remain unclassified and cannot persist EIDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
@@ -265,7 +268,7 @@ pub struct EcContext {
     recovery_eligible: bool,
     /// Browser-carried proof of recent pull-partner completeness.
     pull_sync_marker: PullSyncMarkerState,
-    /// Allowed returning-user EID persistence source, assigned only after route dispatch.
+    /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
 }
 
