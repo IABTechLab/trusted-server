@@ -87,7 +87,8 @@ pub struct GenerateBrowserOpts {
     pub settle_quiet_ms: u64,
     /// Shared budget in milliseconds for the initial, post-scroll, and GPT settle waits.
     ///
-    /// Starts after navigation; scrolling and evidence reads consume this budget.
+    /// Starts after navigation; scrolling consumes this budget. GPT polling
+    /// precedes metadata extraction so those reads cannot consume its budget.
     /// Navigation and browser operations have separate timeouts, so this is not
     /// a total page deadline. An exhausted budget still takes one GPT snapshot;
     /// two consecutive empty GPT polls end the wait early regardless of the budget.

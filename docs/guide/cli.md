@@ -575,9 +575,12 @@ refuses cookies when URLs span multiple origins. The quiet settle window must
 not exceed the maximum.
 
 Generation shares one `--settle-max-ms` budget across the initial settle,
-optional post-scroll settle, and final GPT registry wait. The clock starts after
-navigation, immediately before the initial settle; scrolling and evidence reads
-also consume the remaining budget. Navigation and browser operations have their
+optional post-scroll settle, and GPT registry wait. The clock starts after
+navigation, immediately before the initial settle; scrolling also consumes the
+remaining budget. GPT polling precedes metadata extraction, so those reads cannot
+consume its remaining budget. If the budget is spent before post-scroll settling,
+generation reports that the wait was skipped and post-scroll evidence may be
+missing. Navigation and browser operations have their
 own timeouts, and an in-flight operation can finish after the settle budget, so
 this is not a total page deadline. Even when the budget is exhausted, generation
 takes one GPT snapshot and reports partial non-empty evidence. Two consecutive

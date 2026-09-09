@@ -617,15 +617,10 @@ async fn collect_open_page(
     }
 
     // All settle phases share one clock. Navigation has its own timeout;
-    // scrolling and evidence reads also consume the remaining settle budget.
+    // scrolling also consumes the remaining settle budget. Read GPT before
+    // metadata so unrelated evidence extraction cannot starve stabilization.
     let settle_start = std::time::Instant::now();
-    if !wait_for_page_settle(
-        page,
-        settings.settle_quiet,
-        settings.settle_max.saturating_sub(settle_start.elapsed()),
-    )
-    .await?
-    {
+    if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
                 .to_string(),
@@ -639,13 +634,14 @@ async fn collect_open_page(
                 .into_iter()
                 .map(|failure| failure.to_string()),
         );
-        if !wait_for_page_settle(
-            page,
-            settings.settle_quiet,
-            settings.settle_max.saturating_sub(settle_start.elapsed()),
-        )
-        .await?
-        {
+        let remaining = settings.settle_max.saturating_sub(settle_start.elapsed());
+        if remaining.is_zero() {
+            warnings.push(
+                "settle budget was exhausted before the post-scroll settle; \
+                 post-scroll evidence may be missing; raise `--settle-max-ms`"
+                    .to_string(),
+            );
+        } else if !wait_for_page_settle(page, settings.settle_quiet, remaining).await? {
             warnings.push(
                 "browser audit timed out while waiting for the page to settle after scroll; \
                  results may be partial"
@@ -653,6 +649,24 @@ async fn collect_open_page(
             );
         }
     }
+
+    // GPT can finish registering slots after the document and resource stream
+    // are otherwise quiet. Wait for a non-empty registry to stabilize instead
+    // of treating the first empty read as authoritative.
+    //
+    // The ad-template verifier needs no counterpart wait: its evidence
+    // collector wraps `googletag.defineSlot` before publisher scripts run and
+    // accumulates every slot defined before the read. This command reads a
+    // `getSlots()` snapshot instead and can observe a half-registered registry.
+    // `ts audit page` also takes a snapshot, but reports what it saw rather
+    // than generating config from it.
+    let gpt_slots = collect_stable_gpt_slots(
+        page,
+        settings.settle_quiet,
+        settings.settle_max.saturating_sub(settle_start.elapsed()),
+        &mut warnings,
+    )
+    .await;
 
     match timeout(CDP_OPERATION_TIMEOUT, page.frames()).await {
         Ok(Ok(frames)) if frames.len() > 1 => warnings.push(format!(
@@ -711,24 +725,6 @@ async fn collect_open_page(
     if let Some(warning) = resource_timing_buffer_warning(network_requests.len()) {
         warnings.push(warning.to_string());
     }
-
-    // GPT can finish registering slots after the document and resource stream
-    // are otherwise quiet. Wait for a non-empty registry to stabilize instead
-    // of treating the first empty read as authoritative.
-    //
-    // The ad-template verifier needs no counterpart wait: its evidence
-    // collector wraps `googletag.defineSlot` before publisher scripts run and
-    // accumulates every slot defined before the read. This command reads a
-    // `getSlots()` snapshot instead and can observe a half-registered registry.
-    // `ts audit page` also takes a snapshot, but reports what it saw rather
-    // than generating config from it.
-    let gpt_slots = collect_stable_gpt_slots(
-        page,
-        settings.settle_quiet,
-        settings.settle_max.saturating_sub(settle_start.elapsed()),
-        &mut warnings,
-    )
-    .await;
 
     // Links come from the hydrated DOM, not the served markup: an app-router
     // page keeps its link graph in the framework payload, so parsing the raw
@@ -1396,6 +1392,17 @@ mod tests {
       }
       var slots = []
       var armed = false
+      // Model a metadata read slower than the shared settle budget, while
+      // staying below the individual CDP operation timeout.
+      if (location.hash === '#slow-title') {
+        Object.defineProperty(document, 'title', {
+          get: function () {
+            var start = performance.now()
+            while (performance.now() - start < 4000) {}
+            return 'Slow metadata fixture'
+          },
+        })
+      }
       window.googletag = {
         pubads: function () {
           return {
@@ -2099,6 +2106,8 @@ mod tests {
 
         for scroll in [false, true] {
             let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+            // A quiet window equal to the maximum cannot finish inside that
+            // maximum, so the initial settle spends the entire shared budget.
             let options = GenerateBrowserOpts {
                 settle_quiet_ms: 600,
                 settle_max_ms: 600,
@@ -2122,7 +2131,63 @@ mod tests {
                     .any(|warning| warning.contains("within the 0ms budget")),
                 "should report exhausted remaining GPT budget (scroll={scroll})"
             );
+            assert_eq!(
+                collected.warnings.iter().any(|warning| {
+                    warning.contains("settle budget was exhausted before the post-scroll settle")
+                }),
+                scroll,
+                "should report skipped post-scroll settling only when scrolling (scroll={scroll})"
+            );
+            assert!(
+                !collected.warnings.iter().any(|warning| {
+                    warning.contains("timed out while waiting for the page to settle after scroll")
+                }),
+                "should not report a timeout for a wait that never ran (scroll={scroll})"
+            );
         }
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn slow_metadata_does_not_consume_gpt_settle_budget() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+        let mut url = fixture.url().clone();
+        url.set_fragment(Some("slow-title"));
+        // The 4s title read exceeds this budget on its own. GPT's second
+        // batch appears only after polling starts, so a single late snapshot
+        // cannot substitute for giving the registry its remaining dwell time.
+        let options = GenerateBrowserOpts {
+            settle_quiet_ms: 750,
+            settle_max_ms: 3500,
+            ..GenerateBrowserOpts::default()
+        };
+        let collected = BrowserAuditCollector::default()
+            .with_browser_options(&options)
+            .collect_page(&url, &[])
+            .expect("should collect GPT slots and slow metadata");
+
+        assert_eq!(
+            collected.page_title.as_deref(),
+            Some("Slow metadata fixture"),
+            "should still extract metadata after stabilizing the registry"
+        );
+        assert_eq!(
+            collected.gpt_slots.len(),
+            2,
+            "should retain both registration batches despite slow metadata extraction"
+        );
+        assert!(
+            !collected
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GPT slot registration did not hold still")),
+            "should let the registry stabilize before reading slow metadata: {:?}",
+            collected.warnings
+        );
     }
 
     #[test]
