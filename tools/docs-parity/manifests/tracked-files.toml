@@ -359,6 +359,10 @@ path = "crates/trusted-server-adapter-spin/src/lib.rs"
 kind = "text"
 
 [[files]]
+path = "crates/trusted-server-adapter-spin/src/logging.rs"
+kind = "text"
+
+[[files]]
 path = "crates/trusted-server-adapter-spin/src/middleware.rs"
 kind = "text"
 
@@ -2747,7 +2751,27 @@ path = "scripts/benchmark.sh"
 kind = "text"
 
 [[files]]
+path = "scripts/build-trusted-server-js.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/dependency-snapshot-submit.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/docs-links-reconcile.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/generate-docs-link-results.sh"
+kind = "text"
+
+[[files]]
 path = "scripts/generate-integration-viceroy-configs.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/install-wrangler.sh"
 kind = "text"
 
 [[files]]
@@ -2760,6 +2784,14 @@ kind = "text"
 
 [[files]]
 path = "scripts/profile.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/read-tool-versions.sh"
+kind = "text"
+
+[[files]]
+path = "scripts/restore-cloudflare-build.sh"
 kind = "text"
 
 [[files]]

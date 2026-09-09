@@ -200,6 +200,10 @@ fn fingerprint(contents: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(contents))
 }
 
+fn historical_cname() -> String {
+    ["your-custom-", "domain.com"].concat()
+}
+
 #[test]
 fn allowlist_requires_explicit_review_attestation() {
     let repository = TestRepository::new("notes.txt", b"safe text\n", "text");
@@ -2013,7 +2017,7 @@ fn bootstrap_preserves_exact_attestation_but_reopens_review_for_a_new_finding() 
 
 #[test]
 fn bootstrap_assigns_historical_and_project_owned_domain_classes() {
-    let historical = ["your-custom-", "domain.com"].concat();
+    let historical = historical_cname();
     let project_owned = "https://iabtechlab.github.io/trusted-server/";
     let contents = format!("{historical}\n{project_owned}\n");
     let repository = TestRepository::new("notes.txt", contents.as_bytes(), "text");
@@ -2047,6 +2051,31 @@ fn bootstrap_assigns_historical_and_project_owned_domain_classes() {
             .count(),
         1,
         "IAB GitHub Pages URL should be project-owned"
+    );
+}
+
+#[test]
+fn approved_historical_cname_survives_offset_movement() {
+    let historical = historical_cname();
+    let contents = format!("new preface shifts the governed value\n{historical}\n");
+    let path = "docs/superpowers/specs/2026-08-19-documentation-refresh-design.md";
+    let repository = TestRepository::new(path, contents.as_bytes(), "text");
+    repository.write_allowlist(&exception_for_contents(
+        "historical_example",
+        path,
+        "domain",
+        contents.as_bytes(),
+        &historical,
+        "2027-08-31T00:00:00Z",
+    ));
+
+    let result = repository.scan();
+
+    assert_eq!(
+        status_code(&result),
+        SUCCESS,
+        "approved historical value should remain valid after an offset shift: {}",
+        diagnostic(&result)
     );
 }
 

@@ -490,6 +490,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "crates/trusted-server-adapter-spin/src/logging.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "crates/trusted-server-adapter-spin/src/middleware.rs"
 mode = "whole"
 disposition = "exclude"
@@ -3986,7 +3992,32 @@ mode = "comments"
 grammar = "shell"
 
 [[sources]]
+path = "scripts/build-trusted-server-js.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/dependency-snapshot-submit.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/docs-links-reconcile.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/generate-docs-link-results.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
 path = "scripts/generate-integration-viceroy-configs.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/install-wrangler.sh"
 mode = "comments"
 grammar = "shell"
 
@@ -4002,6 +4033,16 @@ grammar = "shell"
 
 [[sources]]
 path = "scripts/profile.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/read-tool-versions.sh"
+mode = "comments"
+grammar = "shell"
+
+[[sources]]
+path = "scripts/restore-cloudflare-build.sh"
 mode = "comments"
 grammar = "shell"
 
@@ -4735,7 +4776,7 @@ disposition = "include"
 
 [[comments]]
 path = ".github/actions/setup-integration-test-env/action.yml"
-selector = "bytes:1813-1882"
+selector = "bytes:1779-1848"
 fingerprint = "sha256:f9b3915c860b6a4806f050c3dd87ce6120edbbda8ce21972a7ede7902b8c6348"
 disposition = "include"
 
@@ -4903,103 +4944,103 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:2786-2862"
+selector = "bytes:2752-2828"
 fingerprint = "sha256:5bcc0f1e0df6ddb3dc89c0dc173d9d799479e565068cf65d0967786c469a22bc"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:2869-2950"
+selector = "bytes:2835-2916"
 fingerprint = "sha256:eeef7eb4ac89c9ddbf078740689ea9df451e66a3b13139db1bc26ea869c346f6"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:2957-3021"
+selector = "bytes:2923-2987"
 fingerprint = "sha256:803702320e8f6659473c423b6781f4815ef252d97e3d7b10d80e21c2b61beda2"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3028-3061"
+selector = "bytes:2994-3027"
 fingerprint = "sha256:08c036f570035852e5fabe58d8dd35a24f2d81dee8501374cabcc66ffed2f947"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3068-3102"
+selector = "bytes:3034-3068"
 fingerprint = "sha256:a66fd1db76baf8e6ac71a1aa4313cb0817a16478717b95d9b9df0c054a04f07c"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3110-3154"
+selector = "bytes:3076-3120"
 fingerprint = "sha256:633bdd2871fa62d9a89830b26b5c274f784154ecf0cb41df9f63921a23886ed5"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3383-3463"
+selector = "bytes:3316-3396"
 fingerprint = "sha256:711a17cb513eccce5000578c166dc95cf7334ce94055e77eda6263152fd85e58"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3474-3553"
+selector = "bytes:3407-3486"
 fingerprint = "sha256:6464ac24a9e0297da0be99fcb191df644276a2d6346ea4618bda76d31897d06c"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3564-3646"
+selector = "bytes:3497-3579"
 fingerprint = "sha256:d989fd08b9a3046d499de4c69881c535a2521cbe4f86ca03b7845af4507b9d0e"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3658-3882"
+selector = "bytes:3591-3815"
 fingerprint = "sha256:ac4a07230f3ca42c4f60fdbef154d8a3b2babe6a788d3c4e44bd492b8f8b28ca"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3893-3942"
+selector = "bytes:3826-3875"
 fingerprint = "sha256:81619eab818e0186acda226f5afa49a2e5b9d3b1653370735c959578882a02e5"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:3950-4025"
+selector = "bytes:3883-3958"
 fingerprint = "sha256:40f128685b59936d8fc3f9cd170b8702f22d226fb7321c611d71ef3ab33309f8"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:4032-4108"
+selector = "bytes:3965-4041"
 fingerprint = "sha256:f41c5d966f116c59107790320a9e4bf4bc42ca17bd09a5d16db3133d825ca4c0"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:4115-4191"
+selector = "bytes:4048-4124"
 fingerprint = "sha256:20806516037f99f27aabf05696a79ee98e3e8fac0860ea2630d6772f0ddafdaa"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:4198-4219"
+selector = "bytes:4131-4152"
 fingerprint = "sha256:0f0ec25ec01230715e1755e2fe11f9e8507269920d63cf04f5f88366cbb0be6e"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:4226-4283"
+selector = "bytes:4159-4216"
 fingerprint = "sha256:33198ac91cad01faf30e6ad4e44eb5cf995f7230fbbb21f9c04f25c2f51c6c82"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/codeql.yml"
-selector = "bytes:4290-4405"
+selector = "bytes:4223-4338"
 fingerprint = "sha256:d9d6c972eda95b908cdaea758f1a99476bd874d5c90dafdc7ad023051afb5ec0"
 disposition = "include"
 
@@ -5023,19 +5064,19 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/deploy-docs.yml"
-selector = "bytes:594-619"
+selector = "bytes:560-585"
 fingerprint = "sha256:804beb579f1c80f65289ffc86eac2c6e941b5908036f232e1ecdc9ecd0740cc9"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/format.yml"
-selector = "bytes:2046-2119"
+selector = "bytes:1915-1988"
 fingerprint = "sha256:96d3763b18b1fe0da0db932c28667a817691eaa38e57b65f4c74afbb08771974"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/format.yml"
-selector = "bytes:2126-2194"
+selector = "bytes:1995-2063"
 fingerprint = "sha256:0e139f698774557455af996d50837eb2289f818a2a9c684b114216b884db67e4"
 disposition = "include"
 
@@ -5053,13 +5094,13 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/integration-tests.yml"
-selector = "bytes:8067-8141"
+selector = "bytes:6876-6950"
 fingerprint = "sha256:2330dbe6289b49889b5c6d37991ef8ce3ca761a0fede60b9c7a18d4a098e366e"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/integration-tests.yml"
-selector = "bytes:8148-8196"
+selector = "bytes:6957-7005"
 fingerprint = "sha256:413310b737a2a26ee161a1f960cebc3b707d3e440dc81f35e7679499c04e86ad"
 disposition = "include"
 
@@ -5071,145 +5112,145 @@ disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:1151-1199"
+selector = "bytes:957-1005"
 fingerprint = "sha256:842c0aa07d94b3a357bc624c79c101208feba70dde9e9df2dbf5d221f3d7c1c9"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:1399-1426"
+selector = "bytes:1172-1199"
 fingerprint = "sha256:bbe8da767f9b01fd20b006317293e73fca03b7aa732f0355387d9fe9775c0744"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:2004-2036"
+selector = "bytes:1669-1701"
 fingerprint = "sha256:096c24d01365d94d233b2d92f4c5cc45972fefb63a7b5c73ce170754bb5e9973"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:2772-2841"
+selector = "bytes:2371-2440"
 fingerprint = "sha256:851cf80f5d728881efd2b8cf4e16f9508f6a45ad3d4ab404b515a88ec0ae0164"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:2850-2920"
+selector = "bytes:2449-2519"
 fingerprint = "sha256:9d17d34b4053a571cbe8d7c4dc1064841cf9cdbf137eb3acc1a5de26891d8b29"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:5277-5339"
+selector = "bytes:4716-4778"
 fingerprint = "sha256:dddd1c73fc23a32f9f82b87dd2dc6d4a39056019a913524783617838ee48dab5"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:5350-5407"
+selector = "bytes:4789-4846"
 fingerprint = "sha256:e7462ddcda9246b78604882126b32d821fe6e487f87c76d9d0627cec8f81469d"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:5918-6004"
+selector = "bytes:5323-5409"
 fingerprint = "sha256:c6669917038ed4d2a44e99243f003462d13cfc5f01ff5ededfe111fd9f0a545d"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:6099-6170"
+selector = "bytes:5504-5575"
 fingerprint = "sha256:61eec0a0e6b946a5666009f1bde47dc7bb293ce2e0167f6b3c80696cc2cb51da"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:6177-6217"
+selector = "bytes:5582-5622"
 fingerprint = "sha256:f3f8c21327b248576070c0333042eb622a2a06b1b54fc5956203aa4af9ed1b48"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:6544-6614"
+selector = "bytes:5915-5985"
 fingerprint = "sha256:59923b19b81bf859e9ea01417797ecd9e90f40e8b6949797d510d1aac285c108"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:6625-6693"
+selector = "bytes:5996-6064"
 fingerprint = "sha256:4f93c2780630ab8249305bc76247a8661afd191f6a7cf119f91c93f2f7888ac5"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:6752-6827"
+selector = "bytes:6123-6198"
 fingerprint = "sha256:6f1c410220b2af1fbd9fa52b47f81c53e21fdcd6181be21f7eb416a495ca3a54"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:6834-6899"
+selector = "bytes:6205-6270"
 fingerprint = "sha256:b86e41e444aacb0ebc00a85275f68f910262efd3f7ed9d430154a19ff33ddada"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:10059-10124"
+selector = "bytes:9228-9293"
 fingerprint = "sha256:88df77c5db6a7f2cbb73be4b132220411d81e47ca4894576da3cea3951283b9b"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:10133-10203"
+selector = "bytes:9302-9372"
 fingerprint = "sha256:d7656dc0938f3c1e666de37d1b72f4f332f331b0379c8715bce51b0266f49b26"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:10212-10248"
+selector = "bytes:9381-9417"
 fingerprint = "sha256:32e847ef9cec555409bd5c556669261bccf67e6ddc999c27587ecf60b5da4b5f"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:11977-12049"
+selector = "bytes:11049-11121"
 fingerprint = "sha256:0a7c8a2ecb3d3f52df5a03f1c5bb4b33952c8032276aa25a4e242a6cecb850cd"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:12054-12130"
+selector = "bytes:11126-11202"
 fingerprint = "sha256:69d945daea35888666d4044680771fe484e6ab5874a933724388deabc7357892"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:12135-12182"
+selector = "bytes:11207-11254"
 fingerprint = "sha256:863bda41d4205b066f4c6f2735d6825fa67dbad8f4289a586cdb8e0f575999db"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:13227-13302"
+selector = "bytes:12202-12277"
 fingerprint = "sha256:da8b34b5c8e2c1a3bf6a08d682555a1fcbff653614bee41ae48a9d9c51e2fd35"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:13309-13385"
+selector = "bytes:12284-12360"
 fingerprint = "sha256:b895c72a0578ff3ae34474218aa8e7b684c31a786b18d8070ff1b1f2940307ab"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:13392-13468"
+selector = "bytes:12367-12443"
 fingerprint = "sha256:e5dda19814742b949f9ac09203ffae37f43165b5b1470a650dd04be857431ad0"
 disposition = "include"
 
 [[comments]]
 path = ".github/workflows/test.yml"
-selector = "bytes:13475-13554"
+selector = "bytes:12450-12529"
 fingerprint = "sha256:c2d2731be2dc78c9c5bb1ac73695c63a420e52c587346c0a6f7d52e08a17c91c"
 disposition = "include"
 
@@ -7026,6 +7067,30 @@ fingerprint = "sha256:871ae54456aaafaa275996370bc6a98bb88e7fc723e00190b41f4ac9e0
 disposition = "include"
 
 [[comments]]
+path = "scripts/build-trusted-server-js.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/dependency-snapshot-submit.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/docs-links-reconcile.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/generate-docs-link-results.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
 path = "scripts/generate-integration-viceroy-configs.sh"
 selector = "bytes:0-19"
 fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
@@ -7053,6 +7118,12 @@ disposition = "include"
 path = "scripts/generate-integration-viceroy-configs.sh"
 selector = "bytes:138-139"
 fingerprint = "sha256:334359b90efed75da5f0ada1d5e6b256f4a6bd0aee7eb39c0f90182a021ffc8b"
+disposition = "include"
+
+[[comments]]
+path = "scripts/install-wrangler.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
 disposition = "include"
 
 [[comments]]
@@ -7551,6 +7622,18 @@ disposition = "include"
 path = "scripts/profile.sh"
 selector = "bytes:7970-8002"
 fingerprint = "sha256:8ad3c1be11c6579c68610cf20bffa3527e550306c2d2ece81d3ace5620e3eea4"
+disposition = "include"
+
+[[comments]]
+path = "scripts/read-tool-versions.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
+disposition = "include"
+
+[[comments]]
+path = "scripts/restore-cloudflare-build.sh"
+selector = "bytes:0-19"
+fingerprint = "sha256:e2b37d0fbeebd5358ba88a5ef5469cfab940c91f397b72b95107b9b6515a9ece"
 disposition = "include"
 
 [[comments]]

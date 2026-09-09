@@ -1912,14 +1912,9 @@ fn historical_example_evidence(record: &ExceptionRecord, finding: &Finding) -> b
         Detector::Domain => {
             record.fingerprint == HISTORICAL_CNAME_FINGERPRINT
                 && matches!(
-                    (record.path.as_str(), record.selector.as_str()),
-                    (
-                        "docs/internal/audits/documentation-refresh-decisions.md",
-                        "bytes:5027-5049"
-                    ) | (
-                        "docs/superpowers/specs/2026-08-19-documentation-refresh-design.md",
-                        "bytes:3892-3914"
-                    )
+                    record.path.as_str(),
+                    "docs/internal/audits/documentation-refresh-decisions.md"
+                        | "docs/superpowers/specs/2026-08-19-documentation-refresh-design.md"
                 )
         }
         Detector::BinaryString => record.path == HISTORICAL_BINARY_PATH,

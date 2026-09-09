@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use docs_parity::dependency_snapshot::{
-    DependencySnapshotContext, generate_archive, validate_archive,
+    DependencyRelationship, DependencyScope, DependencySnapshotContext,
+    generate_archive_with_metadata, validate_archive,
 };
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+const EMPTY_METADATA: &[u8] = br#"{"packages": []}"#;
 
 fn context() -> DependencySnapshotContext {
     DependencySnapshotContext {
@@ -101,10 +104,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "abcdef0123456789"
 "#;
 
-    let first =
-        generate_archive(&context(), root_lock, tool_lock).expect("should generate archive");
-    let second =
-        generate_archive(&context(), root_lock, tool_lock).expect("should regenerate archive");
+    let first = generate_archive_with_metadata(
+        &context(),
+        root_lock,
+        EMPTY_METADATA,
+        tool_lock,
+        EMPTY_METADATA,
+    )
+    .expect("should generate archive");
+    let second = generate_archive_with_metadata(
+        &context(),
+        root_lock,
+        EMPTY_METADATA,
+        tool_lock,
+        EMPTY_METADATA,
+    )
+    .expect("should regenerate archive");
     let parsed = validate_archive(&first, &context()).expect("should validate generated archive");
 
     assert_eq!(first, second, "snapshot ZIP should be byte-stable");
@@ -118,6 +133,123 @@ checksum = "abcdef0123456789"
 }
 
 #[test]
+fn snapshot_derives_relationship_and_scope_from_manifest_edges() {
+    let root_lock = br#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["alpha", "dev-only", "workspace-lib"]
+
+[[package]]
+name = "workspace-lib"
+version = "0.1.0"
+dependencies = ["workspace-dev", "workspace-runtime"]
+
+[[package]]
+name = "alpha"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = ["runtime-transitive"]
+
+[[package]]
+name = "dev-only"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "workspace-runtime"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "workspace-dev"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "runtime-transitive"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "unreachable"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+    let root_metadata = br#"{
+      "packages": [
+        {
+          "name": "app",
+          "version": "0.1.0",
+          "source": null,
+          "dependencies": [
+            {"name": "alpha", "kind": null},
+            {"name": "dev-only", "kind": "dev"},
+            {"name": "workspace-lib", "kind": null}
+          ]
+        },
+        {
+          "name": "workspace-lib",
+          "version": "0.1.0",
+          "source": null,
+          "dependencies": [
+            {"name": "workspace-dev", "kind": "dev"},
+            {"name": "workspace-runtime", "kind": null}
+          ]
+        }
+      ]
+    }"#;
+    let archive = generate_archive_with_metadata(
+        &context(),
+        root_lock,
+        root_metadata,
+        b"version = 4\n",
+        EMPTY_METADATA,
+    )
+    .expect("should classify the resolved graph");
+    let snapshot = validate_archive(&archive, &context()).expect("should validate snapshot");
+    let resolved = &snapshot.manifests["Cargo.lock"].resolved;
+
+    assert!(!resolved.contains_key("app@0.1.0"));
+    assert!(!resolved.contains_key("workspace-lib@0.1.0"));
+    assert!(!resolved.contains_key("unreachable@6.0.0"));
+    assert_eq!(
+        resolved["alpha@1.0.0"].relationship,
+        DependencyRelationship::Direct
+    );
+    assert_eq!(resolved["alpha@1.0.0"].scope, DependencyScope::Runtime);
+    assert_eq!(
+        resolved["dev-only@2.0.0"].relationship,
+        DependencyRelationship::Direct
+    );
+    assert_eq!(
+        resolved["dev-only@2.0.0"].scope,
+        DependencyScope::Development
+    );
+    assert_eq!(
+        resolved["workspace-runtime@3.0.0"].relationship,
+        DependencyRelationship::Direct
+    );
+    assert_eq!(
+        resolved["workspace-runtime@3.0.0"].scope,
+        DependencyScope::Runtime
+    );
+    assert_eq!(
+        resolved["workspace-dev@4.0.0"].scope,
+        DependencyScope::Development
+    );
+    assert_eq!(
+        resolved["runtime-transitive@5.0.0"].relationship,
+        DependencyRelationship::Indirect
+    );
+    assert_eq!(
+        resolved["runtime-transitive@5.0.0"].scope,
+        DependencyScope::Runtime
+    );
+}
+
+#[test]
 fn snapshot_rejects_unknown_fields_stale_context_and_noncanonical_packages() {
     let malformed_lock = br#"version = 4
 
@@ -127,12 +259,25 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 "#;
     assert!(
-        generate_archive(&context(), malformed_lock, b"version = 4\n").is_err(),
+        generate_archive_with_metadata(
+            &context(),
+            malformed_lock,
+            EMPTY_METADATA,
+            b"version = 4\n",
+            EMPTY_METADATA,
+        )
+        .is_err(),
         "invalid Cargo package identity should fail"
     );
 
-    let archive = generate_archive(&context(), b"version = 4\n", b"version = 4\n")
-        .expect("empty locks should be valid");
+    let archive = generate_archive_with_metadata(
+        &context(),
+        b"version = 4\n",
+        EMPTY_METADATA,
+        b"version = 4\n",
+        EMPTY_METADATA,
+    )
+    .expect("empty locks should be valid");
     let mut stale = context();
     stale.run_attempt = 4;
     assert!(
@@ -140,10 +285,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         "authenticated context mismatch should fail"
     );
 
-    let populated = generate_archive(
+    let populated = generate_archive_with_metadata(
         &context(),
-        b"version = 4\n\n[[package]]\nname = \"alpha\"\nversion = \"1.2.3\"\n",
+        b"version = 4\n\n[[package]]\nname = \"root\"\nversion = \"0.1.0\"\ndependencies = [\"alpha\"]\n\n[[package]]\nname = \"alpha\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        br#"{"packages":[{"name":"root","version":"0.1.0","source":null,"dependencies":[{"name":"alpha","kind":null}]}]}"#,
         b"version = 4\n",
+        EMPTY_METADATA,
     )
     .expect("should generate populated fixture");
     for package_url in [
@@ -174,12 +321,25 @@ fn snapshot_enforces_archive_json_record_and_string_bounds() {
     let long_name = "x".repeat(2_049);
     let lock = format!("version = 4\n\n[[package]]\nname = \"{long_name}\"\nversion = \"1.0.0\"\n");
     assert!(
-        generate_archive(&context(), lock.as_bytes(), b"version = 4\n").is_err(),
+        generate_archive_with_metadata(
+            &context(),
+            lock.as_bytes(),
+            EMPTY_METADATA,
+            b"version = 4\n",
+            EMPTY_METADATA,
+        )
+        .is_err(),
         "oversized schema strings should fail"
     );
 
-    let archive = generate_archive(&context(), b"version = 4\n", b"version = 4\n")
-        .expect("should generate framing fixture");
+    let archive = generate_archive_with_metadata(
+        &context(),
+        b"version = 4\n",
+        EMPTY_METADATA,
+        b"version = 4\n",
+        EMPTY_METADATA,
+    )
+    .expect("should generate framing fixture");
     let mut prefixed = b"preamble".to_vec();
     prefixed.extend_from_slice(&archive);
     assert!(
@@ -199,20 +359,79 @@ fn repository_generation_requires_bounded_tracked_regular_lockfiles() {
     let directory = tempfile::tempdir().expect("should create repository fixture");
     fs::create_dir_all(directory.path().join("tools/docs-parity"))
         .expect("should create tool directory");
-    fs::write(directory.path().join("Cargo.lock"), "version = 4\n")
-        .expect("should write root lock");
+    fs::create_dir_all(directory.path().join("src")).expect("should create root source directory");
+    fs::create_dir_all(directory.path().join("tools/docs-parity/src"))
+        .expect("should create tool source directory");
+    fs::write(directory.path().join("src/lib.rs"), "").expect("should write root package target");
+    fs::write(directory.path().join("tools/docs-parity/src/lib.rs"), "")
+        .expect("should write tool package target");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname = \"root-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("should write root manifest");
+    fs::write(
+        directory.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"root-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("should write root lock");
+    fs::write(
+        directory.path().join("tools/docs-parity/Cargo.toml"),
+        "[package]\nname = \"tool-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .expect("should write tool manifest");
     fs::write(
         directory.path().join("tools/docs-parity/Cargo.lock"),
-        "version = 4\n",
+        "version = 4\n\n[[package]]\nname = \"tool-fixture\"\nversion = \"0.1.0\"\n",
     )
     .expect("should write tool lock");
     run_git(directory.path(), &["init", "--quiet"]);
     run_git(
         directory.path(),
-        &["add", "Cargo.lock", "tools/docs-parity/Cargo.lock"],
+        &[
+            "add",
+            "Cargo.toml",
+            "Cargo.lock",
+            "src/lib.rs",
+            "tools/docs-parity/Cargo.toml",
+            "tools/docs-parity/Cargo.lock",
+            "tools/docs-parity/src/lib.rs",
+        ],
     );
     let clean = generate_from(directory.path());
-    assert!(clean.status.success(), "bounded regular locks should pass");
+    assert!(
+        clean.status.success(),
+        "bounded regular locks should pass: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    let extracted = Command::new(binary())
+        .current_dir(directory.path())
+        .env("GITHUB_REPOSITORY", "IABTechLab/trusted-server")
+        .env("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+        .env("GITHUB_REF", "refs/heads/main")
+        .env("GITHUB_RUN_ID", "42")
+        .env("GITHUB_RUN_ATTEMPT", "3")
+        .args([
+            "dependency-snapshot",
+            "validate",
+            "--archive",
+            "snapshot.zip",
+            "--output-json",
+            "snapshot.json",
+        ])
+        .output()
+        .expect("should execute dependency validator");
+    assert!(
+        extracted.status.success(),
+        "dependency JSON extraction should pass: {}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    let extracted_snapshot = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(directory.path().join("snapshot.json"))
+            .expect("should read extracted dependency JSON"),
+    )
+    .expect("extracted dependency JSON should parse");
+    assert_eq!(extracted_snapshot["version"], 0);
 
     #[cfg(unix)]
     {

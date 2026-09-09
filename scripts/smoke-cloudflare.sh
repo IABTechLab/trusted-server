@@ -159,11 +159,10 @@ run_case() {
             grep --fixed-strings --quiet 'env.TRUSTED_SERVER_CONFIG' "$log_path" ||
                 smoke_die "missing-secret case did not retain the config control binding"
         fi
-        printf '%s\n' "$expected_diagnostic" >"$WORKSPACE/$case_name.diagnostic"
         smoke_assert_failure \
             "$expected_status" \
             "$expected_diagnostic" \
-            "$WORKSPACE/$case_name.diagnostic"
+            "$log_path"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi
@@ -171,16 +170,16 @@ run_case() {
 
 run_case missing-config "$BASE_PORT" "" "" 500 \
     'env.TRUSTED_SERVER_CONFIG' \
-    'Cloudflare config binding missing: env.TRUSTED_SERVER_CONFIG'
+    'Cloudflare TRUSTED_SERVER_CONFIG is required'
 run_case missing-handler "$((BASE_PORT + 1))" "$CONFIG_JSON" handler_password 500 \
     'env.handler_password' \
-    'Cloudflare secret binding missing: env.handler_password -> handlers[0].password'
+    "failed to resolve secret reference at \`handlers[0].password\` from secret store \`trusted_server_secrets\`"
 run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secret 500 \
     'env.publisher_proxy_secret' \
-    'Cloudflare secret binding missing: env.publisher_proxy_secret -> publisher.proxy_secret'
+    "failed to resolve secret reference at \`publisher.proxy_secret\` from secret store \`trusted_server_secrets\`"
 run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 500 \
     'env.ec_passphrase' \
-    'Cloudflare secret binding missing: env.ec_passphrase -> ec.passphrase'
+    "failed to resolve secret reference at \`ec.passphrase\` from secret store \`trusted_server_secrets\`"
 run_case positive "$((BASE_PORT + 4))" "$CONFIG_JSON" "" 200 "" ""
 
 echo "Cloudflare first-success smoke passed"

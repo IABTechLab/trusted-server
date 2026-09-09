@@ -104,18 +104,17 @@ run_case() {
             [ "$CONFIG_PUSHED" = true ] ||
                 smoke_die "missing-secret case ran before the config push"
         fi
-        printf '%s\n' "$expected_diagnostic" >"$WORKSPACE/$case_name.diagnostic"
         smoke_assert_failure \
             "$expected_status" \
             "$expected_diagnostic" \
-            "$WORKSPACE/$case_name.diagnostic"
+            "$component_log_dir/trusted-server_stderr.txt"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi
 }
 
 run_case missing-config "$BASE_PORT" "" 503 \
-    'Spin app-config missing: default/trusted_server_config'
+    'failed to read Spin Trusted Server app-config blob'
 
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     "$SMOKE_TS_BIN" config push \
@@ -128,11 +127,11 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
 CONFIG_PUSHED=true
 
 run_case missing-handler "$((BASE_PORT + 1))" "$SPIN_HANDLER_VAR" 503 \
-    "Spin variable unresolved: $SPIN_HANDLER_VAR -> handlers[0].password"
+    "resolved secret at \`handlers[0].password\` must not be empty"
 run_case missing-proxy "$((BASE_PORT + 2))" "$SPIN_PROXY_VAR" 503 \
-    "Spin variable unresolved: $SPIN_PROXY_VAR -> publisher.proxy_secret"
+    "resolved secret at \`publisher.proxy_secret\` must not be empty"
 run_case missing-ec "$((BASE_PORT + 3))" "$SPIN_EC_VAR" 503 \
-    "Spin variable unresolved: $SPIN_EC_VAR -> ec.passphrase"
+    "resolved secret at \`ec.passphrase\` must not be empty"
 run_case positive "$((BASE_PORT + 4))" "" 200
 
 echo "Spin first-success smoke passed"

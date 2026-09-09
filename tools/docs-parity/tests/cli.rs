@@ -281,6 +281,26 @@ fn pages_command_tree_is_constructible() {
     assert!(String::from_utf8_lossy(&help.stdout).contains("--check"));
 }
 
+#[test]
+fn artifact_validation_commands_expose_canonical_json_output() {
+    for command in [
+        &["links", "--help"][..],
+        &["dependency-snapshot", "validate", "--help"][..],
+    ] {
+        let help = output(
+            command_in(
+                env::current_dir()
+                    .expect("should read current directory")
+                    .as_path(),
+            )
+            .args(command),
+        );
+
+        assert_eq!(status_code(&help), SUCCESS);
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--output-json"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn check_all_executes_clean_with_external_sentinel_and_without_repository_writes() {

@@ -353,7 +353,7 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 # Optional: connect to origin_url but send this outbound Host header.
 # origin_host_header_override = "www.publisher.com"
-proxy_secret = "publisher_proxy_secret"},{
+proxy_secret = "publisher_proxy_secret"
 ```
 
 **Environment Override**:
@@ -879,18 +879,18 @@ Path-based HTTP Basic Authentication.
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "admin_password"},{
+password = "admin_password"
 
 # Multiple handlers
 [[handlers]]
 path = "^/secure"
 username = "user1"
-password = "secure_handler_password"},{
+password = "secure_handler_password"
 
 [[handlers]]
 path = "^/api/private"
 username = "api-user"
-password = "api_handler_password"},{
+password = "api_handler_password"
 ```
 
 **Environment Override**:

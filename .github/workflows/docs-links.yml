@@ -6,8 +6,8 @@ on:
     - cron: "17 9 * * 1"
   workflow_dispatch:
 concurrency:
-  group: documentation-automation
-  cancel-in-progress: false
+  group: "documentation-automation-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'default-branch-writers' }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 jobs:
   pull-request:
     name: Documentation parity
@@ -17,7 +17,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
         with:
           ref: "${{ github.event.pull_request.head.sha }}"
           persist-credentials: false
@@ -25,11 +25,11 @@ jobs:
       - name: Read pinned Node version
         id: node-version
         run: echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: "1.95.0"
           cache: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: "${{ steps.node-version.outputs.node }}"
       - name: Install JSDoc lint dependencies
@@ -45,24 +45,24 @@ jobs:
       contents: read
     outputs:
       artifact-sha256: "${{ steps.digest.outputs.sha256 }}"
+      checked-at: "${{ steps.link-result.outputs.checked-at }}"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
         with:
           ref: "${{ github.sha }}"
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: "1.95.0"
           cache: false
       - name: Generate closed link result
-        run: |
-          checked_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          DOCS_PARITY_CHECKED_AT="$checked_at" cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external --artifact "$RUNNER_TEMP/link-results.zip"
+        id: link-result
+        run: ./scripts/generate-docs-link-results.sh
       - name: Record link artifact digest
         id: digest
         run: echo "sha256=$(sha256sum "$RUNNER_TEMP/link-results.zip" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: link-results
           path: "${{ runner.temp }}/link-results.zip"
@@ -76,14 +76,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      contents: read
       issues: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: "${{ github.sha }}"
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
+        with:
+          toolchain: "1.95.0"
+          cache: false
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: link-results
           path: "${{ runner.temp }}/link-results"
       - name: Validate LinkResultsV1 and reconcile one owned issue
         env:
+          DOCS_PARITY_CHECKED_AT: "${{ needs.link-reader.outputs.checked-at }}"
           EXPECTED_SHA256: "${{ needs.link-reader.outputs.artifact-sha256 }}"
           EXPECTED_REPOSITORY: "${{ github.repository }}"
           EXPECTED_REF: "${{ github.ref }}"
@@ -91,95 +102,7 @@ jobs:
           EXPECTED_RUN_ID: "${{ github.run_id }}"
           EXPECTED_RUN_ATTEMPT: "${{ github.run_attempt }}"
           GH_TOKEN: "${{ github.token }}"
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/link-results/link-results.zip"
-          json="$RUNNER_TEMP/link-results.json"
-          test "$(find "$RUNNER_TEMP/link-results" -mindepth 1 -maxdepth 1 -print | wc -l)" -eq 1
-          test -f "$archive"
-          test ! -L "$archive"
-          test "$(stat -c '%a' "$archive")" = 644
-          test "$(stat -c '%s' "$archive")" -le 2097152
-          test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256"
-          python3 -c 'import pathlib, struct, sys, zipfile; data = pathlib.Path(sys.argv[1]).read_bytes(); assert len(data) >= 22 and data[:4] == b"PK\x03\x04"; signature, disk, central_disk, disk_entries, total_entries, central_size, central_offset, comment_length = struct.unpack("<4s4H2LH", data[-22:]); assert signature == b"PK\x05\x06" and disk == central_disk == 0 and disk_entries == total_entries == 1 and central_size != 0xffffffff and central_offset != 0xffffffff and comment_length == 0 and central_offset + central_size == len(data) - 22; archive = zipfile.ZipFile(sys.argv[1]); infos = archive.infolist(); assert len(infos) == 1 and infos[0].filename == sys.argv[2] and not infos[0].is_dir() and infos[0].external_attr >> 16 in (0o644, 0o100644) and infos[0].file_size <= int(sys.argv[3])' "$archive" "link-results.json" 1048576
-          test "$(unzip -Z1 "$archive")" = "link-results.json"
-          test "$(zipinfo -l "$archive" | awk '/link-results.json$/ { print $1 }')" = "-rw-r--r--"
-          unzip -p "$archive" link-results.json > "$json"
-          test "$(stat -c '%s' "$json")" -le 1048576
-          jq -e --arg repository "$EXPECTED_REPOSITORY" --arg ref "$EXPECTED_REF" --arg sha "$EXPECTED_SOURCE_SHA" --argjson run_id "$EXPECTED_RUN_ID" --argjson run_attempt "$EXPECTED_RUN_ATTEMPT" 'def bounded: type == "string" and utf8bytelength <= 2048; keys == ["checked_at", "findings", "repository", "run_attempt", "run_id", "schema_version", "source_ref", "source_sha"] and .schema_version == 1 and .repository == $repository and .source_ref == $ref and .source_sha == $sha and .run_id == $run_id and .run_attempt == $run_attempt and (.checked_at | bounded) and (.findings | type == "array" and length <= 500) and all(.. | strings; utf8bytelength <= 2048) and all(.findings[]; keys == ["diagnostic", "final_url", "kind", "requested_url", "status"] and (.kind == "unreachable" or .kind == "http_status" or .kind == "redirect") and (.requested_url | bounded) and (.diagnostic | bounded) and (.final_url == null or (.final_url | bounded)) and (.status == null or (.status | type == "number" and floor == . and . >= 100 and . <= 599)))' "$json" >/dev/null
-          python3 - "$json" <<'PY'
-          import datetime
-          import json
-          import re
-          import sys
-          import unicodedata
-          import urllib.parse
-
-          with open(sys.argv[1], encoding="utf-8") as source:
-              result = json.load(source)
-
-          checked_at = result["checked_at"]
-          assert re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", checked_at)
-          assert int(checked_at[:4]) >= 1970
-          datetime.datetime.strptime(checked_at, "%Y-%m-%dT%H:%M:%SZ")
-
-          def valid_url(value):
-              if not value or len(value.encode("utf-8")) > 2048 or "\\" in value:
-                  return False
-              if any(unicodedata.category(character) == "Cc" for character in value):
-                  return False
-              parsed = urllib.parse.urlsplit(value)
-              try:
-                  parsed.port
-              except ValueError:
-                  return False
-              return (
-                  parsed.scheme == "https"
-                  and parsed.hostname is not None
-                  and parsed.username is None
-                  and parsed.password is None
-                  and not any(character.isspace() for character in parsed.netloc)
-              )
-
-          for finding in result["findings"]:
-              assert finding["diagnostic"].strip()
-              assert valid_url(finding["requested_url"])
-              if finding["final_url"] is not None:
-                  assert valid_url(finding["final_url"])
-          PY
-          title="[docs-parity] External link findings"
-          owner_marker="<!-- docs-parity:external-links:v1 -->"
-          issues_json="$RUNNER_TEMP/external-link-issues.json"
-          issue_body="$RUNNER_TEMP/external-link-issue.md"
-          gh api --paginate --slurp "repos/$EXPECTED_REPOSITORY/issues?state=all&per_page=100" > "$issues_json"
-          jq -e 'type == "array" and all(.[]; type == "array" and all(.[]; type == "object" and (.number | type == "number" and floor == . and . > 0) and (.title | type == "string") and (.body == null or (.body | type == "string")) and (.state == "open" or .state == "closed")))' "$issues_json" >/dev/null
-          owned_count="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and ((.body // "") | startswith($marker)))] | length' "$issues_json")"
-          foreign_count="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and (((.body // "") | startswith($marker)) | not))] | length' "$issues_json")"
-          test "$owned_count" -le 1
-          test "$foreign_count" -eq 0
-          issue_number="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and ((.body // "") | startswith($marker)))] | if length == 1 then .[0].number | tostring else "" end' "$issues_json")"
-          issue_state="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and ((.body // "") | startswith($marker)))] | if length == 1 then .[0].state else "" end' "$issues_json")"
-          findings="$(jq '.findings | length' "$json")"
-          printf '%s\n\n' "$owner_marker" > "$issue_body"
-          cat "$json" >> "$issue_body"
-          if test "$findings" -gt 0; then
-            if test "$owned_count" -eq 0; then
-              gh issue create --repo "$EXPECTED_REPOSITORY" --title "$title" --body-file "$issue_body"
-            else
-              if test "$issue_state" = closed; then
-                gh issue reopen --repo "$EXPECTED_REPOSITORY" "$issue_number"
-              else
-                test "$issue_state" = open
-              fi
-              gh issue comment --repo "$EXPECTED_REPOSITORY" "$issue_number" --body-file "$issue_body"
-            fi
-          elif test "$owned_count" -eq 1; then
-            if test "$issue_state" = open; then
-              gh issue close --repo "$EXPECTED_REPOSITORY" "$issue_number" --comment "The latest complete scan is clean."
-            else
-              test "$issue_state" = closed
-            fi
-          fi
+        run: ./scripts/docs-links-reconcile.sh
   dependency-reader:
     name: Generate dependency snapshot
     if: github.repository == 'IABTechLab/trusted-server' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
@@ -190,12 +113,12 @@ jobs:
     outputs:
       artifact-sha256: "${{ steps.digest.outputs.sha256 }}"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
         with:
           ref: "${{ github.sha }}"
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: "1.95.0"
           cache: false
@@ -204,7 +127,7 @@ jobs:
       - name: Record dependency artifact digest
         id: digest
         run: echo "sha256=$(sha256sum "$RUNNER_TEMP/dependency-snapshot.zip" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: dependency-snapshot
           path: "${{ runner.temp }}/dependency-snapshot.zip"
@@ -220,7 +143,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: "${{ github.sha }}"
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
+        with:
+          toolchain: "1.95.0"
+          cache: false
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: dependency-snapshot
           path: "${{ runner.temp }}/dependency-snapshot"
@@ -232,21 +164,4 @@ jobs:
           EXPECTED_RUN_ID: "${{ github.run_id }}"
           EXPECTED_RUN_ATTEMPT: "${{ github.run_attempt }}"
           GH_TOKEN: "${{ github.token }}"
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/dependency-snapshot/dependency-snapshot.zip"
-          json="$RUNNER_TEMP/dependency-snapshot.json"
-          test "$(find "$RUNNER_TEMP/dependency-snapshot" -mindepth 1 -maxdepth 1 -print | wc -l)" -eq 1
-          test -f "$archive"
-          test ! -L "$archive"
-          test "$(stat -c '%a' "$archive")" = 644
-          test "$(stat -c '%s' "$archive")" -le 4194304
-          test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256"
-          python3 -c 'import pathlib, struct, sys, zipfile; data = pathlib.Path(sys.argv[1]).read_bytes(); assert len(data) >= 22 and data[:4] == b"PK\x03\x04"; signature, disk, central_disk, disk_entries, total_entries, central_size, central_offset, comment_length = struct.unpack("<4s4H2LH", data[-22:]); assert signature == b"PK\x05\x06" and disk == central_disk == 0 and disk_entries == total_entries == 1 and central_size != 0xffffffff and central_offset != 0xffffffff and comment_length == 0 and central_offset + central_size == len(data) - 22; archive = zipfile.ZipFile(sys.argv[1]); infos = archive.infolist(); assert len(infos) == 1 and infos[0].filename == sys.argv[2] and not infos[0].is_dir() and infos[0].external_attr >> 16 in (0o644, 0o100644) and infos[0].file_size <= int(sys.argv[3])' "$archive" "dependency-snapshot.json" 2097152
-          test "$(unzip -Z1 "$archive")" = "dependency-snapshot.json"
-          test "$(zipinfo -l "$archive" | awk '/dependency-snapshot.json$/ { print $1 }')" = "-rw-r--r--"
-          unzip -p "$archive" dependency-snapshot.json > "$json"
-          test "$(stat -c '%s' "$json")" -le 2097152
-          jq -e --arg ref "$EXPECTED_REF" --arg sha "$EXPECTED_SOURCE_SHA" --arg id "$EXPECTED_RUN_ID.$EXPECTED_RUN_ATTEMPT" 'def package($key): keys == ["package_url", "relationship", "scope"] and .package_url == ("pkg:cargo/" + $key) and ($key | test("^[A-Za-z0-9._+-]+@[A-Za-z0-9._+-]+$")) and (.relationship == "direct" or .relationship == "indirect") and (.scope == "runtime" or .scope == "development"); keys == ["detector", "job", "manifests", "ref", "sha", "version"] and .version == 0 and .sha == $sha and .ref == $ref and .job == {"correlator":"trusted-server-docs-parity-v1","id":$id} and .detector == {"name":"trusted-server-docs-parity","url":"https://github.com/IABTechLab/trusted-server/tree/main/tools/docs-parity","version":"0.1.0"} and (.manifests | keys == ["Cargo.lock", "tools/docs-parity/Cargo.lock"]) and all(.manifests | to_entries[]; (.value | keys == ["file", "name", "resolved"]) and .value.name == .key and .value.file == {"source_location":.key} and (.value.resolved | type == "object") and all(.value.resolved | to_entries[]; .key as $key | .value | package($key))) and ([.manifests[].resolved | length] | add <= 5000) and all(.. | strings; utf8bytelength <= 2048)' "$json" >/dev/null
-          status="$(gh api --include --method POST "repos/IABTechLab/trusted-server/dependency-graph/snapshots" --input "$json" | sed -n '1s/.* \([0-9][0-9][0-9]\).*/\1/p')"
-          test "$status" = 201
+        run: ./scripts/dependency-snapshot-submit.sh

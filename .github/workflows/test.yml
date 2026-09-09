@@ -26,7 +26,7 @@ jobs:
             platform: macos
     steps:
       # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
@@ -37,35 +37,29 @@ jobs:
 
       - name: Read tool versions
         id: tool-versions
-        run: |
-          echo "rust=$(awk '$1 == \"rust\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+        run: ./scripts/read-tool-versions.sh
 
       # actions-rust-lang/setup-rust-toolchain v1.17.0
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.tool-versions.outputs.rust }}
           cache: false
 
       # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.tool-versions.outputs.node }}
 
       - name: Build Trusted Server JavaScript
-        working-directory: crates/trusted-server-js/lib
-        run: |
-          npm ci
-          npm run build
+        run: ./scripts/build-trusted-server-js.sh
 
       - name: Capture recursive native CLI help
         env:
           TSJS_SKIP_BUILD: "1"
-        run: |
-          cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture --output "${{ runner.temp }}/cli-help-${{ matrix.platform }}.zip"
+        run: cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture --output "${{ runner.temp }}/cli-help-${{ matrix.platform }}.zip"
 
       # actions/upload-artifact v7.0.1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: cli-help-${{ matrix.platform }}
           path: ${{ runner.temp }}/cli-help-${{ matrix.platform }}.zip
@@ -78,27 +72,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Viceroy version
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
@@ -106,7 +100,7 @@ jobs:
 
       - name: Cache Viceroy binary
         id: cache-viceroy
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.cargo/bin/viceroy
           key: viceroy-${{ runner.os }}-v${{ steps.viceroy-version.outputs.viceroy-version }}
@@ -116,7 +110,7 @@ jobs:
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
       - name: Use Node.js for the served-seam contract
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
@@ -133,20 +127,20 @@ jobs:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           # wasm32-wasip1 is required by the "Verify Fastly WASM release
@@ -155,7 +149,7 @@ jobs:
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Use Node.js for Rust build scripts
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
@@ -173,7 +167,7 @@ jobs:
       # these cross-platform browser fixtures.
       - name: Set up Chrome for browser fixture tests
         id: setup-chrome
-        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4
+        uses: browser-actions/setup-chrome@v2.2.0
 
       - name: Run host-target CLI tests
         run: ./scripts/test-cli.sh
@@ -186,8 +180,7 @@ jobs:
       # The codegen crate is not a default member and no adapter alias builds it,
       # so its tests only run if invoked explicitly on the host target.
       - name: Run host-target OpenRTB codegen tests
-        run: |
-          cargo test --package trusted-server-openrtb-codegen --target "$(rustc -vV | sed -n 's/host: //p')"
+        run: "cargo test --package trusted-server-openrtb-codegen --target \"$(rustc -vV | sed -n 's/host: //p')\""
 
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -196,27 +189,27 @@ jobs:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-unknown-unknown
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Use Node.js for Rust build scripts
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
@@ -233,27 +226,27 @@ jobs:
     name: cargo check/build/test (spin native + wasm32-wasip1)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain (native + wasm32-wasip1)
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Use Node.js for Rust build scripts
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
@@ -276,27 +269,27 @@ jobs:
     name: cargo test (cross-adapter parity)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: clippy, rustfmt
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Use Node.js for Rust build scripts
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
@@ -316,27 +309,27 @@ jobs:
     name: cargo test (ts CLI, native)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: "clippy, rustfmt"
           cache-shared-key: cargo-cli-${{ runner.os }}
 
       - name: Use Node.js for Rust build scripts
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
@@ -345,12 +338,10 @@ jobs:
       # native run — the workspace clippy jobs are wasm/adapter-scoped and never
       # lint the CLI's host-only code (macOS dev proxy vs Linux audit differ by cfg).
       - name: cargo clippy
-        run: |
-          cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
+        run: "cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target \"$(rustc -vV | sed -n 's/host: //p')\" --all-targets -- -D warnings"
 
       - name: Run native CLI tests
-        run: |
-          cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/host: //p')"
+        run: "cargo test --package trusted-server-cli --target \"$(rustc -vV | sed -n 's/host: //p')\""
 
   test-typescript:
     name: vitest
@@ -359,16 +350,16 @@ jobs:
       run:
         working-directory: crates/trusted-server-js/lib
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
@@ -388,20 +379,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Read tool versions
         id: tool-versions
-        run: |
-          echo "rust=$(awk '$1 == \"rust\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+        run: ./scripts/read-tool-versions.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.tool-versions.outputs.rust }}
           target: wasm32-wasip1,wasm32-unknown-unknown
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.tool-versions.outputs.node }}
           cache: "npm"

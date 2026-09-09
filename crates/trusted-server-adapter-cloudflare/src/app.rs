@@ -328,7 +328,11 @@ fn publisher_fallback_methods() -> [Method; 7] {
 
 /// Returns a [`RouterService`] that responds to every route with the startup error.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
+    let message = {
+        #[cfg(target_arch = "wasm32")]
+        worker::console_error!("{}", startup_error_diagnostic(e));
+        Arc::new(format!("{}\n", e.current_context().user_message()))
+    };
     let status = e.current_context().status_code();
 
     let make = move |msg: Arc<String>| {
@@ -352,6 +356,14 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         router = router.route("/{*rest}", method, make(Arc::clone(&message)));
     }
     router.build()
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn startup_error_diagnostic(error: &Report<TrustedServerError>) -> String {
+    format!(
+        "Cloudflare startup failed, serving error fallback: {}",
+        error.current_context()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +690,19 @@ mod tests {
             }
         }
         assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn startup_error_diagnostic_preserves_the_specific_adapter_error() {
+        let report = Report::new(TrustedServerError::Configuration {
+            message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_owned(),
+        });
+
+        assert!(
+            startup_error_diagnostic(&report)
+                .contains("Cloudflare TRUSTED_SERVER_CONFIG is required"),
+            "the runtime log must preserve the specific startup failure"
+        );
     }
 
     fn aps_profile_settings() -> Settings {

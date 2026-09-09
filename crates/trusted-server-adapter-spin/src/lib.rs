@@ -5,6 +5,7 @@
 //! time stores fail closed.
 
 pub mod app;
+mod logging;
 pub mod middleware;
 pub mod platform;
 
@@ -17,5 +18,8 @@ use spin_sdk::http_service;
 #[http_service]
 // FORCED: edgezero_adapter_spin::run_app returns anyhow::Result — EdgeZero SDK constraint, not a project choice.
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+    // Each request re-enters this function; an already-installed process logger
+    // is the expected steady state.
+    drop(logging::init_logger());
     edgezero_adapter_spin::run_app::<app::TrustedServerApp>(req).await
 }

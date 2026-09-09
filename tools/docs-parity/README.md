@@ -31,10 +31,15 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external --che
 # Scheduled reader only; findings are retained in a deterministic inner ZIP.
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external \
   --artifact /path/to/link-results.zip
+# Writer only; validates context and writes canonical JSON without network I/O.
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- links \
+  --validate-artifact /path/to/link-results.zip \
+  --output-json /path/to/link-results.json
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- dependency-snapshot \
   generate --output /path/to/dependency-snapshot.zip
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- dependency-snapshot \
-  validate --archive /path/to/dependency-snapshot.zip
+  validate --archive /path/to/dependency-snapshot.zip \
+  --output-json /path/to/dependency-snapshot.json
 # Hosted native capture job only.
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture \
   --output /path/to/cli-help-platform.zip
@@ -159,8 +164,8 @@ diagram record binds its path, selector, prose anchor, owner, and exact semantic
 fence-content SHA-256, so edits or order swaps require renewed review. The
 command is offline and is suitable for pull-request validation.
 
-`links --external --check` is the only command that performs network I/O. It is
-reserved for scheduled or explicit manual execution. Requests require HTTPS,
+The two `links --external` modes are the only commands that perform network
+I/O. They are reserved for scheduled or explicit manual execution. Requests require HTTPS,
 reject URL credentials, follow at most five redirects, use HEAD with GET only
 for unsupported HEAD responses, and make at most three attempts for 429/5xx.
 The production curl process uses the fixed `/usr/bin/curl` executable and
@@ -230,23 +235,29 @@ Canonical gate regions must equal their deterministic render, have one exact
 marker pair, and begin immediately after one unique consumer-specific
 placement anchor. Moving a valid region away from that anchor is drift.
 
-`workflow --check` parses `.github/workflows/test.yml` as YAML data and applies
-the currently activated capture-job policy. The final scheduled reader/writer
-policy is fixture-tested here but is not activated against repository
-workflows until its complete materialization task. The final pull-request
-fixture installs Node from `.tool-versions` through a commit-pinned action
-before invoking the aggregate. Its no-checkout writer revalidates UTC, HTTPS,
-credential-free URLs, nonblank diagnostics, archive identity, and schema
-bounds. Issue reconciliation exhaustively pages the API, acts only on the one
-exact body-marker-owned issue, rejects title collisions and duplicates, and
-lets every API failure abort the job.
+`workflow --check` parses `.github/workflows/test.yml` and
+`.github/workflows/docs-links.yml` as YAML data. It enforces the capture-job
+policy and the active pull-request, scheduled-reader, and reviewed-writer-script
+policy. External actions use exact release-version tags. Newly added
+multi-command workflow logic lives in repository scripts, not inline YAML. Each
+writer checks out the authenticated default-branch SHA with persisted
+credentials disabled, and docs-parity revalidates UTC, HTTPS, credential-free
+URLs, nonblank diagnostics, archive identity, workflow context, and schema
+bounds before the script uses canonical JSON. Issue reconciliation exhaustively
+pages the API, acts only on the one exact body-marker-owned issue, rejects title
+collisions and duplicates, and lets every API failure abort the job.
 
 ## Dependency snapshot artifacts
 
 Dependency generation requires immutable `GITHUB_REPOSITORY`, `GITHUB_SHA`,
 `GITHUB_REF`, `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT` values. It reads the
-root and standalone Cargo lockfiles and writes one deterministic inner ZIP
-whose only regular `0644` member is `dependency-snapshot.json`. Validation
+root and standalone Cargo lockfiles, then runs bounded
+`cargo metadata --no-deps --locked --offline` against each tracked manifest.
+Manifest edges determine directness and development scope; lockfile edges
+determine transitive reachability. Workspace/path packages and unreachable
+lock entries are excluded, while any runtime path takes precedence over a
+development-only path. Generation writes one deterministic inner ZIP whose
+only regular `0644` member is `dependency-snapshot.json`. Validation
 requires the same context and enforces the closed GitHub dependency-submission
 version-0 schema, fixed detector/job identity, record and string bounds, and
 the two exact repository-relative manifest locations. Validation reads through

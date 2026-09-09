@@ -50,7 +50,8 @@ deployed `main` SHA.
    `refs/heads/main`; a manual dispatch is not the first-schedule receipt.
 2. Require the `link-reader` and `issue-writer` jobs to use the same run ID and
    attempt, to finish inside their 30- and 5-minute limits, and to show that the
-   non-canceling `documentation-automation` concurrency contract was honored.
+   non-canceling `documentation-automation-default-branch-writers` concurrency
+   contract was honored.
 3. Record the run, job, and artifact URLs; source SHA and ref; GitHub App
    identities; archive byte length and SHA-256; inner `link-results.json` byte
    length and SHA-256; and the validator result.
@@ -65,8 +66,12 @@ are captured.
 
 1. From the same first scheduled run, require `dependency-reader` and
    `dependency-writer` to use one run ID and attempt and to finish inside their
-   20- and 5-minute limits. The writer must not check out or execute repository
-   code.
+   20- and 5-minute limits. Require the writer to check out only the
+   authenticated `github.sha` with credentials disabled and to execute only
+   `scripts/dependency-snapshot-submit.sh` from that checkout. The script must
+   verify the same-run artifact digest and immutable GitHub context, delegate
+   archive and schema validation to docs-parity, and submit only the resulting
+   canonical JSON.
 2. Record the authenticated `main` ref and SHA, archive and inner JSON byte
    lengths and SHA-256 values, fixed detector `trusted-server-docs-parity`, fixed
    correlator `trusted-server-docs-parity-v1`, and snapshot ID.
@@ -81,7 +86,7 @@ are captured.
 State remains `release-pending` until both the 201 receipt and graph visibility
 are captured.
 
-## Dependabot and immutable action pins
+## Dependabot and action release versions
 
 At the merged `main` SHA, inspect `.github/dependabot.yml`. Require exactly the
 GitHub Actions root plus the root Cargo workspace, docs-parity Cargo workspace,
@@ -89,9 +94,11 @@ JavaScript library, browser tests, Next.js fixture, and docs npm roots; require
 weekly cadence and `target-branch: "main"` for all seven entries.
 
 Inspect every `uses:` entry in tracked workflow and composite-action YAML.
-Require normalized local paths or lowercase 40-hex external revisions. Resolve
-each external revision through its publisher's release or tag and record the
-observed version, commit, and primary release URL. Record `.tool-versions` and
+Require normalized local paths or exact external release-version tags. Resolve
+each external version through its publisher's release or tag and record the
+observed version and primary release URL. Confirm every newly added
+multi-command workflow step delegates to a reviewed repository script and that
+the documentation writers contain no Python. Record `.tool-versions` and
 require Wrangler `4.129.0`.
 
 ## Optional `main` protection

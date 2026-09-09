@@ -3843,13 +3843,14 @@ hosted run is retained as negative evidence and is not the capture source.
   A second authenticated import exited 0 and retained all three exact hashes.
 - The final documentation workflow has an ordinary read-only PR validator and
   a guarded weekly/default-branch automation path. Link and dependency readers
-  produce bounded same-run artifacts; their writers have only the specific
-  write permission, never check out repository code, revalidate schema,
-  provenance, permissions, sizes, names, modes, and digests, and submit or
-  reconcile only unchanged validated data. The workflow validator rejects
-  untrusted triggers, inputs, mutable actions, unknown actions, unsafe local
-  paths, expanded permissions, caller-selected refs, cross-run artifacts,
-  writer checkout, unchecked bodies, and altered dependency identity.
+  produce bounded same-run artifacts. Their writers check out only the
+  authenticated default-branch SHA with persisted credentials disabled, invoke
+  one exact reviewed repository script, revalidate schema, provenance,
+  permissions, sizes, names, modes, and digests, and submit or reconcile only
+  unchanged validated data. The workflow validator rejects untrusted triggers,
+  inputs, non-version action references, unknown actions, unsafe local paths,
+  expanded permissions, caller-selected refs, cross-run artifacts, checkout
+  drift, unreviewed writer commands, and altered dependency identity.
 - The release-runbook validator has negative fixtures for the post-`main`
   boundary, named owner, SLA, canonical capture destination, HTTP 201 receipt,
   and explicit no-protection disposition. The committed runbook keeps Pages,
@@ -3863,34 +3864,24 @@ hosted run is retained as negative evidence and is not the capture source.
   exact snippet classification after the generated list replaced the prior
   fenced command table.
 - All tracked workflow and composite-action YAML now uses normalized local
-  actions or immutable lowercase 40-hex external revisions. Reviewed pins:
-  [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1)
-  `3d3c42e5aac5ba805825da76410c181273ba90b1`;
-  [setup-rust-toolchain v1.17.0](https://github.com/actions-rust-lang/setup-rust-toolchain/releases/tag/v1.17.0)
-  `166cdcfd11aee3cb47222f9ddb555ce30ddb9659`;
-  [rustfmt v1.1.2](https://github.com/actions-rust-lang/rustfmt/releases/tag/v1.1.2)
-  `4066006ec54a31931b9b1fddfd38f2fdf2d27143`;
-  [setup-node v7.0.0](https://github.com/actions/setup-node/releases/tag/v7.0.0)
-  `820762786026740c76f36085b0efc47a31fe5020`;
-  [cache v6.1.0](https://github.com/actions/cache/releases/tag/v6.1.0)
-  `55cc8345863c7cc4c66a329aec7e433d2d1c52a9`;
-  [upload-artifact v7.0.1](https://github.com/actions/upload-artifact/releases/tag/v7.0.1)
-  `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`; and
-  [download-artifact v8.0.1](https://github.com/actions/download-artifact/releases/tag/v8.0.1)
-  `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`.
-- Additional reviewed pins:
-  [Fastly compute setup v14](https://github.com/fastly/compute-actions/releases/tag/v14)
-  `a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786`;
-  [setup-chrome v2.2.0](https://github.com/browser-actions/setup-chrome/releases/tag/v2.2.0)
-  `48ad923757ca74d66703209fe939badbdf80f2f4`;
-  [CodeQL bundle v2.26.4](https://github.com/github/codeql-action/releases/tag/codeql-bundle-v2.26.4)
-  action-v4 commit `cdf488f595d80d6e07e03d4674febd5ab45fa938`;
-  [configure-pages v6.0.0](https://github.com/actions/configure-pages/releases/tag/v6.0.0)
-  `45bfe0192ca1faeb007ade9deae92b16b8254a0d`;
-  [upload-pages-artifact v5.0.0](https://github.com/actions/upload-pages-artifact/releases/tag/v5.0.0)
-  `fc324d3547104276b827a68afc52ff2a11cc49c9`; and
-  [deploy-pages v5.0.1](https://github.com/actions/deploy-pages/releases/tag/v5.0.1)
-  `368f82528645a54fb793d4d04e342629a3f51346`.
+  actions or exact external release-version tags. Reviewed versions:
+  [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1),
+  [setup-rust-toolchain v1.17.0](https://github.com/actions-rust-lang/setup-rust-toolchain/releases/tag/v1.17.0),
+  [rustfmt v1.1.2](https://github.com/actions-rust-lang/rustfmt/releases/tag/v1.1.2),
+  [setup-node v7.0.0](https://github.com/actions/setup-node/releases/tag/v7.0.0),
+  [cache v6.1.0](https://github.com/actions/cache/releases/tag/v6.1.0),
+  [upload-artifact v7.0.1](https://github.com/actions/upload-artifact/releases/tag/v7.0.1),
+  and [download-artifact v8.0.1](https://github.com/actions/download-artifact/releases/tag/v8.0.1).
+- Additional reviewed versions:
+  [Fastly compute setup v14](https://github.com/fastly/compute-actions/releases/tag/v14),
+  [setup-chrome v2.2.0](https://github.com/browser-actions/setup-chrome/releases/tag/v2.2.0),
+  [CodeQL action v4.37.9](https://github.com/github/codeql-action/releases/tag/v4.37.9),
+  [configure-pages v6.0.0](https://github.com/actions/configure-pages/releases/tag/v6.0.0),
+  [upload-pages-artifact v5.0.0](https://github.com/actions/upload-pages-artifact/releases/tag/v5.0.0),
+  and [deploy-pages v5.0.1](https://github.com/actions/deploy-pages/releases/tag/v5.0.1).
+- Every new multi-command CI step is implemented in a checked shell script.
+  The link and dependency writer scripts invoke docs-parity for closed archive,
+  schema, URL, and workflow-context validation, and contain no Python.
 - Dependabot now covers exactly seven roots, all weekly and targeting `main`:
   GitHub Actions; root Cargo; docs-parity Cargo; JavaScript library; browser
   tests; Next.js fixture; and docs. Node cache inputs name lockfiles, Rust jobs
@@ -4005,11 +3996,12 @@ macOS help SHA-256
 and identical capture-manifest SHA-256
 `fb51762ee6aba92240e0d4544065a9efb00ef8a3ccd5ba81830912237fb7a581`.
 
-The base-to-checkpoint review contains 100 unsquashed package commits and 259
-paths: 139,799 insertions and 3,307 deletions. The path review found no
-unrelated runtime feature. Runtime-adjacent changes are the documented narrow
-test seams and browser operation bounds required to exercise existing
-behavior; the only sandbox bypass is fixture-only as described above. Public
+The base-to-current-head review contains 106 unsquashed package commits and 267
+paths: 140,478 insertions and 3,300 deletions. The path review found no
+unrelated runtime feature. Runtime-adjacent changes are the documented test
+seams, fixture-only browser sandbox and cleanup behavior, and logging-only
+Cloudflare and Spin startup diagnostics; responses, routes, public APIs, and
+successful-request behavior are unchanged. Public
 onboarding was intentionally moved to `docs/internal/onboarding.md` as part of
 the approved containment package, while the public guide was substantively
 rewritten and expanded across configuration, routes, integrations, all four
@@ -4023,3 +4015,47 @@ records and generated manifest selectors. PR #1049's bounded
 hosted checks and app identities, and the preserved Appendix B and adapter
 smoke regions. No rc result is represented as a live deployment, first
 schedule, dependency submission, graph receipt, or `main` protection change.
+
+#### Task 19 — Self-review remediation
+
+This section supersedes conflicting Task 18 statements about browser-operation
+bounds, writer checkout, and action commit pins.
+
+- The production CLI browser timeout and process-reaping edits were removed.
+  Only browser-fixture-specific sandbox and cleanup seams plus test-server
+  hardening remain; production browser behavior again matches the audited
+  target.
+- Cloudflare and Spin negative smokes no longer manufacture their expected
+  diagnostic. Each adapter emits its specific startup error to the runtime log,
+  and each smoke asserts that independently captured log. Response status,
+  body, routing, and successful-request behavior remain unchanged. Cloudflare
+  uses the Workers console facility. Because EdgeZero's Spin logger initializer
+  is a no-op, the Spin adapter owns a target-filtered `log` backend that emits
+  only the startup diagnostic target to Spin's captured component stderr.
+- The public configuration examples are valid TOML and execute in validation
+  mode; the two broad illustrative waivers were removed.
+- Pull-request workflow runs now have per-PR concurrency and cancel only stale
+  runs for that PR. Scheduled and manual default-branch writers share a
+  separate non-canceling group.
+- Dependency snapshots combine manifest declarations with lock-graph
+  reachability. Workspace, path, and unreachable packages are excluded;
+  directness and development scope are now meaningful, with runtime taking
+  precedence when both scopes reach a package.
+- External actions use exact reviewed release-version tags. New multi-command
+  workflow logic lives in seven checked shell scripts. The two writer scripts
+  delegate closed archive, schema, URL, and context validation to docs-parity
+  and do not invoke Python.
+- Red-to-green evidence includes seven workflow-policy tests, five dependency
+  snapshot tests, canonical JSON extraction for both artifact types, strict
+  Rust linting, shell syntax and lint checks, workflow linting, and real Spin
+  and Cloudflare first-success smoke runs.
+- The remediation acceptance pass completed all six adapter Clippy aliases,
+  host CLI and codegen Clippy, all four adapter test aliases, 13 cross-adapter
+  parity tests, the full native CLI suite and all five browser fixtures, 45
+  JavaScript files with 949 tests and type checking, JavaScript lint/format/13
+  builds, documentation lint/format/build, six warning-denied rustdoc commands,
+  and the standalone docs-parity format, Clippy, full test suite, generated
+  output, snippets, workflow, and `check --all` gates. The real dependency
+  generator and validator produced 603 reachable root packages and 158
+  reachable docs-parity packages, with directness and runtime/development
+  scopes populated from Cargo metadata. All reviewed manifests are current.

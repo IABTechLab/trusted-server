@@ -2432,6 +2432,43 @@ fn link_results_zip_is_deterministic_closed_and_context_bound() {
     assert_eq!(first, second, "link result ZIP should be byte-stable");
     assert_eq!(parsed, result);
 
+    let output_directory = tempfile::tempdir().expect("should create link output directory");
+    let archive_path = output_directory.path().join("link-results.zip");
+    let json_path = output_directory.path().join("link-results.json");
+    fs::write(&archive_path, &first).expect("should write link artifact");
+    let extracted = Command::new(binary())
+        .current_dir(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("tool manifest should be nested under repository root"),
+        )
+        .env("GITHUB_REPOSITORY", &result.repository)
+        .env("GITHUB_SHA", &result.source_sha)
+        .env("GITHUB_REF", &result.source_ref)
+        .env("GITHUB_RUN_ID", result.run_id.to_string())
+        .env("GITHUB_RUN_ATTEMPT", result.run_attempt.to_string())
+        .env("DOCS_PARITY_CHECKED_AT", &result.checked_at)
+        .args([
+            "links",
+            "--validate-artifact",
+            archive_path.to_str().expect("archive path should be UTF-8"),
+            "--output-json",
+            json_path.to_str().expect("JSON path should be UTF-8"),
+        ])
+        .output()
+        .expect("should execute link artifact validation");
+    assert!(
+        extracted.status.success(),
+        "link artifact extraction should pass: {}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    let extracted_result = serde_json::from_slice::<docs_parity::markdown::LinkResultsV1>(
+        &fs::read(json_path).expect("should read extracted link JSON"),
+    )
+    .expect("extracted link JSON should match the closed schema");
+    assert_eq!(extracted_result, result);
+
     let mut stale = link_context();
     stale.run_attempt = 3;
     assert!(

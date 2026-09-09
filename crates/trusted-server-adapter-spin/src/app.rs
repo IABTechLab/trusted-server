@@ -474,7 +474,11 @@ fn legacy_admin_alias_denied() -> Response {
 /// 503 Service Unavailable. The startup error is logged but not echoed in the
 /// response body so that deployment state is not leaked to anonymous callers.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    log::error!("startup failed, serving error fallback: {:?}", e);
+    log::error!(
+        target: crate::logging::STARTUP_DIAGNOSTIC_TARGET,
+        "{}",
+        startup_error_diagnostic(e)
+    );
 
     let handler = |_ctx: RequestContext| {
         let body = edgezero_core::body::Body::from("Service Unavailable\n");
@@ -504,6 +508,13 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         builder = builder.route("/{*rest}", method, handler);
     }
     builder.build()
+}
+
+fn startup_error_diagnostic(error: &Report<TrustedServerError>) -> String {
+    format!(
+        "Spin startup failed, serving error fallback: {}",
+        error.current_context()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1342,19 @@ mod tests {
             &body[..],
             b"ok",
             "startup-fallback health body should be `ok`"
+        );
+    }
+
+    #[test]
+    fn startup_error_diagnostic_preserves_the_specific_adapter_error() {
+        let report = Report::new(TrustedServerError::Configuration {
+            message: "failed to read Spin Trusted Server app-config blob".to_owned(),
+        });
+
+        assert!(
+            startup_error_diagnostic(&report)
+                .contains("failed to read Spin Trusted Server app-config blob"),
+            "the runtime log must preserve the specific startup failure"
         );
     }
 

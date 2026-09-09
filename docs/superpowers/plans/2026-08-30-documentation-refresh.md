@@ -764,8 +764,8 @@ invokes capture, import, issue, or dependency-submission paths.
 
 - [x] **Step 2: Add native capture CI**
 
-Add a permanent read-only Linux/macOS pull-request matrix job. Pin every
-external action changed in `test.yml` to a lowercase 40-hex SHA. Checkout
+Add a permanent read-only Linux/macOS pull-request matrix job. Reference every
+external action changed in `test.yml` by its exact reviewed release-version tag. Checkout
 `github.event.pull_request.head.sha` with `persist-credentials: false`, assert
 that `git rev-parse HEAD` equals it, run the same command with no platform
 override. Upload GitHub artifacts named exactly `cli-help-linux` and
@@ -803,14 +803,15 @@ integration-test modules. Task 17 creates
 
 - [x] **Step 5: Write final-workflow policy fixtures first**
 
-Positive fixtures: ordinary read-only PR validation, scheduled clean/finding link paths, issue dedup/auto-close, dependency generation/submission, and closed manual refresh. Negative fixtures: `pull_request_target`, `merge_group`, status write, caller tool/SHA input, privileged PR checkout, unpinned action, expanded permissions, unsafe cache/service/local action, stale source, extra path/member, traversal, unsafe mode/symlink, mixed inputs, malformed/oversized artifacts, unknown schema fields, and write job executing repository code.
+Positive fixtures: ordinary read-only PR validation, scheduled clean/finding link paths, issue dedup/auto-close, dependency generation/submission, exact reviewed writer scripts, and closed manual refresh. Negative fixtures: `pull_request_target`, `merge_group`, status write, caller tool/SHA input, privileged PR checkout, non-version action reference, expanded permissions, unsafe cache/service/local action, stale source, extra path/member, traversal, unsafe mode/symlink, mixed inputs, malformed/oversized artifacts, unknown schema fields, and writer script drift.
 
 - [x] **Step 6: Implement workflow, result, and snapshot policy**
 
 Parse YAML as data. Implement reusable policy for read-only pull-request jobs,
-lowercase 40-hex external action pins, default-deny permissions, same-run
-reader/writer transfer, no-checkout writers, fixed concurrency/timeouts, closed
-inner archives, closed JSON schemas, and authenticated source SHA/ref. Make the
+exact external action release versions, default-deny permissions, same-run
+reader/writer transfer, exact `github.sha` writer checkout with persisted
+credentials disabled, exact reviewed writer scripts, fixed concurrency/timeouts,
+closed inner archives, closed JSON schemas, and authenticated source SHA/ref. Make the
 external-link engine return `LinkResultsV1`; interactive check mode still fails
 on findings, while artifact mode writes a complete result. Implement the exact
 dependency-submission version-0 schema and fixed identity from the design. Link
@@ -1464,6 +1465,8 @@ git commit -m "Complete in-code documentation"
 - Modify: `.github/actions/setup-integration-test-env/action.yml`
 - Modify: `.github/dependabot.yml`
 - Modify: `.tool-versions`
+- Create: `scripts/{build-trusted-server-js,dependency-snapshot-submit,docs-links-reconcile,generate-docs-link-results,install-wrangler,read-tool-versions,restore-cloudflare-build}.sh`
+- Modify: `scripts/README.md`
 - Modify: `crates/trusted-server-openrtb-codegen/Cargo.toml`
 - Modify: `CLAUDE.md`
 - Modify: `AGENTS.md`
@@ -1482,7 +1485,7 @@ git commit -m "Complete in-code documentation"
 
 - [x] **Step 1: Write failing automation fixtures**
 
-Assert missing rc CodeQL triggers, docs-parity jobs, rustdoc/doctest jobs, nested lockfile cache inputs, Node pins, Dependabot roots, Wrangler pin, generated gate equality, action SHA pins, final `main` targets, reader/writer separation, closed manual refresh, and release-pending runbook fields.
+Assert missing rc CodeQL triggers, docs-parity jobs, rustdoc/doctest jobs, nested lockfile cache inputs, Node pins, Dependabot roots, Wrangler pin, generated gate equality, action release versions, final `main` targets, reader/writer separation, reviewed script entry points, closed manual refresh, and release-pending runbook fields.
 
 - [x] **Step 2: Import the final CLI recapture**
 
@@ -1505,27 +1508,32 @@ External network links remain scheduled, not a PR dependency.
 
 Add CodeQL `rc/*` PR triggers, `.tool-versions` deploy paths, exact setup-node
 lockfile paths, pinned Wrangler, all approved Dependabot roots targeting `main`,
-and `[lints] workspace = true`. Pin every external `uses:` reference in all
-tracked workflow and composite-action YAML to a lowercase 40-hex SHA; permit
-normalized `./...` local actions only in read-only checkout jobs. Record each
-pin's release version and primary release URL in evidence.
+and `[lints] workspace = true`. Reference every external `uses:` entry in all
+tracked workflow and composite-action YAML by its exact reviewed release-version
+tag; permit normalized `./...` local actions only in read-only checkout jobs.
+Record each version and primary release URL in evidence.
 
 - [x] **Step 5: Finalize `docs-links.yml`**
 
 Create `docs-links.yml` once in final form: ordinary read-only pull-request
 validation; weekly `17 9 * * 1` default-branch schedule; input-free manual
 dispatch; repository/main guards on every scheduled/manual reader and writer;
-fixed non-canceling concurrency; 30/20/5-minute timeouts; same-run split link
-and dependency readers/writers; exact inner archive schemas and digests; one
+per-pull-request concurrency with stale validation cancellation; a separate
+fixed non-canceling group for scheduled/manual automation; 30/20/5-minute
+timeouts; same-run split link and dependency readers/writers; manifest-derived
+direct/development classification combined with lockfile transitive edges;
+workspace/path and unreachable-package exclusion; exact inner archive schemas
+and digests; one
 owned issue with dedup/auto-close; the fixed dependency snapshot identity; and
 unchanged-body submission after revalidation. Reject `pull_request_target`,
 `merge_group`, status writes, temporary rc targets, retirement paths, cross-run
-artifact selection, caller-selected refs/tools/SHAs, writer checkout, and writer
-execution of checked-out repository code.
+artifact selection, caller-selected refs/tools/SHAs, writer checkout of anything
+except exact `github.sha` with credentials disabled, unreviewed writer commands,
+and inline multi-command workflow bodies.
 
 - [x] **Step 6: Write the release-pending runbook**
 
-Document exact post-main Pages/CNAME smoke, first scheduled link run, first dependency submission and 201/graph proof, Dependabot/action-pin inspection, alert owner/SLA, and optional branch-protection activation only after contexts report from expected apps. Mark every receipt release-pending; do not create another PR or claim execution from rc.
+Document exact post-main Pages/CNAME smoke, first scheduled link run, first dependency submission and 201/graph proof, Dependabot/action-version inspection, alert owner/SLA, and optional branch-protection activation only after contexts report from expected apps. Mark every receipt release-pending; do not create another PR or claim execution from rc.
 
 - [x] **Step 7: Generate all gate consumers**
 
@@ -1628,6 +1636,22 @@ Push to `origin/spec-docs-refresh`. Update only the bounded `<!-- docs-refresh:f
 
 Review `git diff origin/rc/202608...HEAD` path by path, require no unrelated runtime change, keep package commits unsquashed, and mark PR #1049 ready for review without opening or requesting approval on any other PR. Completion means repository implementation is finished; merge and release-pending operations remain outside this plan.
 
+### Task 19: Self-review remediation
+
+- [x] Replace external action commit pins with exact reviewed release-version
+      tags and move new multi-command workflow logic into checked shell scripts.
+- [x] Preserve the reader/writer trust boundary with exact-SHA, credential-free
+      writer checkouts and repository validators for same-run artifact context,
+      archive shape, and canonical JSON.
+- [x] Derive dependency directness and runtime/development scope from manifest
+      declarations plus lock-graph reachability.
+- [x] Replace synthetic negative-smoke diagnostics with real Cloudflare and Spin
+      runtime log capture while preserving responses, routes, and success paths.
+- [x] Remove production browser lifecycle changes; retain only fixture-scoped
+      sandbox and cleanup seams.
+- [x] Re-run the complete acceptance matrix and record the results in Task 19 of
+      the evidence ledger.
+
 ## Final plan-to-spec traceability
 
 | Spec surface                               | Plan tasks |
@@ -1643,5 +1667,8 @@ Review `git diff origin/rc/202608...HEAD` path by path, require no unrelated run
 | WP7 in-code docs                           | 16         |
 | WP8b final CI/release-pending controls     | 17         |
 | Final PR #1049 acceptance                  | 18         |
+| Self-review remediation                    | 19         |
 
-The implementation is complete only when Task 18 verifies the exact final #1049 head. No individual implementation PR or default-branch receipt is part of this plan.
+The implementation is complete only when Task 19 verifies the exact final #1049
+head after the Task 18 acceptance checkpoint. No individual implementation PR
+or default-branch receipt is part of this plan.

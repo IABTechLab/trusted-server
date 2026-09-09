@@ -1,8 +1,3 @@
-//! Chromium-backed evidence collector for generated audits.
-//!
-//! The collector owns browser startup, navigation limits, progress events,
-//! consent stubbing, and guaranteed process/profile cleanup.
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -16,6 +11,8 @@ use tokio::runtime::Builder;
 use tokio::time::{sleep, timeout};
 use url::Url;
 
+#[cfg(test)]
+use crate::commands::audit::browser::browser_fixture_tests_enabled;
 use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
     resolve_chrome, set_browser_cookies,
@@ -38,8 +35,6 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// soft bound: the settle loop is the real readiness signal and the scrape reads
 /// whatever rendered by then.
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
-const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
-const PRE_NAVIGATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Size the page's resource-timing buffer is raised to before navigation, and
@@ -414,14 +409,11 @@ async fn with_browser(
     .map_err(report_error)?;
 
     on_progress(CollectionProgress::Launching)?;
-    let (mut browser, mut handler) = timeout(BROWSER_LAUNCH_TIMEOUT, Browser::launch(config))
-        .await
-        .map_err(|_| report_error("timed out launching Chrome/Chromium for audit"))?
-        .map_err(|error| {
-            report_error(format!(
-                "failed to launch Chrome/Chromium for audit: {error}"
-            ))
-        })?;
+    let (mut browser, mut handler) = Browser::launch(config).await.map_err(|error| {
+        report_error(format!(
+            "failed to launch Chrome/Chromium for audit: {error}"
+        ))
+    })?;
 
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
     let page_settings = PageCollectionSettings {
@@ -495,34 +487,40 @@ async fn with_browser(
                 report_error(format!("failed to close browser after audit: {error}"))
             })
         });
-    // Reap the child even when the CDP close request failed or timed out. Give
-    // waiting its own budget so a slow close cannot consume the entire teardown
-    // window and leave chromiumoxide's drop handler to kill the process.
-    let wait_result = reap_browser(&mut browser).await;
+    // Give process exit its own budget so a slow close cannot consume the
+    // entire teardown window. Test fixtures may force cleanup after that bound;
+    // production retains the established timeout error and drop behavior.
+    let wait_result = wait_for_browser_exit(&mut browser).await;
     handler_task.abort();
     let _ = handler_task.await;
 
     combine_browser_run_results(result, finalization_result, close_result, wait_result)
 }
 
-/// Waits for graceful browser exit, then forcibly reaps a process that outlives
-/// the close deadline.
-async fn reap_browser(browser: &mut Browser) -> CliResult<()> {
+async fn wait_for_browser_exit(browser: &mut Browser) -> CliResult<()> {
     match timeout(BROWSER_CLOSE_TIMEOUT, browser.wait()).await {
         Ok(waited) => waited.map(|_| ()).map_err(|error| {
             report_error(format!(
                 "failed waiting for browser process to exit after audit: {error}"
             ))
         }),
-        Err(_) => timeout(BROWSER_CLOSE_TIMEOUT, browser.kill())
-            .await
-            .map_err(|_| report_error("timed out killing browser process after audit"))
-            .and_then(|killed| match killed {
-                Some(Ok(())) | None => Ok(()),
-                Some(Err(error)) => Err(report_error(format!(
-                    "failed to kill browser process after audit: {error}"
-                ))),
-            }),
+        Err(_) => {
+            #[cfg(test)]
+            if browser_fixture_tests_enabled() {
+                return timeout(BROWSER_CLOSE_TIMEOUT, browser.kill())
+                    .await
+                    .map_err(|_| report_error("timed out killing browser test fixture"))
+                    .and_then(|killed| match killed {
+                        Some(Ok(())) | None => Ok(()),
+                        Some(Err(error)) => Err(report_error(format!(
+                            "failed to kill browser test fixture: {error}"
+                        ))),
+                    });
+            }
+            Err(report_error(
+                "timed out waiting for browser process to exit after audit",
+            ))
+        }
     }
 }
 
@@ -556,13 +554,10 @@ async fn collect_page_from_browser(
     // duplicate in the middle of progress output.
     set_browser_cookies(browser, cookies, target_url).await?;
 
-    let page = timeout(
-        PRE_NAVIGATION_OPERATION_TIMEOUT,
-        browser.new_page("about:blank"),
-    )
-    .await
-    .map_err(|_| "timed out creating browser page for audit".to_string())?
-    .map_err(|error| format!("failed to create browser page for audit: {error}"))?;
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|error| format!("failed to create browser page for audit: {error}"))?;
 
     let result = collect_open_page(&page, target_url, discover_sitemap, settings).await;
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, page.close()).await;
@@ -598,23 +593,15 @@ async fn collect_open_page(
     // Must run before any page script, so the consent platform finds the APIs
     // already answered rather than installing its own gate.
     if settings.assume_consent {
-        timeout(
-            PRE_NAVIGATION_OPERATION_TIMEOUT,
-            page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT),
-        )
-        .await
-        .map_err(|_| "timed out installing the consent stub".to_string())?
-        .map_err(|error| format!("failed to install the consent stub: {error}"))?;
+        page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT)
+            .await
+            .map_err(|error| format!("failed to install the consent stub: {error}"))?;
         warnings.push(CONSENT_STUB_WARNING.to_string());
     }
-    timeout(
-        PRE_NAVIGATION_OPERATION_TIMEOUT,
-        page.evaluate_on_new_document(format!(
-            "performance.setResourceTimingBufferSize({RESOURCE_TIMING_BUFFER_SIZE})"
-        )),
-    )
+    page.evaluate_on_new_document(format!(
+        "performance.setResourceTimingBufferSize({RESOURCE_TIMING_BUFFER_SIZE})"
+    ))
     .await
-    .map_err(|_| "timed out increasing the resource timing buffer".to_string())?
     .map_err(|error| format!("failed to increase the resource timing buffer: {error}"))?;
 
     // Navigate, but don't hard-fail when the `load` event never fires. Ad-heavy

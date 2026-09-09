@@ -1510,8 +1510,8 @@ fingerprint = "sha256:22f79a94836fa1be9cd1db2ea238c503d6953a9ee3ffa7229c370bec59
 [[snippets]]
 path = "docs/guide/configuration.md"
 selector = "fence:13"
-command = "illustrative-toml"
-fingerprint = "sha256:469a152c186d5e2bf936d45880750c5a826a4be6fb5dab689bfc895f58075d56"
+command = "validate-toml"
+fingerprint = "sha256:4b8db7a689f52f317ebd68a76917ed920cb18a44a8a23ce189879dd2da4f5bdf"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
@@ -1624,8 +1624,8 @@ fingerprint = "sha256:cba0b6bcef57f8d09137934eeed9943e77aee3d96104363a45421887a5
 [[snippets]]
 path = "docs/guide/configuration.md"
 selector = "fence:32"
-command = "illustrative-toml"
-fingerprint = "sha256:1783959f4964681217237cecdb59f3d1c061376965051c7a2e96d54223de2c95"
+command = "validate-toml"
+fingerprint = "sha256:78660163ed06be11bfed892202e31429f107a69cd23c0b7d0d9cb5cb0736c186"
 
 [[snippets]]
 path = "docs/guide/configuration.md"
@@ -4109,7 +4109,7 @@ fingerprint = "sha256:dfcb9cf10b6c483587853cd2e72719081d3ec4dbe2df2cab79eba721bc
 path = "tools/docs-parity/README.md"
 selector = "fence:1"
 command = "validate-bash"
-fingerprint = "sha256:59a6728758d0cdc0eb3a03180f790490062d69a84a0359a7df3140311b377c60"
+fingerprint = "sha256:2f63d0273f0e44ce9483e8b17fcb1d466390c34f94bfa2a3ed4158d1403f63c8"
 
 [[snippets]]
 path = "tools/docs-parity/README.md"

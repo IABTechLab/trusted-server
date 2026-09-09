@@ -202,6 +202,9 @@ enum DependencySnapshotAction {
         /// Archive path to validate.
         #[arg(long)]
         archive: PathBuf,
+        /// Optional destination for the validated canonical JSON body.
+        #[arg(long)]
+        output_json: Option<PathBuf>,
     },
 }
 
@@ -239,25 +242,23 @@ struct GenerateArguments {
 #[derive(Args, Debug)]
 struct LinksArguments {
     /// Validate relative files, routes, anchors, and publication inventories.
-    #[arg(
-        long,
-        conflicts_with = "external",
-        required_unless_present = "external"
-    )]
+    #[arg(long, conflicts_with_all = ["external", "validate_artifact"])]
     local: bool,
     /// Perform the scheduled/manual bounded external network check.
-    #[arg(long, conflicts_with = "local", required_unless_present = "local")]
+    #[arg(long, conflicts_with_all = ["local", "validate_artifact"])]
     external: bool,
     /// Validate without changing repository bytes.
-    #[arg(
-        long,
-        conflicts_with = "artifact",
-        required_unless_present = "artifact"
-    )]
+    #[arg(long, conflicts_with_all = ["artifact", "validate_artifact"])]
     check: bool,
     /// Write a complete deterministic result artifact and exit cleanly on findings.
     #[arg(long, conflicts_with_all = ["check", "local"], requires = "external")]
     artifact: Option<PathBuf>,
+    /// Validate a closed link-result artifact against the current workflow context.
+    #[arg(long, conflicts_with_all = ["local", "external", "check", "artifact"], requires = "output_json")]
+    validate_artifact: Option<PathBuf>,
+    /// Write the canonical validated link-result JSON body.
+    #[arg(long, requires = "validate_artifact")]
+    output_json: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -441,12 +442,22 @@ fn dependency_snapshot(
             write_output_atomically(output, &bytes)
                 .change_context(DocsParityError::DependencySnapshot)?;
         }
-        DependencySnapshotAction::Validate { archive } => {
+        DependencySnapshotAction::Validate {
+            archive,
+            output_json,
+        } => {
             let bytes = read_bounded_regular_file(archive, 4 * 1024 * 1024)
                 .change_context(DocsParityError::DependencySnapshot)
                 .attach("dependency snapshot path is not a stable bounded regular file")?;
-            dependency_snapshot::validate_archive(&bytes, &context)
+            let snapshot = dependency_snapshot::validate_archive(&bytes, &context)
                 .change_context(DocsParityError::DependencySnapshot)?;
+            if let Some(output_json) = output_json {
+                let json = serde_json::to_vec(&snapshot)
+                    .change_context(DocsParityError::DependencySnapshot)
+                    .attach("validated dependency snapshot cannot be serialized")?;
+                write_output_atomically(output_json, &json)
+                    .change_context(DocsParityError::DependencySnapshot)?;
+            }
         }
     }
     Ok(Outcome::Clean)
@@ -486,27 +497,47 @@ fn links(
     repository: &Repository,
     arguments: &LinksArguments,
 ) -> Result<Outcome, Report<DocsParityError>> {
-    if arguments.local {
-        debug_assert!(arguments.check, "local links require check mode");
-        markdown::check_local_repository(repository).change_context(DocsParityError::Markdown)?;
-    } else if let Some(artifact) = &arguments.artifact {
-        let context = link_context()?;
-        let result = markdown::collect_external_repository(repository, &context)
-            .change_context(DocsParityError::Markdown)?;
-        let bytes = markdown::encode_link_results_archive(&result)
-            .change_context(DocsParityError::Markdown)?;
-        write_output_atomically(artifact, &bytes)?;
-    } else {
-        debug_assert!(
-            arguments.check,
-            "interactive external links require check mode"
-        );
-        debug_assert!(
-            arguments.external,
-            "clap should require one link-check scope"
-        );
-        markdown::check_external_repository(repository)
-            .change_context(DocsParityError::Markdown)?;
+    match (
+        arguments.local,
+        arguments.external,
+        arguments.check,
+        arguments.artifact.as_ref(),
+        arguments.validate_artifact.as_ref(),
+        arguments.output_json.as_ref(),
+    ) {
+        (true, false, true, None, None, None) => {
+            markdown::check_local_repository(repository)
+                .change_context(DocsParityError::Markdown)?;
+        }
+        (false, true, false, Some(artifact), None, None) => {
+            let context = link_context()?;
+            let result = markdown::collect_external_repository(repository, &context)
+                .change_context(DocsParityError::Markdown)?;
+            let bytes = markdown::encode_link_results_archive(&result)
+                .change_context(DocsParityError::Markdown)?;
+            write_output_atomically(artifact, &bytes)?;
+        }
+        (false, true, true, None, None, None) => {
+            markdown::check_external_repository(repository)
+                .change_context(DocsParityError::Markdown)?;
+        }
+        (false, false, false, None, Some(archive), Some(output_json)) => {
+            let context = link_context()?;
+            let bytes = read_bounded_regular_file(archive, 2 * 1024 * 1024)
+                .change_context(DocsParityError::Markdown)
+                .attach("link-result path is not a stable bounded regular file")?;
+            let result = markdown::validate_link_results_archive(&bytes, &context)
+                .change_context(DocsParityError::Markdown)?;
+            let json = serde_json::to_vec(&result)
+                .change_context(DocsParityError::Markdown)
+                .attach("validated link result cannot be serialized")?;
+            write_output_atomically(output_json, &json)?;
+        }
+        _ => {
+            return Err(Report::new(DocsParityError::Markdown).attach(
+                "links requires exactly one mode: --local --check, --external --check, --external --artifact, or --validate-artifact --output-json",
+            ));
+        }
     }
     Ok(Outcome::Clean)
 }

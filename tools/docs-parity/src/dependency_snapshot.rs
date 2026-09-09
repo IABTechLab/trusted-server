@@ -1,8 +1,9 @@
 //! Closed dependency-submission schema and deterministic artifact handling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::Path;
+use std::process::Command;
 
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,12 @@ pub enum DependencySnapshotError {
     /// A lockfile cannot be decoded into bounded Cargo package records.
     #[display("invalid dependency lockfile: {detail}")]
     Lockfile {
+        /// Stable failure detail.
+        detail: String,
+    },
+    /// Cargo manifest metadata cannot be generated or decoded safely.
+    #[display("invalid Cargo dependency metadata: {detail}")]
+    Metadata {
         /// Stable failure detail.
         detail: String,
     },
@@ -158,11 +165,60 @@ struct CargoLock {
     package: Vec<CargoPackage>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct CargoPackage {
     name: String,
     version: String,
     source: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadata {
+    #[serde(default)]
+    packages: Vec<CargoMetadataPackage>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<CargoMetadataDependency>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataDependency {
+    name: String,
+    kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PackageId {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TraversalScope {
+    Runtime,
+    Development,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DependencyKinds {
+    runtime: bool,
+    development: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PackageClassification {
+    direct: bool,
+    runtime: bool,
+    development: bool,
 }
 
 /// Generate the deterministic inner dependency-snapshot ZIP.
@@ -171,18 +227,20 @@ struct CargoPackage {
 ///
 /// Returns an error for untrusted context, malformed lockfiles, invalid Cargo
 /// package identities, schema bounds, serialization, or archive generation.
-pub fn generate_archive(
+pub fn generate_archive_with_metadata(
     context: &DependencySnapshotContext,
     root_lock: &[u8],
+    root_metadata: &[u8],
     tool_lock: &[u8],
+    tool_metadata: &[u8],
 ) -> Result<Vec<u8>, Report<DependencySnapshotError>> {
     validate_context(context)?;
     let mut manifests = BTreeMap::new();
-    for (path, bytes) in [
-        ("Cargo.lock", root_lock),
-        ("tools/docs-parity/Cargo.lock", tool_lock),
+    for (path, lock_bytes, metadata_bytes) in [
+        ("Cargo.lock", root_lock, root_metadata),
+        ("tools/docs-parity/Cargo.lock", tool_lock, tool_metadata),
     ] {
-        let resolved = parse_lock(bytes, path)?;
+        let resolved = classify_lock_graph(lock_bytes, metadata_bytes, path)?;
         manifests.insert(
             path.to_owned(),
             SnapshotManifest {
@@ -233,7 +291,15 @@ pub(crate) fn generate_repository_archive(
     let tool_lock = repository
         .read_tracked_bounded(&tool_path, MAXIMUM_JSON_BYTES)
         .map_err(|_error| lock_error("tool lockfile is not a bounded tracked regular file"))?;
-    generate_archive(context, &root_lock, &tool_lock)
+    let root_metadata = generate_cargo_metadata(repository, "Cargo.toml")?;
+    let tool_metadata = generate_cargo_metadata(repository, "tools/docs-parity/Cargo.toml")?;
+    generate_archive_with_metadata(
+        context,
+        &root_lock,
+        &root_metadata,
+        &tool_lock,
+        &tool_metadata,
+    )
 }
 
 /// Validate and decode a dependency-snapshot ZIP against immutable context.
@@ -277,38 +343,279 @@ fn validate_context(
     Ok(())
 }
 
-fn parse_lock(
-    bytes: &[u8],
+fn classify_lock_graph(
+    lock_bytes: &[u8],
+    metadata_bytes: &[u8],
     path: &str,
 ) -> Result<BTreeMap<String, SnapshotPackage>, Report<DependencySnapshotError>> {
-    if bytes.len() > MAXIMUM_JSON_BYTES {
+    if lock_bytes.len() > MAXIMUM_JSON_BYTES {
         return Err(lock_error(format!("{path} exceeds 2097152 bytes")));
     }
-    let text =
-        core::str::from_utf8(bytes).map_err(|_error| lock_error(format!("{path} is not UTF-8")))?;
+    if metadata_bytes.len() > MAXIMUM_JSON_BYTES {
+        return Err(metadata_error(format!(
+            "metadata for {path} exceeds 2097152 bytes"
+        )));
+    }
+    let text = core::str::from_utf8(lock_bytes)
+        .map_err(|_error| lock_error(format!("{path} is not UTF-8")))?;
     let lock = toml::from_str::<CargoLock>(text)
         .map_err(|_error| lock_error(format!("cannot parse {path}")))?;
     if lock.package.len() > MAXIMUM_RECORDS {
         return Err(lock_error(format!("{path} exceeds 5000 package records")));
     }
-    let mut resolved = BTreeMap::new();
+    let metadata = serde_json::from_slice::<CargoMetadata>(metadata_bytes)
+        .map_err(|_error| metadata_error(format!("cannot parse metadata for {path}")))?;
+    if metadata.packages.len() > MAXIMUM_RECORDS {
+        return Err(metadata_error(format!(
+            "metadata for {path} exceeds 5000 package records"
+        )));
+    }
+
+    let mut packages = BTreeMap::new();
     for package in lock.package {
         validate_package_component(&package.name, "name")?;
         validate_package_component(&package.version, "version")?;
         if let Some(source) = &package.source {
             validate_string(source, "package source")?;
         }
-        let key = format!("{}@{}", package.name, package.version);
+        for dependency in &package.dependencies {
+            validate_string(dependency, "lockfile dependency")?;
+        }
+        let id = PackageId {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            source: package.source.clone(),
+        };
+        if packages.insert(id.clone(), package).is_some() {
+            return Err(lock_error(format!(
+                "duplicate Cargo package {}@{}",
+                id.name, id.version
+            )));
+        }
+    }
+
+    let mut workspace_dependencies = BTreeMap::new();
+    for package in metadata.packages {
+        validate_package_component(&package.name, "metadata package name")?;
+        validate_package_component(&package.version, "metadata package version")?;
+        if package.source.is_some() {
+            return Err(metadata_error(format!(
+                "metadata for {path} contains a non-workspace root"
+            )));
+        }
+        let id = PackageId {
+            name: package.name,
+            version: package.version,
+            source: None,
+        };
+        if !packages.contains_key(&id) {
+            return Err(metadata_error(format!(
+                "workspace package {}@{} is absent from {path}",
+                id.name, id.version
+            )));
+        }
+        let mut dependencies = BTreeMap::<String, DependencyKinds>::new();
+        for dependency in package.dependencies {
+            validate_package_component(&dependency.name, "metadata dependency name")?;
+            let kinds = dependencies.entry(dependency.name).or_default();
+            match dependency.kind.as_deref() {
+                None | Some("build") => kinds.runtime = true,
+                Some("dev") => kinds.development = true,
+                Some(_) => {
+                    return Err(metadata_error(format!(
+                        "metadata for {path} contains an unknown dependency kind"
+                    )));
+                }
+            }
+        }
+        if workspace_dependencies.insert(id, dependencies).is_some() {
+            return Err(metadata_error(format!(
+                "metadata for {path} contains a duplicate workspace package"
+            )));
+        }
+    }
+
+    let mut classifications = BTreeMap::<PackageId, PackageClassification>::new();
+    let mut queue = VecDeque::new();
+    for root in workspace_dependencies.keys() {
+        queue.push_back((root.clone(), TraversalScope::Runtime));
+    }
+    let mut visited = BTreeSet::new();
+    while let Some((current_id, current_scope)) = queue.pop_front() {
+        if !visited.insert((current_id.clone(), current_scope)) {
+            continue;
+        }
+        let package = packages
+            .get(&current_id)
+            .ok_or_else(|| lock_error(format!("dependency disappeared from {path}")))?;
+        let direct_kinds = workspace_dependencies.get(&current_id);
+        for dependency_text in &package.dependencies {
+            let dependency_id = resolve_lock_dependency(dependency_text, &packages, path)?;
+            let scopes = traversal_scopes(
+                current_scope,
+                direct_kinds,
+                dependency_id.name.as_str(),
+                path,
+            )?;
+            for scope in scopes {
+                if dependency_id.source.is_some() {
+                    let classification = classifications.entry(dependency_id.clone()).or_default();
+                    classification.direct |= direct_kinds.is_some();
+                    match scope {
+                        TraversalScope::Runtime => classification.runtime = true,
+                        TraversalScope::Development => classification.development = true,
+                    }
+                }
+                queue.push_back((dependency_id.clone(), scope));
+            }
+        }
+    }
+
+    let mut resolved = BTreeMap::new();
+    for (id, classification) in classifications {
+        let key = format!("{}@{}", id.name, id.version);
         let value = SnapshotPackage {
-            package_url: format!("pkg:cargo/{}@{}", package.name, package.version),
-            relationship: DependencyRelationship::Indirect,
-            scope: DependencyScope::Runtime,
+            package_url: format!("pkg:cargo/{}@{}", id.name, id.version),
+            relationship: if classification.direct {
+                DependencyRelationship::Direct
+            } else {
+                DependencyRelationship::Indirect
+            },
+            scope: if classification.runtime {
+                DependencyScope::Runtime
+            } else if classification.development {
+                DependencyScope::Development
+            } else {
+                return Err(lock_error(format!(
+                    "dependency {key} has no reachable scope"
+                )));
+            },
         };
         if resolved.insert(key.clone(), value).is_some() {
             return Err(lock_error(format!("duplicate Cargo identity {key}")));
         }
     }
     Ok(resolved)
+}
+
+fn traversal_scopes(
+    current_scope: TraversalScope,
+    direct_kinds: Option<&BTreeMap<String, DependencyKinds>>,
+    dependency_name: &str,
+    path: &str,
+) -> Result<Vec<TraversalScope>, Report<DependencySnapshotError>> {
+    if current_scope == TraversalScope::Development {
+        return Ok(vec![TraversalScope::Development]);
+    }
+    let Some(direct_kinds) = direct_kinds else {
+        return Ok(vec![TraversalScope::Runtime]);
+    };
+    let kinds = direct_kinds.get(dependency_name).ok_or_else(|| {
+        metadata_error(format!(
+            "workspace dependency {dependency_name} from {path} is absent from metadata"
+        ))
+    })?;
+    let mut scopes = Vec::with_capacity(2);
+    if kinds.runtime {
+        scopes.push(TraversalScope::Runtime);
+    }
+    if kinds.development {
+        scopes.push(TraversalScope::Development);
+    }
+    if scopes.is_empty() {
+        return Err(metadata_error(format!(
+            "workspace dependency {dependency_name} from {path} has no supported kind"
+        )));
+    }
+    Ok(scopes)
+}
+
+fn resolve_lock_dependency(
+    value: &str,
+    packages: &BTreeMap<PackageId, CargoPackage>,
+    path: &str,
+) -> Result<PackageId, Report<DependencySnapshotError>> {
+    let parts = value.split_ascii_whitespace().collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(lock_error(format!(
+            "invalid dependency reference in {path}"
+        )));
+    }
+    let name = parts[0];
+    let version = parts.get(1).copied();
+    let source = parts.get(2).and_then(|value| {
+        value
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+    });
+    if parts.len() == 3 && source.is_none() {
+        return Err(lock_error(format!(
+            "invalid dependency source reference in {path}"
+        )));
+    }
+    let matches = packages
+        .keys()
+        .filter(|candidate| {
+            candidate.name == name
+                && version.is_none_or(|version| candidate.version == version)
+                && source.is_none_or(|source| candidate.source.as_deref() == Some(source))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(lock_error(format!(
+            "dependency reference {value} in {path} is missing or ambiguous"
+        )));
+    }
+    matches
+        .into_iter()
+        .next()
+        .ok_or_else(|| lock_error("dependency resolution failed"))
+}
+
+fn generate_cargo_metadata(
+    repository: &Repository,
+    manifest_path: &str,
+) -> Result<Vec<u8>, Report<DependencySnapshotError>> {
+    let normalized = NormalizedRelativePath::new(Path::new(manifest_path))
+        .map_err(|_error| metadata_error("Cargo manifest path is invalid"))?;
+    repository
+        .read_tracked_bounded(&normalized, MAXIMUM_JSON_BYTES)
+        .map_err(|_error| {
+            metadata_error(format!("{manifest_path} is not a bounded tracked file"))
+        })?;
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--manifest-path",
+            manifest_path,
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--locked",
+            "--offline",
+        ])
+        .current_dir(repository.root())
+        .output()
+        .map_err(|_error| {
+            metadata_error(format!("cannot execute cargo metadata for {manifest_path}"))
+        })?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(MAXIMUM_STRING_BYTES)
+            .collect::<String>();
+        return Err(metadata_error(format!(
+            "cargo metadata failed for {manifest_path}: {}",
+            diagnostic.trim()
+        )));
+    }
+    if output.stdout.len() > MAXIMUM_JSON_BYTES {
+        return Err(metadata_error(format!(
+            "cargo metadata for {manifest_path} exceeds 2097152 bytes"
+        )));
+    }
+    Ok(output.stdout)
 }
 
 fn validate_snapshot(
@@ -476,6 +783,12 @@ fn context_error(detail: impl Into<String>) -> Report<DependencySnapshotError> {
 
 fn lock_error(detail: impl Into<String>) -> Report<DependencySnapshotError> {
     Report::new(DependencySnapshotError::Lockfile {
+        detail: detail.into(),
+    })
+}
+
+fn metadata_error(detail: impl Into<String>) -> Report<DependencySnapshotError> {
+    Report::new(DependencySnapshotError::Metadata {
         detail: detail.into(),
     })
 }

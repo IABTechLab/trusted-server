@@ -13,20 +13,20 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1,wasm32-unknown-unknown
@@ -34,12 +34,12 @@ jobs:
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Use Node.js for Rust build scripts
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run cargo fmt
-        uses: actions-rust-lang/rustfmt@4066006ec54a31931b9b1fddfd38f2fdf2d27143
+        uses: actions-rust-lang/rustfmt@v1.1.2
 
       - name: Run cargo clippy (Fastly — wasm32-wasip1)
         run: cargo clippy-fastly
@@ -74,16 +74,16 @@ jobs:
         working-directory: crates/trusted-server-js/lib
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
@@ -105,16 +105,16 @@ jobs:
         working-directory: docs
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
@@ -137,23 +137,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
       - name: Read tool versions
         id: tool-versions
-        run: |
-          echo "rust=$(awk '$1 == \"rust\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+        run: ./scripts/read-tool-versions.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.tool-versions.outputs.rust }}
           components: "clippy, rustfmt"
           cache-workspaces: "tools/docs-parity -> tools/docs-parity/target"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.tool-versions.outputs.node }}
           cache: "npm"

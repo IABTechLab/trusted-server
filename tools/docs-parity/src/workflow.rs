@@ -10,120 +10,14 @@ use crate::repository::{NormalizedRelativePath, Repository};
 const MAXIMUM_WORKFLOW_BYTES: usize = 512 * 1024;
 const MAXIMUM_JOBS: usize = 64;
 const CAPTURE_JOB: &str = "cli-help-capture";
-const CHECKOUT_ACTION: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
-const SETUP_RUST_ACTION: &str =
-    "actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659";
-const SETUP_NODE_ACTION: &str = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
-const UPLOAD_ACTION: &str = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
-const DOWNLOAD_ACTION: &str = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+const CHECKOUT_ACTION: &str = "actions/checkout@v7.0.1";
+const SETUP_RUST_ACTION: &str = "actions-rust-lang/setup-rust-toolchain@v1.17.0";
+const SETUP_NODE_ACTION: &str = "actions/setup-node@v7.0.0";
+const UPLOAD_ACTION: &str = "actions/upload-artifact@v7.0.1";
+const DOWNLOAD_ACTION: &str = "actions/download-artifact@v8.0.1";
+const FINAL_CONCURRENCY_GROUP: &str = "documentation-automation-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'default-branch-writers' }}";
+const FINAL_CANCEL_IN_PROGRESS: &str = "${{ github.event_name == 'pull_request' }}";
 const FINAL_GUARD: &str = "github.repository == 'IABTechLab/trusted-server' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')";
-const LINK_WRITER_SCRIPT: &str = r#"set -euo pipefail
-archive="$RUNNER_TEMP/link-results/link-results.zip"
-json="$RUNNER_TEMP/link-results.json"
-test "$(find "$RUNNER_TEMP/link-results" -mindepth 1 -maxdepth 1 -print | wc -l)" -eq 1
-test -f "$archive"
-test ! -L "$archive"
-test "$(stat -c '%a' "$archive")" = 644
-test "$(stat -c '%s' "$archive")" -le 2097152
-test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256"
-python3 -c 'import pathlib, struct, sys, zipfile; data = pathlib.Path(sys.argv[1]).read_bytes(); assert len(data) >= 22 and data[:4] == b"PK\x03\x04"; signature, disk, central_disk, disk_entries, total_entries, central_size, central_offset, comment_length = struct.unpack("<4s4H2LH", data[-22:]); assert signature == b"PK\x05\x06" and disk == central_disk == 0 and disk_entries == total_entries == 1 and central_size != 0xffffffff and central_offset != 0xffffffff and comment_length == 0 and central_offset + central_size == len(data) - 22; archive = zipfile.ZipFile(sys.argv[1]); infos = archive.infolist(); assert len(infos) == 1 and infos[0].filename == sys.argv[2] and not infos[0].is_dir() and infos[0].external_attr >> 16 in (0o644, 0o100644) and infos[0].file_size <= int(sys.argv[3])' "$archive" "link-results.json" 1048576
-test "$(unzip -Z1 "$archive")" = "link-results.json"
-test "$(zipinfo -l "$archive" | awk '/link-results.json$/ { print $1 }')" = "-rw-r--r--"
-unzip -p "$archive" link-results.json > "$json"
-test "$(stat -c '%s' "$json")" -le 1048576
-jq -e --arg repository "$EXPECTED_REPOSITORY" --arg ref "$EXPECTED_REF" --arg sha "$EXPECTED_SOURCE_SHA" --argjson run_id "$EXPECTED_RUN_ID" --argjson run_attempt "$EXPECTED_RUN_ATTEMPT" 'def bounded: type == "string" and utf8bytelength <= 2048; keys == ["checked_at", "findings", "repository", "run_attempt", "run_id", "schema_version", "source_ref", "source_sha"] and .schema_version == 1 and .repository == $repository and .source_ref == $ref and .source_sha == $sha and .run_id == $run_id and .run_attempt == $run_attempt and (.checked_at | bounded) and (.findings | type == "array" and length <= 500) and all(.. | strings; utf8bytelength <= 2048) and all(.findings[]; keys == ["diagnostic", "final_url", "kind", "requested_url", "status"] and (.kind == "unreachable" or .kind == "http_status" or .kind == "redirect") and (.requested_url | bounded) and (.diagnostic | bounded) and (.final_url == null or (.final_url | bounded)) and (.status == null or (.status | type == "number" and floor == . and . >= 100 and . <= 599)))' "$json" >/dev/null
-python3 - "$json" <<'PY'
-import datetime
-import json
-import re
-import sys
-import unicodedata
-import urllib.parse
-
-with open(sys.argv[1], encoding="utf-8") as source:
-    result = json.load(source)
-
-checked_at = result["checked_at"]
-assert re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", checked_at)
-assert int(checked_at[:4]) >= 1970
-datetime.datetime.strptime(checked_at, "%Y-%m-%dT%H:%M:%SZ")
-
-def valid_url(value):
-    if not value or len(value.encode("utf-8")) > 2048 or "\\" in value:
-        return False
-    if any(unicodedata.category(character) == "Cc" for character in value):
-        return False
-    parsed = urllib.parse.urlsplit(value)
-    try:
-        parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname is not None
-        and parsed.username is None
-        and parsed.password is None
-        and not any(character.isspace() for character in parsed.netloc)
-    )
-
-for finding in result["findings"]:
-    assert finding["diagnostic"].strip()
-    assert valid_url(finding["requested_url"])
-    if finding["final_url"] is not None:
-        assert valid_url(finding["final_url"])
-PY
-title="[docs-parity] External link findings"
-owner_marker="<!-- docs-parity:external-links:v1 -->"
-issues_json="$RUNNER_TEMP/external-link-issues.json"
-issue_body="$RUNNER_TEMP/external-link-issue.md"
-gh api --paginate --slurp "repos/$EXPECTED_REPOSITORY/issues?state=all&per_page=100" > "$issues_json"
-jq -e 'type == "array" and all(.[]; type == "array" and all(.[]; type == "object" and (.number | type == "number" and floor == . and . > 0) and (.title | type == "string") and (.body == null or (.body | type == "string")) and (.state == "open" or .state == "closed")))' "$issues_json" >/dev/null
-owned_count="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and ((.body // "") | startswith($marker)))] | length' "$issues_json")"
-foreign_count="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and (((.body // "") | startswith($marker)) | not))] | length' "$issues_json")"
-test "$owned_count" -le 1
-test "$foreign_count" -eq 0
-issue_number="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and ((.body // "") | startswith($marker)))] | if length == 1 then .[0].number | tostring else "" end' "$issues_json")"
-issue_state="$(jq -er --arg title "$title" --arg marker "$owner_marker" '[.[][] | select((has("pull_request") | not) and .title == $title and ((.body // "") | startswith($marker)))] | if length == 1 then .[0].state else "" end' "$issues_json")"
-findings="$(jq '.findings | length' "$json")"
-printf '%s\n\n' "$owner_marker" > "$issue_body"
-cat "$json" >> "$issue_body"
-if test "$findings" -gt 0; then
-  if test "$owned_count" -eq 0; then
-    gh issue create --repo "$EXPECTED_REPOSITORY" --title "$title" --body-file "$issue_body"
-  else
-    if test "$issue_state" = closed; then
-      gh issue reopen --repo "$EXPECTED_REPOSITORY" "$issue_number"
-    else
-      test "$issue_state" = open
-    fi
-    gh issue comment --repo "$EXPECTED_REPOSITORY" "$issue_number" --body-file "$issue_body"
-  fi
-elif test "$owned_count" -eq 1; then
-  if test "$issue_state" = open; then
-    gh issue close --repo "$EXPECTED_REPOSITORY" "$issue_number" --comment "The latest complete scan is clean."
-  else
-    test "$issue_state" = closed
-  fi
-fi
-"#;
-const DEPENDENCY_WRITER_SCRIPT: &str = r#"set -euo pipefail
-archive="$RUNNER_TEMP/dependency-snapshot/dependency-snapshot.zip"
-json="$RUNNER_TEMP/dependency-snapshot.json"
-test "$(find "$RUNNER_TEMP/dependency-snapshot" -mindepth 1 -maxdepth 1 -print | wc -l)" -eq 1
-test -f "$archive"
-test ! -L "$archive"
-test "$(stat -c '%a' "$archive")" = 644
-test "$(stat -c '%s' "$archive")" -le 4194304
-test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256"
-python3 -c 'import pathlib, struct, sys, zipfile; data = pathlib.Path(sys.argv[1]).read_bytes(); assert len(data) >= 22 and data[:4] == b"PK\x03\x04"; signature, disk, central_disk, disk_entries, total_entries, central_size, central_offset, comment_length = struct.unpack("<4s4H2LH", data[-22:]); assert signature == b"PK\x05\x06" and disk == central_disk == 0 and disk_entries == total_entries == 1 and central_size != 0xffffffff and central_offset != 0xffffffff and comment_length == 0 and central_offset + central_size == len(data) - 22; archive = zipfile.ZipFile(sys.argv[1]); infos = archive.infolist(); assert len(infos) == 1 and infos[0].filename == sys.argv[2] and not infos[0].is_dir() and infos[0].external_attr >> 16 in (0o644, 0o100644) and infos[0].file_size <= int(sys.argv[3])' "$archive" "dependency-snapshot.json" 2097152
-test "$(unzip -Z1 "$archive")" = "dependency-snapshot.json"
-test "$(zipinfo -l "$archive" | awk '/dependency-snapshot.json$/ { print $1 }')" = "-rw-r--r--"
-unzip -p "$archive" dependency-snapshot.json > "$json"
-test "$(stat -c '%s' "$json")" -le 2097152
-jq -e --arg ref "$EXPECTED_REF" --arg sha "$EXPECTED_SOURCE_SHA" --arg id "$EXPECTED_RUN_ID.$EXPECTED_RUN_ATTEMPT" 'def package($key): keys == ["package_url", "relationship", "scope"] and .package_url == ("pkg:cargo/" + $key) and ($key | test("^[A-Za-z0-9._+-]+@[A-Za-z0-9._+-]+$")) and (.relationship == "direct" or .relationship == "indirect") and (.scope == "runtime" or .scope == "development"); keys == ["detector", "job", "manifests", "ref", "sha", "version"] and .version == 0 and .sha == $sha and .ref == $ref and .job == {"correlator":"trusted-server-docs-parity-v1","id":$id} and .detector == {"name":"trusted-server-docs-parity","url":"https://github.com/IABTechLab/trusted-server/tree/main/tools/docs-parity","version":"0.1.0"} and (.manifests | keys == ["Cargo.lock", "tools/docs-parity/Cargo.lock"]) and all(.manifests | to_entries[]; (.value | keys == ["file", "name", "resolved"]) and .value.name == .key and .value.file == {"source_location":.key} and (.value.resolved | type == "object") and all(.value.resolved | to_entries[]; .key as $key | .value | package($key))) and ([.manifests[].resolved | length] | add <= 5000) and all(.. | strings; utf8bytelength <= 2048)' "$json" >/dev/null
-status="$(gh api --include --method POST "repos/IABTechLab/trusted-server/dependency-graph/snapshots" --input "$json" | sed -n '1s/.* \([0-9][0-9][0-9]\).*/\1/p')"
-test "$status" = 201
-"#;
 
 /// Repository workflow policy activated for a validation call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,9 +42,9 @@ impl core::error::Error for WorkflowError {}
 /// # Errors
 ///
 /// Returns an error for malformed or oversized YAML, untrusted events,
-/// expanded permissions, mutable actions, privileged checkout, unsafe
+/// expanded permissions, non-versioned actions, privileged checkout, unsafe
 /// services/caches/local actions, unbounded jobs or artifacts, or writer jobs
-/// that execute repository code.
+/// that execute anything except their reviewed repository scripts.
 pub fn validate_workflow(bytes: &[u8], scope: WorkflowScope) -> Result<(), Report<WorkflowError>> {
     if bytes.len() > MAXIMUM_WORKFLOW_BYTES {
         return Err(workflow_error("workflow exceeds 524288 bytes"));
@@ -196,12 +90,12 @@ pub fn validate_workflow(bytes: &[u8], scope: WorkflowScope) -> Result<(), Repor
 }
 
 /// Require every YAML `uses:` value to be a normalized local action or an
-/// external action pinned to a lowercase 40-hex commit.
+/// external action using a normalized release-version tag.
 ///
 /// # Errors
 ///
-/// Returns an error for malformed or oversized YAML, mutable or abbreviated
-/// external references, and unsafe local-action paths.
+/// Returns an error for malformed or oversized YAML, non-version external
+/// references, and unsafe local-action paths.
 pub fn validate_action_references(bytes: &[u8]) -> Result<(), Report<WorkflowError>> {
     if bytes.len() > MAXIMUM_WORKFLOW_BYTES {
         return Err(workflow_error("workflow exceeds 524288 bytes"));
@@ -235,6 +129,9 @@ pub fn validate_release_runbook(bytes: &[u8]) -> Result<(), Report<WorkflowError
         "State remains `release-pending`",
         "HTTP 201 response",
         "expected GitHub App",
+        "authenticated `github.sha`",
+        "credentials disabled",
+        "`scripts/dependency-snapshot-submit.sh`",
         "No branch-protection change is selected",
     ] {
         if !text.contains(fragment) {
@@ -282,9 +179,9 @@ fn validate_action_reference(action: &str) -> Result<(), Report<WorkflowError>> 
     }
     let (name, revision) = action
         .split_once('@')
-        .ok_or_else(|| workflow_error("external action lacks an immutable revision"))?;
+        .ok_or_else(|| workflow_error("external action lacks a release version"))?;
     if action.matches('@').count() != 1
-        || !lower_hex_sha(revision)
+        || !release_version(revision)
         || name.split('/').count() < 2
         || name.split('/').any(|component| {
             component.is_empty()
@@ -294,18 +191,26 @@ fn validate_action_reference(action: &str) -> Result<(), Report<WorkflowError>> 
         })
     {
         return Err(workflow_error(
-            "external action must use a normalized lowercase 40-hex pin",
+            "external action must use a normalized vMAJOR or vMAJOR.MINOR.PATCH release",
         ));
     }
     Ok(())
 }
 
-fn lower_hex_sha(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+fn release_version(value: &str) -> bool {
+    let Some(version) = value.strip_prefix('v') else {
+        return false;
+    };
+    let components = version.split('.').collect::<Vec<_>>();
+    if !matches!(components.len(), 1 | 3) {
+        return false;
+    }
+    components.iter().enumerate().all(|(index, component)| {
+        !component.is_empty()
+            && component.bytes().all(|byte| byte.is_ascii_digit())
+            && (component == &"0" || !component.starts_with('0'))
+            && (index != 0 || component != &"0")
+    })
 }
 
 pub(crate) fn check_capture_repository(
@@ -319,12 +224,12 @@ pub(crate) fn check_capture_repository(
     validate_workflow(&bytes, WorkflowScope::CaptureJob)
 }
 
-/// Validate the final documentation workflow and repository automation pins.
+/// Validate the final documentation workflow and repository automation versions.
 ///
 /// # Errors
 ///
-/// Returns an error when a required workflow, action, tool pin, cache input,
-/// Dependabot root, or workspace lint declaration is absent or unsafe.
+/// Returns an error when a required workflow, action version, script, tool pin,
+/// cache input, Dependabot root, or workspace lint declaration is absent or unsafe.
 pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<WorkflowError>> {
     check_capture_repository(repository)?;
     let final_workflow = read_repository_file(repository, ".github/workflows/docs-links.yml")?;
@@ -366,6 +271,7 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Wor
                 "tools/docs-parity -> tools/docs-parity/target",
                 "crates/trusted-server-js/lib/package-lock.json",
                 "docs/package-lock.json",
+                "./scripts/read-tool-versions.sh",
             ][..],
         ),
         (
@@ -374,6 +280,8 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Wor
                 "documentation-rustdoc:",
                 "fetch-depth: 0",
                 "crates/trusted-server-js/lib/package-lock.json",
+                "./scripts/read-tool-versions.sh",
+                "./scripts/build-trusted-server-js.sh",
             ][..],
         ),
         (
@@ -381,7 +289,8 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Wor
             &[
                 "crates/trusted-server-integration-tests/browser/package-lock.json",
                 "crates/trusted-server-js/lib/package-lock.json",
-                "wrangler@$WRANGLER_VERSION",
+                "./scripts/install-wrangler.sh",
+                "./scripts/restore-cloudflare-build.sh",
             ][..],
         ),
         (
@@ -440,12 +349,8 @@ fn validate_final(root: &Mapping, jobs: &Mapping) -> Result<(), Report<WorkflowE
     validate_final_events(required(root, "on")?)?;
     let concurrency = value_mapping(required(root, "concurrency")?, "concurrency")?;
     require_exact_keys(concurrency, &["group", "cancel-in-progress"], "concurrency")?;
-    require_exact_string(concurrency, "group", "documentation-automation")?;
-    if scalar_bool(required(concurrency, "cancel-in-progress")?) != Some(false) {
-        return Err(workflow_error(
-            "final concurrency must not cancel in progress",
-        ));
-    }
+    require_exact_string(concurrency, "group", FINAL_CONCURRENCY_GROUP)?;
+    require_exact_string(concurrency, "cancel-in-progress", FINAL_CANCEL_IN_PROGRESS)?;
     require_exact_keys(
         jobs,
         &[
@@ -592,7 +497,22 @@ fn validate_link_reader(job: &Mapping) -> Result<(), Report<WorkflowError>> {
         "contents",
         "read",
     )?;
-    validate_digest_output(job)?;
+    let outputs = value_mapping(required(job, "outputs")?, "link-reader outputs")?;
+    require_exact_keys(
+        outputs,
+        &["artifact-sha256", "checked-at"],
+        "link-reader outputs",
+    )?;
+    require_exact_string(
+        outputs,
+        "artifact-sha256",
+        "${{ steps.digest.outputs.sha256 }}",
+    )?;
+    require_exact_string(
+        outputs,
+        "checked-at",
+        "${{ steps.link-result.outputs.checked-at }}",
+    )?;
     let steps = steps(job, "link-reader")?;
     if steps.len() != 5 {
         return Err(workflow_error(
@@ -604,12 +524,9 @@ fn validate_link_reader(job: &Mapping) -> Result<(), Report<WorkflowError>> {
     validate_run_step(
         &steps[2],
         Some("Generate closed link result"),
+        Some("link-result"),
         None,
-        None,
-        concat!(
-            "checked_at=\"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"\n",
-            "DOCS_PARITY_CHECKED_AT=\"$checked_at\" cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external --artifact \"$RUNNER_TEMP/link-results.zip\"\n",
-        ),
+        "./scripts/generate-docs-link-results.sh",
     )?;
     validate_run_step(
         &steps[3],
@@ -675,19 +592,25 @@ fn validate_issue_writer(job: &Mapping) -> Result<(), Report<WorkflowError>> {
         "issue-writer",
         "Reconcile external-link issue",
         "link-reader",
-        "issues",
+        &[("contents", "read"), ("issues", "write")],
     )?;
     let steps = steps(job, "issue-writer")?;
-    if steps.len() != 2 {
+    if steps.len() != 4 {
         return Err(workflow_error(
-            "issue-writer must contain exactly two steps",
+            "issue-writer must contain exactly four steps",
         ));
     }
-    validate_artifact_download(&steps[0], "link-results")?;
+    validate_checkout_step(&steps[0], "${{ github.sha }}")?;
+    validate_setup_rust_step(&steps[1])?;
+    validate_artifact_download(&steps[2], "link-results")?;
     validate_writer_command_step(
-        &steps[1],
+        &steps[3],
         "Validate LinkResultsV1 and reconcile one owned issue",
         &[
+            (
+                "DOCS_PARITY_CHECKED_AT",
+                "${{ needs.link-reader.outputs.checked-at }}",
+            ),
             (
                 "EXPECTED_SHA256",
                 "${{ needs.link-reader.outputs.artifact-sha256 }}",
@@ -699,7 +622,7 @@ fn validate_issue_writer(job: &Mapping) -> Result<(), Report<WorkflowError>> {
             ("EXPECTED_RUN_ATTEMPT", "${{ github.run_attempt }}"),
             ("GH_TOKEN", "${{ github.token }}"),
         ],
-        LINK_WRITER_SCRIPT,
+        "./scripts/docs-links-reconcile.sh",
     )
 }
 
@@ -709,17 +632,19 @@ fn validate_dependency_writer(job: &Mapping) -> Result<(), Report<WorkflowError>
         "dependency-writer",
         "Submit dependency snapshot",
         "dependency-reader",
-        "contents",
+        &[("contents", "write")],
     )?;
     let steps = steps(job, "dependency-writer")?;
-    if steps.len() != 2 {
+    if steps.len() != 4 {
         return Err(workflow_error(
-            "dependency-writer must contain exactly two steps",
+            "dependency-writer must contain exactly four steps",
         ));
     }
-    validate_artifact_download(&steps[0], "dependency-snapshot")?;
+    validate_checkout_step(&steps[0], "${{ github.sha }}")?;
+    validate_setup_rust_step(&steps[1])?;
+    validate_artifact_download(&steps[2], "dependency-snapshot")?;
     validate_writer_command_step(
-        &steps[1],
+        &steps[3],
         "Validate and submit unchanged version-0 snapshot",
         &[
             (
@@ -732,7 +657,7 @@ fn validate_dependency_writer(job: &Mapping) -> Result<(), Report<WorkflowError>
             ("EXPECTED_RUN_ATTEMPT", "${{ github.run_attempt }}"),
             ("GH_TOKEN", "${{ github.token }}"),
         ],
-        DEPENDENCY_WRITER_SCRIPT,
+        "./scripts/dependency-snapshot-submit.sh",
     )
 }
 
@@ -763,7 +688,7 @@ fn validate_writer_job_header(
     context: &str,
     name: &str,
     needs: &str,
-    permission: &str,
+    expected_permissions: &[(&str, &str)],
 ) -> Result<(), Report<WorkflowError>> {
     require_exact_keys(
         job,
@@ -778,7 +703,22 @@ fn validate_writer_job_header(
         ],
         context,
     )?;
-    validate_job_header(job, name, FINAL_GUARD, 5, permission, "write")?;
+    require_exact_string(job, "name", name)?;
+    require_exact_string(job, "if", FINAL_GUARD)?;
+    require_exact_string(job, "runs-on", "ubuntu-latest")?;
+    if scalar_u64(required(job, "timeout-minutes")?) != Some(5) {
+        return Err(workflow_error(format!("job {name} has the wrong timeout")));
+    }
+    let mut expected = expected_permissions
+        .iter()
+        .map(|(permission, level)| ((*permission).to_owned(), (*level).to_owned()))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    if permissions(job)? != expected {
+        return Err(workflow_error(format!(
+            "job {name} has the wrong permissions"
+        )));
+    }
     require_exact_string(job, "needs", needs)
 }
 
@@ -992,10 +932,7 @@ fn validate_capture_steps(value: &Value) -> Result<(), Report<WorkflowError>> {
         Some("Read tool versions"),
         Some("tool-versions"),
         None,
-        concat!(
-            "echo \"rust=$(awk '$1 == \\\"rust\\\" { print $2 }' .tool-versions)\" >> \"$GITHUB_OUTPUT\"\n",
-            "echo \"node=$(awk '$1 == \\\"nodejs\\\" { print $2 }' .tool-versions)\" >> \"$GITHUB_OUTPUT\"\n",
-        ),
+        "./scripts/read-tool-versions.sh",
     )?;
     validate_action_step(
         &steps[3],
@@ -1020,8 +957,8 @@ fn validate_capture_steps(value: &Value) -> Result<(), Report<WorkflowError>> {
         &steps[5],
         Some("Build Trusted Server JavaScript"),
         None,
-        Some("crates/trusted-server-js/lib"),
-        "npm ci\nnpm run build\n",
+        None,
+        "./scripts/build-trusted-server-js.sh",
     )?;
     validate_capture_command_step(&steps[6])?;
     validate_action_step(
@@ -1131,7 +1068,7 @@ fn validate_capture_command_step(value: &Value) -> Result<(), Report<WorkflowErr
     require_exact_string(
         step,
         "run",
-        "cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture --output \"${{ runner.temp }}/cli-help-${{ matrix.platform }}.zip\"\n",
+        "cargo run --manifest-path tools/docs-parity/Cargo.toml -- cli-help capture --output \"${{ runner.temp }}/cli-help-${{ matrix.platform }}.zip\"",
     )
 }
 
