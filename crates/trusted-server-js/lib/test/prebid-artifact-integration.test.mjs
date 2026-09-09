@@ -202,7 +202,10 @@ function expectNoUnexpectedNetworkActivity(stubs) {
 
 function installServerState(pageWindow, { analytics = false } = {}) {
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
-  pageWindow.__tsjs_prebid = { clientSideBidders: [] };
+  pageWindow.__tsjs_prebid = {
+    clientSideBidders: [],
+    serverSideBidders: ['appnexus'],
+  };
 
   if (analytics) {
     pageWindow.__analyticsLifecycle = {
