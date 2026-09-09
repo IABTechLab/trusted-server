@@ -104,7 +104,11 @@ impl Default for Publisher {
 
 impl Publisher {
     /// Known placeholder values that must not be used in production.
-    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret", "proxy-secret"];
+    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &[
+        "change-me-proxy-secret",
+        "proxy-secret",
+        "replace-with-random-proxy-secret",
+    ];
 
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
@@ -211,14 +215,42 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Default, Clone, Deserialize, Serialize)]
 pub struct IntegrationSettings {
     #[serde(flatten)]
     entries: HashMap<String, JsonValue>,
 }
 
+impl std::fmt::Debug for IntegrationSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut integration_ids = self.entries.keys().collect::<Vec<_>>();
+        integration_ids.sort_unstable();
+        formatter
+            .debug_struct("IntegrationSettings")
+            .field("integration_ids", &integration_ids)
+            .finish()
+    }
+}
+
 pub trait IntegrationConfig: DeserializeOwned + Validate {
     fn is_enabled(&self) -> bool;
+
+    /// Validate the public field schema for an explicitly disabled config.
+    ///
+    /// The default deserializes the integration's normal schema, except it
+    /// permits omitted enabled-only required fields. Override this only when a
+    /// disabled integration has a distinct public schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deserialization error when the disabled public field schema is invalid.
+    fn validate_disabled_schema(raw: &JsonValue) -> Result<(), serde_json::Error> {
+        match serde_json::from_value::<Self>(raw.clone()) {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().starts_with("missing field ") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl IntegrationSettings {
@@ -251,6 +283,29 @@ impl IntegrationSettings {
             == Some(false)
     }
 
+    fn remove_legacy_static_secret_store_selectors(&mut self) {
+        let Some(datadome) = self
+            .entries
+            .get_mut("datadome")
+            .and_then(JsonValue::as_object_mut)
+        else {
+            return;
+        };
+
+        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
+        if let Some(bypass) = datadome
+            .get_mut("protection_test_bypass")
+            .and_then(JsonValue::as_object_mut)
+        {
+            removed |= bypass.remove("credential_secret_store").is_some();
+        }
+        if removed {
+            log::warn!(
+                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
+    }
+
     /// Retrieves and validates a typed configuration for an integration.
     ///
     /// # Errors
@@ -269,6 +324,11 @@ impl IntegrationSettings {
         };
 
         if Self::is_explicitly_disabled(raw) {
+            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
+                message: format!(
+                    "Integration '{integration_id}' configuration could not be parsed"
+                ),
+            })?;
             return Ok(None);
         }
 
@@ -318,7 +378,7 @@ impl DerefMut for IntegrationSettings {
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
 ///
 /// Partners are defined statically in `trusted-server.toml` rather than
-/// registered via API. At startup, each partner's `api_token` is hashed
+/// registered via API. At startup, each configured `api_token` is hashed
 /// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -340,9 +400,12 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
-    /// Plaintext API token. Hashed at startup for auth lookups.
-    /// Used by batch sync (inbound) and identify (inbound).
-    pub api_token: Redacted<String>,
+    /// Plaintext API token used by inbound batch sync and identify requests.
+    ///
+    /// When present, the token is hashed at startup for auth lookups. Omitting
+    /// it disables inbound partner API authentication for this partner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<Redacted<String>>,
     /// Max batch sync API requests per partner per minute.
     #[serde(
         default = "EcPartner::default_batch_rate_limit",
@@ -515,6 +578,7 @@ impl Ec {
         "secret_key",
         "trusted-server",
         "trusted-server-placeholder-secret",
+        "replace-with-random-ec-passphrase",
     ];
 
     /// Default maximum concurrent pull-sync requests.
@@ -712,16 +776,12 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
-fn default_s3_secret_store() -> String {
-    "s3-auth".to_string()
+fn default_s3_access_key_id() -> Redacted<String> {
+    Redacted::new("access_key_id".to_string())
 }
 
-fn default_s3_access_key_id() -> String {
-    "access_key_id".to_string()
-}
-
-fn default_s3_secret_access_key() -> String {
-    "secret_access_key".to_string()
+fn default_s3_secret_access_key() -> Redacted<String> {
+    Redacted::new("secret_access_key".to_string())
 }
 
 fn default_asset_image_optimizer_enabled() -> bool {
@@ -808,25 +868,25 @@ impl AssetOriginAuth {
 /// AWS Signature Version 4 configuration for `S3` asset origins.
 ///
 /// The route `origin_url` must use the same `S3` host that `AWS` validates in
-/// the `SigV4` canonical request. Credentials are read from the named runtime
-/// secret store and cached per process by configured secret names.
+/// the `SigV4` canonical request. Credential fields hold secret-store key names
+/// in app config and resolved values at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3SigV4AuthConfig {
     /// `AWS` region used in the credential scope.
     pub region: String,
-    /// Runtime secret store containing `S3` credentials.
-    #[serde(default = "default_s3_secret_store")]
-    pub secret_store: String,
-    /// Secret name containing the `AWS` access key ID.
+    /// Deprecated per-route store selector accepted for migration only.
+    #[serde(default, skip_serializing)]
+    pub secret_store: Option<String>,
+    /// Secret reference containing the `AWS` access key ID.
     #[serde(default = "default_s3_access_key_id")]
-    pub access_key_id: String,
-    /// Secret name containing the `AWS` secret access key.
+    pub access_key_id: Redacted<String>,
+    /// Secret reference containing the `AWS` secret access key.
     #[serde(default = "default_s3_secret_access_key")]
-    pub secret_access_key: String,
-    /// Optional secret name containing an `AWS` session token.
+    pub secret_access_key: Redacted<String>,
+    /// Optional secret reference containing an `AWS` session token.
     #[serde(default)]
-    pub session_token: Option<String>,
+    pub session_token: Option<Redacted<String>>,
     /// Query-string handling policy for the signed `S3` origin request.
     ///
     /// Set this to `strip` when request query parameters are transformation
@@ -845,14 +905,17 @@ fn s3_region_is_valid(region: &str) -> bool {
 impl S3SigV4AuthConfig {
     fn normalize(&mut self) {
         self.region = self.region.trim().to_string();
-        self.secret_store = self.secret_store.trim().to_string();
-        self.access_key_id = self.access_key_id.trim().to_string();
-        self.secret_access_key = self.secret_access_key.trim().to_string();
-        self.session_token = self
-            .session_token
-            .take()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        if self.secret_store.take().is_some() {
+            log::warn!(
+                "S3 secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
+        self.access_key_id = Redacted::new(self.access_key_id.expose().trim().to_string());
+        self.secret_access_key = Redacted::new(self.secret_access_key.expose().trim().to_string());
+        self.session_token = self.session_token.take().and_then(|value| {
+            let value = value.expose().trim().to_string();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
     }
 
     fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
@@ -868,12 +931,9 @@ impl S3SigV4AuthConfig {
                         .to_string(),
             }));
         }
-        if self.secret_store.is_empty()
-            || self.access_key_id.is_empty()
-            || self.secret_access_key.is_empty()
-        {
+        if self.access_key_id.expose().is_empty() || self.secret_access_key.expose().is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "proxy.asset_routes auth s3_sigv4 secret names must not be empty"
+                message: "proxy.asset_routes auth s3_sigv4 credentials must not be empty after secret resolution"
                     .to_string(),
             }));
         }
@@ -1793,15 +1853,15 @@ pub struct TinybirdSettings {
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
     pub api_host: String,
-    /// Fastly Secret Store name containing Tinybird append tokens.
-    #[serde(default = "default_tinybird_secret_store")]
-    pub secret_store: String,
+    /// Deprecated feature-specific store selector accepted for migration only.
+    #[serde(default, skip_serializing)]
+    pub secret_store: Option<String>,
     /// Auction Events API datasource name.
     #[serde(default = "default_tinybird_auction_dataset")]
     pub auction_dataset: String,
-    /// Secret key containing the auction datasource APPEND token.
-    #[serde(default = "default_tinybird_auction_token_secret")]
-    pub auction_token_secret: String,
+    /// Secret reference containing the auction datasource APPEND token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auction_token_secret: Option<Redacted<String>>,
     /// Reserved for future access-log telemetry.
     ///
     /// `true` is rejected until an access-log emitter is wired, so operators
@@ -1811,9 +1871,9 @@ pub struct TinybirdSettings {
     /// Future access-log Events API datasource name.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Future Secret Store key containing the access-log datasource APPEND token.
-    #[serde(default = "default_tinybird_access_token_secret")]
-    pub access_token_secret: String,
+    /// Deprecated placeholder for the unwired access-log APPEND token.
+    #[serde(default, skip_serializing)]
+    pub access_token_secret: Option<Redacted<String>>,
     /// Future fraction of requests to emit for optional access telemetry.
     #[serde(default)]
     pub access_sample_rate: f64,
@@ -1822,24 +1882,12 @@ pub struct TinybirdSettings {
     pub max_body_bytes: usize,
 }
 
-fn default_tinybird_secret_store() -> String {
-    "ts_secrets".to_owned()
-}
-
 fn default_tinybird_auction_dataset() -> String {
     "auction_events_raw".to_owned()
 }
 
-fn default_tinybird_auction_token_secret() -> String {
-    "tinybird_auction_append_token".to_owned()
-}
-
 fn default_tinybird_access_dataset() -> String {
     "access_logs_raw".to_owned()
-}
-
-fn default_tinybird_access_token_secret() -> String {
-    "tinybird_access_append_token".to_owned()
 }
 
 fn default_tinybird_max_body_bytes() -> usize {
@@ -1851,12 +1899,12 @@ impl Default for TinybirdSettings {
         Self {
             enabled: false,
             api_host: String::new(),
-            secret_store: default_tinybird_secret_store(),
+            secret_store: None,
             auction_dataset: default_tinybird_auction_dataset(),
-            auction_token_secret: default_tinybird_auction_token_secret(),
+            auction_token_secret: None,
             access_enabled: false,
             access_dataset: default_tinybird_access_dataset(),
-            access_token_secret: default_tinybird_access_token_secret(),
+            access_token_secret: None,
             access_sample_rate: 0.0,
             max_body_bytes: default_tinybird_max_body_bytes(),
         }
@@ -1866,11 +1914,18 @@ impl Default for TinybirdSettings {
 impl TinybirdSettings {
     fn normalize(&mut self) {
         self.api_host = self.api_host.trim().to_ascii_lowercase();
-        self.secret_store = self.secret_store.trim().to_owned();
+        if self.secret_store.take().is_some() {
+            log::warn!(
+                "tinybird.secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
         self.auction_dataset = self.auction_dataset.trim().to_owned();
-        self.auction_token_secret = self.auction_token_secret.trim().to_owned();
+        self.auction_token_secret = self.auction_token_secret.take().and_then(|value| {
+            let value = value.expose().trim().to_owned();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
         self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = self.access_token_secret.trim().to_owned();
+        self.access_token_secret = None;
     }
 
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
@@ -1894,18 +1949,15 @@ impl TinybirdSettings {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
-        if self.secret_store.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
+        validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
                 message:
-                    "tinybird.secret_store must not be empty when Tinybird telemetry is enabled"
+                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
                         .to_owned(),
-            }));
-        }
-        if self.enabled {
-            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-            validate_tinybird_secret(&self.auction_token_secret, "tinybird.auction_token_secret")?;
-        }
-        Ok(())
+            })
+        })?;
+        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
     }
 }
 
@@ -1946,7 +1998,7 @@ fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<Tr
 fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
     if value.is_empty() || value.chars().any(char::is_control) {
         return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be a non-empty Secret Store key"),
+            message: format!("{setting} must be non-empty after secret resolution"),
         }));
     }
     Ok(())
@@ -2689,7 +2741,7 @@ pub struct TrustedClientIpConfig {
     /// Header containing the shared-secret authentication value.
     pub auth_header: String,
     /// Shared secret required before accepting the forwarded client IP address.
-    #[validate(custom(function = validate_redacted_not_empty))]
+    #[validate(custom(function = validate_trusted_client_ip_shared_secret))]
     pub shared_secret: Redacted<String>,
 }
 
@@ -2763,7 +2815,13 @@ fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), Vali
         return Err(ValidationError::new("unsafe_trusted_client_ip_auth_header"));
     }
 
-    let shared_secret = config.shared_secret.expose();
+    Ok(())
+}
+
+fn validate_trusted_client_ip_shared_secret(
+    shared_secret: &Redacted<String>,
+) -> Result<(), ValidationError> {
+    let shared_secret = shared_secret.expose();
     if shared_secret.len() < TrustedClientIpConfig::MIN_SHARED_SECRET_LENGTH {
         return Err(ValidationError::new(
             "short_trusted_client_ip_shared_secret",
@@ -2899,21 +2957,30 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
+    pub(crate) fn normalize_deserialized(&mut self) {
+        self.cache.normalize();
+        self.proxy.normalize();
+        self.image_optimizer.normalize();
+        self.debug.auction_html_comment_options.normalize();
+        self.tinybird.normalize();
+        self.integrations
+            .remove_legacy_static_secret_store_selectors();
+        self.consent.validate();
+    }
+
     pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.cache.normalize();
-        settings.proxy.normalize();
-        settings.image_optimizer.normalize();
-        settings.debug.auction_html_comment_options.normalize();
-        settings.consent.validate();
-
+        settings.normalize_deserialized();
         settings.prepare_runtime()?;
 
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("{validation_label} validation failed: {err}"),
+                message: format!(
+                    "{validation_label} validation failed: {}",
+                    validation_error_summary(&err)
+                ),
             })
         })?;
 
@@ -3015,7 +3082,11 @@ impl Settings {
             insecure_fields.push("trusted_client_ip.shared_secret".to_owned());
         }
         for partner in &self.ec.partners {
-            if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
+            if partner
+                .api_token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
             }
         }
@@ -3216,7 +3287,7 @@ impl Settings {
     ///
     /// Returns [`TrustedServerError::Configuration`] listing any uncovered
     /// admin endpoints.
-    fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
+    pub(crate) fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
         let uncovered = self.uncovered_admin_endpoints()?;
         if uncovered.is_empty() {
             return Ok(());
@@ -3238,7 +3309,9 @@ impl Settings {
     /// regexes, so a narrow handler can shadow the admin namespace for paths no
     /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
     /// a placeholder password is never valid on any of them.
-    fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
+    pub(crate) fn validate_admin_handler_passwords(
+        &self,
+    ) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
             if is_admin_placeholder_password(handler.password.expose()) {
                 return Err(Report::new(TrustedServerError::Configuration {
@@ -3331,6 +3404,47 @@ fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
+    fn walk(errors: &validator::ValidationErrors, prefix: &str, messages: &mut Vec<String>) {
+        let mut fields = errors
+            .errors()
+            .keys()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+
+        for field in fields {
+            let path = if prefix.is_empty() {
+                field.to_owned()
+            } else {
+                format!("{prefix}.{field}")
+            };
+            let Some(kind) = errors.errors().get(field) else {
+                continue;
+            };
+            match kind {
+                validator::ValidationErrorsKind::Field(validations) => {
+                    for validation in validations {
+                        messages.push(format!("{path}: {}", validation.code));
+                    }
+                }
+                validator::ValidationErrorsKind::Struct(inner) => {
+                    walk(inner, &path, messages);
+                }
+                validator::ValidationErrorsKind::List(items) => {
+                    for (index, inner) in items {
+                        walk(inner, &format!("{path}[{index}]"), messages);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut messages = Vec::new();
+    walk(errors, "", &mut messages);
+    messages.join(", ")
 }
 
 fn validate_redacted_not_empty(value: &Redacted<String>) -> Result<(), ValidationError> {
@@ -3430,9 +3544,10 @@ where
 }
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
-// This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
-// represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
-// JSON arrays or comma-separated values.
+// This lets env vars such as
+// TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser work;
+// the config env source represents the value as an object rather than a sequence.
+// String inputs may also be JSON arrays or comma-separated values.
 /// Deserializes a `HashMap<String, String>` from either:
 /// - A TOML table / JSON object (standard deserialization)
 /// - A JSON string (e.g. from env var: `'{"Key": "value"}'`)
@@ -3568,6 +3683,7 @@ mod tests {
     use regex::Regex;
     use serde_json::json;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
@@ -4091,6 +4207,47 @@ mod tests {
     }
 
     #[test]
+    fn json_settings_rejects_legacy_auction_provider_list_with_migration_guidance() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["auction"]["providers"] = json!(["prebid"]);
+
+        let error = Settings::from_json_value(value)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("auction.providers"),
+            "error should identify the removed field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "error should direct operators to the migration guidance, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn toml_settings_reject_legacy_auction_provider_list_with_migration_guidance() {
+        let toml = format!(
+            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("auction.providers"),
+            "error should identify the removed field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "error should direct operators to the migration guidance, got {rendered}"
+        );
+    }
+
+    #[test]
     fn auction_debug_comment_options_default_matches_serde_defaults() {
         let opts = AuctionDebugCommentOptions::default();
         assert!(opts.include_provider_responses, "should default to true");
@@ -4266,12 +4423,9 @@ mod tests {
             !settings.tinybird.enabled,
             "Tinybird should default disabled"
         );
-        assert_eq!(settings.tinybird.secret_store, "ts_secrets");
+        assert_eq!(settings.tinybird.secret_store, None);
         assert_eq!(settings.tinybird.auction_dataset, "auction_events_raw");
-        assert_eq!(
-            settings.tinybird.auction_token_secret,
-            "tinybird_auction_append_token"
-        );
+        assert!(settings.tinybird.auction_token_secret.is_none());
     }
 
     #[test]
@@ -4291,7 +4445,7 @@ mod tests {
     #[test]
     fn tinybird_accepts_region_host_without_scheme() {
         let toml = format!(
-            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\n",
+            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"\n",
             crate_test_settings_str()
         );
 
@@ -4327,10 +4481,7 @@ mod tests {
             .integration_config::<PrebidIntegrationConfig>("prebid")
             .expect("Prebid config query should succeed")
             .expect("Prebid config should load from test settings");
-        assert_eq!(
-            prebid_cfg.server_url,
-            "https://test-prebid.com/openrtb2/auction"
-        );
+        assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
                 .integration_config::<NextJsIntegrationConfig>("nextjs")
@@ -5093,6 +5244,24 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn ec_partner_api_token_can_be_omitted() {
+        let partner: EcPartner = toml::from_str(
+            r#"
+name = "Example Partner"
+source_domain = "partner.example.com"
+"#,
+        )
+        .expect("should deserialize partner without API token");
+
+        assert!(partner.api_token.is_none(), "should omit API token");
+        let serialized = serde_json::to_value(partner).expect("should serialize partner");
+        assert!(
+            serialized.get("api_token").is_none(),
+            "should not serialize an omitted API token"
+        );
+    }
+
+    #[test]
     fn validate_passphrase_rejects_under_32_characters() {
         let passphrase = Redacted::new("a".repeat(31));
 
@@ -5283,101 +5452,6 @@ origin_host_header_overide = "www.example.com""#,
 
         let settings = Settings::from_toml(&toml_str);
         assert!(settings.is_err(), "Should fail when sections are missing");
-    }
-
-    #[test]
-    fn test_prebid_bidders_override_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        // Ensure no external override interferes
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(env_key, Some("[\"smartadserver\",\"rubicon\"]"), || {
-                    let res = Settings::from_toml_and_env(&toml_str);
-                    if res.is_err() {
-                        eprintln!("JSON override error: {:?}", res.as_ref().err());
-                    }
-                    let settings = res.expect("Settings should parse with JSON env override");
-                    let cfg = settings
-                        .integration_config::<PrebidIntegrationConfig>("prebid")
-                        .expect("Prebid config query should succeed")
-                        .expect("Prebid config should exist with env override");
-                    assert_eq!(
-                        cfg.bidders,
-                        vec!["smartadserver".to_string(), "rubicon".to_string()]
-                    );
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn test_prebid_bidders_override_with_indexed_env() {
-        let toml_str = crate_test_settings_str();
-
-        let env_key0 = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}0",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let env_key1 = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}1",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        // Also ensure origin_url env is a plain string (avoid any external env interference)
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(env_key0, Some("smartadserver"), || {
-                    temp_env::with_var(env_key1, Some("openx"), || {
-                        let res = Settings::from_toml_and_env(&toml_str);
-                        if res.is_err() {
-                            eprintln!("Indexed override error: {:?}", res.as_ref().err());
-                        }
-                        let settings =
-                            res.expect("Settings should parse with indexed env override");
-                        let cfg = settings
-                            .integration_config::<PrebidIntegrationConfig>("prebid")
-                            .expect("Prebid config query should succeed")
-                            .expect("Prebid config should exist with indexed env override");
-                        assert_eq!(
-                            cfg.bidders,
-                            vec!["smartadserver".to_string(), "openx".to_string()]
-                        );
-                    });
-                });
-            },
-        );
     }
 
     #[test]
@@ -5574,7 +5648,14 @@ origin_host_header_overide = "www.example.com""#,
                 );
                 assert_eq!(settings.ec.partners[0].openrtb_atype, 571187);
                 assert!(settings.ec.partners[0].bidstream_enabled);
-                assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
+                assert_eq!(
+                    settings.ec.partners[0]
+                        .api_token
+                        .as_ref()
+                        .map(Redacted::expose)
+                        .map(String::as_str),
+                    Some("env-token-0")
+                );
                 assert_eq!(settings.ec.partners[1].name, "Env Partner 1");
                 assert_eq!(
                     settings.ec.partners[1].source_domain,
@@ -5582,7 +5663,14 @@ origin_host_header_overide = "www.example.com""#,
                 );
                 assert_eq!(settings.ec.partners[1].openrtb_atype, 3);
                 assert!(!settings.ec.partners[1].bidstream_enabled);
-                assert_eq!(settings.ec.partners[1].api_token.expose(), "env-token-1");
+                assert_eq!(
+                    settings.ec.partners[1]
+                        .api_token
+                        .as_ref()
+                        .map(Redacted::expose)
+                        .map(String::as_str),
+                    Some("env-token-1")
+                );
             },
         );
     }
@@ -5929,7 +6017,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn disabled_invalid_integration_skips_validation() {
+    fn disabled_integration_can_omit_enabled_required_fields_and_skip_semantic_validation() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -5937,21 +6025,26 @@ origin_host_header_overide = "www.example.com""#,
                 "gpt",
                 &json!({
                     "enabled": false,
-                    "script_url": "not a url",
                 }),
             )
             .expect("should insert GPT config");
 
         let config = settings
             .integration_config::<GptConfig>("gpt")
-            .expect("disabled GPT config should be ignored");
+            .expect("minimal disabled GPT config should be ignored");
         assert!(config.is_none(), "disabled GPT config should be skipped");
-        IntegrationRegistry::new(&settings)
-            .expect("disabled invalid integration config should not fail registry startup");
+        IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("disabled invalid integration config should not fail registry startup");
     }
 
     #[test]
-    fn disabled_invalid_default_enabled_prebid_skips_validation() {
+    fn minimal_disabled_prebid_deserializes_without_enabled_only_validation() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -5959,7 +6052,6 @@ origin_host_header_overide = "www.example.com""#,
                 "prebid",
                 &json!({
                     "enabled": false,
-                    "server_url": "not a url",
                 }),
             )
             .expect("should insert prebid config");
@@ -5968,10 +6060,47 @@ origin_host_header_overide = "www.example.com""#,
             .integration_config::<PrebidIntegrationConfig>("prebid")
             .expect("disabled prebid config should be ignored");
         assert!(config.is_none(), "disabled prebid config should be skipped");
-        IntegrationRegistry::new(&settings)
-            .expect("disabled default-enabled prebid config should not fail registry startup");
+        IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("disabled default-enabled prebid config should not fail registry startup");
         build_orchestrator(&settings)
-            .expect("disabled default-enabled prebid config should not fail orchestrator startup");
+            .expect("minimal disabled prebid config should not fail orchestrator startup");
+    }
+
+    #[test]
+    fn disabled_removed_prebid_and_aps_fields_are_rejected() {
+        for (integration_id, removed_field) in [("prebid", "server_url"), ("aps", "account_id")] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    integration_id,
+                    &json!({
+                        "enabled": false,
+                        (removed_field): "removed-value",
+                    }),
+                )
+                .expect("should insert removed integration config field");
+
+            let error = match integration_id {
+                "prebid" => settings
+                    .integration_config::<PrebidIntegrationConfig>(integration_id)
+                    .expect_err("should reject removed disabled Prebid field"),
+                "aps" => settings
+                    .integration_config::<crate::integrations::aps::ApsConfig>(integration_id)
+                    .expect_err("should reject removed disabled APS field"),
+                _ => unreachable!("test integration ID should be known"),
+            };
+            assert!(
+                format!("{error:?}").contains(removed_field),
+                "should identify removed field `{removed_field}`: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -5988,79 +6117,19 @@ origin_host_header_overide = "www.example.com""#,
             )
             .expect("should insert GPT config");
 
-        let err = match IntegrationRegistry::new(&settings) {
+        let err = match IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        ) {
             Ok(_) => panic!("enabled invalid integration should fail registry startup"),
             Err(err) => err,
         };
         assert!(
             err.to_string().contains("Integration 'gpt'"),
             "should identify the invalid integration config"
-        );
-    }
-
-    #[test]
-    fn disabled_invalid_provider_config_does_not_fail_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &json!({
-                    "enabled": false,
-                    "endpoint": "not a url",
-                }),
-            )
-            .expect("should insert adserver mock config");
-
-        build_orchestrator(&settings).expect("disabled invalid provider config should be ignored");
-    }
-
-    #[test]
-    fn enabled_invalid_provider_config_fails_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &json!({
-                    "enabled": true,
-                    "endpoint": "not a url",
-                }),
-            )
-            .expect("should insert adserver mock config");
-
-        let err = match build_orchestrator(&settings) {
-            Ok(_) => panic!("enabled invalid provider config should fail startup"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("Integration 'adserver_mock'"),
-            "should identify the invalid provider config"
-        );
-    }
-
-    #[test]
-    fn empty_prebid_server_url_fails_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "",
-                }),
-            )
-            .expect("should insert prebid config");
-
-        let err = match build_orchestrator(&settings) {
-            Ok(_) => panic!("empty prebid server_url should fail startup"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("Integration 'prebid' configuration failed validation"),
-            "should surface a validation error for prebid.server_url"
         );
     }
 
@@ -6120,7 +6189,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             "#;
 
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
@@ -6141,7 +6209,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             rewrite_creatives = false
             "#;
 
@@ -6168,7 +6235,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             allowed_context_keys = ["permutive_segments", "lockr_ids"]
             "#;
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
@@ -6184,7 +6250,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             allowed_context_keys = []
             "#;
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
@@ -6404,9 +6469,9 @@ origin_host_header_overide = "www.example.com""#,
         match route.auth.as_ref().expect("should configure route auth") {
             AssetOriginAuth::S3SigV4(config) => {
                 assert_eq!(config.region, "us-east-1");
-                assert_eq!(config.secret_store, "s3-auth");
-                assert_eq!(config.access_key_id, "access_key_id");
-                assert_eq!(config.secret_access_key, "secret_access_key");
+                assert_eq!(config.secret_store, None);
+                assert_eq!(config.access_key_id.expose(), "access_key_id");
+                assert_eq!(config.secret_access_key.expose(), "secret_access_key");
             }
         }
     }

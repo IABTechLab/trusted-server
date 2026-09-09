@@ -1036,14 +1036,17 @@ async fn adapter_buffers_nextjs_auction_output() {
     settings
         .integrations
         .insert("nextjs".to_owned(), serde_json::json!({"enabled": true}));
-    settings.integrations.insert(
-        "adserver_mock".to_owned(),
-        serde_json::json!({
-            "enabled": true, "endpoint": "https://auction.example.com/mediate", "timeout_ms": 5000
-        }),
-    );
     settings.auction.enabled = true;
-    settings.auction.providers = vec!["adserver_mock".to_owned()];
+    settings.auction.mediator = None;
+    settings.auction.providers = serde_json::from_value(serde_json::json!({
+        "parity": {
+            "protocol": "openrtb-2.6",
+            "endpoint": "https://auction.example.com/bid",
+            "routing": "all_eligible",
+            "timeout_ms": 5000
+        }
+    }))
+    .expect("should configure parity auction provider");
     settings.creative_opportunities = Some(
         toml::from_str(
             r#"

@@ -518,7 +518,7 @@ mod tests {
     fn pull_partner(ttl_sec: u64) -> PartnerConfig {
         PartnerConfig {
             name: "SSP X".to_owned(),
-            api_key_hash: "deadbeef".to_owned(),
+            api_key_hash: Some("deadbeef".to_owned()),
             bidstream_enabled: true,
             source_domain: "ssp.example.com".to_owned(),
             openrtb_atype: 3,
@@ -767,6 +767,7 @@ mod tests {
     // Snapshot-driven eligibility and request-wide aggregation
     // -----------------------------------------------------------------------
 
+    use crate::ec::kv::TombstoneOutcome;
     use crate::error::TrustedServerError;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::settings::EcPartner;
@@ -792,7 +793,9 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(format!("{source_domain}-api-token-32-bytes-minimum")),
+            api_token: Some(Redacted::new(format!(
+                "{source_domain}-api-token-32-bytes-minimum"
+            ))),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,
             pull_sync_url: Some(format!("https://{source_domain}/sync")),
@@ -965,9 +968,13 @@ mod tests {
         let snapshot = seed_present_snapshot(&graph, &ec_id);
 
         // Concurrent withdrawal lands after the snapshot was captured.
-        graph
-            .write_withdrawal_tombstone(&ec_id)
-            .expect("should tombstone the row");
+        assert_eq!(
+            graph
+                .write_withdrawal_tombstone(&ec_id, drop)
+                .expect("should tombstone the row"),
+            TombstoneOutcome::Written,
+            "should tombstone the row the snapshot still reports as present"
+        );
 
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, br#"{"uid":"leaked-uid"}"#.to_vec());
