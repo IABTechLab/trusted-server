@@ -3996,8 +3996,8 @@ macOS help SHA-256
 and identical capture-manifest SHA-256
 `fb51762ee6aba92240e0d4544065a9efb00ef8a3ccd5ba81830912237fb7a581`.
 
-The base-to-current-head review contains 106 unsquashed package commits and 267
-paths: 140,478 insertions and 3,300 deletions. The path review found no
+The base-to-current-head review contains 107 unsquashed package commits and 267
+paths: 140,494 insertions and 3,300 deletions. The path review found no
 unrelated runtime feature. Runtime-adjacent changes are the documented test
 seams, fixture-only browser sandbox and cleanup behavior, and logging-only
 Cloudflare and Spin startup diagnostics; responses, routes, public APIs, and
@@ -4059,3 +4059,19 @@ bounds, writer checkout, and action commit pins.
   generator and validator produced 603 reachable root packages and 158
   reachable docs-parity packages, with directness and runtime/development
   scopes populated from Cargo metadata. All reviewed manifests are current.
+- Exact-head Run Tests `34316723321` succeeded at
+  `0dcf054063dd6f746b1bb44ca58418d23efae887`. Linux capture job
+  `102354381564` produced artifact `10090397245` (32,788 bytes,
+  `sha256:ff23327b542aca834c118a53313f50722164a1f92a52a563543979907310e7f4`);
+  macOS capture job `102354381693` produced artifact `10090451966` (36,299
+  bytes,
+  `sha256:1844e6f1536b375fec8a7a92a18a6403831f289f5710d40684ae8fee4619563a`).
+  Both help goldens retained their prior SHA-256 values. Two authenticated
+  imports changed only the source SHA, run ID, and two CLI source blob IDs and
+  produced the identical capture-manifest SHA-256
+  `fc51a476a716e7b18ccd4a0dd9b912698448d78a26ecc65b7d1c139a4b3ddf2c`.
+- After import, the complete docs-parity suite passed: 38 library, 35
+  classification, 27 CLI, 13 CLI-help, five dependency, six gate, 33
+  integration, two JSDoc, 62 link, 11 Markdown, two README, 70 route, 74
+  scanner, 24 settings, five snippet, and seven workflow tests. The standalone
+  `check --all` gate then passed against the same working tree.
