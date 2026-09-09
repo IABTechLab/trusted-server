@@ -6967,6 +6967,10 @@ mod tests {
             // Report a miss: the scheduling assertions only care about ordering.
             Ok(None)
         }
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
         fn insert(
             &self,
             key: &str,
