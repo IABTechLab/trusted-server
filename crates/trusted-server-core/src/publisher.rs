@@ -12252,6 +12252,247 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn template_cookie_publisher_warm_variant_finalizes_ec_withdrawal() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let mut settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+                Arc::make_mut(&mut settings).auction.providers =
+                    crate::auction_config_types::AuctionConfig::legacy_provider_map(&[
+                        SCHEDULING_PROVIDER,
+                    ]);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let graph = KvIdentityGraph::in_memory("cookie-withdrawal-store");
+                let identities = [
+                    format!("{}.Read01", "a".repeat(64)),
+                    format!("{}.Read02", "b".repeat(64)),
+                ];
+                for (index, identity) in identities.iter().enumerate() {
+                    assert!(
+                        crate::ec::generation::is_valid_ec_id(identity),
+                        "should use valid EC identities in the fixture"
+                    );
+                    graph
+                        .create(
+                            identity,
+                            &crate::ec::kv_types::KvEntry::minimal(
+                                "example.com",
+                                &format!("partner-reader-{index}"),
+                                crate::ec::current_timestamp(),
+                            ),
+                        )
+                        .expect("should seed a live reader identity");
+                }
+                let registry = IntegrationRegistry::new(&settings)
+                    .expect("should create integration registry");
+                let partner = serde_json::from_value(serde_json::json!({
+                    "name": "Example partner",
+                    "source_domain": "example.com",
+                    "bidstream_enabled": true
+                }))
+                .expect("should deserialize fixture partner");
+                let partners = PartnerRegistry::from_config(&[partner])
+                    .expect("should create partner registry");
+                // Only the cold request has an origin response available.
+                queue_shareable_html(&stub);
+
+                for (index, (identity, withdrawn)) in [
+                    (&identities[0], false),
+                    (&identities[1], false),
+                    (&identities[1], true),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let consent = if withdrawn {
+                        ConsentContext {
+                            jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
+                                "CA".to_owned(),
+                            ),
+                            gpc: true,
+                            ..Default::default()
+                        }
+                    } else {
+                        scheduling_consent()
+                    };
+                    let mut ec_context = EcContext::new_for_test(Some(identity.clone()), consent);
+                    assert_eq!(
+                        ec_context.ec_allowed(),
+                        !withdrawn,
+                        "should apply reader consent"
+                    );
+                    let captured = Arc::new(Mutex::new(None));
+                    let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                    orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
+                        captured: Arc::clone(&captured),
+                        http: Arc::clone(&stub),
+                        lookups: Arc::new(AtomicUsize::new(0)),
+                    }));
+                    let orchestrator = Arc::new(orchestrator);
+                    let cookies = format!("ab_bucket=A; ts-ec={identity}");
+                    let response = handle_publisher_request(
+                        &settings,
+                        &services,
+                        Some(&graph),
+                        &mut ec_context,
+                        AuctionDispatch {
+                            orchestrator: &orchestrator,
+                            slots: &[article_slot()],
+                            registry: Some(&partners),
+                        },
+                        cookie_policy_request(&[cookies.as_bytes()]),
+                        EdgeCacheHeader::SMaxageFallback,
+                    )
+                    .await
+                    .expect("should serve a reader with an existing EC");
+                    assert!(
+                        ec_context.kv_snapshot().entry_for(identity).is_some(),
+                        "should preload this reader's identity even during withdrawal on a hit"
+                    );
+                    let mut response = match finalizer {
+                        Finalizer::Streaming => publisher_response_into_streaming_response(
+                            response,
+                            &Method::GET,
+                            Arc::clone(&settings),
+                            &registry,
+                            orchestrator,
+                            services.clone(),
+                        )
+                        .await
+                        .expect("should finalize streaming reader response"),
+                        Finalizer::Buffered => buffer_publisher_response_async(
+                            response,
+                            &Method::GET,
+                            &settings,
+                            &registry,
+                            &orchestrator,
+                            &services,
+                        )
+                        .await
+                        .expect("should finalize buffered reader response"),
+                    };
+                    crate::ec::finalize::ec_finalize_response(
+                        &settings,
+                        &mut ec_context,
+                        Some(&graph),
+                        &partners,
+                        None,
+                        None,
+                        &mut response,
+                    );
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        if index == 0 { "miss-stored" } else { "hit" },
+                        "should share one variant across identities and withdrawal"
+                    );
+                    let cache_control = response.headers()[header::CACHE_CONTROL]
+                        .to_str()
+                        .expect("should decode cache policy");
+                    for directive in ["private", "no-store"] {
+                        assert!(
+                            cache_control
+                                .split(',')
+                                .any(|value| value.trim() == directive),
+                            "should keep finalized reader responses private and uncacheable"
+                        );
+                    }
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get_all(header::SET_COOKIE)
+                            .iter()
+                            .any(|value| {
+                                let value = value.to_str().expect("should decode response cookie");
+                                value.starts_with("ts-ec=") && value.contains("Max-Age=0")
+                            }),
+                        withdrawn,
+                        "should expire the EC cookie only for the withdrawing reader"
+                    );
+                    let body = body_of(response).await;
+                    assert!(!body.is_empty(), "should render a complete reader response");
+                    let captured = captured.lock().expect("should lock captured auction");
+                    let auction = captured.as_ref().expect("should dispatch a reader auction");
+                    assert_eq!(
+                        auction.request.user.id.as_deref(),
+                        if withdrawn {
+                            None
+                        } else {
+                            Some(identity.as_str())
+                        },
+                        "should use this reader's identity and suppress it after withdrawal"
+                    );
+                    if withdrawn {
+                        assert!(
+                            auction.request.user.eids.is_none(),
+                            "should suppress withdrawn EIDs"
+                        );
+                    } else {
+                        let eids = auction
+                            .request
+                            .user
+                            .eids
+                            .as_ref()
+                            .expect("should include consenting reader EIDs");
+                        assert_eq!(eids.len(), 1, "should expose only the configured partner");
+                        assert_eq!(
+                            eids[0].source, "example.com",
+                            "should use the registered source"
+                        );
+                        assert_eq!(
+                            eids[0].uids[0].id,
+                            format!("partner-reader-{index}"),
+                            "should use this reader's partner identity on cold and warm requests"
+                        );
+                    }
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "should fetch origin only once"
+                );
+                assert_eq!(
+                    looked_up_cache_keys(&cache).len(),
+                    3,
+                    "should look up every reader"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should store only the cold template"
+                );
+                for (index, identity) in identities.iter().enumerate() {
+                    let (entry, _) = graph
+                        .get(identity)
+                        .expect("should read reader identity")
+                        .expect("should retain the live row or its tombstone");
+                    assert_eq!(
+                        entry.consent.ok,
+                        index == 0,
+                        "should revoke only the second reader"
+                    );
+                    assert_eq!(
+                        entry.ids.is_empty(),
+                        index == 1,
+                        "should clear only revoked partner IDs"
+                    );
+                }
+                let entries = cache.entries.lock().expect("should lock cached templates");
+                let stored = &entries
+                    .values()
+                    .next()
+                    .expect("should retain shared template")
+                    .body;
+                let stored = String::from_utf8_lossy(stored);
+                for identity in &identities {
+                    assert!(
+                        !stored.contains(identity),
+                        "should keep reader identities out of cached bytes"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn by_default_a_cookie_bearing_request_uses_no_shared_cache() {
             // The shipped default, and the reason the cache is nearly inert on real
             // traffic: TS sets its own identity cookie, so essentially every repeat
