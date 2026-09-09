@@ -18,7 +18,6 @@ use crate::openrtb::{Eid, Uid};
 
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::MAX_UID_LENGTH;
-use super::log_id;
 use super::registry::PartnerRegistry;
 
 /// Maximum raw `ts-eids` cookie size accepted before base64 decode.
@@ -217,17 +216,12 @@ fn ingest_eid_cookies_with_writer(
 
     match writer.upsert_partner_ids(ec_id, &updates) {
         Ok(()) => {
-            log::debug!(
-                "EID cookies: synced {} partner IDs for EC ID '{}'",
-                updates.len(),
-                log_id(ec_id),
-            );
+            log::debug!("EID cookies: processed {} partner IDs", updates.len());
         }
         Err(err) => {
             log::warn!(
-                "EID cookies: failed to sync {} partner IDs for EC ID '{}': {err:?}",
+                "EID cookies: failed to process {} partner IDs: {err:?}",
                 updates.len(),
-                log_id(ec_id),
             );
         }
     }

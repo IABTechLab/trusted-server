@@ -86,6 +86,20 @@ use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
 use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
+/// Bounded request classifications that may persist browser EID cookies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub enum EidSyncSource {
+    /// Publisher top-level document navigation.
+    #[display("navigation")]
+    Navigation,
+    /// `POST /auction` request.
+    #[display("auction")]
+    Auction,
+    /// Request that generated a new EC identity.
+    #[display("new_ec")]
+    NewEc,
+}
+
 /// Request-scoped view of one EC identity-graph lookup.
 ///
 /// The state distinguishes an authoritative miss from a store failure and
@@ -251,6 +265,8 @@ pub struct EcContext {
     recovery_eligible: bool,
     /// Browser-carried proof of recent pull-partner completeness.
     pull_sync_marker: PullSyncMarkerState,
+    /// Allowed returning-user EID persistence source, assigned only after route dispatch.
+    eid_sync_source: Option<EidSyncSource>,
 }
 
 impl EcContext {
@@ -331,6 +347,7 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
+            eid_sync_source: None,
         })
     }
 
@@ -514,6 +531,17 @@ impl EcContext {
         self.recovery_eligible = eligible;
     }
 
+    /// Allows returning-user EID cookie persistence for this request source.
+    pub fn set_eid_sync_source(&mut self, source: EidSyncSource) {
+        self.eid_sync_source = Some(source);
+    }
+
+    /// Returns the allowed returning-user EID persistence source.
+    #[must_use]
+    pub fn eid_sync_source(&self) -> Option<EidSyncSource> {
+        self.eid_sync_source
+    }
+
     /// Returns whether orphan recovery is allowed for this request.
     #[must_use]
     pub fn recovery_eligible(&self) -> bool {
@@ -607,6 +635,7 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 
@@ -630,6 +659,7 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 
@@ -656,6 +686,7 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 }
