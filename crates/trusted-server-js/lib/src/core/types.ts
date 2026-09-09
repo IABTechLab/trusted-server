@@ -87,10 +87,6 @@ export interface AuctionBidData {
   hb_cache_path?: string;
   /** Opaque server-auction correlation ID used only by GPT diagnostics. */
   hb_auction_id?: string;
-  /** Winning creative width; the bridge sizes the inline render from this. */
-  w?: number;
-  /** Winning creative height; the bridge sizes the inline render from this. */
-  h?: number;
   nurl?: string;
   burl?: string;
   /** Typed winning-bid renderer capability. */
@@ -123,10 +119,19 @@ export type GptDiagnosticsAuctionType = 'ssat' | 'trusted_server' | 'client_side
 /** Clock origin for server auction timings, independent of aggregate auction classification. */
 export type GptDiagnosticsServerAuctionTimingOrigin = 'navigation' | 'spa_auction';
 
-/** Sanitized winning-bid facts already exposed in GPT targeting. */
+/** Sanitized bid facts already exposed as bucketed ad-server targeting. */
 export interface GptDiagnosticsAuctionWinner {
   bidder: string;
   priceBucket: string;
+  /** ISO currency supplied by the evidence source; absent means not supplied. */
+  currency?: string;
+}
+
+/** A completed, exactly correlated client-side Prebid auction. */
+export interface GptDiagnosticsPrebidAuctionEvidence {
+  auctionId: string;
+  targetingCandidate?: GptDiagnosticsAuctionWinner;
+  win?: GptDiagnosticsAuctionWinner;
 }
 
 /** Internal Trusted Server auction evidence attached to the next GPT request. */
@@ -278,7 +283,10 @@ export interface GptDiagnosticsRequestCycle {
   requestIntentId?: number;
   trustedServerAuctionId?: string;
   auctionType?: GptDiagnosticsAuctionType;
+  /** Compatibility field: winner of the observed server auction, not necessarily the served creative. */
   auctionWinner?: GptDiagnosticsAuctionWinner;
+  /** Completed Prebid facts, correlated to this exact slot, request, and auction attempt. */
+  prebidAuction?: GptDiagnosticsPrebidAuctionEvidence;
   serverAuctionTimings?: AuctionDiagnosticsData;
   /** Retained separately because `auctionType` can become `competing`. */
   serverAuctionTimingOrigin?: GptDiagnosticsServerAuctionTimingOrigin;
@@ -395,6 +403,18 @@ export interface GptDiagnosticsRecorder {
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  /** Record a completed Prebid attempt at its targeting boundary for one exact GPT slot. */
+  recordPrebidAuction(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    targetingCandidate?: GptDiagnosticsAuctionWinner
+  ): void;
+  /** Record Prebid's documented `bidWon` observation for that exact attempt. */
+  recordPrebidWin(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    winner: GptDiagnosticsAuctionWinner
+  ): void;
   /** Record a creative markup request and return its opaque attempt ID. */
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
   /** Record that a creative attempt successfully posted markup. */

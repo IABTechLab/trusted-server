@@ -10,8 +10,7 @@
 GPT Runtime Diagnostics is an opt-in browser console for documented Google
 Publisher Tag (GPT) lifecycle callbacks and Trusted Server integration evidence.
 It groups observations into per-slot request cycles, shows auction and GPT timings,
-links each page badge to the same stable `Ad #N` in the side panel, binds slots to exact
-DOM elements, and downloads the same allowlisted data as versioned JSON.
+links each accessible page badge to the same stable `Ad #N` and `Request #M` in the side panel, binds slots to exact DOM elements, and downloads the same allowlisted data as versioned JSON. See the complete [label dictionary](./gpt-diagnostics-dictionary.md) for every operator-facing term.
 
 The console reports positive observations, not inferred ownership. A filled result
 means only that GPT emitted `slotRenderEnded` with `isEmpty === false`. A Trusted
@@ -109,11 +108,11 @@ Visible, Filled, Empty, Pending/Incomplete, and Unbound/Ambiguous slots.
 
 Each request cycle can show:
 
-- The same stable `Ad #N` used by the creative's page badge.
+- The same stable `Ad #N` and `Request #M` used by the request's page badge.
 - The observed request path, request-intent ID, and direct Trusted Server opportunity.
-- Auction classification: SSAT, TS auction, client-side auction, or competing auctions.
+- Explicit auction classification: initial-page server, SPA server, completed client-side Prebid, multiple observed paths, or not observed.
 - Opaque Trusted Server auction-ID correlation and opportunity-to-request latency when available.
-- The winning bidder and bucketed bid price from the existing `hb_bidder` and `hb_pb` bid fields.
+- Source-scoped server-auction winner, Prebid targeting candidate, and documented Prebid win observations. None is presented as the final served creative.
 - Server-measured auction dispatch, resolution, commit, and wait timing when available.
 - Observed replacement of an earlier retained filled render, including GPT creative-ID transitions.
 - Requesting, Response received, Filled, Empty, or Rendered (fill unknown) GPT
@@ -139,12 +138,13 @@ and `responseClass` remains absent. `unclassified_non_empty` requires an explici
 
 Auction labels describe the path observed for that GPT request cycle:
 
-| Label               | Meaning                                                                                                    |
-| ------------------- | ---------------------------------------------------------------------------------------------------------- |
-| SSAT                | The initial document's server-side auction populated the direct request.                                   |
-| TS auction          | The SPA `/_ts/page-bids` server auction populated the direct request.                                      |
-| Client-side auction | The installed Prebid refresh path was the only auction path observed.                                      |
-| Competing auctions  | Trusted Server direct and client-side Prebid auction evidence were both observed for the same GPT request. |
+| Label                             | Meaning                                                                                              |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| SSAT: initial-page server auction | Explicit completed initial-document server-auction evidence populated the direct request.            |
+| TS auction: SPA server auction    | Explicit completed `/_ts/page-bids` server-auction evidence populated the direct request.            |
+| Client-side Prebid auction        | A completed Prebid attempt was joined by exact auction ID, ad-unit code, GPT slot, and next request. |
+| Multiple auction paths observed   | Server and completed client-side evidence were both observed. This does not prove a race or winner.  |
+| Auction not observed              | Explicit completed-auction evidence was absent or malformed. It never defaults to SSAT.              |
 
 Publisher refresh evidence does not by itself establish another auction. It remains
 visible in the request-path classification but does not turn an SSAT, TS auction, or
@@ -152,18 +152,19 @@ client-side auction label into “Competing auctions.” Publisher-only refreshe
 unattributed requests have no auction label because the available evidence does not
 establish an auction implementation.
 
+For synthetic refresh auctions, diagnostics correlates the auction ID supplied by
+Prebid's own `bidsBackHandler`; it does not provide or override Prebid auction IDs. The
+`bidWon` listener, targeting reads, and bounded correlation state are installed only
+when an active diagnostics recorder exists, so an inactive console does not change
+Prebid-visible behavior.
+
 Server auction timing and browser GPT timing use separate clocks and are never
-subtracted from each other. Initial SSAT offsets use navigation-request T0. SPA TS
-auction offsets use a local server clock started immediately before auction dispatch,
-not the browser's navigation clock or the edge's request-receipt time. Diagnostics
-retain that timing origin separately from the aggregate auction classification, so a
-request marked `competing` still labels SPA offsets from SPA auction T0. The server
-facts are:
+subtracted from each other. Both initial and SPA offsets use their request-scoped `RequestTimings` T0: server request processing start. Diagnostics retains the server origin separately from aggregate classification. The server facts are:
 
 - `auctionDispatchedMs`: bid dispatch offset from that timing origin.
-- `auctionResolvedMs`: final bid or timeout offset from the same timing origin.
+- `auctionResolvedMs`: offset when auction collection completed, including timeout handling.
 - `auctionCommittedMs`: offset when winning bids were available to page state.
-- `auctionWaitMs`: time spent awaiting the auction.
+- `auctionWaitMs`: actual time blocked in auction collection.
 - `auctionWaitPlacement`: whether that wait occurred before response headers or while
   the document response was streaming.
 
@@ -243,8 +244,8 @@ For the direct path, `adInit` records one opportunity:
 | `unrenderable_candidate` | Bid targeting was applied, but the current bridge lacked the complete ID/render-source combination needed to serve markup. |
 | `no_candidate`           | `adInit` explicitly observed no direct Trusted Server bid targeting for that configured slot.                              |
 
-An absent opportunity is displayed as unknown. It must not be converted into a
-negative demand-source conclusion.
+An absent opportunity is displayed as `Not observed`. It must not be converted into
+a negative demand-source conclusion.
 
 ## Trusted Server Evidence Ladder
 
@@ -266,9 +267,9 @@ The derived `delivery` value uses these evidence-safe meanings:
 
 | Delivery state                 | Panel wording                                                                                                                                               |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `trusted_server_response_sent` | Trusted Server selected; markup response sent to PUC                                                                                                        |
-| `trusted_server_selected`      | Trusted Server selected; no markup response confirmed                                                                                                       |
-| `candidate_unconfirmed`        | Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible                                                          |
+| `trusted_server_response_sent` | Creative markup sent; execution not confirmed                                                                                                               |
+| `trusted_server_selected`      | Server bid selected by the creative bridge; response not confirmed                                                                                          |
+| `candidate_unconfirmed`        | Server bid available; selection not confirmed                                                                                                               |
 | `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                                                                         |
 | `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed                                                                        |
 | `pending`                      | Waiting for Trusted Server creative evidence                                                                                                                |
