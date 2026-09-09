@@ -10,7 +10,9 @@ use edgezero_core::http::{
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
@@ -38,7 +40,7 @@ use trusted_server_core::settings_data::{
 use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
+use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -60,8 +62,13 @@ pub struct AppState {
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
-    let settings =
-        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
+    let settings = get_settings_from_config_store(
+        &AxumPlatformConfigStore,
+        &AxumPlatformSecretStore,
+        &store_name,
+        &config_key,
+        &trusted_server_core::settings_data::default_secret_store_name(),
+    )?;
     build_state_with_settings(settings)
 }
 
@@ -74,8 +81,10 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
