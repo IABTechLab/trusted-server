@@ -194,14 +194,43 @@ rolling it out broadly.
 When managed User IDs are configured and the page exposes a callable
 `window.__tcfapi`, the Trusted Server shim activates Prebid's standard IAB GDPR
 collector by adding only `consentManagement.gdpr.cmpApi = "iab"`. It does not
-set a timeout or force `defaultGdprScope`. An existing publisher-owned `gdpr`
-value always wins, sibling consent settings are preserved, and pages without a
-TCF API are unchanged. If queued or late publisher configuration later supplies
-its own `gdpr` value, the shim first deactivates the collector it created so the
-old IAB listener cannot overwrite the publisher's consent state. Ownership
-transfers once; the automatic collector is not re-enabled afterward. A delayed
-first CMP response is also ignored after transfer and removes its listener when
-the CMP finally supplies the listener ID.
+set a timeout or force `defaultGdprScope`. An existing publisher-owned
+configuration always wins, sibling consent settings are preserved, and pages
+without a TCF API are unchanged. If queued or late publisher configuration later
+takes ownership, the shim first deactivates the collector it created so the old
+IAB listener cannot overwrite the publisher's consent state. Ownership transfers
+once; the automatic collector is not re-enabled afterward. A delayed first CMP
+response is also ignored after transfer and removes its listener when the CMP
+finally supplies the listener ID.
+
+Publisher ownership follows Prebid's own rule for reading `consentManagement`:
+a truthy `gdpr`, `usp`, or `gpp` selects the namespaced shape, and any other
+non-empty object is read as a legacy top-level TCF configuration such as
+`{ cmpApi: "static", consentData: ... }`. The shim recognizes both, so it never
+appends a `gdpr` namespace that would demote a publisher's legacy settings, and
+when a publisher merge uses the legacy shape the retired namespace is removed
+rather than left behind as a disabled TCF module.
+
+### CMP discovery timing
+
+TCF activation reads `window.__tcfapi` once, so a CMP that installs itself after
+the deferred shim runs would otherwise leave managed modules seeded with
+Prebid's GDPR handler disabled — the module fires its vendor request with no TCF
+parameters, and no later reconfiguration can recall it. Managed entries
+therefore stay out of every configuration Prebid sees until CMP discovery
+concludes:
+
+| Event                                      | Result                                                          |
+| ------------------------------------------ | --------------------------------------------------------------- |
+| `window.__tcfapi` is callable at shim time | The collector activates and managed entries seed immediately    |
+| A CMP installs `window.__tcfapi` later     | Discovery concludes then: the collector activates, entries seed |
+| No CMP appears before the first auction    | Discovery concludes at `requestBids`; entries seed with no TCF  |
+
+A conforming CMP installs its stub before vendor tags request bids, so the first
+auction is the last useful moment to conclude that no CMP is coming. While
+discovery is pending, publisher `setConfig` and `mergeConfig` calls pass through
+unchanged; managed entries are merged onto the effective configuration once
+discovery concludes.
 
 ## Debug Mode
 
@@ -564,8 +593,12 @@ The module must be present in the built bundle. Name it under
 preset, which covers the commonly used modules.
 
 `ts prebid bundle` resolves every managed `name` through the checked-in
-`user_id_modules.json` registry. An unknown name, or a name that maps to more
-than one module, fails before bundle generation. After generation, the command
+`user_id_modules.json` registry. An unknown name, a name that maps to more than
+one module, or two managed names that resolve to the same module — `sharedId`
+and `pubCommonId` both select `sharedIdSystem`, for example — fail before bundle
+generation. Prebid registers one submodule for a module's name and each of its
+aliases and then selects the first matching entry, so a shared module would
+silently drop one managed configuration. After generation, the command
 reads the new manifest and confirms that every resolved module is present. A
 missing module reports both the managed name and required module and leaves the
 existing bundle hash and SRI unchanged.
@@ -615,10 +648,11 @@ The generated bundle carries Prebid's `tcfControl` module alongside the
 `consentManagement*` modules. That pairing is what makes the TCF signal
 enforceable: `consentManagement*` retrieves the consent data, while `tcfControl`
 registers activity controls that act on it. For managed User IDs, the shim
-activates the collector when `window.__tcfapi` is callable and the publisher has
-not already supplied a `consentManagement.gdpr` value. Under pinned Prebid's
-defaults, a later publisher `gdpr` value takes ownership after the shim removes
-its automatically registered IAB listener. Purpose 1 and LiveRamp's GVL vendor
+activates the collector once CMP discovery concludes and the publisher has not
+already supplied a TCF configuration in either the namespaced or the legacy
+shape. Under pinned Prebid's defaults, later publisher consent configuration
+takes ownership after the shim removes its automatically registered IAB
+listener. Purpose 1 and LiveRamp's GVL vendor
 consent (vendor 97) gate IdentityLink resolution and storage. Purpose 3 has no
 standalone default rule. Purpose 4 controls user-provided-data activity, but
 denying it alone does not block IdentityLink resolution or storage.

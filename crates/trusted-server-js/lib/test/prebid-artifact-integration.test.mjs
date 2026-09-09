@@ -176,6 +176,18 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.eval(shimCode);
     const wrappedRequestBids = pageWindow.pbjs.requestBids;
 
+    // Managed User ID seeding waits for CMP discovery. This page never installs
+    // `__tcfapi`, so the first auction is what concludes discovery and seeds the
+    // managed entry. Consent enforcement itself is covered by
+    // prebid-consent-enforcement.test.mjs.
+    expect(
+      pageWindow.pbjs
+        .getConfig('userSync.userIds')
+        .some(({ name }) => name === 'identityLink')
+    ).toBe(false);
+
+    pageWindow.pbjs.requestBids({ adUnits: [] });
+
     expect(pageWindow.pbjs.getConfig('userSync.userIds')).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: 'sharedId' }),
