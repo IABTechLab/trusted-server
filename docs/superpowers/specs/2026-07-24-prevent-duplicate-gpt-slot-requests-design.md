@@ -50,13 +50,17 @@ A GPT `slotRequested` or `slotRenderEnded` event also claims for the publisher w
 has not claimed first. `adInit()` may write `ts_initial=1`, apply `hb_*` targeting, and
 request an existing slot only after it atomically claims an untouched slot.
 
-Publisher auction claims use unique, expiring registration tokens. The matching
+Publisher auction claims use unique, expiring registration tokens. Publisher codes
+resolve through their DOM identity, injected div ID, or Prebid's default GPT ad-unit
+path match, then retain that exact element even if its visibility changes. The matching
 callback associates returned ad IDs with only its registration in Prebid's delivery
 correlation state. Overlapping auctions cannot clear each other's tokens. Exact ad-ID
-delivery consumes only its matching registration. A code-only delivery consumes a registration only
-when exactly one current candidate matches; ambiguous ordinary deliveries run a new
-auction, while ambiguous TS-owned suppressing deliveries fail closed without deleting
-their tombstones. If TS claimed first, the GPT refresh wrapper filters one correlated
+delivery consumes only its matching registration. A synchronous code-only delivery
+inside `bidsBackHandler` uses that callback's registration. Outside the callback, a
+code-only delivery consumes a registration only when exactly one current candidate
+matches; ambiguous ordinary deliveries run a new auction, while ambiguous TS-owned
+suppressing deliveries fail closed without deleting their tombstones. If TS claimed
+first, the GPT refresh wrapper filters one correlated
 losing publisher delivery and restores the TS targeting snapshot. It forwards every
 unaffected slot and the original refresh options exactly once. The one-shot state is
 then consumed, so later publisher refresh auctions remain eligible.
@@ -104,7 +108,9 @@ competing container slot and an invalid duplicate definition.
 5. **Later refreshes and SPA navigation** — after the one-shot suppression is
    consumed, publisher refreshes are untouched. On navigation, TS clears its
    targeting from the shared slot and may reuse it for the next route; it must not
-   destroy a slot after ownership has transferred.
+   destroy a slot after ownership has transferred. If GPT is still a command-queue
+   stub, cleanup captures the previous route's keys and element IDs before queuing,
+   so a later route cannot replace the bookkeeping used by the deferred callback.
 
 The wrapper is not a global deduplicator. It only handles IDs present in TS's
 handoff registry or one uniquely safe hydrated-ID match and must preserve native

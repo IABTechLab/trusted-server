@@ -196,17 +196,20 @@ export function releaseTrustedServerFirstImpressionClaim(
   }
 }
 
+type FirstImpressionElementResolver = (adUnitCode: string) => HTMLElement | undefined;
+
 /** Register real publisher auctions before native `requestBids()` starts. */
 export function registerPublisherFirstImpressionAuctions(
   ts: TsjsApi,
   adUnitCodes: Iterable<string>,
-  now = Date.now()
+  now = Date.now(),
+  resolveElement: FirstImpressionElementResolver = resolveFirstImpressionElement
 ): Map<string, string> {
   const state = pruneFirstImpressionState(ts, now);
   const registrations = new Map<string, string>();
 
   for (const adUnitCode of adUnitCodes) {
-    const element = resolveFirstImpressionElement(adUnitCode);
+    const element = resolveElement(adUnitCode);
     if (!element) continue;
 
     let claim = state.slots[element.id];

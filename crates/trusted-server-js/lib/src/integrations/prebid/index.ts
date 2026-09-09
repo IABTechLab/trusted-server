@@ -407,6 +407,7 @@ let publisherAdUnitSnapshots = new Map<string, PublisherAdUnitSnapshot>();
 let pendingPublisherBids = new Map<string, PendingPublisherBid>();
 let pendingPublisherCodes = new Map<string, Map<number, PendingPublisherCode>>();
 let pendingPublisherRegistrationId = 0;
+let activePublisherRegistrationId: number | undefined;
 let publisherFirstImpressionTokens = new Map<string, Set<string>>();
 let syntheticRefreshAdUnits = new WeakSet<TrustedServerAdUnit>();
 type TrustedServerBidRequest = {
@@ -555,6 +556,15 @@ function bannerSizesFromInjectedSlot(slot: AuctionSlot | undefined): BannerSize[
 function refreshSlotElementId(slot: RefreshGptSlot): string | undefined {
   const elementId = slot.getSlotElementId?.();
   return elementId && elementId.length > 0 ? elementId : undefined;
+}
+
+function refreshSlotAdUnitPath(slot: RefreshGptSlot): string | undefined {
+  try {
+    const adUnitPath = slot.getAdUnitPath?.();
+    return typeof adUnitPath === 'string' && adUnitPath.length > 0 ? adUnitPath : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefined {
@@ -925,31 +935,38 @@ function pendingPublisherContextIsCurrent(
   return (
     pending.generation === (window.tsjs?.navGeneration ?? 0) &&
     pending.element.isConnected &&
-    document.getElementById(pending.element.id) === pending.element &&
-    resolvePublisherDeliveryElement(pending.adUnitCode) === pending.element
+    document.getElementById(pending.element.id) === pending.element
   );
 }
 
 function resolvePublisherDeliveryElement(adUnitCode: string): HTMLElement | undefined {
+  const matches = new Set<HTMLElement>();
   const direct = resolveFirstImpressionElement(adUnitCode);
-  if (direct) return direct;
+  if (direct) matches.add(direct);
 
   const gpt = (
     window as unknown as {
       googletag?: { pubads?(): { getSlots?(): RefreshGptSlot[] } };
     }
   ).googletag;
-  const matches = (gpt?.pubads?.().getSlots?.() ?? [])
-    .filter((slot) => {
+  for (const slot of gpt?.pubads?.().getSlots?.() ?? []) {
+    try {
       const injectedSlot = findInjectedSlotForRefresh(slot);
-      return refreshSlotElementId(slot) === adUnitCode || injectedSlot?.div_id === adUnitCode;
-    })
-    .map((slot) => {
+      if (
+        refreshSlotElementId(slot) !== adUnitCode &&
+        slot.getAdUnitPath?.() !== adUnitCode &&
+        injectedSlot?.div_id !== adUnitCode
+      ) {
+        continue;
+      }
       const elementId = refreshSlotElementId(slot);
-      return elementId ? document.getElementById(elementId) : null;
-    })
-    .filter((element): element is HTMLElement => Boolean(element?.isConnected));
-  return matches.length === 1 ? matches[0] : undefined;
+      const element = elementId ? document.getElementById(elementId) : null;
+      if (element?.isConnected) matches.add(element);
+    } catch {
+      // Optional GPT metadata must not make an ambiguous publisher code look exact.
+    }
+  }
+  return matches.size === 1 ? matches.values().next().value : undefined;
 }
 
 function pendingPublisherContextMatchesSlot(
@@ -1146,12 +1163,14 @@ function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliver
     const injectedSlot = findInjectedSlotForRefresh(slot);
     const pendingCodeCandidates = [
       ...new Map(
-        [refreshSlotElementId(slot), injectedSlot?.div_id]
+        [refreshSlotElementId(slot), refreshSlotAdUnitPath(slot), injectedSlot?.div_id]
           .filter((code): code is string => typeof code === 'string' && code.length > 0)
           .flatMap((code) => [...(pendingPublisherCodes.get(code)?.values() ?? [])])
           .filter(
             (pending) =>
               pendingPublisherContextMatchesSlot(pending, slot) &&
+              (activePublisherRegistrationId === undefined ||
+                pending.registrationId === activePublisherRegistrationId) &&
               (!hasAdId || pending.retainUntilContextChange)
           )
           .map((pending) => [pending.registrationId, pending] as const)
@@ -1316,6 +1335,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pendingPublisherBids = new Map();
   pendingPublisherCodes = new Map();
   pendingPublisherRegistrationId = 0;
+  activePublisherRegistrationId = undefined;
   publisherFirstImpressionTokens = new Map();
   syntheticRefreshAdUnits = new WeakSet();
 
@@ -1437,7 +1457,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       !isSyntheticRefresh && !window.tsjs?.adInitRefreshInProgress
         ? registerPublisherFirstImpressionAuctions(
             (window.tsjs ??= {} as TsjsApi),
-            publisherAdUnitCodes
+            publisherAdUnitCodes,
+            Date.now(),
+            resolvePublisherDeliveryElement
           )
         : new Map<string, string>();
     for (const [adUnitCode, token] of firstImpressionTokens) {
@@ -1545,6 +1567,8 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         : registerPendingPublisherBids(publisherAdUnitCodes, args[0], firstImpressionTokens);
       if (typeof originalBidsBack !== 'function') return;
 
+      const previousRegistrationId = activePublisherRegistrationId;
+      activePublisherRegistrationId = registrationId;
       try {
         originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
       } catch (error) {
@@ -1558,6 +1582,8 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           forgetPublisherFirstImpressionToken(adUnitCode, token);
         }
         throw error;
+      } finally {
+        activePublisherRegistrationId = previousRegistrationId;
       }
     };
 

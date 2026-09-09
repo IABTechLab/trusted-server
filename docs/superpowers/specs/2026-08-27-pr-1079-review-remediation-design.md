@@ -22,13 +22,17 @@ them. The existing per-slot registration limit bounds the set before registratio
 closes, so an arbitrarily late correlated callback cannot become unrelated.
 
 Prebid's pending bid/code correlation records carry the navigation generation and
-physical element identity captured at registration. A record is usable only while
-both still match, and consuming one exact ad-ID delivery removes only its auction's
-registration. A code-only delivery consumes a record only when exactly one current
-registration matches. Ambiguous ordinary code-only deliveries run an independent
-auction rather than guessing; ambiguous TS-owned suppressing deliveries fail closed
-without deleting their tombstones. Scoped `requestBids({ adUnitCodes })` calls
-inspect, mutate, claim, and correlate only those requested global ad units.
+physical element identity captured at registration. Publisher codes may resolve
+through Prebid's default GPT ad-unit path match as well as DOM and injected div IDs.
+A record remains bound to the captured element even if its visibility changes, and
+consuming one exact ad-ID delivery removes only its auction's registration. A
+synchronous code-only delivery inside `bidsBackHandler` uses that callback's
+registration. Outside the callback, a code-only delivery consumes a record only when
+exactly one current registration matches. Ambiguous ordinary code-only deliveries
+run an independent auction rather than guessing; ambiguous TS-owned suppressing
+deliveries fail closed without deleting their tombstones. Scoped
+`requestBids({ adUnitCodes })` calls inspect, mutate, claim, and correlate only those
+requested global ad units.
 
 ## Refresh suppression
 
@@ -61,8 +65,10 @@ response or recording successful response/billing evidence. A stale result may b
 recorded as safe failure telemetry, but is never recorded as a response or win.
 Validation covers navigation generation, winning bid identity, authenticated
 source iframe identity, DOM connectivity, and containment in the authenticated
-slot root. When a configured prefix matches several roots, the requesting frame
-may disambiguate them only when exactly one candidate root owns that source.
+slot root. Source-to-slot resolution prefers an exact configured or runtime mapping,
+then one unique longest configured prefix. Equal-rank or nested-root ambiguity still
+fails closed. Publisher-native rendering may use an outer `-container` only when it
+contains the configured inner div and owns the requesting frame.
 
 After a valid response is posted, a collapsed 1x1 source iframe is expanded to the
 winning creative size. The bridge walks all collapsed ancestors through the

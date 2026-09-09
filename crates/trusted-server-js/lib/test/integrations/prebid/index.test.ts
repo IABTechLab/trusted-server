@@ -4333,6 +4333,74 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     }
   });
 
+  it('correlates a publisher code through the default GPT ad-unit path', () => {
+    const code = '/123/homepage_leaderboard';
+    const elementId = 'div-gpt-ad-leaderboard';
+    const slot = {
+      getSlotElementId: () => elementId,
+      getAdUnitPath: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[728, 90]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    let publisherAuction: Parameters<typeof completePublisherAuction>[0];
+    mockRequestBids.mockImplementation((options) => {
+      publisherAuction = options;
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: () => pubads.refresh([slot]),
+    } as unknown as RequestBidsArg);
+
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    expect(
+      claimFirstImpressionForTrustedServer(ts, document.getElementById(elementId)!)
+    ).toBeUndefined();
+
+    publisherAuction!.bidsBackHandler?.({}, false, 'example-path-auction');
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    expect(slot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledOnce();
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('keeps an exact publisher delivery after its prefix-resolved element loses visibility', () => {
+    const code = 'example-responsive-';
+    const elementId = 'example-responsive-leaderboard';
+    const adId = 'example-responsive-ad-id';
+    const slot = {
+      getSlotElementId: () => elementId,
+      getTargeting: () => [],
+      getSizes: () => [[728, 90]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((options) => {
+      options.bidsBackHandler?.({
+        [code]: { bids: [{ adId, adUnitCode: code }] },
+      });
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: () => {
+        document.getElementById(elementId)!.style.display = 'none';
+        deliveryAdIds.set(slot, adId);
+        pubads.refresh([slot]);
+      },
+    } as unknown as RequestBidsArg);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    expect(slot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledOnce();
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
   it('correlates null and no-argument targeting with a custom GPT slot match', () => {
     const code = 'example-custom-matched-code';
     const slot = {
@@ -4636,6 +4704,42 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
 
     expect(mockRequestBids).toHaveBeenCalledTimes(2);
     expect(slot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenNthCalledWith(1, [slot], undefined);
+    expect(originalRefresh).toHaveBeenNthCalledWith(2, [slot], undefined);
+  });
+
+  it('uses the active callback registration for overlapping code-only deliveries', () => {
+    const code = 'example-active-overlapping-code';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const auctions: Array<Parameters<typeof completePublisherAuction>[0]> = [];
+    mockRequestBids.mockImplementation((options) => {
+      auctions.push(options);
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: () => {
+        pbjs.requestBids({
+          adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+          bidsBackHandler: () => pubads.refresh([slot]),
+        } as unknown as RequestBidsArg);
+        auctions[1]!.bidsBackHandler?.({}, false, 'example-inner-auction');
+        pubads.refresh([slot]);
+      },
+    } as unknown as RequestBidsArg);
+
+    auctions[0]!.bidsBackHandler?.({}, false, 'example-outer-auction');
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(slot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
     expect(originalRefresh).toHaveBeenNthCalledWith(1, [slot], undefined);
     expect(originalRefresh).toHaveBeenNthCalledWith(2, [slot], undefined);
   });
