@@ -16,7 +16,7 @@ use super::profile::{
 use super::routing::{
     PrebidTransportHeaders, ProviderAuctionInput, ProviderSlotInput, RoutedAuction,
 };
-use super::types::{AuctionResponse, Bid};
+use super::types::{AdFormat, AuctionResponse, Bid};
 use crate::consent::ConsentSource;
 use crate::error::TrustedServerError;
 use crate::openrtb::{
@@ -85,6 +85,84 @@ impl ResponseAdmissionDiagnostics {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DimensionMatch {
+    Unique((u32, u32)),
+    Ambiguous,
+}
+
+impl DimensionMatch {
+    fn include(&mut self, dimensions: (u32, u32)) {
+        if matches!(self, Self::Unique(existing) if *existing != dimensions) {
+            *self = Self::Ambiguous;
+        }
+    }
+
+    fn resolve(self) -> Result<(u32, u32), BidRejectionReason> {
+        match self {
+            Self::Unique(dimensions) => Ok(dimensions),
+            Self::Ambiguous => Err(BidRejectionReason::AmbiguousDimensions),
+        }
+    }
+}
+
+/// Precomputed dimension resolutions for one requested impression.
+pub(crate) struct SlotBidDimensions {
+    exact: BTreeSet<(u32, u32)>,
+    by_width: BTreeMap<u32, DimensionMatch>,
+    by_height: BTreeMap<u32, DimensionMatch>,
+    unqualified: Option<DimensionMatch>,
+}
+
+impl SlotBidDimensions {
+    fn from_formats(formats: &[AdFormat]) -> Self {
+        let mut exact = BTreeSet::new();
+        let mut by_width = BTreeMap::new();
+        let mut by_height = BTreeMap::new();
+        let mut unqualified: Option<DimensionMatch> = None;
+
+        for format in formats {
+            let dimensions = (format.width, format.height);
+            if !exact.insert(dimensions) {
+                continue;
+            }
+            by_width
+                .entry(format.width)
+                .and_modify(|candidate: &mut DimensionMatch| candidate.include(dimensions))
+                .or_insert(DimensionMatch::Unique(dimensions));
+            by_height
+                .entry(format.height)
+                .and_modify(|candidate: &mut DimensionMatch| candidate.include(dimensions))
+                .or_insert(DimensionMatch::Unique(dimensions));
+            match &mut unqualified {
+                Some(candidate) => candidate.include(dimensions),
+                None => unqualified = Some(DimensionMatch::Unique(dimensions)),
+            }
+        }
+
+        Self {
+            exact,
+            by_width,
+            by_height,
+            unqualified,
+        }
+    }
+}
+
+/// Precomputed requested banner dimensions keyed by impression ID.
+pub(crate) type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
+
+/// Build the requested-dimension index once for one provider response.
+pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
+    let mut index = BidDimensionIndex::new();
+    for slot in input.slots() {
+        index
+            .entry(slot.slot().id.clone())
+            .or_insert_with(|| SlotBidDimensions::from_formats(slot.slot().formats.as_slice()));
+    }
+    index
+}
+
 /// Parse an optional positive `OpenRTB` bid dimension.
 pub(crate) fn parse_optional_bid_dimension(
     value: &Value,
@@ -93,52 +171,60 @@ pub(crate) fn parse_optional_bid_dimension(
     let Some(raw) = value.get(key) else {
         return Ok(None);
     };
-    raw.as_u64()
+    if raw.is_null() {
+        return Ok(None);
+    }
+
+    let dimension = raw
+        .as_u64()
         .and_then(|dimension| u32::try_from(dimension).ok())
+        .or_else(|| {
+            let dimension = raw.as_f64()?;
+            (dimension.is_finite()
+                && dimension > 0.0
+                && dimension.fract() == 0.0
+                && dimension <= f64::from(u32::MAX))
+            .then_some(dimension as u32)
+        })
         .filter(|dimension| *dimension > 0)
-        .map(Some)
-        .ok_or(BidRejectionReason::InvalidBid)
+        .ok_or(BidRejectionReason::InvalidBid)?;
+    Ok(Some(dimension))
 }
 
-/// Validate explicit dimensions or infer them from one routed banner format.
+/// Validate explicit dimensions or infer them from one matching banner format.
 pub(crate) fn resolve_bid_dimensions(
-    input: &ProviderAuctionInput,
+    dimensions_by_slot: &BidDimensionIndex,
     slot_id: &str,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<(u32, u32), BidRejectionReason> {
-    let slot = input
-        .slots()
-        .iter()
-        .find(|slot| slot.slot().id == slot_id)
+    let dimensions = dimensions_by_slot
+        .get(slot_id)
         .ok_or(BidRejectionReason::UnrequestedImpression)?;
-    let dimensions = slot
-        .slot()
-        .formats
-        .iter()
-        .map(|format| (format.width, format.height))
-        .collect::<BTreeSet<_>>();
 
-    if let (Some(width), Some(height)) = (width, height) {
-        return dimensions
+    match (width, height) {
+        (Some(width), Some(height)) => dimensions
+            .exact
             .contains(&(width, height))
             .then_some((width, height))
-            .ok_or(BidRejectionReason::DimensionMismatch);
+            .ok_or(BidRejectionReason::DimensionMismatch),
+        (Some(width), None) => dimensions
+            .by_width
+            .get(&width)
+            .copied()
+            .ok_or(BidRejectionReason::DimensionMismatch)?
+            .resolve(),
+        (None, Some(height)) => dimensions
+            .by_height
+            .get(&height)
+            .copied()
+            .ok_or(BidRejectionReason::DimensionMismatch)?
+            .resolve(),
+        (None, None) => dimensions
+            .unqualified
+            .ok_or(BidRejectionReason::DimensionMismatch)?
+            .resolve(),
     }
-
-    if dimensions.len() != 1 {
-        return Err(BidRejectionReason::AmbiguousDimensions);
-    }
-    let inferred = dimensions
-        .first()
-        .copied()
-        .expect("should have one routed banner format");
-    if width.is_some_and(|width| width != inferred.0)
-        || height.is_some_and(|height| height != inferred.1)
-    {
-        return Err(BidRejectionReason::DimensionMismatch);
-    }
-    Ok(inferred)
 }
 
 /// Result of request construction before transport.
@@ -416,6 +502,10 @@ fn apply_prebid(
         } else if slot.has_trusted_stored_request() || !slot.bidder_params().is_empty() {
             prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
         }
+        debug_assert!(
+            !prebid.is_empty(),
+            "should never route a demandless slot to prebid-server"
+        );
         imp.ext = Some(Map::from_iter([(
             "prebid".to_string(),
             Value::Object(prebid),
@@ -680,6 +770,7 @@ pub(crate) fn extract_standard_response(
                 .with_metadata("error_type", json!("parse_response"));
         }
     }
+    let dimensions_by_slot = build_bid_dimension_index(input);
     let mut diagnostics = ResponseAdmissionDiagnostics::default();
     let mut bids = Vec::new();
     for seatbid in response
@@ -696,7 +787,7 @@ pub(crate) fn extract_standard_response(
             continue;
         };
         for value in entries {
-            match extract_standard_bid(value, returned_seat, input) {
+            match extract_standard_bid(value, returned_seat, &dimensions_by_slot) {
                 Ok(bid) => bids.push(bid),
                 Err(reason) => diagnostics.record(reason),
             }
@@ -714,7 +805,7 @@ pub(crate) fn extract_standard_response(
 fn extract_standard_bid(
     value: &Value,
     returned_seat: Option<&str>,
-    input: &ProviderAuctionInput,
+    dimensions_by_slot: &BidDimensionIndex,
 ) -> Result<Bid, BidRejectionReason> {
     let slot_id = value
         .get("impid")
@@ -724,7 +815,7 @@ fn extract_standard_bid(
         .to_string();
     let width = parse_optional_bid_dimension(value, "w")?;
     let height = parse_optional_bid_dimension(value, "h")?;
-    let (width, height) = resolve_bid_dimensions(input, &slot_id, width, height)?;
+    let (width, height) = resolve_bid_dimensions(dimensions_by_slot, &slot_id, width, height)?;
     let price = value
         .get("price")
         .and_then(Value::as_f64)

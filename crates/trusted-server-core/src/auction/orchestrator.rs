@@ -762,7 +762,6 @@ impl AuctionOrchestratorHarness {
             (None, local_winners())
         };
         let unroutable_bidder_count = routed.diagnostics().unroutable_bidder_count();
-        // lgtm[rust/cleartext-logging]
         // This logs only a bounded routing count, never request data or secrets.
         log::info!(
             "Auction routing diagnostics: unroutable_bidder_count={}",
@@ -1160,7 +1159,6 @@ impl AuctionOrchestrator {
             let provider = match self.providers.get(*provider_name) {
                 Some(p) => p,
                 None => {
-                    // lgtm[rust/cleartext-logging]
                     // This logs a configured provider identifier, not request data or secrets.
                     log::warn!("Provider '{}' not registered, skipping", provider_name);
                     continue;
@@ -1216,7 +1214,6 @@ impl AuctionOrchestrator {
                 services: context.services,
             };
 
-            // lgtm[rust/cleartext-logging]
             // This logs a configured provider identifier and timeout, not request data or secrets.
             log::info!(
                 "Launching bid request to '{}' with a {}ms budget",
@@ -1401,7 +1398,6 @@ impl AuctionOrchestrator {
                                 responses.push(auction_response);
                             }
                             Err(e) => {
-                                // lgtm[rust/cleartext-logging]
                                 // This warning reports provider parse failures only; no secret values are logged.
                                 log::warn!(
                                     "Provider '{}' failed to parse response: {:?}",
@@ -1789,6 +1785,8 @@ impl AuctionOrchestrator {
         }
 
         if pending_requests.is_empty() && immediate_response_count == 0 {
+            // A pre-launch timeout is a completed provider outcome. Only a set
+            // made entirely of launch failures crosses the fatal boundary.
             if launch_failure_count > 0 && launch_failure_count == routed.inputs().len() {
                 for response in &mut completed_responses {
                     if let Some(&count) =
@@ -1911,7 +1909,6 @@ impl AuctionOrchestrator {
             let provider = match self.providers.get(*provider_name) {
                 Some(p) => p,
                 None => {
-                    // lgtm[rust/cleartext-logging]
                     // The provider name is a static config identifier (e.g. "prebid"), not a secret.
                     log::warn!("Provider '{}' not registered, skipping", provider_name);
                     continue;
@@ -1935,7 +1932,6 @@ impl AuctionOrchestrator {
             // Match the synchronous path's strict deadline semantics: do not
             // invoke even an immediate provider after the budget reaches zero.
             if effective_timeout == 0 {
-                // lgtm[rust/cleartext-logging]
                 // This logs a configured provider identifier and timeout, not request data or secrets.
                 log::warn!(
                     "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
@@ -2010,7 +2006,6 @@ impl AuctionOrchestrator {
                         ));
                         continue;
                     }
-                    // lgtm[rust/cleartext-logging]
                     // This logs configured provider and backend identifiers plus a timeout, not request data or secrets.
                     log::info!(
                         "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
@@ -2063,7 +2058,6 @@ impl AuctionOrchestrator {
             };
         }
 
-        // lgtm[rust/cleartext-logging]
         // This logs bounded request counts and a timeout, not request data or secrets.
         log::info!(
             "Dispatched {} SSP request(s) with {} immediate response(s) (timeout: {}ms)",
@@ -2388,7 +2382,6 @@ impl AuctionOrchestrator {
                     };
                 }
                 let mediator_start = Instant::now();
-                // lgtm[rust/cleartext-logging]
                 // This logs a configured mediator identifier and timeout values, not request data or secrets.
                 log::info!(
                     "Running mediator '{}' with {}ms logical budget and {}ms transport timeout (A_deadline remaining: {}ms, configured: {}ms)",
@@ -2866,14 +2859,89 @@ mod tests {
         else {
             panic!("all planned launch failures should surface a split dispatch failure");
         };
-        assert!(fatal_admission_error.is_none());
-        assert_eq!(provider_responses.len(), 1);
-        assert_eq!(provider_responses[0].provider, "launch-fail");
+        assert!(
+            fatal_admission_error.is_none(),
+            "should carry no fatal admission error"
+        );
+        assert_eq!(
+            provider_responses.len(),
+            1,
+            "should keep one launch-failure response"
+        );
+        assert_eq!(
+            provider_responses[0].provider, "launch-fail",
+            "should attribute the response to the failed provider"
+        );
         assert_eq!(
             provider_responses[0].metadata["error_type"],
             ERROR_TYPE_LAUNCH_FAILED
         );
         assert!(http.recorded_backend_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_failure_plus_prelaunch_timeout_remains_a_completed_auction() {
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[
+                    ("launch-fail", RoutingMode::AllEligible),
+                    ("timeout", RoutingMode::AllEligible),
+                ],
+                false,
+            ))
+            .expect("should compile mixed-outcome plan"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let backend = Arc::new(FailThenZeroCanonicalBackend::new());
+        let http = Arc::new(StubHttpClient::new());
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let result = orchestrator
+            .run_auction(&planned_request(), &context)
+            .await
+            .expect("should treat a pre-launch timeout as a completed provider outcome");
+
+        assert_eq!(
+            result.provider_responses.len(),
+            2,
+            "should retain both provider outcomes"
+        );
+        assert!(
+            result.provider_responses.iter().any(|response| {
+                response.provider == "launch-fail"
+                    && response.metadata["error_type"] == ERROR_TYPE_LAUNCH_FAILED
+            }),
+            "should retain the launch-failure outcome"
+        );
+        assert!(
+            result.provider_responses.iter().any(|response| {
+                response.provider == "timeout"
+                    && response.metadata["error_type"] == ERROR_TYPE_TIMEOUT
+            }),
+            "should retain the pre-launch timeout outcome"
+        );
+        assert_eq!(
+            backend.ensured.load(Ordering::Relaxed),
+            1,
+            "should attempt only the provider with a transport budget"
+        );
+        assert!(
+            http.recorded_backend_names().is_empty(),
+            "should start no provider network requests"
+        );
     }
 
     #[tokio::test]
@@ -3027,6 +3095,49 @@ mod tests {
             _configured_ms: u32,
         ) -> u32 {
             0
+        }
+    }
+
+    struct FailThenZeroCanonicalBackend {
+        canonicalizations: AtomicUsize,
+        ensured: AtomicUsize,
+    }
+
+    impl FailThenZeroCanonicalBackend {
+        fn new() -> Self {
+            Self {
+                canonicalizations: AtomicUsize::new(0),
+                ensured: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PlatformBackend for FailThenZeroCanonicalBackend {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            BackendNamingPolicy::Axum
+        }
+
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            BackendNamingPolicy::Axum
+                .predict(spec)
+                .map(|prediction| prediction.name)
+                .change_context(PlatformError::Backend)
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.ensured.fetch_add(1, Ordering::Relaxed);
+            Err(Report::new(PlatformError::Backend))
+        }
+
+        fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+            if self.canonicalizations.fetch_add(1, Ordering::Relaxed) == 0 {
+                remaining_ms.min(configured_ms)
+            } else {
+                0
+            }
         }
     }
 
@@ -4006,7 +4117,7 @@ mod tests {
         stub.push_response(200, b"{}".to_vec());
         stub.push_response(200, b"{}".to_vec());
         stub.push_select_delay(Duration::ZERO);
-        stub.push_select_delay(Duration::from_millis(50));
+        stub.push_wait_delay(Duration::from_millis(50));
         let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
         let config = AuctionConfig {
             enabled: true,
@@ -5707,7 +5818,7 @@ mod tests {
         );
         http.push_response(200, b"{}".to_vec());
         http.push_select_delay(Duration::ZERO);
-        http.push_select_delay(Duration::from_millis(50));
+        http.push_wait_delay(Duration::from_millis(50));
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
@@ -6212,7 +6323,7 @@ mod tests {
         assert_eq!(
             debug["responseheaders"],
             serde_json::json!({"content-type": ["application/json"]}),
-            "async stub should preserve queued response headers"
+            "async stub should preserve allowlisted response headers"
         );
         assert!(
             debug["requestbody"]

@@ -90,11 +90,11 @@ request shape and returns an OpenRTB response with first-party processed
 creatives. Creative URLs are rewritten by default; set
 `[auction].sanitize_creatives = true` to strip executable markup.
 
-**Request Body:**
-
 Configured provider IDs appear in response metadata and provider responses.
 Consumers that previously matched the literal provider name `prebid` must use
 the configured provider ID, such as `pbs-main`.
+
+**Request Body:**
 
 ```json
 {

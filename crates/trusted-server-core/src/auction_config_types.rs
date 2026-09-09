@@ -1,8 +1,12 @@
 //! Auction configuration types shared by settings and auction planning.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use validator::Validate;
+
+const LEGACY_PROVIDER_LIST_MESSAGE: &str = "Configuration field `auction.providers` uses the removed list schema; migrate to `[auction.providers.<id>]` map entries as described in the CHANGELOG.md breaking migration";
 
 pub use crate::auction::plan::{
     BidderId, BidderRouteConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
@@ -46,7 +50,7 @@ pub struct AuctionConfig {
     pub rewrite_creatives: bool,
 
     /// Operator-defined bidder-provider instances, keyed by provider ID.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_provider_map")]
     pub providers: BTreeMap<ProviderId, ProviderConfig>,
 
     /// Client-visible bidder routes, keyed by bidder code.
@@ -89,6 +93,39 @@ impl Default for AuctionConfig {
             allowed_context_keys: HashSet::new(),
         }
     }
+}
+
+fn deserialize_provider_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<ProviderId, ProviderConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ProviderMapVisitor;
+
+    impl<'de> Visitor<'de> for ProviderMapVisitor {
+        type Value = BTreeMap<ProviderId, ProviderConfig>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of auction provider IDs to provider configurations")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            Self::Value::deserialize(MapAccessDeserializer::new(map))
+        }
+
+        fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            Err(A::Error::custom(LEGACY_PROVIDER_LIST_MESSAGE))
+        }
+    }
+
+    deserializer.deserialize_any(ProviderMapVisitor)
 }
 
 fn default_timeout() -> u32 {

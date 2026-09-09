@@ -321,24 +321,6 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
-python3 - "$WORK/fastly.toml" <<'PYEOF'
-import sys
-
-with open(sys.argv[1], "a") as manifest:
-    manifest.write('''
-[[local_server.secret_stores.ts_secrets]]
-key = "publisher_proxy_secret"
-data = "fictional-local-publisher-proxy-secret-value"
-
-[[local_server.secret_stores.ts_secrets]]
-key = "ec_passphrase"
-data = "fictional-local-ec-passphrase-secret-value"
-
-[[local_server.secret_stores.ts_secrets]]
-key = "handler_password"
-data = "fictional-local-handler-password-secret-value"
-''')
-PYEOF
 
 # The application registers provider backends dynamically. Pre-register the exact
 # deterministic name so Viceroy reuses a local backend that trusts the temporary CA.
@@ -382,6 +364,25 @@ if content.count(marker) != 1:
     raise SystemExit("expected one local backend insertion target")
 content = content.replace(marker, f"{marker}{backend}\n", 1)
 open(manifest, "w").write(content)
+PYEOF
+
+python3 - "$WORK/fastly.toml" <<'PYEOF'
+import sys
+
+with open(sys.argv[1], "a") as manifest:
+    manifest.write('''
+[[local_server.secret_stores.ts_secrets]]
+key = "publisher_proxy_secret"
+data = "fictional-local-publisher-proxy-secret-value"
+
+[[local_server.secret_stores.ts_secrets]]
+key = "ec_passphrase"
+data = "fictional-local-ec-passphrase-secret-value"
+
+[[local_server.secret_stores.ts_secrets]]
+key = "handler_password"
+data = "fictional-local-handler-password-secret-value"
+''')
 PYEOF
 
 ln -s "$REPO_ROOT/crates" "$WORK/crates"

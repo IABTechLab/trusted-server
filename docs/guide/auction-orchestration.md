@@ -204,14 +204,19 @@ Convert OrchestrationResult → OpenRTB 2.x Response
 
 The orchestrator is composed of several modules:
 
-| Module            | Path                                      | Purpose                                     |
-| ----------------- | ----------------------------------------- | ------------------------------------------- |
-| `orchestrator.rs` | `crates/trusted-server-core/src/auction/` | Core parallel execution and bid selection   |
-| `provider.rs`     | `crates/trusted-server-core/src/auction/` | `AuctionProvider` trait definition          |
-| `types.rs`        | `crates/trusted-server-core/src/auction/` | Data structures (AuctionRequest, Bid, etc.) |
-| `formats.rs`      | `crates/trusted-server-core/src/auction/` | Format conversions (TSJS ↔ OpenRTB)         |
-| `endpoints.rs`    | `crates/trusted-server-core/src/auction/` | HTTP handler for `POST /auction`            |
-| `config.rs`       | `crates/trusted-server-core/src/auction/` | Auction configuration types                 |
+| Module            | Path                                      | Purpose                                      |
+| ----------------- | ----------------------------------------- | -------------------------------------------- |
+| `orchestrator.rs` | `crates/trusted-server-core/src/auction/` | Parallel execution and bid selection         |
+| `plan.rs`         | `crates/trusted-server-core/src/auction/` | Provider-plan compilation and validation     |
+| `profile.rs`      | `crates/trusted-server-core/src/auction/` | Typed OpenRTB profile policies               |
+| `routing.rs`      | `crates/trusted-server-core/src/auction/` | Bidder ownership and provider routing        |
+| `openrtb.rs`      | `crates/trusted-server-core/src/auction/` | Shared OpenRTB request and response handling |
+| `provider.rs`     | `crates/trusted-server-core/src/auction/` | `AuctionProvider` trait and planned provider |
+| `telemetry.rs`    | `crates/trusted-server-core/src/auction/` | Auction event construction                   |
+| `types.rs`        | `crates/trusted-server-core/src/auction/` | Auction request, response, and bid types     |
+| `formats.rs`      | `crates/trusted-server-core/src/auction/` | TSJS and OpenRTB format conversions          |
+| `endpoints.rs`    | `crates/trusted-server-core/src/auction/` | HTTP handler for `POST /auction`             |
+| `config.rs`       | `crates/trusted-server-core/src/auction/` | Auction configuration types                  |
 
 ### Configuration-first plan
 

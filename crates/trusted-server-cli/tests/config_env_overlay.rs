@@ -4,7 +4,7 @@ use std::fs;
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
-use toml_edit::{DocumentMut, value};
+use toml_edit::{Array, DocumentMut, value};
 
 const LEGACY_CONFIG: &str = include_str!(
     "../../trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml"
@@ -80,6 +80,43 @@ fn validate_with_overlay(project: &MigratedProject, raw_value: &str) -> Output {
         .env(REWRITE_ENV, raw_value)
         .output()
         .expect("should run ts config validate")
+}
+
+#[test]
+fn config_validate_explains_legacy_provider_list_migration() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    let mut providers = Array::new();
+    providers.push("prebid");
+    document["auction"]["providers"] = value(providers);
+    fs::write(&project.config_path, document.to_string())
+        .expect("should write legacy provider-list config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args(["config", "validate", "--manifest"])
+        .arg(&project.manifest_path)
+        .arg("--app-config")
+        .arg(&project.config_path)
+        .current_dir(project.directory.path())
+        .output()
+        .expect("should run ts config validate");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "legacy provider list should fail validation"
+    );
+    assert!(
+        stderr.contains("auction.providers"),
+        "error should identify the removed field: {stderr}"
+    );
+    assert!(
+        stderr.contains("CHANGELOG.md"),
+        "error should direct operators to migration guidance: {stderr}"
+    );
 }
 
 #[test]

@@ -48,12 +48,13 @@ ts config validate
 ts config push --adapter fastly
 ```
 
-### Secret-store migration
+### Static secret references
 
 Static app-config credentials contain stable key names only. This includes
-publisher, EC, handler, Tinybird, DataDome, and S3 credential fields:
+publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
+- `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
 - `ec.passphrase`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
@@ -68,19 +69,17 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
-Migrate an existing deployment in this order:
+Prepare an initial reference-based deployment in this order:
 
-1. Populate the physical store mapped from `trusted_server_secrets` with the
-   existing credential values without printing them in shell history, logs, or
-   CI output.
-2. Replace each active credential value with a stable key name and remove the
-   legacy Tinybird, DataDome, and S3 `secret_store` selectors.
-3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
-4. Restart/redeploy instances as needed to load the new values. Rotation is
-   startup-scoped; changing a store value does not alter already-built state.
+1. Create the physical store and configure its `trusted_server_secrets` mapping.
+2. Choose a stable key name for each active credential field in the app config.
+3. Write each credential value under its referenced key without exposing it in
+   command arguments, shell history, logs, or CI output.
+4. Run `ts config validate`, then `ts config push --adapter fastly`.
+5. Start or deploy instances after the store and pushed config are both ready.
 
-`--no-diff` prevents `config push` from rendering the previous plaintext
-configuration during this migration.
+Changing a store value does not alter already-built state. Restart or redeploy
+instances when rotating static credentials.
 
 Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
 rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
@@ -436,11 +435,11 @@ it but keep using their own runtime client address.
 
 ### `[trusted_client_ip]`
 
-| Field           | Type   | Required | Description                                                                       |
-| --------------- | ------ | -------- | --------------------------------------------------------------------------------- |
-| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                                   |
-| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                                 |
-| `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
+| Field           | Type   | Required | Description                                                      |
+| --------------- | ------ | -------- | ---------------------------------------------------------------- |
+| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                  |
+| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                |
+| `shared_secret` | String | Yes      | Key in `trusted_server_secrets` for the front-door shared secret |
 
 All three fields are required when the section exists. When the section is
 absent, Trusted Server continues to use the immediate peer address, and
@@ -460,7 +459,7 @@ this order wrong takes the service down rather than degrading it.
 [trusted_client_ip]
 ip_header = "x-ts-client-ip"
 auth_header = "x-ts-client-ip-auth"
-shared_secret = "replace-with-a-random-shared-secret"
+shared_secret = "trusted_client_ip_shared_secret"
 ```
 
 Prefer a dedicated `x-` name for `ip_header`, as shown. `fastly-client-ip` is
@@ -472,8 +471,9 @@ front-door configuration this section depends on.
 
 The front door must overwrite both headers on every request it forwards to
 Trusted Server, and must remove client-supplied copies on its other routes.
-Trusted Server accepts the forwarded address only when the request has exactly
-one `auth_header` value that matches `shared_secret` byte-for-byte and exactly
+Trusted Server resolves `shared_secret` from `trusted_server_secrets` at startup.
+It accepts the forwarded address only when the request has exactly one
+`auth_header` value that matches the resolved secret byte-for-byte and exactly
 one `ip_header` value that parses directly as IPv4 or IPv6. Values are not
 trimmed or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
 values do not reject the request; Trusted Server safely falls back to the
@@ -491,12 +491,12 @@ sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
 dedicated `x-` names that no other application or routing logic uses, because
 Trusted Server removes the configured headers before routing.
 
-Generate `shared_secret` with a cryptographically secure random generator,
-encode it as hex or base64url, store the same value only in the front door and
-Trusted Server configuration, and never commit it. The value is redacted from
-configuration debug output. Configuration requires at least 32 ASCII graphic
-bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
-and startup fails when the value is still the documented placeholder.
+Generate the referenced secret value with a cryptographically secure random
+generator, encode it as hex or base64url, and store the same value only in the
+front door and the physical store mapped from `trusted_server_secrets`. Put only
+the key name in Trusted Server configuration. The resolved value must contain at
+least 32 ASCII graphic bytes (`!` through `~`) with no whitespace, controls, DEL,
+or non-ASCII bytes.
 
 Independently of this section, the Fastly adapter treats `fastly-client-ip` as
 client-spoofable and strips it at request entry, so Trusted Server no longer
@@ -504,18 +504,17 @@ forwards an inbound `Fastly-Client-IP` to the publisher origin. This applies
 even when `[trusted_client_ip]` is absent. Check whether the origin reads that
 header before deploying.
 
-Redaction protects debug output and validation errors; it does not move the
-value into a platform secret store. `ts config push` serializes the value in the
-Trusted Server application-config blob, so restrict access to that configuration
-store. Every adapter removes the configured IP and authentication headers before
-routing, although only Fastly uses them for client-IP resolution.
+Startup fails closed if the configured key is missing, empty, invalid UTF-8, or
+resolves to an invalid shared-secret value. Every adapter removes the configured
+IP and authentication headers before routing, although only Fastly uses them for
+client-IP resolution.
 
 **Environment Overrides**:
 
 ```bash
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=x-ts-client-ip
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
-TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=replace-with-a-random-shared-secret
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=trusted_client_ip_shared_secret
 ```
 
 Because the typed environment overlay cannot create a missing section, add
@@ -655,15 +654,16 @@ Cache-Control = "public, max-age=3600"
 
 **Environment Override**:
 
-Use a JSON object to preserve header name casing and hyphens:
+Override an existing header leaf by preserving its TOML key punctuation in the
+environment path. Shell assignment syntax cannot contain hyphens, so use `env`:
 
 ```bash
-TRUSTED_SERVER__RESPONSE_HEADERS='{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}'
+env 'TRUSTED_SERVER__RESPONSE_HEADERS__X-CUSTOM-HEADER=updated value' \
+  ts config validate
 ```
 
-::: tip Why JSON?
-Individual env var keys like `TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER` lose hyphens and casing (becoming `x_custom_header`). The JSON format preserves exact header names.
-:::
+The overlay cannot add a header or replace the whole `response_headers` table.
+Edit TOML, validate, and push again for those changes.
 
 **Use Cases**:
 
@@ -908,17 +908,8 @@ exclude_domains = [
 
 **Environment Override**:
 
-```bash
-# JSON array
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS='["*.cdn.example.com","localhost"]'
-
-# Indexed
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS__0="*.cdn.example.com"
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS__1="localhost"
-
-# Comma-separated
-TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS="*.cdn.example.com,localhost"
-```
+EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
+`exclude_domains` in TOML, then validate and push the file again.
 
 ### Pattern Matching
 
@@ -999,17 +990,8 @@ allowed_domains = [
 
 **Environment Override**:
 
-```bash
-# JSON array
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["assets.example.com","*.cdn.example.com"]'
-
-# Indexed
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="assets.example.com"
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.cdn.example.com"
-
-# Comma-separated
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="assets.example.com,*.cdn.example.com"
-```
+EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
+`allowed_domains` in TOML, then validate and push the file again.
 
 ### Field Details
 
@@ -1526,9 +1508,10 @@ max_combined_payload_bytes = 10485760
 
 ```bash
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES=href,link,url,src
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
+
+Edit `rewrite_attributes` in TOML because the overlay cannot replace arrays.
 
 ### Osano Integration
 
@@ -1661,7 +1644,7 @@ remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
 roll back the binary.
 
-**Environment overlays:** EdgeZero's env overlays cannot create missing TOML
+**Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
@@ -1721,6 +1704,7 @@ protocol = "openrtb-2.6"
 profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
+timeout_ms = 1200
 
 [auction.providers.pbs-main.profile_config]
 debug = false
@@ -2462,7 +2446,7 @@ trusted-server.dev.toml      # Development overrides
 **Environment Variables Not Applied**:
 
 - Run the override through `ts config validate`, `ts config diff`, or `ts config push`
-- Verify the target leaf already exists in `trusted-server.toml`; the env overlay does not create missing fields
+- Verify the target leaf already exists in `trusted-server.toml`; the pinned EdgeZero loader does not create missing fields
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm the variable is exported: `echo $VARIABLE_NAME`
