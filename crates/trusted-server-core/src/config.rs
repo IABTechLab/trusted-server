@@ -172,6 +172,13 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 false,
             ),
             field(
+                vec![
+                    optional_object("trusted_client_ip"),
+                    object("shared_secret"),
+                ],
+                false,
+            ),
+            field(
                 vec![optional_object("tinybird"), object("auction_token_secret")],
                 true,
             ),
@@ -244,11 +251,11 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
+    validate_js_asset_proxy_config(settings)?;
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
     structural_settings.validate_admin_coverage()?;
-    validate_js_asset_proxy_config(settings)?;
 
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
@@ -266,8 +273,8 @@ pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    settings.validate_admin_handler_passwords()?;
     validate_js_asset_proxy_config(settings)?;
+    settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
@@ -411,6 +418,13 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         )?;
     }
 
+    if let Some(trusted_client_ip) = &settings.trusted_client_ip {
+        validate_secret_key_reference(
+            "trusted_client_ip.shared_secret",
+            trusted_client_ip.shared_secret.expose(),
+        )?;
+    }
+
     if settings.tinybird.enabled && settings.tinybird.auction_enabled {
         let token = settings
             .tinybird
@@ -487,7 +501,7 @@ fn validate_secret_key_reference(
     path: &str,
     key_name: &str,
 ) -> Result<(), Report<TrustedServerError>> {
-    if key_name.is_empty() {
+    if key_name.trim().is_empty() {
         return Err(missing_secret_key_reference(path));
     }
     Ok(())
@@ -515,7 +529,7 @@ mod tests {
     use super::*;
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::redacted::Redacted;
-    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig};
+    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
 
@@ -761,6 +775,7 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
+                ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 ("tinybird.access_token_secret".to_owned(), true),
                 (
@@ -910,6 +925,26 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn wrapper_rejects_legacy_auction_provider_list_with_migration_guidance() {
+        let toml = format!(
+            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            crate_test_settings_str()
+        );
+
+        let error = toml::from_str::<TrustedServerAppConfig>(&toml)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("auction.providers"),
+            "should identify the removed field: {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "should direct operators to migration guidance: {rendered}"
+        );
+    }
+
+    #[test]
     fn static_gam_unit_template_is_accepted_by_legacy_schema() {
         let creative_opportunities = serialized_creative_opportunities(Some("/99999/example/home"));
 
@@ -963,6 +998,33 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("publisher.proxy_secret"),
             "error should identify the empty secret reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_new_accepts_trusted_client_ip_secret_key_reference() {
+        let mut settings = valid_settings();
+        settings.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-ts-client-ip".to_owned(),
+            auth_header: "x-ts-client-ip-auth".to_owned(),
+            shared_secret: Redacted::new("trusted_client_ip_shared_secret".to_owned()),
+        });
+
+        TrustedServerAppConfig::new(settings)
+            .expect("should validate the shared-secret key name without treating it as the value");
+    }
+
+    #[test]
+    fn app_config_new_rejects_whitespace_secret_key_reference() {
+        let mut settings = valid_settings();
+        settings.publisher.proxy_secret = Redacted::new(" \t ".to_owned());
+
+        let err = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject a whitespace-only secret key reference");
+
+        assert!(
+            err.to_string().contains("publisher.proxy_secret"),
+            "error should identify the whitespace-only secret reference: {err:?}"
         );
     }
 
@@ -1160,6 +1222,33 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn deploy_validation_rejects_retired_aps_fields_when_explicitly_disabled() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({
+                    "enabled": false,
+                    "endpoint": "https://aps.example.com/e/pb/bid"
+                }),
+            )
+            .expect("should insert disabled APS config with a retired field");
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject retired APS server fields when explicitly disabled");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("Integration 'aps' configuration could not be parsed"),
+            "should identify the APS configuration: {rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint"),
+            "should identify the retired APS field: {rendered}"
+        );
+    }
+
+    #[test]
     fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
         let mut settings = valid_settings();
         settings.proxy.allowed_domains.clear();
@@ -1170,6 +1259,27 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("proxy.allowed_domains"),
             "error should mention proxy.allowed_domains: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_enabled_js_asset_proxy_config() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "js_asset_proxy".to_string(),
+            serde_json::json!({ "enabled": true }),
+        );
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject invalid JS asset proxy config");
+        let message = err.to_string();
+        assert!(
+            message.contains("js_asset_proxy"),
+            "error should mention JS asset proxy validation"
+        );
+        assert!(
+            message.contains("empty_assets") || message.contains("assets"),
+            "error should mention the missing assets"
         );
     }
 
@@ -1222,27 +1332,6 @@ password = "production-admin-password-32-bytes"
             error
                 .to_string()
                 .contains("both client-side and server-side")
-        );
-    }
-
-    #[test]
-    fn validate_rejects_invalid_enabled_js_asset_proxy_config() {
-        let mut settings = valid_settings();
-        settings.integrations.insert(
-            "js_asset_proxy".to_string(),
-            serde_json::json!({ "enabled": true }),
-        );
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject invalid JS asset proxy config");
-        let message = err.to_string();
-        assert!(
-            message.contains("js_asset_proxy"),
-            "error should mention JS asset proxy validation"
-        );
-        assert!(
-            message.contains("empty_assets") || message.contains("assets"),
-            "error should mention the missing assets"
         );
     }
 

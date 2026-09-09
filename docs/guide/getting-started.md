@@ -53,12 +53,18 @@ Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastl
 cargo install viceroy --version 0.17.0 --locked --force
 ```
 
-Start the local Fastly simulator:
+Create and push the starter config, then start the local Fastly simulator:
 
 ```bash
+cp trusted-server.example.toml trusted-server.toml
+set -a && source .env.dev && set +a
+
+ts config push --adapter fastly --local --yes --no-diff
 fastly compute serve
 ```
 
+The local manifest provides public development-only values for the starter
+config's three secret references. Do not reuse them outside local development.
 The server will be available at `http://localhost:7676`.
 
 ### Option B — Axum dev server
@@ -72,8 +78,7 @@ the variables into your shell before starting the server.
 ```bash
 # Create the local app config and apply the non-secret development overlay.
 cp trusted-server.example.toml trusted-server.toml
-cp .env.dev .env
-set -a && source .env && set +a
+set -a && source .env.dev && set +a
 
 # Create the local blob-backed config-store entry.
 ts config push --adapter axum --local --yes
@@ -152,33 +157,34 @@ only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- browser integrations under `[integrations.*]`
-- server auction providers under map-shaped `[auction.providers.<id>]`
-- server bidder routes under `[auction.bidders.<id>]`
-- ad server integrations
-- KV store mappings
-- EC configuration
-- consent settings under `[gdpr]`
-- stable key names for `trusted_server_secrets`
+- browser integrations under `[integrations.*]`;
+- server auction providers under map-shaped `[auction.providers.<id>]`;
+- server bidder routes under `[auction.bidders.<id>]`;
+- ad server integrations;
+- KV store mappings;
+- EC configuration;
+- consent settings (`[gdpr]`); and
+- stable key names for `trusted_server_secrets`.
 
 Do not put a Prebid Server URL or server bidder list under
-`[integrations.prebid]`, and do not put APS account, endpoint, or timeout fields
-under `[integrations.aps]`. Those server values belong to auction provider
-common fields and `profile_config`.
+`[integrations.prebid]`, and do not put APS account/endpoint/timeout fields under
+`[integrations.aps]`. Those server values belong to auction provider common
+fields and `profile_config`.
 
-Provision the physical store mapped from logical `trusted_server_secrets` with
-the existing credential values before pushing a migrated config. On Fastly,
-`ts_secrets` is the documented example physical name. Then validate and push:
+Before the first push, provision the physical store mapped from logical
+`trusted_server_secrets` with the credential values referenced by the config.
+On Fastly, `ts_secrets` is the documented example physical name. Then validate
+and push:
 
 ```bash
 ts config validate
 ts config push --adapter fastly
 ```
 
-The validation command performs target-independent plan validation. Each adapter
-performs mandatory target-aware fan-out and backend-name validation at startup.
-The EdgeZero callback needed for target-aware pre-write push validation is not
-yet available in this tree, so startup remains the final target gate.
+This command performs target-independent plan validation. Each adapter performs
+mandatory target-aware fan-out and backend-name validation at startup. The
+EdgeZero callback needed for target-aware pre-write push validation is not yet
+available in this tree, so startup remains the final target gate.
 
 Restart or redeploy instances after secret rotation. See
 [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.

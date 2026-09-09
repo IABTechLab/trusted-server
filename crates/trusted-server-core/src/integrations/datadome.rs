@@ -399,17 +399,12 @@ impl DataDomeIntegration {
             });
         config.protection_api_origin = config.protection_api_origin.trim().to_string();
         config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
-        if let Some(bypass) = &mut config.protection_test_bypass {
-            if bypass.credential_secret_store.take().is_some() {
-                log::warn!(
-                    "DataDome credential_secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
-                );
-            }
-            bypass.credential_secret_name =
-                bypass.credential_secret_name.take().and_then(|value| {
-                    let value = value.expose().trim().to_string();
-                    (!value.is_empty()).then(|| Redacted::new(value))
-                });
+        if let Some(bypass) = &mut config.protection_test_bypass
+            && bypass.credential_secret_store.take().is_some()
+        {
+            log::warn!(
+                "DataDome credential_secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
         }
 
         if config.enable_protection {
@@ -515,7 +510,11 @@ impl DataDomeIntegration {
                 "protection_test_bypass requires enable_protection to be true",
             )));
         }
-        if bypass.credential_secret_name.is_none() {
+        if bypass
+            .credential_secret_name
+            .as_ref()
+            .is_none_or(|credential| credential.expose().is_empty())
+        {
             return Err(Report::new(Self::error(
                 "protection_test_bypass credential_secret_name is required when enabled",
             )));
@@ -1302,6 +1301,34 @@ mod tests {
 
         DataDomeIntegration::try_new(config)
             .expect("should defer bypass credential strength enforcement to requests");
+    }
+
+    #[test]
+    fn protection_test_bypass_preserves_resolved_credential() {
+        let credential = " resolved-test-bypass-credential-32-bytes ";
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.server_side_key_secret_name = Some(Redacted::new("resolved-server-key".to_string()));
+        config.protection_test_bypass = Some(ProtectionTestBypassConfig {
+            enabled: true,
+            credential_secret_store: None,
+            credential_secret_name: Some(Redacted::new(credential.to_owned())),
+        });
+
+        let integration =
+            DataDomeIntegration::try_new(config).expect("should create DataDome integration");
+        let resolved = integration
+            .config
+            .protection_test_bypass
+            .as_ref()
+            .and_then(|bypass| bypass.credential_secret_name.as_ref())
+            .expect("should retain the resolved bypass credential");
+
+        assert_eq!(
+            resolved.expose(),
+            credential,
+            "should not normalize resolved secret material"
+        );
     }
 
     #[test]

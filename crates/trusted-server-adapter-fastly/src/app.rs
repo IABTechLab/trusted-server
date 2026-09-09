@@ -90,6 +90,7 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::env_config::EnvConfig;
@@ -1521,7 +1522,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let runtime_env = EnvConfig::from_env();
+        let runtime_env = runtime_env_config(Self::stores());
         let stores = RuntimeStoreConfig::from_env(&runtime_env);
         Self::router_with_state(&stores).0
     }
@@ -1554,9 +1555,10 @@ mod tests {
     use super::{
         AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
         NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RouteClass, RouteMetadata,
-        RuntimeStoreConfig, TSJS_ROUTE_TEMPLATE, TrustedServerApp, build_per_request_services,
-        build_state_from_settings, handle_publisher_request,
-        publisher_response_into_streaming_response, publisher_route_template, startup_error_router,
+        RuntimeStoreConfig, TSJS_ROUTE_TEMPLATE, TrustedServerApp, build_orchestrator_with_plan,
+        build_per_request_services, build_state_from_settings, compile_auction_plan,
+        handle_publisher_request, publisher_response_into_streaming_response,
+        publisher_route_template, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -3367,16 +3369,13 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build();
-        let plan = Arc::new(
-            trusted_server_core::auction::compile_auction_plan(&settings)
-                .expect("should compile auction plan"),
-        );
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
         let registry = Arc::new(
             IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
                 .expect("should build integration registry"),
         );
         let orchestrator = Arc::new(
-            trusted_server_core::auction::build_orchestrator_with_plan(plan, &settings)
+            build_orchestrator_with_plan(plan, &settings)
                 .expect("should build auction orchestrator"),
         );
 

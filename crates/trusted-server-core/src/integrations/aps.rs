@@ -18,6 +18,7 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction::openrtb::ignored_bidder_params_count;
+use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 #[cfg(test)]
 use crate::auction::plan::{AuctionPlanConfig, NotificationConfig, ProviderConfig, RoutingMode};
 use crate::auction::profile::ApsProfilePlan;
@@ -932,7 +933,7 @@ pub(crate) async fn parse_planned_aps_response(
         };
         return Ok(attach_planned_aps_metadata(
             AuctionResponse::error(provider_id, response_time_ms)
-                .with_metadata("error_type", json!("http_status"))
+                .with_metadata("error_type", json!(ERROR_TYPE_HTTP_STATUS))
                 .with_metadata("http_status", json!(status.as_u16())),
             &policy,
             input,

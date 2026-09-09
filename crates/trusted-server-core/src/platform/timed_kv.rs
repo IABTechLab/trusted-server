@@ -89,6 +89,11 @@ impl<S: EcKvStore> EcKvStore for TimedKvStore<S> {
         self.inner.lookup(key)
     }
 
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        let _span = self.timings.span(Phase::EcKv);
+        self.inner.key_exists(key)
+    }
+
     fn insert(
         &self,
         key: &str,

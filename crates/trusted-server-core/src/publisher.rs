@@ -4623,10 +4623,7 @@ pub async fn handle_publisher_request(
                 &consent_context,
                 &request_info,
                 &settings.publisher.domain,
-                auction_client_request
-                    .headers()
-                    .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
+                user_agent,
             );
             apply_auction_eids_and_device(
                 &mut auction_request,
@@ -7248,6 +7245,10 @@ mod tests {
             // Report a miss: the scheduling assertions only care about ordering.
             Ok(None)
         }
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
         fn insert(
             &self,
             key: &str,

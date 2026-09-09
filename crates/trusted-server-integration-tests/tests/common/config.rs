@@ -46,7 +46,8 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
 mod tests {
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
-    const VICEROY_SERVICE_ID: &str = "0000000000000000000000";
+    const VICEROY_SECRET_STORE_MAPPING_KEY: &str =
+        "EDGEZERO__SERVICES__0000000000000000000000__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME";
 
     #[test]
     fn local_fastly_config_defines_runtime_kv_stores() {
@@ -73,24 +74,48 @@ mod tests {
     }
 
     #[test]
-    fn local_fastly_configs_scope_runtime_secret_mapping_to_viceroy_service() {
-        let runtime_mapping_key = format!(
-            "EDGEZERO__SERVICES__{VICEROY_SERVICE_ID}__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME"
-        );
-
+    fn local_fastly_secret_store_mapping_is_service_scoped() {
         for (name, config) in [
-            ("root fastly.toml", FASTLY_CONFIG),
-            ("integration Viceroy template", VICEROY_TEMPLATE),
+            ("fastly.toml", FASTLY_CONFIG),
+            ("Viceroy integration template", VICEROY_TEMPLATE),
         ] {
             let parsed: toml::Value =
-                toml::from_str(config).expect("should parse local Fastly configuration");
-            let contents =
+                toml::from_str(config).expect("should parse Fastly configuration");
+            let runtime_env =
                 &parsed["local_server"]["config_stores"]["edgezero_runtime_env"]["contents"];
 
             assert_eq!(
-                contents[&runtime_mapping_key].as_str(),
+                runtime_env[VICEROY_SECRET_STORE_MAPPING_KEY].as_str(),
                 Some("ts_secrets"),
-                "{name} should scope its secret-store mapping to Viceroy's service id"
+                "{name} should scope the secret-store mapping to Viceroy's service ID"
+            );
+            assert!(
+                runtime_env
+                    .get("EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME")
+                    .is_none(),
+                "{name} should not define the ignored unscoped secret-store mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn local_fastly_config_defines_starter_secret_references() {
+        let parsed: toml::Value =
+            toml::from_str(FASTLY_CONFIG).expect("should parse root fastly.toml");
+        let entries = parsed["local_server"]["secret_stores"]["ts_secrets"]
+            .as_array()
+            .expect("fastly.toml should define ts_secrets");
+
+        for key in [
+            "publisher_proxy_secret",
+            "ec_passphrase",
+            "handler_password",
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["key"].as_str() == Some(key)),
+                "fastly.toml should define local value for starter secret `{key}`"
             );
         }
     }
