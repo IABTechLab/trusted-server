@@ -23,6 +23,7 @@ workspace = true
 [dependencies]
 edgezero-core = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
@@ -40,7 +41,6 @@ reqwest = { workspace = true, features = ["blocking", "cookies"] }
 scraper = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-toml = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
 trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }

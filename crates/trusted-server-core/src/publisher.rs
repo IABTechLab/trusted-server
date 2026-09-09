@@ -3015,6 +3015,7 @@ fn make_collect_context<'a>(
         settings,
         request: placeholder,
         timeout_ms: 0,
+        transport_timeout_ms: 0,
         provider_responses: None,
         services,
     }
@@ -4462,11 +4463,16 @@ pub async fn handle_publisher_request(
         // trusted-server edge host, so using it here would attribute navigation
         // rows to the edge/staging domain while `/auction` rows (built from
         // `AuctionRequest::publisher.domain`) use the configured domain.
+        let user_agent = auction_client_request
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok());
         let observation = AuctionObservationContext::from_parts(
             AuctionSource::InitialNavigation,
             &settings.publisher.domain,
             &request_path,
             matched_slots.len(),
+            user_agent,
             ec_context,
         );
 
@@ -4481,10 +4487,7 @@ pub async fn handle_publisher_request(
                 &consent_context,
                 &request_info,
                 &settings.publisher.domain,
-                auction_client_request
-                    .headers()
-                    .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
+                user_agent,
             );
             apply_auction_eids_and_device(
                 &mut auction_request,
@@ -4503,6 +4506,7 @@ pub async fn handle_publisher_request(
                 settings,
                 request: &auction_client_request,
                 timeout_ms: auction_timeout_ms,
+                transport_timeout_ms: auction_timeout_ms,
                 provider_responses: None,
                 services,
             };
@@ -4519,8 +4523,18 @@ pub async fn handle_publisher_request(
                 DispatchAuctionOutcome::DispatchFailed {
                     request,
                     provider_responses,
+                    fatal_admission_error,
+                    metadata,
                     elapsed_ms,
                 } => {
+                    if let Some(error) = fatal_admission_error {
+                        log::warn!(
+                            "Auction admission failed before publisher dispatch; continuing without bids: {error:?}"
+                        );
+                    }
+                    if !metadata.is_empty() {
+                        log::info!("Auction dispatch failure metadata: {metadata:?}");
+                    }
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
                             observation,
@@ -6582,11 +6596,16 @@ pub async fn handle_page_bids(
     } else {
         // Same publisher identity as the outbound bid request — see the
         // matching note on the initial-navigation observation above.
+        let user_agent = req
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok());
         let observation = AuctionObservationContext::from_parts(
             AuctionSource::SpaNavigation,
             &settings.publisher.domain,
             &path_param,
             matched_slots.len(),
+            user_agent,
             ec_context,
         );
         if ad_stack_enabled && !is_bot && !is_prefetch {
@@ -6616,9 +6635,7 @@ pub async fn handle_page_bids(
                 &consent_context,
                 &request_info,
                 &settings.publisher.domain,
-                req.headers()
-                    .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
+                user_agent,
             );
             apply_auction_eids_and_device(
                 &mut auction_request,
@@ -6640,6 +6657,7 @@ pub async fn handle_page_bids(
                 settings,
                 request: &req,
                 timeout_ms,
+                transport_timeout_ms: timeout_ms,
                 provider_responses: None,
                 services,
             };
@@ -6955,6 +6973,10 @@ mod tests {
             // Report a miss: the scheduling assertions only care about ordering.
             Ok(None)
         }
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
         fn insert(
             &self,
             key: &str,
@@ -7001,11 +7023,13 @@ mod tests {
 
     fn scheduling_settings() -> Settings {
         let toml = format!(
-            "{}\n[auction]\nenabled = true\nproviders = [\"{SCHEDULING_PROVIDER}\"]\n\n\
+            "{}\n[auction]\nenabled = true\n\n\
              [creative_opportunities]\ngam_network_id = \"12345\"\n",
             crate_test_settings_str()
         );
         let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
+        settings.auction.providers =
+            crate::auction::AuctionConfig::legacy_provider_map(&[SCHEDULING_PROVIDER]);
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         settings
             .integrations
@@ -7308,6 +7332,7 @@ mod tests {
             creative: Some(creative.to_string()),
             adomain: None,
             bidder: "seat".to_string(),
+            returned_seat: None,
             width: 300,
             height: 250,
             nurl: None,
@@ -8220,8 +8245,14 @@ mod tests {
             .integrations
             .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
             .expect("should enable diagnostics");
-        let integration_registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let integration_registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let mut request = HttpRequest::builder()
             .method(Method::GET)
             .uri("https://publisher.example/article?ts_console=1")
@@ -8259,8 +8290,14 @@ mod tests {
     #[test]
     fn stream_publisher_body_round_trips_gzip() {
         let settings = create_test_settings();
-        let integration_registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let integration_registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.js\"}";
         let compressed = gzip_encode(input);
         let params = make_stream_params(&settings, "gzip");
@@ -8290,8 +8327,14 @@ mod tests {
     #[test]
     fn stream_publisher_body_round_trips_brotli() {
         let settings = create_test_settings();
-        let integration_registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let integration_registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.css\"}";
         let compressed = brotli_encode(input);
         let params = make_stream_params(&settings, "br");
@@ -8581,9 +8624,8 @@ mod tests {
                 "prebid".to_string(),
                 serde_json::json!({
                     "enabled": enabled,
-                    "server_url": "https://prebid.example.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
-                    "timeout": timeout_ms,
+                    "timeout_ms": timeout_ms,
                 }),
             );
             settings
@@ -9370,6 +9412,7 @@ mod tests {
                         creative: None,
                         adomain: None,
                         bidder: STUB_BIDDER.to_string(),
+                        returned_seat: None,
                         width: 728,
                         height: 90,
                         nurl: None,
@@ -9403,7 +9446,8 @@ mod tests {
         /// [`settings_with_mode`], with an auction provider that actually bids.
         fn settings_with_bidder(mode: &str) -> Settings {
             let mut settings = settings_with_mode(mode);
-            settings.auction.providers = vec![STUB_BIDDER.to_string()];
+            settings.auction.providers =
+                crate::auction_config_types::AuctionConfig::legacy_provider_map(&[STUB_BIDDER]);
             settings
         }
 
@@ -11337,9 +11381,8 @@ mod tests {
                 "prebid".to_string(),
                 serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://prebid.example.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
-                    "timeout": timeout_ms,
+                    "timeout_ms": timeout_ms,
                 }),
             );
             settings
@@ -14277,7 +14320,7 @@ mod tests {
 
         const ORIGIN_ETAG: &str = "\"origin-tag\"";
         const ORIGIN_LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
-        const UNEXPECTED_304_PROVIDER: &str = "example_navigation_bidder";
+        const UNEXPECTED_304_PROVIDER: &str = "example-navigation-bidder";
         const UNEXPECTED_304_BACKEND: &str = "example-navigation-bidder-backend";
 
         struct DispatchingTestProvider;
@@ -14336,7 +14379,7 @@ mod tests {
 
         #[async_trait::async_trait(?Send)]
         impl AuctionProvider for DispatchingTestProvider {
-            fn provider_name(&self) -> &'static str {
+            fn provider_name(&self) -> &str {
                 UNEXPECTED_304_PROVIDER
             }
 
@@ -14440,7 +14483,7 @@ mod tests {
 
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
+                "{}\n[auction]\nenabled = true\n\n[auction.providers.{UNEXPECTED_304_PROVIDER}]\nprotocol = \"openrtb-2.6\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
@@ -14749,6 +14792,45 @@ mod tests {
                     .expect("should lock telemetry batches")
                     .is_empty(),
                 "should not emit abandonment for an auction that never dispatched"
+            );
+        }
+
+        #[tokio::test]
+        async fn signer_admission_failure_continues_publisher_origin_without_provider_io() {
+            let mut settings = settings_with_dispatching_provider();
+            settings
+                .request_signing
+                .as_mut()
+                .expect("should configure request signing stores")
+                .enabled = true;
+            let plan = Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile signed navigation auction"),
+            );
+            let orchestrator = crate::auction::build_orchestrator_with_plan(plan, &settings)
+                .expect("should build signed plan-backed orchestrator");
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
+            let services = services_with_telemetry(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let slots = [article_slot()];
+
+            let response = run_with_orchestrator(
+                &settings,
+                &services,
+                &orchestrator,
+                &slots,
+                conditional_navigation_request(),
+            )
+            .await;
+
+            assert_eq!(response_head(response).status, StatusCode::OK);
+            assert_eq!(
+                stub.recorded_backend_names(),
+                vec!["stub-backend".to_string()],
+                "signer admission failure should skip provider I/O and still fetch the publisher origin"
             );
         }
 
@@ -15870,6 +15952,7 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "enable_protection": true,
+                    "server_side_key_secret_name": "server-side-key",
                     "protection_excluded_ip_cidrs": ["192.0.2.0/24"],
                     "client_side_key": "test-client-key",
                 }),
@@ -16899,8 +16982,14 @@ mod tests {
     #[test]
     fn tsjs_dynamic_returns_not_found_for_unknown_filename() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=unknown.js",
@@ -16914,8 +17003,14 @@ mod tests {
     #[test]
     fn tsjs_dynamic_serves_unified_bundle_for_known_filename() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-unified.min.js",
@@ -16933,8 +17028,14 @@ mod tests {
             .integrations
             .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
             .expect("should enable diagnostics");
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let mut req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-gpt_diagnostics.min.js",
@@ -17000,8 +17101,14 @@ mod tests {
     #[test]
     fn tsjs_dynamic_serves_prebid_shim_when_enabled() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
@@ -17025,13 +17132,18 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": false,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                 }),
             )
             .expect("should update prebid config");
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
@@ -17049,8 +17161,14 @@ mod tests {
     #[test]
     fn tsjs_dynamic_returns_not_found_for_arbitrary_module_name() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-evil.min.js",
@@ -17205,8 +17323,14 @@ mod tests {
         use std::io::Write;
 
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
 
         // Compress CSS containing an origin URL that should be rewritten.
         // CSS uses the text URL replacer (not lol_html), so inline URLs are rewritten.
@@ -17269,8 +17393,14 @@ mod tests {
     #[test]
     fn stream_publisher_body_handles_empty_body() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
@@ -17312,8 +17442,14 @@ mod tests {
     #[test]
     fn stream_publisher_body_rejects_stream_body_in_sync_path() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
             template_cache_key: None,
@@ -17430,8 +17566,14 @@ mod tests {
     fn stream_publisher_body_async_processes_stream_without_auction() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
@@ -17488,8 +17630,14 @@ mod tests {
     fn stream_publisher_body_async_processes_gzip_stream_without_auction() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
@@ -17549,8 +17697,14 @@ mod tests {
     fn stream_publisher_body_async_processes_deflate_stream_without_auction() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
@@ -17610,8 +17764,14 @@ mod tests {
     fn stream_publisher_body_async_processes_brotli_stream_without_auction() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
@@ -17671,8 +17831,14 @@ mod tests {
     fn stream_publisher_body_async_rejects_truncated_brotli_stream() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
@@ -17750,8 +17916,14 @@ mod tests {
     fn stream_publisher_body_async_rejects_truncated_gzip_stream() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = non_html_stream_params("gzip");
@@ -17787,8 +17959,14 @@ mod tests {
     fn stream_publisher_body_async_rejects_truncated_deflate_stream() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = non_html_stream_params("deflate");
@@ -17829,8 +18007,14 @@ mod tests {
             // decoded expansion exceeds it — the decompression-bomb case the
             // raw-byte cap alone cannot catch.
             settings.publisher.max_buffered_body_bytes = 1024;
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = non_html_stream_params("gzip");
@@ -17912,8 +18096,14 @@ mod tests {
     fn stream_publisher_body_async_processes_stream_with_auction_hold() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let state = AdBidsState::default();
@@ -17981,8 +18171,14 @@ mod tests {
     fn stream_publisher_body_async_auction_hold_decodes_multi_member_gzip_buffered() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let state = AdBidsState::default();
@@ -18053,8 +18249,14 @@ mod tests {
     fn stream_publisher_body_async_processes_non_html_stream_after_auction_collect() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let registry =
-                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
@@ -18112,7 +18314,14 @@ mod tests {
     fn drain_streaming_finalize_body(content_encoding: &str, body: EdgeBody) -> Vec<u8> {
         let settings = Arc::new(create_test_settings());
         let registry = Arc::new(
-            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+            IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry"),
         );
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
         let services = noop_services();
@@ -18237,7 +18446,14 @@ mod tests {
     ) -> EdgeBody {
         let settings = Arc::new(settings);
         let registry = Arc::new(
-            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+            IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry"),
         );
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
         let services = noop_services();
@@ -18505,7 +18721,14 @@ mod tests {
         // responses must carry no body and correct framing per status.
         let settings = Arc::new(create_test_settings());
         let registry = Arc::new(
-            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+            IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry"),
         );
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
 
@@ -18564,8 +18787,14 @@ mod tests {
         // The buffered finalizer (Axum/Cloudflare/Spin) must correct bodiless
         // framing identically to the streaming finalizer.
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let services = noop_services();
 
@@ -18644,8 +18873,14 @@ mod tests {
         // terminal abandonment event so the SSP work and quota consumption stay
         // observable instead of vanishing silently.
         let settings = Arc::new(create_test_settings());
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
 
         let make_params = || {
@@ -18669,6 +18904,7 @@ mod tests {
                     "proxy.example.com",
                     "/article",
                     1,
+                    Some("FictionalBrowser/123.4"),
                     &ec_context,
                 )),
                 auction_request: Some(test_auction_request()),
@@ -18817,7 +19053,14 @@ mod tests {
     fn publisher_response_streaming_finalize_holds_auction_and_keeps_gzip_tail() {
         let settings = Arc::new(create_test_settings());
         let registry = Arc::new(
-            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+            IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry"),
         );
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
         let services = noop_services();
@@ -18908,8 +19151,14 @@ mod tests {
     #[test]
     fn stream_publisher_body_treats_mixed_case_html_as_html() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
         let bids_script =
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
@@ -18966,8 +19215,14 @@ mod tests {
     #[test]
     fn stream_publisher_body_surfaces_mid_stream_decode_error() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
 
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
@@ -19061,8 +19316,14 @@ mod tests {
             )
             .expect("should update nextjs config");
 
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
 
         assert!(
             registry.has_html_post_processors(),
@@ -19141,8 +19402,14 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
 
         // Small, single-fragment RSC script — placeholder path (not fallback).
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
@@ -19270,6 +19537,7 @@ mod tests {
                 creative: None,
                 adomain: None,
                 bidder: bidder.to_string(),
+                returned_seat: None,
                 width: 300,
                 height: 250,
                 nurl: Some(nurl.to_string()),
@@ -19864,6 +20132,7 @@ mod tests {
                 creative: Some(creative.to_string()),
                 adomain: None,
                 bidder: "prebid".to_string(),
+                returned_seat: None,
                 width: 300,
                 height: 250,
                 nurl: None,
@@ -20267,6 +20536,7 @@ mod tests {
                     creative: None,
                     adomain: None,
                     bidder: "thetradedesk".to_string(),
+                    returned_seat: None,
                     width: 300,
                     height: 250,
                     nurl: None,
@@ -20322,6 +20592,7 @@ mod tests {
                     creative: None,
                     adomain: None,
                     bidder: "amazon-aps".to_string(),
+                    returned_seat: None,
                     width: 300,
                     height: 250,
                     nurl: None,
@@ -20434,6 +20705,7 @@ mod tests {
                     creative: None,
                     adomain: None,
                     bidder: "amazon-aps".to_string(),
+                    returned_seat: None,
                     width: 300,
                     height: 250,
                     nurl: None,
@@ -20478,6 +20750,7 @@ mod tests {
                     creative: None,
                     adomain: None,
                     bidder: "kargo".to_string(),
+                    returned_seat: None,
                     width: 300,
                     height: 250,
                     nurl: None,
@@ -20810,7 +21083,7 @@ mod tests {
 
         #[async_trait::async_trait(?Send)]
         impl AuctionProvider for AuctionIdTestProvider {
-            fn provider_name(&self) -> &'static str {
+            fn provider_name(&self) -> &str {
                 AUCTION_ID_TEST_PROVIDER
             }
 
@@ -20855,6 +21128,7 @@ mod tests {
                         creative: None,
                         adomain: None,
                         bidder: AUCTION_ID_TEST_PROVIDER.to_string(),
+                        returned_seat: None,
                         width: 300,
                         height: 250,
                         nurl: None,
@@ -21111,7 +21385,8 @@ mod tests {
         #[tokio::test]
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
-            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
             settings
                 .integrations
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
@@ -21267,7 +21542,8 @@ mod tests {
             }
 
             let mut settings = settings_with_co();
-            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
             settings
                 .integrations
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
@@ -21852,7 +22128,7 @@ mod tests {
         /// `[publisher] domain` from [`crate_test_settings_str`].
         const CONFIGURED_DOMAIN: &str = "test-publisher.com";
 
-        const CAPTURING_PROVIDER: &str = "request_capturing_provider";
+        const CAPTURING_PROVIDER: &str = "request-capturing-provider";
 
         /// Records the [`AuctionRequest`] the orchestrator dispatched, then
         /// fails its launch so no real transport handle is needed.
@@ -21862,7 +22138,7 @@ mod tests {
 
         #[async_trait::async_trait(?Send)]
         impl AuctionProvider for RequestCapturingProvider {
-            fn provider_name(&self) -> &'static str {
+            fn provider_name(&self) -> &str {
                 CAPTURING_PROVIDER
             }
 
@@ -21921,7 +22197,7 @@ mod tests {
 
         fn settings_with_capturing_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\nproviders = [\"{CAPTURING_PROVIDER}\"]\n\n\
+                "{}\n[auction]\nenabled = true\n\n[auction.providers.{CAPTURING_PROVIDER}]\nprotocol = \"openrtb-2.6\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
