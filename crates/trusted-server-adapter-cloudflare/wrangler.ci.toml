@@ -6,9 +6,23 @@ compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 # No [build] section — bundle is pre-built in CI; wrangler dev must not rebuild.
 
+# One binding per logical KV store id in edgezero.toml [stores.kv].ids — the
+# EdgeZero dispatcher requires every declared id to open.
 [[kv_namespaces]]
-binding = "TRUSTED_SERVER_KV"
+binding = "trusted_server_kv"
 id = "ci-local-kv"
+
+[[kv_namespaces]]
+binding = "ec_identity_store"
+id = "ci-local-kv-ec"
+
+[[kv_namespaces]]
+binding = "consent_store"
+id = "ci-local-kv-consent"
+
+[[kv_namespaces]]
+binding = "creative_store"
+id = "ci-local-kv-creative"
 
 [vars]
 # Placeholder replaced by the integration test harness with a JSON object that

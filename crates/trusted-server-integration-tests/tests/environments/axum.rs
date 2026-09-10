@@ -12,7 +12,7 @@ const AXUM_DEFAULT_PORT: u16 = 8787;
 
 /// Secret-store entries referenced by the integration app-config fixture.
 ///
-/// The Axum dev server resolves secrets through the EdgeZero `EnvSecretStore`,
+/// The Axum dev server resolves secrets through the `EdgeZero` `EnvSecretStore`,
 /// which reads an environment variable named exactly after the secret key.
 const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
     (

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_adapter_fastly::config_store::FastlyConfigStore;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
+use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_adapter_fastly::secret_store::FastlySecretStore;
 use edgezero_core::app::StoresMetadata;
 use edgezero_core::config_store::{
@@ -41,6 +42,7 @@ use edgezero_core::store_registry::{
 };
 use fastly::ConfigStore;
 use fastly::config_store::OpenError;
+use trusted_server_core::stores::RUNTIME_ONLY_SECRET_IDS;
 
 /// Plain key/value reader over a Fastly Config Store.
 ///
@@ -104,10 +106,14 @@ impl EdgeConfigStore for PlainFastlyConfigStore {
 #[must_use]
 pub(crate) fn build_config_registry(stores: &StoresMetadata) -> Option<ConfigRegistry> {
     let meta = stores.config?;
+    let env = runtime_env_config(*stores);
     let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
+        // The registry key stays the logical id; the opened store is the
+        // physical name, which the runtime-env mapping may override.
+        let name = env.store_name("config", id);
         let handle = if *id == meta.default {
-            match FastlyConfigStore::try_open(id) {
+            match FastlyConfigStore::try_open(&name) {
                 Ok(store) => ConfigStoreHandle::new(Arc::new(store)),
                 Err(error) => {
                     log::warn!(
@@ -118,7 +124,7 @@ pub(crate) fn build_config_registry(stores: &StoresMetadata) -> Option<ConfigReg
                 }
             }
         } else {
-            match PlainFastlyConfigStore::try_open(id) {
+            match PlainFastlyConfigStore::try_open(&name) {
                 Ok(store) => ConfigStoreHandle::new(Arc::new(store)),
                 Err(error) => {
                     log::warn!(
@@ -149,9 +155,10 @@ pub(crate) fn build_config_registry(stores: &StoresMetadata) -> Option<ConfigReg
 #[must_use]
 pub(crate) fn build_kv_registry(stores: &StoresMetadata) -> Option<KvRegistry> {
     let meta = stores.kv?;
+    let env = runtime_env_config(*stores);
     let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
     for id in meta.ids {
-        match FastlyKvStore::open(id) {
+        match FastlyKvStore::open(&env.store_name("kv", id)) {
             Ok(store) => {
                 by_id.insert((*id).to_owned(), KvHandle::new(Arc::new(store)));
             }
@@ -169,17 +176,21 @@ pub(crate) fn build_kv_registry(stores: &StoresMetadata) -> Option<KvRegistry> {
 ///
 /// [`FastlySecretStore`] is stateless — it opens the named Fastly Secret Store
 /// on each `get_bytes(store_name, key)` call — so one provider handle is shared
-/// across every binding and each declared id is bound to its own store name
-/// (D7: the logical id). Returns `None` when no secret stores are declared.
+/// across every binding. Each declared id binds to its physical store name
+/// (the logical id, unless the runtime-env mapping overrides it), and the
+/// management-provisioned [`RUNTIME_ONLY_SECRET_IDS`] bind on top — they are
+/// deliberately absent from `[stores.secrets]` (see their doc). Returns `None`
+/// when no secret stores are declared.
 #[must_use]
 pub(crate) fn build_secret_registry(stores: &StoresMetadata) -> Option<SecretRegistry> {
     let meta = stores.secrets?;
+    let env = runtime_env_config(*stores);
     let handle = SecretHandle::new(Arc::new(FastlySecretStore));
     let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
-    for id in meta.ids {
+    for id in meta.ids.iter().chain(RUNTIME_ONLY_SECRET_IDS) {
         by_id.insert(
             (*id).to_owned(),
-            BoundSecretStore::new(handle.clone(), (*id).to_owned()),
+            BoundSecretStore::new(handle.clone(), env.store_name("secrets", id)),
         );
     }
     StoreRegistry::from_parts(by_id, meta.default.to_owned())
@@ -275,7 +286,7 @@ mod tests {
 
         assert!(
             registry.named("signing_keys").is_some(),
-            "the declared `signing_keys` id should bind to its own Fastly secret store"
+            "the runtime-only `signing_keys` id should bind to its own Fastly secret store"
         );
         assert!(
             registry.named("nope").is_none(),

@@ -28,8 +28,13 @@ default = "trusted_server_kv"
 ids = ["trusted_server_config", "jwks_store", "datadome_ip_bypass"]
 default = "trusted_server_config"
 
+# Only the default id: the EdgeZero CLI rejects multi-id [stores.secrets]
+# while any Single-capable adapter (axum, cloudflare, spin) is declared here.
+# The management-provisioned request-signing secret store (`signing_keys`)
+# binds registry-locally in the adapters instead — see
+# trusted-server-core/src/stores.rs `RUNTIME_ONLY_SECRET_IDS`.
 [stores.secrets]
-ids = ["trusted_server_secrets", "signing_keys", "ts_secrets", "s3_auth"]
+ids = ["trusted_server_secrets"]
 default = "trusted_server_secrets"
 
 # -- Fastly Compute (production) --------------------------------------------

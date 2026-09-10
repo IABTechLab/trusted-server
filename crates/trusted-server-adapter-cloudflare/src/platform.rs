@@ -76,7 +76,7 @@ impl PlatformBackend for NoopBackend {
 // ---------------------------------------------------------------------------
 
 /// Bridges edgezero's [`KvHandle`] (injected by `run_app` from the
-/// `TRUSTED_SERVER_KV` KV namespace binding) to [`PlatformKvStore`].
+/// `trusted_server_kv` KV namespace binding) to [`PlatformKvStore`].
 ///
 /// Delegates all operations through `KvHandle`'s raw-bytes API, which includes
 /// key/value validation before forwarding to the underlying store.

@@ -80,7 +80,14 @@ runtime-env mapping, and the store selectors
 tested. The surviving rule: logical ids default to same-named physical stores,
 overrides are **provisioning-time** EdgeZero configuration (never app-level
 runtime env reads of config values), and every id a config field can name must
-be declared in `edgezero.toml` for strict registry lookup.
+be declared in `edgezero.toml` for strict registry lookup — with one carve-out:
+the v0.0.8 CLI capability matrix rejects a multi-id `[stores.secrets]` while
+any Single-capable adapter (axum, cloudflare, spin) is declared, so the
+management-provisioned `signing_keys` secret store is a **runtime-only id**
+(`trusted_server_core::stores::RUNTIME_ONLY_SECRET_IDS`) bound by the Fastly
+and Axum registry builders rather than declared in the manifest. Cloudflare's
+dispatcher also treats every declared `[stores.kv]` id as a required binding,
+so the wrangler manifests bind all four logical KV ids.
 
 **Remaining work to full migration (rescoped).**
 
@@ -225,7 +232,7 @@ _(P-BOOT's `build_state()` gets subsumed under full convergence: once `run_app` 
 
 ### Phase 0 — EdgeZero prerequisites (external, edgezero repo) — **COMPLETE** (shipped in edgezero v0.0.8)
 
-**Owner:** edgezero. **Tracked by:** its own spec + PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306) — "State<T> extractor + nested/array #[secret] support".
+**Owner:** edgezero. **Tracked by:** its own spec + PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306) — "`State<T>` extractor + nested/array `#[secret]` support".
 **Delivers:** (A) `State<T>` extractor + `RouterBuilder::with_state`; (B) nested/array `#[secret]` in `#[derive(AppConfig)]` + path-aware `secret_walk`; **(C, if resolved upstream) P0-C** header-preserving Fastly dispatch + pre-dispatch extension hook (§4a).
 **Blocks:** Phase 3 (B), Phase 4 (A), Phase 5/Fastly end-state (C). **This umbrella consumes it as a versioned dependency** — bump the pinned `edgezero` rev once merged.
 **Note for #306:** the trusted-server secret audit (Phase 3 / §5) confirms **array secrets exist** (`ec.partners[].api_token`, `handlers[].password`) and **optional-string secrets exist** (`ts_pull_token`). So edgezero #306's `ArrayEach` and `Option<String>` support are **required**, not deferrable — this settles that PR's open question B-1.

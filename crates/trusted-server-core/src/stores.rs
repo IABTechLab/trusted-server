@@ -7,16 +7,30 @@
 //! Cloudflare, and Spin runtimes. The anti-drift test in this module asserts the
 //! const and the manifest never diverge.
 //!
-//! The `DataDome` IP-CIDR config store (`datadome_ip_bypass`) and the S3 secret
-//! store (`s3_auth`) are declared here as underscore logical ids. `EdgeZero`'s
-//! manifest validator requires store ids to match `[A-Za-z0-9_]` (they become
-//! `EDGEZERO__STORES__…` env segments), so the previously hyphenated names were
-//! converged onto underscores. Under the D7 convention the logical id equals the
-//! physical platform store name, so each maps to a same-named physical store; an
-//! operator whose physical store keeps a different name overrides it out of band
-//! with `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
+//! The `DataDome` IP-CIDR config store (`datadome_ip_bypass`) is declared here
+//! as an underscore logical id. `EdgeZero`'s manifest validator requires store
+//! ids to match `[A-Za-z0-9_]` (they become `EDGEZERO__STORES__…` env
+//! segments), so the previously hyphenated names were converged onto
+//! underscores. Under the D7 convention the logical id equals the physical
+//! platform store name, so each maps to a same-named physical store; an
+//! operator whose physical store keeps a different name overrides it out of
+//! band with `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
 
 use edgezero_core::app::{StoreMetadata, StoresMetadata};
+
+/// Secret store ids resolved at runtime but deliberately NOT declared in
+/// `edgezero.toml` `[stores.secrets]`.
+///
+/// The `EdgeZero` v0.0.8 CLI capability matrix marks the Axum, Cloudflare, and
+/// Spin adapters Single-capable for secrets (their secret backends are flat
+/// namespaces), and `ts config push` runs that check across every adapter the
+/// manifest declares — so `[stores.secrets].ids` may hold only the default id.
+/// The request-signing private-key store is provisioned on the management path
+/// (never by `ts config push`), so it is bound registry-locally instead: the
+/// Fastly and Axum registry builders add these ids on top of
+/// [`STORES_METADATA`]. On adapters whose registries come from `run_app`
+/// (Cloudflare, Spin) these ids do not resolve, and reads fail closed.
+pub const RUNTIME_ONLY_SECRET_IDS: &[&str] = &["signing_keys"];
 
 /// Logical store metadata declared by Trusted Server, shared by every adapter's
 /// [`edgezero_core::app::Hooks::stores`] implementation.
@@ -39,14 +53,18 @@ pub const STORES_METADATA: StoresMetadata = StoresMetadata {
             "creative_store",
         ],
     }),
+    // Only the default id is declared: the v0.0.8 CLI rejects multi-id
+    // `[stores.secrets]` while any Single-capable adapter (axum, cloudflare,
+    // spin) is declared in the manifest. The management-provisioned
+    // request-signing store binds registry-locally via
+    // [`RUNTIME_ONLY_SECRET_IDS`] instead. The retired `ts_secrets` and
+    // `s3_auth` logical ids are gone: since mainline #1036, DataDome/S3/
+    // Tinybird credentials resolve at startup from the default store, and
+    // `trusted_server_secrets` maps to a differently named physical store
+    // (e.g. Fastly `ts_secrets`) via `EDGEZERO__STORES__SECRETS__…__NAME`.
     secrets: Some(StoreMetadata {
         default: "trusted_server_secrets",
-        ids: &[
-            "trusted_server_secrets",
-            "signing_keys",
-            "ts_secrets",
-            "s3_auth",
-        ],
+        ids: &["trusted_server_secrets"],
     }),
 };
 

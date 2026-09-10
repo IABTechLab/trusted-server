@@ -160,7 +160,6 @@ use crate::platform::{
 pub(crate) struct RuntimeStoreConfig {
     pub(crate) config_store_name: StoreName,
     pub(crate) config_key: String,
-    pub(crate) secret_store_name: StoreName,
 }
 
 impl RuntimeStoreConfig {
@@ -168,7 +167,6 @@ impl RuntimeStoreConfig {
         Self {
             config_store_name: StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID)),
             config_key: env.store_key("config", DEFAULT_CONFIG_STORE_ID),
-            secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
         }
     }
 }
@@ -207,9 +205,10 @@ pub(crate) fn load_settings_from_config_store(
         })
     })?;
     // Boot-time secret resolution reads through the same EdgeZero secret
-    // registry as request-time reads, so a `trusted_server_secrets` selector
-    // mapped to a differently named physical store (e.g. `ts_secrets`) resolves
-    // identically at startup.
+    // registry as request-time reads. The registry binds the logical id to its
+    // physical store name, so a `trusted_server_secrets` selector mapped to a
+    // differently named physical store (e.g. `ts_secrets`) resolves identically
+    // at startup — the lookup key here is always the logical id.
     let secret_store = CompositeSecretStore::new(
         crate::registries::build_secret_registry(&trusted_server_core::stores::STORES_METADATA),
         Arc::new(FastlyPlatformSecretStore),
@@ -221,7 +220,7 @@ pub(crate) fn load_settings_from_config_store(
         &config_store,
         &stores.config_key,
         &secret_store,
-        &stores.secret_store_name,
+        &StoreName::from(DEFAULT_SECRET_STORE_ID),
     ))
 }
 
@@ -1470,7 +1469,6 @@ mod tests {
 
         assert_eq!(stores.config_store_name.as_ref(), "physical_config");
         assert_eq!(stores.config_key, "active_config");
-        assert_eq!(stores.secret_store_name.as_ref(), "ts_secrets");
     }
 
     #[test]
@@ -1479,7 +1477,6 @@ mod tests {
 
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");
-        assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
     }
 
     fn settings_with_missing_consent_store() -> Settings {

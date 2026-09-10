@@ -34,6 +34,7 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
+use trusted_server_core::stores::RUNTIME_ONLY_SECRET_IDS;
 
 /// Environment variable naming an explicit JSON config-store file for the
 /// default app-config store, mirroring the boot-time override in
@@ -139,7 +140,10 @@ pub fn build_secret_registry_axum(stores: &StoresMetadata) -> Option<SecretRegis
     let meta = stores.secrets?;
     let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
     let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
-    for id in meta.ids {
+    // The management-provisioned RUNTIME_ONLY_SECRET_IDS bind on top of the
+    // declared ids; every binding aliases the same flat env-var namespace, so
+    // the extra ids cost nothing locally.
+    for id in meta.ids.iter().chain(RUNTIME_ONLY_SECRET_IDS) {
         by_id.insert(
             (*id).to_owned(),
             BoundSecretStore::new(handle.clone(), (*id).to_owned()),
