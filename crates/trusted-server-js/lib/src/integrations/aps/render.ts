@@ -122,32 +122,46 @@ function sourceBelongsToElement(
     : false;
 }
 
-function sourceMatchedCandidates(
-  candidates: HTMLElement[],
-  source?: MessageEventSource | null
-): HTMLElement[] {
-  if (!source) return candidates;
-  return candidates.filter((element) => sourceBelongsToElement(source, element));
-}
-
-function dynamicSlotCandidates(
-  divIdPrefix: string,
-  source?: MessageEventSource | null
-): HTMLElement[] {
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+function dynamicSlotCandidates(divIdPrefix: string): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
     (element) => element.id.startsWith(divIdPrefix) && !element.id.endsWith('-container')
   );
-  return sourceMatchedCandidates(candidates, source);
 }
 
 function uniqueSlotCandidate(candidates: HTMLElement[]): HTMLElement | null {
   return candidates.length === 1 ? candidates[0]! : null;
 }
 
+function authenticatedSlotRoot(
+  element: HTMLElement,
+  source?: MessageEventSource | null
+): HTMLElement | null {
+  if (!source || sourceBelongsToElement(source, element)) return element;
+  if (element.id.endsWith('-container')) return null;
+
+  const container = document.getElementById(`${element.id}-container`);
+  return container?.contains(element) && sourceBelongsToElement(source, container)
+    ? container
+    : null;
+}
+
+function authenticatedSlotCandidates(
+  candidates: HTMLElement[],
+  source?: MessageEventSource | null
+): HTMLElement[] {
+  return [
+    ...new Set(
+      candidates
+        .map((element) => authenticatedSlotRoot(element, source))
+        .filter((element): element is HTMLElement => element !== null)
+    ),
+  ];
+}
+
 function findApsContainer(slotId: string, source?: MessageEventSource | null): HTMLElement | null {
   try {
     const mapping = window.tsjs?.divToSlotId ?? {};
-    const mappedCandidates = sourceMatchedCandidates(
+    const mappedCandidates = authenticatedSlotCandidates(
       Object.entries(mapping)
         .filter(([, mappedSlotId]) => mappedSlotId === slotId)
         .map(([divId]) => findSlot(divId))
@@ -159,26 +173,33 @@ function findApsContainer(slotId: string, source?: MessageEventSource | null): H
 
     if (slotId.endsWith('-container')) {
       const inner = findSlot(slotId.slice(0, -'-container'.length));
-      if (inner) return source && !sourceBelongsToElement(source, inner) ? null : inner;
+      if (inner) {
+        const authenticated = authenticatedSlotRoot(inner, source);
+        if (authenticated) return authenticated;
+      }
     }
 
     const direct = findSlot(slotId);
     if (direct && !direct.id.endsWith('-container')) {
-      return source && !sourceBelongsToElement(source, direct) ? null : direct;
+      const authenticated = authenticatedSlotRoot(direct, source);
+      if (authenticated) return authenticated;
     }
 
     const configuredDivId = window.tsjs?.adSlots?.find((slot) => slot.id === slotId)?.div_id;
     if (configuredDivId) {
       const configured = findSlot(configuredDivId);
       if (configured) {
-        return source && !sourceBelongsToElement(source, configured) ? null : configured;
+        const authenticated = authenticatedSlotRoot(configured, source);
+        if (authenticated) return authenticated;
       }
 
-      const dynamic = uniqueSlotCandidate(dynamicSlotCandidates(configuredDivId, source));
+      const dynamic = uniqueSlotCandidate(
+        authenticatedSlotCandidates(dynamicSlotCandidates(configuredDivId), source)
+      );
       if (dynamic) return dynamic;
     }
 
-    return uniqueSlotCandidate(dynamicSlotCandidates(slotId, source));
+    return uniqueSlotCandidate(authenticatedSlotCandidates(dynamicSlotCandidates(slotId), source));
   } catch {
     return null;
   }

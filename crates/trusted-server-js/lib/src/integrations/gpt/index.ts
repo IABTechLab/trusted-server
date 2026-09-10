@@ -155,10 +155,15 @@ function sourceFrameInRoots(
   return { iframe, root };
 }
 
+interface ConfiguredMessageSourceFrame extends MessageSourceFrame {
+  exact: boolean;
+  prefixLength: number;
+}
+
 function sourceFrameForConfiguredDivId(
   source: MessageEventSource | null,
   divId: string
-): MessageSourceFrame | undefined {
+): ConfiguredMessageSourceFrame | undefined {
   const exact = document.getElementById(divId);
   const candidates = exact
     ? [exact]
@@ -168,7 +173,8 @@ function sourceFrameForConfiguredDivId(
   const matches = candidates
     .map((element) => sourceFrameInRoots(source, candidateSlotRoots(element.id)))
     .filter((frame): frame is MessageSourceFrame => frame !== undefined);
-  return matches.length === 1 ? matches[0] : undefined;
+  const frame = matches.length === 1 ? matches[0] : undefined;
+  return frame ? { ...frame, exact: exact !== null, prefixLength: divId.length } : undefined;
 }
 
 function uniqueSourceFrame(
@@ -201,16 +207,45 @@ interface MessageSourceSlotFrame extends MessageSourceFrame {
 function slotFrameForMessageSource(
   source: MessageEventSource | null
 ): MessageSourceSlotFrame | undefined {
-  const slotIds = new Set<string>();
+  const candidates: Array<{
+    slotId: string;
+    frame: MessageSourceFrame;
+    exact: boolean;
+    prefixLength: number;
+  }> = [];
   for (const [elementId, slotId] of Object.entries(window.tsjs?.divToSlotId ?? {})) {
-    if (sourceFrameInRoots(source, candidateSlotRoots(elementId))) slotIds.add(slotId);
+    const frame = sourceFrameInRoots(source, candidateSlotRoots(elementId));
+    if (frame) candidates.push({ slotId, frame, exact: true, prefixLength: elementId.length });
   }
   for (const slot of window.tsjs?.adSlots ?? []) {
-    if (sourceFrameForConfiguredDivId(source, slot.div_id)) slotIds.add(slot.id);
+    const frame = sourceFrameForConfiguredDivId(source, slot.div_id);
+    if (frame) {
+      candidates.push({
+        slotId: slot.id,
+        frame,
+        exact: frame.exact,
+        prefixLength: frame.prefixLength,
+      });
+    }
   }
+
+  const exactCandidates = candidates.filter((candidate) => candidate.exact);
+  const rankedCandidates =
+    exactCandidates.length > 0
+      ? exactCandidates
+      : candidates.filter(
+          (candidate) =>
+            candidate.prefixLength ===
+            Math.max(...candidates.map((possible) => possible.prefixLength))
+        );
+  const slotIds = new Set(rankedCandidates.map((candidate) => candidate.slotId));
   if (slotIds.size !== 1) return undefined;
   const slotId = slotIds.values().next().value as string;
-  const frame = sourceFrameForSlotId(source, slotId);
+  const frame = uniqueSourceFrame(
+    rankedCandidates
+      .filter((candidate) => candidate.slotId === slotId)
+      .map((candidate) => candidate.frame)
+  );
   return frame ? { ...frame, slotId } : undefined;
 }
 
@@ -1083,6 +1118,22 @@ function applyTrustedServerTargeting(
   return Object.keys(slot.targeting ?? {});
 }
 
+function clearPreviousTargetingSnapshot(
+  g: Partial<GoogleTag>,
+  previousKeys: Record<string, string[]>,
+  touchedElementIds: ReadonlySet<string>
+): boolean {
+  const pubads = g.pubads?.();
+  if (!pubads) return false;
+
+  for (const slot of pubads.getSlots?.() ?? []) {
+    const elementId = slot.getSlotElementId();
+    if (!touchedElementIds.has(elementId)) continue;
+    clearTargetingKeys(slot, [...TS_BASE_TARGETING_KEYS, ...(previousKeys[elementId] ?? [])]);
+  }
+  return true;
+}
+
 function clearPreviousNavigationTargeting(ts: TsjsApi, g: Partial<GoogleTag>): void {
   const previousKeys = ts.prevSlotTargetingKeys ?? {};
   const touchedElementIds = new Set([
@@ -1090,13 +1141,13 @@ function clearPreviousNavigationTargeting(ts: TsjsApi, g: Partial<GoogleTag>): v
     ...Object.keys(ts.divToSlotId ?? {}),
   ]);
 
-  const pubads = g.pubads?.();
-  if (pubads && touchedElementIds.size > 0) {
-    for (const slot of pubads.getSlots?.() ?? []) {
-      const elementId = slot.getSlotElementId();
-      if (!touchedElementIds.has(elementId)) continue;
-      clearTargetingKeys(slot, [...TS_BASE_TARGETING_KEYS, ...(previousKeys[elementId] ?? [])]);
-    }
+  if (
+    touchedElementIds.size > 0 &&
+    !clearPreviousTargetingSnapshot(g, previousKeys, touchedElementIds)
+  ) {
+    g.cmd?.push(() => {
+      clearPreviousTargetingSnapshot(g, previousKeys, touchedElementIds);
+    });
   }
 
   ts.prevSlotTargetingKeys = {};

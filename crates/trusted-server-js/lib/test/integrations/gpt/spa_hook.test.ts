@@ -354,6 +354,59 @@ describe('installSpaAuctionHook', () => {
     expect(gptSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'publisher-current');
   });
 
+  it('queues a targeting snapshot cleanup while GPT is still a stub', async () => {
+    fetchStub.mockImplementation(() => new Promise<Response>(() => {}));
+    const element = document.createElement('div');
+    element.id = 'div-stubbed-route-slot';
+    document.body.appendChild(element);
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      clearTargeting,
+      getSlotElementId: vi.fn().mockReturnValue(element.id),
+    };
+    const pubads = {
+      getSlots: vi.fn().mockReturnValue([gptSlot]),
+    };
+    const queuedCommands: Array<() => void> = [];
+    const googletag: {
+      cmd: { push: ReturnType<typeof vi.fn> };
+      pubads?: () => typeof pubads;
+    } = {
+      cmd: { push: vi.fn((callback: () => void) => queuedCommands.push(callback)) },
+    };
+    (window as TestWindow).googletag = googletag;
+
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    ts.prevSlotTargetingKeys = { [element.id]: ['ts_route_a'] };
+    ts.divToSlotId = { [element.id]: 'route_a_slot' };
+    const queuedBeforeNavigation = queuedCommands.length;
+
+    history.pushState({}, '', '/route-b');
+
+    expect(queuedCommands).toHaveLength(queuedBeforeNavigation + 1);
+    expect(ts.prevSlotTargetingKeys).toEqual({});
+    expect(ts.divToSlotId).toEqual({});
+
+    ts.prevSlotTargetingKeys = { 'div-route-b': ['ts_route_b'] };
+    ts.divToSlotId = { 'div-route-b': 'route_b_slot' };
+    googletag.pubads = () => pubads;
+    queuedCommands[queuedCommands.length - 1]!();
+
+    expect(clearTargeting.mock.calls.map(([key]) => key)).toEqual([
+      'hb_pb',
+      'hb_bidder',
+      'hb_adid',
+      'hb_cache_host',
+      'hb_cache_path',
+      'ts_initial',
+      'ts_route_a',
+    ]);
+    expect(ts.prevSlotTargetingKeys).toEqual({ 'div-route-b': ['ts_route_b'] });
+    expect(ts.divToSlotId).toEqual({ 'div-route-b': 'route_b_slot' });
+  });
+
   it('defers applying bids until the route ad container is inserted', async () => {
     fetchStub.mockResolvedValue({
       ok: true,

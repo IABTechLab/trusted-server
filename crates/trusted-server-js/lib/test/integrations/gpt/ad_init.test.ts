@@ -4276,6 +4276,90 @@ describe('installTsRenderBridge', () => {
     document.getElementById('div-header-dynamic')?.remove();
   });
 
+  it('prefers an exact configured div over an overlapping shorter prefix', async () => {
+    const renderer = apsRenderer();
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.adSlots = [
+      {
+        id: 'homepage_header',
+        formats: [[728, 90]],
+        gam_unit_path: '/a/b/header',
+        div_id: 'div-ranked-',
+        targeting: {},
+      },
+      {
+        id: 'homepage_header_mobile',
+        formats: [[320, 50]],
+        gam_unit_path: '/a/b/mobile',
+        div_id: 'div-ranked-mobile',
+        targeting: {},
+      },
+    ];
+    tsjs.divToSlotId = {};
+    tsjs.bids.homepage_header_mobile = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-ranked-mobile');
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(portMessages).toHaveLength(1);
+    document.getElementById('div-ranked-mobile')?.remove();
+  });
+
+  it('prefers one longest configured prefix for a requesting frame', async () => {
+    const renderer = apsRenderer();
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.adSlots = [
+      {
+        id: 'homepage_header',
+        formats: [[728, 90]],
+        gam_unit_path: '/a/b/header',
+        div_id: 'div-ranked-',
+        targeting: {},
+      },
+      {
+        id: 'homepage_header_mobile',
+        formats: [[320, 50]],
+        gam_unit_path: '/a/b/mobile',
+        div_id: 'div-ranked-mobile-',
+        targeting: {},
+      },
+    ];
+    tsjs.divToSlotId = {};
+    tsjs.bids.homepage_header_mobile = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-ranked-mobile-responsive');
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(portMessages).toHaveLength(1);
+    document.getElementById('div-ranked-mobile-responsive')?.remove();
+  });
+
   it('does not let an overlapping slot prefix claim another slot iframe', async () => {
     const renderer = apsRenderer();
     (window as TestWindow).tsjs.bids.homepage_header = {
