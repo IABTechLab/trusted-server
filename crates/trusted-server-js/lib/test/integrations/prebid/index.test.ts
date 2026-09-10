@@ -954,7 +954,7 @@ describe('prebid/installPrebidNpm', () => {
     expect(Object.getOwnPropertyDescriptor(testWindow, '__tcfapi')?.value).toBe(cmp);
   });
 
-  it('seeds managed User IDs at the first auction when no CMP ever appears', () => {
+  it('keeps managed User IDs deferred across auctions when no CMP appears', () => {
     testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     mockGetConfig.mockImplementation((key?: string) =>
       key === 'userSync.userIds' ? [] : undefined
@@ -967,9 +967,87 @@ describe('prebid/installPrebidNpm', () => {
     mockPbjs.requestBids({ adUnits: [] });
 
     const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
-    expect(managedCall?.[0].userSync.userIds).toEqual([EXPECTED_MANAGED_USER_ID]);
+    expect(managedCall).toBeUndefined();
     expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
-    expect(Object.prototype.hasOwnProperty.call(testWindow, '__tcfapi')).toBe(false);
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    testWindow.__tcfapi = vi.fn();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it.each(['setConfig', 'mergeConfig'] as const)(
+    'seeds deferred IDs after publisher %s supplies TCF configuration',
+    (method) => {
+      testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+      let consent: unknown = undefined;
+      mockGetConfig.mockImplementation((key?: string) => {
+        if (key === 'consentManagement') return consent;
+        if (key === 'userSync.userIds') return [];
+        return undefined;
+      });
+      installPrebidNpm();
+      expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+      consent = { gdpr: { cmpApi: 'static', consentData: { gdprApplies: false } } };
+      mockPbjs[method]({ consentManagement: consent });
+      expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+    }
+  );
+
+  it.each([false, true])(
+    'preserves publisher userSync and autoRefresh=%s when seeding late IDs',
+    (autoRefresh) => {
+      testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+      const userSync = { userIds: [], auctionDelay: 300, syncEnabled: false, autoRefresh };
+      mockGetConfig.mockImplementation((key?: string) => {
+        if (key === 'userSync.userIds') return [];
+        if (key === 'userSync') return userSync;
+        return undefined;
+      });
+      installPrebidNpm();
+      testWindow.__tcfapi = vi.fn();
+      const seeds = mockSetConfig.mock.calls.filter(([value]) => value?.userSync?.userIds);
+      expect(seeds[0][0].userSync).toEqual({
+        ...userSync,
+        userIds: [EXPECTED_MANAGED_USER_ID],
+        autoRefresh: true,
+      });
+      expect(seeds.at(-1)?.[0].userSync).toEqual({
+        ...userSync,
+        userIds: [EXPECTED_MANAGED_USER_ID],
+      });
+      expect(seeds).toHaveLength(autoRefresh ? 1 : 2);
+    }
+  );
+
+  it('seeds IDs with existing publisher TCF configuration even without a CMP API', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return { cmpApi: 'static', consentData: {} };
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+    installPrebidNpm();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+  });
+
+  it('keeps IDs deferred when the CMP property cannot be watched', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    const defineProperty = Object.defineProperty;
+    const spy = vi.spyOn(Object, 'defineProperty').mockImplementation((target, key, descriptor) => {
+      if (target === testWindow && key === '__tcfapi') throw new Error('unwatchable');
+      return defineProperty(target, key, descriptor);
+    });
+    try {
+      installPrebidNpm();
+      mockPbjs.requestBids({ adUnits: [] });
+      expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('leaves a legacy top-level TCF consent configuration to the publisher', () => {

@@ -1515,8 +1515,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
   const managedUserIds = injected?.managedUserIds;
-  // Set while managed User ID seeding waits for a CMP that has not appeared yet.
-  let resolveManagedUserIdCmpDiscovery: (() => void) | undefined;
+  let trySeedManagedUserIds: (() => void) | undefined;
   if (
     managedUserIds &&
     managedUserIds.length > 0 &&
@@ -1534,6 +1533,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     // configuration Prebid sees: a module seeded before the CMP is discoverable
     // would call its vendor with the GDPR handler disabled.
     let managedUserIdsDeferred = true;
+    let awaitingLateConsent = false;
 
     const retireAutomaticTcfConsent = (
       publisherConfig: PbjsConfig,
@@ -1623,7 +1623,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
     pbjs.setConfig = ((publisherConfig: PbjsConfig) => {
       retireAutomaticTcfConsent(publisherConfig);
-      return originalSetConfig(normalizePublisherConfig(publisherConfig));
+      const result = originalSetConfig(normalizePublisherConfig(publisherConfig));
+      trySeedManagedUserIds?.();
+      return result;
     }) as typeof pbjs.setConfig;
     if (originalMergeConfig) {
       prebidConfigApi.mergeConfig = ((publisherConfig: PbjsConfig) => {
@@ -1656,6 +1658,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           // would demote the publisher's legacy TCF configuration.
           removeAutomaticGdprNamespace(originalSetConfig, getConfig);
         }
+        trySeedManagedUserIds?.();
         return result;
       }) as typeof pbjs.setConfig;
     }
@@ -1691,25 +1694,50 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         );
       }
       if (effectiveUserIds) {
-        pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
+        const effectiveUserSync = getConfig.call(pbjs, 'userSync');
+        const seed = withManagedUserIds(
+          {
+            userSync: {
+              ...(isRecord(effectiveUserSync) ? effectiveUserSync : {}),
+              userIds: effectiveUserIds,
+            },
+          } as PbjsConfig,
+          managedUserIds
+        );
+        if (awaitingLateConsent && seed.userSync.autoRefresh !== true) {
+          // Let Prebid initialize newly added modules even if its initial pass
+          // already finished. Preserve the publisher's policy after this seed.
+          originalSetConfig({
+            ...seed,
+            userSync: { ...seed.userSync, autoRefresh: true },
+          } as PbjsConfig);
+        }
+        originalSetConfig(seed);
       }
     };
 
-    const tcfApiInstalled =
-      typeof window !== 'undefined' &&
-      typeof (window as { __tcfapi?: unknown }).__tcfapi === 'function';
-    if (tcfApiInstalled) {
-      activateAndSeedManagedUserIds();
-    } else {
-      // No CMP yet. Wait for one rather than seeding without TCF enforcement,
-      // and give up at the first auction: a conforming CMP installs its stub
-      // before vendor tags request bids.
-      const settleCmpDiscovery = watchForLateTcfApi(activateAndSeedManagedUserIds);
-      if (settleCmpDiscovery) {
-        resolveManagedUserIdCmpDiscovery = settleCmpDiscovery;
-      } else {
-        activateAndSeedManagedUserIds();
+    trySeedManagedUserIds = () => {
+      if (!managedUserIdsDeferred) return;
+      const tcfApiInstalled =
+        typeof window !== 'undefined' &&
+        typeof (window as { __tcfapi?: unknown }).__tcfapi === 'function';
+      let publisherConsentConfigured = false;
+      try {
+        const consent = getConfig?.call(pbjs, 'consentManagement');
+        publisherConsentConfigured =
+          isRecord(consent) && publisherOwnsTcfConsentManagement(consent);
+      } catch (error) {
+        log.error('[tsjs-prebid] publisher consent configuration could not be read', error);
       }
+      if (tcfApiInstalled || publisherConsentConfigured) activateAndSeedManagedUserIds();
+    };
+    trySeedManagedUserIds();
+    if (managedUserIdsDeferred) {
+      awaitingLateConsent = true;
+      // Auctions may run before an asynchronous CMP arrives. Keep managed IDs
+      // deferred even when the property cannot be watched; later configuration
+      // and auction calls recheck discovery without treating absence as consent.
+      watchForLateTcfApi(trySeedManagedUserIds);
     }
   }
 
@@ -1783,11 +1811,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // every unowned bidder is left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
-    // A conforming CMP installs `__tcfapi` before vendor tags request bids, so
-    // an auction is the last useful moment to conclude that none is coming.
-    const settleCmpDiscovery = resolveManagedUserIdCmpDiscovery;
-    resolveManagedUserIdCmpDiscovery = undefined;
-    settleCmpDiscovery?.();
+    trySeedManagedUserIds?.();
     recordUserIdModuleDiagnostics();
 
     const opts = { ...(requestObj ?? {}) };

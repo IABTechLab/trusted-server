@@ -140,6 +140,8 @@ async function runGdprPage(
     latePublisherConsentManagement,
     cmpEventAfterLateConfig,
     deferInitialCmpResponse = false,
+    lateCmp = false,
+    queueAuction = true,
     replaceTcfApiBeforeLateEvent = false,
   } = {}
 ) {
@@ -178,7 +180,7 @@ async function runGdprPage(
   let removedConsentListenerCount = 0;
   let replacementApiRemoveCount = 0;
   const consentData = tcData(grants);
-  pageWindow.__tcfapi = (command, _version, callback, parameter) => {
+  const cmp = (command, _version, callback, parameter) => {
     if (command === 'addEventListener') {
       const listenerId = nextListenerId++;
       consentListeners.set(listenerId, callback);
@@ -194,6 +196,8 @@ async function runGdprPage(
       callback(true, true);
     }
   };
+
+  if (!lateCmp) pageWindow.__tcfapi = cmp;
 
   // Mirror the server's head-injected state, which always precedes the bundle
   // script in document order.
@@ -224,7 +228,16 @@ async function runGdprPage(
     publisherConfig.consentManagement = publisherConsentManagement;
   }
   pageWindow.pbjs.setConfig(publisherConfig);
+  if (lateCmp && queueAuction) {
+    pageWindow.pbjs.que.push(() => {
+      pageWindow.pbjs.requestBids({ adUnits: [], bidsBackHandler: () => {} });
+    });
+  }
   pageWindow.eval(shimCode);
+  if (lateCmp) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    pageWindow.__tcfapi = cmp;
+  }
 
   if (latePublisherConsentManagement !== undefined) {
     pageWindow.pbjs.setConfig({ consentManagement: latePublisherConsentManagement });
@@ -258,6 +271,33 @@ async function runGdprPage(
 }
 
 describe('external bundle TCF enforcement', () => {
+  it('keeps a queued auction safe before a late denying CMP appears', async () => {
+    const { requestedUrls, cookies, consentManagement } = await runGdprPage(
+      { purpose1: false, vendor97: false },
+      { lateCmp: true }
+    );
+    expect(envelopeRequests(requestedUrls)).toEqual([]);
+    expect(cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
+    expect(cookies).not.toContain('_lr_retry_request');
+    expect(consentManagement.gdpr.cmpApi).toBe('iab');
+  });
+
+  it('resolves IDs after a queued auction when a late CMP grants consent', async () => {
+    const { requestedUrls, cookies, consentManagement } = await runGdprPage({}, { lateCmp: true });
+    expect(envelopeRequests(requestedUrls)).toHaveLength(1);
+    expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);
+    expect(consentManagement.gdpr.cmpApi).toBe('iab');
+  });
+
+  it('resolves late managed IDs when publisher initialization precedes the first auction', async () => {
+    const { requestedUrls, cookies } = await runGdprPage(
+      {},
+      { lateCmp: true, queueAuction: false }
+    );
+    expect(envelopeRequests(requestedUrls)).toHaveLength(1);
+    expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);
+  });
+
   it('bundles the activity-control module alongside the consent collectors', () => {
     // A bundle that collects consent but cannot act on it is the failure mode
     // this whole suite exists to prevent.

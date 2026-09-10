@@ -220,17 +220,20 @@ parameters, and no later reconfiguration can recall it. Managed entries
 therefore stay out of every configuration Prebid sees until CMP discovery
 concludes:
 
-| Event                                      | Result                                                          |
-| ------------------------------------------ | --------------------------------------------------------------- |
-| `window.__tcfapi` is callable at shim time | The collector activates and managed entries seed immediately    |
-| A CMP installs `window.__tcfapi` later     | Discovery concludes then: the collector activates, entries seed |
-| No CMP appears before the first auction    | Discovery concludes at `requestBids`; entries seed with no TCF  |
+| Event                                              | Result                                                       |
+| -------------------------------------------------- | ------------------------------------------------------------ |
+| `window.__tcfapi` is callable at shim time         | The collector activates and managed entries seed immediately |
+| A CMP installs `window.__tcfapi` later             | The collector activates before managed entries seed          |
+| The publisher supplies TCF configuration           | Managed entries seed under the publisher's policy            |
+| No CMP or publisher TCF configuration is available | Auctions proceed with managed entries deferred               |
 
-A conforming CMP installs its stub before vendor tags request bids, so the first
-auction is the last useful moment to conclude that no CMP is coming. While
-discovery is pending, publisher `setConfig` and `mergeConfig` calls pass through
-unchanged; managed entries are merged onto the effective configuration once
-discovery concludes.
+An auction does not establish that TCF does not apply. Discovery remains open
+across auctions, including when the CMP property cannot be watched. Publisher
+`setConfig`, `mergeConfig`, and auction calls recheck whether a callable CMP or
+publisher-owned TCF configuration is now available. Until then, publisher
+configuration passes through without adding managed entries. Once ready, managed
+entries are merged onto the effective configuration. Pages without a CMP must
+supply their own explicit Prebid TCF policy to enable managed IDs.
 
 ## Debug Mode
 
