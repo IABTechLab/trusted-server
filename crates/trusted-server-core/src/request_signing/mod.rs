@@ -22,7 +22,7 @@
 
 use std::sync::LazyLock;
 
-use error_stack::{Report, ResultExt as _};
+use error_stack::Report;
 
 use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreName};
@@ -64,15 +64,23 @@ fn parse_active_kids(active_kids: &str) -> Vec<String> {
 async fn read_active_kids(
     services: &RuntimeServices,
 ) -> Result<Vec<String>, Report<TrustedServerError>> {
-    services
+    // A missing `active-kids` entry means none have been recorded yet — an empty
+    // list. But an unreadable store must propagate: silently treating it as empty
+    // would let a rotation overwrite the real list and drop live keys from the
+    // published JWKS.
+    match services
         .config_store()
         .get(&JWKS_STORE_NAME, "active-kids")
         .await
-        .change_context(TrustedServerError::Configuration {
-            message: "failed to read active-kids from config store".into(),
-        })
-        .attach("while fetching active kids list")
-        .map(|active_kids| parse_active_kids(&active_kids))
+    {
+        Ok(active_kids) => Ok(parse_active_kids(&active_kids)),
+        Err(report) if crate::platform::is_not_found(&report) => Ok(Vec::new()),
+        Err(report) => Err(report
+            .change_context(TrustedServerError::Configuration {
+                message: "failed to read active-kids from config store".into(),
+            })
+            .attach("while fetching active kids list")),
+    }
 }
 
 pub use discovery::*;

@@ -58,7 +58,7 @@ impl PlatformConfigStore for CompositeConfigStore {
             .ok_or_else(|| Report::new(PlatformError::ConfigStore))?;
         match binding.handle.get(key).await {
             Ok(Some(value)) => Ok(value),
-            Ok(None) => Err(Report::new(PlatformError::ConfigStore)
+            Ok(None) => Err(Report::new(PlatformError::NotFound)
                 .attach(format!("config key `{key}` not found"))),
             Err(error) => Err(Report::new(PlatformError::ConfigStore)
                 .attach(format!("config store read failed: {error}"))),
@@ -114,7 +114,7 @@ impl PlatformSecretStore for CompositeSecretStore {
             .ok_or_else(|| Report::new(PlatformError::SecretStore))?;
         match bound.get_bytes(key).await {
             Ok(Some(bytes)) => Ok(bytes.to_vec()),
-            Ok(None) => Err(Report::new(PlatformError::SecretStore)
+            Ok(None) => Err(Report::new(PlatformError::NotFound)
                 .attach(format!("secret key `{key}` not found"))),
             Err(error) => Err(Report::new(PlatformError::SecretStore)
                 .attach(format!("secret store read failed: {error}"))),

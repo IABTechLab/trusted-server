@@ -44,7 +44,7 @@ mod types;
 
 pub use composite::{CompositeConfigStore, CompositeSecretStore};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
-pub use error::PlatformError;
+pub use error::{is_not_found, PlatformError};
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSelectResult, UnavailableHttpClient,

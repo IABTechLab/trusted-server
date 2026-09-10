@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{read_active_kids, Keypair};
 use crate::error::TrustedServerError;
-use crate::platform::{RuntimeServices, StoreId};
+use crate::platform::{is_not_found, RuntimeServices, StoreId};
 use crate::request_signing::JWKS_STORE_NAME;
 
 /// Result of a key rotation operation.
@@ -65,15 +65,26 @@ impl KeyRotationManager {
         services: &RuntimeServices,
         kid: Option<String>,
     ) -> Result<KeyRotationResult, Report<TrustedServerError>> {
-        let previous_kid = services
+        // Distinguish "no key rotated in yet" (safe: `None`/empty) from "store
+        // unreadable" (abort): rotating on top of an unreadable store would drop
+        // the existing active kids and previous key from the rotation result.
+        let previous_kid = match services
             .config_store()
             .get(&JWKS_STORE_NAME, "current-kid")
             .await
-            .ok();
-        let active_kids = read_active_kids(services).await.unwrap_or_default();
+        {
+            Ok(current) => Some(current),
+            Err(report) if is_not_found(&report) => None,
+            Err(report) => {
+                return Err(report.change_context(TrustedServerError::Configuration {
+                    message: "failed to read current signing key before rotation".into(),
+                }));
+            }
+        };
+        let active_kids = read_active_kids(services).await?;
         let new_kid = match kid {
             Some(kid) => {
-                if self.key_exists(services, &kid, &active_kids).await {
+                if self.key_exists(services, &kid, &active_kids).await? {
                     return Err(Report::new(TrustedServerError::Configuration {
                         message: format!("kid '{kid}' already exists; choose a unique kid"),
                     }));
@@ -82,7 +93,7 @@ impl KeyRotationManager {
             }
             None => {
                 self.generate_unique_date_based_kid(services, &active_kids)
-                    .await
+                    .await?
             }
         };
 
@@ -151,26 +162,33 @@ impl KeyRotationManager {
         services: &RuntimeServices,
         kid: &str,
         active_kids: &[String],
-    ) -> bool {
-        active_kids.iter().any(|active_kid| active_kid == kid)
-            || services
-                .config_store()
-                .get(&JWKS_STORE_NAME, kid)
-                .await
-                .is_ok()
+    ) -> Result<bool, Report<TrustedServerError>> {
+        if active_kids.iter().any(|active_kid| active_kid == kid) {
+            return Ok(true);
+        }
+        // Fail closed on an unreadable store: treating an unavailable store as
+        // "key does not exist" would let rotation mint a colliding kid and
+        // overwrite a live key. Only a positive not-found is a safe `false`.
+        match services.config_store().get(&JWKS_STORE_NAME, kid).await {
+            Ok(_) => Ok(true),
+            Err(report) if is_not_found(&report) => Ok(false),
+            Err(report) => Err(report.change_context(TrustedServerError::Configuration {
+                message: format!("failed to check whether signing key '{kid}' already exists"),
+            })),
+        }
     }
 
     async fn generate_unique_date_based_kid(
         &self,
         services: &RuntimeServices,
         active_kids: &[String],
-    ) -> String {
+    ) -> Result<String, Report<TrustedServerError>> {
         let base_kid = generate_date_based_kid();
-        if !self.key_exists(services, &base_kid, active_kids).await {
-            return base_kid;
+        if !self.key_exists(services, &base_kid, active_kids).await? {
+            return Ok(base_kid);
         }
 
-        format!("{base_kid}-{}", Uuid::new_v4().simple())
+        Ok(format!("{base_kid}-{}", Uuid::new_v4().simple()))
     }
 
     fn store_private_key(
@@ -317,20 +335,29 @@ impl KeyRotationManager {
         kid: &str,
         operation: &str,
     ) -> Result<(), Report<TrustedServerError>> {
-        if services
+        // Fail closed: only proceed when we can positively confirm `kid` is not
+        // the active signing key. A genuinely-absent `current-kid` (no key has
+        // been rotated in yet) means there is nothing to protect, so it is safe.
+        // But an unreadable config store must NOT be treated as "not current" —
+        // doing so would let a transient store outage delete the live key.
+        match services
             .config_store()
             .get(&JWKS_STORE_NAME, "current-kid")
             .await
-            .is_ok_and(|current| current == kid)
         {
-            return Err(Report::new(TrustedServerError::Configuration {
+            Ok(current) if current == kid => Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "cannot {operation} '{kid}' because it is the current signing key; rotate first"
                 ),
-            }));
+            })),
+            Ok(_) => Ok(()),
+            Err(report) if is_not_found(&report) => Ok(()),
+            Err(report) => Err(report.change_context(TrustedServerError::Configuration {
+                message: format!(
+                    "cannot {operation} '{kid}': unable to read the current signing key to confirm it is not active"
+                ),
+            })),
         }
-
-        Ok(())
     }
 }
 
