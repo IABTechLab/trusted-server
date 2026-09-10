@@ -34,7 +34,7 @@ beforeAll(async () => {
     '--adapters',
     'adf',
     '--user-id-modules',
-    'sharedIdSystem',
+    'sharedIdSystem,identityLinkIdSystem',
     '--out',
     outputDirectory,
   ]);
@@ -86,7 +86,7 @@ describe('tsjs-prebid shim artifact', () => {
     // A value-import of Prebid or a private rendering helper would multiply
     // the shim size; retain a margin above the normal compact shim output.
     expect(bundleCode.length).toBeGreaterThan(200_000);
-    expect(shimCode.length).toBeLessThan(30_000);
+    expect(shimCode.length).toBeLessThan(40_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 });
@@ -135,9 +135,25 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.__tsjs_prebid = {
       clientSideBidders: [],
       serverSideBidders: ['appnexus'],
+      managedUserIds: [
+        {
+          name: 'identityLink',
+          params: { pid: '999', notUse3P: false },
+          storage: {
+            type: 'cookie',
+            name: 'idl_env',
+            expires: 15,
+            refreshInSeconds: 1800,
+          },
+        },
+      ],
     };
 
     pageWindow.eval(bundleCode);
+    pageWindow.pbjs.setConfig({
+      userSync: { userIds: [{ name: 'sharedId' }] },
+    });
+    pageWindow.pbjs.setConfig({ userSync: { syncDelay: 41 } });
 
     expect(typeof pageWindow.pbjs.requestBids).toBe('function');
     expect(typeof pageWindow.pbjs.registerBidAdapter).toBe('function');
@@ -147,7 +163,10 @@ describe('external bundle + served shim evaluated together', () => {
       'adform',
       'adformOpenRTB',
     ]);
-    expect([...pageWindow.__tsjs_prebid_bundle.userIdModules]).toEqual(['sharedIdSystem']);
+    expect([...pageWindow.__tsjs_prebid_bundle.userIdModules]).toEqual([
+      'sharedIdSystem',
+      'identityLinkIdSystem',
+    ]);
 
     // Count trustedServer registrations across repeated shim evaluations.
     const originalRegisterBidAdapter = pageWindow.pbjs.registerBidAdapter.bind(pageWindow.pbjs);
@@ -156,6 +175,83 @@ describe('external bundle + served shim evaluated together', () => {
 
     pageWindow.eval(shimCode);
     const wrappedRequestBids = pageWindow.pbjs.requestBids;
+
+    // Managed IDs remain deferred until the publisher supplies its consent policy.
+    expect(
+      pageWindow.pbjs.getConfig('userSync.userIds').some(({ name }) => name === 'identityLink')
+    ).toBe(false);
+
+    pageWindow.pbjs.setConfig({
+      consentManagement: {
+        gdpr: { cmpApi: 'static', consentData: { gdprApplies: false } },
+      },
+    });
+
+    pageWindow.pbjs.requestBids({ adUnits: [] });
+
+    expect(pageWindow.pbjs.getConfig('userSync.userIds')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'sharedId' }),
+        expect.objectContaining({
+          name: 'identityLink',
+          params: { pid: '999', notUse3P: false },
+          storage: expect.objectContaining({ name: 'idl_env' }),
+        }),
+      ])
+    );
+
+    // Characterize the pinned Prebid artifact: partial userSync updates retain
+    // its effective User ID list, including the operator-managed entry.
+    pageWindow.pbjs.setConfig({ userSync: { syncDelay: 50 } });
+
+    const userIdsAfterPartialUpdate = pageWindow.pbjs.getConfig('userSync.userIds');
+    expect(userIdsAfterPartialUpdate.filter(({ name }) => name === 'identityLink')).toEqual([
+      expect.objectContaining({
+        name: 'identityLink',
+        params: { pid: '999', notUse3P: false },
+      }),
+    ]);
+    expect(userIdsAfterPartialUpdate).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+    );
+    expect(pageWindow.pbjs.getConfig('userSync.syncDelay')).toBe(50);
+
+    // Exercise the real Prebid mergeConfig implementation. It closes over
+    // Prebid's internal setConfig, so the shim must guard mergeConfig itself
+    // to prevent a publisher-owned duplicate from bypassing the setConfig guard.
+    pageWindow.pbjs.mergeConfig({
+      userSync: {
+        userIds: [
+          { name: 'sharedId' },
+          { name: 'identityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    const mergedUserIds = pageWindow.pbjs.getConfig('userSync.userIds');
+    expect(mergedUserIds.filter(({ name }) => name === 'identityLink')).toEqual([
+      expect.objectContaining({
+        name: 'identityLink',
+        params: { pid: '999', notUse3P: false },
+      }),
+    ]);
+    expect(mergedUserIds).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+    );
+
+    pageWindow.pbjs.mergeConfig({ userSync: { syncDelay: 75 } });
+
+    const userIdsAfterPartialMerge = pageWindow.pbjs.getConfig('userSync.userIds');
+    expect(userIdsAfterPartialMerge.filter(({ name }) => name === 'identityLink')).toEqual([
+      expect.objectContaining({
+        name: 'identityLink',
+        params: { pid: '999', notUse3P: false },
+      }),
+    ]);
+    expect(userIdsAfterPartialMerge).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+    );
+    expect(pageWindow.pbjs.getConfig('userSync.syncDelay')).toBe(75);
 
     // A second evaluation (double script inclusion, or a legacy bundle that
     // still carries a baked-in shim running after this one) must be a no-op.

@@ -188,6 +188,19 @@ test.describe("GPT runtime diagnostics", () => {
     }, testInfo) => {
         const pageErrors: string[] = [];
         const diagnosticNetworkRequests: string[] = [];
+        await page.addInitScript(() => {
+            const originalAttachShadow = Element.prototype.attachShadow;
+            Element.prototype.attachShadow = function (init: ShadowRootInit) {
+                const root = originalAttachShadow.call(this, init);
+                if (
+                    (this as HTMLElement).id ===
+                    "trusted-server-gpt-diagnostics"
+                ) {
+                    (window as any).__gptDiagnosticsTestRoot = root;
+                }
+                return root;
+            };
+        });
         page.on("pageerror", (error) => pageErrors.push(error.message));
         page.on("request", (request) => {
             if (
@@ -220,7 +233,7 @@ test.describe("GPT runtime diagnostics", () => {
         );
         await emit(page, "slotRenderEnded", "gpt-diagnostics-slot-primary", {
             isEmpty: false,
-            size: [300, 250],
+            size: [1, 1],
             isBackfill: true,
             slotContentChanged: true,
         });
@@ -271,12 +284,15 @@ test.describe("GPT runtime diagnostics", () => {
                 slot.slotElementId === "gpt-diagnostics-slot-secondary",
         );
         expect(primary.binding).toEqual({ status: "bound" });
+        expect(snapshot.slots.map((slot: any) => slot.runtimeSlotNumber)).toEqual([
+            1, 2,
+        ]);
         expect(
             primary.requests.map((cycle: any) => cycle.requestNumber),
         ).toEqual([1, 2, 3]);
         expect(primary.requests[0]).toMatchObject({
             isEmpty: false,
-            size: [300, 250],
+            size: [1, 1],
             isBackfill: true,
             slotContentChanged: true,
         });
@@ -335,6 +351,77 @@ test.describe("GPT runtime diagnostics", () => {
         await expect(page.locator(`#${HOST_ID}`)).toHaveCount(1);
         const hiddenPeriodSnapshot = await page.evaluate(() =>
             (window as any).tsjs.gptDiagnostics.snapshot(),
+        );
+        await page.waitForFunction(() =>
+            Boolean(
+                (window as any).__gptDiagnosticsTestRoot?.querySelector(
+                    ".tsgd-badge",
+                ),
+            ),
+        );
+        const badgeIdentity = await page.evaluate(() => {
+            const badge = (
+                window as any
+            ).__gptDiagnosticsTestRoot.querySelector(
+                ".tsgd-badge",
+            ) as HTMLButtonElement;
+            badge.focus();
+            return {
+                tagName: badge.tagName,
+                text: badge.textContent,
+                ariaLabel: badge.getAttribute("aria-label"),
+                runtimeSlotNumber: badge.dataset.runtimeSlot,
+                requestNumber: badge.dataset.requestNumber,
+            };
+        });
+        expect(badgeIdentity).toMatchObject({
+            tagName: "BUTTON",
+            text: expect.stringMatching(/Ad #\d+ · Request #\d+/),
+            ariaLabel: expect.stringMatching(/Ad #\d+, Request #\d+/),
+        });
+        await page.keyboard.press("Enter");
+        await page.waitForFunction(
+            ({ runtimeSlotNumber, requestNumber }) => {
+                const root = (window as any)
+                    .__gptDiagnosticsTestRoot as ShadowRoot;
+                const selected = root?.querySelector<HTMLElement>(
+                    `[aria-current="true"][data-runtime-slot="${runtimeSlotNumber}"][data-request-number="${requestNumber}"]`,
+                );
+                return selected !== null && root.activeElement === selected;
+            },
+            {
+                runtimeSlotNumber: badgeIdentity.runtimeSlotNumber,
+                requestNumber: badgeIdentity.requestNumber,
+            },
+        );
+        await page.evaluate(
+            ({ runtimeSlotNumber, requestNumber }) => {
+                const root = (window as any)
+                    .__gptDiagnosticsTestRoot as ShadowRoot;
+                const selected = root.querySelector<HTMLElement>(
+                    `[aria-current="true"][data-runtime-slot="${runtimeSlotNumber}"][data-request-number="${requestNumber}"]`,
+                );
+                const locate = Array.from(
+                    selected
+                        ?.closest(".tsgd-slot")
+                        ?.querySelectorAll("button") ?? [],
+                ).find(
+                    (candidate) =>
+                        candidate.textContent === "Locate on page",
+                );
+                locate?.click();
+            },
+            {
+                runtimeSlotNumber: badgeIdentity.runtimeSlotNumber,
+                requestNumber: badgeIdentity.requestNumber,
+            },
+        );
+        await page.waitForFunction(() =>
+            Boolean(
+                (window as any).__gptDiagnosticsTestRoot?.querySelector(
+                    ".tsgd-highlight",
+                ),
+            ),
         );
         expect(
             hiddenPeriodSnapshot.slots.find(

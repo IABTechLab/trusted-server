@@ -2,7 +2,12 @@ import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { unhandledCase } from './exhaustive';
-import { formatSizes, scheduleFrame } from './presentation_helpers';
+import {
+  auctionTypeBadgeLabel,
+  displayableGptFillSize,
+  formatSizes,
+  scheduleFrame,
+} from './presentation_helpers';
 import type {
   GptDiagnosticsBindingInput,
   GptDiagnosticsStoreSlotSnapshot,
@@ -33,6 +38,7 @@ interface BadgeOptions {
   window?: BadgeWindow;
   document?: Document;
   scheduleFrame?: (callback: () => void) => void;
+  onActivate?: (runtimeSlotNumber: number, requestNumber: number) => void;
 }
 
 function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
@@ -106,9 +112,12 @@ function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   else if (cycle.isEmpty === false) firstLine.push('Filled');
   else if (cycle.renderAtMs !== undefined) firstLine.push('Rendered (fill unknown)');
   else firstLine.push('Pending');
+  if (cycle.auctionType) firstLine.push(auctionTypeBadgeLabel(cycle.auctionType));
   const delivery = deliveryLabel(cycle);
   if (delivery) firstLine.push(delivery);
-  if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
+  if (cycle.requestPath === 'competing' && cycle.auctionType !== 'competing') {
+    firstLine.push('Competing paths');
+  }
   if (cycle.requestedSlotSizes) {
     const displayedSizes = cycle.requestedSlotSizes.slice(0, MAX_BADGE_REQUESTED_SLOT_SIZES);
     const remainingSizeCount = cycle.requestedSlotSizes.length - displayedSizes.length;
@@ -116,16 +125,17 @@ function badgeText(cycle: GptDiagnosticsRequestCycle): string {
       `Req ${formatSizes(displayedSizes)}${remainingSizeCount > 0 ? ` +${remainingSizeCount}` : ''}`
     );
   }
-  if (cycle.size) firstLine.push(`Fill ${cycle.size[0]}×${cycle.size[1]}`);
+  const fillSize = displayableGptFillSize(cycle.size);
+  if (fillSize) firstLine.push(`Fill ${fillSize[0]}×${fillSize[1]}`);
   if (cycle.observedSlotSize) {
-    firstLine.push(`Box ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
+    firstLine.push(`Size filled ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
   }
 
   const timingLine: string[] = [];
   const response = formatMilliseconds(cycle.durations.requestToResponseMs);
   const render = formatMilliseconds(cycle.durations.responseToRenderMs);
-  if (response) timingLine.push(`Response ${response}`);
-  if (render) timingLine.push(`Render ${render}`);
+  if (response) timingLine.push(`GAM request → response ${response}`);
+  if (render) timingLine.push(`GAM response → render ${render}`);
 
   const lines = [firstLine.join(' · ')];
   if (timingLine.length > 0) lines.push(timingLine.join(' · '));
@@ -148,6 +158,7 @@ export class GptDiagnosticsBadgeManager {
   private readonly window: BadgeWindow;
   private readonly document: Document;
   private readonly scheduleFrame: (callback: () => void) => void;
+  private readonly onActivate: (runtimeSlotNumber: number, requestNumber: number) => void;
   private readonly unsubscribeStore: () => void;
   private readonly unsubscribeBindings: () => void;
   private readonly slotElementIds = new Set<string>();
@@ -165,6 +176,7 @@ export class GptDiagnosticsBadgeManager {
     this.document = options.document ?? document;
     this.scheduleFrame =
       options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
+    this.onActivate = options.onActivate ?? (() => undefined);
     this.refreshSlotElementIds();
     this.unsubscribeStore = this.store.subscribe(() => {
       this.refreshSlotElementIds();
@@ -201,10 +213,19 @@ export class GptDiagnosticsBadgeManager {
       if (!intersectsViewport(rectangle, this.window)) continue;
       observedElements.push(element);
 
-      const badge = this.document.createElement('div');
+      const badge = this.document.createElement('button');
+      badge.type = 'button';
       badge.className = 'tsgd-badge';
       badge.dataset.runtimeSlot = String(slot.runtimeSlotNumber);
-      badge.textContent = badgeText(cycle);
+      badge.dataset.requestNumber = String(cycle.requestNumber);
+      badge.textContent = `Ad #${slot.runtimeSlotNumber} · Request #${cycle.requestNumber} · ${badgeText(cycle)}`;
+      badge.setAttribute(
+        'aria-label',
+        `Open diagnostics for Ad #${slot.runtimeSlotNumber}, Request #${cycle.requestNumber}`
+      );
+      badge.addEventListener('click', () =>
+        this.onActivate(slot.runtimeSlotNumber, cycle.requestNumber)
+      );
       badge.style.maxWidth = `${BADGE_MAX_WIDTH_PX}px`;
       badge.style.left = `${Math.max(
         BADGE_EDGE_GUTTER_PX,
@@ -222,7 +243,8 @@ export class GptDiagnosticsBadgeManager {
       badges.push(badge);
     }
 
-    this.layer.replaceChildren(...badges);
+    for (const badge of this.layer.querySelectorAll('.tsgd-badge')) badge.remove();
+    this.layer.append(...badges);
     this.resizeObserver?.disconnect();
     for (const element of observedElements) this.resizeObserver?.observe(element);
   }

@@ -8,6 +8,7 @@
     "test:wordpress": "TEST_FRAMEWORK=wordpress npx playwright test"
   },
   "devDependencies": {
-    "@playwright/test": "^1.49.0"
+    "@playwright/test": "^1.49.0",
+    "prebid-universal-creative": "1.17.2"
   }
 }

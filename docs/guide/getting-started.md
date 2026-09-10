@@ -147,7 +147,7 @@ ts config init
 To bootstrap from a public publisher page, run an audit first:
 
 ```bash
-ts audit https://publisher.example
+ts audit generate https://publisher.example
 ```
 
 The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
@@ -160,6 +160,7 @@ Edit `trusted-server.toml` to configure:
 - browser integrations under `[integrations.*]`;
 - server auction providers under map-shaped `[auction.providers.<id>]`;
 - server bidder routes under `[auction.bidders.<id>]`;
+- ad server integrations;
 - KV store mappings;
 - EC configuration;
 - consent settings (`[gdpr]`); and

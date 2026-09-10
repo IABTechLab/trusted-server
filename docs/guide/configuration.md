@@ -153,6 +153,8 @@ fail and the service will return its startup-error response.
 | `[request_signing]`   | Ed25519 request signing                      |
 | `[auction]`           | Auction orchestration                        |
 | `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
+| `[observability]`     | Server-Timing header emission                |
+| `[tinybird]`          | Auction and access telemetry transport       |
 
 ## Example: Production Setup
 
@@ -212,7 +214,7 @@ base TOML configuration by `ts config validate`, `ts config diff`, and
 stored in the app-config blob. Changing an environment variable requires
 rerunning validation and pushing the resolved config, not rebuilding the binary.
 
-The pinned EdgeZero loader only overrides leaves that already exist in the
+EdgeZero's env overlay only overrides leaves that already exist in the
 parsed TOML; it does not create missing fields. Add newly introduced defaulted
 fields to an existing config before relying on their environment overrides.
 Secret overlays still contain key names, never secret values. Pass `--no-env`
@@ -567,7 +569,13 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for Edge Cookie identifier generation. The `ec_store` KV store is the only KV-backed EC lifecycle store. It holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence.
+
+### Migrating from `consent_store`
+
+The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading. Remove the field before upgrading; it is not accepted as an ignored or deprecated option.
+
+Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
 ### `[ec]`
 
@@ -1337,18 +1345,19 @@ apply when the integration section exists in `trusted-server.toml`.
 timeout, routing, profile debug/test controls, consent forwarding, bidder-param
 overrides, and notification suppression belong under `[auction]`.
 
-| Browser field                         | Type          | Default                                                                | Description                                                                    |
-| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `enabled`                             | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
-| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
-| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
-| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
-| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
-| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
-| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
-| `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
-| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                              |
+| Browser field                         | Type          | Default                                                                | Description                                                                                                                   |
+| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                             | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter                                                |
+| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration                                                             |
+| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout                                                       |
+| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug                                                             |
+| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                                                                       |
+| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                                                                    |
+| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                                                                   |
+| `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                                                                 |
+| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                                                                  |
+| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                                                                             |
+| `managed_user_ids`                    | Array[Table]  | `[]`                                                                   | Prebid User ID modules Trusted Server installs and keeps installed; each entry is forwarded to Prebid.js verbatim (see below) |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
@@ -1365,6 +1374,15 @@ debug = false
 client_side_bidders = ["example-browser"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 script_patterns = ["/prebid.js", "/prebid.min.js"]
+
+[[integrations.prebid.managed_user_ids]]
+name = "sharedId"
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie"
+name = "_sharedid"
+expires = 15
+refresh_in_seconds = 1800
 
 [proxy]
 allowed_domains = ["assets.example.com"]
@@ -1409,6 +1427,46 @@ env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
 Environment overlays only replace existing scalar leaves. Keep
 `client_side_bidders`, provider profile tables, bidder-parameter overrides, and
 rules in TOML, then validate and push the edited file.
+
+**Managed User ID modules**:
+
+Each `[[integrations.prebid.managed_user_ids]]` entry names a Prebid
+`userSync.userIds` module that Trusted Server installs on the page and
+reinstates whenever publisher JavaScript replaces the User ID configuration.
+Trusted Server does not interpret module-specific fields; every registered
+module uses the same vendor-neutral surface. The managed `name` must match a
+`configNames` entry in the checked-in `user_id_modules.json` registry:
+
+| Field                        | Type    | Default                        | Description                                                                          |
+| ---------------------------- | ------- | ------------------------------ | ------------------------------------------------------------------------------------ |
+| `name`                       | String  | Required                       | Prebid `userSync.userIds` entry name, for example `sharedId`. Unique across entries  |
+| `params`                     | Table   | `{}`                           | Module-specific parameters, forwarded to Prebid unchanged                            |
+| `storage.type`               | String  | `cookie`                       | Browser storage: `cookie` or `html5`                                                 |
+| `storage.name`               | String  | Required when `storage` exists | Cookie or local-storage key the module reads and writes                              |
+| `storage.expires`            | Integer | Prebid's own default           | Storage lifetime in days; must be at least 1. Any per-module ceiling is the module's |
+| `storage.refresh_in_seconds` | Integer | Prebid's own default           | Seconds before the module may refresh the stored value; must be at least 1           |
+
+The module must be present in the built bundle. Name it under
+`[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
+generator's default preset. `ts prebid bundle` resolves each managed `name`
+through the checked-in `user_id_modules.json` registry, rejects unknown names,
+ambiguous names, and two names that resolve to the same module, and confirms the
+required modules in the newly generated
+manifest. A failure identifies the managed name or required module and does not
+update the configured bundle hash or SRI. The browser diagnostic remains a
+fallback for externally hosted, stale, or modified bundles. Trusted Server core
+does not interpret module-specific `params`; it forwards them to Prebid.js
+unchanged.
+
+Persisting a resolved ID into the Edge Cookie identity graph additionally
+requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
+module's OpenRTB EID source.
+
+`managed_user_ids` is an array of tables, so it cannot be set through a
+`TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves
+the published TOML already declares. See
+[Managed User ID modules](/guide/integrations/prebid#managed-user-id-modules)
+for consent, timing, privacy, degraded behavior, and validation guidance.
 
 **Script Pattern Matching**:
 
@@ -2118,6 +2176,158 @@ fastly config-store create --name trusted_server_config
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service
 version if that is required.
+
+## Observability and Access Telemetry Configuration
+
+Settings for the `Server-Timing` response header and the sampled
+access-telemetry sink. Both are off by default and are independent switches:
+enabling one does not enable the other.
+
+### `[observability]`
+
+| Field                   | Type     | Required | Default | Description                                                                                               |
+| ----------------------- | -------- | -------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `server_timing_enabled` | Boolean  | No       | `false` | Append request-phase timings to the `Server-Timing` response header                                       |
+| `route_sections`        | String[] | No       | `[]`    | Section names kept as publisher route templates (`/{section}/*`) in access telemetry; empty collapses all |
+
+**Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
+phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
+`ts-template-cache`) as a standard `Server-Timing` header, in milliseconds
+with one decimal place. An unrecorded phase is omitted from the header
+rather than rendered as zero.
+
+**Emission is conservative**: the header is appended only on responses that
+are conclusively private, meaning `Cache-Control` contains `private` or
+`no-store`. A response that is heuristically cacheable, carries a bare
+`max-age`, or has no cache header at all never receives the header, because a
+shared-cache object would otherwise replay one request's timings for its
+entire stored lifetime. The long-lived, shared-cacheable `tsjs` asset route is
+the concrete case this excludes. The header is appended, never inserted, so
+an origin-supplied `Server-Timing` value and any entries the fronting
+delivery layer adds are preserved alongside the TS entries.
+
+The Axum adapter applies the same private-response rule at its own terminal
+point before serializing the response, and emits the header only; it does not
+send access-telemetry rows.
+
+**Example**:
+
+```toml
+[observability]
+server_timing_enabled = true
+```
+
+::: tip The Axum dev server reads this flag once at startup
+Unlike the Fastly adapter, which reads settings per request, the Axum dev
+server bakes `server_timing_enabled` into its service when it starts.
+Flipping the flag there requires a restart to take effect.
+:::
+
+::: warning Client-visible latency disclosure
+The `Server-Timing` header is sent to every client on eligible responses,
+not only to operators: browsers expose the values to same-origin JavaScript
+via `PerformanceResourceTiming.serverTiming`, and any caller can read the
+raw header. Enabling it publishes measured per-phase server latency,
+including KV read timing on the public identity endpoints (`ts-kv`) and
+origin/cache behaviour on publisher pages (`ts-origin`,
+`ts-template-cache`). This is standard `Server-Timing` practice and the
+values are durations only, but treat the flag as a diagnostic aid to enable
+deliberately, not a general always-on toggle, unless disclosing those
+timings to all clients is acceptable for the deployment.
+:::
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED=true
+```
+
+::: tip Present-but-false by default
+`server_timing_enabled` ships as `false` in the base operator config rather
+than being left out, even though `false` is also its default. The
+environment-variable overlay can only override a leaf that already exists in
+the parsed TOML; it cannot create a missing one. Keeping the leaf present lets
+`TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED` take effect without an
+extra edit to add the table first.
+:::
+
+### `[tinybird]` access telemetry keys
+
+`[tinybird]` configures a shared Events API transport (`enabled`, `api_host`,
+`secret_store`, and per-sink dataset and token fields) used by two
+independent emitters: auction telemetry (`auction_dataset`,
+`auction_token_secret`) and access telemetry. The keys below cover the
+access-telemetry sink and the shared enable flags.
+
+| Field                 | Type    | Required                             | Default                        | Description                                                                     |
+| --------------------- | ------- | ------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------- |
+| `enabled`             | Boolean | Yes, when `access_enabled`           | `false`                        | Master switch for the shared Tinybird transport (host, store, credentials)      |
+| `auction_enabled`     | Boolean | No                                   | `true`                         | Independently gates auction telemetry emission, decoupled from access telemetry |
+| `access_enabled`      | Boolean | No                                   | `false`                        | Enables the sampled access-telemetry row sent after each response is delivered  |
+| `access_dataset`      | String  | Yes, when `access_enabled`           | `access_logs_raw`              | Access-log Events API datasource name                                           |
+| `access_token_secret` | String  | Yes, when `access_enabled`           | `tinybird_access_append_token` | Secret Store key holding the access APPEND token                                |
+| `max_body_bytes`      | Integer | No                                   | `1048576`                      | Maximum NDJSON request body size; must be at least 1024                         |
+| `access_sample_rate`  | Float   | Yes (`> 0.0`), when `access_enabled` | `0.0`                          | Fraction (`0.0`-`1.0`) of requests to emit an access-telemetry row for          |
+
+**Purpose**: `access_enabled` and `auction_enabled` gate the two Tinybird
+sinks separately so that turning on one does not silently turn on (or leave
+off) the other; a settings test locks this decoupling in both directions.
+Setting `access_enabled = true` with `access_sample_rate = 0.0` is rejected at
+config load as an armed-but-silent configuration; use `access_enabled` itself
+to turn the sink off, not the sample rate. Enabling `access_enabled` also
+requires the shared transport fields (`enabled`, non-empty `api_host`,
+`secret_store`, `access_dataset`, `access_token_secret`, and a
+`max_body_bytes` of at least 1024) to already be set.
+
+**Example**:
+
+```toml
+[tinybird]
+enabled = true
+api_host = "api.tinybird.example.com"
+secret_store = "ts_secrets"
+auction_enabled = true
+
+# Access-log telemetry, decoupled from auction emission.
+access_enabled = true
+access_dataset = "access_logs_raw"
+access_token_secret = "tinybird_access_append_token"
+access_sample_rate = 0.05
+max_body_bytes = 1048576
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TINYBIRD__ACCESS_ENABLED=true
+TRUSTED_SERVER__TINYBIRD__ACCESS_SAMPLE_RATE=0.05
+TRUSTED_SERVER__TINYBIRD__AUCTION_ENABLED=true
+```
+
+A sampled request emits one access-telemetry row to `access_dataset` after
+the response has already been delivered to the client, so ingest never delays
+the response the reader sees.
+
+### Deploy and rollback ordering
+
+::: warning Push a compatibility config before rolling back
+The compatibility boundary is uneven. The top-level `Settings` schema uses
+`deny_unknown_fields`, so an older binary rejects a config carrying the
+`[observability]` table. The nested `[tinybird]` table does not: an older
+binary accepts unknown keys there, rejects `access_enabled = true` through
+validation, ignores `auction_enabled` entirely, and reads `enabled = true`
+as "auction telemetry on".
+
+**Deploying**: upgrade the binary first, then push a config containing the
+new fields second. Never push a config with these fields while a
+pre-observability binary can still receive it.
+
+**Rolling back**: push a compatibility config first, then roll the binary
+back. The compatibility config removes the `[observability]` table, sets
+`access_enabled = false`, and, for a deployment that only used the access
+sink, sets `enabled = false` as well; otherwise the older binary would
+interpret the leftover `enabled = true` as enabling auction telemetry.
+:::
 
 ## Validation
 

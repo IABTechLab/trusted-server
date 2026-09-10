@@ -61,16 +61,30 @@ pub fn settings_from_config_blob(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    if data
-        .pointer("/tinybird/enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        && let Some(tinybird) = data
-            .get_mut("tinybird")
-            .and_then(serde_json::Value::as_object_mut)
+    if let Some(tinybird) = data
+        .get_mut("tinybird")
+        .and_then(serde_json::Value::as_object_mut)
     {
-        tinybird.remove("auction_token_secret");
-        tinybird.remove("access_token_secret");
+        let enabled = tinybird.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+        if !enabled {
+            tinybird.remove("auction_token_secret");
+            tinybird.remove("access_token_secret");
+        } else {
+            if tinybird
+                .get("auction_enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                tinybird.remove("auction_token_secret");
+            }
+            if tinybird
+                .get("access_enabled")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                tinybird.remove("access_token_secret");
+            }
+        }
     }
 
     if let Some(partners) = data
@@ -127,7 +141,10 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::integrations::IntegrationRegistry;
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
@@ -834,9 +851,15 @@ mod tests {
     #[test]
     fn runtime_blob_accepts_disabled_browser_bidder_ownership_overlap() {
         let original = settings_with_browser_bidder_overlap(false);
+        let reconstructed = load_settings(&envelope_json(&original))
+            .expect("should decode dormant conflicting runtime blob");
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&reconstructed)
+                .expect("should compile decoded disabled auction plan"),
+        );
 
-        load_settings(&envelope_json(&original))
-            .expect("runtime should accept disabled browser bidder ownership overlap");
+        IntegrationRegistry::with_plan(&reconstructed, plan)
+            .expect("runtime registry should accept disabled ownership overlap");
     }
 
     #[test]

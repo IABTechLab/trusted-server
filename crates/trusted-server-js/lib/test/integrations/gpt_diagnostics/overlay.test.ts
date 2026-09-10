@@ -110,7 +110,7 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.destroy();
   });
 
-  it('presents the request path and Trusted Server delivery evidence without winner claims', () => {
+  it('presents request-path, auction, winner, timing, and delivery evidence', () => {
     const frames: Array<() => void> = [];
     let now = 10;
     const store = new GptDiagnosticsStore({
@@ -125,7 +125,19 @@ describe('GptDiagnosticsOverlay', () => {
       responseSentSlot,
       'auction-response-sent',
       'renderable_candidate',
-      'auction-123'
+      'auction-123',
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example-bidder', priceBucket: '1.20' },
+        serverTimings: {
+          auctionDispatchedMs: 4,
+          auctionResolvedMs: 84,
+          auctionCommittedMs: 85,
+          auctionWaitMs: 80,
+          auctionWaitPlacement: 'in_stream',
+        },
+      }
     );
     store.recordSlotRequested(responseSentSlot);
     now = 11;
@@ -162,7 +174,19 @@ describe('GptDiagnosticsOverlay', () => {
     store.recordTrustedServerOpportunity(
       selectedSlot,
       'auction-selected',
-      'unrenderable_candidate'
+      'unrenderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        serverTimings: {
+          auctionDispatchedMs: 0,
+          auctionResolvedMs: 40,
+          auctionCommittedMs: 41,
+          auctionWaitMs: 40,
+          auctionWaitPlacement: 'pre_header',
+        },
+      }
     );
     store.recordPrebidRefresh([selectedSlot]);
     store.recordSlotRequested(selectedSlot);
@@ -248,8 +272,15 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Request path: Trusted Server direct');
     expect(responseSentArticle).toContain('Request intent: 1');
     expect(responseSentArticle).toContain('Trusted Server auction: auction-123');
+    expect(responseSentArticle).toContain('Auction evidence: SSAT: initial-page server auction');
+    expect(responseSentArticle).toContain('Server auction winner: example-bidder');
+    expect(responseSentArticle).toContain('Server bid price bucket: 1.20');
+    expect(responseSentArticle).toContain('Server request start → auction dispatched 4 ms');
+    expect(responseSentArticle).toContain('Server request start → auction collected 84 ms');
+    expect(responseSentArticle).toContain('Server request start → bids ready 85 ms');
+    expect(responseSentArticle).toContain('Auction collection wait (in stream) 80 ms');
     expect(responseSentArticle).toContain('Opportunity → request 0 ms');
-    expect(responseSentArticle).toContain('Direct opportunity: Renderable candidate');
+    expect(responseSentArticle).toContain('Server bid available; creative source present');
     expect(responseSentArticle).toContain('Trusted Server creative request observed at 13 ms');
     expect(responseSentArticle).toContain('Trusted Server markup response sent at 14 ms');
     expect(
@@ -258,7 +289,7 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Creative bridge failure: cache fetch failed');
     expect(responseSentArticle).toContain('Creative bridge failure: invalid cache payload');
     expect(responseSentArticle).toContain('Creative bridge failure: response post failed');
-    expect(responseSentArticle).toContain('Trusted Server selected; markup response sent to PUC');
+    expect(responseSentArticle).toContain('Creative markup sent; execution not confirmed');
     expect(responseSentArticle).toContain(
       'Ad Manager reported line item 6543210987 · order 2345678901'
     );
@@ -270,48 +301,47 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).not.toMatch(/creative rendered|ad visible|pixels confirmed/i);
 
     const selectedArticle = slotArticle(root!, 'selected-slot').textContent ?? '';
-    expect(selectedArticle).toContain('Request path: Competing paths');
-    expect(selectedArticle).toContain('Direct opportunity: Unrenderable candidate');
+    expect(selectedArticle).toContain('Request path: Multiple paths observed');
+    expect(selectedArticle).toContain('Auction evidence: TS auction: SPA server auction');
+    expect(selectedArticle).toContain('Server request start → auction dispatched 0 ms');
+    expect(selectedArticle).toContain('Server request start → auction collected 40 ms');
+    expect(selectedArticle).toContain('Server bid available; creative source incomplete');
     expect(selectedArticle).toContain('Trusted Server creative request observed at 23 ms');
     expect(selectedArticle).not.toContain('Trusted Server markup response sent');
-    expect(selectedArticle).toContain('Trusted Server selected; no markup response confirmed');
+    expect(selectedArticle).toContain(
+      'Server bid selected by the creative bridge; response not confirmed'
+    );
 
     const noCandidateArticle = slotArticle(root!, 'no-candidate-slot').textContent ?? '';
     expect(noCandidateArticle).toContain('Request path: Trusted Server direct');
     expect(noCandidateArticle).toContain('Direct opportunity: No candidate');
-    expect(noCandidateArticle).toContain(
-      'adInit observed no direct Trusted Server candidate for this request'
-    );
+    expect(noCandidateArticle).toContain('No direct Trusted Server candidate');
 
     const unattributedArticle = slotArticle(root!, 'unattributed-slot').textContent ?? '';
-    expect(unattributedArticle).toContain('Request path: Unattributed');
-    expect(unattributedArticle).toContain('Direct opportunity: Unknown (not observed)');
+    expect(unattributedArticle).toContain('Request path: Not observed');
+    expect(unattributedArticle).toContain('Direct opportunity: Not observed');
     expect(unattributedArticle).toContain(
-      'Delivery status unknown — required GPT or direct-candidate evidence was not observed'
+      'Delivery status unknown — required evidence was not observed'
     );
 
     const prebidArticle = slotArticle(root!, 'prebid-slot').textContent ?? '';
     expect(prebidArticle).toContain('Request path: Prebid refresh');
-    expect(prebidArticle).toContain('Direct opportunity: Unknown (not observed)');
-    expect(prebidArticle).toContain(
-      'Delivery status unknown — required GPT or direct-candidate evidence was not observed'
-    );
+    expect(prebidArticle).toContain('Direct opportunity: Not observed');
+    expect(prebidArticle).toContain('Delivery status unknown — required evidence was not observed');
 
     const unconfirmedArticle = slotArticle(root!, 'unconfirmed-slot').textContent ?? '';
     expect(unconfirmedArticle).toContain('Request path: Trusted Server direct');
-    expect(unconfirmedArticle).toContain('Direct opportunity: Renderable candidate');
-    expect(unconfirmedArticle).toContain(
-      'Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible'
-    );
+    expect(unconfirmedArticle).toContain('Server bid available; creative source present');
+    expect(unconfirmedArticle).toContain('Server bid available; selection not confirmed');
 
     const pendingArticle = slotArticle(root!, 'candidate-pending-slot').textContent ?? '';
     expect(pendingArticle).toContain('Request path: Trusted Server direct');
-    expect(pendingArticle).toContain('Direct opportunity: Renderable candidate');
+    expect(pendingArticle).toContain('Server bid available; creative source present');
     expect(pendingArticle).toContain('Waiting for Trusted Server creative evidence');
 
     const notApplicableArticle = slotArticle(root!, 'not-applicable-slot').textContent ?? '';
     expect(notApplicableArticle).toContain('Request path: Trusted Server direct');
-    expect(notApplicableArticle).toContain('Direct opportunity: Renderable candidate');
+    expect(notApplicableArticle).toContain('Server bid available; creative source present');
     expect(notApplicableArticle).not.toMatch(
       /Trusted Server selected|candidate unconfirmed|no direct Trusted Server candidate|Delivery status unknown|Waiting for Trusted Server creative evidence/
     );
@@ -466,22 +496,35 @@ describe('GptDiagnosticsOverlay', () => {
     expect(root!.textContent).toContain('GPT observed');
     expect(root!.textContent).toContain('callback issues');
     expect(root!.textContent).toContain('attribution issues');
-    expect(root!.textContent).toContain('filled-slot');
+    expect(root!.textContent).toContain('Ad #1 · Request #2 · filled-slot');
     expect(root!.textContent).toContain('/example/site/filled-slot');
     expect(root!.textContent).toContain('Empty');
-    expect(root!.textContent).toContain('Previous requests (1)');
-    expect(root!.textContent).toContain('Requested slot sizes 300×250, 728×90, 320×50, 970×250');
-    expect(root!.textContent).toContain('GPT-reported fill size 300×250');
-    expect(root!.textContent).toContain('Observed outer slot box 320×270');
+    expect(root!.textContent).toContain('Request history (1 previous)');
+    expect(root!.textContent).toContain('Requested sizes 300×250, 728×90, 320×50, 970×250');
+    expect(root!.textContent).toContain('GPT-reported size 300×250');
+    expect(root!.textContent).toContain('Size filled 320×270');
     expect(root!.textContent).toContain('Backfill yes');
     expect(root!.textContent).toContain('GPT slot onload observed');
     expect(root!.textContent).toContain('GPT impressionViewable observed');
-    expect(root!.textContent).toContain('Request → response 10 ms');
+    expect(root!.textContent).toContain('GAM request → response 10 ms');
     expect(root!.textContent).toContain('GPT visibility 60%');
     expect(root!.textContent).toContain('Requesting');
     expect(root!.textContent).toContain('Ambiguous binding');
     expect(root!.textContent).toContain('Incomplete sequence');
+    expect(slotArticle(root!, 'pending-slot').textContent).toContain(
+      'Delivery evidence: Not applicable'
+    );
+    expect(slotArticle(root!, 'pending-slot').textContent).not.toContain(
+      'Served bidder not confirmed'
+    );
+    const emptySummary = slotArticle(root!, 'filled-slot').querySelector('.tsgd-group');
+    expect(emptySummary?.textContent).toContain('Delivery evidence: Not applicable');
+    expect(emptySummary?.textContent).not.toContain('Served bidder not confirmed');
 
+    expect(root!.textContent).toContain('How to read this evidence');
+    expect(root!.querySelector<HTMLAnchorElement>('a')?.href).toBe(
+      'https://iabtechlab.github.io/trusted-server/guide/integrations/gpt-diagnostics-dictionary'
+    );
     button(root!, 'Export JSON').click();
     expect(exportSnapshot).toHaveBeenCalledTimes(1);
 
@@ -519,6 +562,64 @@ describe('GptDiagnosticsOverlay', () => {
     expect(element.getAttributeNames()).toEqual(['id']);
     expect(element.className).toBe('');
     expect(element.getAttribute('style')).toBeNull();
+    overlay.destroy();
+  });
+
+  it('reveals an exact request and locates it without mutating publisher markup', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const publisherSlot = document.createElement('div');
+    publisherSlot.id = 'locatable-slot';
+    publisherSlot.className = 'publisher-class';
+    publisherSlot.style.minHeight = '250px';
+    document.body.append(publisherSlot);
+    const originalMarkup = publisherSlot.outerHTML;
+    const scrollIntoView = vi.fn();
+    publisherSlot.scrollIntoView = scrollIntoView;
+    vi.spyOn(publisherSlot, 'getBoundingClientRect').mockReturnValue({
+      left: 10,
+      top: 20,
+      width: 300,
+      height: 250,
+    } as DOMRect);
+    const observedSlot = slot('locatable-slot');
+    store.recordSlotRequested(observedSlot);
+    store.recordSlotRequested(observedSlot);
+    bindings.set(1, { status: 'bound' }, publisherSlot, true);
+    let root: ShadowRoot | undefined;
+    const overlay = new GptDiagnosticsOverlay(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+      onShadowRoot: (createdRoot) => {
+        root = createdRoot;
+      },
+    });
+    runNextFrame(frames);
+    runNextFrame(frames);
+
+    overlay.selectRequest(1, 1);
+    runNextFrame(frames);
+    const selected = root?.querySelector<HTMLElement>(
+      '[data-runtime-slot="1"][data-request-number="1"]'
+    );
+    expect(selected?.getAttribute('aria-current')).toBe('true');
+    expect(root?.textContent).toContain('Request history (1 previous)');
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+    selected?.focus();
+    const focusCallsBeforeUpdate = focus.mock.calls.length;
+    store.recordSlotResponseReceived(observedSlot);
+    runNextFrame(frames);
+    expect(focus.mock.calls.length).toBeGreaterThan(focusCallsBeforeUpdate);
+
+    button(root!, 'Locate on page').click();
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: 'auto',
+      block: 'center',
+      inline: 'nearest',
+    });
+    runNextFrame(frames);
+    expect(root?.querySelector('.tsgd-highlight')).not.toBeNull();
+    expect(publisherSlot.outerHTML).toBe(originalMarkup);
     overlay.destroy();
   });
 
@@ -568,14 +669,14 @@ describe('GptDiagnosticsOverlay', () => {
     runNextFrame(frames);
 
     const content = root!.querySelector<HTMLElement>('.tsgd-content')!;
-    const history = root!.querySelector<HTMLDetailsElement>('details')!;
+    const history = root!.querySelector<HTMLDetailsElement>('.tsgd-slot details')!;
     history.open = true;
     content.scrollTop = 42;
     store.recordSlotResponseReceived(diagnosticSlot);
     runNextFrame(frames);
 
     expect(root!.textContent).toContain('Rendered (fill unknown)');
-    expect(root!.querySelector<HTMLDetailsElement>('details')?.open).toBe(true);
+    expect(root!.querySelector<HTMLDetailsElement>('.tsgd-slot details')?.open).toBe(true);
     expect(root!.querySelector<HTMLElement>('.tsgd-content')?.scrollTop).toBe(42);
     overlay.destroy();
   });

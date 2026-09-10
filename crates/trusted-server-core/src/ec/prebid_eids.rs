@@ -18,7 +18,6 @@ use crate::openrtb::{Eid, Uid};
 
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::MAX_UID_LENGTH;
-use super::log_id;
 use super::registry::PartnerRegistry;
 
 /// Maximum raw `ts-eids` cookie size accepted before base64 decode.
@@ -217,17 +216,12 @@ fn ingest_eid_cookies_with_writer(
 
     match writer.upsert_partner_ids(ec_id, &updates) {
         Ok(()) => {
-            log::debug!(
-                "EID cookies: synced {} partner IDs for EC ID '{}'",
-                updates.len(),
-                log_id(ec_id),
-            );
+            log::debug!("EID cookies: processed {} partner IDs", updates.len());
         }
         Err(err) => {
             log::warn!(
-                "EID cookies: failed to sync {} partner IDs for EC ID '{}': {err:?}",
+                "EID cookies: failed to process {} partner IDs: {err:?}",
                 updates.len(),
-                log_id(ec_id),
             );
         }
     }
@@ -797,6 +791,29 @@ mod tests {
         assert_eq!(
             calls[0][2],
             PartnerIdUpdate::new("sharedid.org", "shared-cookie-id")
+        );
+    }
+
+    #[test]
+    fn ingest_liveramp_eid_cookie_preserves_the_opaque_envelope() {
+        let registry = make_registry(vec![("liveramp", "liveramp.com")]);
+        let cookie = encode_json(&json!([
+            {
+                "source": "liveramp.com",
+                "uids": [{"id": "opaque-test-envelope", "atype": 3}]
+            }
+        ]));
+        let writer = RecordingWriter::default();
+
+        ingest_eid_cookies_with_writer(Some(&cookie), None, "ec-id", &writer, &registry);
+
+        let calls = writer.calls.borrow();
+        assert_eq!(calls.len(), 1, "should perform one bulk writer call");
+        assert_eq!(calls[0].len(), 1, "should write one LiveRamp partner ID");
+        assert_eq!(
+            calls[0][0],
+            PartnerIdUpdate::new("liveramp.com", "opaque-test-envelope"),
+            "should preserve the opaque envelope without decoding it"
         );
     }
 

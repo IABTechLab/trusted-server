@@ -43,6 +43,7 @@ mod template_assembly;
 mod template_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod timed_kv;
 mod traits;
 mod types;
 
@@ -72,6 +73,7 @@ pub use template_cache::{
     TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
     VaryHeaderValues, VarySpec,
 };
+pub use timed_kv::TimedKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,

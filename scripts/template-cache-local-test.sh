@@ -238,6 +238,7 @@ s = replace_once(
     f'origin_url = "http://127.0.0.1:{origin_port}"',
     "publisher origin",
 )
+# The example publisher domains are reserved placeholders that validation rejects.
 s = replace_once(
     s,
     'domain = "example.com"',
@@ -250,6 +251,7 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
+
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,

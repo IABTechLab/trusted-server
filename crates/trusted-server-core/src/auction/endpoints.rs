@@ -769,6 +769,7 @@ mod tests {
             "the endpoint must hand its snapshot to the request context"
         );
 
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,

@@ -4171,7 +4171,8 @@ mod tests {
                 .expect("current adapters should accept completed late mediator responses");
             assert!(
                 current_mediator.response_time_ms >= 50,
-                "mediator timing should preserve actual elapsed duration"
+                "mediator timing should preserve actual elapsed duration, got {} ms",
+                current_mediator.response_time_ms
             );
             assert_eq!(current.winning_bids["slot-1"].bidder, "mediated");
 

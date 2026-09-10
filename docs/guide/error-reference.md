@@ -55,9 +55,8 @@ Missing required field: publisher.domain
 
 **Cause:** Required configuration field not provided
 
-**Solution:** Add the missing field to `trusted-server.toml`. The secret below
-is an intentionally rejected placeholder; replace it with `openssl rand -base64 32`
-before validation.
+**Solution:** Add the missing field to `trusted-server.toml`. Secret fields name
+entries in the Trusted Server secret store.
 
 ```toml
 [publisher]

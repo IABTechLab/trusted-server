@@ -195,14 +195,9 @@ fn spin_secret_variable_name(
 ///
 /// Delegates all operations through `KvHandle`'s raw-bytes API. Spin KV has no
 /// native TTL support, so [`put_bytes_with_ttl`](KvStore::put_bytes_with_ttl)
-/// *errors* (`KvError::Validation`) rather than silently writing a non-expiring
-/// record — the privacy-safe failure mode. Consequently TTL-backed consent
-/// persistence (`save_consent_to_kv`) is unavailable on Spin: each write returns
-/// the error, which the core caller logs and treats as non-fatal (consistent
-/// with all adapters — failing to persist consent never breaks the request, and
-/// not persisting is the safe direction). Operators configuring
-/// `settings.consent.consent_store` on Spin should expect stored-consent
-/// fallback not to function.
+/// returns `KvError::Validation` rather than silently writing a non-expiring
+/// record. Callers of the generic platform KV interface must handle that
+/// capability difference explicitly.
 struct KvHandleAdapter(KvHandle);
 
 #[async_trait::async_trait(?Send)]
@@ -788,6 +783,12 @@ mod tests {
 
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::http::request_builder;
+    use edgezero_core::params::PathParams;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
     use trusted_server_core::platform::AuctionTargetId;
 
     #[test]
@@ -799,12 +800,6 @@ mod tests {
             "Spin outbound HTTP does not expose an enforceable hard total request deadline"
         );
     }
-    use edgezero_core::context::RequestContext;
-    use edgezero_core::http::request_builder;
-    use edgezero_core::params::PathParams;
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write as _;
 
     struct InMemoryConfigStore(std::collections::BTreeMap<String, String>);
 
@@ -951,6 +946,30 @@ mod tests {
         assert_eq!(
             value, "blob-envelope",
             "should not translate a KV-backed config key into a Spin variable name"
+        );
+    }
+
+    #[test]
+    fn spin_variable_name_encodes_trusted_server_keys() {
+        assert_eq!(
+            spin_variable_name("current-kid", PlatformError::ConfigStore)
+                .expect("should encode current kid key"),
+            "v_current_x2dkid"
+        );
+        assert_eq!(
+            spin_variable_name("active-kids", PlatformError::ConfigStore)
+                .expect("should encode active kids key"),
+            "v_active_x2dkids"
+        );
+        assert_eq!(
+            spin_variable_name("ts-2026-05-25", PlatformError::ConfigStore)
+                .expect("should encode generated kid"),
+            "v_ts_x2d2026_x2d05_x2d25"
+        );
+        // Digit-leading keys are rejected at the encoder boundary.
+        assert!(
+            spin_variable_name("2026-key", PlatformError::ConfigStore).is_err(),
+            "should reject digit-leading key"
         );
     }
 
