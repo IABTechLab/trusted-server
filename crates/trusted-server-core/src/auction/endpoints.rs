@@ -181,6 +181,49 @@ pub async fn handle_auction(
     };
     let consent_context = ec_context.consent().clone();
 
+    if !orchestrator.is_enabled() {
+        log::info!("/auction: auction is disabled; returning no-bid response");
+        let auction_request = convert_tsjs_to_auction_request(
+            &body,
+            settings,
+            services,
+            &http_req,
+            consent_context,
+            ec_id.as_deref(),
+            None,
+        )?;
+        let observation = AuctionObservationContext::from_auction_request(
+            AuctionSource::AuctionApi,
+            &auction_request,
+            ec_context,
+        );
+        let elapsed_ms = observation.elapsed_ms();
+        emit_auction_events_best_effort_lazy(services, || {
+            build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Skipped {
+                    reason: "auction_disabled",
+                    elapsed_ms,
+                },
+            )
+        })
+        .await;
+
+        let empty_result = OrchestrationResult {
+            provider_responses: Vec::new(),
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 0,
+            metadata: HashMap::new(),
+        };
+        return convert_to_openrtb_response(
+            &empty_result,
+            settings,
+            &auction_request,
+            ec_context.ec_allowed(),
+        );
+    }
+
     // Server-side auction consent gate. The publisher-navigation and
     // `/_ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
     // lack effective TCF Purpose 1. `/auction` is the programmatic entry point
@@ -308,6 +351,7 @@ pub async fn handle_auction(
         settings,
         request: &http_req,
         timeout_ms: settings.auction.timeout_ms,
+        transport_timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
     };
@@ -580,6 +624,7 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
@@ -642,9 +687,9 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: crate::redacted::Redacted::new(format!(
+            api_token: Some(crate::redacted::Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
-            )),
+            ))),
             batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
@@ -665,7 +710,7 @@ mod tests {
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
-            providers: vec!["eid_capturing_provider".to_string()],
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
@@ -757,7 +802,7 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for PanicOnBidProvider {
-        fn provider_name(&self) -> &'static str {
+        fn provider_name(&self) -> &str {
             "panic_provider"
         }
 
@@ -795,7 +840,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for TemplateSwitchProbeProvider {
         fn provider_name(&self) -> &'static str {
-            "template_switch_probe"
+            "template-switch-probe"
         }
 
         async fn request_bids(
@@ -847,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn direct_auction_remains_available_when_templates_are_disabled() {
         let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\nproviders = [\"template_switch_probe\"]\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+            "{}\n[auction]\nenabled = true\n\n[auction.providers.template-switch-probe]\nprotocol = \"openrtb-2.6\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
             crate_test_settings_str()
         );
         let settings = Settings::from_toml(&settings_toml)
@@ -905,6 +950,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work() {
+        let settings = create_test_settings();
+        let config = AuctionConfig {
+            enabled: false,
+            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.example/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
+            ))
+            .expect("should build disabled-auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect("disabled auction should return a no-bid response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "disabled auction should return a 200 no-bid response"
+        );
+        let batches = telemetry_sink
+            .batches
+            .lock()
+            .expect("should lock telemetry batches");
+        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
+        let rows = batches[0].rows();
+        assert_eq!(rows.len(), 1, "should emit one skipped summary row");
+        assert_eq!(rows[0].event_kind, "summary", "should emit a summary row");
+        assert_eq!(rows[0].terminal_status.as_deref(), Some("skipped"));
+        assert_eq!(
+            rows[0].terminal_reason.as_deref(),
+            Some("auction_disabled"),
+            "should identify the disabled auction policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
+        let settings_toml = format!(
+            "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
+            crate_test_settings_str()
+        );
+        let settings =
+            Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings)
+                .expect("should compile launch-failure plan"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.example/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize launch-failure body"),
+            ))
+            .expect("should build launch-failure request");
+
+        let error = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect_err("all planned launch failures should fail the auction endpoint");
+
+        assert_eq!(
+            error.current_context().status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+        let batches = telemetry_sink
+            .batches
+            .lock()
+            .expect("should lock telemetry batches");
+        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
+        let rows = batches[0].rows();
+        assert_eq!(rows.len(), 1, "should emit one execution-failure summary");
+        assert_eq!(rows[0].event_kind, "summary");
+        assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
+        assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
+    }
+
+    #[tokio::test]
     async fn auction_endpoint_consent_gate_returns_no_bid_without_contacting_providers() {
         // GDPR/unknown jurisdiction lacking effective TCF Purpose 1 must not run
         // a server-side auction. The /auction endpoint must short-circuit to a
@@ -913,7 +1078,7 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: vec!["panic_provider".to_string()],
+            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
@@ -997,7 +1162,7 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for EidCapturingProvider {
-        fn provider_name(&self) -> &'static str {
+        fn provider_name(&self) -> &str {
             "eid_capturing_provider"
         }
 
@@ -1041,7 +1206,7 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: vec!["eid_capturing_provider".to_string()],
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
