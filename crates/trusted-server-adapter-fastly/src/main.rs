@@ -34,7 +34,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::platform::{RuntimeServices, TimedKvStore};
+use trusted_server_core::platform::TimedKvStore;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::publisher::TemplateCacheResponseState;
 use trusted_server_core::request_timing::{Phase, RequestTimings, append_server_timing_if_private};
@@ -1050,6 +1050,7 @@ mod tests {
     use fastly::mime;
     use std::time::Duration;
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::platform::RuntimeServices;
     use trusted_server_core::request_timing::AuctionWaitPlacement;
 
     fn test_settings() -> Settings {
