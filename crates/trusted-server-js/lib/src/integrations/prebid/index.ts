@@ -119,6 +119,7 @@ const APS_BID_RESPONSE_LISTENER_SENTINEL = '__tsApsBidResponseListenerInstalled'
 // Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
 const MAX_OPENRTB_ATYPE = 2_147_483_647;
 const BIDDER_PARAMS_KEY = 'bidderParams';
+const STORED_REQUEST_KEY = 'storedRequest';
 const ZONE_KEY = 'zone';
 const TS_REFRESH_TARGETING_KEYS = [
   'ts_initial',
@@ -372,6 +373,7 @@ type TrustedServerAdUnit = {
 };
 type ClientSideBidSnapshot = { bidder: string; params: Record<string, unknown> };
 type PublisherAdUnitSnapshot = {
+  storedRequest?: unknown;
   bidderParams: Record<string, Record<string, unknown>>;
   clientSideBids: ClientSideBidSnapshot[];
   zone?: string;
@@ -668,7 +670,15 @@ function foldedBidderParams(
   );
 }
 
-/** Capture immutable request-scoped bidder and zone data before the shim mutates an ad unit. */
+/** Preserve authored presence and values, including invalid values for server validation. */
+function storedRequestParams(bid: TrustedServerBid | undefined): { storedRequest?: unknown } {
+  if (!bid) return { storedRequest: false };
+  return Object.prototype.hasOwnProperty.call(bid.params ?? {}, STORED_REQUEST_KEY)
+    ? { storedRequest: copyParamValue(bid.params?.[STORED_REQUEST_KEY]) }
+    : {};
+}
+
+/** Capture immutable request-scoped demand and zone data before the shim mutates an ad unit. */
 function capturePublisherAdUnitSnapshot(
   unit: TrustedServerAdUnit,
   serverSideBidders: Set<string>
@@ -700,6 +710,7 @@ function capturePublisherAdUnitSnapshot(
   const zone = unit.mediaTypes?.banner?.name;
 
   return {
+    ...storedRequestParams(existingTsBid),
     bidderParams,
     clientSideBids,
     ...(zone ? { zone } : {}),
@@ -784,6 +795,21 @@ function serverSideBidderParamsForRefresh(
         ])
       )
     : {};
+}
+
+/** Use the same live-unit authority and snapshot fallback as refresh bidder params. */
+function storedRequestParamsForRefresh(candidateCodes: Array<string | undefined>): {
+  storedRequest?: unknown;
+} {
+  const match = findRefreshAdUnit(candidateCodes);
+  if (match) {
+    const bid = Array.isArray(match.bids)
+      ? match.bids.find((bid) => bid?.bidder === ADAPTER_CODE)
+      : undefined;
+    return storedRequestParams(bid);
+  }
+  const snapshot = findRefreshSnapshot(candidateCodes);
+  return snapshot ? storedRequestParams({ params: snapshot }) : { storedRequest: false };
 }
 
 /** Return a live publisher zone, falling back to a request-scoped snapshot. */
@@ -1266,6 +1292,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           bidder: ADAPTER_CODE,
           params: {
             [BIDDER_PARAMS_KEY]: bidderParams,
+            [STORED_REQUEST_KEY]: false,
             ...(zone ? { [ZONE_KEY]: zone } : {}),
           },
         });
@@ -1454,7 +1481,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             DEFAULT_REFRESH_SIZES,
           ...(zone ? { name: zone } : {}),
         };
-        const tsParams: Record<string, unknown> = zone ? { [ZONE_KEY]: zone } : {};
+        const tsParams: Record<string, unknown> = {
+          ...storedRequestParamsForRefresh(candidateCodes),
+          ...(zone ? { [ZONE_KEY]: zone } : {}),
+        };
         // Carry the publisher's inline server-side (PBS) bidder params captured
         // on the initial ad unit so refresh/scroll auctions don't drop them.
         const serverSideParams = serverSideBidderParamsForRefresh(candidateCodes);

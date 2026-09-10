@@ -5920,6 +5920,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planned_prebid_stored_intent_filters_wire_demand_and_skips_empty_transports() {
+        for inline_providers in 0..=2 {
+            let http = Arc::new(StubHttpClient::new());
+            // Providers launch in ID order: APS, then only PBS instances with usable demand.
+            http.push_response(204, Vec::new());
+            for index in 0..inline_providers {
+                http.push_response(
+                    200,
+                    serde_json::to_vec(&serde_json::json!({
+                        "seatbid":[{"seat":"example-seat","bid":[{
+                            "id":format!("bid-{index}"), "impid":format!("inline-{index}"),
+                            "price":2.0, "adm":"<div>example</div>", "w":300, "h":250
+                        }]}]
+                    }))
+                    .expect("should serialize PBS response"),
+                );
+            }
+            let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+            let services = build_services_with_backend_and_http_client(
+                Arc::clone(&backend) as Arc<_>,
+                Arc::clone(&http) as Arc<_>,
+            );
+            let mut config = planned_prebid_config(&[
+                (
+                    "pbs-a",
+                    serde_json::json!({}),
+                    NotificationConfig::default(),
+                ),
+                (
+                    "pbs-b",
+                    serde_json::json!({}),
+                    NotificationConfig::default(),
+                ),
+            ]);
+            config.providers.extend(planned_aps_config().providers);
+            for (bidder, provider) in [("alpha", "pbs-a"), ("beta", "pbs-b")] {
+                config.bidders.insert(
+                    bidder.parse().expect("should parse bidder"),
+                    crate::auction::plan::BidderRouteConfig {
+                        provider: provider.parse().expect("should parse provider"),
+                    },
+                );
+            }
+            let plan = AuctionPlan::compile(config).expect("should compile plan");
+            let orchestrator = AuctionOrchestratorHarness::new(plan, None);
+            let mut request = planned_request();
+            let template = request.slots[0].clone();
+            // Both PBS instances must evaluate candidates but omit them after overrides.
+            request.slots[0].bidders.insert(
+                "trustedServer".to_string(),
+                serde_json::json!({
+                    "storedRequest":false, "bidderParams":{"alpha":{},"beta":{}}
+                }),
+            );
+            request.slots.push(AdSlot {
+                id: "synthetic-no-pbs".to_string(),
+                bidders: HashMap::from([(
+                    "trustedServer".to_string(),
+                    serde_json::json!({"storedRequest":false,"bidderParams":{}}),
+                )]),
+                ..template.clone()
+            });
+            for index in 0..inline_providers {
+                let bidder = if index == 0 { "alpha" } else { "beta" };
+                request.slots.push(AdSlot {
+                    id:format!("inline-{index}"),
+                    bidders:HashMap::from([("trustedServer".to_string(),serde_json::json!({"storedRequest":false,"bidderParams":{bidder:{"placement":index}}}))]),
+                    ..template.clone()
+                });
+            }
+            let settings = create_test_settings();
+            let inbound = http::Request::builder()
+                .uri("https://example.com/auction")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build inbound");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &inbound,
+                timeout_ms: 777,
+                transport_timeout_ms: 777,
+                provider_responses: None,
+                services: &services,
+            };
+            let result = orchestrator
+                .run_auction(&request, &context)
+                .await
+                .expect("should run auction");
+            let bodies = http.recorded_request_bodies();
+            assert_eq!(
+                bodies.len(),
+                1 + inline_providers,
+                "should never transport an empty PBS request"
+            );
+            let aps: serde_json::Value =
+                serde_json::from_slice(&bodies[0]).expect("should parse APS wire request");
+            assert_eq!(
+                aps["imp"]
+                    .as_array()
+                    .expect("should have impressions")
+                    .len(),
+                2 + inline_providers
+            );
+            assert_eq!(result.winning_bids.len(), inline_providers);
+            for index in 0..inline_providers {
+                let wire: serde_json::Value = serde_json::from_slice(&bodies[index + 1])
+                    .expect("should parse PBS wire request");
+                assert_eq!(
+                    wire["imp"]
+                        .as_array()
+                        .expect("should have impressions")
+                        .len(),
+                    1
+                );
+                assert_eq!(wire["imp"][0]["id"], format!("inline-{index}"));
+                let prebid = &wire["imp"][0]["ext"]["prebid"];
+                assert!(prebid.get("storedrequest").is_none());
+                let bidder = if index == 0 { "alpha" } else { "beta" };
+                assert_eq!(
+                    prebid["bidder"],
+                    serde_json::json!({bidder:{"placement":index}})
+                );
+                assert_eq!(
+                    result.winning_bids[&format!("inline-{index}")]
+                        .bid_id
+                        .as_deref(),
+                    Some(format!("bid-{index}").as_str())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn planned_prebid_instances_preserve_headers_metadata_suppression_and_identity() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(

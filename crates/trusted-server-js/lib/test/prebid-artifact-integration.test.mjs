@@ -192,6 +192,11 @@ describe('external bundle + served shim evaluated together', () => {
             },
           ],
         },
+        {
+          code: 'ad-slot-2',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [],
+        },
       ],
       timeout: 1000,
     });
@@ -221,6 +226,9 @@ describe('external bundle + served shim evaluated together', () => {
     // codes; provider IDs and returned aliases cannot reach /auction.
     const trustedServerBid = adUnit.bids.find((bid) => bid.bidder === 'trustedServer');
     expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: { placementId: 1 } });
+    expect(trustedServerBid.params).not.toHaveProperty('storedRequest');
+    const generated = payload.adUnits.find((unit) => unit.code === 'ad-slot-2');
+    expect(generated.bids[0].params).toEqual({ bidderParams: {}, storedRequest: false });
 
     dom.window.close();
   }, 60_000);
