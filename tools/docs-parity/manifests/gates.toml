@@ -36,6 +36,8 @@ commands = [
   "cargo clippy-spin-wasm",
   "cargo clippy --package trusted-server-cli --target $(rustc -vV | sed -n 's/host: //p') --all-targets --all-features -- -D warnings",
   "cargo clippy --package trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p') --all-targets -- -D warnings",
+  "cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check",
+  "cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings",
 ]
 
 [[gates]]

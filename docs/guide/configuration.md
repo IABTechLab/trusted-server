@@ -1606,13 +1606,13 @@ See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
 
 **Section**: `[integrations.google_tag_manager]`
 
-| Field                  | Type    | Default                            | Contract                                                    |
-| ---------------------- | ------- | ---------------------------------- | ----------------------------------------------------------- |
-| `enabled`              | Boolean | `false`                            | Enable tag-gateway routes and rewriting                     |
-| `container_id`         | String  | Required                           | `GTM-` followed by alphanumeric characters; 5–50 characters |
-| `upstream_url`         | URL     | `https://www.googletagmanager.com` | Script upstream                                             |
-| `cache_max_age`        | Integer | `900`                              | `60..=86400` seconds                                        |
-| `max_beacon_body_size` | Integer | `65536`                            | `1024..=1048576` bytes                                      |
+| Field                  | Type    | Default                            | Contract                                            |
+| ---------------------- | ------- | ---------------------------------- | --------------------------------------------------- |
+| `enabled`              | Boolean | `false`                            | Enable tag-gateway routes and rewriting             |
+| `container_id`         | String  | Required                           | `GTM-` followed by 4–20 uppercase letters or digits |
+| `upstream_url`         | URL     | `https://www.googletagmanager.com` | Script upstream                                     |
+| `cache_max_age`        | Integer | `900`                              | `60..=86400` seconds                                |
+| `max_beacon_body_size` | Integer | `65536`                            | `1024..=1048576` bytes                              |
 
 See [Google Tag Manager](/guide/integrations/google_tag_manager).
 

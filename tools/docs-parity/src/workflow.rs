@@ -282,6 +282,8 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Wor
                 "crates/trusted-server-js/lib/package-lock.json",
                 "./scripts/read-tool-versions.sh",
                 "./scripts/build-trusted-server-js.sh",
+                "--test documentation_snippets",
+                "--manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings",
             ][..],
         ),
         (
@@ -303,7 +305,8 @@ pub(crate) fn check_repository(repository: &Repository) -> Result<(), Report<Wor
                 "target-branch: \"main\"",
             ][..],
         ),
-        (".tool-versions", &["wrangler 4.129.0"][..]),
+        (".tool-versions", &["rust 1.95.0", "wrangler 4.129.0"][..]),
+        ("rust-toolchain.toml", &["channel = \"1.95.0\""][..]),
         (
             "crates/trusted-server-openrtb-codegen/Cargo.toml",
             &["[lints]", "workspace = true"][..],
@@ -424,7 +427,7 @@ fn validate_pull_request_job(job: &Mapping) -> Result<(), Report<WorkflowError>>
     )?;
     validate_job_header(
         job,
-        "Documentation parity",
+        "Documentation automation guard",
         "github.event_name == 'pull_request'",
         30,
         "contents",
@@ -448,7 +451,7 @@ fn validate_pull_request_job(job: &Mapping) -> Result<(), Report<WorkflowError>>
         Some("Read pinned Node version"),
         Some("node-version"),
         None,
-        "echo \"node=$(awk '$1 == \\\"nodejs\\\" { print $2 }' .tool-versions)\" >> \"$GITHUB_OUTPUT\"",
+        "echo \"node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)\" >> \"$GITHUB_OUTPUT\"",
     )?;
     validate_setup_rust_step(&steps[read_node_index + 1])?;
     validate_action_step(

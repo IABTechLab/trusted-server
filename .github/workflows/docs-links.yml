@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 jobs:
   pull-request:
-    name: Documentation parity
+    name: Documentation automation guard
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0
       - name: Read pinned Node version
         id: node-version
-        run: echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+        run: echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
       - uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: "1.95.0"

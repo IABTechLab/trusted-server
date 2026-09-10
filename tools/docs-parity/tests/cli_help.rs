@@ -340,9 +340,21 @@ fn import_accepts_bounded_api_size_that_differs_from_download_length() {
 }
 
 #[test]
+fn import_accepts_captures_from_any_pull_request_number() {
+    let mut client = hosted_client();
+    client.run.pull_request = 2048;
+
+    import_authenticated(&mut client, 91, "0123456789abcdef0123456789abcdef01234567")
+        .expect("should authenticate captures from any pull request");
+}
+
+#[test]
 fn import_rejects_stale_mixed_unauthenticated_or_oversized_inputs() {
     let valid = hosted_client();
     let mut cases = Vec::new();
+    let mut missing_pull_request = valid.clone();
+    missing_pull_request.run.pull_request = 0;
+    cases.push(missing_pull_request);
     let mut wrong_repository = valid.clone();
     wrong_repository.run.repository = "example/other".to_owned();
     cases.push(wrong_repository);

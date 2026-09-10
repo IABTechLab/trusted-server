@@ -671,31 +671,25 @@ fingerprint = "sha256:082f99de1da154a4f7c68f3f9ee6d6734eb995a8dab67b95a6346af900
 path = "docs/README.md"
 selector = "fence:3"
 command = "illustrative-plain"
-fingerprint = "sha256:75e0b8271714399ebbebfa4144671a9367db4c068d252c203bec2a440f7f5584"
+fingerprint = "sha256:69ab3232ca431ec715e2683cd7c2b4ca56b5fec9b4bf27b631bf03761e041174"
 
 [[snippets]]
 path = "docs/README.md"
 selector = "fence:4"
 command = "illustrative-plain"
-fingerprint = "sha256:69ab3232ca431ec715e2683cd7c2b4ca56b5fec9b4bf27b631bf03761e041174"
-
-[[snippets]]
-path = "docs/README.md"
-selector = "fence:5"
-command = "illustrative-plain"
 fingerprint = "sha256:16bd3e33d5c05acfd314c0caeb96711bb392ff5098eaa803c631b1e354b6b87a"
 
 [[snippets]]
 path = "docs/README.md"
-selector = "fence:6"
+selector = "fence:5"
 command = "validate-bash"
 fingerprint = "sha256:07bd7a255380482aeb7eb92495199915e482998b9353677b441f59943ac39736"
 
 [[snippets]]
 path = "docs/README.md"
-selector = "fence:7"
+selector = "fence:6"
 command = "illustrative-plain"
-fingerprint = "sha256:440d98ebab06629e05517e641639c9b838cdf35780f37f7da61d9a0bfdad514f"
+fingerprint = "sha256:0ad407c3578b3e151833bc59ec42b3e23a075b786f7233af0e53768e329d0144"
 
 [[snippets]]
 path = "docs/epics/revenue-operations-dashboard.md"
@@ -2093,7 +2087,7 @@ fingerprint = "sha256:a89b982a2d3184d3748d3ca689ad0b2670ef92f46294bdef44db8a4050
 path = "docs/guide/creative-processing.md"
 selector = "fence:33"
 command = "illustrative-html"
-fingerprint = "sha256:e4515ac7cc79554d6803f8abf52fd2880acb01260ee832145be191ecd4173e72"
+fingerprint = "sha256:200efb60a1d9ab9df9a5d9e18c599994aafb0638166e10880205bb2886826fba"
 
 [[snippets]]
 path = "docs/guide/creative-processing.md"
@@ -3881,7 +3875,7 @@ fingerprint = "sha256:71a3487d7bceac084ac6346d0251b100537806fd7b51042e2c556ebff1
 path = "docs/guide/testing.md"
 selector = "fence:4"
 command = "validate-bash"
-fingerprint = "sha256:f197a6053f42463f046bda4a40206510da828fdb9180537267624eda3b4b440a"
+fingerprint = "sha256:f7e5860d57fb927480c359a5fe8ce838f4fad3b1f6d5ba7fe82efce727a42738"
 
 [[snippets]]
 path = "docs/guide/testing.md"
@@ -3935,7 +3929,7 @@ fingerprint = "sha256:3266d24eb5f87360b162b34f16527a1cff7cb8f7bc39d838e39a8769ae
 path = "docs/guide/testing.md"
 selector = "fence:13"
 command = "validate-bash"
-fingerprint = "sha256:10f1baee211f4b500954311fde229c88410da7acbcd261dde1d538fd5283d254"
+fingerprint = "sha256:28ccff08f67c64bdbe36a51d8ff637108b0f87bbe2e557c99756ee6172792c48"
 
 [[snippets]]
 path = "docs/guide/testing.md"

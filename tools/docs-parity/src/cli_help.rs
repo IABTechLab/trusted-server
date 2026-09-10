@@ -2100,7 +2100,7 @@ fn validate_run(run: &HostedRun, run_id: u64, head: &str) -> Result<(), Report<C
         || run.repository != REPOSITORY
         || run.event != "pull_request"
         || run.conclusion != "success"
-        || run.pull_request != 1049
+        || run.pull_request == 0
         || run.workflow_path != WORKFLOW_PATH
         || run.head_sha != head
         || !lower_hex_sha(head)
@@ -2108,7 +2108,7 @@ fn validate_run(run: &HostedRun, run_id: u64, head: &str) -> Result<(), Report<C
         || run.started_at > run.completed_at
     {
         return Err(cli_error(
-            "workflow run is not the authenticated PR #1049 head",
+            "workflow run is not an authenticated pull-request head",
         ));
     }
     Ok(())

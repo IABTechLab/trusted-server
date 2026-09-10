@@ -36,6 +36,8 @@ Learn how to test Trusted Server locally and in CI/CD.
 - `cargo clippy-spin-wasm`
 - `cargo clippy --package trusted-server-cli --target $(rustc -vV | sed -n 's/host: //p') --all-targets --all-features -- -D warnings`
 - `cargo clippy --package trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p') --all-targets -- -D warnings`
+- `cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check`
+- `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings`
 
 ### Rust tests and release builds
 
@@ -129,7 +131,7 @@ cargo test-axum
 cargo test-fastly test_generate_ec_id
 
 # Run a specific test by name (Axum native)
-cargo test-axum test_generate_ec_id
+cargo test-axum sets_geo_unavailable_header
 
 # Run tests for a specific crate (native)
 cargo test -p trusted-server-core
@@ -335,7 +337,7 @@ cargo clippy-fastly
 cargo clippy-axum
 
 # Fix clippy warnings automatically (Axum)
-cargo clippy-axum --fix --allow-dirty
+cargo clippy -p trusted-server-adapter-axum --all-targets --all-features --fix --allow-dirty
 ```
 
 ### Code Coverage

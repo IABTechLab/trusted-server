@@ -140,7 +140,7 @@ enum CliHelpAction {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Authenticate and import a successful PR #1049 hosted capture run.
+    /// Authenticate and import a successful hosted pull-request capture run.
     ImportHosted {
         /// GitHub Actions run ID containing both platform artifacts.
         #[arg(long)]
@@ -288,10 +288,14 @@ struct ScanArguments {
 #[derive(Args, Debug)]
 struct CheckArguments {
     /// Run the explicit deterministic offline check registry.
-    #[arg(long, conflicts_with = "tracked_paths_record")]
+    #[arg(
+        long,
+        conflicts_with = "tracked_paths_record",
+        required_unless_present = "tracked_paths_record"
+    )]
     all: bool,
     /// Repository-relative generated record to compare.
-    #[arg(long, conflicts_with = "all")]
+    #[arg(long, conflicts_with = "all", required_unless_present = "all")]
     tracked_paths_record: Option<PathBuf>,
 }
 
@@ -738,7 +742,15 @@ where
 {
     let mut drift = false;
     for entry in &OFFLINE_CHECKS {
-        drift |= execute(entry).attach_with(|| format!("offline check: {}", entry.kind.name()))?;
+        if execute(entry).attach_with(|| format!("offline check: {}", entry.kind.name()))? {
+            drift = true;
+            let mut standard_error = std::io::stderr().lock();
+            let _ = writeln!(
+                standard_error,
+                "docs-parity: drift detected by the {} check",
+                entry.kind.name()
+            );
+        }
     }
     Ok(if drift {
         Outcome::Drift

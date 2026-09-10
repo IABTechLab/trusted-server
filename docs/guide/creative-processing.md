@@ -791,9 +791,8 @@ The Trusted Server JavaScript (TSJS) library is automatically injected:
 
 ```html
 <script
-  async
-  src="/static/tsjs-core.min.js"
-  data-tsjs-integration="core"
+  src="/static/tsjs=tsjs-unified.min.js?v=<hash>"
+  id="trustedserver-js"
 ></script>
 ```
 

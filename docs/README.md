@@ -41,11 +41,9 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 
 ### Custom Domain Setup
 
-1. **Update CNAME file**: Edit `docs/public/CNAME` with your domain:
-
-   ```
-   docs.yourdomain.com
-   ```
+1. **Set the custom domain**: In repository **Settings** → **Pages**, enter
+   your domain (for example `docs.yourdomain.com`). This repository
+   intentionally tracks no `docs/public/CNAME` file; do not add one.
 
 2. **Configure DNS**: Add DNS records at your domain provider:
 
@@ -117,8 +115,7 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 **Check**:
 
 - DNS records propagated (use `dig docs.yourdomain.com`)
-- CNAME file exists in `docs/public/CNAME`
-- Custom domain verified in GitHub Pages settings
+- Custom domain configured and verified in GitHub Pages settings
 - HTTPS enforced (may take up to 24 hours)
 
 **DNS Verification**:
@@ -151,7 +148,6 @@ docs/
 │   ├── configuration.md
 │   └── ...
 ├── public/                 # Static assets
-│   └── CNAME              # Custom domain file
 ├── index.md               # Homepage
 ├── package.json           # Dependencies
 └── README.md             # This file

@@ -258,8 +258,8 @@ jobs:
 
       - name: Build Spin adapter release WASM
         # This verifies the release artifact compiles. Spin loads runtime
-        # settings from its configured KV store; boot behavior is covered by a
-        # separately provisioned smoke test.
+        # settings from its configured KV store; boot behavior is exercised by
+        # the manually run scripts/smoke-spin.sh, which no CI workflow runs.
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -298,6 +298,9 @@ jobs:
 
       - name: Run cross-adapter parity tests
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+
+      - name: Run documentation snippet tests
+        run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test documentation_snippets
 
       - name: Clippy (parity test crate)
         run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings

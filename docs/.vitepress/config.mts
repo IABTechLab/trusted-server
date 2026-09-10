@@ -53,7 +53,6 @@ export default withMermaid(
       'superpowers/**',
       'internal/**',
       'epics/**',
-      'guide/onboarding.md',
       'README.md',
       'business-use-cases.md',
     ],
