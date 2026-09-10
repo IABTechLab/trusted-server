@@ -1964,6 +1964,50 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_output_overflow_restores_in_progress_script_at_every_split() {
+        let mut settings = create_test_settings();
+        settings.integrations.insert(
+            "nextjs".to_owned(),
+            json!({"enabled": true, "max_combined_payload_bytes": 128}),
+        );
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
+        )
+        .expect("should create registry");
+        let first = r#"<html><body><script>self.__next_f.push([1,"1:T3,ab"])</script>"#;
+        let script = r#"self.__next_f.push([1,"c"])"#;
+        let padding = "x".repeat(129);
+        let expected = format!("{first}{padding}<script>{script}</script></body></html>");
+
+        for split in 1..script.len() {
+            let mut config = create_test_config();
+            config.integrations = registry.clone();
+            let mut processor = create_html_processor(config);
+            let mut output = processor
+                .process_chunk(first.as_bytes(), false)
+                .expect("should process unresolved RSC group");
+            let second = format!("{padding}<script>{}", &script[..split]);
+            output.extend(
+                processor
+                    .process_chunk(second.as_bytes(), false)
+                    .expect("should process output overflow and partial script"),
+            );
+            let third = format!("{}</script></body></html>", &script[split..]);
+            output.extend(
+                processor
+                    .process_chunk(third.as_bytes(), true)
+                    .expect("should finish bypassed script"),
+            );
+            assert_eq!(
+                String::from_utf8(output).expect("should retain UTF-8"),
+                expected,
+                "should restore all original bytes when overflow occurs at script split {split}"
+            );
+        }
+    }
+
+    #[test]
     fn a_nonce_bearing_meta_policy_is_observed() {
         let observed = Arc::new(AtomicBool::new(false));
         let mut processor =

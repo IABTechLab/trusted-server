@@ -145,8 +145,17 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.bypass_rsc {
-            if ctx.is_last_in_text_node {
-                state.rsc_script = super::rsc_stream::FragmentState::Idle;
+            // The downstream processor can enter bypass after the parser has
+            // suppressed part of this script. Restore it before passing through
+            // the next fragment so an output limit cannot truncate JavaScript.
+            let mut restored = match std::mem::take(&mut state.rsc_script) {
+                super::rsc_stream::FragmentState::Buffering(buffer) => buffer,
+                _ => String::new(),
+            };
+            restored.push_str(&std::mem::take(&mut state.rsc_probe));
+            if !restored.is_empty() {
+                restored.push_str(content);
+                return ScriptRewriteAction::replace(restored);
             }
             return ScriptRewriteAction::keep();
         }
