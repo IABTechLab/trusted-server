@@ -1,14 +1,47 @@
 pub mod browser;
 pub mod ca;
 pub mod config;
+pub mod metrics;
+pub mod prefixed_io;
 pub mod rewrite;
 pub mod server;
+pub mod upstream;
 
 use std::sync::Arc;
 
 use error_stack::ResultExt as _;
 
 use crate::output;
+
+pub struct ProxyState {
+    pub config: Arc<config::ResolvedConfig>,
+    pub upstream: upstream::UpstreamClient,
+    pub metrics: Arc<metrics::ProxyMetrics>,
+}
+
+impl ProxyState {
+    #[must_use]
+    pub fn new(config: Arc<config::ResolvedConfig>) -> Arc<Self> {
+        Self::with_upstream_options(config, upstream::UpstreamOptions::default())
+    }
+
+    #[must_use]
+    pub fn with_upstream_options(
+        config: Arc<config::ResolvedConfig>,
+        options: upstream::UpstreamOptions,
+    ) -> Arc<Self> {
+        let metrics = Arc::new(metrics::ProxyMetrics::default());
+        Arc::new(Self {
+            upstream: upstream::UpstreamClient::with_options(
+                Arc::clone(&metrics),
+                config.connect_timeout,
+                options,
+            ),
+            config,
+            metrics,
+        })
+    }
+}
 
 /// Errors surfaced by `ts dev proxy`.
 #[derive(Debug, derive_more::Display)]
@@ -28,6 +61,20 @@ pub enum ProxyError {
 }
 
 impl core::error::Error for ProxyError {}
+
+async fn finish_interrupted_run<Restore, Stop, Drain>(
+    restore_system_proxy: Restore,
+    stop_accept_loop: Stop,
+    drain_manager: Drain,
+) where
+    Restore: FnOnce(),
+    Stop: FnOnce(),
+    Drain: std::future::Future<Output = ()>,
+{
+    restore_system_proxy();
+    stop_accept_loop();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain_manager).await;
+}
 
 /// `ts dev proxy [OPTIONS]` — see the design spec §4.
 #[derive(Debug, clap::Args)]
@@ -229,11 +276,21 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
             .change_context(ProxyError::Server)?;
         cfg.listen = listener.local_addr().change_context(ProxyError::Server)?;
         let cfg = Arc::new(cfg);
+        let state = ProxyState::new(Arc::clone(&cfg));
+        for rule in &cfg.rules.0 {
+            if ca.is_cached(&rule.from) {
+                continue;
+            }
+            let started = tokio::time::Instant::now();
+            ca.server_config(&rule.from)
+                .change_context(ProxyError::CertAuthority)?;
+            state.metrics.record_ca_miss(started.elapsed(), false);
+        }
         let pac: Arc<str> = Arc::from(browser::generate_pac(&cfg.rules, cfg.listen).as_str());
         output::info(&format!("ts dev proxy listening on {}", cfg.listen));
-        let server = tokio::spawn(server::serve_on(
+        let mut server = tokio::spawn(server::serve_on_with_state(
             listener,
-            Arc::clone(&cfg),
+            Arc::clone(&state),
             Arc::clone(&ca),
             Arc::clone(&pac),
         ));
@@ -249,13 +306,84 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
         // Race the server against Ctrl-C.  On clean interrupt, restore any
         // system proxy state that was changed for Safari before exiting.
         tokio::select! {
-            result = server => result.change_context(ProxyError::Server)?,
+            result = &mut server => result.change_context(ProxyError::Server)?,
             _ = tokio::signal::ctrl_c() => {
                 // Interactive: the cached sudo credential may have expired during
                 // a long run, so allow `sudo networksetup` to prompt for it.
-                browser::restore_system_proxy_if_pending(&cfg.ca_dir, true);
+                finish_interrupted_run(
+                    || browser::restore_system_proxy_if_pending(&cfg.ca_dir, true),
+                    || server.abort(),
+                    state.upstream.shutdown(),
+                ).await;
+                log::debug!("{}", state.metrics.debug_summary());
                 Ok(())
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    struct DrainProbe {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        recorded: bool,
+    }
+
+    impl std::future::Future for DrainProbe {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.recorded {
+                self.events
+                    .lock()
+                    .expect("should lock shutdown events")
+                    .push("drain");
+                self.recorded = true;
+            }
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_cleanup_restores_then_stops_then_bounds_drain() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started = tokio::time::Instant::now();
+        finish_interrupted_run(
+            {
+                let events = Arc::clone(&events);
+                move || {
+                    events
+                        .lock()
+                        .expect("should lock shutdown events")
+                        .push("restore");
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                move || {
+                    events
+                        .lock()
+                        .expect("should lock shutdown events")
+                        .push("stop");
+                }
+            },
+            DrainProbe {
+                events: Arc::clone(&events),
+                recorded: false,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *events.lock().expect("should lock shutdown events"),
+            ["restore", "stop", "drain"]
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+    }
 }

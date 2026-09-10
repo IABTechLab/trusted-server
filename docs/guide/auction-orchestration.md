@@ -10,9 +10,9 @@ Key capabilities:
 
 - **Parallel execution** — Bid requests to all providers launch concurrently using Fastly's `select()` API
 - **Strategy-based winner selection** — Automatic strategy detection based on configuration
-- **Mediator support** — Optional external mediator for decoding encoded prices (e.g., APS) and applying unified floor pricing
+- **Mediator support** — Optional external mediator for final winner selection and unified floor pricing
 - **Provider abstraction** — Pluggable provider interface for adding new demand sources
-- **Creative rewriting** — Winning creatives automatically rewritten with first-party proxy URLs
+- **Creative processing** — Winning creatives are rewritten to first-party proxy URLs by default, with opt-in sanitization
 
 ## System Flow (Prebid + APS)
 
@@ -92,26 +92,26 @@ sequenceDiagram
     activate Mock
 
     par Parallel Provider Calls
-      Orch->>APS: POST /e/dtb/bid<br/>APS TAM format
-      Note right of Orch: { "pubId": "5128",<br/>  "slots": [{ "slotID": "header-banner",<br/>    "sizes": [[728,90]] }] }
+      Orch->>APS: POST /e/pb/bid<br/>APS OpenRTB
+      Note right of Orch: { "id": "request",<br/>  "imp": [{ "id": "header-banner",<br/>    "banner": { "w": 728, "h": 90 } }],<br/>  "ext": { "account": "example-account" } }
 
-      APS->>Mock: APS TAM request
-      Mock-->>APS: APS bid response<br/>(encoded prices, no creative)
-      Note right of Mock: { "contextual": { "slots": [{<br/>  "slotID": "header-banner",<br/>  "amznbid": "Mi41MA==", // "2.50"<br/>  "fif": "1" }] } }
+      APS->>Mock: APS OpenRTB request
+      Mock-->>APS: OpenRTB bid response<br/>(decoded price and renderer URL)
+      Note right of Mock: { "seatbid": [{ "bid": [{<br/>  "impid": "header-banner", "price": 2.50,<br/>  "ext": { "creativeurl": "https://creative.example/render",<br/>    "tagtype": "iframe" } }] }] }
 
-      APS-->>Orch: AuctionResponse<br/>(APS bids)
+      APS-->>Orch: AuctionResponse<br/>(decoded price and typed renderer)
     and
       Orch->>Prebid: POST /openrtb2/auction<br/>OpenRTB 2.x format
       Note right of Orch: { "id": "request",<br/>  "imp": [{ "id": "header-banner",<br/>    "banner": { "w": 728, "h": 90 } }] }
 
       Prebid->>Mock: OpenRTB request
-      Mock-->>Prebid: OpenRTB response<br/>(clear prices, with creative)
+      Mock-->>Prebid: OpenRTB response<br/>(decoded price with creative)
       Note right of Mock: { "seatbid": [{ "seat": "prebid",<br/>  "bid": [{ "price": 2.00, "adm": "<html>..." }] }] }
 
       Prebid-->>Orch: AuctionResponse<br/>(Prebid bids)
     end
 
-    Note over Orch: Collected bids from all providers<br/>APS: encoded prices, no creative<br/>Prebid: clear prices, with creative
+    Note over Orch: Collected decoded-price bids<br/>APS: typed renderer, no adm<br/>Prebid: sanitized creative or cache source
     deactivate Mock
     deactivate APS
     deactivate Prebid
@@ -122,23 +122,19 @@ sequenceDiagram
     rect rgb(236,253,245)
       Note over Client,Mock: Mediation Flow
       activate Med
-      Orch->>Med: POST /adserver/mediate<br/>All bids for final selection
-      Note right of Orch: { "id": "auction-123",<br/>  "imp": [...],<br/>  "ext": { "bidder_responses": [<br/>    { "bidder": "amazon-aps",<br/>      "bids": [{ "encoded_price": "Mi41MA==" }] },<br/>    { "bidder": "prebid",<br/>      "bids": [{ "price": 2.00 }] }] } }
+      Orch->>Med: POST /adserver/mediate<br/>Decoded-price bids for final selection
+      Note right of Orch: APS price: 2.50<br/>Prebid price: 2.00
 
-      Med->>Med: Decode APS encoded prices<br/>Apply floor prices<br/>Select highest CPM per slot
-      Note right of Med: Base64 decode: "Mi41MA==" → "2.50"<br/>Winner: APS at $2.50 vs Prebid at $2.00
-
+      Med->>Med: Apply mediation policy and floors<br/>Select highest CPM per slot
       Med-->>Orch: OpenRTB response with winners
-      Note right of Med: { "seatbid": [{ "seat": "amazon-aps",<br/>  "bid": [{ "price": 2.50, "impid": "header-banner" }] }] }
+      Note right of Med: APS renderer state is restored from<br/>the reduced source bid after mediation
       deactivate Med
     end
   else No Mediator (parallel_only)
     rect rgb(253,243,235)
       Note over Client,Mock: Direct Winner Selection
-      Orch->>Orch: Compare clear prices only<br/>Skip APS (encoded prices)<br/>Select highest CPM
-      Note right of Orch: APS bids skipped (encoded prices)<br/>Winner: Prebid at $2.00 (only clear price)
-
-      Note over Orch: Results: Limited winner selection<br/>Cannot compare encoded APS prices<br/>Prebid wins by default
+      Orch->>Orch: Compare decoded prices<br/>Apply slot floor<br/>Select highest CPM
+      Note right of Orch: Winner: APS at $2.50 vs Prebid at $2.00
     end
   end
 
@@ -147,12 +143,12 @@ sequenceDiagram
     Note over Client,Mock: Response Assembly
     activate TS
     activate Client
-    Orch->>Orch: Transform to OpenRTB response<br/>Generate iframe creatives<br/>Rewrite creative URLs<br/>Add orchestrator metadata
+    Orch->>Orch: Transform to OpenRTB response<br/>Preserve typed render source<br/>Optionally sanitize creative HTML<br/>Optionally rewrite creative URLs<br/>Add orchestrator metadata
 
     Orch-->>TS: OpenRTB BidResponse
-    Note right of Orch: { "id": "auction-response",<br/>  "seatbid": [{ "seat": "amazon-aps",<br/>    "bid": [{ "price": 2.50,<br/>      "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",<br/>      "w": 728, "h": 90 }] }] }<br/>  "ext": { "orchestrator": {<br/>    "strategy": "parallel_mediation",<br/>    "bidders": 2, "time_ms": 150 } }
+    Note right of Orch: APS winner carries ext.trusted_server.renderer<br/>with no adm; ordinary winners retain sanitized adm/cache data
 
-    TS-->>Client: 200 OpenRTB response<br/>with winning creative
+    TS-->>Client: 200 OpenRTB response<br/>with winning render capability
     deactivate Orch
     deactivate TS
   end
@@ -160,8 +156,13 @@ sequenceDiagram
   %% === Creative Rendering ===
   rect rgb(239,246,255)
     Note over Client,Mock: Creative Rendering
-    Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative through proxy
-    Note right of Client: iframe src="/first-party/proxy?tsurl=...&tstoken=sig"<br/>Ensures first-party serving<br/>Maintains privacy & security
+    alt APS winner
+      Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer
+      Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
+    else Ordinary creative
+      Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative resources
+      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: accepted external URLs remain direct
+    end
     deactivate Client
   end
 ```
@@ -187,46 +188,56 @@ AuctionOrchestrator.run_auction()
   ├─ Launch all providers in parallel via select()
   ├─ Collect responses as they complete
   │
-  ├─[parallel_only]─── Select highest CPM per slot (clear prices only)
-  └─[parallel_mediation]─── Forward all bids to mediator for final selection
+  ├─[parallel_only]─── Select highest decoded CPM per slot
+  └─[parallel_mediation]─── Forward decoded-price bids to mediator for final selection
   │
   ▼
 Convert OrchestrationResult → OpenRTB 2.x Response
   │
-  ├─ Rewrite creative HTML with first-party proxy URLs
+  ├─[sanitize_creatives=true] Strip executable markup
+  ├─[rewrite_creatives=true] Rewrite URLs and inject creative TSJS
   ├─ Add ext.orchestrator metadata
-  └─ Set EC ID response headers
+  └─ Set consent and optional EID response headers
 ```
 
 ### Key Components
 
 The orchestrator is composed of several modules:
 
-| Module            | Path                                      | Purpose                                     |
-| ----------------- | ----------------------------------------- | ------------------------------------------- |
-| `orchestrator.rs` | `crates/trusted-server-core/src/auction/` | Core parallel execution and bid selection   |
-| `provider.rs`     | `crates/trusted-server-core/src/auction/` | `AuctionProvider` trait definition          |
-| `types.rs`        | `crates/trusted-server-core/src/auction/` | Data structures (AuctionRequest, Bid, etc.) |
-| `formats.rs`      | `crates/trusted-server-core/src/auction/` | Format conversions (TSJS ↔ OpenRTB)         |
-| `endpoints.rs`    | `crates/trusted-server-core/src/auction/` | HTTP handler for `POST /auction`            |
-| `config.rs`       | `crates/trusted-server-core/src/auction/` | Auction configuration types                 |
+| Module            | Path                                      | Purpose                                      |
+| ----------------- | ----------------------------------------- | -------------------------------------------- |
+| `orchestrator.rs` | `crates/trusted-server-core/src/auction/` | Parallel execution and bid selection         |
+| `plan.rs`         | `crates/trusted-server-core/src/auction/` | Provider-plan compilation and validation     |
+| `profile.rs`      | `crates/trusted-server-core/src/auction/` | Typed OpenRTB profile policies               |
+| `routing.rs`      | `crates/trusted-server-core/src/auction/` | Bidder ownership and provider routing        |
+| `openrtb.rs`      | `crates/trusted-server-core/src/auction/` | Shared OpenRTB request and response handling |
+| `provider.rs`     | `crates/trusted-server-core/src/auction/` | `AuctionProvider` trait and planned provider |
+| `telemetry.rs`    | `crates/trusted-server-core/src/auction/` | Auction event construction                   |
+| `types.rs`        | `crates/trusted-server-core/src/auction/` | Auction request, response, and bid types     |
+| `formats.rs`      | `crates/trusted-server-core/src/auction/` | TSJS and OpenRTB format conversions          |
+| `endpoints.rs`    | `crates/trusted-server-core/src/auction/` | HTTP handler for `POST /auction`             |
+| `config.rs`       | `crates/trusted-server-core/src/auction/` | Auction configuration types                  |
 
-### Provider Auto-Discovery
+### Configuration-first plan
 
-Providers register themselves at startup via builder functions. The `build_orchestrator()` function in `auction/mod.rs` iterates all registered builders, passes the application settings, and each builder returns zero or more providers depending on whether its config section is present and enabled:
+At startup, Trusted Server compiles `[auction.providers]` and
+`[auction.bidders]` through one registry into an immutable `AuctionPlan`.
+Provider IDs, endpoints, profile defaults, routes, static extensions, and
+notification policy are resolved once. The same `Arc<AuctionPlan>` is shared by
+the orchestrator and integration registry; request handling does not reinterpret
+raw provider configuration.
 
-```rust
-// Each integration registers its own builder
-fn provider_builders() -> &'static [ProviderBuilder] {
-    &[
-        prebid::register_auction_provider,
-        aps::register_providers,
-        adserver_mock::register_providers,
-    ]
-}
-```
+The first version registers three OpenRTB 2.6 profiles in Rust:
 
-This means you only need to add a config section to `trusted-server.toml` for a provider to be automatically discovered and registered.
+- `standard` for the common banner subset and bounded static extensions;
+- `prebid-server` for PBS request, response, cache, override, and diagnostics
+  behavior; and
+- `aps` for APS account/SDK fields, response eligibility, and renderer output.
+
+Each configured provider is an instance of the generic planned OpenRTB path.
+Multiple instances may select the same profile or endpoint and remain distinct
+through their provider IDs. The existing `adserver_mock` mediator stays in a
+separate static integration path selected by `[auction].mediator`.
 
 ## Auction Strategies
 
@@ -239,90 +250,95 @@ When no mediator is set, the orchestrator runs all providers in parallel and sel
 ```toml
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-# No mediator — direct price comparison
 timeout_ms = 2000
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+profile_config = { account_id = "example-aps-account" }
+
+[auction.bidders.example-server]
+provider = "pbs-main"
+
+# No mediator — direct price comparison
 ```
 
 **How winner selection works:**
 
-1. Collect bids from all providers
-2. Group bids by slot ID
-3. For each slot, select the bid with the highest CPM
-4. Bids with `price: None` (e.g., APS encoded prices) are **skipped** — they cannot be compared without decoding
-5. Apply floor prices — drop winners below the slot's floor
+1. Collect bids from all providers.
+2. Group bids by slot ID.
+3. Skip bids without a decoded numeric price.
+4. Select the highest CPM for each slot.
+5. Apply floor prices and drop winners below the slot's floor.
 
-**Limitations:**
-
-- APS bids are effectively ignored since their prices are encoded
-- Only bidders returning clear decimal prices can compete
-- May result in lower revenue when APS would have won
+APS OpenRTB supplies decoded prices, so eligible APS bids participate directly without requiring a mediator.
 
 ### Parallel Mediation
 
-When a `mediator` is configured, all provider responses are forwarded to the mediator service for final winner selection. The mediator can decode proprietary price formats (like APS encoded bids) and apply unified floor pricing.
+When a `mediator` is configured, provider responses are forwarded to the mediator service for final winner selection and unified floor pricing.
 
 ```toml
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-mediator = "adserver_mock"  # Enables mediation
 timeout_ms = 2000
+mediator = "adserver_mock"  # Enables mediation
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+profile_config = { account_id = "example-aps-account" }
+
+[auction.bidders.example-server]
+provider = "pbs-main"
+
+[integrations.adserver_mock]
+enabled = true
+endpoint = "https://mediator.example.com/mediate"
+timeout_ms = 500
 ```
 
 **How mediation works:**
 
-1. Run all providers in parallel (same as parallel_only)
-2. Collect all responses
-3. Forward all bids to the mediator as a single request, including:
-   - Regular bids with clear `price` fields
-   - APS bids with `encoded_price` fields (from `amznbid` metadata)
-4. Mediator decodes APS prices, applies floor pricing, and selects the highest CPM per slot
-5. Mediator returns an OpenRTB response with winning bids at decoded prices
-6. Orchestrator filters any bids the mediator returned without a decoded price
+1. Run all providers in parallel (same as parallel_only).
+2. Collect all responses.
+3. Forward bids with decoded numeric prices to the mediator.
+4. Let the mediator apply policy and choose a winner.
+5. Restore render/accounting state from the selected source bid.
+6. Filter any mediator winner without a decoded price.
 
-**Advantages over parallel_only:**
-
-- All bidders compete on equal footing, including those with encoded prices
-- Centralized floor pricing enforcement
-- Proper APS integration — encoded bids are decoded and compared fairly
-- Higher potential revenue from broader competition
+Mediation is optional for APS. APS reduces to one candidate per impression before mediation so the selected renderer can be restored without same-slot ambiguity.
 
 ## Providers
 
 ### Provider Interface
 
-All demand sources implement the `AuctionProvider` trait:
+Demand sources implement the async, platform-neutral
+[`AuctionProvider`](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/provider.rs).
+The trait receives an `AuctionRequest` and `AuctionContext`, launches a request
+as a `ProviderRequestOutcome`, and parses a `PlatformResponse` into an
+`AuctionResponse`. It also supplies capability, timeout, enablement, and
+platform-backend metadata. Providers that need request-local response state use
+the context-aware parsing hooks instead of storing mutable state on the shared
+provider instance.
 
-```rust
-pub trait AuctionProvider: Send + Sync {
-    fn provider_name(&self) -> &'static str;
-
-    fn request_bids(
-        &self,
-        request: &AuctionRequest,
-        context: &AuctionContext<'_>,
-    ) -> Result<PendingRequest, Report<TrustedServerError>>;
-
-    fn parse_response(
-        &self,
-        response: fastly::Response,
-        response_time_ms: u64,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>>;
-
-    fn supports_media_type(&self, media_type: &MediaType) -> bool;
-    fn timeout_ms(&self) -> u32;
-    fn is_enabled(&self) -> bool;
-    fn backend_name(&self) -> Option<String>;
-}
-```
-
-The trait uses a two-phase design:
-
-1. **`request_bids()`** — Builds and sends the HTTP request, returning a `PendingRequest` (Fastly's async handle)
-2. **`parse_response()`** — Called once the response arrives, parses the provider-specific format into a unified `AuctionResponse`
-
-This split enables true parallel execution: all requests launch first, then the orchestrator uses `select()` to process responses as they arrive.
+The orchestrator launches every request before collecting pending responses, so
+providers can run concurrently without depending on a Fastly-specific API.
 
 ### Prebid Provider
 
@@ -338,49 +354,71 @@ Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid S
 
 **Response parsing:**
 
-- Bids include decoded `price` (clear decimal CPM)
-- Creative HTML provided in `adm` field
-- Creative URLs rewritten to first-party proxy format
-- Per-bidder timing (`responsetimemillis`), errors, and warnings always attached as response metadata
-- When `debug` is enabled, PBS debug payload and per-bid status (`bidstatus`) also included
+- Bids include decoded `price` as a decimal CPM.
+- Missing bid dimensions inherit the routed impression size only when that
+  impression has one banner format. Ambiguous or mismatched dimensions are
+  rejected.
+- Creative HTML comes from the `adm` field.
+- Winning creative URLs are rewritten to first-party proxy format by default
+  when the `/auction` response is assembled.
+- Per-bidder timing (`responsetimemillis`), errors, and warnings are attached as
+  response metadata.
+- `response_admission` reports bounded rejected-bid and reason counts without
+  retaining raw bid payloads.
+- When `debug` is enabled, PBS debug payload and per-bid status (`bidstatus`) are
+  also included.
 
 ```toml
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid-server.example.com"
-timeout_ms = 1000
-bidders = ["appnexus", "rubicon"]
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+
+[auction.bidders.example-server]
+provider = "pbs-main"
 ```
 
 ### APS Provider
 
-Transforms auction requests into Amazon's TAM (Transparent Ad Marketplace) format.
+Builds an independent banner OpenRTB request for Amazon Publisher Services.
 
 **Request transformation:**
 
-- `AdSlot` → `ApsSlot` with `slot_id`, `slot_name`, and `sizes` array
-- Publisher ID, page URL, user agent, and timeout included
+- banner `AdSlot` formats become secure OpenRTB impressions;
+- `ext.account` uses canonical `account_id`;
+- `ext.sdk` identifies the compatible Prebid contract; and
+- existing page, device, consent, identity, and geo privacy gates are preserved.
 
 **Response parsing:**
 
-- Bids have `price: None` — APS uses proprietary encoding (`amznbid` field is base64-encoded)
-- Bids have `creative: None` — APS does not return HTML creatives
-- Encoded price metadata (`amznbid`, `amznp`) preserved in bid metadata for the mediator
-- Only slots with `fif: "1"` (filled) are processed
-
-This is why mediation is important when using APS: without a mediator, APS bids cannot participate in winner selection.
+- decoded USD prices compete directly with other providers;
+- positive compatible dimensions and an HTTPS `creativeurl` are required;
+- script creatives are rejected before winner selection unless explicitly enabled;
+- one candidate per impression is retained deterministically; and
+- a minimized typed renderer is preserved instead of creative markup or APS notifications.
 
 ```toml
-[integrations.aps]
-enabled = true
-pub_id = "example-publisher"
-endpoint = "https://aps.example.com/e/dtb/bid"
-timeout_ms = 800
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+
+[auction.providers.aps-main.profile_config]
+account_id = "example-aps-account"
+debug = false
+allow_script_creatives = false
 ```
+
+See [APS OpenRTB Integration](/guide/integrations/aps) for rollout and rendering requirements.
 
 ### AdServer Mock Mediator
 
-An external mediation service that receives all bidder responses and performs unified winner selection. The mock implementation uses base64 decoding for APS prices; a production mediator would use Amazon's proprietary decoding.
+An external mediation service that receives decoded-price bidder responses and performs final winner selection. APS prices are already decoded at the provider boundary.
 
 **Mediation request format:**
 
@@ -393,8 +431,8 @@ An external mediation service that receives all bidder responses and performs un
   "ext": {
     "bidder_responses": [
       {
-        "bidder": "amazon-aps",
-        "bids": [{ "imp_id": "header-banner", "encoded_price": "Mi41MA==" }]
+        "bidder": "aps",
+        "bids": [{ "imp_id": "header-banner", "price": 2.5, "adm": null }]
       },
       {
         "bidder": "prebid",
@@ -457,20 +495,21 @@ The unified bid format used across all providers:
 ```rust
 pub struct Bid {
     pub slot_id: String,
-    pub price: Option<f64>,           // None for APS (encoded)
+    pub price: Option<f64>,           // Missing prices fail closed
     pub currency: String,
-    pub creative: Option<String>,     // None for APS (no HTML from TAM)
+    pub creative: Option<String>,     // APS uses renderer instead of markup
     pub adomain: Option<Vec<String>>,
     pub bidder: String,
     pub width: u32,
     pub height: u32,
     pub nurl: Option<String>,         // Win notification URL
     pub burl: Option<String>,         // Billing URL
+    pub renderer: Option<BidRenderer>,
     pub metadata: HashMap<String, serde_json::Value>,
 }
 ```
 
-The `price` and `creative` fields are `Option` types specifically to handle APS, which returns encoded prices and no creative HTML. This is a key design decision — it lets the type system enforce awareness of encoded vs. decoded bids throughout the auction pipeline.
+The `price` field remains optional so missing-price bids fail closed. APS supplies a decoded price and a typed renderer instead of creative HTML; the renderer is retained through direct winner selection and mediation.
 
 ### OrchestrationResult
 
@@ -549,13 +588,90 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
 }
 ```
 
+APS renderer winners use the same OpenRTB response with a typed renderer extension instead of `adm`:
+
+```json
+{
+  "id": "auction-abc123",
+  "seatbid": [
+    {
+      "seat": "aps",
+      "bid": [
+        {
+          "id": "upstream-aps-bid-id",
+          "impid": "header-banner",
+          "price": 2.5,
+          "w": 728,
+          "h": 90,
+          "ext": {
+            "trusted_server": {
+              "renderer": {
+                "type": "aps",
+                "version": 1,
+                "accountId": "example-account",
+                "bidId": "upstream-aps-bid-id",
+                "tagType": "iframe",
+                "creativeUrl": "https://creative.example/render",
+                "aaxResponse": "fictional-base64-envelope",
+                "width": 728,
+                "height": 90
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+For these bids, `id` preserves APS's upstream bid ID, `crid` is present only when APS supplies one, and `adm` is absent. TSJS understands this contract; other `/auction` consumers must render `ext.trusted_server.renderer` explicitly.
+
 EC identity is maintained with the `ts-ec` cookie; auction responses do not emit EC ID headers.
 
 ## Creative Processing
 
-Winning creatives are processed through a streaming HTML rewriter (`lol_html`) before being returned. This rewrites external resource URLs to first-party proxy paths, maintaining privacy and enabling security controls.
+Winning creatives returned by `POST /auction` pass through two independent
+transforms. `sanitize_creatives` (opt-in, default `false`) strips executable
+markup with its inner content. `rewrite_creatives` (default `true`) runs an
+HTML rewriter (`lol_html`) that converts eligible external resource and click
+URLs to signed first-party paths, adds `data-tsclick`, rewrites inline CSS
+`url(...)` values, removes bidder-supplied `<base>` elements, and injects the
+unified creative TSJS runtime exactly once, whether or not the bidder supplied a
+`<body>` element. In every mode, a creative
+larger than the 1 MiB per-creative cap is rejected and its `adm` is dropped.
 
-**Elements rewritten:**
+```toml
+[auction]
+sanitize_creatives = false
+rewrite_creatives = true
+```
+
+| `sanitize_creatives` | `rewrite_creatives` | Winning-bid `adm` behavior                                                                                                              |
+| -------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                       |
+| `true`               | `false`             | Strip executable markup, then deliver without rewriting. Accepted asset and click URLs remain direct.                                   |
+| `false`              | `true` (default)    | Rewrite eligible URLs, add click-guard attributes, and inject creative TSJS into the raw bidder markup. Executable markup is preserved. |
+| `true`               | `true`              | Sanitize first, then rewrite eligible URLs, add click-guard attributes, and inject creative TSJS.                                       |
+
+When sanitization is enabled, scripts, stylesheets, style blocks, forms, event
+handlers, dangerous URL schemes, and other rejected content are removed together
+with their inner content — which blanks script-based creatives. Disabling
+rewriting removes the injected creative runtime and first-party proxy/click
+mediation from the resulting `adm`, so the browser may contact third-party hosts
+without mediation. Sanitizer-accepted hosts are not allowlisted or trusted
+merely because their URLs remain in the output.
+
+Both settings apply to winning-bid `adm` in both the shared `POST /auction`
+response converter and the production publisher SSAT/page-bids path. The former
+emits root-relative first-party URLs and injects creative TSJS; the latter emits
+absolute first-party URLs for its foreign-origin renderer and does not inject
+that bundle. HTML/CSS returned by `/first-party/proxy` continues to be
+rewritten independently. `[debug].inject_adm_for_testing` adds the diagnostic
+`debug_bid` blob and enables a testing-only direct GAM replacement; it does not
+control whether processed `adm` is delivered.
+
+**Elements handled by the rewrite pass:**
 
 | Element                          | Attributes                  | Target                         |
 | -------------------------------- | --------------------------- | ------------------------------ |
@@ -568,113 +684,160 @@ Winning creatives are processed through a streaming HTML rewriter (`lol_html`) b
 | `<style>`, `[style]`             | `url()` references          | `/first-party/proxy?tsurl=...` |
 | SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `/first-party/proxy?tsurl=...` |
 
-URLs that are relative, or use `data:`, `javascript:`, `blob:`, or `mailto:` schemes are left unchanged. Domains in the `rewrite.exclude_domains` config list (supports wildcards like `*.cloudflare.com`) are also skipped.
+The rewrite pass leaves relative URLs and non-network schemes unchanged. When
+`sanitize_creatives` is also enabled, sanitization runs first and strips
+dangerous schemes, so only sanitizer-accepted values reach this pass; with
+sanitization disabled, the rewriter operates on the raw bidder markup. Domains
+in the `rewrite.exclude_domains` config list (supports wildcards like
+`*.cdn.example.com`) are also skipped.
 
 Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See [Proxy Signing](/guide/proxy-signing) for details.
 
 ## Configuration
 
-### Full Example
+### Full example
 
 ```toml
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-mediator = "adserver_mock"    # Remove for parallel_only strategy
+sanitize_creatives = false     # Opt-in; blanks script-based creatives when enabled
+rewrite_creatives = true
 timeout_ms = 2000
+mediator = "adserver_mock"
 
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid-server.example.com"
-timeout_ms = 1000
-bidders = ["appnexus", "rubicon"]
-auto_configure = true
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+timeout_ms = 900
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
 debug = false
+test_mode = false
+consent_forwarding = "both"
 
-[integrations.aps]
-enabled = true
-pub_id = "example-publisher"
-endpoint = "https://aps.example.com/e/dtb/bid"
-timeout_ms = 800
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = ["example-seat"]
 
-[integrations.adserver_mock]
-enabled = true
-endpoint = "https://your-mediator.example.com/adserver/mediate"
-timeout_ms = 500
-price_floor = 0.50
-```
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
 
-### Configuration Reference
+[auction.providers.aps-main.profile_config]
+account_id = "example-aps-account"
+debug = false
+allow_script_creatives = false
 
-#### `[auction]`
-
-| Field        | Type     | Default | Description                                                     |
-| ------------ | -------- | ------- | --------------------------------------------------------------- |
-| `enabled`    | bool     | `false` | Enable the auction system                                       |
-| `providers`  | string[] | `[]`    | Ordered list of provider names to call                          |
-| `mediator`   | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`) |
-| `timeout_ms` | u32      | `2000`  | Overall auction timeout in milliseconds                         |
-
-#### `[integrations.prebid]`
-
-| Field            | Type     | Default           | Description                                                                            |
-| ---------------- | -------- | ----------------- | -------------------------------------------------------------------------------------- |
-| `enabled`        | bool     | `true`            | Enable Prebid provider                                                                 |
-| `server_url`     | string   | —                 | Prebid Server URL (required)                                                           |
-| `timeout_ms`     | u32      | `1000`            | Request timeout                                                                        |
-| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot                                            |
-| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts                                              |
-| `debug`          | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`) |
-| `test_mode`      | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                                    |
-
-#### `[integrations.aps]`
-
-| Field        | Type   | Default                             | Description                 |
-| ------------ | ------ | ----------------------------------- | --------------------------- |
-| `enabled`    | bool   | `false`                             | Enable APS provider         |
-| `pub_id`     | string | —                                   | APS publisher ID (required) |
-| `endpoint`   | string | `https://aps.example.com/e/dtb/bid` | APS TAM endpoint            |
-| `timeout_ms` | u32    | `800`                               | Request timeout             |
-
-#### `[integrations.adserver_mock]`
-
-| Field         | Type   | Default                                  | Description               |
-| ------------- | ------ | ---------------------------------------- | ------------------------- |
-| `enabled`     | bool   | `false`                                  | Enable mediator           |
-| `endpoint`    | string | `http://localhost:6767/adserver/mediate` | Mediator service endpoint |
-| `timeout_ms`  | u32    | `500`                                    | Request timeout           |
-| `price_floor` | f64?   | `null`                                   | Global price floor CPM    |
-
-### Timeout Tuning
-
-The orchestrator timeout should exceed the sum of provider timeouts to allow all providers to respond. Providers that exceed their individual timeouts are collected as they finish — the orchestrator doesn't wait indefinitely.
-
-```toml
-[auction]
-timeout_ms = 2000              # Overall ceiling
+[auction.bidders.example-server]
+provider = "pbs-main"
 
 [integrations.prebid]
-timeout_ms = 1000              # Prebid Server budget
+enabled = true
+timeout_ms = 1000
+debug = false
+client_side_bidders = ["example-browser"]
+external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 
-[integrations.aps]
-timeout_ms = 800               # APS budget
+[proxy]
+allowed_domains = ["assets.example.com"]
 
 [integrations.adserver_mock]
-timeout_ms = 500               # Mediator budget (called after providers)
+enabled = true
+endpoint = "https://mediator.example.com/mediate"
+timeout_ms = 500
 ```
 
-### Environment Variable Overrides
+`[auction.providers]` is a map, not a provider-name list. Each provider ID owns
+endpoint/backend correlation and telemetry. `[auction.bidders]` maps each
+client-visible bidder ID to one provider. The mediator remains a separately
+registered integration selected by `[auction].mediator`.
 
-All auction configuration can be overridden via environment variables:
+Common provider fields and defaults:
+
+| Field            | Default         | Meaning                                                        |
+| ---------------- | --------------- | -------------------------------------------------------------- |
+| `protocol`       | Required        | `openrtb-2.6`                                                  |
+| `profile`        | `standard`      | Typed OpenRTB behavior                                         |
+| `endpoint`       | Required        | Fixed absolute HTTPS endpoint                                  |
+| `timeout_ms`     | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout     |
+| `routing`        | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles             |
+| `profile_config` | `{}`            | Profile-owned typed settings                                   |
+| `notifications`  | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats |
+
+APS normally uses `all_eligible`, which sends every compatible banner slot but
+never another provider's bidder parameters. `explicit` providers receive only
+centrally routed or trusted stored-request demand. The `prebid-server` profile
+rejects `all_eligible` because PBS requires bidder or stored-request demand on
+each impression.
+
+Provider IDs must match `^[a-z][a-z0-9-]{0,62}$`. Bidder IDs are limited to 128
+UTF-8 bytes and cannot be the exact reserved browser envelope ID
+`trustedServer`. Static standard-profile `request_ext` and `imp_ext` objects
+are each limited to 16 KiB, eight container levels, and 256 keys at one object
+level. Notification seat lists are limited to 128 unique entries of at most 128
+UTF-8 bytes each.
+
+### Validation and target capability
+
+Target-independent `ts config validate` compiles profiles, defaults, routes,
+endpoints, bounds, signing structure, and mediator selection. Every adapter
+startup compiles the same plan and then validates backend-name prediction,
+fan-out capability, and target resource limits. Fastly and Axum allow
+multi-provider fan-out; Cloudflare and Spin currently reject enabled auctions
+with more than one provider. Fastly reserves 40 of its default 200 dynamic
+backend names for non-auction traffic and rejects auction plans whose provider
+IDs and reachable timeout buckets could require more than the remaining 160.
+
+This tree does not yet have the EdgeZero callback required to run target-aware
+validation before `ts config push --adapter <target>` performs remote work.
+Until that callback lands, startup remains the mandatory target-aware gate.
+
+### Timeout behavior
+
+For each provider, Trusted Server uses the smaller of its resolved timeout and
+the remaining auction budget for launch decisions and OpenRTB `tmax`. The
+mediator is not launched after the logical auction budget is exhausted.
+
+No current adapter claims an abortable provider-wide total-request deadline.
+Already-launched work may complete after the logical budget, and a completed
+late response can remain eligible. Local decision and delivery also finish
+after network launch closes, so `timeout_ms` is not a hard wall-clock ceiling
+and an auction can exceed it.
+
+Browser Prebid `timeout_ms` and `debug` stay under `[integrations.prebid]` and
+are independent of all server provider values. Server endpoint, timeout,
+routes, profile debug/test/overrides/consent, and notification suppression do
+not belong to the browser integration.
+
+### Environment variable overrides
+
+The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
+override existing scalar leaves. The pinned EdgeZero loader does not create
+missing leaves or replace arrays, tables, maps, or rules. Existing configs must add
+`rewrite_creatives = true` and `sanitize_creatives = false` before relying on
+those scalar overrides. Edit and re-push TOML for other values. Provider map
+keys preserve hyphens, so `pbs-main` uses the `PBS-MAIN` segment and needs
+`env` shell syntax:
 
 ```bash
-TRUSTED_SERVER__AUCTION__ENABLED=true
-TRUSTED_SERVER__AUCTION__PROVIDERS=prebid,aps
-TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
-TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://pbs.example.com
-TRUSTED_SERVER__INTEGRATIONS__APS__PUB_ID=5128
+env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
+  'TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true' \
+  'TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false' \
+  'TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+  'TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock' \
+  ts config validate
 ```
+
+Before rolling back to a binary that does not know a creative-processing field,
+remove that field's non-default value (`rewrite_creatives = false` or
+`sanitize_creatives = true`), push the default-compatible blob, and then roll
+back. See [Configuration](/guide/configuration#auction-configuration) for the
+complete migration, upgrade-sequencing, and rollback guidance.
 
 ## Floor Prices
 
@@ -682,17 +845,17 @@ Floor prices can be set per-slot in the auction request. The orchestrator enforc
 
 - In **parallel_only** mode: bids below the floor are dropped after selection
 - In **parallel_mediation** mode: the floor is sent to the mediator in `ext.config.price_floor`, and also enforced locally as a safety net
-- Bids with `price: None` (encoded prices) **pass through** floor checks — the floor is deferred to the mediator
+- Bids without a decoded numeric price are dropped before delivery in both strategies
 
 ## Error Handling
 
 The orchestrator is designed to be resilient:
 
-- **Provider launch failure** — If a provider fails to launch its request (e.g., missing backend), it is skipped with a warning. Other providers continue.
+- **Provider launch failure** — The provider records a `launch_failed` outcome and other providers continue. If every eligible provider fails before producing a pending or immediate outcome, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
 - **Provider parse failure** — If a response can't be parsed, an `AuctionResponse::error()` is recorded. Other results are unaffected.
-- **No providers configured** — Returns an error: `"No providers configured"`
-- **All providers fail** — Returns an empty `OrchestrationResult` with zero winning bids
-- **Mediator returns bids without decoded prices** — Those bids are filtered out with a warning
+- **No providers configured** — Completes as a no-bid without provider I/O.
+- **No provider produces a valid bid** — Returns an empty `OrchestrationResult` with zero winning bids after recording provider outcomes.
+- **Mediator returns bids without decoded prices** — Those bids are filtered out with a warning.
 
 ## Observability
 
@@ -700,11 +863,11 @@ The orchestrator is designed to be resilient:
 
 The auction system logs at multiple levels throughout execution:
 
-| Level   | Examples                                                                              |
-| ------- | ------------------------------------------------------------------------------------- |
-| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing |
-| `debug` | Skipped bids (encoded prices), creative rewrite sizes                                 |
-| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices        |
+| Level   | Examples                                                                                |
+| ------- | --------------------------------------------------------------------------------------- |
+| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing   |
+| `debug` | Bid-drop reasons, mediation restoration notes, creative processing mode and byte counts |
+| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices          |
 
 ### Response Metadata
 
@@ -718,3 +881,79 @@ Every auction response includes structured metadata in `ext.orchestrator`:
   "time_ms": 145
 }
 ```
+
+### SSAT HTML Debug Comment
+
+For local server-side auction template (SSAT) investigation, Trusted Server can
+insert a `<!-- ts-debug: ... -->` comment before the page's bids script. Enable
+it in `trusted-server.toml`, push the local configuration, restart the local
+server, and search the page source for `ts-debug`:
+
+```toml
+[debug]
+auction_html_comment = true
+
+[debug.auction_html_comment_options]
+include_provider_responses = true
+include_mediator_response = false
+include_bids = false
+verbosity = "full"
+format = "pretty"
+```
+
+```bash
+ts config validate
+ts config push --adapter fastly --local
+fastly compute serve
+```
+
+This example is useful when investigating raw Prebid Server requests and
+responses without spending the dump budget on winning creatives. Raw PBS
+`debug.httpcalls` and `resolvedrequest` metadata also require
+`debug = true` under `[auction.providers.<id>.profile_config]` for the relevant
+Prebid Server provider.
+
+| Option                       | Default                                | Behavior                                                                                       |
+| ---------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `include_provider_responses` | `true`                                 | Include the provider response array                                                            |
+| `include_mediator_response`  | `true`                                 | Include the mediator response when a mediator ran                                              |
+| `include_bids`               | `true`                                 | Include bid objects; when `false`, provider status and metadata remain                         |
+| `metadata_keys`              | `error_type`, `http_status`, `message` | Subset of the fixed validated keys; gates them in `redacted` and `upstream`, ignored in `full` |
+| `verbosity`                  | `redacted`                             | Select `redacted`, `upstream`, or `full` sensitivity                                           |
+| `format`                     | `compact`                              | Use compact outer JSON or indented outer JSON with `pretty`                                    |
+
+`metadata_keys` is a subset selector against a fixed allowlist —
+`error_type`, `http_status`, and `message` — never a way to add keys. Any other
+entry fails config load rather than being silently ignored.
+
+The verbosity modes form an explicit sensitivity ladder:
+
+- `redacted` reconstructs only validated `error_type`, `http_status`, and a
+  server-generated `message`, intersected with `metadata_keys`. A successful
+  provider response can therefore have `metadata: {}`.
+- `upstream` adds provider-controlled errors, warnings, response timings, bid
+  statuses, and bounded upstream-message fields. It builds on the redacted
+  metadata, so `metadata_keys` still gates the three validated keys, while the
+  provider diagnostics are unlocked by `verbosity` alone. It does not include
+  raw PBS `httpcalls` or `resolvedrequest`.
+- `full` includes raw response metadata and untruncated creatives, ignoring
+  `metadata_keys` entirely. It can expose IP addresses, geo data, identifiers,
+  consent strings, request signatures, and complete provider request/response
+  bodies.
+
+`format = "pretty"` indents only the outer dump. JSON-looking fields such as
+`requestbody` and `responsebody` remain strings exactly as captured, so their
+contents still appear escaped. Use a local JSON inspection tool when those
+nested values need additional formatting.
+
+The summary line's `winning=N` count is computed before section filtering, so
+it can be nonzero while `include_bids = false` produces empty bid arrays. Every
+mode and format neutralizes HTML-comment terminators and enforces a 256 KiB
+total dump cap. A capped dump ends with `…(truncated N bytes)` and is no longer
+valid JSON.
+
+::: danger Local debugging only
+Do not enable the auction HTML comment in production. Even `redacted` can
+contain bid-level data and creative previews, while `upstream` and `full` may
+expose identity-bearing request data to anyone who can view the page source.
+:::

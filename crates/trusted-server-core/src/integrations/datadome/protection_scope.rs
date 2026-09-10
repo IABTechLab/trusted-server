@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreName};
 
-use super::{DataDomeConfig, DATADOME_INTEGRATION_ID};
+use super::{DATADOME_INTEGRATION_ID, DataDomeConfig};
 
 /// Configured source for dynamic IP CIDR bypass lists.
 #[derive(Debug, Clone, Deserialize)]
@@ -91,12 +91,52 @@ pub(super) struct ProtectionRequestFacts<'a> {
     pub(super) asn: Option<u32>,
 }
 
+/// Typed reason why `DataDome` protection was skipped.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum ProtectionSkipReason {
+    Method,
+    ClientIp,
+    ClientIpSource,
+    Asn,
+    PathExact,
+    PathPrefix,
+    PathRegex,
+    QueryParamNonEmpty,
+    IpCidr,
+    IpCidrSource,
+}
+
+impl ProtectionSkipReason {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Method => "method",
+            Self::ClientIp => "client_ip",
+            Self::ClientIpSource => "client_ip_source",
+            Self::Asn => "asn",
+            Self::PathExact => "path_exact",
+            Self::PathPrefix => "path_prefix",
+            Self::PathRegex => "path_regex",
+            Self::QueryParamNonEmpty => "query_param_non_empty",
+            Self::IpCidr => "ip_cidr",
+            Self::IpCidrSource => "ip_cidr_source",
+        }
+    }
+
+    pub(super) const fn is_ip_based(self) -> bool {
+        matches!(
+            self,
+            Self::ClientIp | Self::ClientIpSource | Self::IpCidr | Self::IpCidrSource
+        )
+    }
+}
+
 /// Result of evaluating whether `DataDome` protection should run.
 pub(super) enum ProtectionScopeDecision {
     Protect,
     Skip {
         rule_id: String,
-        reason: &'static str,
+        reason: ProtectionSkipReason,
+        suppress_client_tag: bool,
     },
 }
 
@@ -210,18 +250,23 @@ impl ProtectionScope {
         facts: &ProtectionRequestFacts<'_>,
         services: &RuntimeServices,
     ) -> ProtectionScopeDecision {
-        if self.excluded_methods.matches(facts.method) {
-            return ProtectionScopeDecision::Skip {
-                rule_id: "excluded-methods".to_string(),
-                reason: "method",
-            };
-        }
+        let mut primary = self
+            .excluded_methods
+            .matches(facts.method)
+            .then(|| ("excluded-methods".to_string(), ProtectionSkipReason::Method));
 
         if let Some(client_ip) = facts.client_ip {
             if cidrs_match(&self.excluded_ip_cidrs, client_ip) {
+                let (rule_id, reason) = primary.unwrap_or_else(|| {
+                    (
+                        "excluded-ip-cidrs".to_string(),
+                        ProtectionSkipReason::ClientIp,
+                    )
+                });
                 return ProtectionScopeDecision::Skip {
-                    rule_id: "excluded-ip-cidrs".to_string(),
-                    reason: "client_ip",
+                    rule_id,
+                    reason,
+                    suppress_client_tag: true,
                 };
             }
 
@@ -230,34 +275,53 @@ impl ProtectionScope {
                     .matches(client_ip, services, self.ip_list_cache_ttl)
                     .await
                 {
+                    let (rule_id, reason) = primary.unwrap_or_else(|| {
+                        (source.rule_id(), ProtectionSkipReason::ClientIpSource)
+                    });
                     return ProtectionScopeDecision::Skip {
-                        rule_id: source.rule_id(),
-                        reason: "client_ip_source",
+                        rule_id,
+                        reason,
+                        suppress_client_tag: true,
                     };
                 }
             }
         }
 
-        if facts
-            .asn
-            .is_some_and(|asn| self.excluded_asns.contains(&asn))
+        if primary.is_none()
+            && facts
+                .asn
+                .is_some_and(|asn| self.excluded_asns.contains(&asn))
         {
-            return ProtectionScopeDecision::Skip {
-                rule_id: "excluded-asns".to_string(),
-                reason: "asn",
-            };
+            primary = Some(("excluded-asns".to_string(), ProtectionSkipReason::Asn));
         }
 
         for rule in &self.exclusion_rules {
+            let reason = rule.matcher.reason();
+            if primary.is_some() && !reason.is_ip_based() {
+                continue;
+            }
             if rule.matches(facts, services, self.ip_list_cache_ttl).await {
-                return ProtectionScopeDecision::Skip {
-                    rule_id: rule.id.clone(),
-                    reason: rule.matcher.reason(),
-                };
+                let suppress_client_tag = reason.is_ip_based();
+                let (rule_id, reason) = primary.unwrap_or_else(|| (rule.id.clone(), reason));
+                if suppress_client_tag {
+                    return ProtectionScopeDecision::Skip {
+                        rule_id,
+                        reason,
+                        suppress_client_tag,
+                    };
+                }
+                primary = Some((rule_id, reason));
             }
         }
 
-        ProtectionScopeDecision::Protect
+        match primary {
+            Some((rule_id, reason)) => ProtectionScopeDecision::Skip {
+                rule_id,
+                reason,
+                suppress_client_tag: false,
+            },
+            None => ProtectionScopeDecision::Protect,
+        }
     }
 }
 
@@ -407,10 +471,10 @@ impl ProtectionExclusionRule {
         services: &RuntimeServices,
         cache_ttl: Duration,
     ) -> bool {
-        if let Some(methods) = &self.methods {
-            if !methods.matches(facts.method) {
-                return false;
-            }
+        if let Some(methods) = &self.methods
+            && !methods.matches(facts.method)
+        {
+            return false;
         }
 
         self.matcher.matches(facts, services, cache_ttl).await
@@ -499,15 +563,15 @@ impl ProtectionMatcher {
         }
     }
 
-    fn reason(&self) -> &'static str {
+    fn reason(&self) -> ProtectionSkipReason {
         match self {
-            ProtectionMatcher::PathExact(_) => "path_exact",
-            ProtectionMatcher::PathPrefix(_) => "path_prefix",
-            ProtectionMatcher::PathRegex(_) => "path_regex",
-            ProtectionMatcher::QueryParamNonEmpty(_) => "query_param_non_empty",
-            ProtectionMatcher::Asn(_) => "asn",
-            ProtectionMatcher::IpCidr(_) => "ip_cidr",
-            ProtectionMatcher::IpCidrSource(_) => "ip_cidr_source",
+            ProtectionMatcher::PathExact(_) => ProtectionSkipReason::PathExact,
+            ProtectionMatcher::PathPrefix(_) => ProtectionSkipReason::PathPrefix,
+            ProtectionMatcher::PathRegex(_) => ProtectionSkipReason::PathRegex,
+            ProtectionMatcher::QueryParamNonEmpty(_) => ProtectionSkipReason::QueryParamNonEmpty,
+            ProtectionMatcher::Asn(_) => ProtectionSkipReason::Asn,
+            ProtectionMatcher::IpCidr(_) => ProtectionSkipReason::IpCidr,
+            ProtectionMatcher::IpCidrSource(_) => ProtectionSkipReason::IpCidrSource,
         }
     }
 }
@@ -667,7 +731,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::platform::test_support::{
-        build_services_with_config_and_secret, HashMapConfigStore, NoopSecretStore,
+        HashMapConfigStore, NoopSecretStore, build_services_with_config_and_secret,
     };
 
     use super::*;
@@ -723,16 +787,20 @@ mod tests {
         let cidr = "2001:db8::/32"
             .parse::<IpCidr>()
             .expect("should parse CIDR");
-        assert!(cidr.contains(IpAddr::V6(
-            "2001:db8::1"
-                .parse::<Ipv6Addr>()
-                .expect("should parse IPv6")
-        )));
-        assert!(!cidr.contains(IpAddr::V6(
-            "2001:db9::1"
-                .parse::<Ipv6Addr>()
-                .expect("should parse IPv6")
-        )));
+        assert!(
+            cidr.contains(IpAddr::V6(
+                "2001:db8::1"
+                    .parse::<Ipv6Addr>()
+                    .expect("should parse IPv6")
+            ))
+        );
+        assert!(
+            !cidr.contains(IpAddr::V6(
+                "2001:db9::1"
+                    .parse::<Ipv6Addr>()
+                    .expect("should parse IPv6")
+            ))
+        );
     }
 
     #[test]
@@ -749,7 +817,8 @@ mod tests {
         assert!(matches!(
             decision,
             ProtectionScopeDecision::Skip {
-                reason: "method",
+                reason: ProtectionSkipReason::Method,
+                suppress_client_tag: false,
                 ..
             }
         ));
@@ -768,7 +837,11 @@ mod tests {
 
         assert!(matches!(
             decision,
-            ProtectionScopeDecision::Skip { reason: "asn", .. }
+            ProtectionScopeDecision::Skip {
+                reason: ProtectionSkipReason::Asn,
+                suppress_client_tag: false,
+                ..
+            }
         ));
     }
 
@@ -793,7 +866,8 @@ mod tests {
         assert!(matches!(
             decision,
             ProtectionScopeDecision::Skip {
-                reason: "client_ip",
+                reason: ProtectionSkipReason::ClientIp,
+                suppress_client_tag: true,
                 ..
             }
         ));
@@ -827,7 +901,8 @@ mod tests {
         assert!(matches!(
             decision,
             ProtectionScopeDecision::Skip {
-                reason: "client_ip_source",
+                reason: ProtectionSkipReason::ClientIpSource,
+                suppress_client_tag: true,
                 ..
             }
         ));
@@ -852,7 +927,8 @@ mod tests {
                 scope.evaluate(&facts("GET", "/app.JSON", None, None, None), &services)
             ),
             ProtectionScopeDecision::Skip {
-                reason: "path_regex",
+                reason: ProtectionSkipReason::PathRegex,
+                suppress_client_tag: false,
                 ..
             }
         ));
@@ -861,6 +937,119 @@ mod tests {
                 scope.evaluate(&facts("POST", "/app.JSON", None, None, None), &services)
             ),
             ProtectionScopeDecision::Protect
+        ));
+    }
+
+    #[test]
+    fn method_skip_detects_overlapping_inline_ip_exclusion() {
+        let mut config = config_with_protection();
+        config.protection_excluded_methods = vec!["GET".to_string()];
+        config.protection_excluded_ip_cidrs = vec!["192.0.2.0/24".to_string()];
+        let scope = ProtectionScope::compile(&config).expect("should compile scope");
+        let services = crate::platform::test_support::noop_services();
+
+        let decision = futures::executor::block_on(scope.evaluate(
+            &facts(
+                "GET",
+                "/page",
+                None,
+                Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+                None,
+            ),
+            &services,
+        ));
+
+        assert!(matches!(
+            decision,
+            ProtectionScopeDecision::Skip {
+                reason: ProtectionSkipReason::Method,
+                suppress_client_tag: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn earlier_non_ip_skip_detects_later_structured_ip_exclusion() {
+        for primary_asn in [None, Some(64500)] {
+            let mut config = config_with_protection();
+            config.protection_excluded_asns = primary_asn.into_iter().collect();
+            config.protection_exclusion_rules = vec![
+                ProtectionExclusionRuleConfig {
+                    id: "path".to_string(),
+                    enabled: primary_asn.is_none(),
+                    methods: Vec::new(),
+                    matcher: ProtectionMatcherConfig::PathExact {
+                        paths: vec!["/page".to_string()],
+                    },
+                },
+                ProtectionExclusionRuleConfig {
+                    id: "ip".to_string(),
+                    enabled: true,
+                    methods: Vec::new(),
+                    matcher: ProtectionMatcherConfig::IpCidr {
+                        cidrs: vec!["192.0.2.0/24".to_string()],
+                    },
+                },
+            ];
+            let scope = ProtectionScope::compile(&config).expect("should compile scope");
+            let services = crate::platform::test_support::noop_services();
+
+            let decision = futures::executor::block_on(scope.evaluate(
+                &facts(
+                    "GET",
+                    "/page",
+                    None,
+                    Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+                    primary_asn,
+                ),
+                &services,
+            ));
+
+            assert!(matches!(
+                decision,
+                ProtectionScopeDecision::Skip {
+                    reason: ProtectionSkipReason::Asn | ProtectionSkipReason::PathExact,
+                    suppress_client_tag: true,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn method_scoped_structured_ip_does_not_suppress_when_scope_does_not_apply() {
+        let mut config = config_with_protection();
+        config.protection_excluded_methods = vec!["POST".to_string()];
+        config.protection_exclusion_rules = vec![ProtectionExclusionRuleConfig {
+            id: "get-ip".to_string(),
+            enabled: true,
+            methods: vec!["GET".to_string()],
+            matcher: ProtectionMatcherConfig::IpCidr {
+                cidrs: vec!["192.0.2.0/24".to_string()],
+            },
+        }];
+        let scope = ProtectionScope::compile(&config).expect("should compile scope");
+        let services = crate::platform::test_support::noop_services();
+
+        let decision = futures::executor::block_on(scope.evaluate(
+            &facts(
+                "POST",
+                "/page",
+                None,
+                Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+                None,
+            ),
+            &services,
+        ));
+
+        assert!(matches!(
+            decision,
+            ProtectionScopeDecision::Skip {
+                reason: ProtectionSkipReason::Method,
+                suppress_client_tag: false,
+                ..
+            }
         ));
     }
 
@@ -884,7 +1073,8 @@ mod tests {
                 &services
             )),
             ProtectionScopeDecision::Skip {
-                reason: "query_param_non_empty",
+                reason: ProtectionSkipReason::QueryParamNonEmpty,
+                suppress_client_tag: false,
                 ..
             }
         ));

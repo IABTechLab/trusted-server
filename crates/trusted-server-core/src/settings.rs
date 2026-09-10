@@ -1,18 +1,24 @@
 #[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
+use glob::{MatchOptions, Pattern};
 use regex::Regex;
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::Duration;
+use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
+use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
+use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
@@ -50,15 +56,21 @@ pub struct Publisher {
     /// exceeding it fails the response rather than allocating past the cap.
     /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
     ///
-    /// On Fastly the *effective* ceiling for a publisher page is lower: the
-    /// platform HTTP client rejects any origin response whose raw (still
-    /// compressed) body exceeds 10 MiB before this buffer is ever filled, so
-    /// raising this value only helps highly compressible pages whose decoded
-    /// size exceeds the 16 MiB default while their compressed origin body stays
-    /// under 10 MiB. Raising it above ~10 MiB does not lift the platform cap for
-    /// uncompressed pages. That platform limit is removed once true streaming
-    /// lands (tracked for PR 15, issue #495), after which this setting becomes
-    /// the sole ceiling.
+    /// Fastly origin bodies are preserved as streams on the publisher path, so
+    /// this setting also caps the streaming pipeline twice over: cumulative
+    /// raw (still compressed) bytes pulled from origin, and cumulative decoded
+    /// bytes emitted by the decompressor — the latter so a decompression bomb
+    /// cannot push an unbounded decoded volume through the rewrite pipeline.
+    /// On the streaming path headers are already committed when either cap
+    /// trips, so the response is truncated mid-body (with the error logged)
+    /// rather than replaced with a 5xx.
+    ///
+    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// There it additionally bounds how much decoded gzip output may sit in the
+    /// heap at once, so a bomb is rejected mid-decode instead of after its full
+    /// expansion; that bound is per-step, never cumulative, so a gzip-encoded
+    /// body is judged by the same post-rewrite total as an identity, deflate or
+    /// brotli one.
     ///
     /// Must be at least 1: a zero-byte cap fails every non-empty buffered
     /// publisher response at request time, so it is rejected at config
@@ -92,7 +104,11 @@ impl Default for Publisher {
 
 impl Publisher {
     /// Known placeholder values that must not be used in production.
-    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret", "proxy-secret"];
+    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &[
+        "change-me-proxy-secret",
+        "proxy-secret",
+        "replace-with-random-proxy-secret",
+    ];
 
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
@@ -112,6 +128,51 @@ impl Publisher {
         Self::PROXY_SECRET_PLACEHOLDERS
             .iter()
             .any(|p| p.eq_ignore_ascii_case(proxy_secret))
+    }
+
+    /// Reserved example publisher values copied verbatim from the config
+    /// template. They deserialize fine but must be replaced before deploying.
+    const PLACEHOLDER_DOMAINS: &[&str] = &["example.com"];
+    const PLACEHOLDER_COOKIE_DOMAINS: &[&str] = &[".example.com"];
+    /// Reserved example origin hosts. Matched against the parsed URL host so a
+    /// spelling that resolves to the same host (an explicit `:443`, a trailing
+    /// slash, a different scheme) cannot slip past the placeholder check.
+    const PLACEHOLDER_ORIGIN_HOSTS: &[&str] = &["origin.example.com"];
+
+    /// Returns `true` if `domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_domain(domain: &str) -> bool {
+        Self::PLACEHOLDER_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(domain.trim()))
+    }
+
+    /// Returns `true` if `cookie_domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_cookie_domain(cookie_domain: &str) -> bool {
+        Self::PLACEHOLDER_COOKIE_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(cookie_domain.trim()))
+    }
+
+    /// Returns `true` if `origin_url` resolves to an unedited template
+    /// placeholder host (case-insensitive).
+    ///
+    /// The comparison is on the parsed URL host, not the raw string, so
+    /// equivalent spellings of the reserved host - an explicit default port, a
+    /// trailing slash, or a different scheme - are all rejected.
+    #[must_use]
+    pub fn is_placeholder_origin_url(origin_url: &str) -> bool {
+        Url::parse(origin_url.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                Self::PLACEHOLDER_ORIGIN_HOSTS
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&host))
+            })
     }
 
     /// Extracts the host (including port if present) from the `origin_url`.
@@ -154,14 +215,42 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Default, Clone, Deserialize, Serialize)]
 pub struct IntegrationSettings {
     #[serde(flatten)]
     entries: HashMap<String, JsonValue>,
 }
 
+impl std::fmt::Debug for IntegrationSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut integration_ids = self.entries.keys().collect::<Vec<_>>();
+        integration_ids.sort_unstable();
+        formatter
+            .debug_struct("IntegrationSettings")
+            .field("integration_ids", &integration_ids)
+            .finish()
+    }
+}
+
 pub trait IntegrationConfig: DeserializeOwned + Validate {
     fn is_enabled(&self) -> bool;
+
+    /// Validate the public field schema for an explicitly disabled config.
+    ///
+    /// The default deserializes the integration's normal schema, except it
+    /// permits omitted enabled-only required fields. Override this only when a
+    /// disabled integration has a distinct public schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deserialization error when the disabled public field schema is invalid.
+    fn validate_disabled_schema(raw: &JsonValue) -> Result<(), serde_json::Error> {
+        match serde_json::from_value::<Self>(raw.clone()) {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().starts_with("missing field ") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl IntegrationSettings {
@@ -187,42 +276,34 @@ impl IntegrationSettings {
         Ok(())
     }
 
-    fn normalize_env_value(value: JsonValue) -> JsonValue {
-        match value {
-            JsonValue::Object(map) => JsonValue::Object(
-                map.into_iter()
-                    .map(|(key, val)| (key, Self::normalize_env_value(val)))
-                    .collect(),
-            ),
-            JsonValue::Array(items) => {
-                JsonValue::Array(items.into_iter().map(Self::normalize_env_value).collect())
-            }
-            JsonValue::String(raw) => {
-                if let Ok(parsed) = serde_json::from_str::<JsonValue>(&raw) {
-                    parsed
-                } else {
-                    JsonValue::String(raw)
-                }
-            }
-            other => other,
-        }
-    }
-
-    /// Normalizes all entries in place, converting JSON-encoded strings from
-    /// environment variables into their proper typed representations.
-    /// Called eagerly after deserialization so that TOML serialization in
-    /// build.rs preserves correct types.
-    pub fn normalize(&mut self) {
-        for value in self.entries.values_mut() {
-            *value = Self::normalize_env_value(value.clone());
-        }
-    }
-
     fn is_explicitly_disabled(raw: &JsonValue) -> bool {
         raw.as_object()
             .and_then(|map| map.get("enabled"))
             .and_then(JsonValue::as_bool)
             == Some(false)
+    }
+
+    fn remove_legacy_static_secret_store_selectors(&mut self) {
+        let Some(datadome) = self
+            .entries
+            .get_mut("datadome")
+            .and_then(JsonValue::as_object_mut)
+        else {
+            return;
+        };
+
+        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
+        if let Some(bypass) = datadome
+            .get_mut("protection_test_bypass")
+            .and_then(JsonValue::as_object_mut)
+        {
+            removed |= bypass.remove("credential_secret_store").is_some();
+        }
+        if removed {
+            log::warn!(
+                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
     }
 
     /// Retrieves and validates a typed configuration for an integration.
@@ -243,6 +324,11 @@ impl IntegrationSettings {
         };
 
         if Self::is_explicitly_disabled(raw) {
+            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
+                message: format!(
+                    "Integration '{integration_id}' configuration could not be parsed"
+                ),
+            })?;
             return Ok(None);
         }
 
@@ -254,6 +340,15 @@ impl IntegrationSettings {
             },
         )?;
 
+        // Field validation runs only for integrations that resolve to enabled.
+        // An integration whose `enabled` flag is omitted falls back to its
+        // serde default, which the explicit-`false` fast path above cannot
+        // observe. Validating before this check would reject documented
+        // template placeholders in sections that are not actually turned on.
+        if !config.is_enabled() {
+            return Ok(None);
+        }
+
         config.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -261,10 +356,6 @@ impl IntegrationSettings {
                 ),
             })
         })?;
-
-        if !config.is_enabled() {
-            return Ok(None);
-        }
 
         Ok(Some(config))
     }
@@ -287,7 +378,7 @@ impl DerefMut for IntegrationSettings {
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
 ///
 /// Partners are defined statically in `trusted-server.toml` rather than
-/// registered via API. At startup, each partner's `api_token` is hashed
+/// registered via API. At startup, each configured `api_token` is hashed
 /// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -299,18 +390,22 @@ pub struct EcPartner {
     /// This normalized domain is also the canonical EC KV `ids` map key.
     #[validate(custom(function = EcPartner::validate_source_domain))]
     pub source_domain: String,
-    /// `OpenRTB` `atype` value (typically 3).
+    /// `OpenRTB` `atype` value, including vendor-specific values such as PAIR's `571187`.
     #[serde(
         default = "EcPartner::default_openrtb_atype",
         deserialize_with = "from_value_or_str"
     )]
-    pub openrtb_atype: u8,
+    #[validate(range(min = 0, message = "must be a non-negative OpenRTB agent type"))]
+    pub openrtb_atype: i32,
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
-    /// Plaintext API token. Hashed at startup for auth lookups.
-    /// Used by batch sync (inbound) and identify (inbound).
-    pub api_token: Redacted<String>,
+    /// Plaintext API token used by inbound batch sync and identify requests.
+    ///
+    /// When present, the token is hashed at startup for auth lookups. Omitting
+    /// it disables inbound partner API authentication for this partner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<Redacted<String>>,
     /// Max batch sync API requests per partner per minute.
     #[serde(
         default = "EcPartner::default_batch_rate_limit",
@@ -417,7 +512,7 @@ impl EcPartner {
     }
 
     #[must_use]
-    pub const fn default_openrtb_atype() -> u8 {
+    pub const fn default_openrtb_atype() -> i32 {
         3
     }
 
@@ -483,6 +578,7 @@ impl Ec {
         "secret_key",
         "trusted-server",
         "trusted-server-placeholder-secret",
+        "replace-with-random-ec-passphrase",
     ];
 
     /// Default maximum concurrent pull-sync requests.
@@ -648,20 +744,44 @@ pub struct RequestSigning {
     pub secret_store_id: String,
 }
 
+impl RequestSigning {
+    /// Reserved example store-id values from the config template, plus the
+    /// empty string, that must not be deployed while request signing is enabled.
+    pub const STORE_ID_PLACEHOLDERS: &[&str] = &[
+        "<management-config-store-id>",
+        "<management-secret-store-id>",
+    ];
+
+    /// Returns `true` if `store_id` is empty or a known template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_store_id(store_id: &str) -> bool {
+        let store_id = store_id.trim();
+        store_id.is_empty()
+            || Self::STORE_ID_PLACEHOLDERS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(store_id))
+    }
+
+    /// Returns `true` if `store_id` cannot be deployed as-is: a placeholder, or
+    /// a value with surrounding whitespace that the key-management routes would
+    /// forward to the management API verbatim.
+    #[must_use]
+    pub fn is_unusable_store_id(store_id: &str) -> bool {
+        Self::is_placeholder_store_id(store_id) || store_id != store_id.trim()
+    }
+}
+
 fn default_request_signing_enabled() -> bool {
     false
 }
 
-fn default_s3_secret_store() -> String {
-    "s3_auth".to_string()
+fn default_s3_access_key_id() -> Redacted<String> {
+    Redacted::new("access_key_id".to_string())
 }
 
-fn default_s3_access_key_id() -> String {
-    "access_key_id".to_string()
-}
-
-fn default_s3_secret_access_key() -> String {
-    "secret_access_key".to_string()
+fn default_s3_secret_access_key() -> Redacted<String> {
+    Redacted::new("secret_access_key".to_string())
 }
 
 fn default_asset_image_optimizer_enabled() -> bool {
@@ -748,25 +868,25 @@ impl AssetOriginAuth {
 /// AWS Signature Version 4 configuration for `S3` asset origins.
 ///
 /// The route `origin_url` must use the same `S3` host that `AWS` validates in
-/// the `SigV4` canonical request. Credentials are read from the named runtime
-/// secret store and cached per process by configured secret names.
+/// the `SigV4` canonical request. Credential fields hold secret-store key names
+/// in app config and resolved values at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3SigV4AuthConfig {
     /// `AWS` region used in the credential scope.
     pub region: String,
-    /// Runtime secret store containing `S3` credentials.
-    #[serde(default = "default_s3_secret_store")]
-    pub secret_store: String,
-    /// Secret name containing the `AWS` access key ID.
+    /// Deprecated per-route store selector accepted for migration only.
+    #[serde(default, skip_serializing)]
+    pub secret_store: Option<String>,
+    /// Secret reference containing the `AWS` access key ID.
     #[serde(default = "default_s3_access_key_id")]
-    pub access_key_id: String,
-    /// Secret name containing the `AWS` secret access key.
+    pub access_key_id: Redacted<String>,
+    /// Secret reference containing the `AWS` secret access key.
     #[serde(default = "default_s3_secret_access_key")]
-    pub secret_access_key: String,
-    /// Optional secret name containing an `AWS` session token.
+    pub secret_access_key: Redacted<String>,
+    /// Optional secret reference containing an `AWS` session token.
     #[serde(default)]
-    pub session_token: Option<String>,
+    pub session_token: Option<Redacted<String>>,
     /// Query-string handling policy for the signed `S3` origin request.
     ///
     /// Set this to `strip` when request query parameters are transformation
@@ -785,14 +905,17 @@ fn s3_region_is_valid(region: &str) -> bool {
 impl S3SigV4AuthConfig {
     fn normalize(&mut self) {
         self.region = self.region.trim().to_string();
-        self.secret_store = self.secret_store.trim().to_string();
-        self.access_key_id = self.access_key_id.trim().to_string();
-        self.secret_access_key = self.secret_access_key.trim().to_string();
-        self.session_token = self
-            .session_token
-            .take()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        if self.secret_store.take().is_some() {
+            log::warn!(
+                "S3 secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
+        self.access_key_id = Redacted::new(self.access_key_id.expose().trim().to_string());
+        self.secret_access_key = Redacted::new(self.secret_access_key.expose().trim().to_string());
+        self.session_token = self.session_token.take().and_then(|value| {
+            let value = value.expose().trim().to_string();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
     }
 
     fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
@@ -808,12 +931,9 @@ impl S3SigV4AuthConfig {
                         .to_string(),
             }));
         }
-        if self.secret_store.is_empty()
-            || self.access_key_id.is_empty()
-            || self.secret_access_key.is_empty()
-        {
+        if self.access_key_id.expose().is_empty() || self.secret_access_key.expose().is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "proxy.asset_routes auth s3_sigv4 secret names must not be empty"
+                message: "proxy.asset_routes auth s3_sigv4 credentials must not be empty after secret resolution"
                     .to_string(),
             }));
         }
@@ -1211,8 +1331,9 @@ fn validate_image_optimizer_format(
     value: &str,
 ) -> Result<(), Report<TrustedServerError>> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "auto" | "avif" | "gif" | "jpeg" | "jpg" | "jxl" | "jpegxl" | "mp4" | "png"
-        | "webp" => Ok(()),
+        "auto" | "avif" | "gif" | "jpeg" | "jpg" | "jxl" | "jpegxl" | "mp4" | "png" | "webp" => {
+            Ok(())
+        }
         _ => Err(Report::new(TrustedServerError::Configuration {
             message: format!(
                 "image_optimizer.profile_sets `{set_name}` profile `{profile_name}` has unsupported format `{value}`"
@@ -1593,15 +1714,17 @@ pub struct Proxy {
     /// Set to false for local development with self-signed certificates.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
-    /// Permitted redirect target domains for the first-party proxy.
+    /// Permitted signing, initial fetch, and redirect target domains for the
+    /// first-party proxy.
     ///
     /// Supports exact hostname match (`"example.com"`) and subdomain wildcard
     /// prefix (`"*.example.com"`, which also matches the apex `example.com`).
     /// Matching is case-insensitive.
     ///
-    /// When empty (the default), redirect destinations are not restricted.
-    /// Configure this in production to prevent SSRF via redirect chains
-    /// initiated by signed first-party proxy URLs.
+    /// When empty (the default), proxy hosts are not restricted. Configure this
+    /// in production to constrain signed and fetched first-party proxy targets.
+    /// When `integrations.prebid.external_bundle_url` is configured, this list
+    /// must include its host and any HTTPS redirect targets.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
     /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
@@ -1658,7 +1781,7 @@ impl Proxy {
 
         if self.allowed_domains.is_empty() {
             log::debug!(
-                "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
+                "proxy.allowed_domains is empty: all signing, initial fetch, and redirect hosts are permitted (open mode)"
             );
         }
 
@@ -1730,15 +1853,15 @@ pub struct TinybirdSettings {
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
     pub api_host: String,
-    /// Fastly Secret Store name containing Tinybird append tokens.
-    #[serde(default = "default_tinybird_secret_store")]
-    pub secret_store: String,
+    /// Deprecated feature-specific store selector accepted for migration only.
+    #[serde(default, skip_serializing)]
+    pub secret_store: Option<String>,
     /// Auction Events API datasource name.
     #[serde(default = "default_tinybird_auction_dataset")]
     pub auction_dataset: String,
-    /// Secret key containing the auction datasource APPEND token.
-    #[serde(default = "default_tinybird_auction_token_secret")]
-    pub auction_token_secret: String,
+    /// Secret reference containing the auction datasource APPEND token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auction_token_secret: Option<Redacted<String>>,
     /// Reserved for future access-log telemetry.
     ///
     /// `true` is rejected until an access-log emitter is wired, so operators
@@ -1748,9 +1871,9 @@ pub struct TinybirdSettings {
     /// Future access-log Events API datasource name.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Future Secret Store key containing the access-log datasource APPEND token.
-    #[serde(default = "default_tinybird_access_token_secret")]
-    pub access_token_secret: String,
+    /// Deprecated placeholder for the unwired access-log APPEND token.
+    #[serde(default, skip_serializing)]
+    pub access_token_secret: Option<Redacted<String>>,
     /// Future fraction of requests to emit for optional access telemetry.
     #[serde(default)]
     pub access_sample_rate: f64,
@@ -1759,24 +1882,12 @@ pub struct TinybirdSettings {
     pub max_body_bytes: usize,
 }
 
-fn default_tinybird_secret_store() -> String {
-    "ts_secrets".to_owned()
-}
-
 fn default_tinybird_auction_dataset() -> String {
     "auction_events_raw".to_owned()
 }
 
-fn default_tinybird_auction_token_secret() -> String {
-    "tinybird_auction_append_token".to_owned()
-}
-
 fn default_tinybird_access_dataset() -> String {
     "access_logs_raw".to_owned()
-}
-
-fn default_tinybird_access_token_secret() -> String {
-    "tinybird_access_append_token".to_owned()
 }
 
 fn default_tinybird_max_body_bytes() -> usize {
@@ -1788,12 +1899,12 @@ impl Default for TinybirdSettings {
         Self {
             enabled: false,
             api_host: String::new(),
-            secret_store: default_tinybird_secret_store(),
+            secret_store: None,
             auction_dataset: default_tinybird_auction_dataset(),
-            auction_token_secret: default_tinybird_auction_token_secret(),
+            auction_token_secret: None,
             access_enabled: false,
             access_dataset: default_tinybird_access_dataset(),
-            access_token_secret: default_tinybird_access_token_secret(),
+            access_token_secret: None,
             access_sample_rate: 0.0,
             max_body_bytes: default_tinybird_max_body_bytes(),
         }
@@ -1803,11 +1914,18 @@ impl Default for TinybirdSettings {
 impl TinybirdSettings {
     fn normalize(&mut self) {
         self.api_host = self.api_host.trim().to_ascii_lowercase();
-        self.secret_store = self.secret_store.trim().to_owned();
+        if self.secret_store.take().is_some() {
+            log::warn!(
+                "tinybird.secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
         self.auction_dataset = self.auction_dataset.trim().to_owned();
-        self.auction_token_secret = self.auction_token_secret.trim().to_owned();
+        self.auction_token_secret = self.auction_token_secret.take().and_then(|value| {
+            let value = value.expose().trim().to_owned();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
         self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = self.access_token_secret.trim().to_owned();
+        self.access_token_secret = None;
     }
 
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
@@ -1831,18 +1949,15 @@ impl TinybirdSettings {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
-        if self.secret_store.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
+        validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
                 message:
-                    "tinybird.secret_store must not be empty when Tinybird telemetry is enabled"
+                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
                         .to_owned(),
-            }));
-        }
-        if self.enabled {
-            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-            validate_tinybird_secret(&self.auction_token_secret, "tinybird.auction_token_secret")?;
-        }
-        Ok(())
+            })
+        })?;
+        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
     }
 }
 
@@ -1883,38 +1998,729 @@ fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<Tr
 fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
     if value.is_empty() || value.chars().any(char::is_control) {
         return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be a non-empty Secret Store key"),
+            message: format!("{setting} must be non-empty after secret resolution"),
         }));
     }
     Ok(())
+}
+
+/// Cache behavior configuration.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheSettings {
+    /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
+    #[serde(default)]
+    pub asset_rules: Vec<CacheAssetRule>,
+}
+
+impl CacheSettings {
+    fn normalize(&mut self) {
+        for rule in &mut self.asset_rules {
+            rule.normalize();
+        }
+    }
+
+    /// Eagerly validate runtime-only cache settings artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any rule ID is duplicate, or if an
+    /// enabled rule has an invalid policy/matcher or cannot compile its regex/glob.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut seen_ids = HashSet::new();
+        for rule in &self.asset_rules {
+            if rule.id.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "cache.asset_rules id must not be empty".to_string(),
+                }));
+            }
+            if !seen_ids.insert(rule.id.clone()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!("cache.asset_rules contains duplicate id `{}`", rule.id),
+                }));
+            }
+        }
+        for rule in &self.asset_rules {
+            rule.prepare_runtime()?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the first enabled asset cache rule that matches `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if a lazily prepared matcher unexpectedly
+    /// fails to compile.
+    pub fn asset_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        for rule in &self.asset_rules {
+            if rule.matches_path(path)? {
+                return Ok(Some(rule.cache_policy()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A configurable cache rule for publisher-origin or rehosted static assets.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheAssetRule {
+    /// Stable operator-facing identifier for logs/tests/config errors.
+    pub id: String,
+    /// Whether this rule participates in matching.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Built-in framework/static preset matcher.
+    #[serde(default)]
+    pub preset: Option<CacheAssetPreset>,
+    /// Raw path prefix matcher.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Single glob matcher retained for concise configs.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    /// Multiple glob matchers.
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    /// Regex matcher applied to the request path.
+    #[serde(default)]
+    pub path_regex: Option<String>,
+    /// File extensions matched against the request path, case-insensitively.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Bundler fingerprint style required in the filename before matching.
+    #[serde(default)]
+    pub fingerprint_style: Option<CacheAssetFingerprintStyle>,
+    /// Browser-facing cache visibility.
+    #[serde(default)]
+    pub visibility: CachePolicyVisibility,
+    /// Browser cache TTL rendered as `max-age`.
+    #[serde(default)]
+    pub browser_ttl_seconds: Option<u64>,
+    /// Shared edge cache TTL rendered as runtime-specific edge control.
+    #[serde(default)]
+    pub edge_ttl_seconds: Option<u64>,
+    /// Optional stale-while-revalidate duration.
+    #[serde(default)]
+    pub stale_while_revalidate_seconds: Option<u64>,
+    /// Optional stale-if-error duration.
+    #[serde(default)]
+    pub stale_if_error_seconds: Option<u64>,
+    /// Whether browser caches may treat the response as immutable.
+    #[serde(default)]
+    pub immutable: bool,
+    #[serde(skip)]
+    compiled_regex: OnceLock<Result<Regex, String>>,
+    #[serde(skip)]
+    compiled_globs: OnceLock<Result<Vec<Pattern>, String>>,
+}
+
+impl CacheAssetRule {
+    fn normalize(&mut self) {
+        self.id = self.id.trim().to_string();
+        self.path_prefix = self
+            .path_prefix
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_glob = self
+            .path_glob
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_globs = self
+            .path_globs
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        self.path_regex = self
+            .path_regex
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.extensions = self
+            .extensions
+            .iter()
+            .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        self.validate_matcher_shape()?;
+        self.compiled_regex().map(|_| ())?;
+        self.compiled_globs().map(|_| ())?;
+        self.validate_policy_shape()?;
+        Ok(())
+    }
+
+    fn validate_matcher_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.path_glob.is_some() && !self.path_globs.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must use path_glob or path_globs, not both",
+                    self.id
+                ),
+            }));
+        }
+
+        let matcher_count = usize::from(self.preset.is_some())
+            + usize::from(self.path_prefix.is_some())
+            + usize::from(self.path_glob.is_some() || !self.path_globs.is_empty())
+            + usize::from(self.path_regex.is_some())
+            + usize::from(!self.extensions.is_empty());
+
+        if matcher_count != 1 {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure exactly one matcher",
+                    self.id
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    fn validate_policy_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.visibility == CachePolicyVisibility::Private {
+            if self.edge_ttl_seconds.is_some() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` sets edge_ttl_seconds with private visibility; private rules must use browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+            if self.browser_ttl_seconds.is_none() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` with private visibility must configure browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+        } else if self.browser_ttl_seconds.is_none() && self.edge_ttl_seconds.is_none() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure browser_ttl_seconds or edge_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        if !self.immutable {
+            return Ok(());
+        }
+
+        if self
+            .browser_ttl_seconds
+            .is_none_or(|browser_ttl| browser_ttl == 0)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` sets immutable without a positive browser_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        let preset_is_content_addressed =
+            matches!(self.preset, Some(CacheAssetPreset::NextJsStatic));
+        if !preset_is_content_addressed {
+            match self.fingerprint_style {
+                None => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(CacheAssetFingerprintStyle::ViteBase64Url) => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` cannot set immutable with vite-base64-url; use a content-addressed preset or an unambiguous fingerprint_style",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compiled_regex(&self) -> Result<Option<&Regex>, Report<TrustedServerError>> {
+        let Some(pattern) = self.path_regex.as_deref() else {
+            return Ok(None);
+        };
+        match self
+            .compiled_regex
+            .get_or_init(|| Regex::new(pattern).map_err(|err| err.to_string()))
+        {
+            Ok(regex) => Ok(Some(regex)),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` path_regex `{pattern}` failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn compiled_globs(&self) -> Result<Option<&[Pattern]>, Report<TrustedServerError>> {
+        if self.path_glob.is_none() && self.path_globs.is_empty() {
+            return Ok(None);
+        }
+
+        match self.compiled_globs.get_or_init(|| {
+            let mut compiled = Vec::new();
+            let source_patterns = self
+                .path_glob
+                .iter()
+                .chain(self.path_globs.iter())
+                .map(String::as_str);
+            for pattern in source_patterns {
+                compile_cache_asset_glob_patterns(pattern, &mut compiled)?;
+            }
+            Ok(compiled)
+        }) {
+            Ok(patterns) => Ok(Some(patterns.as_slice())),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` glob matcher failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        if !self.enabled || !self.matcher_matches_path(path)? {
+            return Ok(false);
+        }
+
+        if let Some(style) = self.fingerprint_style
+            && !filename_contains_fingerprint(path, style)
+        {
+            log::debug!(
+                "cache asset rule `{}` rejects path `{path}` because the filename has no {style:?} fingerprint",
+                self.id
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn matcher_matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        if let Some(preset) = self.preset {
+            return Ok(preset.matches_path(path));
+        }
+        if let Some(prefix) = self.path_prefix.as_deref() {
+            return Ok(path.starts_with(prefix));
+        }
+        if let Some(patterns) = self.compiled_globs()? {
+            return Ok(patterns
+                .iter()
+                .any(|pattern| pattern.matches_with(path, CACHE_ASSET_GLOB_MATCH_OPTIONS)));
+        }
+        if let Some(regex) = self.compiled_regex()? {
+            return Ok(regex.is_match(path));
+        }
+        if !self.extensions.is_empty() {
+            return Ok(path_extension(path).is_some_and(|extension| {
+                self.extensions
+                    .iter()
+                    .any(|candidate| candidate == &extension)
+            }));
+        }
+        Ok(false)
+    }
+
+    fn cache_policy(&self) -> CachePolicy {
+        CachePolicy {
+            visibility: self.visibility.into(),
+            browser_ttl: self.browser_ttl_seconds.map(Duration::from_secs),
+            edge_ttl: self.edge_ttl_seconds.map(Duration::from_secs),
+            stale_while_revalidate: self.stale_while_revalidate_seconds.map(Duration::from_secs),
+            stale_if_error: self.stale_if_error_seconds.map(Duration::from_secs),
+            immutable: self.immutable,
+        }
+    }
+}
+
+const CACHE_ASSET_GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+fn compile_cache_asset_glob_patterns(
+    pattern: &str,
+    compiled: &mut Vec<Pattern>,
+) -> Result<(), String> {
+    let mut variants = vec![pattern.to_string()];
+    let mut variant_index = 0;
+
+    while variant_index < variants.len() {
+        let variant = variants[variant_index].clone();
+        let optional_segments = variant
+            .match_indices("**/")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for segment_start in optional_segments {
+            let without_segment = format!(
+                "{}{}",
+                &variant[..segment_start],
+                &variant[segment_start + "**/".len()..]
+            );
+            if !variants.contains(&without_segment) {
+                variants.push(without_segment);
+            }
+        }
+        variant_index += 1;
+    }
+
+    for variant in variants {
+        compiled.push(Pattern::new(&variant).map_err(|err| err.to_string())?);
+    }
+
+    Ok(())
+}
+
+/// Built-in cache-rule presets that operators can enable explicitly.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetPreset {
+    /// Next.js build output under `/_next/static/`.
+    #[serde(rename = "nextjs-static")]
+    NextJsStatic,
+}
+
+impl CacheAssetPreset {
+    fn matches_path(self, path: &str) -> bool {
+        match self {
+            Self::NextJsStatic => path.starts_with("/_next/static/"),
+        }
+    }
+}
+
+/// Cache visibility parsed from operator configuration.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CachePolicyVisibility {
+    /// Public browser/cache visibility.
+    #[default]
+    Public,
+    /// Private browser visibility.
+    Private,
+}
+
+impl From<CachePolicyVisibility> for CacheVisibility {
+    fn from(value: CachePolicyVisibility) -> Self {
+        match value {
+            CachePolicyVisibility::Public => Self::Public,
+            CachePolicyVisibility::Private => Self::Private,
+        }
+    }
+}
+
+fn path_extension(path: &str) -> Option<String> {
+    let filename = path.rsplit('/').next()?;
+    let (_, extension) = filename.rsplit_once('.')?;
+    (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
+}
+
+/// Operator-selected filename fingerprint convention for a cache rule.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetFingerprintStyle {
+    /// A hexadecimal suffix, such as `app.0123abcd.js`.
+    Hex,
+    /// An eight-character uppercase Base32 suffix, such as `app-VRTVD5R5.js`.
+    EsbuildBase32,
+    /// An eight-character `Base64URL` suffix for non-immutable rules, such as `index-BsELY24f.js`.
+    ViteBase64Url,
+}
+
+impl CacheAssetFingerprintStyle {
+    fn matches_candidate(self, candidate: &str) -> bool {
+        match self {
+            Self::Hex => {
+                candidate.len() >= 8
+                    && candidate.chars().all(|ch| ch.is_ascii_hexdigit())
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::EsbuildBase32 => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || matches!(ch, '2'..='7'))
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::ViteBase64Url => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+                    && candidate.chars().any(|ch| ch.is_ascii_uppercase())
+                    && candidate.chars().any(|ch| {
+                        ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')
+                    })
+            }
+        }
+    }
+}
+
+fn filename_contains_fingerprint(path: &str, style: CacheAssetFingerprintStyle) -> bool {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let Some((stem, extension)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || extension.is_empty() {
+        return false;
+    }
+
+    stem.char_indices()
+        .filter(|(_, ch)| matches!(ch, '.' | '-' | '_' | '~'))
+        .any(|(separator_index, separator)| {
+            let candidate_start = separator_index + separator.len_utf8();
+            let prefix = &stem[..separator_index];
+            let candidate = &stem[candidate_start..];
+            !prefix.is_empty() && style.matches_candidate(candidate)
+        })
 }
 
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
-    /// Expose the JA4/TLS fingerprint debug endpoint at `GET /_ts/debug/ja4`.
+    /// Expose the JA4/TLS probabilistic identifier debug endpoint at `GET /_ts/debug/ja4`.
     ///
     /// When `false` (the default), the endpoint returns 404. Enable only for
-    /// intentional Fastly/browser TLS investigation — the endpoint reflects
+    /// intentional Fastly/browser TLS investigation. The endpoint reflects
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
-    /// auction pipeline stats (SSP count, mediator status, winning bid count).
-    /// Never enable in production — visible in page source.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping
+    /// per-provider auction diagnostics. The default validates response-level
+    /// metadata, but bid fields and bounded creative previews remain visible;
+    /// this is not a fully anonymized dump. Never enable in production.
     #[serde(default)]
     pub auction_html_comment: bool,
 
-    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
-    /// debug rendering through the Prebid Universal Creative bridge.
+    /// Content and verbosity of the `auction_html_comment` dump. Ignored
+    /// when `auction_html_comment` is false.
     ///
-    /// Use this to validate the server-side auction→GAM targeting→creative
-    /// rendering pipeline while PBS Cache is unavailable. Never enable in
-    /// production — injects raw HTML from SSPs.
+    /// The default table must stay omitted from serialized config blobs:
+    /// [`DebugConfig`] denies unknown fields, so an older binary rejects a blob
+    /// carrying this table during a mixed-version deployment or rollback. Any
+    /// non-default table still serializes and requires restoring a compatible
+    /// blob before rolling back.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_auction_debug_comment_options"
+    )]
+    pub auction_html_comment_options: AuctionDebugCommentOptions,
+
+    /// Enable the testing-only direct GAM-replace path and the verbose per-bid
+    /// `debug_bid` blob in `window.tsjs.bids`.
+    ///
+    /// Note: the sanitized winning `adm` is now injected **unconditionally** for
+    /// production inline rendering through the pbRender bridge (see
+    /// [`crate::publisher::build_bid_map`]); this flag no longer gates `adm`.
+    /// What it still gates is the client-side `debug_bid` signal that turns on
+    /// the direct GAM-creative replacement (`injectAdmIntoSlot`), which bypasses
+    /// GAM entirely — useful for validating the auction→creative pipeline while
+    /// PBS Cache is unavailable. The `debug_bid` blob also carries the raw,
+    /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+}
+
+/// Metadata keys safe to surface in the `ts-debug` auction comment.
+///
+/// Fail-closed superset: any key not listed here — notably `debug`, which
+/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
+/// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
+/// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
+/// `metadata_keys` is a subset selector against this const, never a way to
+/// add new keys.
+pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] =
+    &["error_type", "http_status", "message"];
+
+/// Provider-controlled diagnostic keys exposed only by `Upstream` or `Full`.
+///
+/// Values remain untyped upstream JSON and may contain request or identity
+/// data. Keeping this list separate prevents [`AuctionDebugCommentOptions::metadata_keys`]
+/// from widening the default response-metadata boundary.
+pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
+    "errors",
+    "warnings",
+    "responsetimemillis",
+    "bidstatus",
+    "upstream_message",
+    "upstream_message_truncated",
+];
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auction_debug_metadata_keys() -> Vec<String> {
+    AUCTION_DEBUG_METADATA_ALLOWLIST
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
+// This predicate preserves rollback compatibility by omitting the default table.
+fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) -> bool {
+    *value == AuctionDebugCommentOptions::default()
+}
+
+/// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
+/// [`DebugConfig::auction_html_comment`] is true.
+///
+/// `deny_unknown_fields` matches the convention used by sibling config
+/// structs in this file, including the `DebugConfig` this struct nests
+/// under: an operator typo (e.g. `metadata_key` instead of `metadata_keys`)
+/// must fail config load loudly, not be silently ignored.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuctionDebugCommentOptions {
+    /// Include the `provider_responses` section at all.
+    #[serde(default = "default_true")]
+    pub include_provider_responses: bool,
+
+    /// Include `mediator_response` when a mediator ran.
+    #[serde(default = "default_true")]
+    pub include_mediator_response: bool,
+
+    /// Include each provider's `bids` array (vs. status/metadata only).
+    #[serde(default = "default_true")]
+    pub include_bids: bool,
+
+    /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
+    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. This selector cannot
+    /// unlock provider diagnostics, and entries outside the fixed allowlist are
+    /// rejected at config load by
+    /// [`validate_metadata_keys`](Self::validate_metadata_keys).
+    ///
+    /// [`AuctionDebugCommentVerbosity::Upstream`] builds on the redacted
+    /// metadata, so this subset still gates those three keys there; the six
+    /// upstream diagnostics are unlocked by `verbosity` alone. Ignored entirely
+    /// when `verbosity` is [`AuctionDebugCommentVerbosity::Full`].
+    #[serde(default = "default_auction_debug_metadata_keys")]
+    pub metadata_keys: Vec<String>,
+
+    /// `Redacted` (default): validated `metadata_keys` subset only, with
+    /// creative previews truncated to `MAX_BID_CREATIVE_DUMP_BYTES`.
+    /// `Upstream`: redacted fields plus six untyped provider diagnostics;
+    /// creative previews remain truncated.
+    /// `Full`: raw `response.metadata` verbatim, including the `debug`
+    /// subtree (httpcalls/resolvedrequest) when present, and no creative
+    /// truncation. The total dump byte cap and comment-terminator
+    /// neutralization still apply unconditionally.
+    ///
+    /// NEVER enable `Upstream` or `Full` in production — identity-bearing
+    /// request/response data may become visible via view-source.
+    #[serde(default)]
+    pub verbosity: AuctionDebugCommentVerbosity,
+
+    /// JSON representation used for the outer auction dump.
+    #[serde(default)]
+    pub format: AuctionDebugCommentFormat,
+}
+
+impl Default for AuctionDebugCommentOptions {
+    fn default() -> Self {
+        Self {
+            include_provider_responses: true,
+            include_mediator_response: true,
+            include_bids: true,
+            metadata_keys: default_auction_debug_metadata_keys(),
+            verbosity: AuctionDebugCommentVerbosity::Redacted,
+            format: AuctionDebugCommentFormat::Compact,
+        }
+    }
+}
+
+impl AuctionDebugCommentOptions {
+    pub(crate) fn normalize(&mut self) {
+        self.metadata_keys = self
+            .metadata_keys
+            .drain(..)
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .collect();
+    }
+
+    /// Reject [`Self::metadata_keys`] entries outside
+    /// [`AUCTION_DEBUG_METADATA_ALLOWLIST`].
+    ///
+    /// Render time intersects the configured list with the allowlist, so an
+    /// entry outside it is dead config that silently renders `metadata: {}`.
+    /// Fail the load loudly instead, matching the `deny_unknown_fields`
+    /// contract on this struct. The render-time intersection stays as
+    /// defense-in-depth for config paths that bypass this check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming every unknown key.
+    pub(crate) fn validate_metadata_keys(&self) -> Result<(), Report<TrustedServerError>> {
+        let unknown: Vec<&str> = self
+            .metadata_keys
+            .iter()
+            .map(String::as_str)
+            .filter(|key| !AUCTION_DEBUG_METADATA_ALLOWLIST.contains(key))
+            .collect();
+
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "debug.auction_html_comment_options.metadata_keys contains unsupported keys [{}]; supported keys are [{}]",
+                unknown.join(", "),
+                AUCTION_DEBUG_METADATA_ALLOWLIST.join(", ")
+            ),
+        }))
+    }
+}
+
+/// Verbosity of the `ts-debug` auction comment. See
+/// [`AuctionDebugCommentOptions::verbosity`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentVerbosity {
+    #[default]
+    Redacted,
+    Upstream,
+    Full,
+}
+
+/// JSON representation used for the outer `ts-debug` auction dump.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentFormat {
+    #[default]
+    Compact,
+    Pretty,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -1925,6 +2731,114 @@ pub struct TesterCookieConfig {
     pub enabled: bool,
 }
 
+/// Authenticated forwarding configuration for a trusted client IP header.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trusted_client_ip))]
+pub struct TrustedClientIpConfig {
+    /// Header containing the client IP address supplied by the trusted edge.
+    pub ip_header: String,
+    /// Header containing the shared-secret authentication value.
+    pub auth_header: String,
+    /// Shared secret required before accepting the forwarded client IP address.
+    #[validate(custom(function = validate_trusted_client_ip_shared_secret))]
+    pub shared_secret: Redacted<String>,
+}
+
+impl TrustedClientIpConfig {
+    /// Placeholder shared secrets shipped in the example configuration and docs.
+    pub const SHARED_SECRET_PLACEHOLDERS: &[&str] = &["replace-with-a-random-shared-secret"];
+
+    /// Minimum accepted `shared_secret` length.
+    ///
+    /// Matches `Ec::MIN_PASSPHRASE_LENGTH`. This secret is the only gate on
+    /// forging the client address that geolocation, EC identity derivation, and
+    /// bot protection consume, so it is held to the same strength as the EC
+    /// passphrase.
+    const MIN_SHARED_SECRET_LENGTH: usize = Ec::MIN_PASSPHRASE_LENGTH;
+
+    /// Returns `true` if `shared_secret` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_shared_secret(shared_secret: &str) -> bool {
+        Self::SHARED_SECRET_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(shared_secret))
+    }
+
+    /// Returns whether `candidate` exactly matches the configured shared secret.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::redacted::Redacted;
+    /// use trusted_server_core::settings::TrustedClientIpConfig;
+    ///
+    /// let config = TrustedClientIpConfig {
+    ///     ip_header: "fastly-client-ip".to_owned(),
+    ///     auth_header: "x-trusted-client-auth".to_owned(),
+    ///     shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+    /// };
+    ///
+    /// assert!(config.authenticates("fictional-shared-secret-0123456789"));
+    /// assert!(!config.authenticates("fictional-wrong-secret"));
+    /// ```
+    #[must_use]
+    pub fn authenticates(&self, candidate: &str) -> bool {
+        let configured_digest = Sha256::digest(self.shared_secret.expose().as_bytes());
+        let candidate_digest = Sha256::digest(candidate.as_bytes());
+
+        configured_digest.ct_eq(&candidate_digest).into()
+    }
+}
+
+fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), ValidationError> {
+    let ip_header = http::HeaderName::from_bytes(config.ip_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_header"))?;
+    let auth_header = http::HeaderName::from_bytes(config.auth_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_auth_header"))?;
+
+    if ip_header == auth_header {
+        return Err(ValidationError::new("identical_trusted_client_ip_headers"));
+    }
+
+    for header in [&ip_header, &auth_header] {
+        if INTERNAL_HEADERS.contains(&header.as_str()) {
+            return Err(ValidationError::new("reserved_trusted_client_ip_header"));
+        }
+    }
+
+    if ip_header.as_str() != "fastly-client-ip" && !ip_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_header"));
+    }
+    if !auth_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_auth_header"));
+    }
+
+    Ok(())
+}
+
+fn validate_trusted_client_ip_shared_secret(
+    shared_secret: &Redacted<String>,
+) -> Result<(), ValidationError> {
+    let shared_secret = shared_secret.expose();
+    if shared_secret.len() < TrustedClientIpConfig::MIN_SHARED_SECRET_LENGTH {
+        return Err(ValidationError::new(
+            "short_trusted_client_ip_shared_secret",
+        ));
+    }
+    if !shared_secret
+        .bytes()
+        .all(|byte| matches!(byte, b'!'..=b'~'))
+    {
+        return Err(ValidationError::new(
+            "invalid_trusted_client_ip_shared_secret",
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -1932,6 +2846,17 @@ pub struct Settings {
     pub publisher: Publisher,
     #[serde(default)]
     pub tester_cookie: TesterCookieConfig,
+    /// Optional authenticated trusted client IP forwarding configuration.
+    ///
+    /// `None` must stay omitted from serialized config blobs: `Settings`
+    /// schemas that predate this field reject unknown keys, so emitting
+    /// `trusted_client_ip: null` would make an unchanged `ts config push`
+    /// break older instances during rollout or rollback. A configured value
+    /// remains serialized and requires restoring a compatible blob before
+    /// rolling back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub trusted_client_ip: Option<TrustedClientIpConfig>,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -1947,9 +2872,12 @@ pub struct Settings {
     #[validate(nested)]
     pub rewrite: Rewrite,
     #[serde(default)]
+    #[validate(nested)]
     pub auction: AuctionConfig,
     #[serde(default)]
     pub consent: ConsentConfig,
+    #[serde(default)]
+    pub cache: CacheSettings,
     #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
@@ -2029,20 +2957,30 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
+    pub(crate) fn normalize_deserialized(&mut self) {
+        self.cache.normalize();
+        self.proxy.normalize();
+        self.image_optimizer.normalize();
+        self.debug.auction_html_comment_options.normalize();
+        self.tinybird.normalize();
+        self.integrations
+            .remove_legacy_static_secret_store_selectors();
+        self.consent.validate();
+    }
+
     pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.integrations.normalize();
-        settings.proxy.normalize();
-        settings.image_optimizer.normalize();
-        settings.consent.validate();
-
+        settings.normalize_deserialized();
         settings.prepare_runtime()?;
 
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("{validation_label} validation failed: {err}"),
+                message: format!(
+                    "{validation_label} validation failed: {}",
+                    validation_error_summary(&err)
+                ),
             })
         })?;
 
@@ -2057,12 +2995,17 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
-    /// prepared, if any handler path regex does not compile, or if a creative
-    /// opportunity slot is invalid.
+    /// prepared, if any handler path regex does not compile, if a creative
+    /// opportunity slot is invalid, or if
+    /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
+        self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.debug
+            .auction_html_comment_options
+            .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
@@ -2071,6 +3014,13 @@ impl Settings {
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
+            // Parse `gam_unit_path` templates once here (mirrors the compiled
+            // glob cache) so request-time rendering is substitution-only.
+            co.compile_unit_templates().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity gam_unit_path template: {err}"),
+                })
+            })?;
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
@@ -2097,13 +3047,14 @@ impl Settings {
         Ok(())
     }
 
-    /// Returns compiled creative opportunity slots, or empty slice if feature is disabled.
+    /// Returns compiled creative opportunity slots when template delivery is enabled.
     #[must_use]
     pub fn creative_opportunity_slots(
         &self,
     ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
         self.creative_opportunities
             .as_ref()
+            .filter(|co| co.enabled)
             .map(|co| co.slot.as_slice())
             .unwrap_or(&[])
     }
@@ -2123,14 +3074,50 @@ impl Settings {
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
         }
+        if let Some(trusted_client_ip) = &self.trusted_client_ip
+            && TrustedClientIpConfig::is_placeholder_shared_secret(
+                trusted_client_ip.shared_secret.expose(),
+            )
+        {
+            insecure_fields.push("trusted_client_ip.shared_secret".to_owned());
+        }
         for partner in &self.ec.partners {
-            if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
+            if partner
+                .api_token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
             }
         }
         for handler in &self.handlers {
             if Handler::is_placeholder_password(handler.password.expose()) {
                 insecure_fields.push(format!("handlers[{}].password", handler.path));
+            }
+        }
+        if Publisher::is_placeholder_domain(&self.publisher.domain) {
+            insecure_fields.push("publisher.domain".to_owned());
+        }
+        if Publisher::is_placeholder_cookie_domain(&self.publisher.cookie_domain) {
+            insecure_fields.push("publisher.cookie_domain".to_owned());
+        }
+        if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
+            insecure_fields.push("publisher.origin_url".to_owned());
+        }
+        // Checked whenever the block is present, not just when it is enabled:
+        // the key rotate/deactivate admin routes are registered unconditionally
+        // and read these store IDs without consulting `enabled`, so placeholder
+        // IDs behind a disabled block would still reach key management at
+        // runtime. Surrounding whitespace is rejected too: the placeholder check
+        // trims for comparison but the raw value is what `signing_store_ids`
+        // forwards to `KeyRotationManager`, so a padded id would validate yet
+        // reach the management API unusable.
+        if let Some(request_signing) = &self.request_signing {
+            if RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
+                insecure_fields.push("request_signing.config_store_id".to_owned());
+            }
+            if RequestSigning::is_unusable_store_id(&request_signing.secret_store_id) {
+                insecure_fields.push("request_signing.secret_store_id".to_owned());
             }
         }
 
@@ -2169,6 +3156,18 @@ impl Settings {
         Ok(())
     }
 
+    /// Resolve the first matching configured asset cache policy for the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if matcher preparation unexpectedly fails.
+    pub fn asset_cache_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        self.cache.asset_policy_for_path(path)
+    }
+
     /// Resolve the longest matching asset route for the request path.
     #[must_use]
     pub fn asset_route_for_path(&self, path: &str) -> Option<&ProxyAssetRoute> {
@@ -2193,15 +3192,62 @@ impl Settings {
         Ok(None)
     }
 
+    /// Returns whether `path` is within the reserved Trusted Server admin
+    /// namespace.
+    #[must_use]
+    pub(crate) fn is_admin_path(path: &str) -> bool {
+        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
+    }
+
     /// Known admin endpoint paths that must be covered by a handler.
     ///
     /// [`from_toml`](Self::from_toml) rejects configurations
     /// where any of these paths lack a matching handler, ensuring admin
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
-    /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
-        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
+    /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
+    ///
+    /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Its
+    /// coverage is checked via [`admin_auth_probes`](Self::admin_auth_probes),
+    /// while validation errors continue to report this operator-facing route
+    /// template.
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/_ts/admin/ec",
+        "/_ts/admin/ec/{id}",
+        "/_ts/admin/eids",
+    ];
+
+    /// Probes that establish handler coverage for the dynamic
+    /// `/_ts/admin/ec/{id}` route.
+    ///
+    /// Coverage cannot be sampled: the router accepts any single segment after
+    /// `/_ts/admin/ec/` and basic auth runs on the raw path before routing, so
+    /// a handler that matches only some ID shapes leaves the rest of the route
+    /// surface — including malformed IDs, which still reach the admin handler —
+    /// unauthenticated at configuration time and fail-closed at runtime.
+    ///
+    /// Both probes must match the same configuration for the route to count as
+    /// covered. The bare prefix rejects handlers anchored to specific ID
+    /// shapes; the concrete ID rejects handlers anchored to the prefix itself
+    /// (`^/_ts/admin/ec/$`). Together they admit only prefix-level matchers
+    /// such as `^/_ts/admin` or `^/_ts/admin/ec/`.
+    const ADMIN_EC_ID_AUTH_PROBES: [&str; 2] = [
+        "/_ts/admin/ec/",
+        concat!(
+            "/_ts/admin/ec/",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ".Ab12Z9",
+        ),
+    ];
+
+    fn admin_auth_probes(path: &'static str) -> [&'static str; 2] {
+        match path {
+            "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBES,
+            path => [path, path],
+        }
+    }
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -2217,12 +3263,16 @@ impl Settings {
     ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
         let mut uncovered = Vec::new();
         for &path in Self::ADMIN_ENDPOINTS {
-            let mut covered = false;
-            for h in &self.handlers {
-                if h.matches_path(path)? {
-                    covered = true;
-                    break;
+            let mut covered = true;
+            for probe in Self::admin_auth_probes(path) {
+                let mut probe_covered = false;
+                for handler in &self.handlers {
+                    if handler.matches_path(probe)? {
+                        probe_covered = true;
+                        break;
+                    }
                 }
+                covered &= probe_covered;
             }
             if !covered {
                 uncovered.push(path);
@@ -2237,7 +3287,7 @@ impl Settings {
     ///
     /// Returns [`TrustedServerError::Configuration`] listing any uncovered
     /// admin endpoints.
-    fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
+    pub(crate) fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
         let uncovered = self.uncovered_admin_endpoints()?;
         if uncovered.is_empty() {
             return Ok(());
@@ -2252,18 +3302,21 @@ impl Settings {
         }))
     }
 
-    fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Rejects placeholder and well-known weak handler passwords.
+    ///
+    /// Applies to every handler rather than to handlers inferred to cover an
+    /// admin endpoint: handler selection is first-match-wins over operator
+    /// regexes, so a narrow handler can shadow the admin namespace for paths no
+    /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
+    /// a placeholder password is never valid on any of them.
+    pub(crate) fn validate_admin_handler_passwords(
+        &self,
+    ) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
-            let covers_admin = Self::ADMIN_ENDPOINTS
-                .iter()
-                .try_fold(false, |covered, path| {
-                    handler.matches_path(path).map(|matches| covered || matches)
-                })?;
-
-            if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
+            if is_admin_placeholder_password(handler.password.expose()) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "Admin handler `{}` uses a placeholder password; configure a strong secret",
+                        "Handler `{}` uses a placeholder password; configure a strong secret",
                         handler.path
                     ),
                 }));
@@ -2351,6 +3404,47 @@ fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
+    fn walk(errors: &validator::ValidationErrors, prefix: &str, messages: &mut Vec<String>) {
+        let mut fields = errors
+            .errors()
+            .keys()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+
+        for field in fields {
+            let path = if prefix.is_empty() {
+                field.to_owned()
+            } else {
+                format!("{prefix}.{field}")
+            };
+            let Some(kind) = errors.errors().get(field) else {
+                continue;
+            };
+            match kind {
+                validator::ValidationErrorsKind::Field(validations) => {
+                    for validation in validations {
+                        messages.push(format!("{path}: {}", validation.code));
+                    }
+                }
+                validator::ValidationErrorsKind::Struct(inner) => {
+                    walk(inner, &path, messages);
+                }
+                validator::ValidationErrorsKind::List(items) => {
+                    for (index, inner) in items {
+                        walk(inner, &format!("{path}[{index}]"), messages);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut messages = Vec::new();
+    walk(errors, "", &mut messages);
+    messages.join(", ")
 }
 
 fn validate_redacted_not_empty(value: &Redacted<String>) -> Result<(), ValidationError> {
@@ -2450,9 +3544,10 @@ where
 }
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
-// This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
-// represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
-// JSON arrays or comma-separated values.
+// This lets env vars such as
+// TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser work;
+// the config env source represents the value as an object rather than a sequence.
+// String inputs may also be JSON arrays or comma-separated values.
 /// Deserializes a `HashMap<String, String>` from either:
 /// - A TOML table / JSON object (standard deserialization)
 /// - A JSON string (e.g. from env var: `'{"Key": "value"}'`)
@@ -2588,18 +3683,736 @@ mod tests {
     use regex::Regex;
     use serde_json::json;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
-        datadome::{DataDomeConfig, ProtectionMatcherConfig},
-        gpt::GptConfig,
-        nextjs::NextJsIntegrationConfig,
+        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
-        testlight::TestlightConfig,
-        IntegrationRegistry,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
+        format!(
+            "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn trusted_client_ip_is_absent_by_default() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        assert!(
+            settings.trusted_client_ip.is_none(),
+            "should leave trusted client IP configuration disabled by default"
+        );
+    }
+
+    /// Mirrors the `Settings` schema of the revision that predates
+    /// `trusted_client_ip`: every key that revision knew, and
+    /// `deny_unknown_fields` so an extra key fails deserialization exactly as an
+    /// older binary would reject a pushed config blob.
+    // The fields exist to model the accepted key set, never to be read.
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BaseRevisionSettings {
+        #[serde(default)]
+        publisher: serde::de::IgnoredAny,
+        #[serde(default)]
+        tester_cookie: serde::de::IgnoredAny,
+        #[serde(default)]
+        ec: serde::de::IgnoredAny,
+        #[serde(default)]
+        integrations: serde::de::IgnoredAny,
+        #[serde(default)]
+        handlers: serde::de::IgnoredAny,
+        #[serde(default)]
+        response_headers: serde::de::IgnoredAny,
+        #[serde(default)]
+        request_signing: serde::de::IgnoredAny,
+        #[serde(default)]
+        rewrite: serde::de::IgnoredAny,
+        #[serde(default)]
+        auction: serde::de::IgnoredAny,
+        #[serde(default)]
+        consent: serde::de::IgnoredAny,
+        #[serde(default)]
+        cache: serde::de::IgnoredAny,
+        #[serde(default)]
+        proxy: serde::de::IgnoredAny,
+        #[serde(default)]
+        creative_opportunities: serde::de::IgnoredAny,
+        #[serde(default)]
+        image_optimizer: serde::de::IgnoredAny,
+        #[serde(default)]
+        tinybird: serde::de::IgnoredAny,
+        #[serde(default)]
+        debug: serde::de::IgnoredAny,
+    }
+
+    #[test]
+    fn trusted_client_ip_is_omitted_from_serialized_config_when_unset() {
+        // `ts config push` serializes `Settings` verbatim. Emitting the key —
+        // even as `null` — makes a `deny_unknown_fields` binary from the base
+        // revision reject the blob during rollout or rollback.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            value.get("trusted_client_ip").is_none(),
+            "unset trusted_client_ip should not be serialized, got {value}"
+        );
+    }
+
+    #[test]
+    fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        serde_json::from_value::<BaseRevisionSettings>(value)
+            .expect("base revision schema should accept a config blob with no trusted client IP");
+    }
+
+    #[test]
+    fn trusted_client_ip_parses_and_redacts_shared_secret_in_debug_output() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(config.ip_header, "fastly-client-ip");
+        assert_eq!(config.auth_header, "x-trusted-client-auth");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("[REDACTED]"),
+            "should redact trusted client IP shared secret in debug output"
+        );
+        assert!(
+            !debug.contains("fictional-shared-secret-0123456789"),
+            "should not expose trusted client IP shared secret in debug output"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_x_prefixed_ip_header() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "x-trusted-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should accept an x-prefixed trusted client IP header");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(
+            config.ip_header, "x-trusted-client-ip",
+            "should retain the x-prefixed trusted client IP header"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_authentication_requires_an_exact_match() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert!(
+            config.authenticates("fictional-shared-secret-0123456789"),
+            "should authenticate an exact shared secret match"
+        );
+        assert!(
+            !config.authenticates("fictional-wrong-secret"),
+            "should reject a different shared secret"
+        );
+        assert!(
+            !config.authenticates(" fictional-shared-secret-0123456789"),
+            "should reject a leading-whitespace shared secret"
+        );
+        assert!(
+            !config.authenticates("fictional-shared-secret-0123456789 "),
+            "should reject a trailing-whitespace shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_identical_header_names() {
+        for (ip_header, auth_header) in [
+            ("x-trusted-client", "x-trusted-client"),
+            ("X-Trusted-Client", "x-trusted-client"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject identical trusted client IP header names");
+
+            assert!(
+                format!("{error:?}").contains("identical_trusted_client_ip_headers"),
+                "should identify duplicate trusted client IP header names"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_unsafe_header_names() {
+        for (ip_header, auth_header, expected_code) in [
+            (
+                "host",
+                "x-trusted-client-auth",
+                "unsafe_trusted_client_ip_header",
+            ),
+            (
+                "fastly-client-ip",
+                "authorization",
+                "unsafe_trusted_client_ip_auth_header",
+            ),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject unsafe trusted client IP header names");
+            let message = format!("{error:?}");
+
+            assert!(
+                message.contains(expected_code),
+                "should identify unsafe trusted client IP header names"
+            );
+            assert!(
+                !message.contains("fictional-shared-secret-0123456789"),
+                "should not include the shared secret in validation errors"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_reserved_internal_headers() {
+        for (ip_header, auth_header) in [
+            ("x-ts-tls-protocol", "x-trusted-client-auth"),
+            ("x-ts-tls-cipher", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-tls-protocol"),
+            ("fastly-client-ip", "x-ts-tls-cipher"),
+            ("x-forwarded-for", "x-trusted-client-auth"),
+            ("x-geo-info-available", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-ec"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject reserved internal headers");
+
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_client_ip_header"),
+                "should identify reserved internal headers"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_empty_secret_malformed_names_and_incomplete_sections() {
+        let empty_secret = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "",
+        ));
+        assert!(
+            empty_secret.is_err(),
+            "should reject an empty trusted client IP shared secret"
+        );
+
+        for (ip_header, auth_header, expected_code) in [
+            (
+                "invalid header",
+                "x-trusted-client-auth",
+                "invalid_trusted_client_ip_header",
+            ),
+            (
+                "fastly-client-ip",
+                "invalid header",
+                "invalid_trusted_client_ip_auth_header",
+            ),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject malformed trusted client IP header names");
+            assert!(
+                format!("{error:?}").contains(expected_code),
+                "should identify malformed trusted client IP header names"
+            );
+        }
+
+        for section in [
+            "[trusted_client_ip]\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"\nunknown_field = true",
+        ] {
+            let result =
+                Settings::from_toml(&format!("{}\n{section}\n", crate_test_settings_str()));
+            assert!(
+                result.is_err(),
+                "should reject incomplete or unknown trusted client IP configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_control_byte_auth_header_without_exposing_secret() {
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted\u{0000}client-auth",
+            "shared_secret": "fictional-control-byte-secret-0123",
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a control byte in the trusted client IP auth header");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_auth_header"),
+            "should identify the malformed trusted client IP auth header"
+        );
+        assert!(
+            !message.contains("fictional-control-byte-secret-0123"),
+            "should not expose the trusted client IP shared secret in validation errors"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_31_byte_shared_secret_without_exposing_it() {
+        let shared_secret = "1234567890123456789012345678901";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a shared secret below the minimum length");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("short_trusted_client_ip_shared_secret"),
+            "should identify the undersized trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the undersized trusted client IP shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_an_exactly_32_byte_ascii_graphic_shared_secret() {
+        let shared_secret = "0123456789abcdef0123456789ABCDEF";
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect("should accept an exactly 32-byte ASCII graphic shared secret");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(
+            config.shared_secret.expose(),
+            shared_secret,
+            "should retain the accepted shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_non_ascii_shared_secret_without_exposing_it() {
+        let shared_secret = "ascii-graphic-secret-0123456789é";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a non-ASCII shared secret that exceeds 32 bytes");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the non-ASCII trusted client IP shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_an_embedded_space_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with space-012345";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a shared secret containing an ASCII space");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing an ASCII space"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_an_embedded_tab_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\t-tab-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing a horizontal tab");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing a horizontal tab"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_del_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\u{007f}-del-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing DEL");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing DEL"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_a_control_byte_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\u{0001}-control-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing a control byte");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing a control byte"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_placeholder_shared_secrets() {
+        for placeholder in TrustedClientIpConfig::SHARED_SECRET_PLACEHOLDERS {
+            assert!(
+                TrustedClientIpConfig::is_placeholder_shared_secret(placeholder),
+                "should detect placeholder shared secret '{placeholder}'"
+            );
+            assert!(
+                TrustedClientIpConfig::is_placeholder_shared_secret(&placeholder.to_uppercase()),
+                "should detect placeholder shared secret case-insensitively"
+            );
+
+            let settings = Settings::from_toml(&trusted_client_ip_toml(
+                "fastly-client-ip",
+                "x-trusted-client-auth",
+                placeholder,
+            ))
+            .expect("should parse a placeholder trusted client IP shared secret");
+            let error = settings
+                .reject_placeholder_secrets()
+                .expect_err("should reject a placeholder trusted client IP shared secret");
+
+            assert!(
+                format!("{error:?}").contains("trusted_client_ip.shared_secret"),
+                "should name the placeholder trusted client IP shared secret field"
+            );
+        }
+    }
+
+    #[test]
+    fn json_settings_rejects_legacy_auction_provider_list_with_migration_guidance() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["auction"]["providers"] = json!(["prebid"]);
+
+        let error = Settings::from_json_value(value)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("auction.providers"),
+            "error should identify the removed field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "error should direct operators to the migration guidance, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn toml_settings_reject_legacy_auction_provider_list_with_migration_guidance() {
+        let toml = format!(
+            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("auction.providers"),
+            "error should identify the removed field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "error should direct operators to the migration guidance, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_default_matches_serde_defaults() {
+        let opts = AuctionDebugCommentOptions::default();
+        assert!(opts.include_provider_responses, "should default to true");
+        assert!(opts.include_mediator_response, "should default to true");
+        assert!(opts.include_bids, "should default to true");
+        assert_eq!(
+            opts.metadata_keys,
+            vec![
+                "error_type".to_string(),
+                "http_status".to_string(),
+                "message".to_string(),
+            ],
+            "should default to only schema-validated response metadata"
+        );
+        assert_eq!(
+            opts.verbosity,
+            AuctionDebugCommentVerbosity::Redacted,
+            "should default to Redacted"
+        );
+        assert_eq!(
+            opts.format,
+            AuctionDebugCommentFormat::Compact,
+            "should default to compact output"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_normalize_trims_and_drops_empty_keys() {
+        let mut opts = AuctionDebugCommentOptions {
+            metadata_keys: vec![
+                " http_status ".to_string(),
+                "".to_string(),
+                "debug".to_string(),
+            ],
+            ..AuctionDebugCommentOptions::default()
+        };
+        opts.normalize();
+        assert_eq!(
+            opts.metadata_keys,
+            vec!["http_status".to_string(), "debug".to_string()]
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_upstream_verbosity() {
+        let options: AuctionDebugCommentOptions = toml::from_str(r#"verbosity = "upstream""#)
+            .expect("should deserialize upstream verbosity");
+        assert_eq!(options.verbosity, AuctionDebugCommentVerbosity::Upstream);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_pretty_format() {
+        let options: AuctionDebugCommentOptions =
+            toml::from_str(r#"format = "pretty""#).expect("should deserialize pretty format");
+        assert_eq!(options.format, AuctionDebugCommentFormat::Pretty);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_bad_format_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"format = "expanded""#);
+        assert!(
+            result.is_err(),
+            "unrecognized format must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn bad_verbosity_string_fails_config_load() {
+        // Deserialize AuctionDebugCommentOptions directly, not a full Settings —
+        // Settings has required fields with no #[serde(default)] (e.g.
+        // `publisher`), so a full-Settings fixture missing them would fail with
+        // "missing field `publisher`" regardless of whether `verbosity` itself
+        // deserialized correctly, testing the wrong thing.
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"verbosity = "everything""#);
+        assert!(
+            result.is_err(),
+            "unrecognized verbosity must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_metadata_key_fails_config_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\"http_staus\", \"errors\"]\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&toml)
+            .expect_err("should reject metadata keys outside the fixed allowlist");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("http_staus") && rendered.contains("errors"),
+            "error should name every unsupported key, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_allowlisted_metadata_keys_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\" message \"]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should accept an allowlisted key");
+        assert_eq!(
+            settings.debug.auction_html_comment_options.metadata_keys,
+            vec!["message".to_string()],
+            "normalize should trim before validation runs"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_field_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"metadata_key = ["message"]"#);
+        assert!(
+            result.is_err(),
+            "a misspelled field must fail config load, not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn default_auction_debug_comment_options_stay_out_of_serialized_config() {
+        // Rollback contract: `DebugConfig` denies unknown fields, so the
+        // previous binary rejects a config blob carrying a table it does not
+        // know. Defaults must therefore serialize to nothing.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyDebugConfig {
+            #[serde(default)]
+            ja4_endpoint_enabled: bool,
+            #[serde(default)]
+            auction_html_comment: bool,
+            #[serde(default)]
+            inject_adm_for_testing: bool,
+        }
+
+        let value = serde_json::to_value(DebugConfig::default())
+            .expect("should serialize the default debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_none(),
+            "default options table should not be serialized, got {value}"
+        );
+
+        let legacy: LegacyDebugConfig = serde_json::from_value(value)
+            .expect("legacy schema should accept the default debug payload");
+        assert!(!legacy.ja4_endpoint_enabled);
+        assert!(!legacy.auction_html_comment);
+        assert!(!legacy.inject_adm_for_testing);
+
+        let configured = DebugConfig {
+            auction_html_comment: true,
+            auction_html_comment_options: AuctionDebugCommentOptions {
+                include_bids: false,
+                ..AuctionDebugCommentOptions::default()
+            },
+            ..DebugConfig::default()
+        };
+        let value =
+            serde_json::to_value(&configured).expect("should serialize a configured debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_some(),
+            "non-default options must still serialize, got {value}"
+        );
+    }
 
     #[test]
     fn tinybird_defaults_to_disabled_placeholders() {
@@ -2610,12 +4423,9 @@ mod tests {
             !settings.tinybird.enabled,
             "Tinybird should default disabled"
         );
-        assert_eq!(settings.tinybird.secret_store, "ts_secrets");
+        assert_eq!(settings.tinybird.secret_store, None);
         assert_eq!(settings.tinybird.auction_dataset, "auction_events_raw");
-        assert_eq!(
-            settings.tinybird.auction_token_secret,
-            "tinybird_auction_append_token"
-        );
+        assert!(settings.tinybird.auction_token_secret.is_none());
     }
 
     #[test]
@@ -2635,7 +4445,7 @@ mod tests {
     #[test]
     fn tinybird_accepts_region_host_without_scheme() {
         let toml = format!(
-            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\n",
+            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"\n",
             crate_test_settings_str()
         );
 
@@ -2671,10 +4481,7 @@ mod tests {
             .integration_config::<PrebidIntegrationConfig>("prebid")
             .expect("Prebid config query should succeed")
             .expect("Prebid config should load from test settings");
-        assert_eq!(
-            prebid_cfg.server_url,
-            "https://test-prebid.com/openrtb2/auction"
-        );
+        assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
                 .integration_config::<NextJsIntegrationConfig>("nextjs")
@@ -2732,6 +4539,445 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_nextjs_preset_is_operator_controlled() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nextjs-static"
+            enabled = true
+            preset = "nextjs-static"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        let policy = settings
+            .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+            .expect("should evaluate cache rules")
+            .expect("should match enabled Next.js preset");
+        assert_eq!(
+            policy,
+            CachePolicy::public_immutable(Duration::from_secs(31_536_000)),
+            "enabled preset should produce immutable static policy"
+        );
+
+        let disabled_toml = toml_str.replace("enabled = true", "enabled = false");
+        let disabled_settings =
+            Settings::from_toml(&disabled_toml).expect("should parse disabled cache asset rule");
+        assert!(
+            disabled_settings
+                .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+                .expect("should evaluate disabled cache rules")
+                .is_none(),
+            "disabled preset must not mark framework paths immutable"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_requires_selected_fingerprint_style() {
+        let expected_policy = CachePolicy::public_immutable(Duration::from_secs(31_536_000));
+        for (style, matching_path, non_matching_path) in [
+            ("hex", "/assets/app.0123abcd.js", "/assets/app-VRTVD5R5.js"),
+            (
+                "esbuild-base32",
+                "/assets/app-VRTVD5R5.js",
+                "/assets/index-BsELY24f.js",
+            ),
+        ] {
+            let toml_str = format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "publisher-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "{style}"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            );
+            let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+            assert_eq!(
+                settings
+                    .asset_cache_policy_for_path(matching_path)
+                    .expect("should evaluate cache rules"),
+                Some(expected_policy),
+                "{style} should match its configured fingerprint convention"
+            );
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(non_matching_path)
+                    .expect("should evaluate cache rules")
+                    .is_none(),
+                "{style} should not fall through to another fingerprint convention"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_vite_style_cannot_cache_human_named_assets() {
+        let rule = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.js", "/assets/**/*.jpg", "/assets/**/*.png", "/assets/**/*.svg"]
+            fingerprint_style = "vite-base64-url"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        for path in [
+            "/assets/hero-Portrait.jpg",
+            "/assets/logo-DarkMode.svg",
+            "/assets/banner-Summer24.png",
+        ] {
+            let error = Settings::from_toml(&rule)
+                .expect_err("should reject immutable Vite-style cache rule");
+            assert!(
+                format!("{error:?}").contains("cannot set immutable with vite-base64-url"),
+                "{path} must not receive an immutable policy through a Vite-style rule"
+            );
+        }
+    }
+
+    #[test]
+    fn non_immutable_vite_style_remains_available_for_cache_matching() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            fingerprint_style = "vite-base64-url"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings =
+            Settings::from_toml(&toml).expect("should allow Vite-style matching without immutable");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/index-BsELY24f.js")
+                .expect("should evaluate Vite-style cache rule")
+                .is_some(),
+            "non-immutable Vite-style rule should still match a Vite output filename"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_respect_path_separators() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "direct-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app.js")
+                .expect("should evaluate direct asset rule")
+                .is_some(),
+            "single-star glob should match a direct child"
+        );
+        for path in ["/assets/vendor/app.js", "/assets/app.JS"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate direct asset rule")
+                    .is_none(),
+                "single-star glob should not match {path}"
+            );
+        }
+
+        let recursive_toml = toml_str.replace("/assets/*.js", "/assets/**/*.js");
+        let recursive_settings =
+            Settings::from_toml(&recursive_toml).expect("should parse recursive cache asset rule");
+        for path in ["/assets/app.js", "/assets/vendor/app.js"] {
+            assert!(
+                recursive_settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive asset rule")
+                    .is_some(),
+                "double-star glob should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_expand_each_optional_recursive_segment() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nested-assets"
+            enabled = true
+            path_glob = "/a/**/b/**/c.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse recursive cache rule");
+
+        for path in ["/a/x/b/y/c.js", "/a/b/y/c.js", "/a/x/b/c.js", "/a/b/c.js"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive cache rule")
+                    .is_some(),
+                "recursive pattern should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_cache_asset_rules_defer_matcher_and_policy_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "disabled-invalid-regex"
+            enabled = false
+            path_regex = "["
+
+            [[cache.asset_rules]]
+            id = "disabled-placeholder"
+            enabled = false
+
+            [[cache.asset_rules]]
+            id = "disabled-unsafe-immutable"
+            enabled = false
+            path_prefix = "/assets/"
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should defer disabled rule validation");
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app-DA15JTLU.js")
+                .expect("should evaluate disabled cache rules")
+                .is_none(),
+            "disabled rules should never match"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_policy_validation_rejects_unsafe_config() {
+        let missing_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_ttl_err =
+            Settings::from_toml(&missing_ttl).expect_err("should reject rule without a TTL");
+        assert!(
+            format!("{missing_ttl_err:?}").contains("browser_ttl_seconds or edge_ttl_seconds"),
+            "should explain missing TTL: {missing_ttl_err:?}"
+        );
+
+        let immutable_without_fingerprint_style = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "unsafe-immutable"
+            enabled = true
+            path_prefix = "/assets/"
+            browser_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let fingerprint_style_err = Settings::from_toml(&immutable_without_fingerprint_style)
+            .expect_err("should reject immutable rule without a fingerprint style");
+        assert!(
+            format!("{fingerprint_style_err:?}").contains("fingerprint_style"),
+            "should explain immutable fingerprint-style requirement: {fingerprint_style_err:?}"
+        );
+
+        let immutable_without_browser_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "immutable-without-browser-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+            fingerprint_style = "hex"
+            browser_ttl_seconds = 0
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let browser_ttl_err = Settings::from_toml(&immutable_without_browser_ttl)
+            .expect_err("should reject immutable rule without positive browser TTL");
+        assert!(
+            format!("{browser_ttl_err:?}").contains("positive browser_ttl_seconds"),
+            "should explain immutable browser TTL requirement: {browser_ttl_err:?}"
+        );
+
+        let private_edge_only = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "private-edge-only"
+            enabled = true
+            path_prefix = "/assets/"
+            visibility = "private"
+            edge_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let private_edge_only_err = Settings::from_toml(&private_edge_only)
+            .expect_err("should reject private rule with only an edge TTL");
+        assert!(
+            format!("{private_edge_only_err:?}").contains("edge_ttl_seconds"),
+            "should explain that private rules cannot use an edge TTL: {private_edge_only_err:?}"
+        );
+
+        let private_dual_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"",
+            "id = \"private-dual-ttl\"\n            browser_ttl_seconds = 300",
+        );
+        let private_dual_ttl_err = Settings::from_toml(&private_dual_ttl)
+            .expect_err("should reject private rule with browser and edge TTLs");
+        assert!(
+            format!("{private_dual_ttl_err:?}").contains("edge_ttl_seconds"),
+            "should reject edge TTL even when a private rule has a browser TTL: {private_dual_ttl_err:?}"
+        );
+
+        let private_browser_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            edge_ttl_seconds = 300",
+            "id = \"private-browser-ttl\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            browser_ttl_seconds = 300",
+        );
+        let private_settings = Settings::from_toml(&private_browser_ttl)
+            .expect("should accept a private rule with a browser TTL");
+        let private_policy = private_settings
+            .asset_cache_policy_for_path("/assets/app.js")
+            .expect("should evaluate private cache rule")
+            .expect("should match private cache rule");
+        assert_eq!(
+            private_policy
+                .cache_control_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            "private, max-age=300",
+            "private rules should render their browser TTL"
+        );
+        assert_eq!(
+            private_policy
+                .edge_header_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            None,
+            "private rules should not render an edge cache TTL"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_validation_rejects_invalid_config() {
+        let duplicate_ids = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/assets/"
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/static/"
+        "#,
+            crate_test_settings_str()
+        );
+        let duplicate_err =
+            Settings::from_toml(&duplicate_ids).expect_err("should reject duplicate rule ids");
+        assert!(
+            format!("{duplicate_err:?}").contains("duplicate id"),
+            "should explain duplicate rule id: {duplicate_err:?}"
+        );
+
+        let invalid_regex = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "bad-regex"
+            enabled = true
+            path_regex = "["
+        "#,
+            crate_test_settings_str()
+        );
+        let regex_err =
+            Settings::from_toml(&invalid_regex).expect_err("should reject invalid regex");
+        assert!(
+            format!("{regex_err:?}").contains("path_regex"),
+            "should explain invalid regex: {regex_err:?}"
+        );
+
+        let invalid_shape = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "too-many-matchers"
+            enabled = true
+            path_prefix = "/assets/"
+            extensions = ["js"]
+        "#,
+            crate_test_settings_str()
+        );
+        let shape_err =
+            Settings::from_toml(&invalid_shape).expect_err("should reject invalid matcher shape");
+        assert!(
+            format!("{shape_err:?}").contains("exactly one matcher"),
+            "should explain invalid matcher shape: {shape_err:?}"
+        );
+
+        let missing_matcher = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-matcher"
+            enabled = true
+            browser_ttl_seconds = 60
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_matcher_err =
+            Settings::from_toml(&missing_matcher).expect_err("should reject missing matcher");
+        assert!(
+            format!("{missing_matcher_err:?}").contains("exactly one matcher"),
+            "should explain missing matcher: {missing_matcher_err:?}"
         );
     }
 
@@ -2806,6 +5052,46 @@ mod tests {
                 "should reject invalid source_domain {source_domain:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_accepts_vendor_specific_ec_partner_atype() {
+        let toml_str = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "PAIR Partner"
+            source_domain = "google.com"
+            openrtb_atype = 571187
+            api_token = "test-vendor-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str(),
+        );
+
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should accept vendor-specific OpenRTB agent type");
+
+        assert_eq!(
+            settings.ec.partners[0].openrtb_atype, 571187,
+            "should preserve PAIR's vendor-specific atype"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_negative_ec_partner_atype() {
+        let toml_str = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "Invalid Partner"
+            source_domain = "partner.example.com"
+            openrtb_atype = -1
+            api_token = "test-vendor-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str(),
+        );
+
+        let result = Settings::from_toml(&toml_str);
+
+        assert!(result.is_err(), "should reject negative OpenRTB agent type");
     }
 
     #[test]
@@ -2958,6 +5244,24 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn ec_partner_api_token_can_be_omitted() {
+        let partner: EcPartner = toml::from_str(
+            r#"
+name = "Example Partner"
+source_domain = "partner.example.com"
+"#,
+        )
+        .expect("should deserialize partner without API token");
+
+        assert!(partner.api_token.is_none(), "should omit API token");
+        let serialized = serde_json::to_value(partner).expect("should serialize partner");
+        assert!(
+            serialized.get("api_token").is_none(),
+            "should not serialize an omitted API token"
+        );
+    }
+
+    #[test]
     fn validate_passphrase_rejects_under_32_characters() {
         let passphrase = Redacted::new("a".repeat(31));
 
@@ -3004,6 +5308,79 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn is_placeholder_domain_rejects_known_placeholders_case_insensitively() {
+        for placeholder in Publisher::PLACEHOLDER_DOMAINS {
+            assert!(
+                Publisher::is_placeholder_domain(placeholder),
+                "should detect placeholder domain '{placeholder}'"
+            );
+        }
+        assert!(
+            Publisher::is_placeholder_domain(" Example.COM "),
+            "should detect trimmed, mixed-case placeholder domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_domain_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_domain("publisher.test"),
+            "should accept a real publisher domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_cookie_domain_rejects_known_placeholders_case_insensitively() {
+        for placeholder in Publisher::PLACEHOLDER_COOKIE_DOMAINS {
+            assert!(
+                Publisher::is_placeholder_cookie_domain(placeholder),
+                "should detect placeholder cookie_domain '{placeholder}'"
+            );
+        }
+        assert!(
+            Publisher::is_placeholder_cookie_domain(" .Example.COM "),
+            "should detect trimmed, mixed-case placeholder cookie_domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_cookie_domain_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_cookie_domain(".publisher.test"),
+            "should accept a real cookie domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_origin_url_rejects_equivalent_spellings_of_reserved_host() {
+        for reserved in [
+            "https://origin.example.com",
+            "https://origin.example.com/",
+            "https://origin.example.com:443",
+            "http://origin.example.com",
+            "https://Origin.Example.com",
+            " https://origin.example.com ",
+        ] {
+            assert!(
+                Publisher::is_placeholder_origin_url(reserved),
+                "should reject origin_url resolving to the reserved host: '{reserved}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_origin_url_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_origin_url("https://origin.publisher.test"),
+            "should accept a real origin url"
+        );
+        assert!(
+            !Publisher::is_placeholder_origin_url("https://cdn.example.com"),
+            "should accept a different host under the same example domain"
+        );
+    }
+
+    #[test]
     fn is_placeholder_handler_password_rejects_known_template_value() {
         assert!(
             Handler::is_placeholder_password("replace-with-admin-password-32-bytes"),
@@ -3026,6 +5403,26 @@ origin_host_header_overide = "www.example.com""#,
         assert!(
             format!("{err:?}").contains("handlers"),
             "error should mention handler password field"
+        );
+    }
+
+    #[test]
+    fn is_unusable_store_id_rejects_placeholders_empty_and_padded_values() {
+        for placeholder in RequestSigning::STORE_ID_PLACEHOLDERS {
+            assert!(
+                RequestSigning::is_unusable_store_id(placeholder),
+                "should reject placeholder store id '{placeholder}'"
+            );
+        }
+        for bad in ["", "   ", " 01GCFG ", "01GCFG "] {
+            assert!(
+                RequestSigning::is_unusable_store_id(bad),
+                "should reject unusable store id '{bad}'"
+            );
+        }
+        assert!(
+            !RequestSigning::is_unusable_store_id("01GCFG"),
+            "should accept a clean store id"
         );
     }
 
@@ -3055,423 +5452,6 @@ origin_host_header_overide = "www.example.com""#,
 
         let settings = Settings::from_toml(&toml_str);
         assert!(settings.is_err(), "Should fail when sections are missing");
-    }
-
-    #[test]
-    fn test_prebid_bidders_override_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        // Ensure no external override interferes
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(env_key, Some("[\"smartadserver\",\"rubicon\"]"), || {
-                    let res = Settings::from_toml_and_env(&toml_str);
-                    if res.is_err() {
-                        eprintln!("JSON override error: {:?}", res.as_ref().err());
-                    }
-                    let settings = res.expect("Settings should parse with JSON env override");
-                    let cfg = settings
-                        .integration_config::<PrebidIntegrationConfig>("prebid")
-                        .expect("Prebid config query should succeed")
-                        .expect("Prebid config should exist with env override");
-                    assert_eq!(
-                        cfg.bidders,
-                        vec!["smartadserver".to_string(), "rubicon".to_string()]
-                    );
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn test_prebid_bidders_override_with_indexed_env() {
-        let toml_str = crate_test_settings_str();
-
-        let env_key0 = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}0",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let env_key1 = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}1",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        // Also ensure origin_url env is a plain string (avoid any external env interference)
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(env_key0, Some("smartadserver"), || {
-                    temp_env::with_var(env_key1, Some("openx"), || {
-                        let res = Settings::from_toml_and_env(&toml_str);
-                        if res.is_err() {
-                            eprintln!("Indexed override error: {:?}", res.as_ref().err());
-                        }
-                        let settings =
-                            res.expect("Settings should parse with indexed env override");
-                        let cfg = settings
-                            .integration_config::<PrebidIntegrationConfig>("prebid")
-                            .expect("Prebid config query should succeed")
-                            .expect("Prebid config should exist with indexed env override");
-                        assert_eq!(
-                            cfg.bidders,
-                            vec!["smartadserver".to_string(), "openx".to_string()]
-                        );
-                    });
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn test_prebid_bid_param_overrides_override_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDES",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    env_key,
-                    Some(r#"{"criteo":{"networkId":99999,"pubid":"server-pub"}}"#),
-                    || {
-                        let settings = Settings::from_toml_and_env(&toml_str)
-                            .expect("Settings should parse with bidder param override env");
-                        let cfg = settings
-                            .integration_config::<PrebidIntegrationConfig>("prebid")
-                            .expect("Prebid config query should succeed")
-                            .expect("Prebid config should exist with env override");
-                        let cfg_json =
-                            serde_json::to_value(&cfg).expect("should serialize config to JSON");
-
-                        assert_eq!(
-                            cfg_json["bid_param_overrides"]["criteo"]["networkId"],
-                            json!(99999),
-                            "should deserialize networkId override from env JSON"
-                        );
-                        assert_eq!(
-                            cfg_json["bid_param_overrides"]["criteo"]["pubid"],
-                            json!("server-pub"),
-                            "should deserialize pubid override from env JSON"
-                        );
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_prebid_bid_param_override_rules_override_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDE_RULES",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    env_key,
-                    Some(
-                        r#"[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"server-header","keep":"yes"}}]"#,
-                    ),
-                    || {
-                        let settings = Settings::from_toml_and_env(&toml_str)
-                            .expect("Settings should parse canonical bidder param override rules");
-                        let cfg = settings
-                            .integration_config::<PrebidIntegrationConfig>("prebid")
-                            .expect("Prebid config query should succeed")
-                            .expect("Prebid config should exist with env override");
-                        let cfg_json =
-                            serde_json::to_value(&cfg).expect("should serialize config to JSON");
-
-                        assert_eq!(
-                            cfg_json["bid_param_override_rules"][0]["when"]["bidder"],
-                            json!("kargo"),
-                            "should deserialize bidder matcher from env JSON"
-                        );
-                        assert_eq!(
-                            cfg_json["bid_param_override_rules"][0]["when"]["zone"],
-                            json!("header"),
-                            "should deserialize zone matcher from env JSON"
-                        );
-                        assert_eq!(
-                            cfg_json["bid_param_override_rules"][0]["set"]["placementId"],
-                            json!("server-header"),
-                            "should deserialize set object from env JSON"
-                        );
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_datadome_protection_scope_overrides_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
-        );
-        let enabled_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}ENABLED",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let enable_protection_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}ENABLE_PROTECTION",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let excluded_methods_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_METHODS",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let cidr_sources_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_IP_CIDR_SOURCES",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let rules_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUSION_RULES",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (enabled_key, Some("true")),
-                (enable_protection_key, Some("true")),
-                (excluded_methods_key, Some(r#"["OPTIONS","TRACE"]"#)),
-                (
-                    cidr_sources_key,
-                    Some(r#"[{"config_store":"datadome_ip_bypass","key":"googlebot_ips"}]"#),
-                ),
-                (
-                    rules_key,
-                    Some(
-                        r#"[{"id":"legacy-static-get-head","methods":["GET","HEAD"],"type":"path_regex","patterns":["(?i)\\.(css|js)$"]},{"id":"next-rsc","type":"query_param_non_empty","names":["_rsc"]}]"#,
-                    ),
-                ),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&toml_str)
-                    .expect("Settings should parse DataDome JSON env overrides");
-                let cfg = settings
-                    .integration_config::<DataDomeConfig>("datadome")
-                    .expect("DataDome config query should succeed")
-                    .expect("DataDome config should exist with env override");
-
-                assert!(cfg.enabled, "should parse enabled override as bool");
-                assert!(
-                    cfg.enable_protection,
-                    "should parse enable_protection override as bool"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_methods,
-                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
-                    "should parse method list from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].config_store, "datadome_ip_bypass",
-                    "should parse CIDR source config_store from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
-                    "should parse CIDR source key from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_exclusion_rules.len(),
-                    2,
-                    "should parse all structured rules from JSON env override"
-                );
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[0].matcher,
-                    ProtectionMatcherConfig::PathRegex { patterns }
-                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
-                ));
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[1].matcher,
-                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
-                        if names == &vec!["_rsc".to_string()]
-                ));
-            },
-        );
-    }
-
-    #[test]
-    fn test_datadome_protection_scope_overrides_with_indexed_env() {
-        let toml_str = crate_test_settings_str();
-        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
-        let datadome_prefix = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (format!("{datadome_prefix}ENABLED"), Some("true")),
-                (
-                    format!("{datadome_prefix}ENABLE_PROTECTION"),
-                    Some("true"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}0"),
-                    Some("OPTIONS"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}1"),
-                    Some("TRACE"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_ASNS{separator}0"),
-                    Some("19750"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDRS{separator}0"),
-                    Some("198.51.100.0/24"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}CONFIG_STORE"
-                    ),
-                    Some("datadome_ip_bypass"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}KEY"
-                    ),
-                    Some("googlebot_ips"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}ID"),
-                    Some("legacy-static-get-head"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"),
-                    Some("GET"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"),
-                    Some("HEAD"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"),
-                    Some("path_regex"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"),
-                    Some(r"(?i)\.(css|js)$"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}ID"),
-                    Some("next-rsc"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"),
-                    Some("query_param_non_empty"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"),
-                    Some("_rsc"),
-                ),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&toml_str)
-                    .expect("Settings should parse DataDome indexed env overrides");
-                let cfg = settings
-                    .integration_config::<DataDomeConfig>("datadome")
-                    .expect("DataDome config query should succeed")
-                    .expect("DataDome config should exist with indexed env override");
-
-                assert_eq!(
-                    cfg.protection_excluded_methods,
-                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
-                    "should parse indexed method list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_asns,
-                    vec![19750],
-                    "should parse indexed ASN list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidrs,
-                    vec!["198.51.100.0/24".to_string()],
-                    "should parse indexed IP CIDR list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key,
-                    "googlebot_ips",
-                    "should parse indexed CIDR source list"
-                );
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[0].matcher,
-                    ProtectionMatcherConfig::PathRegex { patterns }
-                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
-                ));
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[1].matcher,
-                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
-                        if names == &vec!["_rsc".to_string()]
-                ));
-            },
-        );
     }
 
     #[test]
@@ -3647,7 +5627,7 @@ origin_host_header_overide = "www.example.com""#,
                 (origin_key, Some("https://origin.test-publisher.com")),
                 (partner_0_name_key, Some("Env Partner 0")),
                 (partner_0_source_domain_key, Some("envpartner0.example.com")),
-                (partner_0_openrtb_atype_key, Some("1")),
+                (partner_0_openrtb_atype_key, Some("571187")),
                 (partner_0_bidstream_enabled_key, Some("true")),
                 (partner_0_api_token_key, Some("env-token-0")),
                 (partner_1_name_key, Some("Env Partner 1")),
@@ -3666,9 +5646,16 @@ origin_host_header_overide = "www.example.com""#,
                     settings.ec.partners[0].source_domain,
                     "envpartner0.example.com"
                 );
-                assert_eq!(settings.ec.partners[0].openrtb_atype, 1);
+                assert_eq!(settings.ec.partners[0].openrtb_atype, 571187);
                 assert!(settings.ec.partners[0].bidstream_enabled);
-                assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
+                assert_eq!(
+                    settings.ec.partners[0]
+                        .api_token
+                        .as_ref()
+                        .map(Redacted::expose)
+                        .map(String::as_str),
+                    Some("env-token-0")
+                );
                 assert_eq!(settings.ec.partners[1].name, "Env Partner 1");
                 assert_eq!(
                     settings.ec.partners[1].source_domain,
@@ -3676,7 +5663,14 @@ origin_host_header_overide = "www.example.com""#,
                 );
                 assert_eq!(settings.ec.partners[1].openrtb_atype, 3);
                 assert!(!settings.ec.partners[1].bidstream_enabled);
-                assert_eq!(settings.ec.partners[1].api_token.expose(), "env-token-1");
+                assert_eq!(
+                    settings.ec.partners[1]
+                        .api_token
+                        .as_ref()
+                        .map(Redacted::expose)
+                        .map(String::as_str),
+                    Some("env-token-1")
+                );
             },
         );
     }
@@ -3998,67 +5992,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn test_integration_settings_from_env() {
-        use crate::integrations::testlight::TestlightConfig;
-
-        let toml_str = crate_test_settings_str();
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-        let timeout_key = format!("{}TIMEOUT_MS", integration_prefix);
-        let rewrite_key = format!("{}REWRITE_SCRIPTS", integration_prefix);
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    endpoint_key,
-                    Some("https://testlight-env.test/auction"),
-                    || {
-                        temp_env::with_var(timeout_key, Some("2500"), || {
-                            temp_env::with_var(rewrite_key, Some("true"), || {
-                                temp_env::with_var(enabled_key, Some("true"), || {
-                                    let settings = Settings::from_toml_and_env(&toml_str)
-                                        .expect("Settings should load");
-
-                                    let config = settings
-                                        .integration_config::<TestlightConfig>("testlight")
-                                        .expect("integration parsing should succeed")
-                                        .expect("integration should be enabled");
-
-                                    assert_eq!(
-                                        config.endpoint,
-                                        "https://testlight-env.test/auction"
-                                    );
-                                    assert_eq!(config.timeout_ms, 2500);
-                                    assert!(config.rewrite_scripts);
-                                    assert!(config.enabled);
-                                });
-                            });
-                        });
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
     fn test_disabled_integration_does_not_register() {
         use crate::integrations::testlight::TestlightConfig;
         use serde_json::json;
@@ -4084,7 +6017,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn disabled_invalid_integration_skips_validation() {
+    fn disabled_integration_can_omit_enabled_required_fields_and_skip_semantic_validation() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -4092,21 +6025,26 @@ origin_host_header_overide = "www.example.com""#,
                 "gpt",
                 &json!({
                     "enabled": false,
-                    "script_url": "not a url",
                 }),
             )
             .expect("should insert GPT config");
 
         let config = settings
             .integration_config::<GptConfig>("gpt")
-            .expect("disabled GPT config should be ignored");
+            .expect("minimal disabled GPT config should be ignored");
         assert!(config.is_none(), "disabled GPT config should be skipped");
-        IntegrationRegistry::new(&settings)
-            .expect("disabled invalid integration config should not fail registry startup");
+        IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("disabled invalid integration config should not fail registry startup");
     }
 
     #[test]
-    fn disabled_invalid_default_enabled_prebid_skips_validation() {
+    fn minimal_disabled_prebid_deserializes_without_enabled_only_validation() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -4114,7 +6052,6 @@ origin_host_header_overide = "www.example.com""#,
                 "prebid",
                 &json!({
                     "enabled": false,
-                    "server_url": "not a url",
                 }),
             )
             .expect("should insert prebid config");
@@ -4123,10 +6060,47 @@ origin_host_header_overide = "www.example.com""#,
             .integration_config::<PrebidIntegrationConfig>("prebid")
             .expect("disabled prebid config should be ignored");
         assert!(config.is_none(), "disabled prebid config should be skipped");
-        IntegrationRegistry::new(&settings)
-            .expect("disabled default-enabled prebid config should not fail registry startup");
+        IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("disabled default-enabled prebid config should not fail registry startup");
         build_orchestrator(&settings)
-            .expect("disabled default-enabled prebid config should not fail orchestrator startup");
+            .expect("minimal disabled prebid config should not fail orchestrator startup");
+    }
+
+    #[test]
+    fn disabled_removed_prebid_and_aps_fields_are_rejected() {
+        for (integration_id, removed_field) in [("prebid", "server_url"), ("aps", "account_id")] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    integration_id,
+                    &json!({
+                        "enabled": false,
+                        (removed_field): "removed-value",
+                    }),
+                )
+                .expect("should insert removed integration config field");
+
+            let error = match integration_id {
+                "prebid" => settings
+                    .integration_config::<PrebidIntegrationConfig>(integration_id)
+                    .expect_err("should reject removed disabled Prebid field"),
+                "aps" => settings
+                    .integration_config::<crate::integrations::aps::ApsConfig>(integration_id)
+                    .expect_err("should reject removed disabled APS field"),
+                _ => unreachable!("test integration ID should be known"),
+            };
+            assert!(
+                format!("{error:?}").contains(removed_field),
+                "should identify removed field `{removed_field}`: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -4143,7 +6117,13 @@ origin_host_header_overide = "www.example.com""#,
             )
             .expect("should insert GPT config");
 
-        let err = match IntegrationRegistry::new(&settings) {
+        let err = match IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        ) {
             Ok(_) => panic!("enabled invalid integration should fail registry startup"),
             Err(err) => err,
         };
@@ -4151,128 +6131,6 @@ origin_host_header_overide = "www.example.com""#,
             err.to_string().contains("Integration 'gpt'"),
             "should identify the invalid integration config"
         );
-    }
-
-    #[test]
-    fn disabled_invalid_provider_config_does_not_fail_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &json!({
-                    "enabled": false,
-                    "endpoint": "not a url",
-                }),
-            )
-            .expect("should insert adserver mock config");
-
-        build_orchestrator(&settings).expect("disabled invalid provider config should be ignored");
-    }
-
-    #[test]
-    fn enabled_invalid_provider_config_fails_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &json!({
-                    "enabled": true,
-                    "endpoint": "not a url",
-                }),
-            )
-            .expect("should insert adserver mock config");
-
-        let err = match build_orchestrator(&settings) {
-            Ok(_) => panic!("enabled invalid provider config should fail startup"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("Integration 'adserver_mock'"),
-            "should identify the invalid provider config"
-        );
-    }
-
-    #[test]
-    fn empty_prebid_server_url_fails_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "",
-                }),
-            )
-            .expect("should insert prebid config");
-
-        let err = match build_orchestrator(&settings) {
-            Ok(_) => panic!("empty prebid server_url should fail startup"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("Integration 'prebid' configuration failed validation"),
-            "should surface a validation error for prebid.server_url"
-        );
-    }
-
-    /// Tests the full build.rs round-trip: env vars are baked into Settings
-    /// at build time via `from_toml_and_env`, serialized to TOML, then parsed
-    /// back at runtime via `from_toml`. Verifies that env-sourced integration
-    /// values (strings like "true") are normalized to proper types so the
-    /// serialized TOML has correct types.
-    #[test]
-    fn test_env_var_roundtrip_normalizes_integration_types() {
-        let toml_str = crate_test_settings_str();
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-        );
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-
-        temp_env::with_var(enabled_key, Some("true"), || {
-            temp_env::with_var(
-                endpoint_key,
-                Some("https://testlight-env.test/auction"),
-                || {
-                    // Step 1: Parse with env vars (what build.rs does)
-                    let settings =
-                        Settings::from_toml_and_env(&toml_str).expect("Settings should parse");
-
-                    // Verify normalization converted "true" to bool
-                    let raw = settings.integrations.get("testlight").unwrap();
-                    assert!(
-                        raw.get("enabled").unwrap().is_boolean(),
-                        "enabled should be normalized to bool, got: {:?}",
-                        raw.get("enabled")
-                    );
-
-                    // Step 2: Serialize to TOML (what build.rs does)
-                    let merged_toml =
-                        toml::to_string_pretty(&settings).expect("Should serialize to TOML");
-
-                    // Step 3: Parse back (what runtime does)
-                    let runtime_settings =
-                        Settings::from_toml(&merged_toml).expect("Runtime should parse");
-
-                    let config = runtime_settings
-                        .integration_config::<TestlightConfig>("testlight")
-                        .expect("should get config")
-                        .expect("should be enabled");
-
-                    assert_eq!(config.endpoint, "https://testlight-env.test/auction");
-                    assert!(config.enabled);
-                },
-            );
-        });
     }
 
     /// Verifies that `from_toml` does NOT read environment variables.
@@ -4326,6 +6184,43 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn test_auction_creative_processing_defaults_when_omitted() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            settings.auction.rewrite_creatives,
+            "creative rewriting stays enabled when the setting is omitted"
+        );
+        assert!(
+            !settings.auction.sanitize_creatives,
+            "creative sanitization is opt-in when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_creatives_accepts_explicit_false() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            rewrite_creatives = false
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.auction.rewrite_creatives,
+            "should disable creative rewriting when explicitly configured"
+        );
+    }
+
+    #[test]
     fn test_auction_allowed_context_keys_defaults_to_empty() {
         let settings = create_test_settings();
         assert!(
@@ -4340,7 +6235,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             allowed_context_keys = ["permutive_segments", "lockr_ids"]
             "#;
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
@@ -4356,7 +6250,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             allowed_context_keys = []
             "#;
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
@@ -4576,9 +6469,9 @@ origin_host_header_overide = "www.example.com""#,
         match route.auth.as_ref().expect("should configure route auth") {
             AssetOriginAuth::S3SigV4(config) => {
                 assert_eq!(config.region, "us-east-1");
-                assert_eq!(config.secret_store, "s3_auth");
-                assert_eq!(config.access_key_id, "access_key_id");
-                assert_eq!(config.secret_access_key, "secret_access_key");
+                assert_eq!(config.secret_store, None);
+                assert_eq!(config.access_key_id.expose(), "access_key_id");
+                assert_eq!(config.secret_access_key.expose(), "secret_access_key");
             }
         }
     }
@@ -4721,67 +6614,99 @@ origin_host_header_overide = "www.example.com""#,
         let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
         let vars = [
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}PREFIX"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}PREFIX"
+                ),
                 Some("/.image/"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"
+                ),
                 Some("https://bucket.s3.us-west-2.amazonaws.com"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"
+                ),
                 Some("s3_sigv4"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"
+                ),
                 Some("us-west-2"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"
+                ),
                 Some("strip"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}ENABLED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}ENABLED"
+                ),
                 Some("true"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}REGION"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}REGION"
+                ),
                 Some("us_west"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}PROFILE_SET"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}PROFILE_SET"
+                ),
                 Some("default_images"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}BASE_PARAMS"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}BASE_PARAMS"
+                ),
                 Some("quality=70&resize-filter=bicubic"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}DEFAULT_PROFILE"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}DEFAULT_PROFILE"
+                ),
                 Some("w828"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W828"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W828"
+                ),
                 Some("format=auto&width=828"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W1536"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W1536"
+                ),
                 Some("format=auto&width=1536"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}ALLOWED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}ALLOWED"
+                ),
                 Some("[\"1-1\",\"16-9\"]"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}PROFILES"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}PROFILES"
+                ),
                 Some("[\"w828\",\"w1536\"]"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}ENABLED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}ENABLED"
+                ),
                 Some("true"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}BUCKETS"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}BUCKETS"
+                ),
                 Some("[10,30,50,70,90]"),
             ),
         ];
@@ -5208,7 +7133,13 @@ origin_host_header_overide = "www.example.com""#,
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"],
+            vec![
+                "/_ts/admin/keys/rotate",
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/ec",
+                "/_ts/admin/ec/{id}",
+                "/_ts/admin/eids",
+            ],
             "should report every admin endpoint as uncovered"
         );
     }
@@ -5242,9 +7173,193 @@ origin_host_header_overide = "www.example.com""#,
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate"],
+            vec![
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/ec",
+                "/_ts/admin/ec/{id}",
+                "/_ts/admin/eids",
+            ],
             "should detect the admin endpoints not covered by the narrow handler"
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_literal_parameter_template_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[{]id[}]$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject literal parameter-template auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the concrete EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_lowercase_only_dynamic_admin_ec_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][a-z0-9]{6}$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject lowercase-only dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the mixed-case EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_placeholder_password_on_shadowing_admin_handler() {
+        // Handler selection is first-match-wins, so a narrow handler placed
+        // ahead of the admin matcher governs the EC IDs it matches. No probe
+        // enumerates those IDs, so the placeholder check cannot be limited to
+        // handlers inferred to cover an admin endpoint.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/ec/[a-f0-9]{64}[.]zzzzzz$"
+            username = "admin"
+            password = "change-me-admin-password"
+
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject placeholder password on shadowing admin handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the placeholder handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_weak_password_on_non_admin_handler() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/private"
+            username = "admin"
+            password = "changeme""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject a weak password on any handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the weak handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_sampled_id_only_dynamic_admin_ec_auth_coverage() {
+        // A handler anchored to the full EC ID grammar still leaves the rest of
+        // the route surface (malformed IDs, which the router accepts and the
+        // admin handler rejects with 400) unauthenticated, so coverage must not
+        // be inferred from ID-shaped samples.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject ID-sampled dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_prefix_anchored_admin_ec_auth_coverage() {
+        // `^/_ts/admin/ec/$` matches the prefix probe but no actual lookup.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject prefix-anchored dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_prefix_matcher_admin_ec_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        Settings::from_toml(&toml_str)
+            .expect("should accept a prefix-level matcher for the dynamic EC route");
     }
 
     #[test]
@@ -5336,13 +7451,68 @@ passphrase = "test-secret-key-32-bytes-minimum"
 [creative_opportunities]
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "atf"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
 "#;
         let settings = Settings::from_toml(toml).expect("should parse");
         let co = settings
             .creative_opportunities
             .expect("should have creative_opportunities");
+        assert!(
+            co.enabled,
+            "creative-opportunity templates should default to enabled"
+        );
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
+        assert_eq!(
+            co.section_segment,
+            Some(0),
+            "startup finalization should materialize the dynamic-template compatibility marker"
+        );
+    }
+
+    #[test]
+    fn settings_disables_creative_opportunity_slots_when_configured_off() {
+        let toml = format!(
+            "{}\n[creative_opportunities]\nenabled = false\ngam_network_id = \"21765378893\"\n\n[[creative_opportunities.slot]]\nid = \"atf\"\npage_patterns = [\"/\"]\nformats = [{{ width = 300, height = 250 }}]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse disabled templates");
+        assert!(
+            settings.creative_opportunity_slots().is_empty(),
+            "disabled template delivery should expose no runtime slots"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_loader_applies_creative_opportunity_enabled_environment_override() {
+        let toml = format!(
+            "{}\n[creative_opportunities]\nenabled = true\ngam_network_id = \"21765378893\"\n",
+            crate_test_settings_str()
+        );
+        let env_key = format!(
+            "{}{}CREATIVE_OPPORTUNITIES{}ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(env_key, Some("false"), || {
+            let settings = Settings::from_toml_and_env(&toml)
+                .expect("should parse template enabled environment override");
+            assert!(
+                !settings
+                    .creative_opportunities
+                    .expect("should have creative opportunities")
+                    .enabled,
+                "legacy settings loader should disable template delivery"
+            );
+        });
     }
 
     #[test]
@@ -5516,7 +7686,25 @@ gam_unit_path = ""
 page_patterns = ["/"]
 formats = [{ width = 300, height = 250 }]
 "#,
-            "resolved GAM unit path must not be empty",
+            "gam_unit_path template must not be empty",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_dynamic_gam_unit_path_over_byte_limit_using_configured_values() {
+        let gam_unit_path = "{network_id}".repeat(10);
+        let slot_body = format!(
+            r#"
+id = "atf"
+gam_unit_path = "{gam_unit_path}"
+page_patterns = ["/"]
+formats = [{{ width = 300, height = 250 }}]
+"#
+        );
+
+        assert_creative_opportunity_slot_config_rejected(
+            &slot_body,
+            "must render to at most 100 UTF-8 bytes",
         );
     }
 

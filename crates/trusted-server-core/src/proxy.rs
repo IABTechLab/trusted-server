@@ -1,16 +1,21 @@
-use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size};
+use crate::http_util::{
+    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
+};
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
+use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
-use http::{header, HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::cache_policy::{
+    CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
+    apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
+    remove_edge_cache_headers,
+};
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
@@ -19,14 +24,11 @@ use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices, StoreName,
-    DEFAULT_FIRST_BYTE_TIMEOUT,
+    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
+    RuntimeServices,
 };
-use crate::redacted::Redacted;
 use crate::s3_sigv4::{self, S3Credentials};
-use crate::settings::{
-    AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings,
-};
+use crate::settings::{AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, Settings};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
 /// Chunk size used for streaming content through the rewrite pipeline.
@@ -90,11 +92,17 @@ const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 11] = [
     header::IF_RANGE,
 ];
 
-const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
+/// Response headers an upstream must not be able to set on a body that is
+/// passed through and served from the publisher's own origin.
+///
+/// All three take effect against the serving origin, so leaving them in place
+/// would let an upstream write first-party cookies, pin HSTS, or clear the
+/// publisher's site data.
+pub(crate) const FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS: [&str; 3] =
     ["set-cookie", "strict-transport-security", "clear-site-data"];
 
 /// Cache-control value used when asset proxy responses must not be stored.
-pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = "no-store, private";
+pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = NO_STORE_PRIVATE_CACHE_CONTROL;
 
 /// Cache policy metadata emitted by the asset proxy handler.
 ///
@@ -107,13 +115,32 @@ pub enum AssetProxyCachePolicy {
     OriginControlled,
     /// Reapply `Cache-Control: no-store, private` after standard finalization.
     NoStorePrivate,
+    /// Reapply an operator-selected normalized cache policy after finalization.
+    ///
+    /// The adapter must call [`Self::apply_after_route_finalization`] after
+    /// standard response and privacy finalization, passing its runtime
+    /// [`EdgeCacheHeader`]. Asset rehosting is Fastly-only today; a future
+    /// adapter must preserve this finalization step to emit its edge directive.
+    Normalized(CachePolicy),
 }
 
 impl AssetProxyCachePolicy {
     /// Apply protected cache headers after route-level response finalization.
-    pub fn apply_after_route_finalization(self, response: &mut Response<EdgeBody>) {
-        if self == Self::NoStorePrivate {
-            apply_no_store_cache_control(response);
+    pub fn apply_after_route_finalization(
+        self,
+        response: &mut Response<EdgeBody>,
+        edge_header: EdgeCacheHeader,
+    ) {
+        match self {
+            Self::OriginControlled => {}
+            Self::NoStorePrivate => apply_no_store_cache_control(response),
+            Self::Normalized(policy) => {
+                if cache_control_headers_are_private_or_no_store(response.headers()) {
+                    remove_edge_cache_headers(response.headers_mut());
+                } else {
+                    policy.apply_to_headers(response.headers_mut(), edge_header);
+                }
+            }
         }
     }
 }
@@ -167,6 +194,11 @@ impl AssetProxyResponse {
         apply_no_store_cache_control(&mut self.response);
     }
 
+    fn apply_normalized_cache_policy(&mut self, policy: CachePolicy) {
+        self.cache_policy = AssetProxyCachePolicy::Normalized(policy);
+        policy.apply_to_headers(self.response.headers_mut(), EdgeCacheHeader::None);
+    }
+
     /// Return cache policy metadata for router finalization.
     #[must_use]
     pub fn cache_policy(&self) -> AssetProxyCachePolicy {
@@ -197,17 +229,6 @@ impl AssetProxyResponse {
         (self.response, self.stream_body)
     }
 }
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct S3CredentialsCacheKey {
-    secret_store: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-}
-
-static S3_CREDENTIALS_CACHE: LazyLock<Mutex<HashMap<S3CredentialsCacheKey, Arc<S3Credentials>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Convert a platform-neutral response into a buffered [`Response`] for downstream processing.
 ///
@@ -246,7 +267,10 @@ fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetPr
     }
 }
 
-/// Stream an asset response body directly to a writable client stream.
+/// Stream a platform response body directly to a writable client stream.
+///
+/// Asset routes and Fastly `EdgeZero` publisher fallback both use this bridge
+/// after headers have been committed through `stream_to_client()`.
 ///
 /// # Errors
 ///
@@ -261,7 +285,7 @@ pub async fn stream_asset_body<W: Write>(
             output
                 .write_all(bytes.as_ref())
                 .change_context(TrustedServerError::Proxy {
-                    message: "failed to write buffered asset response body".to_string(),
+                    message: "failed to write buffered platform response body".to_string(),
                 })?;
         }
         EdgeBody::Stream(mut stream) => {
@@ -274,8 +298,20 @@ pub async fn stream_asset_body<W: Write>(
                 output
                     .write_all(chunk.as_ref())
                     .change_context(TrustedServerError::Proxy {
-                        message: "failed to write streaming asset response body".to_string(),
+                        message: "failed to write streaming platform response body".to_string(),
                     })?;
+                // Flush per chunk: Fastly's `StreamingBody` is a
+                // `BufWriter<StreamingBodyHandle>`, so a segment smaller than
+                // the write buffer would sit in the Wasm heap until a later
+                // write filled it. The publisher stream yields compressed
+                // segments that are commonly smaller than that buffer, and the
+                // generator then awaits the origin (or the auction) before
+                // producing the next one — without this flush the client sees
+                // committed headers and no body, undoing the codec's per-chunk
+                // sync flush and delaying first paint.
+                output.flush().change_context(TrustedServerError::Proxy {
+                    message: "failed to flush streaming platform response body".to_string(),
+                })?;
             }
         }
     }
@@ -311,6 +347,8 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
+    /// When true, ask the platform adapter to preserve the upstream response body as a stream.
+    pub stream_response: bool,
     /// Domains allowed for the initial request and any redirects.
     ///
     /// **Open mode** (`&[]`): every host is permitted. Most integration proxies pass
@@ -339,6 +377,7 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            stream_response: false,
             allowed_domains: &[],
             require_https: false,
         }
@@ -390,6 +429,13 @@ impl<'a> ProxyRequestConfig<'a> {
     #[must_use]
     pub fn with_https_only(mut self) -> Self {
         self.require_https = true;
+        self
+    }
+
+    /// Ask the platform adapter to preserve the upstream response body as a stream.
+    #[must_use]
+    pub fn with_stream_response(mut self) -> Self {
+        self.stream_response = true;
         self
     }
 }
@@ -537,7 +583,7 @@ fn origin_response_metadata(
 /// Apply image content-type header and log pixel heuristics.
 ///
 /// Sets a generic `image/*` content-type when the response has none, then logs
-/// a warning if size or path heuristics suggest a tracking pixel. Both call
+/// a warning if size or path heuristics suggest a pixel image. Both call
 /// sites pass the response through unchanged afterwards, so this returns
 /// nothing.
 fn apply_image_passthrough_metadata(
@@ -571,10 +617,9 @@ fn apply_image_passthrough_metadata(
         .get(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
+        && cl <= 256
     {
-        if cl <= 256 {
-            is_pixel = true;
-        }
+        is_pixel = true;
     }
     if !is_pixel {
         let lower = target_url.to_ascii_lowercase();
@@ -643,8 +688,41 @@ fn finalize_proxied_response_streaming(
     beresp
 }
 
+/// CORS policy headers stripped from every proxied response.
+///
+/// Emitting none of our own is not enough: the buffered path preserves upstream
+/// headers wholesale and the streaming path passes the upstream response
+/// through, so an upstream that answers `Access-Control-Allow-Origin: *` (or
+/// `null`) would hand the browser a readable cross-origin response through our
+/// endpoint. Removing the policy makes the browser fall back to the same-origin
+/// rule, which is the intent.
+const STRIPPED_CORS_RESPONSE_HEADERS: [header::HeaderName; 3] = [
+    header::ACCESS_CONTROL_ALLOW_ORIGIN,
+    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+];
+
+/// Remove any upstream CORS grant so proxied bodies stay unreadable cross-origin.
+fn strip_cors_policy(response: &mut Response<EdgeBody>) {
+    for name in STRIPPED_CORS_RESPONSE_HEADERS {
+        response.headers_mut().remove(name);
+    }
+}
+
 /// Finalize a proxied response, choosing between streaming passthrough and full
 /// content processing based on the `stream_passthrough` flag.
+///
+/// Guarantees no CORS grant reaches the browser — neither one of ours nor one
+/// forwarded from upstream. `/first-party/proxy` is a generic signed fetcher: it
+/// forwards the EC ID and curated client-derived headers, follows redirects, and
+/// runs in open mode when `proxy.allowed_domains` is empty. A signature proves
+/// only that this service minted the URL — and with `sanitize_creatives`
+/// disabled the rewriter mints them from bidder-controlled markup — so letting
+/// an opaque creative frame *read* those bodies would turn the endpoint into a
+/// readable bidder-controlled proxy. Non-CORS subresources (`<img>`,
+/// `<script src>`, stylesheets) are unaffected; CORS-mode ones are covered by
+/// the constrained asset capability tracked in
+/// <https://github.com/IABTechLab/trusted-server/issues/982>.
 fn finalize_response(
     settings: &Settings,
     req: &Request<EdgeBody>,
@@ -652,11 +730,13 @@ fn finalize_response(
     beresp: Response<EdgeBody>,
     stream_passthrough: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    if stream_passthrough {
-        Ok(finalize_proxied_response_streaming(req, url, beresp))
+    let mut response = if stream_passthrough {
+        finalize_proxied_response_streaming(req, url, beresp)
     } else {
-        finalize_proxied_response(settings, req, url, beresp)
-    }
+        finalize_proxied_response(settings, req, url, beresp)?
+    };
+    strip_cors_policy(&mut response);
+    Ok(response)
 }
 
 /// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
@@ -669,6 +749,7 @@ struct ProxyRequestHeaders<'a> {
 struct ProxyRedirectPolicy<'a> {
     follow_redirects: bool,
     stream_passthrough: bool,
+    stream_response: bool,
     allowed_domains: &'a [String],
     require_https: bool,
 }
@@ -697,6 +778,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
+        stream_response,
         allowed_domains,
         require_https,
     } = config;
@@ -724,6 +806,8 @@ pub async fn proxy_request(
         ProxyRedirectPolicy {
             follow_redirects,
             stream_passthrough,
+            stream_response: stream_response
+                && services.http_client().supports_streaming_responses(),
             allowed_domains,
             require_https,
         },
@@ -803,78 +887,7 @@ fn asset_origin_host_header(
     })
 }
 
-fn s3_credentials_cache_key(config: &S3SigV4AuthConfig) -> S3CredentialsCacheKey {
-    S3CredentialsCacheKey {
-        secret_store: config.secret_store.clone(),
-        access_key_id: config.access_key_id.clone(),
-        secret_access_key: config.secret_access_key.clone(),
-        session_token: config.session_token.clone(),
-    }
-}
-
-async fn load_s3_credentials(
-    services: &RuntimeServices,
-    config: &S3SigV4AuthConfig,
-) -> Result<Arc<S3Credentials>, Report<TrustedServerError>> {
-    let cache_key = s3_credentials_cache_key(config);
-    if let Some(credentials) = S3_CREDENTIALS_CACHE
-        .lock()
-        .expect("should lock S3 credentials cache")
-        .get(&cache_key)
-        .cloned()
-    {
-        return Ok(credentials);
-    }
-
-    let store_name = StoreName::from(config.secret_store.as_str());
-    let access_key_id = services
-        .secret_store()
-        .get_string(&store_name, &config.access_key_id)
-        .await
-        .change_context(TrustedServerError::Proxy {
-            message: "failed to read S3 access key ID from secret store".to_string(),
-        })?;
-    let secret_access_key = services
-        .secret_store()
-        .get_string(&store_name, &config.secret_access_key)
-        .await
-        .change_context(TrustedServerError::Proxy {
-            message: "failed to read S3 secret access key from secret store".to_string(),
-        })?;
-    let session_token = match config.session_token.as_deref() {
-        Some(key) => Some(
-            services
-                .secret_store()
-                .get_string(&store_name, key)
-                .await
-                .change_context(TrustedServerError::Proxy {
-                    message: "failed to read S3 session token from secret store".to_string(),
-                })?,
-        ),
-        None => None,
-    };
-    let credentials = Arc::new(S3Credentials {
-        access_key_id,
-        secret_access_key: Redacted::new(secret_access_key),
-        session_token: session_token.map(Redacted::new),
-    });
-
-    let mut cache = S3_CREDENTIALS_CACHE
-        .lock()
-        .expect("should lock S3 credentials cache");
-    Ok(Arc::clone(cache.entry(cache_key).or_insert(credentials)))
-}
-
-#[cfg(test)]
-fn clear_s3_credentials_cache_for_tests() {
-    S3_CREDENTIALS_CACHE
-        .lock()
-        .expect("should lock S3 credentials cache")
-        .clear();
-}
-
-async fn apply_asset_origin_auth(
-    services: &RuntimeServices,
+fn apply_asset_origin_auth(
     method: &Method,
     target_url: &url::Url,
     headers: &mut http::HeaderMap,
@@ -882,13 +895,17 @@ async fn apply_asset_origin_auth(
 ) -> Result<(), Report<TrustedServerError>> {
     match auth {
         AssetOriginAuth::S3SigV4(config) => {
-            let credentials = load_s3_credentials(services, config).await?;
+            let credentials = S3Credentials {
+                access_key_id: config.access_key_id.expose().clone(),
+                secret_access_key: config.secret_access_key.clone(),
+                session_token: config.session_token.clone(),
+            };
             s3_sigv4::sign_headers(
                 method,
                 target_url,
                 headers,
                 &config.region,
-                credentials.as_ref(),
+                &credentials,
                 // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
                 // only accepts `std::time::SystemTime`. `std::time::SystemTime::now()`
                 // panics on `wasm32-unknown-unknown` (Cloudflare Workers), so derive an
@@ -942,6 +959,7 @@ async fn send_asset_origin_request(
     outbound_headers: &http::HeaderMap,
     stream_response: bool,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
+    let stream_response = stream_response && services.http_client().supports_streaming_responses();
     let mut platform_req =
         build_asset_platform_request(method, target_url, outbound_headers, backend_name)?;
     if stream_response {
@@ -965,16 +983,13 @@ async fn send_asset_origin_request(
 fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
     // Asset origins must not be able to mutate publisher-domain browser state
     // or security policy through this proxy path.
-    for header_name in ASSET_PROXY_STRIP_RESPONSE_HEADERS {
+    for header_name in FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS {
         response.headers_mut().remove(header_name);
     }
 }
 
 fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(ASSET_NO_STORE_PRIVATE_CACHE_CONTROL),
-    );
+    apply_no_store_private_to_headers(response.headers_mut());
 }
 
 fn should_preflight_s3(
@@ -1003,7 +1018,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     // HEAD preflight lets missing or unauthorized objects return raw S3 errors
     // without invoking IO on the failure path.
     let mut head_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(services, &Method::HEAD, target_url, &mut head_headers, auth).await?;
+    apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
     let head_response = send_asset_origin_request(
         services,
         backend_name,
@@ -1026,7 +1041,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     }
 
     let mut get_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(services, &Method::GET, target_url, &mut get_headers, auth).await?;
+    apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
     let mut response = send_asset_origin_request(
         services,
         backend_name,
@@ -1101,6 +1116,7 @@ pub async fn handle_asset_proxy_request(
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
         })
         .change_context(TrustedServerError::Proxy {
             message: "asset backend registration failed".to_string(),
@@ -1114,8 +1130,8 @@ pub async fn handle_asset_proxy_request(
     }
     outbound_headers.insert(header::HOST, asset_origin_host_header(&target_url)?);
 
-    if should_preflight_s3(route, image_optimizer.is_some(), req.method()) {
-        if let Some(response) = preflight_s3_origin_for_image_optimizer(
+    if should_preflight_s3(route, image_optimizer.is_some(), req.method())
+        && let Some(response) = preflight_s3_origin_for_image_optimizer(
             services,
             route,
             &target_url,
@@ -1124,20 +1140,12 @@ pub async fn handle_asset_proxy_request(
             &backend_name,
         )
         .await?
-        {
-            return Ok(response);
-        }
+    {
+        return Ok(response);
     }
 
     if let Some(auth) = &route.auth {
-        apply_asset_origin_auth(
-            services,
-            req.method(),
-            &target_url,
-            &mut outbound_headers,
-            auth,
-        )
-        .await?;
+        apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
     }
 
     let mut platform_req =
@@ -1145,7 +1153,10 @@ pub async fn handle_asset_proxy_request(
     if let Some(image_optimizer) = image_optimizer {
         platform_req = platform_req.with_image_optimizer(image_optimizer);
     }
-    platform_req = platform_req.with_stream_response();
+    let stream_response = services.http_client().supports_streaming_responses();
+    if stream_response {
+        platform_req = platform_req.with_stream_response();
+    }
 
     let platform_resp = services
         .http_client()
@@ -1155,8 +1166,19 @@ pub async fn handle_asset_proxy_request(
             message: "Failed to proxy asset request".to_string(),
         })?;
 
-    let mut response = platform_response_to_fastly_asset(platform_resp);
+    let mut response = if stream_response {
+        platform_response_to_fastly_asset(platform_resp)
+    } else {
+        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)?
+    };
     strip_asset_proxy_response_headers(response.response_mut());
+
+    let status = response.response().status();
+    if (status.is_success() || status == StatusCode::NOT_MODIFIED)
+        && let Some(policy) = settings.asset_cache_policy_for_path(incoming_path)?
+    {
+        response.apply_normalized_cache_policy(policy);
+    }
 
     Ok(response)
 }
@@ -1199,11 +1221,11 @@ fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
     }
 }
 
-/// Returns `true` when a redirect to `host` should be followed.
+/// Returns `true` when `host` is permitted by the proxy host policy.
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn redirect_is_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1271,7 +1293,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(redirect_policy.allowed_domains, host) {
+        if !is_host_permitted(redirect_policy.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -1292,6 +1314,7 @@ async fn proxy_with_redirects(
                 certificate_check: settings.proxy.certificate_check,
                 first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
                 between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+                discriminator: None,
             })
             .change_context(TrustedServerError::Proxy {
                 message: "backend registration failed".to_string(),
@@ -1334,10 +1357,15 @@ async fn proxy_with_redirects(
                     message: "failed to build proxy request".to_string(),
                 })?;
 
+        let mut platform_request = PlatformHttpRequest::new(edge_req, backend_name);
+        if redirect_policy.stream_response {
+            platform_request = platform_request.with_stream_response();
+        }
+
         let platform_resp = request_headers
             .services
             .http_client()
-            .send(PlatformHttpRequest::new(edge_req, backend_name))
+            .send(platform_request)
             .await
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to proxy".to_string(),
@@ -1431,7 +1459,7 @@ async fn proxy_with_redirects(
                 }));
             }
         };
-        if !redirect_is_permitted(redirect_policy.allowed_domains, next_host) {
+        if !is_host_permitted(redirect_policy.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
@@ -1495,6 +1523,7 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            stream_response: false,
             allowed_domains: &settings.proxy.allowed_domains,
             require_https: false,
         },
@@ -1591,7 +1620,8 @@ pub async fn handle_first_party_click(
 ///
 /// # Errors
 ///
-/// Returns an error if JSON parsing fails, the URL cannot be parsed, or the URL uses an unsupported scheme.
+/// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
+/// unsupported scheme, the URL lacks a host, or the host violates `proxy.allowed_domains`.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
@@ -1599,6 +1629,21 @@ pub async fn handle_first_party_proxy_sign(
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let method = req.method().clone();
     let req_url = req.uri().to_string();
+    // Capture the request's own scheme before the body is consumed: a
+    // protocol-relative sign target inherits it.
+    //
+    // Prefer the URI's explicit scheme, which adapters that deliver absolute
+    // request targets (Fastly, Spin after normalization) always carry, and fall
+    // back to TLS/forwarded metadata otherwise. What must never be used is the
+    // parsed request target: origin-form URIs — what browsers send and the Axum
+    // adapter forwards verbatim — have no scheme of their own, so parsing would
+    // hand back the placeholder base's `https` and make an HTTP dev server sign
+    // an HTTPS target it then proxies over TLS against a plaintext service.
+    let request_scheme = req
+        .uri()
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| RequestInfo::from_request(&req, _services.client_info()).scheme);
 
     let payload = if method == Method::POST {
         let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;
@@ -1611,9 +1656,7 @@ pub async fn handle_first_party_proxy_sign(
             message: "invalid JSON".to_string(),
         })?
     } else {
-        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
-            message: "Invalid URL".to_string(),
-        })?;
+        let parsed = parse_request_target(&req_url)?;
         let url = parsed
             .query_pairs()
             .find(|(k, _)| k == "url")
@@ -1628,12 +1671,7 @@ pub async fn handle_first_party_proxy_sign(
 
     let trimmed = payload.url.trim();
     let abs = if trimmed.starts_with("//") {
-        let default_scheme = url::Url::parse(&req_url)
-            .ok()
-            .map(|u| u.scheme().to_ascii_lowercase())
-            .filter(|scheme| !scheme.is_empty())
-            .unwrap_or_else(|| "https".to_string());
-        format!("{}:{}", default_scheme, trimmed)
+        format!("{}:{}", request_scheme, trimmed)
     } else {
         crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
@@ -1642,6 +1680,12 @@ pub async fn handle_first_party_proxy_sign(
         })?
     };
 
+    if settings.rewrite.is_excluded(&abs) {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported url".to_string(),
+        }));
+    }
+
     let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
         message: "invalid url".to_string(),
     })?;
@@ -1649,6 +1693,21 @@ pub async fn handle_first_party_proxy_sign(
     if scheme != "http" && scheme != "https" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "unsupported scheme".to_string(),
+        }));
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "missing host".to_string(),
+        })
+    })?;
+    if !is_host_permitted(&settings.proxy.allowed_domains, host) {
+        log::warn!(
+            "sign request for `{}` blocked: host not in proxy.allowed_domains",
+            host
+        );
+        return Err(Report::new(TrustedServerError::AllowlistViolation {
+            host: host.to_string(),
         }));
     }
 
@@ -1691,6 +1750,48 @@ struct ProxyRebuildReq {
     del: Option<Vec<String>>,
 }
 
+/// Media type of a browser form submission, the rebuild endpoint's navigation form.
+const FORM_URLENCODED_MIME: &str = "application/x-www-form-urlencoded";
+
+/// Build a rebuild request from `key=value` pairs, shared by the GET query form
+/// and the form-encoded POST body form. `add`/`del` carry JSON payloads;
+/// unparseable values are ignored rather than failing the request, matching the
+/// endpoint's existing leniency about unknown parameters.
+fn rebuild_request_from_pairs<'a>(
+    pairs: impl Iterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+) -> Result<ProxyRebuildReq, Report<TrustedServerError>> {
+    let mut tsclick: Option<String> = None;
+    let mut add: Option<std::collections::HashMap<String, String>> = None;
+    let mut del: Option<Vec<String>> = None;
+    for (k, v) in pairs {
+        match k.as_ref() {
+            "tsclick" => tsclick = Some(v.into_owned()),
+            "add" => {
+                if let Ok(m) = serde_json::from_str::<std::collections::HashMap<String, String>>(&v)
+                {
+                    add = Some(m);
+                }
+            }
+            "del" => {
+                if let Ok(arr) = serde_json::from_str::<Vec<String>>(&v) {
+                    del = Some(arr);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ProxyRebuildReq {
+        tsclick: tsclick.ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "missing tsclick".to_string(),
+            })
+        })?,
+        add,
+        del,
+    })
+}
+
 #[derive(Serialize)]
 struct ProxyRebuildResp {
     href: String,
@@ -1714,7 +1815,25 @@ pub async fn handle_first_party_proxy_rebuild(
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let method = req.method().clone();
-    let req_url = req.uri().to_string();
+    let req_query = req.uri().query().unwrap_or_default().to_owned();
+    // A form POST is a navigation, not a fetch: the click guard uses it when the
+    // GET recovery URL would exceed the platform's request-URL limit, since the
+    // click is too long to nest in a query string but a body has no such bound.
+    // It answers with the same redirect a GET does — a JSON body would render as
+    // text in the frame the browser just navigated.
+    let is_form_post = method == Method::POST
+        && req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case(FORM_URLENCODED_MIME))
+            });
+    let redirect_response = method == Method::GET || is_form_post;
+
     let payload = if method == Method::POST {
         let body_bytes = request_body_bytes(req.into_body(), "first-party rebuild")?;
         enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
@@ -1722,52 +1841,33 @@ pub async fn handle_first_party_proxy_rebuild(
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
             })?;
-        serde_json::from_str::<ProxyRebuildReq>(body).change_context(TrustedServerError::Proxy {
-            message: "invalid JSON".to_string(),
-        })?
+        if is_form_post {
+            rebuild_request_from_pairs(url::form_urlencoded::parse(body.as_bytes()))?
+        } else {
+            serde_json::from_str::<ProxyRebuildReq>(body).change_context(
+                TrustedServerError::Proxy {
+                    message: "invalid JSON".to_string(),
+                },
+            )?
+        }
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
-        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
-            message: "Invalid URL".to_string(),
-        })?;
-        let mut tsclick: Option<String> = None;
-        let mut add: Option<std::collections::HashMap<String, String>> = None;
-        let mut del: Option<Vec<String>> = None;
-        for (k, v) in parsed.query_pairs() {
-            match k.as_ref() {
-                "tsclick" => tsclick = Some(v.into_owned()),
-                "add" => {
-                    if let Ok(m) =
-                        serde_json::from_str::<std::collections::HashMap<String, String>>(&v)
-                    {
-                        add = Some(m);
-                    }
-                }
-                "del" => {
-                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&v) {
-                        del = Some(arr);
-                    }
-                }
-                _ => {}
-            }
-        }
-        ProxyRebuildReq {
-            tsclick: tsclick.ok_or_else(|| {
-                Report::new(TrustedServerError::Proxy {
-                    message: "missing tsclick".to_string(),
-                })
-            })?,
-            add,
-            del,
-        }
+        // Parse the query component directly rather than the full URI: browsers
+        // (and the Axum/Spin adapters) deliver origin-form URIs (`/path?query`),
+        // which `url::Url::parse` rejects as relative.
+        rebuild_request_from_pairs(url::form_urlencoded::parse(req_query.as_bytes()))?
     };
 
-    let base = "https://edge.local"; // dummy origin to parse relative path
-    let c_url = url::Url::parse(&format!("{}{}", base, payload.tsclick)).change_context(
-        TrustedServerError::Proxy {
+    // Accept both the root-relative form the rewriter emits and an absolute
+    // first-party URL: the client may have absolutized the click to keep it
+    // resolvable inside a `srcdoc` frame. Concatenating a dummy origin would
+    // mangle the absolute form, so parse it properly instead. The signature
+    // covers `tsurl` plus params only, never the origin, so both forms validate
+    // identically.
+    let c_url =
+        parse_request_target(&payload.tsclick).change_context(TrustedServerError::Proxy {
             message: "invalid tsclick".to_string(),
-        },
-    )?;
+        })?;
     if c_url.path() != "/first-party/click" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "invalid tsclick path".to_string(),
@@ -1776,7 +1876,7 @@ pub async fn handle_first_party_proxy_rebuild(
     // Validate the tstoken on the original click URL before applying any changes.
     // Without this, an attacker could submit an unsigned tsclick and mint valid
     // click redirects to arbitrary URLs.
-    reconstruct_and_validate_signed_target(settings, &format!("{}{}", base, payload.tsclick))?;
+    reconstruct_and_validate_signed_target(settings, c_url.as_str())?;
 
     // Extract tsurl and original params (exclude tstoken if present)
     let mut tsurl: Option<String> = None;
@@ -1878,8 +1978,8 @@ pub async fn handle_first_party_proxy_rebuild(
         }
     }
 
-    if method == Method::GET {
-        // Redirect for GET usage to streamline navigation
+    if redirect_response {
+        // Redirect for navigation usage (GET, or a form-encoded POST)
         let location = HeaderValue::from_str(&href).map_err(|_| {
             Report::new(TrustedServerError::InvalidHeaderValue {
                 message: "invalid rebuild redirect target".to_string(),
@@ -1925,6 +2025,39 @@ struct SignedTarget {
     had_params: bool,
 }
 
+/// Placeholder authority used to parse origin-form request targets.
+///
+/// Only the path and query of the parsed value are ever read, so the authority
+/// is irrelevant to behaviour; `.invalid` is reserved by RFC 2606 and can never
+/// resolve.
+const REQUEST_TARGET_BASE: &str = "https://request.invalid";
+
+/// Parse a request target that may be either an absolute URL or origin-form.
+///
+/// Adapters differ in what `Request::uri()` carries: Fastly and the normalized
+/// Spin path expose an absolute URL, while browsers send origin-form targets
+/// (`/path?query`) that the Axum adapter passes through verbatim. Joining a
+/// fixed placeholder origin lets one parser serve both, so first-party
+/// endpoints behave identically across adapters.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] when the target parses as neither form.
+fn parse_request_target(req_url: &str) -> Result<url::Url, Report<TrustedServerError>> {
+    match url::Url::parse(req_url) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => url::Url::parse(REQUEST_TARGET_BASE)
+            .and_then(|base| base.join(req_url))
+            .change_context(TrustedServerError::Proxy {
+                message: "Invalid URL".to_string(),
+            }),
+        Err(error) => Err(Report::new(TrustedServerError::Proxy {
+            message: "Invalid URL".to_string(),
+        })
+        .attach(error.to_string())),
+    }
+}
+
 /// Validate a `/first-party/proxy|click` request and reconstruct the clear target URL.
 ///
 /// The first-party URL encodes the clear target in `tsurl=...` along with any
@@ -1943,9 +2076,7 @@ fn reconstruct_and_validate_signed_target(
     settings: &Settings,
     req_url: &str,
 ) -> Result<SignedTarget, Report<TrustedServerError>> {
-    let parsed = url::Url::parse(req_url).change_context(TrustedServerError::Proxy {
-        message: "Invalid URL".to_string(),
-    })?;
+    let parsed = parse_request_target(req_url)?;
 
     // Extract tsurl and tstoken while preserving original param order for others
     let mut tsurl: Option<String> = None;
@@ -2027,41 +2158,45 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
     use std::io;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
-        asset_origin_host_header, asset_path_skips_image_optimizer, build_asset_proxy_target_url,
-        clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
+        AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
+        SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
+        build_asset_proxy_target_url, handle_asset_proxy_request, handle_first_party_click,
         handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
-        is_host_allowed, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, stream_asset_body,
-        AssetProxyCachePolicy, ProxyRequestConfig, IMAGE_FALLBACK_CONTENT_TYPE,
-        SUPPORTED_ENCODINGS,
+        is_host_allowed, is_host_permitted, proxy_request, rebuild_response_with_body,
+        reconstruct_and_validate_signed_target, stream_asset_body,
     };
+    use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::{
-        build_services_with_http_client, build_services_with_secret_and_http_client, noop_services,
-        HashMapSecretStore, StubHttpClient,
+        HashMapSecretStore, StubHttpClient, build_services_with_http_client,
+        build_services_with_secret_and_http_client, noop_services,
     };
     use crate::platform::{
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
         PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
     };
+    use crate::redacted::Redacted;
     use crate::settings::{
         AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
-        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, UnknownProfilePolicy,
+        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
     use error_stack::Report;
-    use http::{header, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+    use http::{HeaderValue, Method, Request as HttpRequest, Response, StatusCode, header};
 
     #[test]
     fn test_rebuild_response_with_body_preserves_multiple_headers() {
@@ -2115,6 +2250,16 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(EdgeBody::from(body.to_string()))
             .expect("should build http post request")
+    }
+
+    fn build_proxy_sign_request(method: &Method, uri: &str, target: &str) -> HttpRequest<EdgeBody> {
+        if method == Method::GET {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair("url", target);
+            return build_http_request(method.clone(), format!("{uri}?{}", serializer.finish()));
+        }
+
+        build_http_post_json_request(uri, &serde_json::json!({ "url": target }))
     }
 
     fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
@@ -2234,6 +2379,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for StreamingResponseHttpClient {
+        fn supports_streaming_responses(&self) -> bool {
+            true
+        }
+
         async fn send(
             &self,
             _request: PlatformHttpRequest,
@@ -2380,6 +2529,152 @@ mod tests {
     }
 
     #[test]
+    fn proxy_sign_enforces_allowed_domains_for_get_and_post() {
+        struct Case {
+            name: &'static str,
+            allowed_domains: &'static [&'static str],
+            target: &'static str,
+            signing_uri: &'static str,
+            expected_base: Option<&'static str>,
+            permitted: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "exact match",
+                allowed_domains: &["cdn.example.com"],
+                target: "https://cdn.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "rejected host",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://blocked.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: false,
+            },
+            Case {
+                name: "wildcard match",
+                allowed_domains: &["*.example.com"],
+                target: "https://static.cdn.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "protocol-relative match",
+                allowed_domains: &["cdn.example.com"],
+                target: "//cdn.example.com/asset.js",
+                signing_uri: "http://edge.example.com/first-party/sign",
+                expected_base: Some("http://cdn.example.com/asset.js"),
+                permitted: true,
+            },
+            Case {
+                name: "open mode",
+                allowed_domains: &[],
+                target: "https://unlisted.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "user information cannot bypass",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://allowed.example.com@blocked.example.com:9443/path",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: false,
+            },
+            Case {
+                name: "non-host URL parts are ignored",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://user@allowed.example.com:9443/path?cache=1#section",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+        ];
+
+        futures::executor::block_on(async {
+            for case in cases {
+                for method in [&Method::GET, &Method::POST] {
+                    let label = format!("{} {}", method.as_str(), case.name);
+                    let mut settings = create_test_settings();
+                    settings.proxy.allowed_domains = case
+                        .allowed_domains
+                        .iter()
+                        .map(|domain| (*domain).to_string())
+                        .collect();
+                    let req = build_proxy_sign_request(method, case.signing_uri, case.target);
+                    let result =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req).await;
+
+                    if case.permitted {
+                        let response = result.unwrap_or_else(|error| {
+                            panic!("{label} should sign target: {error:?}")
+                        });
+                        assert_eq!(
+                            response.status(),
+                            StatusCode::OK,
+                            "{label} should return 200"
+                        );
+                        let body: serde_json::Value =
+                            serde_json::from_str(&response_body_string(response))
+                                .expect("should parse sign response JSON");
+                        let href = body["href"]
+                            .as_str()
+                            .expect("should include string href in sign response");
+                        let signed_url =
+                            url::Url::parse(&format!("https://edge.example.com{href}"))
+                                .expect("should parse signed proxy URL");
+                        assert_eq!(
+                            signed_url.path(),
+                            "/first-party/proxy",
+                            "{label} should return a first-party proxy href"
+                        );
+                        let signed_params: HashMap<_, _> = signed_url.query_pairs().collect();
+                        for parameter in ["tsurl", "tstoken", "tsexp"] {
+                            assert!(
+                                signed_params.contains_key(parameter),
+                                "{label} should include {parameter} in signed href"
+                            );
+                        }
+                        if let Some(expected_base) = case.expected_base {
+                            assert_eq!(
+                                body["base"].as_str(),
+                                Some(expected_base),
+                                "{label} should inherit the signing request scheme"
+                            );
+                        }
+                    } else {
+                        let error = match result {
+                            Ok(response) => {
+                                panic!("{label} should reject target, got {response:?}")
+                            }
+                            Err(error) => error,
+                        };
+                        assert!(
+                            matches!(
+                                error.current_context(),
+                                TrustedServerError::AllowlistViolation { .. }
+                            ),
+                            "{label} should return AllowlistViolation, got {error:?}"
+                        );
+                        assert_eq!(
+                            error.current_context().status_code(),
+                            StatusCode::FORBIDDEN,
+                            "{label} should map allowlist rejection to 403"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn proxy_sign_rejects_invalid_url() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -2392,6 +2687,60 @@ mod tests {
                     .await
                     .expect_err("expected error");
             assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        });
+    }
+
+    #[test]
+    fn proxy_sign_rejects_excluded_urls() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
+
+            for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
+                let body = serde_json::json!({ "url": url });
+                let req =
+                    build_http_post_json_request("https://edge.example/first-party/sign", &body);
+                let err: Report<TrustedServerError> =
+                    handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                        .await
+                        .expect_err("should reject excluded URL");
+
+                assert_eq!(
+                    err.current_context().status_code(),
+                    StatusCode::BAD_GATEWAY,
+                    "should reject excluded URL `{url}` as unsupported"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_sign_inherits_the_request_scheme_for_protocol_relative_urls() {
+        // A protocol-relative target adopts the scheme the visitor is on. It
+        // must come from the request, not from the parser's placeholder base:
+        // origin-form URIs (browsers, and the Axum adapter verbatim) carry no
+        // scheme, so an HTTP dev server would otherwise sign an HTTPS target
+        // and proxy TLS against a plaintext service.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+
+            for (uri, expected) in [
+                ("/first-party/sign", "http"),
+                ("http://edge.example/first-party/sign", "http"),
+                ("https://edge.example/first-party/sign", "https"),
+            ] {
+                let body = serde_json::json!({ "url": "//cdn.example/asset.js" });
+                let req = build_http_post_json_request(uri, &body);
+                let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                    .await
+                    .expect("should sign protocol-relative URL");
+                let json = response_body_string(resp);
+
+                assert!(
+                    json.contains(&format!("\"base\":\"{expected}://cdn.example/asset.js\"")),
+                    "request `{uri}` should sign a {expected} target: {json}"
+                );
+            }
         });
     }
 
@@ -2426,7 +2775,8 @@ mod tests {
                 HeaderValue::from_static("application/octet-stream"),
             )
             .without_forward_headers()
-            .with_streaming();
+            .with_streaming()
+            .with_stream_response();
 
         assert_eq!(cfg.target_url, "https://example.com/asset");
         assert!(cfg.follow_redirects, "should follow redirects by default");
@@ -2440,6 +2790,10 @@ mod tests {
         assert!(
             cfg.stream_passthrough,
             "should enable streaming passthrough"
+        );
+        assert!(
+            cfg.stream_response,
+            "should request streaming platform responses"
         );
     }
 
@@ -2632,6 +2986,343 @@ mod tests {
         });
     }
 
+    // Build a signed `/first-party/click` target with one extra param.
+    fn signed_click_target(settings: &crate::settings::Settings) -> String {
+        let tsurl = "https://cdn.example/landing.html";
+        let full_for_token = format!("{}?x=1", tsurl);
+        let token = crate::http_util::compute_encrypted_sha256_token(settings, &full_for_token);
+        format!(
+            "/first-party/click?tsurl={}&x=1&tstoken={}",
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            token,
+        )
+    }
+
+    #[test]
+    fn proxied_responses_strip_upstream_cors_policy() {
+        // Emitting no header of our own is not enough: the buffered path
+        // preserves upstream headers and the streaming path passes the response
+        // through, so an upstream CORS grant would still make the body readable
+        // from an opaque creative frame.
+        let settings = create_test_settings();
+
+        for upstream_origin in ["*", "null", "https://attacker.example"] {
+            for streaming in [false, true] {
+                let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from("secret"));
+                beresp.headers_mut().insert(
+                    header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                    HeaderValue::from_str(upstream_origin).expect("valid header"),
+                );
+                beresp.headers_mut().insert(
+                    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    HeaderValue::from_static("true"),
+                );
+                beresp.headers_mut().insert(
+                    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static("x-secret"),
+                );
+
+                let out = super::finalize_response(
+                    &settings,
+                    &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+                    "https://cdn.example/asset.bin",
+                    beresp,
+                    streaming,
+                )
+                .expect("finalize should succeed");
+
+                assert_eq!(
+                    response_header(&out, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                    None,
+                    "upstream '{upstream_origin}' grant must be stripped (streaming={streaming})"
+                );
+                assert_eq!(
+                    response_header(&out, header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                    None,
+                    "upstream credentials grant must be stripped (streaming={streaming})"
+                );
+                assert_eq!(
+                    response_header(&out, header::ACCESS_CONTROL_EXPOSE_HEADERS),
+                    None,
+                    "upstream expose-headers must be stripped (streaming={streaming})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxied_responses_are_not_cross_origin_readable() {
+        // `/first-party/proxy` forwards the EC ID and client-derived headers and
+        // runs in open mode with an empty allowlist, and the rewriter mints its
+        // signed URLs from bidder-controlled markup when sanitization is off.
+        // An allow-origin header would therefore let a creative in an opaque
+        // frame read arbitrary proxied bodies, so neither branch may emit one.
+        let settings = create_test_settings();
+
+        let buffered = super::finalize_response(
+            &settings,
+            &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+            "https://cdn.example/app.mjs",
+            build_http_response(StatusCode::OK, EdgeBody::from("body{}")),
+            false,
+        )
+        .expect("finalize should succeed");
+
+        assert_eq!(
+            response_header(&buffered, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None,
+            "proxied responses must not be readable cross-origin"
+        );
+
+        let streamed = super::finalize_response(
+            &settings,
+            &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+            "https://cdn.example/font.woff2",
+            build_http_response(StatusCode::OK, EdgeBody::from("font")),
+            true,
+        )
+        .expect("streaming finalize should succeed");
+
+        assert_eq!(
+            response_header(&streamed, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None,
+            "streaming passthrough must agree"
+        );
+    }
+
+    #[test]
+    fn first_party_click_accepts_origin_form_uri() {
+        // Browsers send origin-form request targets and the Axum adapter passes
+        // them through verbatim, so the shared signed-target parser must accept
+        // both forms — otherwise the second hop of the rebuild redirect chain
+        // fails instead of reaching the advertiser.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(signed_click_target(&settings))
+                .body(EdgeBody::empty())
+                .expect("should build origin-form click request");
+
+            let resp = handle_first_party_click(&settings, &noop_services(), req)
+                .await
+                .expect("origin-form click should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "should redirect to the advertiser"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("https://cdn.example/landing.html"),
+                "should redirect to the signed target: {location}"
+            );
+        });
+    }
+
+    #[test]
+    fn first_party_proxy_accepts_origin_form_uri() {
+        // Same parser, reached through the proxy endpoint: an origin-form target
+        // must validate rather than fail as a relative URL.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/pixel.png";
+            let token = crate::http_util::compute_encrypted_sha256_token(&settings, tsurl);
+            let uri = format!(
+                "/first-party/proxy?tsurl={}&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                token,
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(EdgeBody::empty())
+                .expect("should build origin-form proxy request");
+
+            // The signature check runs before any upstream fetch; reaching a
+            // non-"Invalid URL" outcome proves origin-form parsing succeeded.
+            let result = handle_first_party_proxy(&settings, &noop_services(), req).await;
+            if let Err(err) = result {
+                let rendered = format!("{err:?}");
+                assert!(
+                    !rendered.contains("Invalid URL"),
+                    "origin-form proxy target must parse: {rendered}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_get_with_origin_form_uri_redirects() {
+        // The opaque-origin creative click guard navigates to this endpoint,
+        // and browsers (via the Axum/Spin adapters) deliver origin-form URIs
+        // (`/path?query`) rather than absolute URLs. The handler must parse the
+        // query and answer with the 302 recovery redirect.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/landing.html";
+            let full_for_token = format!("{}?x=1", tsurl);
+            let token =
+                crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
+            let tsclick = format!(
+                "/first-party/click?tsurl={}&x=1&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                token,
+            );
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("tsclick", &tsclick);
+            query.append_pair("add", "{\"y\":\"2\"}");
+            query.append_pair("del", "[\"x\"]");
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("/first-party/proxy-rebuild?{}", query.finish()))
+                .body(EdgeBody::empty())
+                .expect("should build origin-form rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("origin-form GET rebuild should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "should answer GET with the 302 recovery redirect"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("/first-party/click?tsurl="),
+                "should redirect to the rebuilt first-party click: {location}"
+            );
+            assert!(
+                location.contains("y=2") && !location.contains("x=1"),
+                "should apply the add/del mutations: {location}"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_form_post_redirects_like_get() {
+        // The click guard falls back to a form POST when the GET recovery URL
+        // would exceed the platform's request-URL limit. A form submission is a
+        // navigation, so it must answer with the same 302 a GET does rather than
+        // a JSON body the browser would render as text.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsclick = signed_click_target(&settings);
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("tsclick", &tsclick);
+            form.append_pair("add", "{\"y\":\"2\"}");
+            form.append_pair("del", "[\"x\"]");
+
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/first-party/proxy-rebuild")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded; charset=UTF-8",
+                )
+                .body(EdgeBody::from(form.finish()))
+                .expect("should build form rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("form-encoded rebuild should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "a form navigation must redirect, not return JSON"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("/first-party/click?tsurl="),
+                "should redirect to the rebuilt click: {location}"
+            );
+            assert!(
+                location.contains("y=2") && !location.contains("x=1"),
+                "should apply the add/del mutations: {location}"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_json_post_still_returns_json() {
+        // The same-origin click guard depends on the JSON response shape.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let body = serde_json::json!({
+                "tsclick": signed_click_target(&settings),
+                "add": {"y": "2"},
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build JSON rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("JSON rebuild should succeed");
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(response_body_string(resp).contains("\"href\":\"/first-party/click?tsurl="));
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_accepts_absolute_tsclick() {
+        // The creative runtime absolutizes hrefs so they resolve inside a
+        // `srcdoc` frame; a client that echoes an absolute click back as the
+        // rebuild payload must still be accepted, since the signature covers
+        // `tsurl` plus params and never the origin.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let absolute = format!(
+                "https://publisher.example{}",
+                signed_click_target(&settings)
+            );
+            let body = serde_json::json!({
+                "tsclick": absolute,
+                "add": {"y": "2"},
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("absolute tsclick should be accepted");
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            assert!(
+                json.contains("/first-party/click?tsurl="),
+                "should rebuild a first-party click: {json}"
+            );
+            assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{json}");
+        });
+    }
+
     // Build a signed `/first-party/click` URL carrying a future `tsexp` replay
     // bound, returning (tsclick, tsexp_value).
     fn signed_click_with_tsexp(settings: &crate::settings::Settings) -> (String, String) {
@@ -2736,7 +3427,7 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js?c=3&b=2&a=1";
         // Simulate creative-generated first-party URL
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         // Reconstruct and validate (need absolute URL for parsing)
         let st = reconstruct_and_validate_signed_target(
             &settings,
@@ -2752,7 +3443,7 @@ mod tests {
     fn reconstruct_valid_without_params() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js";
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         let st = reconstruct_and_validate_signed_target(
             &settings,
             &format!("https://edge.example{}", first_party),
@@ -2769,7 +3460,7 @@ mod tests {
             let settings = create_test_settings();
             let clear = "ftp://cdn.example/file.gif";
             // Build a first-party proxy URL with a token for the unsupported scheme
-            let first_party = creative::build_proxy_url(&settings, clear);
+            let first_party = creative::build_proxy_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let err: Report<TrustedServerError> =
@@ -2786,7 +3477,7 @@ mod tests {
             let settings = create_test_settings();
             // Intentionally malformed target (host missing) but signed consistently
             let tsurl = "https://"; // invalid URL
-                                    // Manually construct first-party URL matching creative's format
+            // Manually construct first-party URL matching creative's format
             let full_for_token = tsurl.to_string();
             let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
             let url = format!(
@@ -2808,7 +3499,7 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let clear = "https://cdn.example/landing.html?x=1";
-            let first_party = creative::build_click_url(&settings, clear);
+            let first_party = creative::build_click_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let resp = handle_first_party_click(&settings, &noop_services(), req)
@@ -2886,6 +3577,51 @@ mod tests {
         let body = response_body_string(out);
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         assert_eq!(ct, "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn auction_rewrite_setting_does_not_change_proxied_html_or_css_rewriting() {
+        let mut settings = create_test_settings();
+        settings.auction.rewrite_creatives = false;
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"></body></html>"#;
+        let mut html_response = build_http_response(StatusCode::OK, EdgeBody::from(html));
+        html_response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        let html_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.html",
+            html_response,
+        )
+        .expect("should finalize proxied HTML");
+        let html_body = response_body_string(html_output);
+
+        let css = "body{background:url(https://cdn.example/bg.png)}";
+        let mut css_response = build_http_response(StatusCode::OK, EdgeBody::from(css));
+        css_response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        let css_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.css",
+            css_response,
+        )
+        .expect("should finalize proxied CSS");
+        let css_body = response_body_string(css_output);
+
+        assert!(
+            html_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied HTML when auction rewriting is disabled: {html_body}"
+        );
+        assert!(
+            css_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied CSS when auction rewriting is disabled: {css_body}"
+        );
     }
 
     #[test]
@@ -2981,9 +3717,9 @@ mod tests {
 
     #[test]
     fn html_gzip_response_is_processed_with_compression_preserved() {
+        use flate2::Compression;
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
-        use flate2::Compression;
         use std::io::{Read, Write};
 
         let settings = create_test_settings();
@@ -3037,8 +3773,8 @@ mod tests {
 
     #[test]
     fn css_brotli_response_is_processed_with_compression_preserved() {
-        use brotli::enc::writer::CompressorWriter;
         use brotli::Decompressor;
+        use brotli::enc::writer::CompressorWriter;
         use std::io::{Read, Write};
 
         let settings = create_test_settings();
@@ -3151,6 +3887,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3192,6 +3929,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3238,6 +3976,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3248,6 +3987,39 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response_body_string(response), "redirected");
+        });
+    }
+
+    #[test]
+    fn proxy_request_forwards_stream_response_flag_to_platform_request() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://example.com/");
+
+            proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig::new("https://example.com/resource")
+                    .without_forward_headers()
+                    .with_stream_response(),
+                &services,
+            )
+            .await
+            .expect("should proxy successfully");
+
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![true],
+                "should request a streaming platform response"
+            );
         });
     }
 
@@ -3287,6 +4059,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: true,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3352,6 +4125,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3549,6 +4323,7 @@ mod tests {
             use crate::platform::test_support::StubHttpClient;
 
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(false);
             stub.push_response(200, b"ok".to_vec());
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -3614,6 +4389,11 @@ mod tests {
                 .into_response()
                 .expect("should return buffered asset response");
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![false],
+                "unsupported platforms should buffer asset proxy responses"
+            );
 
             let all_headers = stub.recorded_request_headers();
             assert_eq!(all_headers.len(), 1, "should have captured one request");
@@ -3679,6 +4459,29 @@ mod tests {
     }
 
     #[test]
+    fn handle_asset_proxy_request_streams_when_supported() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy streaming asset response");
+
+            assert_eq!(stub.recorded_stream_response_flags(), vec![true]);
+        });
+    }
+
+    #[test]
     fn handle_asset_proxy_request_strips_unsafe_response_headers() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
@@ -3732,6 +4535,167 @@ mod tests {
         });
     }
 
+    #[test]
+    fn handle_asset_proxy_request_replaces_third_party_cache_policy_for_rehosted_asset() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "no-store")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "hex"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/assets/app.0123abcd.js",
+            );
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(
+                    Duration::from_secs(31_536_000)
+                )),
+                "should carry normalized cache policy metadata"
+            );
+
+            let mut response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=31536000, immutable"),
+                "configured rehost policy should replace the third-party no-store directive"
+            );
+            assert!(
+                response.headers().get("surrogate-control").is_none(),
+                "runtime-specific edge header should wait for adapter finalization"
+            );
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("surrogate-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=31536000"),
+                "Fastly finalization should render Surrogate-Control"
+            );
+        });
+    }
+
+    #[test]
+    fn normalized_asset_policy_preserves_final_private_or_no_store_directives() {
+        for cache_control in ["private, max-age=0", "no-store"] {
+            let mut response = edge_response_builder()
+                .header(header::CACHE_CONTROL, cache_control)
+                .header("surrogate-control", "max-age=31536000")
+                .header("cdn-cache-control", "max-age=31536000")
+                .header("cloudflare-cdn-cache-control", "max-age=31536000")
+                .body(EdgeBody::empty())
+                .expect("should build asset response");
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some(cache_control),
+                "final privacy directive should veto normalized cache policy"
+            );
+            assert!(
+                [
+                    "surrogate-control",
+                    "cdn-cache-control",
+                    "cloudflare-cdn-cache-control",
+                ]
+                .iter()
+                .all(|name| !response.headers().contains_key(*name)),
+                "final privacy directive should remove every edge-cache header"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_leaves_non_matching_assets_origin_controlled() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "public, max-age=60")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "hex"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(Method::GET, "https://www.example.com/assets/app.js");
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::OriginControlled,
+                "non-fingerprinted file should not receive normalized immutable policy"
+            );
+            let response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=60"),
+                "origin-controlled response should preserve origin cache header"
+            );
+        });
+    }
+
     fn test_profile_set() -> ImageOptimizerProfileSet {
         let mut profiles = HashMap::new();
         profiles.insert("default".to_string(), "width=1920".to_string());
@@ -3779,9 +4743,11 @@ mod tests {
         );
         route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
             region: "us-east-1".to_string(),
-            secret_store: "s3_auth".to_string(),
-            access_key_id: "access_key_id".to_string(),
-            secret_access_key: "secret_access_key".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+            secret_access_key: Redacted::new(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
             session_token: None,
             origin_query: None,
         }));
@@ -3823,9 +4789,11 @@ mod tests {
             );
             route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
                 region: "us-east-1".to_string(),
-                secret_store: "s3_auth".to_string(),
-                access_key_id: "access_key_id".to_string(),
-                secret_access_key: "secret_access_key".to_string(),
+                secret_store: None,
+                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+                secret_access_key: Redacted::new(
+                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                ),
                 session_token: None,
                 origin_query: Some(OriginQueryPolicy::Strip),
             }));
@@ -3865,23 +4833,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_caches_s3_credentials_for_repeated_signing() {
+    fn handle_asset_proxy_request_uses_resolved_s3_credentials_without_store_reads() {
         futures::executor::block_on(async {
-            clear_s3_credentials_cache_for_tests();
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, Vec::new());
             stub.push_response(200, b"optimized".to_vec());
-            let secret_store = CountingSecretStore::new(HashMap::from([
-                (
-                    "cache_access_key_id".to_string(),
-                    b"AKIAIOSFODNN7EXAMPLE".to_vec(),
-                ),
-                (
-                    "cache_secret_access_key".to_string(),
-                    b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
-                ),
-                ("cache_session_token".to_string(), b"session-token".to_vec()),
-            ]));
+            let secret_store = CountingSecretStore::new(HashMap::new());
             let observed_secret_store = secret_store.clone();
             let services = build_services_with_secret_and_http_client(
                 secret_store,
@@ -3898,10 +4855,12 @@ mod tests {
             let mut route = test_s3_image_optimizer_route();
             route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
                 region: "us-east-1".to_string(),
-                secret_store: "s3_auth_cache".to_string(),
-                access_key_id: "cache_access_key_id".to_string(),
-                secret_access_key: "cache_secret_access_key".to_string(),
-                session_token: Some("cache_session_token".to_string()),
+                secret_store: None,
+                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+                secret_access_key: Redacted::new(
+                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                ),
+                session_token: Some(Redacted::new("session-token".to_string())),
                 origin_query: None,
             }));
 
@@ -3915,19 +4874,9 @@ mod tests {
                 "should sign both the S3 preflight and final request"
             );
             assert_eq!(
-                observed_secret_store.read_count("cache_access_key_id"),
-                1,
-                "should read S3 access key ID once despite repeated signing"
-            );
-            assert_eq!(
-                observed_secret_store.read_count("cache_secret_access_key"),
-                1,
-                "should read S3 secret access key once despite repeated signing"
-            );
-            assert_eq!(
-                observed_secret_store.read_count("cache_session_token"),
-                1,
-                "should read S3 session token once despite repeated signing"
+                observed_secret_store.read_count("AKIAIOSFODNN7EXAMPLE"),
+                0,
+                "should not read S3 credentials from the runtime secret store"
             );
             let headers = stub.recorded_request_headers();
             assert!(
@@ -3946,6 +4895,7 @@ mod tests {
     fn handle_asset_proxy_request_attaches_image_optimizer_metadata() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"ok".to_vec());
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -4173,6 +5123,7 @@ mod tests {
     fn handle_asset_proxy_request_preflights_s3_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, Vec::new());
             stub.push_response(200, b"optimized".to_vec());
             let services = build_services_with_secret_and_http_client(
@@ -4189,14 +5140,24 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy optimized S3 asset request")
-                .into_response()
-                .expect("should return buffered asset response");
+            let (response, stream_body) =
+                handle_asset_proxy_request(&settings, &services, req, &route)
+                    .await
+                    .expect("should proxy optimized S3 asset request")
+                    .into_response_and_body();
 
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response_body_string(response), "optimized");
+            assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
+            let mut output = Vec::new();
+            stream_asset_body(
+                stream_body.expect("should preserve the asset body as a stream"),
+                &mut output,
+            )
+            .await
+            .expect("should stream the asset body");
+            assert_eq!(
+                output, b"optimized",
+                "should forward the complete asset body"
+            );
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["HEAD", "GET"],
@@ -4232,6 +5193,7 @@ mod tests {
     fn handle_asset_proxy_request_returns_raw_s3_error_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(404, Vec::new());
             stub.push_response_with_headers(
                 404,
@@ -4265,9 +5227,7 @@ mod tests {
                 AssetProxyCachePolicy::NoStorePrivate,
                 "should carry a typed no-store policy for router finalization"
             );
-            let response = asset_response
-                .into_response()
-                .expect("should return buffered asset response");
+            let (response, stream_body) = asset_response.into_response_and_body();
 
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
             assert_eq!(
@@ -4279,7 +5239,14 @@ mod tests {
                 response.headers().get(header::SET_COOKIE).is_none(),
                 "raw S3 error should still strip unsafe response headers"
             );
-            let body = response_body_string(response);
+            let mut output = Vec::new();
+            stream_asset_body(
+                stream_body.expect("should preserve the raw S3 error body as a stream"),
+                &mut output,
+            )
+            .await
+            .expect("should stream the raw S3 error body");
+            let body = String::from_utf8(output).expect("should decode the S3 error body");
             assert!(body.contains("NoSuchKey"), "should return S3 error body");
             assert!(
                 body.contains("image/upload/missing.jpg"),
@@ -4308,6 +5275,7 @@ mod tests {
     fn handle_asset_proxy_request_does_not_preflight_when_io_disabled() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"raw".to_vec());
             let services = build_services_with_secret_and_http_client(
                 HashMapSecretStore::new(test_s3_secrets()),
@@ -4323,13 +5291,21 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy debug S3 asset request")
-                .into_response()
-                .expect("should return buffered asset response");
+            let (response, stream_body) =
+                handle_asset_proxy_request(&settings, &services, req, &route)
+                    .await
+                    .expect("should proxy debug S3 asset request")
+                    .into_response_and_body();
 
-            assert_eq!(response_body_string(response), "raw");
+            assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
+            let mut output = Vec::new();
+            stream_asset_body(
+                stream_body.expect("should preserve the asset body as a stream"),
+                &mut output,
+            )
+            .await
+            .expect("should stream the asset body");
+            assert_eq!(output, b"raw", "should forward the complete asset body");
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["GET"],
@@ -4457,6 +5433,68 @@ mod tests {
         });
     }
 
+    /// One observable step of [`stream_asset_body`] driving a buffered sink.
+    #[derive(Debug, PartialEq, Eq)]
+    enum StreamSinkEvent {
+        SourcePolled(usize),
+        Wrote(usize),
+        Flushed,
+    }
+
+    /// Sink that records its calls so a test can assert how they interleave
+    /// with the source stream's polls.
+    struct RecordingSink(Rc<RefCell<Vec<StreamSinkEvent>>>);
+
+    impl io::Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().push(StreamSinkEvent::Wrote(buf.len()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.borrow_mut().push(StreamSinkEvent::Flushed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_asset_body_flushes_each_chunk_before_polling_the_source_again() {
+        // Fastly's `StreamingBody` is a `BufWriter`, so a yielded segment only
+        // reaches the client once the sink is flushed. The publisher stream
+        // awaits the origin (and the auction) between segments, so a segment
+        // smaller than the write buffer must be flushed before the next poll or
+        // the client renders nothing behind committed headers.
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let source_events = Rc::clone(&events);
+        let body = EdgeBody::from_stream(async_stream::stream! {
+            for (index, segment) in ["<html><head>", "</head><body>"].into_iter().enumerate() {
+                source_events
+                    .borrow_mut()
+                    .push(StreamSinkEvent::SourcePolled(index));
+                yield Ok::<Bytes, io::Error>(Bytes::from_static(segment.as_bytes()));
+            }
+        });
+
+        futures::executor::block_on(stream_asset_body(
+            body,
+            &mut RecordingSink(Rc::clone(&events)),
+        ))
+        .expect("should stream asset body");
+
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                StreamSinkEvent::SourcePolled(0),
+                StreamSinkEvent::Wrote(12),
+                StreamSinkEvent::Flushed,
+                StreamSinkEvent::SourcePolled(1),
+                StreamSinkEvent::Wrote(13),
+                StreamSinkEvent::Flushed,
+            ],
+            "each segment must be flushed to the client before the source is polled again"
+        );
+    }
+
     #[test]
     fn asset_proxy_response_into_response_rejects_stream_body() {
         futures::executor::block_on(async {
@@ -4578,11 +5616,11 @@ mod tests {
     }
 
     #[test]
-    fn redirect_empty_allowlist_permits_any() {
+    fn empty_allowlist_permits_any_host() {
         let allowed: [String; 0] = [];
         assert!(
-            redirect_is_permitted(&allowed, "evil.com"),
-            "empty allowlist should not block any redirect host"
+            is_host_permitted(&allowed, "evil.com"),
+            "empty allowlist should not block any host"
         );
     }
 
@@ -4597,72 +5635,72 @@ mod tests {
         );
     }
 
-    // --- redirect_is_permitted (full guard: empty-list bypass + is_host_allowed) ---
+    // --- is_host_permitted (full guard: empty-list bypass + is_host_allowed) ---
 
     #[test]
-    fn redirect_chain_allowed_when_host_matches_allowlist() {
+    fn host_is_permitted_when_it_matches_allowlist() {
         let allowed = vec!["ad.example.com".to_string(), "cdn.example.com".to_string()];
         assert!(
-            redirect_is_permitted(&allowed, "ad.example.com"),
-            "should permit redirect to exact-match host"
+            is_host_permitted(&allowed, "ad.example.com"),
+            "should permit exact-match host"
         );
         assert!(
-            redirect_is_permitted(&allowed, "cdn.example.com"),
-            "should permit redirect to second allowed host"
+            is_host_permitted(&allowed, "cdn.example.com"),
+            "should permit second allowed host"
         );
     }
 
     #[test]
-    fn redirect_chain_allowed_when_host_matches_wildcard() {
+    fn host_is_permitted_when_it_matches_wildcard() {
         let allowed = vec!["*.example.com".to_string()];
         assert!(
-            redirect_is_permitted(&allowed, "sub.example.com"),
-            "should permit redirect to wildcard-matched subdomain"
+            is_host_permitted(&allowed, "sub.example.com"),
+            "should permit wildcard-matched subdomain"
         );
     }
 
     #[test]
-    fn redirect_chain_blocked_when_host_not_in_allowlist() {
+    fn host_is_blocked_when_not_in_allowlist() {
         let allowed = vec!["ad.example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, "evil.com"),
-            "should block redirect to host not in allowlist"
+            !is_host_permitted(&allowed, "evil.com"),
+            "should block host not in allowlist"
         );
     }
 
     #[test]
-    fn redirect_chain_allowed_when_allowlist_is_empty() {
+    fn any_host_is_permitted_when_allowlist_is_empty() {
         let allowed: Vec<String> = vec![];
         assert!(
-            redirect_is_permitted(&allowed, "any-host.com"),
-            "should allow any redirect when allowlist is empty (open mode)"
+            is_host_permitted(&allowed, "any-host.com"),
+            "should allow any host when allowlist is empty (open mode)"
         );
     }
 
     #[test]
-    fn redirect_chain_blocked_when_host_is_empty() {
+    fn empty_host_is_blocked_when_allowlist_is_non_empty() {
         let allowed = vec!["example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, ""),
-            "should block redirect with empty host when allowlist is non-empty"
+            !is_host_permitted(&allowed, ""),
+            "should block empty host when allowlist is non-empty"
         );
     }
 
     #[test]
-    fn redirect_is_permitted_accepts_str_slices() {
+    fn is_host_permitted_accepts_str_slices() {
         // Verifies the &[impl AsRef<str>] bound works with &str literals,
         // not just Vec<String>.
         let allowed: &[&str] = &["example.com", "*.cdn.example.com"];
         assert!(
-            redirect_is_permitted(allowed, "example.com"),
+            is_host_permitted(allowed, "example.com"),
             "should permit exact match via &str slice"
         );
         assert!(
-            redirect_is_permitted(allowed, "static.cdn.example.com"),
+            is_host_permitted(allowed, "static.cdn.example.com"),
             "should permit wildcard match via &str slice"
         );
         assert!(
-            !redirect_is_permitted(allowed, "evil.com"),
+            !is_host_permitted(allowed, "evil.com"),
             "should block host not in &str slice allowlist"
         );
     }
@@ -4671,19 +5709,19 @@ mod tests {
     fn ip_literal_blocked_by_domain_allowlist() {
         let allowed = vec!["*.example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, "169.254.169.254"),
+            !is_host_permitted(&allowed, "169.254.169.254"),
             "should block cloud metadata IP"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "127.0.0.1"),
+            !is_host_permitted(&allowed, "127.0.0.1"),
             "should block loopback IPv4"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "[::1]"),
+            !is_host_permitted(&allowed, "[::1]"),
             "should block loopback IPv6"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "::1"),
+            !is_host_permitted(&allowed, "::1"),
             "should block bare loopback IPv6"
         );
     }

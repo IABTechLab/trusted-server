@@ -1,39 +1,66 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
 use edgezero_core::app::{Hooks, StoresMetadata};
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
+    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::platform::{PlatformConfigStore, StoreName};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
+use crate::middleware::{
+    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
+};
 use crate::platform::build_runtime_services;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
 
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+/// Spin auto-provides this key-value store label without runtime configuration.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -49,8 +76,49 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
+    let settings = load_startup_settings()?;
     build_state_with_settings(settings)
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
+    let config_key = default_config_key();
+    let config_store =
+        futures::executor::block_on(SpinConfigStore::open(config_store_name.as_ref().to_owned()))
+            .map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: "failed to open Spin Trusted Server config store".to_string(),
+            })
+            .attach(error.to_string())
+        })?;
+    let config_handle = ConfigStoreHandle::new(Arc::new(config_store));
+    let config_adapter = ConfigStoreHandleAdapter(config_handle);
+    // Startup-only reads: this runs during component construction, outside the
+    // request executor, so a top-level `block_on` cannot nest executors.
+    let raw_envelope = futures::executor::block_on(
+        config_adapter.get(&config_store_name, &config_key),
+    )
+    .map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: "failed to read Spin Trusted Server app-config blob".to_string(),
+        })
+        .attach(error.to_string())
+    })?;
+    let secret_store = SpinSecretStoreAdapter;
+    futures::executor::block_on(settings_from_config_blob(
+        &raw_envelope,
+        &secret_store,
+        &default_secret_store_name(),
+    ))
+}
+
+#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "Spin startup settings require the production config store".to_string(),
+    })
+    .attach("use TrustedServerApp::routes_with_settings for host tests"))
 }
 
 /// Build the application state from explicit settings.
@@ -62,8 +130,10 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -141,20 +211,24 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
+        ("/_ts/admin/ec", &[Method::GET]),
+        ("/_ts/admin/ec/{id}", &[Method::GET]),
+        ("/_ts/admin/eids", &[Method::GET]),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
-        ("/__ts/page-bids", &[Method::GET, Method::OPTIONS]),
+        (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
+        (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
-        ("/first-party/proxy-rebuild", &[Method::POST]),
+        ("/first-party/proxy-rebuild", &[Method::GET, Method::POST]),
     ]
 }
 
@@ -322,7 +396,7 @@ fn health_response() -> Response {
 }
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
-/// `/__ts/page-bids`, and the publisher fallback).
+/// `/_ts/page-bids`, and the publisher fallback).
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
@@ -362,6 +436,10 @@ fn admin_key_management_not_supported() -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+fn admin_ec_lookup_not_supported() -> Response {
+    core_admin_ec_lookup_not_supported()
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +600,23 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
 
+        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+        };
+
+        // Admin EIDs echo: pure request inspection (no KV), so this adapter
+        // serves the real handler.
+        let s = Arc::clone(&state);
+        let admin_eids_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request();
+                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
+                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
+                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
+            }
+        };
+
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
@@ -533,17 +628,25 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // `NormalizeMiddleware` before this handler runs, so the signed
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
-                let ec_context = build_ec_context(&s.settings, &services, &req).await;
+                let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
                 Ok(handle_auction(
                     &s.settings,
                     &s.orchestrator,
                     None,
                     None,
-                    &ec_context,
+                    &mut ec_context,
                     &services,
                     req,
                 )
@@ -552,28 +655,36 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // GET /__ts/page-bids — SPA re-auction endpoint.
+        // GET /_ts/page-bids — SPA re-auction endpoint.
         let s = Arc::clone(&state);
         let page_bids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                let ec_context = build_ec_context(&s.settings, &services, &req).await;
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
+                let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
                 };
                 Ok(
-                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req)
+                    handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
                 )
             }
         };
 
-        // OPTIONS /__ts/page-bids — deny the CORS preflight for this
+        // OPTIONS /_ts/page-bids — deny the CORS preflight for this
         // side-effecting GET so the `X-TSJS-Page-Bids` gate stays trustworthy.
         let page_bids_options_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(page_bids_preflight_denied())
@@ -619,7 +730,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         };
         let fp_sign_post_handler = fp_sign_handler.clone();
 
-        // /first-party/proxy-rebuild
+        // GET + POST /first-party/proxy-rebuild — GET serves the click guard's
+        // navigation fallback: the creative iframe is an opaque origin (sandbox
+        // without `allow-same-origin`), so its JSON POST is blocked by CORS and
+        // the guard navigates here for a 302 instead.
         let s = Arc::clone(&state);
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -633,6 +747,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 )
             }
         };
+        let fp_rebuild_post_handler = fp_rebuild_handler.clone();
 
         // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
         async fn dispatch(
@@ -640,7 +755,16 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+                return Ok(response);
+            }
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &state.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
 
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
@@ -648,7 +772,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // Dynamic tsjs serving is GET-only; other methods fall through to the
             // integration/publisher fallback.
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -682,6 +806,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
+                    EdgeCacheHeader::SMaxageFallback,
                 )
                 .await
                 {
@@ -715,6 +840,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             |_ctx: RequestContext| async { Ok::<Response, EdgeError>(legacy_admin_alias_denied()) };
 
         let mut builder = RouterService::builder()
+            // Outermost middleware: strips the configured trusted-client-IP
+            // headers before anything else sees the request. Must stay first —
+            // any middleware registered ahead of it would observe the
+            // shared-secret authentication header.
+            .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip
@@ -741,10 +871,24 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
+            // Admin EC lookup routes. Registered explicitly (like the key
+            // routes above) so they never fall through to the publisher
+            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
+            // coverage. The EC identity graph is Fastly KV backed, so this
+            // adapter has no store to read.
+            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
+            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
+            .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
-            .get("/__ts/page-bids", page_bids_handler)
+            .get(PAGE_BIDS_PATH, page_bids_handler.clone())
+            .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
+            // Deprecated double-underscore alias, kept so tsjs bundles served
+            // before the `/_ts/page-bids` rename keep getting ads on SPA
+            // navigations until they age out of browser caches. See
+            // `PAGE_BIDS_LEGACY_PATH`.
+            .get(PAGE_BIDS_LEGACY_PATH, page_bids_handler)
             .route(
-                "/__ts/page-bids",
+                PAGE_BIDS_LEGACY_PATH,
                 Method::OPTIONS,
                 page_bids_options_handler,
             )
@@ -752,7 +896,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)
             .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+            .get("/first-party/proxy-rebuild", fp_rebuild_handler)
+            .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
 
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
@@ -782,6 +927,100 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn multi_provider_settings() -> Settings {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.enabled = true;
+        settings.auction.providers =
+            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
+                .map(|id| {
+                    (
+                        id.parse().expect("should parse provider ID"),
+                        trusted_server_core::auction::ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "standard".to_string(),
+                            endpoint: format!("https://{id}.example/openrtb"),
+                            timeout_ms: None,
+                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                            notifications:
+                                trusted_server_core::auction::NotificationConfig::default(),
+                            profile_config: "{}"
+                                .parse()
+                                .expect("should parse empty profile config object"),
+                        },
+                    )
+                })
+                .collect();
+        settings
+    }
+
+    #[test]
+    fn startup_registers_aps_renderer_route() {
+        let mut settings = multi_provider_settings();
+        settings.auction.providers.clear();
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            trusted_server_core::auction::ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                notifications: trusted_server_core::auction::NotificationConfig::default(),
+                profile_config: "{\"account_id\":\"example-account\"}"
+                    .parse()
+                    .expect("should parse APS profile config"),
+            },
+        );
+
+        let state =
+            build_state_with_settings(settings).expect("Spin startup should register APS renderer");
+        assert!(
+            state.registry.has_route(
+                &edgezero_core::http::Method::GET,
+                "/integrations/aps/renderer"
+            ),
+            "Spin startup registry should expose the APS renderer"
+        );
+    }
+
+    #[test]
+    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
+        let mut settings = multi_provider_settings();
+        settings.auction.enabled = false;
+
+        build_state_with_settings(settings)
+            .expect("disabled Spin auction should accept dormant fanout");
+    }
+
+    #[test]
+    fn startup_rejects_multi_provider_auction_plan() {
+        let error = match build_state_with_settings(multi_provider_settings()) {
+            Ok(_) => panic!("Spin startup should reject multi-provider fanout"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("concurrent provider fanout"),
+            "should identify unsupported fanout: {error:?}"
+        );
+    }
 
     #[test]
     fn scheme_host_from_spin_url_extracts_localhost_with_port() {

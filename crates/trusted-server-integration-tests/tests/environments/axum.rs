@@ -10,6 +10,33 @@ use std::process::{Child, Command, Stdio};
 /// Default port the Axum dev server binds to when no `PORT` env var is supplied.
 const AXUM_DEFAULT_PORT: u16 = 8787;
 
+/// Secret-store entries referenced by the integration app-config fixture.
+///
+/// The Axum dev server resolves secrets through the EdgeZero `EnvSecretStore`,
+/// which reads an environment variable named exactly after the secret key.
+const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
+    (
+        "integration_admin_password",
+        "integration-admin-password-32-bytes-ok",
+    ),
+    (
+        "integration_proxy_secret",
+        "integration-test-proxy-secret-32-bytes-ok",
+    ),
+    (
+        "integration_ec_passphrase",
+        "integration-test-ec-secret-padded-32",
+    ),
+    (
+        "integration_partner_token_alpha",
+        "integration-test-token-alpha-32-bytes-ok",
+    ),
+    (
+        "integration_partner_token_bravo",
+        "integration-test-token-bravo-32-bytes-ok",
+    ),
+];
+
 /// Axum native dev-server runtime environment.
 ///
 /// Spawns the pre-built `trusted-server-axum` binary directly (no WASM, no
@@ -54,6 +81,7 @@ impl RuntimeEnvironment for AxumDevServer {
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
             .env("TRUSTED_SERVER_AXUM_CONFIG_PATH", &config_path)
+            .envs(INTEGRATION_SECRET_ENV.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

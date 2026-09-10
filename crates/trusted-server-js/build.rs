@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use build_print::{info, warn};
+use sha2::{Digest as _, Sha256};
 
 fn main() {
     // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under lib/
@@ -44,45 +45,43 @@ fn main() {
     }
 
     // Install deps if node_modules missing
-    if !skip {
-        if let Some(npm_path) = npm.as_deref() {
-            if !ts_dir.join("node_modules").exists() {
-                let status = Command::new(npm_path)
-                    .arg("ci")
-                    .current_dir(&ts_dir)
-                    .status();
-                if !status.as_ref().is_ok_and(ExitStatus::success) {
-                    warn!("tsjs: npm ci failed; using existing dist if available");
-                }
-            }
+    if !skip
+        && let Some(npm_path) = npm.as_deref()
+        && !ts_dir.join("node_modules").exists()
+    {
+        let status = Command::new(npm_path)
+            .arg("ci")
+            .current_dir(&ts_dir)
+            .status();
+        if !status.as_ref().is_ok_and(ExitStatus::success) {
+            warn!("tsjs: npm ci failed; using existing dist if available");
         }
     }
 
     // Run tests if requested
-    if !skip && env::var("TSJS_TEST").is_ok_and(|value| value == "1") {
-        if let Some(npm_path) = npm.as_deref() {
-            Command::new(npm_path)
-                .args(["run", "test", "--", "--run"])
-                .current_dir(&ts_dir)
-                .status()
-                .expect("should run requested TSJS tests");
-        }
+    if !skip
+        && env::var("TSJS_TEST").is_ok_and(|value| value == "1")
+        && let Some(npm_path) = npm.as_deref()
+    {
+        Command::new(npm_path)
+            .args(["run", "test", "--", "--run"])
+            .current_dir(&ts_dir)
+            .status()
+            .expect("should run requested TSJS tests");
     }
 
     // Build all module files
-    if !skip {
-        if let Some(npm_path) = npm.as_deref() {
-            info!("tsjs: Building per-module bundles");
+    if !skip && let Some(npm_path) = npm.as_deref() {
+        info!("tsjs: Building per-module bundles");
 
-            let status = Command::new(npm_path)
-                .args(["run", "build"])
-                .current_dir(&ts_dir)
-                .status();
-            assert!(
-                status.as_ref().is_ok_and(ExitStatus::success),
-                "tsjs: npm run build failed - refusing to use stale bundles"
-            );
-        }
+        let status = Command::new(npm_path)
+            .args(["run", "build"])
+            .current_dir(&ts_dir)
+            .status();
+        assert!(
+            status.as_ref().is_ok_and(ExitStatus::success),
+            "tsjs: npm run build failed - refusing to use stale bundles"
+        );
     }
 
     // Discover all tsjs-*.js files in dist/
@@ -127,7 +126,7 @@ fn main() {
 
     // Copy each module file to OUT_DIR
     for (_, filename) in &modules {
-        copy_bundle(filename, true, &crate_dir, &dist_dir, &out_dir);
+        copy_bundle(filename, true, &dist_dir, &out_dir);
     }
 
     // Generate tsjs_modules.rs with include_str!() for each module
@@ -141,9 +140,10 @@ fn main() {
     )
     .expect("should write generated module header");
     for (id, filename) in &modules {
+        let sha256 = bundle_sha256(&out_dir.join(filename));
         writeln!(
             codegen,
-            "    TsjsModuleMeta {{\n        bundle: include_str!(concat!(env!(\"OUT_DIR\"), \"/{filename}\")),\n        id: \"{id}\",\n    }},\n"
+            "    TsjsModuleMeta {{\n        bundle: include_str!(concat!(env!(\"OUT_DIR\"), \"/{filename}\")),\n        id: \"{id}\",\n        sha256: \"{sha256}\",\n    }},\n"
         )
         .expect("should write generated module entry");
     }
@@ -151,6 +151,7 @@ fn main() {
     codegen.push_str("\npub(crate) struct TsjsModuleMeta {\n");
     codegen.push_str("    pub bundle: &'static str,\n");
     codegen.push_str("    pub id: &'static str,\n");
+    codegen.push_str("    pub sha256: &'static str,\n");
     codegen.push_str("}\n");
 
     let generated_path = out_dir.join("tsjs_modules.rs");
@@ -162,30 +163,36 @@ fn main() {
     });
 }
 
-fn copy_bundle(filename: &str, required: bool, crate_dir: &Path, dist_dir: &Path, out_dir: &Path) {
-    let primary = dist_dir.join(filename);
-    let fallback = crate_dir.join("dist").join(filename);
+fn bundle_sha256(path: &Path) -> String {
+    let content = fs::read(path).unwrap_or_else(|err| {
+        panic!(
+            "tsjs: failed to read copied bundle {} for hashing: {err}",
+            path.display()
+        );
+    });
+    hex::encode(Sha256::digest(&content))
+}
+
+fn copy_bundle(filename: &str, required: bool, dist_dir: &Path, out_dir: &Path) {
+    let source = dist_dir.join(filename);
     let target = out_dir.join(filename);
 
-    for source in [&primary, &fallback] {
-        if source.exists() {
-            if let Err(err) = fs::copy(source, &target) {
-                assert!(
-                    !required,
-                    "tsjs: failed to copy {} to {}: {err}",
-                    source.display(),
-                    target.display()
-                );
-            }
-            return;
+    if source.exists() {
+        if let Err(err) = fs::copy(&source, &target) {
+            assert!(
+                !required,
+                "tsjs: failed to copy {} to {}: {err}",
+                source.display(),
+                target.display()
+            );
         }
+        return;
     }
 
     assert!(
         !required,
-        "tsjs: bundle {filename} not found: {} (and fallback {}). Ensure Node is installed and `npm run build` succeeds, or commit dist/{filename}.",
-        primary.display(),
-        fallback.display()
+        "tsjs: bundle {filename} not found: {}. Ensure Node is installed and `npm run build` succeeds, or commit dist/{filename}.",
+        source.display()
     );
 
     fs::write(&target, "").expect("should write optional empty bundle placeholder");

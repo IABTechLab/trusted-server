@@ -7,7 +7,7 @@ hero:
   tagline: "A publisher-owned control plane for monetization, performance, and governance.
 
 
-  One integration point across your stack. Faster, safer pages by reducing third-party browser execution. Policy, consent, and auditability partners can trust."
+  One integration point across your stack. Faster pages by reducing third-party browser execution. Policy, consent, and auditability partners can trust."
   image:
     src: /images/hero-graphic.jpeg
     alt: Trusted Server Control Plane
@@ -20,15 +20,15 @@ hero:
       link: https://github.com/IABTechLab/trusted-server 
 features:
   - title: Edge Cookie (EC) Generation
-    details: HMAC-based edge cookies that preserve privacy while enabling tracking with user consent
-  - title: GDPR Compliant
-    details: Built-in consent management and validation to ensure compliance with privacy regulations
+    details: HMAC-based edge cookies minted by the publisher; downstream use determined by deployer configuration
+  - title: Consent Signal Handling
+    details: Extraction, decoding (TCF v2 format, GPP, GPC), and enforcement logic applied to ad serving decisions
   - title: Edge Computing
     details: Runs on Fastly Compute for low-latency, high-performance ad serving at the edge
   - title: Real-Time Bidding
-    details: Prebid integration for seamless real-time bidding workflows
+    details: Prebid integration for real-time bidding workflows
   - title: Flexible Configuration
-    details: External configuration via TOML files for easy customization and deployment
-  - title: Privacy-First
-    details: All tracking requires explicit GDPR consent checks before any data collection
+    details: External configuration via TOML files for customization and deployment
+  - title: Configurable Consent Handling
+    details: Trusted Server forwards available consent signals (TCF v2 format, GPP, GPC), and the deployer configures jurisdiction lists, signal interpretation, and conflict resolution
 ---

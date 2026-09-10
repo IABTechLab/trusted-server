@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 use error_stack::Report;
 use hmac::{Hmac, Mac as _};
-use http::{header, HeaderMap, HeaderValue, Method};
+use http::{HeaderMap, HeaderValue, Method, header};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 

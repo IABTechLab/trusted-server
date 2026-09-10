@@ -9,6 +9,7 @@ test.describe("Script injection", () => {
 
     const src = await scriptTag.getAttribute("src");
     expect(src).toContain("/static/tsjs=");
+    await expect(scriptTag).not.toHaveAttribute("data-ts-gam-attribution");
   });
 
   test("no unexpected console errors on page load", async ({ page }) => {

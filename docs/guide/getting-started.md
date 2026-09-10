@@ -25,6 +25,20 @@ git clone https://github.com/IABTechLab/trusted-server.git
 cd trusted-server
 ```
 
+### Install the CLI
+
+Install the `ts` operator CLI for your current platform:
+
+```bash
+cargo install-cli
+
+# If your shell cannot find `ts`, add Cargo's bin directory to PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+ts --help
+```
+
+See [Trusted Server CLI](/guide/cli) for command details.
+
 ## Local Development
 
 Trusted Server supports two local development modes:
@@ -39,30 +53,46 @@ Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastl
 cargo install viceroy --version 0.17.0 --locked --force
 ```
 
-Start the local Fastly simulator:
+Create and push the starter config, then start the local Fastly simulator:
 
 ```bash
+cp trusted-server.example.toml trusted-server.toml
+set -a && source .env.dev && set +a
+
+ts config push --adapter fastly --local --yes --no-diff
 fastly compute serve
 ```
 
+The local manifest provides public development-only values for the starter
+config's three secret references. Do not reuse them outside local development.
 The server will be available at `http://localhost:7676`.
 
 ### Option B — Axum dev server
 
 No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
 
-The Axum adapter reads configuration from environment variables — it does **not**
-auto-load `.env` files. You must export the variables into your shell before starting
-the server.
+The Axum adapter reads the EdgeZero config blob from a local config-store file
+and secrets from key-named environment variables — it does **not** auto-load
+`.env` files. You must export the secret variables into your shell before
+starting the server.
 
 ```bash
-# Copy and edit the environment file
-cp .env.dev .env
+# Create the local app config and apply the non-secret development overlay.
+cp trusted-server.example.toml trusted-server.toml
+set -a && source .env.dev && set +a
 
-# Export the variables into your current shell session
-set -a && source .env && set +a
+# Create the local blob-backed config-store entry. The dev server reads it
+# directly from .edgezero/local-config-trusted_server_config.json.
+ts config push --adapter axum --local --yes
 
-# Build and start the dev server
+# Populate the three secret references from the starter config for this shell.
+# Each env var is named exactly after the secret key referenced in the config.
+# Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
+export publisher_proxy_secret="$(openssl rand -base64 32)"
+export ec_passphrase="$(openssl rand -base64 32)"
+export handler_password="$(openssl rand -base64 32)"
+
+# Build and start the dev server in the same shell.
 cargo run -p trusted-server-adapter-axum
 ```
 
@@ -74,10 +104,15 @@ The server will be available at `http://localhost:8787`. Set `PORT=<port>` befor
 The Axum dev server reads through the same `EdgeZero` store registry as the other
 adapters, backed by local files and environment variables:
 
-| Purpose | Source |
-| ------- | ------ |
+| Purpose    | Source                                                                                                                                                                                                                       |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | App config | The `EdgeZero` config store on disk: `.edgezero/local-config-<store-id>.json` (a JSON object of `key → value`). The default app-config store also honors `TRUSTED_SERVER_AXUM_CONFIG_PATH`, pointing it at an explicit file. |
-| Secrets | Environment variables named after the secret **key** (e.g. `signing-key` → `SIGNING_KEY`). Set them before starting the server. |
+| Secrets    | Environment variables named exactly after the secret **key** in the config blob (e.g. a `proxy_secret` reference of `dev_proxy_secret` reads `dev_proxy_secret`). Set them before starting the server.                       |
+
+The config-store value is the verified app-config blob. Secret references in
+that blob are resolved from the environment at startup. Export ephemeral
+secret values only into the current shell; do not put secret values in the
+TOML config, config-store blob, or a source-controlled environment file.
 
 > The older `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` / `TRUSTED_SERVER_SECRET_{STORE}_{KEY}`
 > env conventions no longer apply — config now comes from the config-store file and
@@ -122,22 +157,42 @@ ts audit https://publisher.example
 ```
 
 The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
-Review the draft, replace placeholders/secrets, then validate it.
+The draft includes disabled JS Asset Proxy candidates for detected third-party
+scripts. Review it, replace placeholders with stable secret key names, and enable
+only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- Ad server integrations
-- KV store mappings
-- EC configuration
-- GDPR settings
+- browser integrations under `[integrations.*]`;
+- server auction providers under map-shaped `[auction.providers.<id>]`;
+- server bidder routes under `[auction.bidders.<id>]`;
+- KV store mappings;
+- EC configuration;
+- consent settings (`[gdpr]`); and
+- stable key names for `trusted_server_secrets`.
 
-Validate the config before pushing it to platform storage:
+Do not put a Prebid Server URL or server bidder list under
+`[integrations.prebid]`, and do not put APS account/endpoint/timeout fields under
+`[integrations.aps]`. Those server values belong to auction provider common
+fields and `profile_config`.
+
+Before the first push, provision the physical store mapped from logical
+`trusted_server_secrets` with the credential values referenced by the config.
+On Fastly, `ts_secrets` is the documented example physical name. Then validate
+and push:
 
 ```bash
 ts config validate
+ts config push --adapter fastly
 ```
 
-See [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
+This command performs target-independent plan validation. Each adapter performs
+mandatory target-aware fan-out and backend-name validation at startup. The
+EdgeZero callback needed for target-aware pre-write push validation is not yet
+available in this tree, so startup remains the final target gate.
+
+Restart or redeploy instances after secret rotation. See
+[Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
 
 ## Deploy to Fastly
 

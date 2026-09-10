@@ -1,8 +1,26 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
-    <style>%NORMALIZE_CSS%</style>
+    <script>
+      // Runs before any creative markup, so this is the only opportunity to fix
+      // the trusted origin. Define it non-writable and non-configurable:
+      // creative markup can carry its own <head> script, whose content executes
+      // ahead of the runtime injected at the top of <body>, and a plain
+      // assignment would let it redirect click and rebuild resolution to an
+      // attacker origin.
+      Object.defineProperty(window, '__tsCreativeOrigin', {
+        value: '%TRUSTED_ORIGIN%',
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
+    </script>
+    <style>
+      %NORMALIZE_CSS%
+    </style>
   </head>
-  <body style="margin:0;padding:0;overflow:hidden">%CREATIVE_HTML%</body>
+  <body style="margin: 0; padding: 0; overflow: hidden">
+    %CREATIVE_HTML%
+  </body>
 </html>

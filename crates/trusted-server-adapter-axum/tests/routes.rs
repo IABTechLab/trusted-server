@@ -18,8 +18,8 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-fn test_router() -> edgezero_core::router::RouterService {
-    let settings = trusted_server_core::settings::Settings::from_toml(
+fn test_settings() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -36,9 +36,11 @@ fn test_router() -> edgezero_core::router::RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+fn test_router() -> edgezero_core::router::RouterService {
+    TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
 }
 
@@ -62,6 +64,42 @@ fn assert_route_registered(method: &str, path: &str) {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aps_profile_serves_renderer_through_adapter_fallback() {
+    let mut settings = test_settings();
+    settings.auction.providers.insert(
+        "aps-main".parse().expect("should parse APS provider ID"),
+        trusted_server_core::auction::ProviderConfig {
+            protocol: "openrtb-2.6".to_string(),
+            profile: "aps".to_string(),
+            endpoint: "https://aps.example/e/pb/bid".to_string(),
+            timeout_ms: None,
+            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+            notifications: trusted_server_core::auction::NotificationConfig::default(),
+            profile_config: "{\"account_id\":\"example-account\"}"
+                .parse()
+                .expect("should parse APS profile config"),
+        },
+    );
+    let router = TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router with APS profile");
+    let mut service = EdgeZeroAxumService::new(router);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/integrations/aps/renderer")
+        .body(AxumBody::empty())
+        .expect("should build APS renderer request");
+
+    let response = service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should serve APS renderer");
+    assert_eq!(response.status().as_u16(), 200);
+}
+
 /// Verify that every expected explicit route is registered in the route table.
 ///
 /// Uses [`RouterService::routes()`] for introspection rather than checking
@@ -74,13 +112,27 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
+        ("GET", "/_ts/admin/ec"),
+        ("GET", "/_ts/admin/ec/{id}"),
+        ("GET", "/_ts/admin/eids"),
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
+        // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
+        // paths are spelled out as literals rather than referencing
+        // `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH` so this test pins the
+        // actual URL the tsjs client fetches — asserting a const against itself
+        // would still pass if the const's value changed out from under the
+        // client.
+        ("GET", "/_ts/page-bids"),
+        ("OPTIONS", "/_ts/page-bids"),
+        ("GET", "/__ts/page-bids"),
+        ("OPTIONS", "/__ts/page-bids"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
         ("GET", "/first-party/sign"),
         ("POST", "/first-party/sign"),
+        ("GET", "/first-party/proxy-rebuild"),
         ("POST", "/first-party/proxy-rebuild"),
     ];
 
@@ -197,6 +249,42 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
+    let mut svc = make_service();
+    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let req = Request::builder()
+        .method("GET")
+        .uri(src)
+        .body(AxumBody::empty())
+        .expect("should build request");
+
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "matching TSJS hash should serve OK"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=31536000, s-maxage=31536000, immutable"),
+        "Axum adapter should render the portable s-maxage fallback"
+    );
+    assert!(
+        resp.headers().get("surrogate-control").is_none(),
+        "s-maxage fallback must not emit Fastly Surrogate-Control"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Middleware tests
 // ---------------------------------------------------------------------------
@@ -254,6 +342,193 @@ async fn admin_route_without_credentials_returns_401() {
         401,
         "admin route must return 401 without credentials"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_ec_routes_return_501() {
+    // The EC identity graph is Fastly KV backed, so the Axum dev server
+    // answers the admin EC lookup routes locally with 501 instead of letting
+    // them fall through to the publisher fallback.
+    let sample_ec_id = format!("{}.abc123", "a".repeat(64));
+    for path in [
+        "/_ts/admin/ec".to_owned(),
+        format!("/_ts/admin/ec/{sample_ec_id}"),
+    ] {
+        let mut svc = make_service();
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        assert_eq!(
+            resp.status().as_u16(),
+            501,
+            "{path} should report that Axum EC lookup is unsupported"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_ec_route_without_credentials_returns_401() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_ts/admin/ec")
+        .body(AxumBody::empty())
+        .expect("should build unauthenticated admin EC request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+
+    assert_eq!(resp.status().as_u16(), 401);
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "admin EC 401 should include the Basic authentication challenge"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_eids_route_returns_200() {
+    // The EIDs echo is pure request inspection (no KV), so the dev server
+    // serves the real handler.
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_ts/admin/eids")
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/_ts/admin/eids should serve the real EIDs echo handler"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+    let ec_id = format!("{}.abc123", "a".repeat(64));
+    let valid_paths = [
+        "/_ts/admin/ec".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}"),
+        "/_ts/admin/eids".to_owned(),
+    ];
+
+    for path in valid_paths {
+        for method in ["POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(AxumBody::from("sensitive-admin-body"))
+                .expect("should build authenticated admin request");
+            let response = make_service()
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(request)
+                .await
+                .expect("should respond");
+
+            assert_eq!(response.status().as_u16(), 405);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("allow")
+                    .and_then(|v| v.to_str().ok()),
+                Some("GET")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+
+    for path in [
+        "/_ts/admin/ec/".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}/extra"),
+        "/_ts/admin/eids/".to_owned(),
+        "/_ts/admin/eids/extra".to_owned(),
+        "/_ts/admin/eids.json".to_owned(),
+        "/_ts/admin/ec;foo".to_owned(),
+        format!("/_ts/admin/ec%2F{ec_id}"),
+        // Percent-encoded separators match the `^/_ts/admin` basic-auth
+        // handler but not a literal-slash namespace check, so they must be
+        // reserved before publisher fallback forwards credentials upstream.
+        "/_ts/admin%2Fec".to_owned(),
+        "/_ts/admin%2fec".to_owned(),
+        // Retired non-`/_ts` alias namespace: only the two exact paths are
+        // routed to a local deny, so descendants and encoded separators must
+        // be reserved at the shared fallback boundary.
+        "/admin/keys".to_owned(),
+        "/admin/keys/rotate/extra".to_owned(),
+        "/admin/keys%2Frotate".to_owned(),
+        "/admin%2fkeys/rotate".to_owned(),
+        // Multi-encoded separators survive a single decode, so the reservation
+        // decodes to a fixed point before the publisher fallback runs.
+        "/admin%252Fkeys/rotate".to_owned(),
+        "/_ts%252Fadmin/ec".to_owned(),
+    ] {
+        for method in ["GET", "POST"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(AxumBody::from("sensitive-admin-body"))
+                .expect("should build malformed admin request");
+            let response = make_service()
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(request)
+                .await
+                .expect("should respond");
+
+            assert_eq!(response.status().as_u16(), 404);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

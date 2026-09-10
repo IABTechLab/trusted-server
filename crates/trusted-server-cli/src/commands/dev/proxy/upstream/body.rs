@@ -1,0 +1,451 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use http_body_util::{BodyExt as _, combinators::BoxBody};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
+
+use super::connect::UpstreamSender;
+use super::manager::{Lease, Manager};
+use crate::commands::dev::proxy::metrics::ProxyMetrics;
+
+const STREAMING: u8 = 0;
+const COMPLETE: u8 = 1;
+const FAILED: u8 = 2;
+
+#[derive(Debug, derive_more::Display)]
+/// Error emitted while streaming the browser request body upstream.
+pub enum ProxyBodyError {
+    /// Hyper rejected or failed an incoming body frame.
+    #[display("upstream request body failed")]
+    Hyper(hyper::Error),
+}
+
+impl core::error::Error for ProxyBodyError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Hyper(error) => Some(error),
+        }
+    }
+}
+
+/// Type-erased streaming request body used by the upstream HTTP/1 sender.
+pub type ProxyRequestBody = BoxBody<Bytes, ProxyBodyError>;
+
+/// Request-body adapter that tracks terminal upload completion without buffering.
+pub struct RequestUploadBody {
+    inner: ProxyRequestBody,
+    state: Arc<AtomicU8>,
+}
+
+impl RequestUploadBody {
+    #[must_use]
+    /// Wraps a browser request body and returns its shared completion state.
+    pub fn new(inner: Incoming, known_empty: bool) -> (Self, Arc<AtomicU8>) {
+        Self::from_boxed(inner.map_err(ProxyBodyError::Hyper).boxed(), known_empty)
+    }
+
+    #[must_use]
+    /// Creates a replay-safe, already-complete empty request body.
+    pub fn empty() -> Self {
+        let body = http_body_util::Empty::<Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed();
+        Self::from_boxed(body, true).0
+    }
+
+    fn from_boxed(inner: ProxyRequestBody, known_empty: bool) -> (Self, Arc<AtomicU8>) {
+        let state = Arc::new(AtomicU8::new(if known_empty || inner.is_end_stream() {
+            COMPLETE
+        } else {
+            STREAMING
+        }));
+        (
+            Self {
+                inner,
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+}
+
+impl Body for RequestUploadBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                self.state.store(COMPLETE, Ordering::Release);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.state.store(FAILED, Ordering::Release);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.state.load(Ordering::Acquire) == COMPLETE
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for RequestUploadBody {
+    fn drop(&mut self) {
+        let _ = self
+            .state
+            .compare_exchange(STREAMING, FAILED, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Response-body adapter that returns healthy connections only after terminal EOS.
+pub struct PooledResponseBody {
+    inner: Incoming,
+    lease: Option<Lease<UpstreamSender>>,
+    manager: Arc<Manager<UpstreamSender>>,
+    upload_state: Arc<AtomicU8>,
+    close_intent: bool,
+    metrics: Arc<ProxyMetrics>,
+    finalized: bool,
+    response_complete: bool,
+}
+
+impl PooledResponseBody {
+    /// Wraps an upstream response and owns its lease until response and upload
+    /// lifecycle conditions decide whether reuse is safe.
+    pub fn new(
+        inner: Incoming,
+        lease: Lease<UpstreamSender>,
+        manager: Arc<Manager<UpstreamSender>>,
+        upload_state: Arc<AtomicU8>,
+        close_intent: bool,
+        metrics: Arc<ProxyMetrics>,
+    ) -> Self {
+        let response_complete = inner.is_end_stream();
+        Self {
+            inner,
+            lease: Some(lease),
+            manager,
+            upload_state,
+            close_intent,
+            metrics,
+            finalized: false,
+            response_complete,
+        }
+    }
+
+    fn finalize(&mut self, response_complete: bool) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let reusable = can_reuse(
+            response_complete,
+            self.upload_state.load(Ordering::Acquire),
+            self.close_intent,
+            lease.connection.abort.is_finished(),
+        );
+        if response_complete {
+            self.metrics.record_request_completed();
+        } else {
+            self.metrics.record_request_failed();
+        }
+        if reusable {
+            self.manager.return_idle(lease.connection);
+        } else {
+            lease.connection.abort.abort();
+        }
+    }
+}
+
+fn can_reuse(
+    response_complete: bool,
+    upload_state: u8,
+    close_intent: bool,
+    driver_finished: bool,
+) -> bool {
+    response_complete && upload_state == COMPLETE && !close_intent && !driver_finished
+}
+
+impl Body for PooledResponseBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                self.response_complete = true;
+                self.finalize(true);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finalize(false);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.is_trailers() {
+                    // A trailer frame from Hyper `Incoming` follows the terminal
+                    // chunk. Defer lease reconciliation until the downstream
+                    // driver releases this wrapper so it can serialize the frame.
+                    self.response_complete = true;
+                } else if self.inner.is_end_stream() {
+                    self.response_complete = true;
+                    self.finalize(true);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.finalized
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for PooledResponseBody {
+    fn drop(&mut self) {
+        self.finalize(self.response_complete);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use http_body_util::{Empty, Full};
+    use hyper::service::service_fn;
+    use hyper::{HeaderMap, Request, Response};
+    use hyper_util::rt::TokioIo;
+
+    use super::super::key::{AddressPolicy, OriginKey, ReferenceIdentity, Transport, VerifyMode};
+    use super::super::manager::Acquired;
+    use super::*;
+
+    struct ScriptedBody {
+        frames: VecDeque<Frame<Bytes>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Body for ScriptedBody {
+        type Data = Bytes;
+        type Error = ProxyBodyError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, AtomicOrdering::Relaxed);
+            Poll::Ready(self.frames.pop_front().map(Ok))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.frames.is_empty()
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_completes_only_after_terminal_eos_following_trailers() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-trailer", hyper::header::HeaderValue::from_static("done"));
+        let scripted = ScriptedBody {
+            frames: VecDeque::from([
+                Frame::data(Bytes::from_static(b"data")),
+                Frame::trailers(trailers),
+            ]),
+            polls,
+        };
+        let (mut body, state) = RequestUploadBody::from_boxed(scripted.boxed(), false);
+
+        assert!(body.frame().await.is_some());
+        assert_eq!(state.load(Ordering::Acquire), STREAMING);
+        assert!(body.frame().await.is_some());
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            STREAMING,
+            "trailers are not terminal until the following EOS poll"
+        );
+        assert!(body.frame().await.is_none());
+        assert_eq!(state.load(Ordering::Acquire), COMPLETE);
+    }
+
+    #[tokio::test]
+    async fn upload_adapter_does_not_prepoll_or_buffer_frames() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let scripted = ScriptedBody {
+            frames: VecDeque::from([
+                Frame::data(Bytes::from_static(b"one")),
+                Frame::data(Bytes::from_static(b"two")),
+            ]),
+            polls: Arc::clone(&polls),
+        };
+        let (mut body, _state) = RequestUploadBody::from_boxed(scripted.boxed(), false);
+
+        assert_eq!(polls.load(AtomicOrdering::Relaxed), 0);
+        assert!(body.frame().await.is_some());
+        assert_eq!(polls.load(AtomicOrdering::Relaxed), 1);
+        assert!(body.frame().await.is_some());
+        assert_eq!(polls.load(AtomicOrdering::Relaxed), 2);
+    }
+
+    #[test]
+    fn dropping_upload_before_eos_marks_it_failed() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let scripted = ScriptedBody {
+            frames: VecDeque::from([Frame::data(Bytes::from_static(b"pending"))]),
+            polls,
+        };
+        let (body, state) = RequestUploadBody::from_boxed(scripted.boxed(), false);
+        drop(body);
+        assert_eq!(state.load(Ordering::Acquire), FAILED);
+    }
+
+    #[test]
+    fn response_eos_while_upload_streams_is_never_reusable() {
+        assert!(!can_reuse(true, STREAMING, false, false));
+        assert!(!can_reuse(true, FAILED, false, false));
+        assert!(!can_reuse(true, COMPLETE, true, false));
+        assert!(!can_reuse(true, COMPLETE, false, true));
+        assert!(can_reuse(true, COMPLETE, false, false));
+    }
+
+    #[tokio::test]
+    async fn complete_unpoolable_response_is_not_a_request_failure() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"done"))))
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await;
+        });
+        let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("should complete client handshake");
+        let manager = Manager::start(super::super::manager::PoolLimits::default());
+        let key = OriginKey::new(
+            Transport::Tls,
+            ReferenceIdentity::dns("metrics.example"),
+            443,
+            VerifyMode::Secure,
+            AddressPolicy::Dns,
+        );
+        let Acquired::Open(reservation) = manager.acquire(key).await.expect("should reserve")
+        else {
+            panic!("should open connection");
+        };
+        let id = reservation.id();
+        let driver_manager = Arc::clone(&manager);
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+            driver_manager.driver_closed(id);
+        });
+        let mut lease = reservation.register(&manager, sender, driver.abort_handle());
+        let response = lease
+            .connection
+            .value
+            .send_request(Request::new(RequestUploadBody::empty()))
+            .await
+            .expect("should receive response");
+        let metrics = Arc::new(ProxyMetrics::default());
+        let body = PooledResponseBody::new(
+            response.into_body(),
+            lease,
+            Arc::clone(&manager),
+            Arc::new(AtomicU8::new(COMPLETE)),
+            true,
+            Arc::clone(&metrics),
+        );
+
+        body.collect()
+            .await
+            .expect("should consume complete response");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.requests_completed, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_response_dropped_without_poll_is_completed() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let service =
+                service_fn(|_| async { Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new())) });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await;
+        });
+        let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("should complete client handshake");
+        let manager = Manager::start(super::super::manager::PoolLimits::default());
+        let key = OriginKey::new(
+            Transport::Tls,
+            ReferenceIdentity::dns("empty.example"),
+            443,
+            VerifyMode::Secure,
+            AddressPolicy::Dns,
+        );
+        let Acquired::Open(reservation) = manager.acquire(key).await.expect("should reserve")
+        else {
+            panic!("should open connection");
+        };
+        let id = reservation.id();
+        let driver_manager = Arc::clone(&manager);
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+            driver_manager.driver_closed(id);
+        });
+        let mut lease = reservation.register(&manager, sender, driver.abort_handle());
+        let response = lease
+            .connection
+            .value
+            .send_request(Request::new(RequestUploadBody::empty()))
+            .await
+            .expect("should receive response");
+        assert!(response.body().is_end_stream());
+        let metrics = Arc::new(ProxyMetrics::default());
+        let body = PooledResponseBody::new(
+            response.into_body(),
+            lease,
+            Arc::clone(&manager),
+            Arc::new(AtomicU8::new(COMPLETE)),
+            false,
+            Arc::clone(&metrics),
+        );
+
+        drop(body);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.requests_completed, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+    }
+}

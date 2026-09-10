@@ -13,7 +13,7 @@ flowchart TD
 
   subgraph edge["Trusted Server"]
     direction TB
-    gdpr["GDPR Check"]
+    gdpr["Consent Check"]
     ids["EC IDs"]
     ads["Ad Serving"]
     gdpr --> ids --> ads
@@ -32,7 +32,7 @@ Core library containing shared functionality:
 - Edge Cookie (EC) ID generation
 - Cookie handling
 - HTTP abstractions
-- GDPR consent management
+- Consent signal handling
 - Ad server integrations
 
 ### trusted-server-adapter-fastly
@@ -53,13 +53,13 @@ Native Axum dev/test adapter (native binary):
 
 **Current limitations compared to the Fastly adapter:**
 
-| Feature                                    | Axum dev server                                                                                                                              |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
-| Geo lookup                                 | Always returns `None`                                                                                                                        |
-| Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                     |
-| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Legacy `/admin/keys/*` aliases are denied locally with 404 and are not proxied to the publisher fallback        |
-| Auction fan-out ordering                   | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
+| Feature                                    | Axum dev server                                                                                                                                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                                                                                 |
+| Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
+| Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                                                                         |
+| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
+| Auction fan-out ordering                   | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking                                                     |
 
 ### trusted-server-adapter-spin
 
@@ -68,7 +68,7 @@ Fermyon Spin adapter (`wasm32-wasip1` component):
 - Production-capable deployment target for the Spin runtime
 - Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
 - Outbound HTTP via `spin_sdk::http::send` — no configurable per-request timeout (see rustdoc)
-- Single auction provider only; multi-provider fan-out requires the Fastly adapter
+- Single auction provider only; enabled multi-provider plans fail target validation at startup
 
 ```bash
 # Check (native)
@@ -107,18 +107,25 @@ pub trait RequestWrapper {
 
 External configuration via `trusted-server.toml` allows deployment-time customization without code changes.
 
-### Privacy-First Design
+Server-side auctions are configuration-first. `[auction.providers.<id>]` declares
+provider instances and `[auction.bidders.<id>]` maps browser-visible bidders to
+exactly one provider. Startup compiles these maps into one immutable
+`AuctionPlan` shared by orchestration and integration registration. Provider IDs
+remain distinct from upstream returned seats and browser delivery bidder codes.
+The optional mediator is selected separately by `[auction].mediator`.
 
-All tracking operations require explicit GDPR consent checks before execution.
+### Consent-Aware Design
+
+Data collection operations are subject to available consent signals (TCF v2 format, GPP, GPC). Enforcement follows built-in per-jurisdiction rules, with publisher configuration tuning jurisdiction lists, signal interpretation, and conflict resolution.
 
 ## Data Flow
 
-1. **Request Ingress** - Request arrives at Fastly edge
-2. **Consent Validation** - GDPR consent checked
-3. **ID Generation** - EC ID generated (if consented)
-4. **Ad Request** - Backend ad server called
-5. **Response Processing** - Creative processed and modified
-6. **Response Egress** - Response sent to browser
+1. **Request Ingress**: request arrives at Fastly edge
+2. **Consent Signal Read**: any signals present on the request are decoded
+3. **ID Generation**: EC ID generated when the consent evaluation permits
+4. **Ad Request**: backend ad server called
+5. **Response Processing**: creative processed and modified
+6. **Response Egress**: response sent to browser
 
 ## Storage
 
@@ -131,9 +138,9 @@ Used for:
 - Configuration cache
 - EC ID state
 
-### No User Data Persistence
+### Data Persistence
 
-User data is not persisted in storage - only processed in-flight at the edge.
+Page content and request bodies are processed in-flight and are not persisted. EC ID state and related metadata are stored in KV stores as configured.
 
 ## Performance Characteristics
 
@@ -145,7 +152,7 @@ User data is not persisted in storage - only processed in-flight at the edge.
 ## Security
 
 - **HMAC-based IDs** - Cryptographically secure identifiers
-- **No PII Storage** - Privacy by design
+- **No Direct Identifiers Stored** - No name, email, or account fields are stored
 - **Request Signing** - Optional request authentication
 - **Content Security** - Creative scanning and modification
 
@@ -159,6 +166,12 @@ User data is not persisted in storage - only processed in-flight at the edge.
 | `trusted-server-adapter-axum`       | native                    | Local development and integration testing (see limitations above) |
 
 The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-matched clippy aliases (`cargo clippy-fastly`, `cargo clippy-spin-native`, etc.) rather than broad `--all-features` workspace clippy — the latter is not a reliable gate across adapters.
+
+Fastly and Axum support concurrent auction provider fan-out. Cloudflare and Spin
+currently accept at most one provider in an enabled auction. Every adapter runs
+target-aware fan-out and backend-name checks at startup. No current adapter
+claims an abortable provider-wide total-request deadline, so configured auction
+and provider timeouts are logical budgets rather than hard wall-clock ceilings.
 
 ## Next Steps
 

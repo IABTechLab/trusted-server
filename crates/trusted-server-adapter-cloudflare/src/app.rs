@@ -9,27 +9,38 @@ use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, he
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(target_arch = "wasm32")]
-use trusted_server_core::config_payload::settings_from_config_blob;
+use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
+    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::platform::StoreName;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -37,11 +48,23 @@ use crate::platform::build_runtime_services;
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "wasm32")]
-static CLOUDFLARE_CONFIG_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+thread_local! {
+    static CLOUDFLARE_CONFIG_JSON: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };
+    static CLOUDFLARE_ENV: std::cell::OnceCell<worker::Env> = const { std::cell::OnceCell::new() };
+}
 
 #[cfg(target_arch = "wasm32")]
 pub fn set_cloudflare_config_json(value: String) {
-    let _ = CLOUDFLARE_CONFIG_JSON.set(value);
+    CLOUDFLARE_CONFIG_JSON.with(|slot| {
+        let _ = slot.set(value);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_cloudflare_env(env: worker::Env) {
+    CLOUDFLARE_ENV.with(|slot| {
+        let _ = slot.set(env);
+    });
 }
 
 /// Application state built once at startup and shared across all requests.
@@ -69,12 +92,16 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "Cloudflare startup settings require a Worker config binding".to_string(),
+    })
+    .attach("use TrustedServerApp::routes_with_settings for host tests"))
 }
 
 #[cfg(target_arch = "wasm32")]
 fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
-    let raw_config = CLOUDFLARE_CONFIG_JSON.get().ok_or_else(|| {
+    let raw_config = CLOUDFLARE_CONFIG_JSON.with(|slot| slot.get().cloned());
+    let raw_config = raw_config.ok_or_else(|| {
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
@@ -82,7 +109,7 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
             "set TRUSTED_SERVER_CONFIG to JSON containing the trusted_server_config blob envelope",
         )
     })?;
-    let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(&raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: "invalid Cloudflare TRUSTED_SERVER_CONFIG JSON".to_string(),
         })
@@ -97,7 +124,23 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
                     .to_string(),
             })
         })?;
-    settings_from_config_blob(envelope)
+    let env = CLOUDFLARE_ENV
+        .with(|slot| slot.get().cloned())
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "Cloudflare Worker environment is unavailable during startup".to_string(),
+            })
+        })?;
+    let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
+    let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
+    // Startup-only read: the Worker environment secret accessor is synchronous
+    // underneath, so driving the async resolution with a top-level `block_on`
+    // here cannot stall the JS event loop.
+    futures::executor::block_on(settings_from_config_blob(
+        envelope,
+        &secret_store,
+        &default_secret_store,
+    ))
 }
 
 /// Build the application state from explicit settings.
@@ -109,8 +152,10 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -128,7 +173,7 @@ fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
 }
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
-/// `/__ts/page-bids`, and the publisher fallback).
+/// `/_ts/page-bids`, and the publisher fallback).
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
@@ -180,7 +225,13 @@ where
         let f = f.clone();
         Box::pin(async move {
             let services = build_per_request_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &s.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
             Ok(f(s, services, req).await.unwrap_or_else(|e| http_error(&e)))
         })
     }
@@ -248,6 +299,10 @@ fn admin_key_management_not_supported() -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+fn admin_ec_lookup_not_supported() -> Response {
+    core_admin_ec_lookup_not_supported()
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
@@ -372,14 +427,27 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_per_request_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+                return Ok(response);
+            }
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &state.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
             // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
             let allow_tsjs = method == Method::GET;
 
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(
+                    &req,
+                    &state.registry,
+                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                )
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -413,6 +481,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
+                    EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
                 .await
                 {
@@ -443,6 +512,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         };
 
         let mut router = RouterService::builder()
+            // Outermost middleware: strips the configured trusted-client-IP
+            // headers before anything else sees the request. Must stay first —
+            // any middleware registered ahead of it would observe the
+            // shared-secret authentication header.
+            .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
@@ -473,45 +547,43 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
+            // Admin EC lookup routes. Registered explicitly (like the key
+            // routes above) so they never fall through to the publisher
+            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
+            // coverage. The EC identity graph is Fastly KV backed, so this
+            // adapter has no store to read.
+            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+            })
+            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+            })
+            // Admin EIDs echo: pure request inspection (no KV), so this
+            // adapter serves the real handler.
+            .get(
+                "/_ts/admin/eids",
+                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    handle_admin_eids_lookup(&partner_registry, &req)
+                }),
+            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     // Build the geo-aware EC context so the auction consent gate
                     // sees the caller's jurisdiction — `EcContext::default()`
                     // fails it closed for consented users.
-                    let ec_context = build_ec_context(&s.settings, &services, &req).await;
+                    let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
                         None,
                         None,
-                        &ec_context,
+                        &mut ec_context,
                         &services,
                         req,
                     )
                     .await
-                }),
-            )
-            // SPA re-auction endpoint. The OPTIONS preflight for this
-            // side-effecting GET is denied so the GET handler's `X-TSJS-Page-Bids`
-            // gate stays trustworthy.
-            .route(
-                "/__ts/page-bids",
-                Method::OPTIONS,
-                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                    Ok(page_bids_preflight_denied())
-                }),
-            )
-            .get(
-                "/__ts/page-bids",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    let ec_context = build_ec_context(&s.settings, &services, &req).await;
-                    let auction = AuctionDispatch {
-                        orchestrator: &s.orchestrator,
-                        slots: s.settings.creative_opportunity_slots(),
-                        registry: None,
-                    };
-                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req).await
                 }),
             )
             .get(
@@ -538,12 +610,49 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_first_party_proxy_sign(&s.settings, &services, req).await
                 }),
             )
+            // GET serves the click guard's navigation fallback: the creative
+            // iframe is an opaque origin (sandbox without `allow-same-origin`),
+            // so its JSON POST is blocked by CORS and the guard navigates here
+            // for a 302 instead.
+            .get(
+                "/first-party/proxy-rebuild",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
+                }),
+            )
             .post(
                 "/first-party/proxy-rebuild",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_first_party_proxy_rebuild(&s.settings, &services, req).await
                 }),
             );
+
+        // SPA re-auction endpoint, registered on the canonical path and on the
+        // deprecated `PAGE_BIDS_LEGACY_PATH` double-underscore alias. The alias
+        // keeps tsjs bundles served before the `/_ts/page-bids` rename getting
+        // ads on SPA navigations until they age out of browser caches.
+        //
+        // The OPTIONS preflight is denied on both so the GET handler's
+        // `X-TSJS-Page-Bids` gate stays trustworthy — an alias that let the
+        // preflight fall through to a permissive origin would reopen exactly
+        // the cross-site hole the canonical path closes.
+        let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
+            let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
+            let auction = AuctionDispatch {
+                orchestrator: &s.orchestrator,
+                slots: s.settings.creative_opportunity_slots(),
+                registry: None,
+            };
+            handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req).await
+        });
+        let page_bids_preflight =
+            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                Ok(page_bids_preflight_denied())
+            });
+        for path in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
+            router = router.route(path, Method::GET, page_bids.clone());
+            router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
+        }
 
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
@@ -564,5 +673,151 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         }
 
         router.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aps_profile_settings() -> Settings {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            trusted_server_core::auction::ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                notifications: trusted_server_core::auction::NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"example-account"}),
+            },
+        );
+        settings
+    }
+
+    #[test]
+    fn startup_registers_aps_renderer_route() {
+        let state = build_state_with_settings(aps_profile_settings())
+            .expect("Cloudflare startup should register APS renderer");
+        assert!(
+            state.registry.has_route(
+                &edgezero_core::http::Method::GET,
+                "/integrations/aps/renderer"
+            ),
+            "Cloudflare startup registry should expose the APS renderer"
+        );
+    }
+
+    #[test]
+    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.enabled = false;
+        settings.auction.providers =
+            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
+                .map(|id| {
+                    (
+                        id.parse().expect("should parse provider ID"),
+                        trusted_server_core::auction::ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "standard".to_string(),
+                            endpoint: format!("https://{id}.example/openrtb"),
+                            timeout_ms: None,
+                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                            notifications:
+                                trusted_server_core::auction::NotificationConfig::default(),
+                            profile_config: serde_json::json!({}),
+                        },
+                    )
+                })
+                .collect();
+
+        build_state_with_settings(settings)
+            .expect("disabled Cloudflare auction should accept dormant fanout");
+    }
+
+    #[test]
+    fn startup_rejects_multi_provider_auction_plan() {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.enabled = true;
+        settings.auction.providers =
+            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
+                .map(|id| {
+                    (
+                        id.parse().expect("should parse provider ID"),
+                        trusted_server_core::auction::ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "standard".to_string(),
+                            endpoint: format!("https://{id}.example/openrtb"),
+                            timeout_ms: None,
+                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                            notifications:
+                                trusted_server_core::auction::NotificationConfig::default(),
+                            profile_config: serde_json::json!({}),
+                        },
+                    )
+                })
+                .collect();
+
+        let error = match build_state_with_settings(settings) {
+            Ok(_) => panic!("Cloudflare startup should reject multi-provider fanout"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("concurrent provider fanout"),
+            "should identify unsupported fanout: {error:?}"
+        );
     }
 }

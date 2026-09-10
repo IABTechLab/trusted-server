@@ -4,16 +4,16 @@
 //! lifecycle, and storing keys via platform store primitives through
 //! [`RuntimeServices`].
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt as _};
 use jose_jwk::Jwk;
 use uuid::Uuid;
 
-use super::{read_active_kids, Keypair};
+use super::{Keypair, read_active_kids};
 use crate::error::TrustedServerError;
-use crate::platform::{is_not_found, RuntimeServices, StoreId};
+use crate::platform::{RuntimeServices, StoreId, is_not_found};
 use crate::request_signing::JWKS_STORE_NAME;
 
 /// Result of a key rotation operation.
@@ -441,13 +441,15 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for SpyConfigStore {
         async fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+            // Mirror the composite store's contract: a present store with an
+            // absent key is `NotFound`, never a generic store error.
             self.inner
                 .data
                 .lock()
                 .expect("should lock data")
                 .get(key)
                 .cloned()
-                .ok_or_else(|| Report::new(PlatformError::ConfigStore))
+                .ok_or_else(|| Report::new(PlatformError::NotFound))
         }
 
         fn put(

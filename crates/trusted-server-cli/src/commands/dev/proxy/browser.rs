@@ -738,6 +738,19 @@ fn restore_auto_proxy(
 mod tests {
     use super::*;
     use crate::commands::dev::proxy::rewrite::{Authority, Rule, RuleTable};
+    use crate::commands::dev::proxy::upstream::key::AddressPolicy;
+
+    fn rule(from: &str, to: &str) -> Rule {
+        Rule::new(
+            from.to_string(),
+            Authority::parse(to, false).expect("should parse authority"),
+            false,
+            false,
+            false,
+            AddressPolicy::Dns,
+        )
+        .expect("should build rule")
+    }
 
     #[test]
     fn shell_quote_wraps_and_escapes() {
@@ -826,12 +839,10 @@ mod tests {
 
     #[test]
     fn pac_uses_normalized_connect_address_for_wildcard_bind() {
-        let rules = RuleTable(vec![Rule {
-            from: "www.example-publisher.com".into(),
-            to: Authority::parse("to.edgecompute.app", false).expect("should parse authority"),
-            rewrite_host: false,
-            plaintext: false,
-        }]);
+        let rules = RuleTable(vec![rule(
+            "www.example-publisher.com",
+            "to.edgecompute.app",
+        )]);
         let pac = generate_pac(&rules, "0.0.0.0:18080".parse().expect("addr"));
         assert!(
             pac.contains("PROXY 127.0.0.1:18080"),
@@ -845,12 +856,10 @@ mod tests {
 
     #[test]
     fn pac_proxies_only_https_for_from_hosts() {
-        let rules = RuleTable(vec![Rule {
-            from: "www.example-publisher.com".into(),
-            to: Authority::parse("to.edgecompute.app", false).expect("should parse authority"),
-            rewrite_host: false,
-            plaintext: false,
-        }]);
+        let rules = RuleTable(vec![rule(
+            "www.example-publisher.com",
+            "to.edgecompute.app",
+        )]);
         let pac = generate_pac(
             &rules,
             "127.0.0.1:18080".parse().expect("should parse addr"),

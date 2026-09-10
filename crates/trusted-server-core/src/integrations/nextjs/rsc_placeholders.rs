@@ -5,7 +5,7 @@ use crate::integrations::{
 };
 
 use super::shared::find_rsc_push_payload_range;
-use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
+use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_PREFIX: &str = "__ts_rsc_payload_";
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_SUFFIX: &str = "__";

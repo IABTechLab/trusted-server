@@ -151,6 +151,16 @@ pub struct PlatformBackendSpec {
     pub first_byte_timeout: Duration,
     /// Maximum time to wait between response body bytes.
     pub between_bytes_timeout: Duration,
+    /// Optional stable discriminator folded into the backend name.
+    ///
+    /// Two callers can target the same origin (scheme, host, port, TLS) with
+    /// the same transport timeout yet need distinct dynamic backends — for
+    /// example two auction providers behind one gateway host. Because the
+    /// auction orchestrator correlates responses back to providers by backend
+    /// name, a shared name would let one provider's response be parsed as
+    /// another's. Setting this to a per-provider/integration identifier keeps
+    /// their names distinct while remaining stable across requests.
+    pub discriminator: Option<String>,
 }
 
 /// Cloneable container of platform services for a single request.
@@ -174,6 +184,16 @@ pub struct RuntimeServices {
     /// resolve a named store (e.g. `consent_store`). `None` when no registry is
     /// wired, in which case named lookups return `None`.
     pub(crate) kv_registry: Option<KvRegistry>,
+    /// Shared transformed-template cache. Defaults to
+    /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
+    /// per request rather than failing. Spike-only; see
+    /// [`crate::platform::template_cache`].
+    pub(crate) template_cache: Arc<dyn super::PlatformTemplateCache>,
+    /// Platform-specific cold-response template assembler.
+    ///
+    /// Defaults to [`super::UnavailableTemplateAssembler`]. Core retains a portable
+    /// byte-seam fallback when this service is unavailable or rejects a document.
+    pub(crate) template_assembler: Arc<dyn super::PlatformTemplateAssembler>,
     /// Dynamic backend registration and name prediction.
     pub(crate) backend: Arc<dyn PlatformBackend>,
     /// Outbound HTTP client abstraction.
@@ -227,6 +247,18 @@ impl RuntimeServices {
     #[must_use]
     pub fn kv_store(&self) -> &dyn PlatformKvStore {
         &*self.kv_store
+    }
+
+    /// The shared transformed-template cache. Spike-only.
+    #[must_use]
+    pub fn template_cache(&self) -> &dyn super::PlatformTemplateCache {
+        &*self.template_cache
+    }
+
+    /// Returns the platform-specific cold-response template assembler.
+    #[must_use]
+    pub fn template_assembler(&self) -> &dyn super::PlatformTemplateAssembler {
+        &*self.template_assembler
     }
 
     /// Returns the dynamic backend service.
@@ -291,6 +323,29 @@ impl RuntimeServices {
             ..self
         }
     }
+
+    /// Returns a clone of this instance with the template cache replaced.
+    ///
+    /// Spike-only (#1009).
+    #[must_use]
+    pub fn with_template_cache(self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
+        Self {
+            template_cache: cache,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the template assembler replaced.
+    #[must_use]
+    pub fn with_template_assembler(
+        self,
+        assembler: Arc<dyn super::PlatformTemplateAssembler>,
+    ) -> Self {
+        Self {
+            template_assembler: assembler,
+            ..self
+        }
+    }
 }
 
 impl fmt::Debug for RuntimeServices {
@@ -310,6 +365,8 @@ pub struct RuntimeServicesBuilder {
     secret_store: Option<Arc<dyn PlatformSecretStore>>,
     kv_store: Option<Arc<dyn PlatformKvStore>>,
     kv_registry: Option<KvRegistry>,
+    template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
+    template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
     backend: Option<Arc<dyn PlatformBackend>>,
     http_client: Option<Arc<dyn PlatformHttpClient>>,
     geo: Option<Arc<dyn PlatformGeo>>,
@@ -324,6 +381,8 @@ impl RuntimeServicesBuilder {
             secret_store: None,
             kv_store: None,
             kv_registry: None,
+            template_cache: None,
+            template_assembler: None,
             backend: None,
             http_client: None,
             geo: None,
@@ -343,6 +402,23 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn secret_store(mut self, secret_store: Arc<dyn PlatformSecretStore>) -> Self {
         self.secret_store = Some(secret_store);
+        self
+    }
+
+    /// Set the shared transformed-template cache. Spike-only.
+    #[must_use]
+    pub fn template_cache(mut self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
+        self.template_cache = Some(cache);
+        self
+    }
+
+    /// Set the platform-specific cold-response template assembler.
+    #[must_use]
+    pub fn template_assembler(
+        mut self,
+        assembler: Arc<dyn super::PlatformTemplateAssembler>,
+    ) -> Self {
+        self.template_assembler = Some(assembler);
         self
     }
 
@@ -419,6 +495,14 @@ impl RuntimeServicesBuilder {
                 .kv_store
                 .expect("should set kv_store before building RuntimeServices"),
             kv_registry: self.kv_registry,
+            // Defaulted rather than required: an adapter with no template cache
+            // should degrade to transforming per request, not fail to build.
+            template_cache: self
+                .template_cache
+                .unwrap_or_else(|| Arc::new(super::UnavailableTemplateCache)),
+            template_assembler: self
+                .template_assembler
+                .unwrap_or_else(|| Arc::new(super::UnavailableTemplateAssembler)),
             backend: self
                 .backend
                 .expect("should set backend before building RuntimeServices"),

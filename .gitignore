@@ -37,11 +37,15 @@ src/*.html
 .specstory
 .vscode
 
+# Agent implementation worktrees
+/.worktrees/
+
 # Claude Code — ignore all, then whitelist shared config
 .claude/*
 !.claude/settings.json
 !.claude/commands/
 !.claude/agents/
+!.claude/skills/
 
 # SSL certificates
 *.pem

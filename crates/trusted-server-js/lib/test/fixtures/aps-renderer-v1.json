@@ -1,0 +1,18 @@
+{
+  "seatbid": [
+    {
+      "bid": [
+        {
+          "id": "fictional-selected-bid-id",
+          "price": 1.23,
+          "w": 300,
+          "h": 250,
+          "ext": {
+            "creativeurl": "https://creative.example/render",
+            "tagtype": "iframe"
+          }
+        }
+      ]
+    }
+  ]
+}

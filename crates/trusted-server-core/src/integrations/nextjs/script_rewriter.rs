@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use error_stack::Report;
-use regex::{escape, Regex};
+use regex::{Regex, escape};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -9,7 +9,7 @@ use crate::integrations::{
 };
 
 use super::shared::strip_origin_host_with_optional_port;
-use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
+use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
 pub(super) struct NextJsNextDataRewriter {
     config: Arc<NextJsIntegrationConfig>,
@@ -257,7 +257,9 @@ mod tests {
                 assert!(value.contains("ts.example.com") && value.contains("/reviews"));
                 assert!(value.contains("ts.example.com") && value.contains("/sign-in"));
                 assert!(value.contains(r#""fallbackHref":"http://origin.example.com/legacy""#));
-                assert!(value.contains(r#""protoRelative":"//origin.example.com/assets/logo.png""#));
+                assert!(
+                    value.contains(r#""protoRelative":"//origin.example.com/assets/logo.png""#)
+                );
             }
             _ => panic!("Expected rewrite to update payload"),
         }

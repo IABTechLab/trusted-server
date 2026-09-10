@@ -7,6 +7,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 - [First-Party Endpoints](#first-party-endpoints) - Core ad serving and proxying
 - [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
+- [Admin Diagnostics](#admin-diagnostic-endpoints) - Protected EC troubleshooting
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
 - [Utility Endpoints](#utility-endpoints) - Optional operational helpers
 - [Integration Endpoints](#integration-endpoints) - Third-party service proxying
@@ -82,37 +83,43 @@ curl -i "https://edge.example.com/_ts/clear-tester"
 
 ## First-Party Endpoints
 
-### GET /first-party/ad
+### POST /auction
 
-Server-side ad rendering endpoint. Returns complete HTML for a single ad slot.
+Browser and programmatic auction endpoint. It accepts the Trusted Server ad-unit
+request shape and returns an OpenRTB response with first-party processed
+creatives. Creative URLs are rewritten by default; set
+`[auction].sanitize_creatives = true` to strip executable markup.
 
-**Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `slot` | string | Yes | Ad slot identifier (matches ad unit code) |
-| `w` | integer | Yes | Ad width in pixels |
-| `h` | integer | Yes | Ad height in pixels |
+Configured provider IDs appear in response metadata and provider responses.
+Consumers that previously matched the literal provider name `prebid` must use
+the configured provider ID, such as `pbs-main`.
 
-**Response:**
+**Request Body:**
 
-- **Content-Type:** `text/html; charset=utf-8`
-- **Body:** Complete HTML creative with first-party proxying applied
+```json
+{
+  "adUnits": [
+    {
+      "code": "header-banner",
+      "mediaTypes": { "banner": { "sizes": [[728, 90]] } },
+      "bids": [
+        {
+          "bidder": "example-server-bidder",
+          "params": { "placement": "example-placement" }
+        }
+      ]
+    }
+  ]
+}
+```
 
 **Example:**
 
 ```bash
-curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
+curl -X POST https://edge.example.com/auction \
+  -H "Content-Type: application/json" \
+  -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
-
-**Response Headers:**
-
-No EC ID response header is emitted. EC identity is maintained with the `ts-ec` cookie.
-
-**Use Cases:**
-
-- Server-side ad rendering
-- Direct iframe embedding
-- First-party ad delivery
 
 ---
 
@@ -139,10 +146,10 @@ Returns EC identity plus the authenticated partner's UID and EID for the current
   "ec": "954d...e0c3.nZ1GxL",
   "consent": "ok",
   "degraded": false,
-  "source_domain": "formally-vital-lion.edgecompute.app",
+  "source_domain": "ssp.example.com",
   "uid": "mock-user-123",
   "eid": {
-    "source": "formally-vital-lion.edgecompute.app",
+    "source": "ssp.example.com",
     "uids": [{ "id": "mock-user-123", "atype": 3 }]
   },
   "cluster_size": 3
@@ -183,63 +190,6 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
   "rejected": 0,
   "errors": []
 }
-```
-
----
-
-### POST /third-party/ad
-
-Client-side auction endpoint for TSJS library.
-
-**Request Body:**
-
-```json
-{
-  "adUnits": [
-    {
-      "code": "header-banner",
-      "mediaTypes": {
-        "banner": {
-          "sizes": [
-            [728, 90],
-            [970, 250]
-          ]
-        }
-      }
-    }
-  ],
-  "config": {
-    "debug": false
-  }
-}
-```
-
-**Response:**
-
-```json
-{
-  "seatbid": [
-    {
-      "bid": [
-        {
-          "impid": "header-banner",
-          "adm": "<html>...</html>",
-          "price": 1.5,
-          "w": 728,
-          "h": 90
-        }
-      ]
-    }
-  ]
-}
-```
-
-**Example:**
-
-```bash
-curl -X POST https://edge.example.com/third-party/ad \
-  -H "Content-Type: application/json" \
-  -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
 
 ---
@@ -320,14 +270,14 @@ curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com
 
 ### GET/POST /first-party/sign
 
-URL signing endpoint. Returns signed first-party proxy URL for a given target URL.
+URL signing endpoint. Returns a signed first-party proxy URL for a valid HTTP or HTTPS target. When `proxy.allowed_domains` is non-empty, the endpoint checks the parsed target host before signing. An empty list permits every valid host.
 
 **Request Methods:** GET or POST
 
 **GET Request:**
 
 ```bash
-curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.gif"
+curl "https://edge.example.com/first-party/sign?url=https://cdn.example.com/pixel.gif"
 ```
 
 **POST Request:**
@@ -335,16 +285,23 @@ curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.g
 ```bash
 curl -X POST https://edge.example.com/first-party/sign \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://external.com/pixel.gif"}'
+  -d '{"url":"https://cdn.example.com/pixel.gif"}'
 ```
 
 **Response:**
 
 ```json
 {
-  "signed_url": "https://edge.example.com/first-party/proxy?tsurl=https://external.com/pixel.gif&tstoken=abc123..."
+  "href": "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=abc123...&tsexp=1234567890",
+  "base": "https://cdn.example.com/pixel.gif"
 }
 ```
+
+`href` is the signed proxy path. `base` is the normalized target without its query or fragment.
+
+**Error Responses:**
+
+- `403 Forbidden`: The target has a valid host that does not match a non-empty `proxy.allowed_domains` list
 
 **Use Cases:**
 
@@ -356,13 +313,13 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ### POST /first-party/proxy-rebuild
 
-URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScript modifies query parameters.
+URL mutation recovery endpoint. Re-signs a click URL after creative JavaScript modifies its query parameters. The original `tstoken` is validated first, and `tsurl`, `tstoken`, and `tsexp` can never be added or removed.
 
 **Request Body:**
 
 ```json
 {
-  "tsclick": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&tstoken=original...",
+  "tsclick": "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&tstoken=original...",
   "add": {
     "utm_source": "banner"
   },
@@ -370,18 +327,43 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 }
 ```
 
+`tsclick` may be root-relative (the form the rewriter emits) or absolute.
+
 **Response:**
 
 ```json
 {
-  "url": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&utm_source=banner&tstoken=new..."
+  "href": "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&utm_source=banner&tstoken=new...",
+  "base": "https://advertiser.example",
+  "added": { "utm_source": "banner" },
+  "removed": ["old_param"]
 }
 ```
 
 **Use Cases:**
 
-- TSJS click guard (automatic URL repair)
+- TSJS click guard (automatic URL repair) on same-origin pages
 - Handling creative JavaScript that modifies tracking URLs
+
+---
+
+### GET /first-party/proxy-rebuild
+
+Navigation form of the same recovery, for creatives rendered in a sandboxed iframe without `allow-same-origin`. Their opaque origin makes the JSON POST a CORS-preflighted cross-origin request that the endpoint does not answer, so the click guard navigates here instead — navigations are not subject to CORS.
+
+**Query Parameters:**
+
+| Parameter | Required | Description                                       |
+| --------- | -------- | ------------------------------------------------- |
+| `tsclick` | Yes      | URL-encoded signed click URL                      |
+| `add`     | No       | URL-encoded JSON object of parameters to add      |
+| `del`     | No       | URL-encoded JSON array of parameter names to drop |
+
+**Response:** `302` with the rebuilt `/first-party/click?...` URL in `Location` and `Cache-Control: no-store, private`. The browser follows it to `/first-party/click`, which redirects on to the advertiser.
+
+Validation is identical to the POST form.
+
+**Form-encoded POST (navigation, no URL length limit):** when the GET recovery URL would exceed the platform's request-URL limit (Fastly Compute rejects request URLs over 8192 bytes before the handler runs), the click guard submits a form instead. A `POST` carrying `Content-Type: application/x-www-form-urlencoded` with the same `tsclick`/`add`/`del` fields is treated as a navigation and answered with the same `302`, not the JSON body.
 
 ---
 
@@ -555,6 +537,87 @@ curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
 
 ---
 
+## Admin Diagnostic Endpoints
+
+These endpoints expose sensitive identity and cookie data and require HTTP Basic Authentication. Configure a handler that covers the entire `/_ts/admin` namespace; startup rejects configurations that do not protect every admin route, including handlers that match only some `/_ts/admin/ec/{id}` values — the dynamic route needs a prefix-level matcher such as `^/_ts/admin` or `^/_ts/admin/ec/`. The whole `/_ts/admin` prefix is reserved: any admin path that reaches publisher fallback — unknown, malformed, or percent-encoded (`/_ts/admin%2Fec`) — is answered locally with `404` and is never proxied, so an admin `Authorization` header and request body never reach the publisher origin. The retired non-`/_ts` `/admin/keys` aliases are reserved the same way. Normal diagnostic-handler responses after successful authentication are JSON with `Cache-Control: no-store`. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge. Unexpected configuration or KV failures use the adapter's shared plaintext `5xx` error response. Those authentication and internal-error responses are outside the diagnostic JSON and cache-header contract.
+
+The examples below use fictional IDs and values only.
+
+### GET /\_ts/admin/ec
+
+### GET /\_ts/admin/ec/`{id}`
+
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
+
+This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
+
+**Response fields:**
+
+- `ec_id`, `store`, and `generation` identify the raw KV lookup.
+- `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
+- `metadata` preserves the stored metadata JSON shape.
+- `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
+- `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
+- `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.
+
+The auction preview validates the stored record and partner configuration, but cannot reproduce live per-request consent checks. It must not be treated as proof that a specific auction request will receive those EIDs.
+
+**Status codes:**
+
+| Status | Meaning                                                     |
+| ------ | ----------------------------------------------------------- |
+| `200`  | Record found, including inspectable corrupt records         |
+| `400`  | Invalid explicit EC ID                                      |
+| `401`  | Missing or invalid Basic credentials                        |
+| `404`  | Record not found, or the bare route has no `ts-ec` cookie   |
+| `405`  | Method other than `GET` (`Allow: GET`)                      |
+| `501`  | EC identity graph unavailable on this adapter or deployment |
+| `5xx`  | Unexpected configuration or KV failure (plaintext)          |
+
+```bash
+curl -u 'admin:<resolved-admin-password>' \
+  "https://edge.example.com/_ts/admin/ec/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123"
+
+curl -u 'admin:<resolved-admin-password>' \
+  --cookie "ts-ec=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123" \
+  "https://edge.example.com/_ts/admin/ec"
+```
+
+### GET /\_ts/admin/eids
+
+Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter.
+
+After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
+
+```json
+{
+  "ingest": {
+    "matched": [
+      {
+        "source_domain": "configured.example",
+        "uid": "fictional-uid"
+      }
+    ],
+    "unmatched": [
+      {
+        "source": "unknown.example",
+        "reason": "no_partner"
+      }
+    ]
+  }
+}
+```
+
+```bash
+curl -u 'admin:<resolved-admin-password>' \
+  --cookie "sharedId=fictional-shared-id" \
+  "https://edge.example.com/_ts/admin/eids"
+```
+
+Malformed diagnostic paths return a local `404`, and unsupported methods return a local `405`; they are never forwarded to the publisher origin.
+
+---
+
 ## TSJS Library Endpoint
 
 ### GET /static/tsjs=`<filename>`
@@ -597,30 +660,21 @@ All integration modules are built at compile time. At runtime, the server concat
 
 ### Prebid Integration
 
-#### GET /first-party/ad
+#### POST /auction
 
-See [First-Party Endpoints](#get-first-party-ad) above.
+See [First-Party Endpoints](#post-auction) above.
 
-#### POST /third-party/ad
+#### GET /integrations/prebid/bundle.js
 
-See [First-Party Endpoints](#post-third-party-ad) above.
+Proxies the configured external Prebid bundle through the first-party domain.
+The optional `v` query value is the configured SHA-256 cache key.
 
-#### GET /prebid.js (Optional)
+#### GET `<script_patterns>` (Optional)
 
-Returns empty JavaScript to override Prebid.js when `script_handler` is configured.
-
-**Configuration:**
-
-```toml
-[integrations.prebid]
-script_handler = "/prebid.js"
-```
-
-**Response:**
-
-- **Content-Type:** `application/javascript; charset=utf-8`
-- **Body:** `// Prebid.js override by Trusted Server`
-- **Cache:** `immutable, max-age=31536000`
+Each configured Prebid script pattern registers an endpoint that returns empty
+JavaScript, preventing the publisher's original Prebid bundle from loading.
+The defaults include `/prebid.js`, `/prebid.min.js`, `/prebidjs.js`, and
+`/prebidjs.min.js`; set `script_patterns = []` to disable interception.
 
 ---
 
@@ -730,19 +784,25 @@ Endpoints under protected paths require HTTP Basic Authentication:
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "secure-password"
+password = "admin_password"
 ```
+
+`password` is a key in the Trusted Server secret store. Provision the actual
+Basic Authentication password under `admin_password`.
 
 **Usage:**
 
 ```bash
-curl -u admin:secure-password https://edge.example.com/_ts/admin/keys/rotate
+curl -u 'admin:<resolved-admin-password>' https://edge.example.com/_ts/admin/keys/rotate
 ```
 
 **Protected Endpoints:**
 
 - `/_ts/admin/keys/rotate`
 - `/_ts/admin/keys/deactivate`
+- `/_ts/admin/ec`
+- `/_ts/admin/ec/{id}`
+- `/_ts/admin/eids`
 - Any paths matching configured `handlers` patterns
 
 ---

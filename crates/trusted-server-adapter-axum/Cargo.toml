@@ -1,8 +1,11 @@
 [package]
 name = "trusted-server-adapter-axum"
-version = "0.1.0"
-edition = "2024"
-publish = false
+description = "Axum entry point for Trusted Server — native dev server."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true

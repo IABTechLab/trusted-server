@@ -1,5 +1,7 @@
 // Rendering utilities for Trusted Server demo placements: find slots, seed placeholders,
 // and inject creatives into sandboxed iframes.
+import { normalizeTrustedOrigin } from '../shared/origin';
+
 import { log } from './log';
 import type { AdUnit } from './types';
 import { getUnit, getAllUnits, firstSize } from './registry';
@@ -7,15 +9,22 @@ import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
 // Sandbox permissions granted to creative iframes.
-// Ad creatives routinely contain scripts for tracking, click handling, and
-// viewability measurement, so allow-scripts and allow-same-origin are required
-// for creatives to render correctly. Server-side sanitization is the primary
-// defense against malicious markup; the sandbox provides defense-in-depth.
+//
+// Ad creatives routinely contain scripts for impression reporting, click
+// handling, and viewability measurement, so `allow-scripts` is required for
+// them to render.
+//
+// `allow-same-origin` is deliberately excluded: combined with `allow-scripts` on
+// srcdoc (or first-party src) content, that pair effectively removes the sandbox's
+// origin isolation and would let SSP-provided markup run with the publisher
+// origin's privileges — cookies, storage, and same-origin fetches. The origin
+// boundary must not depend on server-side sanitization, which is optional
+// (`auction.sanitize_creatives`) and cannot run at all for renderer-based bids.
+// Matches APS_RENDERER_SANDBOX and ADM_IFRAME_SANDBOX, which already omit it.
 const CREATIVE_SANDBOX_TOKENS = [
   'allow-forms',
   'allow-popups',
   'allow-popups-to-escape-sandbox',
-  'allow-same-origin',
   'allow-scripts',
   'allow-top-navigation-by-user-activation',
 ] as const;
@@ -26,8 +35,10 @@ export type AcceptedCreativeHtml = {
   kind: 'accepted';
   originalLength: number;
   sanitizedHtml: string;
-  // Always equal to originalLength: the client validates type/emptiness only;
-  // server-side sanitization has already run before adm reaches this function.
+  // Always equal to originalLength: the client validates type/emptiness only
+  // and never removes content. Server-side sanitization is opt-in
+  // (`auction.sanitize_creatives`); the origin boundary for this markup is the
+  // iframe sandbox, not this function.
   // Retained so both union members of SanitizeCreativeHtmlResult have consistent fields.
   sanitizedLength: number;
   // Always 0 for the same reason — no content is removed client-side.
@@ -53,9 +64,12 @@ function normalizeId(raw: string): string {
 }
 
 // Validate the untrusted creative fragment before embedding it in the sandboxed iframe.
-// Dangerous markup is stripped server-side before adm reaches the client; this function
-// only guards against type errors and empty payloads. As a result, sanitizedLength always
-// equals originalLength and removedCount is always 0 for accepted creatives — these fields
+// This is validation-only, not sanitization: it guards against type errors and empty
+// payloads and never removes content. Server-side stripping of executable markup is
+// opt-in (`auction.sanitize_creatives`), so the adm arriving here may be raw bidder
+// markup — the origin boundary is the iframe sandbox (no `allow-same-origin`), which
+// does not depend on any sanitization having run. sanitizedLength always equals
+// originalLength and removedCount is always 0 for accepted creatives — these fields
 // exist for structural consistency with the shared result type but carry no signal here.
 export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
   if (typeof creativeHtml !== 'string') {
@@ -163,7 +177,9 @@ export function renderAllAdUnits(): void {
 
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
-// Construct a sandboxed iframe sized for sanitized, non-executable creative HTML.
+// Construct a sandboxed iframe for creative HTML. The markup may be raw bidder
+// output (server-side sanitization is opt-in); the sandbox's origin isolation,
+// not any sanitization, is the security boundary.
 export function createAdIframe(
   container: HTMLElement,
   opts: IframeOptions = {}
@@ -205,10 +221,28 @@ export function createAdIframe(
   return iframe;
 }
 
-// Build a complete HTML document for a sanitized creative fragment, suitable for iframe.srcdoc.
+// Origin the creative runtime resolves root-relative first-party URLs against.
+//
+// The srcdoc document has an opaque origin and an `about:srcdoc` location, so it
+// has no usable origin of its own; `document.baseURI` would work but is
+// inherited and honours a publisher `<base>`, i.e. it is not a trustworthy
+// security boundary. This page — first-party, non-opaque — knows the real
+// origin, so it stamps it into the document ahead of any creative markup.
+//
+// Only an exact `scheme://host[:port]` shape is emitted, so the value cannot
+// break out of the quoted string it is written into.
+function trustedCreativeOrigin(): string {
+  try {
+    return normalizeTrustedOrigin(location.origin);
+  } catch {
+    // fall through to an empty stamp; the runtime degrades to document.baseURI
+  }
+  return '';
+}
+
+// Build a complete HTML document for a creative fragment, suitable for iframe.srcdoc.
 export function buildCreativeDocument(creativeHtml: string): string {
-  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', () => NORMALIZE_CSS).replace(
-    '%CREATIVE_HTML%',
-    () => creativeHtml
-  );
+  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', () => NORMALIZE_CSS)
+    .replace('%TRUSTED_ORIGIN%', () => trustedCreativeOrigin())
+    .replace('%CREATIVE_HTML%', () => creativeHtml);
 }

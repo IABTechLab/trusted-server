@@ -31,7 +31,7 @@ rewrite_sdk = true
 - `GET /integrations/permutive/sdk` - SDK serving
 - `GET/POST /integrations/permutive/api/*` - API proxy
 - `GET/POST /integrations/permutive/secure-signal/*` - Secure Signals (GAM integration)
-- `GET/POST /integrations/permutive/events/*` - Event tracking
+- `GET/POST /integrations/permutive/events/*` - Event collection
 - `GET/POST /integrations/permutive/sync/*` - ID synchronization
 - `GET /integrations/permutive/cdn/*` - CDN proxy
 
@@ -41,7 +41,7 @@ rewrite_sdk = true
 - **First-party data**: All data collection through your domain
 - **Secure Signals**: Integrate with Google Ad Manager
 - **SDK caching**: Performance optimization (1 hour TTL)
-- **Privacy compliance**: Consent-based activation
+- **Consent-based activation**: Segment activation subject to available consent signals
 
 ## Use Cases
 
@@ -51,7 +51,7 @@ Collect first-party data, build segments, activate in programmatic auctions to i
 
 ### Contextual Targeting
 
-Combine page context with user behavior for privacy-safe targeting.
+Combine page context with user behavior for audience segment targeting.
 
 ### Cross-Site Insights
 

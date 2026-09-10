@@ -12,6 +12,8 @@
 //! - [`PlatformBackend`] — dynamic backend registration
 //! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
+//! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
+//! - [`PlatformTemplateCache`] — shared transformed-template caching
 //!
 //! ## Platform-Agnostic Components
 //!
@@ -32,19 +34,26 @@
 
 use std::time::Duration;
 
+mod backend_naming;
 mod composite;
 mod error;
 mod http;
 mod image_optimizer;
 mod kv;
+mod template_assembly;
+mod template_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod traits;
 mod types;
 
+pub use backend_naming::{
+    AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
+    BackendNamingPolicy, PredictedBackend,
+};
 pub use composite::{CompositeConfigStore, CompositeSecretStore};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
-pub use error::{is_not_found, PlatformError};
+pub use error::{PlatformError, is_not_found};
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSelectResult, UnavailableHttpClient,
@@ -54,6 +63,17 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
+pub use template_assembly::{
+    PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
+    contains_publisher_esi_directive,
+};
+pub use template_cache::{
+    PlatformTemplateCache, PlatformTemplateCacheReservation, REPLAYABLE_POLICY_HEADERS,
+    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
+    TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
+    TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
+    VaryHeaderValues, VarySpec,
+};
 pub use traits::{
     PlatformBackend, PlatformConfigStore, PlatformConfigWriter, PlatformGeo, PlatformSecretStore,
     PlatformSecretWriter,
@@ -203,6 +223,26 @@ mod tests {
             .downcast::<u8>()
             .expect("should recover the stored pending request type");
         assert_eq!(value, 7, "should preserve the stored pending request");
+    }
+
+    #[test]
+    fn platform_pending_request_preserves_response_handling_metadata() {
+        let pending = PlatformPendingRequest::new(7_u8)
+            .with_backend_name("origin")
+            .with_response_handling(true, edgezero_core::http::Method::HEAD);
+        let pending = pending
+            .downcast::<String>()
+            .expect_err("should reject downcast to the wrong pending type");
+
+        assert!(
+            pending.stream_response(),
+            "should preserve the streaming response flag"
+        );
+        assert_eq!(
+            pending.request_method(),
+            Some(&edgezero_core::http::Method::HEAD),
+            "should preserve the originating request method"
+        );
     }
 
     #[test]

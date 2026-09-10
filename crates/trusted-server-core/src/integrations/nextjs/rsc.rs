@@ -96,13 +96,12 @@ impl Iterator for EscapeSequenceIter<'_> {
             return None;
         }
 
-        if let Some(marker) = self.skip_marker {
-            if self.pos + marker.len() <= self.bytes.len()
-                && &self.bytes[self.pos..self.pos + marker.len()] == marker
-            {
-                self.pos += marker.len();
-                return Some(EscapeElement { byte_count: 0 });
-            }
+        if let Some(marker) = self.skip_marker
+            && self.pos + marker.len() <= self.bytes.len()
+            && &self.bytes[self.pos..self.pos + marker.len()] == marker
+        {
+            self.pos += marker.len();
+            return Some(EscapeElement { byte_count: 0 });
         }
 
         if self.bytes[self.pos] == b'\\' && self.pos + 1 < self.bytes.len() {
@@ -123,30 +122,29 @@ impl Iterator for EscapeSequenceIter<'_> {
 
             if esc == b'u' && self.pos + 5 < self.bytes.len() {
                 let hex = &self.str_ref[self.pos + 2..self.pos + 6];
-                if hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    if let Ok(code_unit) = u16::from_str_radix(hex, 16) {
-                        if (0xD800..=0xDBFF).contains(&code_unit)
-                            && self.pos + 11 < self.bytes.len()
-                            && self.bytes[self.pos + 6] == b'\\'
-                            && self.bytes[self.pos + 7] == b'u'
+                if hex.chars().all(|c| c.is_ascii_hexdigit())
+                    && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+                {
+                    if (0xD800..=0xDBFF).contains(&code_unit)
+                        && self.pos + 11 < self.bytes.len()
+                        && self.bytes[self.pos + 6] == b'\\'
+                        && self.bytes[self.pos + 7] == b'u'
+                    {
+                        let hex2 = &self.str_ref[self.pos + 8..self.pos + 12];
+                        if hex2.chars().all(|c| c.is_ascii_hexdigit())
+                            && let Ok(code_unit2) = u16::from_str_radix(hex2, 16)
+                            && (0xDC00..=0xDFFF).contains(&code_unit2)
                         {
-                            let hex2 = &self.str_ref[self.pos + 8..self.pos + 12];
-                            if hex2.chars().all(|c| c.is_ascii_hexdigit()) {
-                                if let Ok(code_unit2) = u16::from_str_radix(hex2, 16) {
-                                    if (0xDC00..=0xDFFF).contains(&code_unit2) {
-                                        self.pos += 12;
-                                        return Some(EscapeElement { byte_count: 4 });
-                                    }
-                                }
-                            }
+                            self.pos += 12;
+                            return Some(EscapeElement { byte_count: 4 });
                         }
-
-                        let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
-                        self.pos += 6;
-                        return Some(EscapeElement {
-                            byte_count: c.len_utf8(),
-                        });
                     }
+
+                    let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
+                    self.pos += 6;
+                    return Some(EscapeElement {
+                        byte_count: c.len_utf8(),
+                    });
                 }
             }
         }

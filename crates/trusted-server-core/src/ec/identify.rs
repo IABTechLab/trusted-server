@@ -15,10 +15,10 @@ use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
 
+use super::EcContext;
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::registry::PartnerRegistry;
-use super::EcContext;
 
 /// Handles `GET /_ts/api/v1/identify`.
 ///
@@ -96,10 +96,10 @@ pub fn handle_identify(
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
                 // Extract only this partner's UID.
-                if let Some(partner_uid) = entry.ids.get(&partner.source_domain) {
-                    if !partner_uid.uid.is_empty() {
-                        uid = Some(partner_uid.uid.clone());
-                    }
+                if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
+                    && !partner_uid.uid.is_empty()
+                {
+                    uid = Some(partner_uid.uid.clone());
                 }
 
                 // Evaluate cluster size lazily for identify responses. Existing
@@ -367,7 +367,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(api_token.to_owned()),
+            api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,

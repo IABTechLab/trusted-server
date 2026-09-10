@@ -145,8 +145,8 @@ fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
 }
 
 fn us_sale_opt_out_from_section(section: &iab_gpp::sections::Section) -> Option<bool> {
-    use iab_gpp::sections::us_common::OptOut;
     use iab_gpp::sections::Section;
+    use iab_gpp::sections::us_common::OptOut;
 
     // Keep this match in sync with new US-state variants added by `iab_gpp`.
     let sale_opt_out = match section {
@@ -204,11 +204,7 @@ pub fn parse_gpp_sid_cookie(raw: &str) -> Option<Vec<u16>> {
         })
         .collect();
 
-    if ids.is_empty() {
-        None
-    } else {
-        Some(ids)
-    }
+    if ids.is_empty() { None } else { Some(ids) }
 }
 
 #[cfg(test)]

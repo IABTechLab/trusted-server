@@ -142,6 +142,7 @@ Playwright directly.
 |---|---|
 | `script-injection` | `script#trustedserver-js` present in live DOM, no console errors |
 | `script-bundle` | JS bundle loads with 200, no parse/runtime errors, correct content type |
+| `aps-renderer` | Static route nonce gating, restrictive CSP, replay rejection, and opaque iframe/script isolation |
 
 ### Browser-level — Next.js
 
@@ -150,6 +151,7 @@ Playwright directly.
 | `navigation` | 4-page SPA navigation chain preserves injection without full reload, back button works, deferred route script executes after SPA transition |
 | `api-passthrough` | API routes return JSON without script injection (`/api/hello`, `/api/data`) |
 | `form-rewriting` | `<form action>` URL rewritten from origin to proxy on `/contact` page |
+| `gpt-diagnostics` | Inactive/active tab behavior, GPT lifecycle capture, conservative overlap handling, exact binding, remount, local export, and non-interference |
 
 ### Browser-level — WordPress
 

@@ -3,7 +3,7 @@
 //! This module provides Ed25519-based signing and verification of HTTP requests
 //! using keys stored via platform store primitives.
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use error_stack::{Report, ResultExt as _};
 use serde::Serialize;

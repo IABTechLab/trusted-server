@@ -31,8 +31,12 @@ describe('render', () => {
     expect(sandbox).toContain('allow-popups');
     expect(sandbox).toContain('allow-popups-to-escape-sandbox');
     expect(sandbox).toContain('allow-top-navigation-by-user-activation');
-    expect(sandbox).toContain('allow-same-origin');
     expect(sandbox).toContain('allow-scripts');
+    // `allow-scripts` + `allow-same-origin` together defeat the sandbox: creative
+    // markup would run with the publisher origin's privileges (cookies, storage,
+    // same-origin fetches). Matches APS_RENDERER_SANDBOX and ADM_IFRAME_SANDBOX,
+    // which already omit it.
+    expect(sandbox).not.toContain('allow-same-origin');
   });
 
   it('preserves dollar sequences when building the creative document', async () => {
@@ -41,6 +45,49 @@ describe('render', () => {
     const documentHtml = buildCreativeDocument(creativeHtml);
 
     expect(documentHtml).toContain(creativeHtml);
+  });
+
+  it('stamps the first-party origin ahead of the creative markup', async () => {
+    // The srcdoc document has an opaque origin and an about:srcdoc location, so
+    // the creative runtime has no trustworthy origin of its own. This page —
+    // first-party and non-opaque — stamps the real one before any bidder markup
+    // can install a <base> or otherwise influence resolution.
+    const { buildCreativeDocument } = await import('../../src/core/render');
+    const creativeHtml = '<div>creative</div>';
+    const documentHtml = buildCreativeDocument(creativeHtml);
+
+    expect(documentHtml).toContain(`value: '${location.origin}'`);
+    expect(documentHtml.indexOf('__tsCreativeOrigin')).toBeLessThan(
+      documentHtml.indexOf(creativeHtml)
+    );
+  });
+
+  it('defines the stamped origin so creative script cannot overwrite it', async () => {
+    // Creative markup can carry its own <head> script, whose content executes
+    // before the runtime injected at the top of <body>. A plain assignment
+    // would let it point click and rebuild resolution at an attacker origin.
+    const { buildCreativeDocument } = await import('../../src/core/render');
+    const documentHtml = buildCreativeDocument('<div>creative</div>');
+
+    expect(documentHtml).toContain("Object.defineProperty(window, '__tsCreativeOrigin'");
+    expect(documentHtml).toContain('writable: false');
+    expect(documentHtml).toContain('configurable: false');
+
+    // Execute the stamp exactly as the browser would, then try to overwrite it.
+    // Parse rather than regex out the script: tag-matching patterns miss case
+    // and attribute variations, and the DOM is what the browser actually uses.
+    const parsed = new DOMParser().parseFromString(documentHtml, 'text/html');
+    const stamp = parsed.querySelector('head script')?.textContent;
+    expect(stamp, 'document should carry the stamping script').toBeTruthy();
+    const host: Record<string, unknown> = {};
+    new Function('window', stamp as string)(host);
+    expect(host.__tsCreativeOrigin).toBe(location.origin);
+    try {
+      host.__tsCreativeOrigin = 'https://attacker.example';
+    } catch {
+      // strict-mode assignment throws; either way the value must not change
+    }
+    expect(host.__tsCreativeOrigin).toBe(location.origin);
   });
 
   it('accepts safe static markup during sanitization', async () => {

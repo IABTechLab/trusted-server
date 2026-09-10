@@ -403,3 +403,79 @@ impl Drop for MinimalOrigin {
         }
     }
 }
+
+/// A minimal HTTP origin that reflects the request's Cookie header in a
+/// cacheable HTML response.
+///
+/// This makes it possible to assert that an edge runtime does not reuse a
+/// cookie-influenced publisher response for another visitor.
+pub struct CookieVaryingOrigin {
+    shutdown_tx: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CookieVaryingOrigin {
+    /// Starts the cookie-varying origin on `127.0.0.1:{port}`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the port is already in use.
+    pub fn start(port: u16) -> Self {
+        let listener =
+            TcpListener::bind(format!("127.0.0.1:{port}")).expect("should bind origin port");
+        listener
+            .set_nonblocking(true)
+            .expect("should set listener nonblocking");
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+        let handle = thread::spawn(move || {
+            loop {
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let mut buf = [0u8; 4096];
+                        let Ok(bytes_read) = stream.read(&mut buf) else {
+                            continue;
+                        };
+                        let request = String::from_utf8_lossy(&buf[..bytes_read]);
+                        let cookie = request
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("cookie").then(|| value.trim())
+                            })
+                            .unwrap_or("viewer=missing");
+                        let body = format!("<html><body>{cookie}</body></html>");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            shutdown_tx,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for CookieVaryingOrigin {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}

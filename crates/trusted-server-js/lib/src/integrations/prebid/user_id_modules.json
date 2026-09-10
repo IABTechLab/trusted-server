@@ -59,6 +59,18 @@
       "notes": "Imported through a local ESM shim because the public Prebid wrapper contains CommonJS require()."
     },
     {
+      "moduleName": "lockrAIMIdSystem",
+      "configNames": ["lockrAIMId"],
+      "eidSources": [],
+      "importPath": "prebid.js/modules/lockrAIMIdSystem.js"
+    },
+    {
+      "moduleName": "pairIdSystem",
+      "configNames": ["pairId"],
+      "eidSources": ["google.com"],
+      "importPath": "prebid.js/modules/pairIdSystem.js"
+    },
+    {
       "moduleName": "pubProvidedIdSystem",
       "configNames": ["pubProvidedId"],
       "eidSources": [],

@@ -356,11 +356,7 @@ impl fmt::Display for PrivacyFlag {
 
 impl From<bool> for PrivacyFlag {
     fn from(value: bool) -> Self {
-        if value {
-            Self::Yes
-        } else {
-            Self::No
-        }
+        if value { Self::Yes } else { Self::No }
     }
 }
 

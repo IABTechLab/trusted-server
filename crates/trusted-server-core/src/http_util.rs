@@ -1,15 +1,17 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chacha20poly1305::{aead::Aead as _, aead::KeyInit as _, XChaCha20Poly1305, XNonce};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit as _};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::{header, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
+use std::time::Duration;
 use subtle::ConstantTimeEq as _;
 
+use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::platform::ClientInfo;
-use crate::settings::Settings;
+use crate::settings::{Settings, TrustedClientIpConfig};
 
 /// Copy `X-*` custom headers from one request to another, skipping TS-internal headers.
 ///
@@ -32,17 +34,35 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
     }
 }
 
-/// Headers that clients can spoof to hijack URL rewriting.
+/// Headers that clients can spoof to hijack URL rewriting or the client address.
 ///
-/// On Fastly Compute the service is the edge — there is no upstream proxy that
-/// legitimately sets these. Stripping them forces [`RequestInfo::from_request`]
-/// to fall back to the trustworthy `Host` header and [`ClientInfo`] TLS detection.
+/// On Fastly Compute these values are client-spoofable at request entry. The
+/// Fastly adapter may first consume an authenticated `fastly-client-ip`, but
+/// removes it before routing along with every other listed header. Stripping
+/// them forces [`RequestInfo::from_request`] to fall back to the trustworthy
+/// `Host` header and [`ClientInfo`] TLS detection.
 pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
     "x-forwarded-proto",
     "fastly-ssl",
+    "fastly-client-ip",
 ];
+
+/// Remove the configured client-IP trust headers before routing.
+///
+/// Only the Fastly adapter consumes these values, but every adapter removes
+/// them so a shared configuration cannot expose an authentication secret to
+/// publisher or integration request handling.
+pub fn sanitize_trusted_client_ip_headers(
+    req: &mut Request<EdgeBody>,
+    config: Option<&TrustedClientIpConfig>,
+) {
+    if let Some(config) = config {
+        req.headers_mut().remove(config.ip_header.as_str());
+        req.headers_mut().remove(config.auth_header.as_str());
+    }
+}
 
 /// Strip forwarded headers that clients can spoof.
 ///
@@ -232,36 +252,39 @@ fn detect_request_scheme(
     }
 
     // 2. Try the Forwarded header (RFC 7239)
-    if let Some(forwarded) = req.headers().get("forwarded") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            if let Some(proto) = parse_forwarded_param(forwarded_str, "proto") {
-                if let Some(scheme) = normalize_scheme(proto) {
-                    return scheme;
-                }
-            }
-        }
+    if let Some(forwarded) = req.headers().get("forwarded")
+        && let Ok(forwarded_str) = forwarded.to_str()
+        && let Some(proto) = parse_forwarded_param(forwarded_str, "proto")
+        && let Some(scheme) = normalize_scheme(proto)
+    {
+        return scheme;
     }
 
     // 3. Try X-Forwarded-Proto header
-    if let Some(proto) = req.headers().get("x-forwarded-proto") {
-        if let Ok(proto_str) = proto.to_str() {
-            if let Some(value) = parse_list_header_value(proto_str) {
-                if let Some(scheme) = normalize_scheme(value) {
-                    return scheme;
-                }
-            }
-        }
+    if let Some(proto) = req.headers().get("x-forwarded-proto")
+        && let Ok(proto_str) = proto.to_str()
+        && let Some(value) = parse_list_header_value(proto_str)
+        && let Some(scheme) = normalize_scheme(value)
+    {
+        return scheme;
     }
 
     // 4. Check Fastly-SSL header. On the `EdgeZero` path this is injected from
     //    authoritative Fastly TLS metadata after spoofable headers are stripped,
     //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
-    if let Some(ssl) = req.headers().get("fastly-ssl") {
-        if let Ok(ssl_str) = ssl.to_str() {
-            if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
-                return "https".to_owned();
-            }
-        }
+    //
+    //    Layering wart: this is a vendor-specific header name living in
+    //    platform-neutral core. It is only a fallback — signal #1 above
+    //    (`ClientInfo::tls_protocol`) is the neutral path adapters populate. The
+    //    `fastly-ssl` fallback (plus its entry in `SPOOFABLE_FORWARDED_HEADERS`
+    //    and the origin-forwarding strip in `publisher::rewrite_origin_request`)
+    //    should be replaced by a platform-neutral scheme signal in a separate
+    //    change, after confirming the legacy path is covered by `ClientInfo`.
+    if let Some(ssl) = req.headers().get("fastly-ssl")
+        && let Ok(ssl_str) = ssl.to_str()
+        && (ssl_str == "1" || ssl_str.to_lowercase() == "true")
+    {
+        return "https".to_owned();
     }
 
     // Default to HTTP
@@ -279,44 +302,41 @@ pub fn serve_static_with_etag(
     body: &str,
     req: &Request<EdgeBody>,
     content_type: &str,
+    edge_header: EdgeCacheHeader,
 ) -> Response<EdgeBody> {
-    // Compute ETag for conditional caching
     let hash = Sha256::digest(body.as_bytes());
     let etag = format!("\"sha256-{}\"", hex::encode(hash));
+    let short_policy = CachePolicy::public_short_with_stale(
+        Duration::from_secs(300),
+        Duration::from_secs(60),
+        Duration::from_secs(86_400),
+    );
 
-    // If-None-Match handling for 304 responses
     if let Some(if_none_match) = req
         .headers()
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
+        && if_none_match == etag
     {
-        if if_none_match == etag {
-            return Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(header::ETAG, &etag)
-                .header(
-                    header::CACHE_CONTROL,
-                    "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
-                )
-                .header("surrogate-control", "max-age=300")
-                .header(header::VARY, "Accept-Encoding")
-                .body(EdgeBody::empty())
-                .expect("should build 304 static response");
-        }
+        let mut response = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::VARY, "Accept-Encoding")
+            .body(EdgeBody::empty())
+            .expect("should build 304 static response");
+        short_policy.apply_to_headers(response.headers_mut(), edge_header);
+        return response;
     }
 
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(
-            header::CACHE_CONTROL,
-            "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
-        )
-        .header("surrogate-control", "max-age=300")
         .header(header::ETAG, &etag)
         .header(header::VARY, "Accept-Encoding")
         .body(EdgeBody::from(body.as_bytes()))
-        .expect("should build static response")
+        .expect("should build static response");
+    short_policy.apply_to_headers(response.headers_mut(), edge_header);
+    response
 }
 
 /// Encrypts a URL using XChaCha20-Poly1305 with a key derived from the publisher `proxy_secret`.
@@ -467,6 +487,8 @@ pub fn enforce_max_body_size(
 mod tests {
     use super::*;
     use crate::platform::ClientInfo;
+    use crate::redacted::Redacted;
+    use crate::settings::TrustedClientIpConfig;
     use http::{HeaderName, HeaderValue, Method};
 
     fn build_request(method: Method, uri: &str) -> Request<EdgeBody> {
@@ -665,6 +687,41 @@ mod tests {
     }
 
     // Sanitization tests
+
+    #[test]
+    fn sanitize_trusted_client_ip_headers_removes_only_configured_headers() {
+        let config = TrustedClientIpConfig {
+            ip_header: "x-reader-ip".to_owned(),
+            auth_header: "x-reader-ip-auth".to_owned(),
+            shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+        };
+        let mut req = build_request(Method::GET, "https://example.com/page");
+        set_header(&mut req, "x-reader-ip", "198.51.100.7");
+        set_header(
+            &mut req,
+            "x-reader-ip-auth",
+            "fictional-shared-secret-0123456789",
+        );
+        set_header(&mut req, "x-unrelated", "preserved");
+
+        sanitize_trusted_client_ip_headers(&mut req, Some(&config));
+
+        assert!(
+            req.headers().get("x-reader-ip").is_none(),
+            "should remove the configured IP header"
+        );
+        assert!(
+            req.headers().get("x-reader-ip-auth").is_none(),
+            "should remove the configured authentication header"
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-unrelated")
+                .expect("should preserve an unrelated header"),
+            "preserved",
+            "should not remove unrelated headers"
+        );
+    }
 
     #[test]
     fn sanitize_removes_all_spoofable_headers() {

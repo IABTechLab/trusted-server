@@ -39,8 +39,8 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use fastly::config_store::OpenError;
 use fastly::ConfigStore;
+use fastly::config_store::OpenError;
 
 /// Plain key/value reader over a Fastly Config Store.
 ///

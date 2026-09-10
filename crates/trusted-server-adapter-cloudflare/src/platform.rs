@@ -5,19 +5,19 @@ use std::time::Duration;
 use bytes::Bytes;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::platform::StoreName;
 use trusted_server_core::platform::{
-    ClientInfo, CompositeConfigStore, CompositeSecretStore, GeoInfo, KvError, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformConfigWriter, PlatformError, PlatformGeo,
-    PlatformHttpClient, PlatformKvStore, PlatformSecretStore, PlatformSecretWriter,
+    BackendNamingPolicy, ClientInfo, CompositeConfigStore, CompositeSecretStore, GeoInfo, KvError,
+    PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformConfigWriter, PlatformError,
+    PlatformGeo, PlatformHttpClient, PlatformKvStore, PlatformSecretStore, PlatformSecretWriter,
     RuntimeServices, StoreId, UnavailableKvStore,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
 use trusted_server_core::platform::UnavailableHttpClient;
 
-#[cfg(target_arch = "wasm32")]
-use error_stack::ResultExt as _;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
@@ -54,20 +54,15 @@ impl PlatformSecretWriter for NoopSecretStore {
 struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Cloudflare
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        let port = spec
-            .port
-            .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
-        let timeout_ms = spec.first_byte_timeout.as_millis();
-        let cert_suffix = if spec.certificate_check {
-            ""
-        } else {
-            "_nocert"
-        };
-        Ok(format!(
-            "{}_{}_{}_{timeout_ms}ms{cert_suffix}",
-            spec.scheme, spec.host, port
-        ))
+        self.naming_policy()
+            .predict(spec)
+            .map(|prediction| prediction.name)
+            .change_context(PlatformError::Backend)
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -207,13 +202,53 @@ fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bo
     HOP_BY_HOP.iter().any(|header| *header == lower) || connection_tokens.contains(&lower)
 }
 
+/// Cache policy for the outbound Workers `fetch` derived from
+/// [`PlatformHttpRequest::bypass_cache`].
+///
+/// Workers subrequests are eligible for Cloudflare's cache by default, so an
+/// ad-stack navigation could otherwise be satisfied from cache (or revalidated
+/// into a bodyless 304) instead of receiving a complete origin body. Mapping
+/// the bypass flag to the runtime's `no-store` mode keeps the core contract's
+/// cache-bypass guarantee intact on this adapter.
+///
+/// Extracted as a free function over a target-independent enum so the mapping
+/// is testable on native targets, where the `#[cfg(target_arch = "wasm32")]`
+/// `execute` impl and its `worker` dependency are excluded from the test
+/// binary.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OutboundCacheMode {
+    /// Leave the Workers runtime's default cache behavior in place.
+    RuntimeDefault,
+    /// Maps to `worker::CacheMode::NoStore`.
+    NoStore,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn outbound_cache_mode(bypass_cache: bool) -> OutboundCacheMode {
+    if bypass_cache {
+        OutboundCacheMode::NoStore
+    } else {
+        OutboundCacheMode::RuntimeDefault
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn outbound_request_init(method: worker::Method, headers: worker::Headers) -> worker::RequestInit {
+    let mut init = worker::RequestInit::new();
+    init.with_method(method)
+        .with_headers(headers)
+        .with_redirect(worker::RequestRedirect::Manual);
+    init
+}
+
 #[cfg(target_arch = "wasm32")]
 impl CloudflareHttpClient {
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
+        use worker::{CacheMode, Fetch, Headers, Method, Request};
 
         // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
         // metadata, and it always buffers the response body (see below). The
@@ -232,6 +267,8 @@ impl CloudflareHttpClient {
                 "streaming response bodies are not supported on the Cloudflare Workers runtime",
             ));
         }
+
+        let cache_mode = outbound_cache_mode(request.bypass_cache);
 
         let uri = request.request.uri().to_string();
         // http::Method always stores uppercase; worker 0.7 implements From<String> only.
@@ -261,7 +298,6 @@ impl CloudflareHttpClient {
             }
         };
 
-        let mut init = RequestInit::new();
         // Force manual redirect handling: the Workers runtime otherwise defaults
         // to `RequestRedirect::Follow` and transparently chases 3xx responses to
         // any host inside `Fetch::send()`. Core's `proxy_with_redirects` does its
@@ -269,9 +305,18 @@ impl CloudflareHttpClient {
         // `allowed_domains`; auto-following here would bypass that allowlist
         // (SSRF). `Manual` surfaces the 3xx + Location back to core unfollowed,
         // matching the Axum adapter's `redirect::Policy::none()`.
-        init.with_method(method)
-            .with_headers(headers)
-            .with_redirect(RequestRedirect::Manual);
+        let mut init = outbound_request_init(method, headers);
+        // Setting the `cache` field requires the `cache_option_enabled`
+        // compatibility flag, which is only on by default from compatibility
+        // date 2024-11-11. `wrangler.toml`/`wrangler.ci.toml` pin an earlier
+        // date and set the flag explicitly; without it the Workers runtime
+        // throws here rather than failing at deploy time.
+        match cache_mode {
+            OutboundCacheMode::NoStore => {
+                init.with_cache(CacheMode::NoStore);
+            }
+            OutboundCacheMode::RuntimeDefault => {}
+        }
         if !body_bytes.is_empty() {
             let uint8 = js_sys::Uint8Array::from(body_bytes.as_slice());
             init.with_body(Some(uint8.into()));
@@ -453,6 +498,43 @@ impl PlatformHttpClient for CloudflareHttpClient {
 // `PlatformSecretStore::get_bytes` is sync. The Cloudflare `env.secret()`
 // call IS synchronous at the JS level, so we call it directly here.
 // ---------------------------------------------------------------------------
+
+/// Bridges [`worker::Env`] secrets to [`PlatformSecretStore`] by calling
+/// `env.secret(key)` synchronously. Writes and deletes return errors.
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct CloudflareSecretStoreAdapter {
+    pub(crate) env: worker::Env,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait::async_trait(?Send)]
+impl PlatformSecretStore for CloudflareSecretStoreAdapter {
+    async fn get_bytes(
+        &self,
+        _store_name: &StoreName,
+        key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        match self.env.secret(key) {
+            // worker 0.7: Secret implements Display via JsValue::as_string() which
+            // returns the raw JS string value with no wrapping or debug formatting.
+            // Verified in worker-rs src/env.rs: `impl Display for Secret { fn fmt ->
+            // write!(f, "{}", self.inner.as_string().unwrap_or_default()) }`.
+            Ok(secret) => Ok(secret.to_string().into_bytes()),
+            Err(err) => Err(Report::new(PlatformError::SecretStore)
+                .attach(format!("secret lookup failed for key `{key}`: {err}"))),
+        }
+    }
+
+    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("secret store writes are not supported on Cloudflare Workers"))
+    }
+
+    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("secret store writes are not supported on Cloudflare Workers"))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // build_runtime_services
@@ -818,6 +900,25 @@ mod registry_test_support {
 mod tests {
     use super::*;
     use edgezero_core::context::RequestContext;
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn outbound_request_creation_sets_manual_redirect_mode() {
+        let init = outbound_request_init(worker::Method::Get, worker::Headers::new());
+        assert!(matches!(init.redirect, worker::RequestRedirect::Manual));
+    }
+
+    #[test]
+    fn auction_http_capabilities_are_explicit() {
+        let capabilities = trusted_server_core::platform::AuctionTargetId::Cloudflare
+            .descriptor()
+            .capabilities();
+        assert!(!capabilities.supports_concurrent_provider_fanout());
+        assert!(
+            !capabilities.has_enforceable_total_request_deadline(),
+            "Workers fetch does not expose an enforceable hard total request deadline"
+        );
+    }
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
     use trusted_server_core::platform::StoreName;
@@ -1091,6 +1192,28 @@ mod tests {
         assert!(
             msg.contains("5"),
             "error message should include provider count"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // outbound_cache_mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn outbound_cache_mode_maps_bypass_to_no_store() {
+        assert_eq!(
+            outbound_cache_mode(true),
+            OutboundCacheMode::NoStore,
+            "bypass_cache should force the Workers `no-store` cache mode"
+        );
+    }
+
+    #[test]
+    fn outbound_cache_mode_leaves_default_when_not_bypassing() {
+        assert_eq!(
+            outbound_cache_mode(false),
+            OutboundCacheMode::RuntimeDefault,
+            "requests without bypass_cache should keep the runtime default cache behavior"
         );
     }
 }
