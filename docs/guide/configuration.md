@@ -2074,7 +2074,11 @@ Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
 manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
 counts and response integrity, and executes the generated GPT module against
-the served seam to require a real `defineSlot` call.
+the served seam to require a real `defineSlot` call. Both modes also exercise a
+cookie-selected origin: A/B isolation without a client variant header, absent
+versus empty buckets, ignored compact JSON and comma-list cookies, and session
+bypass on warm and cold URLs. Each request checks the selected HTML, cache
+diagnostics, private response policy, winning-bid assembly, and origin fetch count.
 
 ### `gam_unit_path` templating
 

@@ -179,13 +179,29 @@ class H(BaseHTTPRequestHandler):
             ("Surrogate-Control", "max-age=1200, stale-while-revalidate=21600, stale-if-error=604800"),
             ("Vary", "Accept-Encoding"),
         ]
+        page = PAGE
+        if self.path.startswith("/article/cookie-policy"):
+            # Model a downstream CDN selecting HTML after TS has selected its key.
+            # Clients deliberately send no X-Exp-Variant header.
+            assert self.headers.get("X-Exp-Variant") is None
+            cookies = {}
+            for field in self.headers.get_all("Cookie", []):
+                for pair in field.split(";"):
+                    name, separator, value = pair.strip().partition("=")
+                    if separator:
+                        cookies[name] = value
+            variant = cookies.get("ab_bucket", "absent") or "empty"
+            session = "session" in cookies
+            marker = f"<p>variant={variant};session={str(session).lower()}</p>"
+            page = PAGE.replace(b"<p>Body copy.</p>", marker.encode())
+            base.append(("Vary", "X-Exp-Variant"))
         if "gzip" in (self.headers.get("Accept-Encoding") or ""):
             print("origin: served COMPRESSED", flush=True)
-            self._send(gzip.compress(PAGE), "text/html; charset=utf-8",
+            self._send(gzip.compress(page), "text/html; charset=utf-8",
                        base + [("Content-Encoding", "gzip")])
         else:
             print("origin: served PLAINTEXT", flush=True)
-            self._send(PAGE, "text/html; charset=utf-8", base)
+            self._send(page, "text/html; charset=utf-8", base)
 
     def do_POST(self):
         print(f"origin: received POST {self.path}", flush=True)
@@ -295,7 +311,9 @@ s = replace_once(
 # and must go at the end: inserted here it would swallow every scalar key that
 # follows into `[[creative_opportunities.slot]]`.
 scalars = f'''assembly_mode = "{mode}"
-template_cache_vary = []
+template_cache_vary = ["x-exp-variant"]
+template_cache_key_cookies = ["ab_bucket"]
+template_cache_bypass_cookies = ["session"]
 origin_is_cookie_independent = true'''
 lines = s.split("\n")
 lines.insert(lines.index("[creative_opportunities]") + 1, scalars)
@@ -303,7 +321,7 @@ lines.append('''
 [[creative_opportunities.slot]]
 id = "ts-slot-header"
 div_id = "ts-slot-header"
-page_patterns = ["/article"]
+page_patterns = ["/article", "/article/cookie-policy*"]
 formats = [{ width = 728, height = 90 }]
 ''')
 open(out, "w").write("\n".join(lines))
@@ -760,6 +778,90 @@ if [ "$MODE" != "inline" ]; then
   # cache still stores identity; that does not require changing what this reader accepts.
   check "the origin fetch stays compressed" \
     "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
+fi
+
+info "Cookie variant isolation and session bypass (mode: $MODE)"
+if python3 - "$TS_PORT" "$MODE" "$WORK/origin.log" "$REQUEST_TIMEOUT_SECONDS" <<'PYEOF'
+import gzip
+import sys
+import urllib.request
+from pathlib import Path
+
+port, mode, origin_log, timeout = sys.argv[1:]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def origin_gets(path):
+    return Path(origin_log).read_text().splitlines().count(f"origin: received GET {path}")
+
+
+def request(path, cookie, variant, state, fetches, session=False):
+    before = origin_gets(path)
+    headers = {
+        "Host": "ts.example.com",
+        "Accept-Encoding": "gzip",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+    with opener.open(req, timeout=float(timeout)) as response:
+        body = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        html = body.decode()
+        assert response.status == 200, response.status
+        marker = f"<p>variant={variant};session={str(session).lower()}</p>"
+        assert marker in html, f"wrong cookie-selected HTML: expected {marker}"
+        assert html.count("<p>variant=") == 1, "should contain only this reader's variant"
+        assert "<!--ts-ad-seam-->" not in html, "unresolved assembly seam"
+        assert '\\"hb_pb\\":\\"4.25\\"' in html, "missing assembled winning bid"
+        policy = response.headers.get("Cache-Control", "").lower()
+        assert "private" in policy and "no-store" in policy, policy
+        actual = response.headers.get("X-TS-Template-Cache")
+        if mode == "esi":
+            assert actual == state, f"{cookie!r}: expected {state}, got {actual}"
+            if state == "hit":
+                assert response.headers.get("X-TS-Assembly") == "byte-seam"
+        else:
+            assert actual not in ("hit", "miss-stored", "miss-reserved"), actual
+    expected_fetches = fetches if mode == "esi" else 1
+    actual_fetches = origin_gets(path) - before
+    assert actual_fetches == expected_fetches, (
+        f"{cookie!r}: expected {expected_fetches} origin fetches, got {actual_fetches}"
+    )
+    print(f"  PASS {path} {cookie!r}: correct HTML, cache state, assembly and origin count")
+
+
+path = "/article/cookie-policy"
+for arm, state in [("A", "miss-stored"), ("B", "miss-stored"), ("A", "hit"), ("B", "hit")]:
+    request(path, f"ab_bucket={arm}", arm, state, int(state != "hit"))
+
+# Presence is a key dimension: neither missing nor empty may reuse A, B, or each other.
+for state in ["miss-stored", "hit"]:
+    request(path, None, "absent", state, int(state != "hit"))
+    request(path, "ab_bucket=", "empty", state, int(state != "hit"))
+
+# Unlisted opaque values must not fragment a warmed experiment arm.
+request(path, 'g_state={"i_l":0}; ab_bucket=A', "A", "hit", 0)
+request(path, "ab_bucket=A; metadata=one,two", "A", "hit", 0)
+
+# Bypass applies even when the anonymous arm is already warm, including empty sessions.
+for cookie in ["ab_bucket=A; session=test", "ab_bucket=A; session=test", "ab_bucket=A; session="]:
+    request(path, cookie, "A", "bypass-request", 1, session=True)
+request(path, "ab_bucket=A", "A", "hit", 0)
+
+# A cold session request must neither populate nor reserve an anonymous template.
+cold_path = "/article/cookie-policy-cold-session"
+request(cold_path, "ab_bucket=B; session=test", "B", "bypass-request", 1, session=True)
+request(cold_path, "ab_bucket=B", "B", "miss-stored", 1)
+request(cold_path, "ab_bucket=B", "B", "hit", 0)
+PYEOF
+then
+  ok "cookie runtime matrix"
+else
+  bad "cookie runtime matrix"
 fi
 
 info "Result"

@@ -600,3 +600,42 @@ above is superseded for unlisted values by the updated spec section 6:
   including exact origin cookie forwarding and session lookup/store bypass.
 - Verify focused regressions fail before the fix, then run the Fastly suite,
   relevant formatting/lint checks, and repeat headless browser verification.
+
+## Review-readiness runtime follow-up (2026-09-10)
+
+Starting revision: `1f56ee08cb25a35d79cccc19a442a698334a398c`. The follow-up
+extends `scripts/template-cache-local-test.sh` and its operator documentation;
+production Rust and JavaScript are unchanged.
+
+The existing temporary origin now serves distinguishable cookie-selected HTML
+for dedicated article paths and returns `Vary: X-Exp-Variant`. Requests omit that
+header to model variant selection downstream of TS. The generated configuration
+includes `ab_bucket` keying, `session` bypass, and independence for opaque unlisted
+cookies. Both ESI and inline runs execute 17 requests covering A/B isolation,
+absent/empty variants, ignored JSON/comma-list cookies, and warm/cold session
+bypass. Every request checks HTML, origin fetch counts, cache state, private
+response policy, and assembled winning bids. Existing CI already runs both modes.
+
+Verification evidence:
+
+- Release build: `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1` passed.
+- `BID_DELAY=3 ./scripts/template-cache-local-test.sh esi` passed: 22 harness
+  checks, including all 17 cookie requests.
+- `BID_DELAY=3 ./scripts/template-cache-local-test.sh inline` passed: 9 harness
+  checks, including all 17 cookie requests with an origin fetch on every request.
+- Negative control: a temporary copy with an empty key-cookie list failed on the
+  first B request because the returned HTML did not contain the B marker. No
+  production code or tracked configuration was changed for this control.
+- Independent review of the harness found no issues; shell syntax and diff
+  whitespace checks passed.
+- All six target-specific Clippy aliases, Rust formatting, Fastly tests (2,902
+  tests/doc-tests passed, 10 ignored), Axum (41), Cloudflare (44), Spin (86), and
+  integration parity (13) passed. Fastly and Axum passed after retrying with the
+  required keychain and local socket access outside the sandbox.
+- JS build, Vitest (45 files, 901 tests using the pinned Node 24.12.0 executable
+  from the library directory), JS formatting, and docs formatting passed.
+
+These checks run Viceroy directly through the repeatable harness. They are
+distinct from the earlier headless-browser smoke test, whose exact tested commit
+was not recorded in the PR description, and from `fastly compute serve`, which
+was not used for this follow-up.
