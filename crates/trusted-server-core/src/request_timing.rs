@@ -1,10 +1,12 @@
 //! Per-request phase timing collection and Server-Timing rendering.
 //!
-//! Collection is always-on and infallible: saturating math, lock failure
-//! drops the sample, no panics. See the design spec
+//! Collection is always-on and infallible: saturating math, no panics. A
+//! contended lock drops the one sample; a poisoned lock recovers (the
+//! guarded data are plain counters), so a panic elsewhere cannot silence
+//! the rest of the request's timing. See the design spec
 //! `docs/superpowers/specs/2026-08-24-request-phase-timing-design.md`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, Response};
@@ -91,7 +93,12 @@ pub enum AuctionWaitPlacement {
 
 /// Mutable state behind [`RequestTimings`], guarded by a [`Mutex`].
 struct Inner {
-    /// Instant the request started; the reference point for elapsed marks.
+    /// Instant the collector was constructed; the reference point for
+    /// elapsed marks. Adapters construct the collector after their own
+    /// prologue (client-request acquisition, logger init, and any
+    /// short-circuit routes on Fastly), so `ts-total` and
+    /// `time_elapsed_ms` exclude that prologue rather than measuring
+    /// wall-clock-from-accept.
     t0: Instant,
     /// Accumulated duration per [`Phase`], indexed by [`Phase::index`].
     phases: [Option<Duration>; PHASE_COUNT],
@@ -124,9 +131,9 @@ struct Inner {
 /// Per-request phase timing collector.
 ///
 /// Cheap to clone (an [`Arc`] handle) and safe to share across threads and
-/// async tasks handling the same request. Every method is infallible: lock
-/// contention or poisoning silently drops the sample rather than blocking or
-/// panicking.
+/// async tasks handling the same request. Every method is infallible:
+/// contention silently drops the one sample rather than blocking, and a
+/// poisoned lock is recovered rather than treated as permanent loss.
 #[derive(Clone)]
 pub struct RequestTimings(Arc<Mutex<Inner>>);
 
@@ -151,10 +158,16 @@ impl RequestTimings {
     /// Accumulates `dur` into `phase`'s running total.
     ///
     /// Repeated calls for the same phase saturate-add rather than overwrite.
-    /// Drops the sample silently on lock contention or poisoning.
+    /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn record(&self, phase: Phase, dur: Duration) {
-        let Ok(mut inner) = self.0.try_lock() else {
-            return;
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         };
         let index = phase.index();
         let accumulated = inner.phases[index]
@@ -166,10 +179,16 @@ impl RequestTimings {
     /// Records an auction wait duration under [`Phase::AuctionWait`] and
     /// stores its placement.
     ///
-    /// Drops the sample silently on lock contention or poisoning.
+    /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn record_auction_wait(&self, placement: AuctionWaitPlacement, dur: Duration) {
-        let Ok(mut inner) = self.0.try_lock() else {
-            return;
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         };
         let index = Phase::AuctionWait.index();
         let accumulated = inner.phases[index]
@@ -195,8 +214,14 @@ impl RequestTimings {
     /// Subsequent calls are no-ops (first call wins). Drops the sample
     /// silently on lock contention or poisoning.
     pub fn mark_headers_ready(&self) {
-        let Ok(mut inner) = self.0.try_lock() else {
-            return;
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         };
         if inner.headers_ready_total.is_none() {
             inner.headers_ready_total = Some(inner.t0.elapsed());
@@ -209,8 +234,14 @@ impl RequestTimings {
     /// Subsequent calls are no-ops (first call wins). Drops the sample
     /// silently on lock contention or poisoning.
     pub fn mark_request_elapsed(&self) {
-        let Ok(mut inner) = self.0.try_lock() else {
-            return;
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         };
         if inner.request_elapsed.is_none() {
             inner.request_elapsed = Some(inner.t0.elapsed());
@@ -266,10 +297,16 @@ impl RequestTimings {
 
     /// Records the response body size in bytes.
     ///
-    /// Drops the sample silently on lock contention or poisoning.
+    /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn set_resp_bytes(&self, bytes: u64) {
-        let Ok(mut inner) = self.0.try_lock() else {
-            return;
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         };
         inner.resp_bytes = Some(bytes);
     }
@@ -285,7 +322,11 @@ impl RequestTimings {
     /// silently (returning `None`) on lock contention or poisoning.
     #[must_use]
     pub fn server_timing_value(&self) -> Option<String> {
-        let inner = self.0.try_lock().ok()?;
+        let inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
         let total = inner.headers_ready_total?;
         let mut entries = vec![format_entry("ts-total", total)];
         for phase in HEADER_PHASES {
@@ -305,8 +346,10 @@ impl RequestTimings {
     /// consistent with the infallibility of every other method.
     #[must_use]
     pub fn snapshot(&self) -> TimingSnapshot {
-        let Ok(inner) = self.0.try_lock() else {
-            return TimingSnapshot::default();
+        let inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return TimingSnapshot::default(),
         };
         TimingSnapshot {
             time_elapsed_ms: duration_ms(inner.headers_ready_total),

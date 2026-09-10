@@ -4853,8 +4853,11 @@ pub async fn handle_publisher_request(
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    // The span must end when the origin responds or fails, before any
-    // abandonment-telemetry await below, so `ts-origin` excludes telemetry.
+    // The span must end when the origin responds (or fails), before any
+    // abandonment-telemetry await below — otherwise `ts-origin` would
+    // absorb Tinybird emission time on the error path. When the origin
+    // fetch was dispatched early (`pending_origin`), the span covers the
+    // remaining wait for its response headers rather than the full fetch.
     let origin_span = timings.span(Phase::Origin);
     let origin_result = if let Some(pending) = pending_origin {
         services.http_client().wait(pending).await
@@ -4864,6 +4867,11 @@ pub async fn handle_publisher_request(
                 message: "publisher origin request was already consumed".to_owned(),
             })
         })?;
+        // Streaming is gated on the capability (unlike the asset-proxy
+        // path, which sets the flag unconditionally and tolerates buffered
+        // fallback): adapters without streaming support may reject the
+        // flag outright rather than silently buffering, which would fail
+        // every publisher fetch.
         let mut platform_request = PlatformHttpRequest::new(origin_req, backend_name);
         if services.http_client().supports_streaming_responses() {
             platform_request = platform_request.with_stream_response();

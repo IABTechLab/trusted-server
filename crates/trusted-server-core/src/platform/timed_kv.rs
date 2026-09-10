@@ -53,6 +53,15 @@ impl PlatformKvStore for TimedKvStore<Arc<dyn PlatformKvStore>> {
         self.inner.put_bytes(key, value).await
     }
 
+    // Forwarded explicitly: the trait's default body falls back to
+    // `get_bytes`, which would silently downgrade a backend's cheap
+    // metadata-only existence probe (the Spin adapter has one) into a full
+    // value transfer just because the store was decorated.
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        let _span = self.timings.span(Phase::EcKv);
+        self.inner.exists(key).await
+    }
+
     async fn put_bytes_with_ttl(
         &self,
         key: &str,
@@ -147,6 +156,65 @@ mod tests {
         assert!(
             timings.snapshot().kv_ms.is_some(),
             "should record Phase::EcKv across both store calls"
+        );
+    }
+
+    #[test]
+    fn exists_delegates_to_the_inner_store_not_get_bytes() {
+        // A stub whose `exists` answer contradicts its `get_bytes` answer:
+        // if the decorator fell back to the trait's get-and-discard default
+        // body, this would return `false`.
+        struct ExistsOnlyStore;
+
+        #[async_trait::async_trait(?Send)]
+        impl PlatformKvStore for ExistsOnlyStore {
+            async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+                Ok(None)
+            }
+            async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+                Ok(())
+            }
+            async fn put_bytes_with_ttl(
+                &self,
+                _key: &str,
+                _value: Bytes,
+                _ttl: StdDuration,
+            ) -> Result<(), KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _key: &str) -> Result<(), KvError> {
+                Ok(())
+            }
+            async fn list_keys_page(
+                &self,
+                _prefix: &str,
+                _cursor: Option<&str>,
+                _limit: usize,
+            ) -> Result<KvPage, KvError> {
+                Ok(KvPage {
+                    keys: Vec::new(),
+                    cursor: None,
+                })
+            }
+            async fn exists(&self, _key: &str) -> Result<bool, KvError> {
+                Ok(true)
+            }
+        }
+
+        let timings = RequestTimings::new();
+        let inner: Arc<dyn PlatformKvStore> = Arc::new(ExistsOnlyStore);
+        let store = TimedKvStore::new(inner, timings.clone());
+
+        let exists = futures::executor::block_on(store.exists("key"))
+            .expect("should forward the existence probe");
+        assert!(
+            exists,
+            "should delegate to the inner exists, not the get_bytes default body"
+        );
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().kv_ms.is_some(),
+            "should time the existence probe like any other store operation"
         );
     }
 

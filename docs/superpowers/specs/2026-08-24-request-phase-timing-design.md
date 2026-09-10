@@ -85,7 +85,7 @@ auction wait, buffered mode ..... auction_wait_ms    (row only; pre-header in th
   |
 send_edgezero_response, immediately before into_parts():
   mark_headers_ready() snapshot (unconditional)
-  build AccessTelemetrySnapshot (unconditional)
+  build AccessTelemetrySnapshot (only when tinybird.access_enabled)
   append Server-Timing header (flag-gated, only on conclusively private responses)
   |
 headers committed; body streams
@@ -125,9 +125,11 @@ New module `crates/trusted-server-core/src/request_timing.rs`.
 - Sharing: `RequestTimings` is a cheap-clone handle, `Arc<Mutex<Inner>>`. It crosses
   three boundaries: adapter entry to core handlers, the streaming body closure (records
   body-phase spans after the response object has been handed off), and the adapter's
-  post-send emission read. Access is exclusively `try_lock()`: a contended or
-  poisoned lock drops the sample immediately rather than waiting, so recording can
-  never delay a request.
+  post-send emission read. Access is exclusively `try_lock()`: a contended lock
+  drops the one sample rather than waiting, so recording can never delay a
+  request, and a poisoned lock is recovered (the guarded data are plain counters
+  with no invariant a panic can break) so one panic cannot silence the rest of
+  the request's timing.
 - Recording API: `timings.record(Phase::Geo, dur)` and a scope guard
   `timings.span(Phase::Origin)` that records on drop. Guards use saturating duration
   math; a non-monotonic reading records zero rather than panicking. The auction-wait
@@ -214,7 +216,8 @@ marks middleware finalization, not header commitment, and must not be treated as
 timing boundary.
 
 At the freeze point, in order: `mark_headers_ready()` (unconditional), the
-`AccessTelemetrySnapshot` build (unconditional, section 10), then, gated on
+`AccessTelemetrySnapshot` build (gated on `tinybird.access_enabled`,
+section 10), then, gated on
 `observability.server_timing_enabled`, append one `Server-Timing` header from
 `server_timing_value()`. Append semantics, never insert: an origin-supplied
 Server-Timing survives, and the fronting delivery layer's own entries (`time-elapsed`,
@@ -290,12 +293,16 @@ and user-generated content (search terms, usernames, emails in slugs). Replaced 
   restricted to a bounded allowlisted charset, plus `/*` when deeper (for example
   `/news/*`). The auction-telemetry normalizer is explicitly not sufficient here: it
   redacts long tokens but preserves short identifiers and arbitrary slugs.
-- Rejection is whole-segment, never truncation: a segment is dropped to `/other/*`
-  when it fails the charset allowlist, exceeds 32 characters, carries more than 7
-  ASCII digits, or is the only segment in the path. Depth is what makes a first
-  segment a section name: single-segment paths are documents (WordPress
-  `/%postname%/` puts every article at depth 1), so they reject wholesale, root
-  landing pages included. The character allowlist alone does not bound identity (`[a-z0-9_-]`
+- Publisher templates come from an operator-configured allowlist of section names
+  (`observability.route_sections`, default empty), not from the request: a path
+  whose first segment matches an allowlist entry and that has at least one further
+  segment emits `/{section}/*` (the lowercased allowlist entry itself); everything
+  else emits `/other/*`, and the root path emits `/`. This replaces the earlier
+  shape heuristics (charset, length, digit bounds), which review showed cannot
+  bound identity: depth-2 first segments are usernames on `/{username}/posts`
+  shapes, and single-segment paths are documents under `/%postname%/` permalinks.
+  With the allowlist, the emitted value set is fixed by configuration, so no
+  request-derived byte ever reaches the row. The character allowlist alone does not bound identity (`[a-z0-9_-]`
   is exactly the alphabet of UUIDs, hex ids, and reset tokens), and a truncated
   prefix of any of those is still identifying, so the length and digit bounds reject
   the segment outright.
@@ -364,7 +371,9 @@ ships as a versioned replacement datasource with a cutover, not an in-place edit
 
 ## 10. Emission mechanics
 
-- `AccessTelemetrySnapshot`: built unconditionally at the freeze point, before
+- `AccessTelemetrySnapshot`: built at the freeze point when
+  `tinybird.access_enabled` is set (revised in review from the original
+  unconditional build, so a disabled deployment pays nothing here), before
   `into_parts()` consumes the response. It captures method, status, route metadata
   (from the `RouteMetadata` extension), and typed dimension states (`env`,
   `template_cache_state`, geo country). It exists because nothing else survives to

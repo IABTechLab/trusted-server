@@ -1855,7 +1855,11 @@ pub struct TinybirdSettings {
     /// configs preserve their current auction-emission behavior after
     /// upgrading; set `false` to silence auction events while keeping
     /// `enabled` on for other Tinybird telemetry (e.g. `access_enabled`).
-    #[serde(default = "default_true")]
+    /// Serialized only when `false`: older binaries ignore the key rather
+    /// than reject it, so writing the default `true` into every pushed
+    /// config would let a rollback silently resume auction telemetry after
+    /// an operator disabled it.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub auction_enabled: bool,
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
@@ -1990,6 +1994,7 @@ impl TinybirdSettings {
                 })
             })?;
             validate_tinybird_secret(token.expose(), "tinybird.access_token_secret")?;
+        }
             if self.access_sample_rate <= 0.0 {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: "tinybird.access_sample_rate must be > 0 when tinybird.access_enabled is true".to_owned(),
@@ -2615,6 +2620,14 @@ pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
     "upstream_message_truncated",
 ];
 
+/// `skip_serializing_if` helper: true is the serde default for the fields
+/// that use it, so serializing it would only widen the pushed config's
+/// rollback surface.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2775,6 +2788,13 @@ pub struct ObservabilitySettings {
     /// timing. Defaults to `false` (off).
     #[serde(default)]
     pub server_timing_enabled: bool,
+    /// Section names whose publisher paths keep a named route template in
+    /// access telemetry (`/{section}/*`); everything else collapses to
+    /// `/other/*`. Matching is ASCII case-insensitive on the first path
+    /// segment, and a match requires at least one further segment. Defaults
+    /// to empty, which collapses every publisher path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_sections: Vec<String>,
 }
 
 impl ObservabilitySettings {
@@ -4619,6 +4639,47 @@ mod tests {
         assert!(
             !toml.contains("[observability]"),
             "should omit the default table so a prior binary can parse the config"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_serializes_only_when_disabled() {
+        let mut settings = create_test_settings();
+        assert!(settings.tinybird.auction_enabled, "should default on");
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("auction_enabled"),
+            "should omit the default-true key: a rollback must not silently \
+             re-enable auction telemetry an operator disabled"
+        );
+
+        settings.tinybird.auction_enabled = false;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("auction_enabled = false"),
+            "should serialize the operator's explicit disable"
+        );
+    }
+
+    #[test]
+    fn route_sections_serialize_only_when_configured() {
+        let mut settings = create_test_settings();
+        assert!(
+            settings.observability.route_sections.is_empty(),
+            "should default to the collapse-everything allowlist"
+        );
+        settings.observability.server_timing_enabled = true;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("route_sections"),
+            "should omit the empty allowlist so a prior binary can parse the config"
+        );
+
+        settings.observability.route_sections = vec!["news".to_owned()];
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("route_sections"),
+            "should serialize a configured allowlist"
         );
     }
 
