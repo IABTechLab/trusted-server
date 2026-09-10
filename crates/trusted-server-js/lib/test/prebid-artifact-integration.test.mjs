@@ -260,6 +260,11 @@ async function runAuction(pageWindow, fetchSpy) {
         mediaTypes: { banner: { sizes: [[300, 250]] } },
         bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
       },
+      {
+        code: 'ad-slot-2',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [],
+      },
     ],
     timeout: 1000,
   });
@@ -284,6 +289,9 @@ async function runAuction(pageWindow, fetchSpy) {
   expect(adUnit.code).toBe('ad-slot-1');
   const trustedServerBid = adUnit.bids.find((bid) => bid.bidder === 'trustedServer');
   expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: { placementId: 1 } });
+  expect(trustedServerBid.params).not.toHaveProperty('storedRequest');
+  const generated = payload.adUnits.find((unit) => unit.code === 'ad-slot-2');
+  expect(generated.bids[0].params).toEqual({ bidderParams: {}, storedRequest: false });
 }
 
 function expectManifest(manifest, analytics) {

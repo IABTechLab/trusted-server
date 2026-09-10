@@ -90,6 +90,20 @@ describe('auction/buildAdRequest', () => {
     expect(unit2!.bids[0].bidder).toBe('openx');
   });
 
+  it.each([{}, { storedRequest: false }, { storedRequest: true }, { storedRequest: null }])(
+    'retains stored intent presence in serialized shared requests: %j',
+    (intent) => {
+      const params = { bidderParams: {}, ...intent };
+      for (const input of [
+        [{ code: 'example-slot', bids: [{ bidder: 'trustedServer', params }] }],
+        [{ adUnitCode: 'example-slot', bidder: 'trustedServer', params }],
+      ]) {
+        const wire = JSON.parse(JSON.stringify(buildAdRequest(input)));
+        expect(wire.adUnits[0].bids[0].params).toEqual(params);
+      }
+    }
+  );
+
   it('handles empty units array', () => {
     const result = buildAdRequest([]);
     expect(result.adUnits).toEqual([]);

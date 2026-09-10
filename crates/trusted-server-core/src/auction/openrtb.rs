@@ -263,6 +263,9 @@ pub(crate) fn build_request(
         return Ok(OpenRtbBuildOutcome::NoImpressions);
     }
     policy.augment_request(&mut request, input, routed)?;
+    if request.imp.is_empty() {
+        return Ok(OpenRtbBuildOutcome::NoImpressions);
+    }
     finalize_request(&mut request, policy, finalization)?;
     Ok(OpenRtbBuildOutcome::Ready(request))
 }
@@ -482,35 +485,43 @@ fn apply_prebid(
         input.slots().len(),
         "should keep one impression per routed slot"
     );
-    for (imp, slot) in request.imp.iter_mut().zip(input.slots()) {
-        let bidder = slot
-            .bidder_params()
-            .iter()
-            .filter_map(|(bidder, params)| {
-                let mut params = params.clone();
-                plan.override_engine
-                    .apply_routed(bidder.as_str(), slot.prebid_zone(), &mut params);
-                params
-                    .as_object()
-                    .is_some_and(|params| !params.is_empty())
-                    .then(|| (bidder.as_str().to_string(), params))
-            })
-            .collect::<Map<_, _>>();
-        let mut prebid = Map::new();
-        if !bidder.is_empty() {
-            prebid.insert("bidder".to_string(), Value::Object(bidder));
-        } else if slot.has_trusted_stored_request() || !slot.bidder_params().is_empty() {
-            prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
-        }
-        debug_assert!(
-            !prebid.is_empty(),
-            "should never route a demandless slot to prebid-server"
-        );
-        imp.ext = Some(Map::from_iter([(
-            "prebid".to_string(),
-            Value::Object(prebid),
-        )]));
-    }
+    // Filter paired impressions and slots together so later demand keeps its slot ID.
+    request.imp = std::mem::take(&mut request.imp)
+        .into_iter()
+        .zip(input.slots())
+        .filter_map(|(mut imp, slot)| {
+            let bidder = slot
+                .bidder_params()
+                .iter()
+                .filter_map(|(bidder, params)| {
+                    let mut params = params.clone();
+                    plan.override_engine.apply_routed(
+                        bidder.as_str(),
+                        slot.prebid_zone(),
+                        &mut params,
+                    );
+                    params
+                        .as_object()
+                        .is_some_and(|params| !params.is_empty())
+                        .then(|| (bidder.as_str().to_string(), params))
+                })
+                .collect::<Map<_, _>>();
+            let mut prebid = Map::new();
+            if !bidder.is_empty() {
+                prebid.insert("bidder".to_string(), Value::Object(bidder));
+            } else if slot.allows_stored_fallback() {
+                prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
+            }
+            if prebid.is_empty() {
+                return None;
+            }
+            imp.ext = Some(Map::from_iter([(
+                "prebid".to_string(),
+                Value::Object(prebid),
+            )]));
+            Some(imp)
+        })
+        .collect();
     let mut prebid_request = Map::new();
     if plan.debug {
         prebid_request.insert("debug".to_string(), Value::Bool(true));
