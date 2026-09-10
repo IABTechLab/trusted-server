@@ -146,17 +146,13 @@ fn is_notice_loader(method: &Method, consent_path: &str) -> bool {
     let public_key = segments.next();
     let file_name = segments.next();
 
-    public_key.is_some_and(|segment| !segment.is_empty())
+    public_key.is_some_and(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
         && file_name == Some("loader.js")
         && segments.next().is_none()
 }
 
-fn trim_ascii(value: &str) -> &str {
-    value.trim_matches(|character: char| character.is_ascii_whitespace())
-}
-
 fn normalize_didomi_geo(geo: &GeoInfo) -> Result<DidomiGeo, DidomiGeoError> {
-    let country = trim_ascii(&geo.country).to_ascii_uppercase();
+    let country = geo.country.trim_ascii().to_ascii_uppercase();
     if country.is_empty() {
         return Err(DidomiGeoError::MissingCountry);
     }
@@ -170,7 +166,7 @@ fn normalize_didomi_geo(geo: &GeoInfo) -> Result<DidomiGeo, DidomiGeoError> {
     let Some(region) = geo.region.as_deref() else {
         return Err(DidomiGeoError::MissingRegion);
     };
-    let region = trim_ascii(region).to_ascii_uppercase();
+    let region = region.trim_ascii().to_ascii_uppercase();
     if region.is_empty() {
         return Err(DidomiGeoError::MissingRegion);
     }
@@ -361,6 +357,7 @@ impl DidomiIntegration {
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(EdgeBody::from("Didomi loader unavailable"))
             .expect("should build static Didomi geo failure response");
+        Self::add_cors_headers(&mut response);
         crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response);
         response
     }
@@ -373,6 +370,7 @@ impl DidomiIntegration {
             .header(header::LOCATION, location)
             .body(EdgeBody::empty())
             .change_context(Self::error("Failed to build Didomi geo redirect"))?;
+        Self::add_cors_headers(&mut response);
         crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response);
         Ok(response)
     }
@@ -681,6 +679,8 @@ mod tests {
             (Method::GET, "/public-key/loader.js.map"),
             (Method::GET, "/nested/public-key/loader.js"),
             (Method::GET, "/public-key/other.js"),
+            (Method::GET, "/./loader.js"),
+            (Method::GET, "/../loader.js"),
         ] {
             assert!(
                 !is_notice_loader(&method, path),
@@ -829,6 +829,14 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store, private"),
             "should make the redirect private and non-storable"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "should keep the redirect usable from cross-origin loader embeds"
         );
         assert!(
             stub.recorded_backend_names().is_empty(),
@@ -1003,6 +1011,14 @@ mod tests {
                     .and_then(|v| v.to_str().ok()),
                 Some("no-store, private"),
                 "should make geo failures private and non-storable"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|v| v.to_str().ok()),
+                Some("*"),
+                "should keep geo failures usable from cross-origin loader embeds"
             );
             assert!(
                 stub.recorded_backend_names().is_empty(),

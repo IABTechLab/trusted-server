@@ -191,6 +191,11 @@ Before enabling `geo_query_parameters`:
    and retain Didomi's freshness and validator headers.
 6. Verify API requests never enter the outbound or downstream cache.
 7. Purge loader and API entries cached before this behavior was enabled.
+8. Test from egress whose geo can shift between requests (carrier NAT pools,
+   relay-style proxies). The loader canonicalizes with one redirect per stable
+   geo, so an egress that resolves to a different country or region on
+   consecutive requests can bounce between canonical targets until the browser's
+   redirect limit and fail to load the notice for that pageview.
 
 Do not enable `geo_query_parameters` on Cloudflare, Axum, or Spin until those
 adapters provide complete trusted geo and their support is documented.
