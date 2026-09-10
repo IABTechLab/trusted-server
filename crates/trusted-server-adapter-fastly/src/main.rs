@@ -455,11 +455,44 @@ fn run_edgezero_pull_sync_after_send(
     partner_registry: &PartnerRegistry,
     ec_state: &EcFinalizeState,
 ) {
-    if ec_state.is_real_browser
-        && let Some(context) = build_pull_sync_context(&ec_state.ec_context)
-    {
-        run_pull_sync_after_send(settings, partner_registry, &context, &ec_state.services);
+    if !ec_state.is_real_browser {
+        return;
     }
+
+    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
+    let Some((context, kv)) =
+        prepare_pull_sync_after_send(prepared_context, || require_identity_graph(settings))
+    else {
+        return;
+    };
+
+    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+    dispatch_pull_sync(
+        settings,
+        &kv,
+        partner_registry,
+        &limiter,
+        &context,
+        &ec_state.services,
+    );
+}
+
+fn prepare_pull_sync_after_send<F>(
+    context: Option<PullSyncContext>,
+    graph_factory: F,
+) -> Option<(PullSyncContext, KvIdentityGraph)>
+where
+    F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
+{
+    let context = context?;
+    let kv = match graph_factory() {
+        Ok(kv) => kv,
+        Err(err) => {
+            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
+            return None;
+        }
+    };
+    Some((context, kv))
 }
 
 /// Runs the post-send steps in their contract order: EC identity pull-sync
@@ -938,24 +971,6 @@ pub(crate) fn identity_graph_with_timing(
     })
 }
 
-fn run_pull_sync_after_send(
-    settings: &Settings,
-    partner_registry: &PartnerRegistry,
-    context: &PullSyncContext,
-    services: &RuntimeServices,
-) {
-    let kv = match require_identity_graph(settings) {
-        Ok(kv) => kv,
-        Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
-            return;
-        }
-    };
-
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context, services);
-}
-
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
 ///
@@ -1081,6 +1096,23 @@ mod tests {
             body_mode: "buffered",
             sample_rate: 0.0,
         }
+    }
+
+    #[test]
+    fn pull_sync_noop_states_skip_post_send_graph_factory() {
+        let calls = std::cell::Cell::new(0);
+        let result = prepare_pull_sync_after_send(None, || {
+            calls.set(calls.get() + 1);
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: "unexpected".to_owned(),
+                message: "graph factory should not run".to_owned(),
+            }))
+        });
+        assert!(
+            result.is_none(),
+            "a skipped pull-sync plan should return none"
+        );
+        assert_eq!(calls.get(), 0, "should not invoke the graph factory");
     }
 
     #[test]
@@ -1467,13 +1499,14 @@ mod tests {
             region: None,
             asn: None,
         };
-        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+        let mut ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
             &settings,
             &request,
             &services,
             Some(&geo_info),
         )
         .expect("should read EC context from a non-regulated request");
+        ec_context.set_eid_sync_source(trusted_server_core::ec::EidSyncSource::Navigation);
         assert!(
             ec_context.ec_was_present(),
             "the pre-seeded ts-ec cookie should be recognized"

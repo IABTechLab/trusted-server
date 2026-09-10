@@ -124,7 +124,7 @@ flowchart TD
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
 
-The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Consent interpretation for each request remains based on the live request signals listed above.
+The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, withdrawal tombstones, and same-TTL completion markers that prevent stale point-read misses from rewriting completed tombstones. Consent interpretation for each request remains based on the live request signals listed above.
 
 ## Partner Sync Channels
 
@@ -250,6 +250,16 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 
 Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `ts-eids` cookie carries a different value for the same configured partner source.
 
+### Pull-Sync Completeness Marker
+
+When the identity graph contains a UID for every pull-enabled partner, Trusted Server sets a signed, host-only `ts-ec-pull-complete` cookie. The cookie contains no partner UID or EC ID. It authenticates a one-hour expiration and a fingerprint of the current pull-partner source-domain set, bound to the active EC ID with key material derived from `ec.passphrase`.
+
+A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, generation, and detected orphan recovery continue to use KV. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and fall back to the normal KV path. The one-hour bound also limits how long deletion of a previously complete row can go undetected.
+
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker even when KV is unavailable.
+
+Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
+
 ## Configuration
 
 Configure EC settings in the `[ec]` section of `trusted-server.toml`. See the [Configuration Reference](/guide/configuration) for the full surface and environment variable overrides.
@@ -287,7 +297,7 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 - Newly generated ECs receive `Set-Cookie: ts-ec=...`.
 - When consent is blocked but not explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
-- `/_ts/api/v1/batch-sync` writes mappings into the EC identity graph. Mapping timestamps are retained for API compatibility but no longer order writes; valid mappings use idempotent last-write-wins semantics.
+- `/_ts/api/v1/batch-sync` validates every input, groups valid mappings by normalized EC ID, and applies the last valid UID for each group once. Group outcomes still account for every original input; infrastructure failures reject the failing and remaining groups. Mapping timestamps remain required for API compatibility but do not order writes. See the [API Reference](/guide/api-reference) for the complete contract.
 - Pull sync fills missing partner UIDs only. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
 
 ## Next Steps

@@ -46,6 +46,7 @@ pub mod kv_types;
 pub mod partner;
 pub mod prebid_eids;
 pub mod pull_sync;
+pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
 pub mod registry;
 
@@ -72,7 +73,7 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::COOKIE_TS_EC;
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -83,6 +84,24 @@ use device::DeviceSignals;
 
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
+use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
+
+/// Bounded request classifications that may persist browser EID cookies.
+///
+/// Adapters assign a source only after pre-route filters allow dispatch.
+/// Challenged or blocked requests remain unclassified and cannot persist EIDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub enum EidSyncSource {
+    /// Publisher top-level document navigation.
+    #[display("navigation")]
+    Navigation,
+    /// `POST /auction` request.
+    #[display("auction")]
+    Auction,
+    /// Request that generated a new EC identity.
+    #[display("new_ec")]
+    NewEc,
+}
 
 /// Request-scoped view of one EC identity-graph lookup.
 ///
@@ -154,6 +173,8 @@ pub use generation::{
 struct RequestEc {
     /// EC ID from the `ts-ec` cookie, if present.
     cookie_ec: Option<String>,
+    /// Pull-sync completeness marker, if present.
+    pull_sync_marker: Option<String>,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
 }
@@ -170,8 +191,17 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
         .and_then(|j| j.get(COOKIE_TS_EC))
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
+    let pull_sync_marker = jar
+        .as_ref()
+        .and_then(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE))
+        .map(cookie::Cookie::value)
+        .map(str::to_owned);
 
-    Ok(RequestEc { cookie_ec, jar })
+    Ok(RequestEc {
+        cookie_ec,
+        pull_sync_marker,
+        jar,
+    })
 }
 
 fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
@@ -233,6 +263,10 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
+    /// Browser-carried proof of recent pull-partner completeness.
+    pull_sync_marker: PullSyncMarkerState,
+    /// Allowed returning-user EID persistence source, assigned only after request filters pass.
+    eid_sync_source: Option<EidSyncSource>,
 }
 
 impl EcContext {
@@ -291,8 +325,6 @@ impl EcContext {
             req,
             config: &settings.consent,
             geo: geo_info,
-            ec_id: None,
-            kv_store: None,
         });
 
         log::info!(
@@ -314,6 +346,8 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
+            eid_sync_source: None,
         })
     }
 
@@ -400,6 +434,7 @@ impl EcContext {
 
             self.ec_value = Some(ec_id);
             self.ec_generated = true;
+            self.pull_sync_marker.invalidate_for_replaced_ec();
             return Ok(());
         }
 
@@ -496,10 +531,52 @@ impl EcContext {
         self.recovery_eligible = eligible;
     }
 
+    /// Allows returning-user EID cookie persistence for this request source.
+    pub fn set_eid_sync_source(&mut self, source: EidSyncSource) {
+        self.eid_sync_source = Some(source);
+    }
+
+    /// Returns the allowed returning-user EID persistence source.
+    #[must_use]
+    pub fn eid_sync_source(&self) -> Option<EidSyncSource> {
+        self.eid_sync_source
+    }
+
     /// Returns whether orphan recovery is allowed for this request.
     #[must_use]
     pub fn recovery_eligible(&self) -> bool {
         self.recovery_eligible
+    }
+
+    /// Validates a browser completeness marker against the active EC and partner set.
+    pub(crate) fn validate_pull_sync_marker(
+        &mut self,
+        settings: &Settings,
+        registry: &registry::PartnerRegistry,
+    ) {
+        validate_marker_state(
+            &mut self.pull_sync_marker,
+            settings,
+            registry,
+            self.ec_value.as_deref(),
+        );
+    }
+
+    /// Returns the current pull-sync marker state.
+    #[must_use]
+    pub(crate) fn pull_sync_marker(&self) -> &PullSyncMarkerState {
+        &self.pull_sync_marker
+    }
+
+    /// Returns mutable pull-sync marker state for response reconciliation.
+    pub(crate) fn pull_sync_marker_mut(&mut self) -> &mut PullSyncMarkerState {
+        &mut self.pull_sync_marker
+    }
+
+    /// Sets pull-sync marker state in focused unit tests.
+    #[cfg(test)]
+    pub(crate) fn set_pull_sync_marker_for_test(&mut self, state: PullSyncMarkerState) {
+        self.pull_sync_marker = state;
     }
 
     /// Replaces an orphaned active ID after its new backing row is persisted.
@@ -507,6 +584,7 @@ impl EcContext {
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
         self.kv_snapshot = snapshot;
+        self.pull_sync_marker.invalidate_for_replaced_ec();
     }
 
     /// Returns whether EC creation is permitted by consent for this request.
@@ -556,6 +634,8 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 
@@ -578,6 +658,8 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 
@@ -603,6 +685,8 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 }

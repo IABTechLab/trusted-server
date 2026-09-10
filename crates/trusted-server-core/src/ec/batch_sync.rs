@@ -2,15 +2,18 @@
 //!
 //! Partners send authenticated batch ID sync requests via Bearer token.
 //! Each mapping associates an `ec_id` (`{64hex}.{6alnum}`)
-//! with the partner's user ID. Mappings are individually validated and
-//! written to the KV identity graph, with per-mapping rejection reasons
-//! reported in the response.
+//! with the partner's user ID. Mappings are individually validated, then valid
+//! mappings are grouped by normalized EC ID before one call to the KV update
+//! path per group.
+//! Responses still report outcomes per original mapping index.
 //!
 //! Mapping timestamps are retained in the request schema for client
 //! compatibility, but the EC identity graph no longer stores per-partner sync
-//! timestamps. Valid mappings therefore use idempotent last-write-wins
-//! semantics: unchanged UIDs are accepted without a write; different UIDs
-//! replace the stored value regardless of timestamp.
+//! timestamps. The last valid mapping in request order supplies each group's
+//! UID; unchanged UIDs are accepted without a write, and different UIDs replace
+//! the stored value regardless of timestamp.
+
+use std::collections::HashMap;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
@@ -86,6 +89,17 @@ struct BatchSyncResponse {
 struct MappingError {
     index: usize,
     reason: &'static str,
+}
+
+/// Valid mappings sharing one normalized EC ID.
+///
+/// `indexes` stays in request order, while the groups themselves stay ordered
+/// by first valid occurrence. The lookup map used to locate this structure is
+/// never used for processing order.
+struct MappingGroup {
+    ec_id: String,
+    partner_uid: String,
+    indexes: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,19 +193,28 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, max_body_size: usize) -
         .is_some_and(|content_length| content_length > max_body_size)
 }
 
+/// Validates all mappings, then processes each normalized EC ID once.
+///
+/// Successful and eligibility outcomes fan out to every valid input in a
+/// group. On infrastructure failure, the failing group and all unprocessed
+/// valid groups are rejected as unavailable; already validated invalid inputs
+/// keep their specific errors. Errors are sorted by original input index.
 fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
     mappings: &[SyncMapping],
 ) -> (usize, Vec<MappingError>) {
-    let mut accepted: usize = 0;
     let mut errors = Vec::new();
+    let mut groups: Vec<MappingGroup> = Vec::new();
+    let mut group_indexes: HashMap<String, usize> = HashMap::new();
 
-    for (idx, mapping) in mappings.iter().enumerate() {
+    // Validate all inputs before beginning KV work. The vector preserves group
+    // order; the map only locates an existing group in constant time.
+    for (index, mapping) in mappings.iter().enumerate() {
         let ec_id = normalize_ec_id_for_kv(&mapping.ec_id);
         if !is_valid_ec_id(&ec_id) {
             errors.push(MappingError {
-                index: idx,
+                index,
                 reason: REASON_INVALID_EC_ID,
             });
             continue;
@@ -199,42 +222,57 @@ fn process_mappings(
 
         if mapping.partner_uid.trim().is_empty() || mapping.partner_uid.len() > MAX_UID_LENGTH {
             errors.push(MappingError {
-                index: idx,
+                index,
                 reason: REASON_INVALID_PARTNER_UID,
             });
             continue;
         }
-        match writer.upsert_partner_id_if_exists(&ec_id, partner_id, &mapping.partner_uid) {
+
+        if let Some(&group_index) = group_indexes.get(&ec_id) {
+            let group = &mut groups[group_index];
+            group.partner_uid.clone_from(&mapping.partner_uid);
+            group.indexes.push(index);
+        } else {
+            group_indexes.insert(ec_id.clone(), groups.len());
+            groups.push(MappingGroup {
+                ec_id,
+                partner_uid: mapping.partner_uid.clone(),
+                indexes: vec![index],
+            });
+        }
+    }
+
+    let mut accepted = 0;
+    for (group_index, group) in groups.iter().enumerate() {
+        match writer.upsert_partner_id_if_exists(&group.ec_id, partner_id, &group.partner_uid) {
             Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
-                accepted += 1;
+                accepted += group.indexes.len();
             }
             Ok(UpsertResult::NotFound | UpsertResult::ConsentWithdrawn) => {
-                errors.push(MappingError {
-                    index: idx,
+                errors.extend(group.indexes.iter().map(|&index| MappingError {
+                    index,
                     reason: REASON_INELIGIBLE,
-                });
+                }));
             }
             Err(err) => {
                 log::warn!(
-                    "Batch sync KV write failed for index {idx} (ec_id '{}'): {err:?}",
-                    log_id(&mapping.ec_id),
+                    "Batch sync KV write failed for group starting at index {} (ec_id '{}'): {err:?}",
+                    group.indexes[0],
+                    log_id(&group.ec_id),
                 );
-                errors.push(MappingError {
-                    index: idx,
-                    reason: REASON_KV_UNAVAILABLE,
-                });
-                // Abort remaining mappings on infrastructure failure.
-                for remaining_idx in (idx + 1)..mappings.len() {
-                    errors.push(MappingError {
-                        index: remaining_idx,
+                for unavailable_group in &groups[group_index..] {
+                    errors.extend(unavailable_group.indexes.iter().map(|&index| MappingError {
+                        index,
                         reason: REASON_KV_UNAVAILABLE,
-                    });
+                    }));
                 }
                 break;
             }
         }
     }
 
+    errors.sort_by_key(|error| error.index);
+    debug_assert_eq!(accepted + errors.len(), mappings.len());
     (accepted, errors)
 }
 
@@ -301,29 +339,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct WriterCall {
+        ec_id: String,
+        partner_id: String,
+        uid: String,
+    }
+
     struct MockWriter {
         results: std::cell::RefCell<VecDeque<Result<UpsertResult, Report<TrustedServerError>>>>,
+        calls: std::cell::RefCell<Vec<WriterCall>>,
     }
 
     impl MockWriter {
         fn new(results: Vec<Result<UpsertResult, Report<TrustedServerError>>>) -> Self {
             Self {
                 results: std::cell::RefCell::new(results.into()),
+                calls: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        fn calls(&self) -> Vec<WriterCall> {
+            self.calls.borrow().clone()
         }
     }
 
     impl BatchSyncWriter for MockWriter {
         fn upsert_partner_id_if_exists(
             &self,
-            _ec_id: &str,
-            _partner_id: &str,
-            _uid: &str,
+            ec_id: &str,
+            partner_id: &str,
+            uid: &str,
         ) -> Result<UpsertResult, Report<TrustedServerError>> {
+            self.calls.borrow_mut().push(WriterCall {
+                ec_id: ec_id.to_owned(),
+                partner_id: partner_id.to_owned(),
+                uid: uid.to_owned(),
+            });
             self.results
                 .borrow_mut()
                 .pop_front()
-                .expect("should provide mock result for each mapping")
+                .expect("should provide mock result for each group")
         }
     }
 
@@ -359,6 +415,14 @@ mod tests {
             .header("authorization", "Bearer test-token-32-bytes-minimum-value")
             .body(EdgeBody::from(body.to_owned()))
             .expect("should build authorized batch request")
+    }
+
+    fn response_json(response: Response<EdgeBody>) -> serde_json::Value {
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should contain batch-sync response");
+        serde_json::from_slice(&body).expect("should serialize batch-sync response")
     }
 
     fn test_registry() -> PartnerRegistry {
@@ -578,8 +642,12 @@ mod tests {
             Ok(UpsertResult::NotFound),
             Ok(UpsertResult::ConsentWithdrawn),
         ]);
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-2", 101)];
+        let missing_ec_id = format!("{}.ABC123", "a".repeat(64));
+        let withdrawn_ec_id = format!("{}.ABC123", "b".repeat(64));
+        let mappings = vec![
+            mapping(&missing_ec_id, "uid-1", 100),
+            mapping(&withdrawn_ec_id, "uid-2", 101),
+        ];
 
         let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
 
@@ -589,26 +657,28 @@ mod tests {
         assert_eq!(errors[0].reason, REASON_INELIGIBLE);
         assert_eq!(errors[1].index, 1);
         assert_eq!(errors[1].reason, REASON_INELIGIBLE);
+        assert_eq!(writer.calls().len(), 2, "should exercise both outcomes");
     }
 
     #[test]
-    fn process_mappings_counts_unchanged_as_accepted() {
+    fn process_mappings_fans_out_unchanged_to_group_members() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Unchanged)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mappings = vec![mapping(&ec_id, "uid-1", 100)];
+        let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-1", 101)];
 
         let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
 
-        assert_eq!(accepted, 1, "should count unchanged mappings as accepted");
+        assert_eq!(accepted, 2, "should accept every unchanged group member");
         assert!(
             errors.is_empty(),
             "should report no errors for unchanged mappings"
         );
+        assert_eq!(writer.calls().len(), 1, "should call once for the group");
     }
 
     #[test]
     fn process_mappings_does_not_order_by_timestamp() {
-        let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![
             mapping(&ec_id, "uid-new", 200),
@@ -622,5 +692,342 @@ mod tests {
             "timestamps are compatibility fields and should not reject older mappings"
         );
         assert!(errors.is_empty(), "should accept valid mappings");
+        assert_eq!(
+            writer.calls(),
+            vec![WriterCall {
+                ec_id,
+                partner_id: "partner".to_owned(),
+                uid: "uid-old".to_owned(),
+            }],
+            "should persist the last valid UID with one writer call"
+        );
+    }
+
+    #[test]
+    fn process_mappings_groups_normalized_ids_in_first_occurrence_order() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Unchanged)]);
+        let ec_id_a = format!("{}.ABC123", "a".repeat(64));
+        let ec_id_a_upper = format!("{}.ABC123", "A".repeat(64));
+        let ec_id_b = format!("{}.ABC123", "b".repeat(64));
+        let mappings = vec![
+            mapping(&ec_id_a, "a-first", 1),
+            mapping(&ec_id_b, "b-only", 2),
+            mapping(&ec_id_a_upper, "a-last", 3),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 3, "should accept every valid group member");
+        assert!(errors.is_empty(), "should report no errors");
+        assert_eq!(
+            writer.calls(),
+            vec![
+                WriterCall {
+                    ec_id: ec_id_a,
+                    partner_id: "partner".to_owned(),
+                    uid: "a-last".to_owned(),
+                },
+                WriterCall {
+                    ec_id: ec_id_b,
+                    partner_id: "partner".to_owned(),
+                    uid: "b-only".to_owned(),
+                },
+            ],
+            "should make one ordered call per normalized EC ID"
+        );
+    }
+
+    #[test]
+    fn process_mappings_keeps_suffix_case_distinct() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
+        let upper_suffix = format!("{}.ABC123", "a".repeat(64));
+        let mixed_suffix = format!("{}.AbC123", "a".repeat(64));
+        let mappings = vec![
+            mapping(&upper_suffix, "upper", 1),
+            mapping(&mixed_suffix, "mixed", 2),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 2, "should accept both distinct EC IDs");
+        assert!(errors.is_empty(), "should report no errors");
+        assert_eq!(
+            writer.calls(),
+            vec![
+                WriterCall {
+                    ec_id: upper_suffix,
+                    partner_id: "partner".to_owned(),
+                    uid: "upper".to_owned(),
+                },
+                WriterCall {
+                    ec_id: mixed_suffix,
+                    partner_id: "partner".to_owned(),
+                    uid: "mixed".to_owned(),
+                },
+            ],
+            "normalization must preserve suffix case"
+        );
+    }
+
+    #[test]
+    fn process_mappings_invalid_duplicate_does_not_replace_last_valid_uid() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mappings = vec![
+            mapping(&ec_id, "first", 1),
+            mapping(&ec_id, "last", 2),
+            mapping(&ec_id, "   ", 3),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 2, "should accept valid group members");
+        assert_eq!(errors.len(), 1, "should retain the invalid UID error");
+        assert_eq!(errors[0].index, 2, "should retain original error index");
+        assert_eq!(errors[0].reason, REASON_INVALID_PARTNER_UID);
+        assert_eq!(
+            writer.calls()[0].uid,
+            "last",
+            "invalid duplicates must not replace the final valid UID"
+        );
+    }
+
+    #[test]
+    fn process_mappings_fans_out_ineligible_outcomes_to_group_members() {
+        let writer = MockWriter::new(vec![
+            Ok(UpsertResult::NotFound),
+            Ok(UpsertResult::ConsentWithdrawn),
+        ]);
+        let ec_id_a = format!("{}.ABC123", "a".repeat(64));
+        let ec_id_b = format!("{}.ABC123", "b".repeat(64));
+        let mappings = vec![
+            mapping(&ec_id_a, "a-1", 1),
+            mapping(&ec_id_b, "b-1", 2),
+            mapping(&ec_id_a, "a-2", 3),
+            mapping(&ec_id_b, "b-2", 4),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 0, "should reject all ineligible group members");
+        assert_eq!(
+            errors.len(),
+            mappings.len(),
+            "should account for every input"
+        );
+        assert_eq!(
+            errors.iter().map(|error| error.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "should sort errors by input index"
+        );
+        assert!(
+            errors.iter().all(|error| error.reason == REASON_INELIGIBLE),
+            "should fan out ineligible outcomes"
+        );
+        assert_eq!(writer.calls().len(), 2, "should call once per group");
+    }
+
+    #[test]
+    fn process_mappings_aborts_by_group_and_preserves_sorted_accounting() {
+        let writer = MockWriter::new(vec![
+            Ok(UpsertResult::Written),
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: "ec_store".to_owned(),
+                message: "down".to_owned(),
+            })),
+        ]);
+        let ec_id_a = format!("{}.ABC123", "a".repeat(64));
+        let ec_id_b = format!("{}.ABC123", "b".repeat(64));
+        let ec_id_c = format!("{}.ABC123", "c".repeat(64));
+        let mappings = vec![
+            mapping("invalid", "bad-id", 1),
+            mapping(&ec_id_a, "a-first", 2),
+            mapping(&ec_id_b, "b-only", 3),
+            mapping(&ec_id_a, "a-last", 4),
+            mapping(&ec_id_c, "c-only", 5),
+            mapping(&ec_id_c, "", 6),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(
+            accepted, 2,
+            "successful groups should accept every member, including later duplicates"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| (error.index, error.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, REASON_INVALID_EC_ID),
+                (2, REASON_KV_UNAVAILABLE),
+                (4, REASON_KV_UNAVAILABLE),
+                (5, REASON_INVALID_PARTNER_UID),
+            ],
+            "should preserve validation errors and fan out failed/unprocessed groups in input order"
+        );
+        assert_eq!(
+            accepted + errors.len(),
+            mappings.len(),
+            "should account for every input exactly once"
+        );
+        assert_eq!(
+            writer.calls().len(),
+            2,
+            "should stop after the failing group"
+        );
+    }
+
+    #[test]
+    fn handle_batch_sync_reports_grouped_success_and_rejection_counts() {
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let ec_id_a = format!("{}.ABC123", "a".repeat(64));
+        let ec_id_b = format!("{}.ABC123", "b".repeat(64));
+        let success_writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let success_body = format!(
+            r#"{{"mappings":[{{"ec_id":"{ec_id_a}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id_a}","partner_uid":"two","timestamp":2}}]}}"#
+        );
+        let success_response = handle_batch_sync_with_writer(
+            &success_writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&success_body),
+        )
+        .expect("should return success response");
+        assert_eq!(success_response.status(), StatusCode::OK);
+        let success_body = success_response
+            .into_body()
+            .into_bytes()
+            .expect("should contain grouped success response");
+        let success_json: serde_json::Value = serde_json::from_slice(&success_body)
+            .expect("should serialize grouped success response");
+        assert_eq!(success_json["accepted"], 2);
+        assert_eq!(success_json["rejected"], 0);
+
+        let rejected_writer = MockWriter::new(vec![Ok(UpsertResult::NotFound)]);
+        let rejected_body = format!(
+            r#"{{"mappings":[{{"ec_id":"{ec_id_b}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id_b}","partner_uid":"two","timestamp":2}}]}}"#
+        );
+        let rejected_response = handle_batch_sync_with_writer(
+            &rejected_writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&rejected_body),
+        )
+        .expect("should return multi-status response");
+        assert_eq!(rejected_response.status(), StatusCode::MULTI_STATUS);
+        let rejected_body = rejected_response
+            .into_body()
+            .into_bytes()
+            .expect("should contain grouped multi-status response");
+        let rejected_json: serde_json::Value = serde_json::from_slice(&rejected_body)
+            .expect("should serialize grouped multi-status response");
+        assert_eq!(rejected_json["accepted"], 0);
+        assert_eq!(rejected_json["rejected"], 2);
+        assert_eq!(
+            rejected_json["errors"],
+            serde_json::json!([
+                {"index": 0, "reason": REASON_INELIGIBLE},
+                {"index": 1, "reason": REASON_INELIGIBLE},
+            ])
+        );
+    }
+
+    #[test]
+    fn handle_batch_sync_reports_validation_errors_without_writer_calls() {
+        let writer = MockWriter::new(vec![]);
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let valid_ec_id = format!("{}.ABC123", "a".repeat(64));
+        let body = format!(
+            r#"{{"mappings":[{{"ec_id":"invalid","partner_uid":"one","timestamp":1}},{{"ec_id":"{valid_ec_id}","partner_uid":"","timestamp":2}}]}}"#
+        );
+
+        let response = handle_batch_sync_with_writer(
+            &writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&body),
+        )
+        .expect("should return validation response");
+
+        assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+        let response = response_json(response);
+        assert_eq!(response["accepted"], 0);
+        assert_eq!(response["rejected"], 2);
+        assert_eq!(
+            response["errors"],
+            serde_json::json!([
+                {"index": 0, "reason": REASON_INVALID_EC_ID},
+                {"index": 1, "reason": REASON_INVALID_PARTNER_UID},
+            ])
+        );
+        assert!(
+            writer.calls().is_empty(),
+            "invalid-only requests should not call the writer"
+        );
+    }
+
+    #[test]
+    fn handle_batch_sync_reports_grouped_infrastructure_failure() {
+        let writer = MockWriter::new(vec![
+            Ok(UpsertResult::Written),
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: "ec_store".to_owned(),
+                message: "down".to_owned(),
+            })),
+        ]);
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let ec_id_a = format!("{}.ABC123", "a".repeat(64));
+        let ec_id_b = format!("{}.ABC123", "b".repeat(64));
+        let ec_id_c = format!("{}.ABC123", "c".repeat(64));
+        let body = format!(
+            r#"{{"mappings":[{{"ec_id":"{ec_id_a}","partner_uid":"a-first","timestamp":1}},{{"ec_id":"{ec_id_b}","partner_uid":"b","timestamp":2}},{{"ec_id":"{ec_id_a}","partner_uid":"a-last","timestamp":3}},{{"ec_id":"{ec_id_c}","partner_uid":"c","timestamp":4}}]}}"#
+        );
+
+        let response = handle_batch_sync_with_writer(
+            &writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&body),
+        )
+        .expect("should return infrastructure failure response");
+
+        assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+        let response = response_json(response);
+        assert_eq!(response["accepted"], 2);
+        assert_eq!(response["rejected"], 2);
+        assert_eq!(
+            response["errors"],
+            serde_json::json!([
+                {"index": 1, "reason": REASON_KV_UNAVAILABLE},
+                {"index": 3, "reason": REASON_KV_UNAVAILABLE},
+            ])
+        );
+        assert_eq!(
+            writer.calls(),
+            vec![
+                WriterCall {
+                    ec_id: ec_id_a,
+                    partner_id: "ssp.example.com".to_owned(),
+                    uid: "a-last".to_owned(),
+                },
+                WriterCall {
+                    ec_id: ec_id_b,
+                    partner_id: "ssp.example.com".to_owned(),
+                    uid: "b".to_owned(),
+                },
+            ],
+            "should stop after the failing group and accept A's later duplicate"
+        );
     }
 }
