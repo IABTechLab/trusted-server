@@ -1621,7 +1621,6 @@ fn validate_page_patterns(patterns: &[String]) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
     use std::io;
     use std::rc::Rc;
 
@@ -1637,26 +1636,6 @@ mod tests {
     struct FakeCollector {
         collected: CollectedPage,
         calls: Cell<usize>,
-    }
-
-    struct FixedPathGenerator {
-        paths: VecDeque<String>,
-    }
-
-    impl FixedPathGenerator {
-        fn new(paths: &[&str]) -> Self {
-            Self {
-                paths: paths.iter().map(|path| (*path).to_string()).collect(),
-            }
-        }
-    }
-
-    impl OpaqueAssetPathGenerator for FixedPathGenerator {
-        fn next_path(&mut self) -> String {
-            self.paths
-                .pop_front()
-                .expect("should have a fixed generated asset path")
-        }
     }
 
     struct MutatingCollector {
@@ -2396,19 +2375,6 @@ mod tests {
             self.paths
                 .pop_front()
                 .expect("should have a fixed generated asset path")
-        }
-    }
-
-    fn audited_asset(url: &str, party: AssetParty, integration: Option<&str>) -> AuditedAsset {
-        AuditedAsset {
-            kind: "script".to_string(),
-            url: url.to_string(),
-            host: Url::parse(url)
-                .ok()
-                .and_then(|parsed| parsed.host_str().map(str::to_string))
-                .unwrap_or_default(),
-            party,
-            integration: integration.map(str::to_string),
         }
     }
 

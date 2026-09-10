@@ -1568,7 +1568,7 @@ mod tests {
         RuntimeStoreConfig, TSJS_ROUTE_TEMPLATE, TrustedServerApp, build_orchestrator_with_plan,
         build_per_request_services, build_state_from_settings, compile_auction_plan,
         handle_publisher_request, publisher_response_into_streaming_response,
-        publisher_route_template, startup_error_router
+        publisher_route_template, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -4054,25 +4054,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_short_circuit_response_is_not_recovery_eligible() {
-        // A request-filter short circuit (e.g. a DataDome challenge/block) must
-        // not authorize orphan recovery even for a would-be publisher
-        // navigation: no publisher page was served.
-        let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
-        let response = route(&router, browser_navigation_request("/some-page"));
-
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "the challenge filter should short-circuit routing"
-        );
-        assert!(
-            !recovery_eligible_of(&response),
-            "a short-circuit filter response must not authorize orphan recovery"
-        );
-    }
-
-    #[test]
     fn server_timing_absent_when_no_cache_control_header_exists() {
         // The fail-closed case: absence of Cache-Control is not evidence of
         // privacy, so emission must be suppressed rather than defaulted on.
@@ -4108,7 +4089,6 @@ mod tests {
         assert!(
             header.contains("ts-total"),
             "should append the TS-owned set: {header}"
-
         );
     }
 }

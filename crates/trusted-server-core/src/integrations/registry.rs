@@ -845,7 +845,11 @@ impl IntegrationRegistry {
 
             for proxy in registration.proxies {
                 for route in proxy.routes() {
-                    let value = (proxy.clone(), registration.integration_id);
+                    let value = (
+                        proxy.clone(),
+                        registration.integration_id,
+                        route.path.clone(),
+                    );
 
                     // Convert /* wildcard to matchit's {*rest} syntax
                     let matchit_path = if route.path.ends_with("/*") {

@@ -1994,7 +1994,6 @@ impl TinybirdSettings {
                 })
             })?;
             validate_tinybird_secret(token.expose(), "tinybird.access_token_secret")?;
-        }
             if self.access_sample_rate <= 0.0 {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: "tinybird.access_sample_rate must be > 0 when tinybird.access_enabled is true".to_owned(),

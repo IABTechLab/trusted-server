@@ -508,7 +508,8 @@ pub struct PrebidIntegrationConfig {
     /// Prebid User ID modules that Trusted Server installs and keeps installed.
     ///
     /// Each entry is forwarded to Prebid.js verbatim; publisher-configured
-    /// entries with other names are preserved. Names must be unique.
+    /// entries with other names are preserved. Names must be unique, and no two
+    /// names may resolve to the same Prebid User ID submodule.
     #[serde(default)]
     #[validate(nested, custom(function = "validate_unique_managed_user_id_names"))]
     pub managed_user_ids: Vec<PrebidManagedUserIdConfig>,
@@ -538,14 +539,6 @@ pub struct PrebidIntegrationConfig {
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
     pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
-    /// Prebid User ID modules that Trusted Server installs and keeps installed.
-    ///
-    /// Each entry is forwarded to Prebid.js verbatim; publisher-configured
-    /// entries with other names are preserved. Names must be unique, and no two
-    /// names may resolve to the same Prebid User ID submodule.
-    #[serde(default)]
-    #[validate(nested, custom(function = "validate_unique_managed_user_id_names"))]
-    pub managed_user_ids: Vec<PrebidManagedUserIdConfig>,
     /// CLI-only external bundle build inputs; runtime registration ignores these fields.
     #[serde(default)]
     pub bundle: PrebidBundleBuildConfig,
@@ -565,7 +558,6 @@ impl Default for PrebidIntegrationConfig {
             external_bundle_sri: None,
             client_side_bidders: Vec::new(),
             excluded_gam_ad_unit_path_suffixes: Vec::new(),
-            managed_user_ids: Vec::new(),
             bundle: PrebidBundleBuildConfig::default(),
         }
     }
@@ -592,7 +584,6 @@ impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
             external_bundle_sri: config.external_bundle_sri.clone(),
             client_side_bidders: config.client_side_bidders.clone(),
             excluded_gam_ad_unit_path_suffixes: config.excluded_gam_ad_unit_path_suffixes.clone(),
-            managed_user_ids: config.managed_user_ids.clone(),
             bundle: PrebidBundleBuildConfig::default(),
         }
     }
@@ -5475,7 +5466,6 @@ external_bundle_sri = "sha384-AAAA"
             1,
             "should contain only the legitimate outer closing script tag"
         );
-
     }
 
     #[test]
