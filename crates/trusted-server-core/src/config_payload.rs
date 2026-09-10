@@ -145,6 +145,7 @@ mod tests {
 
     use super::*;
     use crate::integrations::IntegrationRegistry;
+    use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
@@ -303,6 +304,36 @@ mod tests {
             reconstructed.handlers.len(),
             original.handlers.len(),
             "should preserve arrays"
+        );
+    }
+
+    #[test]
+    fn didomi_geo_query_parameters_survive_blob_round_trip() {
+        let mut original = test_settings();
+        original
+            .integrations
+            .insert_config(
+                "didomi",
+                &DidomiIntegrationConfig {
+                    enabled: true,
+                    geo_query_parameters: true,
+                    proxy_path: None,
+                    sdk_origin: "https://sdk.example.com".to_string(),
+                    api_origin: "https://api.example.com".to_string(),
+                },
+            )
+            .expect("should insert Didomi configuration");
+
+        let reconstructed =
+            load_settings(&envelope_json(&original)).expect("should reconstruct settings");
+        let config = reconstructed
+            .integration_config::<DidomiIntegrationConfig>("didomi")
+            .expect("should read Didomi configuration")
+            .expect("should enable Didomi");
+
+        assert!(
+            config.geo_query_parameters,
+            "should preserve Didomi geo opt-in"
         );
     }
 
