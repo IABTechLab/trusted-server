@@ -1,22 +1,23 @@
 //! Write-side validation for generated ad-template config.
 //!
 //! Everything the generator writes is derived from a live, page-controlled ad
-//! stack, so the candidate document has to clear the same bar the runtime
-//! applies at startup *before* it replaces the operator's file. A config the
+//! stack, so the candidate document must pass source-config validation
+//! before it replaces the operator's file. A config the
 //! runtime rejects is not a degraded ad stack — `build_state` fails and the
 //! adapter answers every route from the startup error router, so an unloadable
 //! `trusted-server.toml` is a full-site outage once pushed.
 
-use trusted_server_core::settings::Settings;
+use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::error::{CliResult, cli_error};
 
 /// Validates the candidate config text the generator is about to persist.
 ///
-/// Runs [`Settings::from_toml`], which drives the identical
-/// `finalize_deserialized` chain the runtime uses — serde (`deny_unknown_fields`
-/// plus required fields), then `compile_slots` → `compile_unit_templates` →
-/// `validate_runtime`, then the validator pass — with no I/O.
+/// Runs [`TrustedServerAppConfig::new`], the push-time validation path, after
+/// deserializing the source TOML. This checks slot and template compilation,
+/// provider configuration, and secret key references without I/O. Secret values
+/// are resolved and validated separately at runtime; treating source key names
+/// as resolved secrets would incorrectly reject otherwise valid baselines.
 ///
 /// `baseline` is the config as it was read from disk. When the baseline is
 /// *already* unloadable, this run cannot be blamed for it: the candidate is
@@ -29,11 +30,11 @@ use crate::error::{CliResult, cli_error};
 /// Returns a user-facing error when the candidate fails to load and the baseline
 /// loaded cleanly — that is, when this run introduced the failure.
 pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<String>> {
-    let Err(candidate_error) = Settings::from_toml(candidate) else {
+    let Err(candidate_error) = validate_source_config(candidate) else {
         return Ok(Vec::new());
     };
 
-    if let Err(baseline_error) = Settings::from_toml(baseline) {
+    if let Err(baseline_error) = validate_source_config(baseline) {
         return Ok(vec![format!(
             "target config was already invalid before this run, so the generated \
              result could not be verified: {baseline_error}"
@@ -46,13 +47,23 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
     ))
 }
 
+fn validate_source_config(source: &str) -> CliResult<()> {
+    let config: TrustedServerAppConfig =
+        toml::from_str(source).map_err(|error| error.to_string())?;
+    TrustedServerAppConfig::new(config.into_settings())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A minimal config that loads cleanly, used as the valid baseline.
+    /// A source config containing secret references, as an operator would edit it.
     fn baseline() -> String {
         crate::commands::config::init::EXAMPLE_CONFIG
+            .replace("\"example.com\"", "\"publisher.example.com\"")
+            .replace("\".example.com\"", "\".publisher.example.com\"")
             .replace(
                 "password = \"handler_password\"",
                 "password = \"test-admin-password-32-bytes-minimum\"",
@@ -64,6 +75,10 @@ mod tests {
             .replace(
                 "proxy_secret = \"publisher_proxy_secret\"",
                 "proxy_secret = \"test-proxy-secret-32-bytes-minimum\"",
+            )
+            .replace(
+                "https://origin.example.com",
+                "https://origin.publisher.example.com",
             )
     }
 

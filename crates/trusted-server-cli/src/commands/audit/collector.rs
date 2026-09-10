@@ -85,7 +85,13 @@ pub struct GenerateBrowserOpts {
     /// Quiet window in milliseconds that marks the page settled.
     #[arg(long, default_value_t = GENERATE_SETTLE_QUIET_MS)]
     pub settle_quiet_ms: u64,
-    /// Hard cap in milliseconds on waiting for the page to settle.
+    /// Shared budget in milliseconds for the initial, post-scroll, and GPT settle waits.
+    ///
+    /// Starts after navigation; scrolling consumes this budget. GPT polling
+    /// precedes metadata extraction so those reads cannot consume its budget.
+    /// Navigation and browser operations have separate timeouts, so this is not
+    /// a total page deadline. An exhausted budget still takes one GPT snapshot;
+    /// two consecutive empty GPT polls end the wait early regardless of the budget.
     #[arg(long, default_value_t = GENERATE_SETTLE_MAX_MS)]
     pub settle_max_ms: u64,
     /// Navigate to origins whose TLS certificate does not validate.

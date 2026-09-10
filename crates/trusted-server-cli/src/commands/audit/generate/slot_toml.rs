@@ -291,22 +291,26 @@ pub(super) fn merge_render_slots_with_observed_diagnostics(
                 }
             }
         } else {
-            if let Some(discovered_div) = slot.div_id.as_deref() {
-                for parent in merged[..existing_count].iter().filter(|configured| {
-                    configured.div_id.as_deref().is_some_and(|prefix| {
-                        !prefix.is_empty()
-                            && observed_literals.contains(prefix)
-                            && discovered_div != prefix
-                            && discovered_div.starts_with(prefix)
-                    }) && configured.has_tuned_fields()
-                }) {
-                    split_warnings.insert(format!(
-                        "discovered div `{discovered_div}` was split from configured div_id prefix \
+            if let Some(discovered_div) = slot.div_id.as_deref()
+                && let Some(parent) = merged[..existing_count]
+                    .iter()
+                    .filter(|configured| {
+                        configured.div_id.as_deref().is_some_and(|prefix| {
+                            !prefix.is_empty()
+                                && observed_literals.contains(prefix)
+                                && discovered_div != prefix
+                                && discovered_div.starts_with(prefix)
+                        })
+                    })
+                    .max_by_key(|configured| configured.div_id.as_deref().map_or(0, str::len))
+                && parent.has_tuned_fields()
+            {
+                split_warnings.insert(format!(
+                    "discovered div `{discovered_div}` was split from configured div_id prefix \
                          `{}`; the new slot does not inherit that configured slot's floor price, \
                          targeting, or provider settings",
-                        parent.div_id.as_deref().unwrap_or_default(),
-                    ));
-                }
+                    parent.div_id.as_deref().unwrap_or_default(),
+                ));
             }
             slot.id = unique_slot_id(&slot.id, &merged);
             merged.push(slot);
@@ -1807,7 +1811,7 @@ slot_id = "sidebar"
     }
 
     #[test]
-    fn split_sibling_warns_for_every_tuned_parent_prefix() {
+    fn split_sibling_warns_only_for_longest_parent_prefix() {
         let existing = existing_config(
             "gam_network_id = \"222\"\n\n\
              [[slot]]\nid = \"broad\"\ndiv_id = \"ad\"\n\
@@ -1836,21 +1840,145 @@ slot_id = "sidebar"
 
         assert_eq!(
             diagnostics.notes.len(),
-            2,
-            "both tuned ancestors should be named"
+            1,
+            "should name only the routing ancestor"
+        );
+        assert!(
+            !diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("prefix `ad`")),
+            "should not claim inheritance from the broader ancestor"
         );
         assert!(
             diagnostics
                 .notes
                 .iter()
-                .any(|note| note.contains("prefix `ad`"))
+                .any(|note| note.contains("prefix `ad-side`")),
+            "the narrower tuned ancestor should be named"
         );
+    }
+
+    #[test]
+    fn split_sibling_does_not_warn_about_a_tuned_broader_ancestor() {
+        let existing = existing_config(
+            r#"
+            gam_network_id = "222"
+            [[slot]]
+            id = "broad"
+            div_id = "ad"
+            gam_unit_path = "/222/broad"
+            page_patterns = ["/"]
+            formats = [{ width = 300, height = 250 }]
+            floor_price = 1.0
+            [[slot]]
+            id = "side"
+            div_id = "ad-side"
+            gam_unit_path = "/222/side"
+            page_patterns = ["/"]
+            formats = [{ width = 300, height = 250 }]
+        "#,
+        );
+        let discovered = ["ad", "ad-side", "ad-sidebar"]
+            .into_iter()
+            .map(|div_id| {
+                RenderSlot::from_evidence(
+                    div_id,
+                    div_id,
+                    Some("/222/new".to_string()),
+                    [(300, 250)],
+                    vec!["/news/*".to_string()],
+                    false,
+                )
+            })
+            .collect();
+        let (_, diagnostics) =
+            merge_render_slots_with_diagnostics(Some(&existing), discovered, false);
         assert!(
-            diagnostics
-                .notes
-                .iter()
-                .any(|note| note.contains("prefix `ad-side`"))
+            diagnostics.notes.is_empty(),
+            "should not claim a broader floor price would have been inherited"
         );
+    }
+
+    #[test]
+    fn refused_but_written_literal_keeps_a_sibling_distinct_during_merge() {
+        let existing = existing_config(
+            r#"
+            gam_network_id = "222"
+            [[slot]]
+            id = "ad-x"
+            div_id = "ad-x"
+            gam_unit_path = "/222/original"
+            page_patterns = ["/"]
+            formats = [{ width = 300, height = 250 }]
+            floor_price = 5.0
+        "#,
+        );
+        let accepted = gpt_slots::DiscoveredSlots {
+            had_slot_evidence: true,
+            slots: ["ad-x", "ad-x-extra"]
+                .into_iter()
+                .map(|div_id| gpt_slots::DiscoveredSlot {
+                    id: div_id.to_string(),
+                    div_id: div_id.to_string(),
+                    gam_unit_path: format!("/222/{div_id}"),
+                    formats: vec![(300, 250)],
+                    has_prebid: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let refused = gpt_slots::DiscoveredSlots {
+            had_slot_evidence: true,
+            refused_div_ids: BTreeSet::from(["ad-x".to_string()]),
+            ..Default::default()
+        };
+        for reverse in [false, true] {
+            let mut table = super::super::evidence::EvidenceTable::default();
+            if reverse {
+                table.fold_page("/news", &refused);
+            }
+            table.fold_page("/", &accepted);
+            if !reverse {
+                table.fold_page("/news", &refused);
+            }
+            let discovered = accepted
+                .slots
+                .iter()
+                .map(|slot| RenderSlot::from_discovered(slot, &["/".to_string()]))
+                .collect();
+            let (merged, _) = merge_render_slots_with_observed_diagnostics(
+                Some(&existing),
+                discovered,
+                &table
+                    .observed_div_ids()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                &table
+                    .observed_literals()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                false,
+            );
+            assert_eq!(
+                merged.len(),
+                2,
+                "should keep the sibling regardless of refusal order"
+            );
+            let sibling = merged
+                .iter()
+                .find(|slot| slot.div_id.as_deref() == Some("ad-x-extra"))
+                .expect("should keep the sibling");
+            assert_eq!(
+                sibling.floor_price, None,
+                "should not inherit the configured floor price"
+            );
+            assert_eq!(
+                sibling.gam_unit_path.as_deref(),
+                Some("/222/ad-x-extra"),
+                "should preserve the observed unit path"
+            );
+        }
     }
 
     #[test]

@@ -187,15 +187,14 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
         if loaded.settings.auction.providers.is_empty() {
             "(none)".to_string()
         } else {
-            let providers = loaded
+            loaded
                 .settings
                 .auction
                 .providers
                 .keys()
-                .map(trusted_server_core::auction::ProviderId::as_str)
+                .map(|id| escape_terminal_text(id.as_str()).into_owned())
                 .collect::<Vec<_>>()
-                .join(", ");
-            escape_terminal_text(&providers).into_owned()
+                .join(", ")
         }
     )
     .map_err(output_error)?;
@@ -723,6 +722,10 @@ mod tests {
         assert!(
             output.contains("auction.enabled:"),
             "should report the auction kill-switch state"
+        );
+        assert!(
+            output.contains("auction.providers: pbs-main"),
+            "should report provider map identifiers: {output}"
         );
         assert!(!output.contains("legacy fallback"));
     }

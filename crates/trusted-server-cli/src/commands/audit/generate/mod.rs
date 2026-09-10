@@ -2379,9 +2379,42 @@ mod tests {
         );
     }
 
+    struct FixedPathGenerator {
+        paths: std::collections::VecDeque<String>,
+    }
+
+    impl FixedPathGenerator {
+        fn new(paths: &[&str]) -> Self {
+            Self {
+                paths: paths.iter().map(|path| (*path).to_string()).collect(),
+            }
+        }
+    }
+
+    impl OpaqueAssetPathGenerator for FixedPathGenerator {
+        fn next_path(&mut self) -> String {
+            self.paths
+                .pop_front()
+                .expect("should have a fixed generated asset path")
+        }
+    }
+
+    fn audited_asset(url: &str, party: AssetParty, integration: Option<&str>) -> AuditedAsset {
+        AuditedAsset {
+            kind: "script".to_string(),
+            url: url.to_string(),
+            host: Url::parse(url)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_string))
+                .unwrap_or_default(),
+            party,
+            integration: integration.map(str::to_string),
+        }
+    }
+
     #[test]
     fn build_draft_config_writes_disabled_js_asset_proxy_candidates() {
-        let url = Url::parse("https://publisher.example/page").expect("should parse URL");
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
             audited_url: url.to_string(),
             page_title: Some("Example".to_string()),
@@ -2389,16 +2422,16 @@ mod tests {
             third_party_asset_count: 2,
             detected_integrations: vec![DetectedIntegration {
                 id: "gpt".to_string(),
-                evidence: "https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string(),
+                evidence: "https://gpt.example.com/gpt.js".to_string(),
             }],
             assets: vec![
                 audited_asset(
-                    "https://cdn.vendor.example/sdk.js",
+                    "https://cdn.vendor.example.com/sdk.js",
                     AssetParty::ThirdParty,
                     None,
                 ),
                 audited_asset(
-                    "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                    "https://gpt.example.com/gpt.js",
                     AssetParty::ThirdParty,
                     Some("gpt"),
                 ),
@@ -2418,7 +2451,10 @@ mod tests {
         )
         .expect("should build draft config");
 
-        assert_eq!(draft.js_asset_proxy_candidate_count, 2);
+        assert_eq!(
+            draft.js_asset_proxy_candidate_count, 2,
+            "should report generated disabled entries"
+        );
         assert!(
             draft
                 .toml
@@ -2429,13 +2465,18 @@ mod tests {
         assert!(
             draft
                 .toml
-                .contains("origin_url = \"https://cdn.vendor.example/sdk.js\"")
+                .contains("origin_url = \"https://cdn.vendor.example.com/sdk.js\"")
         );
         assert!(draft.toml.contains("proxy = \"disabled\""));
         assert!(draft.toml.contains("Detected integration: gpt"));
         assert!(
+            draft
+                .toml
+                .contains("Native integration may be preferable: [integrations.gpt]")
+        );
+        assert!(
             !draft.toml.contains("example-vendor-loader"),
-            "should remove the starter placeholder asset"
+            "should remove starter-template placeholder asset"
         );
         assert!(
             draft.toml.contains(
@@ -2443,35 +2484,83 @@ mod tests {
             ),
             "should preserve documentation for the section following the replaced block"
         );
-        toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
+        let parsed =
+            toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
+        assert!(
+            parsed["integrations"]["js_asset_proxy"]
+                .get("cache_ttl_seconds")
+                .is_none(),
+            "generated config should inherit upstream cache headers by default"
+        );
+    }
+
+    #[test]
+    fn generated_asset_proxy_paths_are_opaque() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 1,
+            third_party_asset_count: 1,
+            detected_integrations: Vec::new(),
+            assets: vec![audited_asset(
+                "https://cdn.vendor.example.com/vendor-loader.js",
+                AssetParty::ThirdParty,
+                None,
+            )],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&["/assets/0123456789abcdef01234567.js"]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+        let path_line = draft
+            .toml
+            .lines()
+            .find(|line| line.starts_with("path = ") && line.contains("0123456789abcdef"))
+            .expect("should include generated path");
+
+        assert!(path_line.contains("/assets/0123456789abcdef01234567.js"));
+        assert!(
+            !path_line.contains("vendor")
+                && !path_line.contains("cdn")
+                && !path_line.contains("loader"),
+            "generated path should not include vendor, domain, or filename semantics"
+        );
     }
 
     #[test]
     fn asset_proxy_generation_deduplicates_and_summarizes_skips() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
-            audited_url: "https://publisher.example/page".to_string(),
+            audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 4,
             third_party_asset_count: 3,
             detected_integrations: Vec::new(),
             assets: vec![
                 audited_asset(
-                    "https://cdn.vendor.example/sdk.js",
+                    "https://cdn.vendor.example.com/sdk.js",
                     AssetParty::ThirdParty,
                     None,
                 ),
                 audited_asset(
-                    "https://cdn.vendor.example/sdk.js",
+                    "https://cdn.vendor.example.com/sdk.js",
                     AssetParty::ThirdParty,
                     None,
                 ),
                 audited_asset(
-                    "https://publisher.example/app.js",
+                    "https://publisher.example.com/app.js",
                     AssetParty::FirstParty,
                     None,
                 ),
                 audited_asset(
-                    "http://cdn.vendor.example/insecure.js",
+                    "http://cdn.vendor.example.com/insecure.js",
                     AssetParty::ThirdParty,
                     None,
                 ),
@@ -2480,25 +2569,78 @@ mod tests {
         };
         let mut generator = FixedPathGenerator::new(&["/assets/111111111111111111111111.js"]);
 
-        let section =
-            build_js_asset_proxy_section(&artifact, &mut generator).expect("should build section");
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
 
-        assert_eq!(section.candidate_count, 1);
+        assert_eq!(draft.js_asset_proxy_candidate_count, 1);
         assert_eq!(
-            section
+            draft
                 .toml
                 .matches("[[integrations.js_asset_proxy.assets]]")
                 .count(),
-            1
+            1,
+            "should only emit one candidate entry"
         );
-        assert!(section.toml.contains("# - 1 first-party script"));
-        assert!(section.toml.contains("# - 1 non-HTTPS third-party script"));
-        assert!(section.toml.contains("# - 1 duplicate script URL"));
+        assert!(draft.toml.contains("# - 1 first-party script"));
+        assert!(draft.toml.contains("# - 1 non-HTTPS third-party script"));
+        assert!(draft.toml.contains("# - 1 duplicate script URL"));
+    }
+
+    #[test]
+    fn asset_proxy_generation_warns_about_query_string_candidates() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 2,
+            third_party_asset_count: 2,
+            detected_integrations: Vec::new(),
+            assets: vec![
+                audited_asset(
+                    "https://cdn.vendor.example.com/sdk.js?v=one",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+                audited_asset(
+                    "https://cdn.vendor.example.com/sdk.js?v=two",
+                    AssetParty::ThirdParty,
+                    None,
+                ),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&[
+            "/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js",
+            "/assets/bbbbbbbbbbbbbbbbbbbbbbbb.js",
+        ]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+
+        assert_eq!(draft.js_asset_proxy_candidate_count, 2);
+        assert_eq!(
+            draft
+                .toml
+                .matches("This URL includes a query string and must remain stable")
+                .count(),
+            2,
+            "each query-string candidate should explain exact-match behavior"
+        );
     }
 
     #[test]
     fn asset_proxy_generation_with_no_candidates_removes_placeholder_asset() {
-        let url = Url::parse("https://publisher.example/page").expect("should parse URL");
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
             audited_url: url.to_string(),
             page_title: None,
@@ -2506,7 +2648,7 @@ mod tests {
             third_party_asset_count: 0,
             detected_integrations: Vec::new(),
             assets: vec![audited_asset(
-                "https://publisher.example/app.js",
+                "https://publisher.example.com/app.js",
                 AssetParty::FirstParty,
                 None,
             )],
@@ -2531,43 +2673,21 @@ mod tests {
         assert!(
             !draft
                 .toml
-                .contains("[[integrations.js_asset_proxy.assets]]")
+                .contains("[[integrations.js_asset_proxy.assets]]"),
+            "should not emit asset array entries without candidates"
         );
-        assert!(!draft.toml.contains("example-vendor-loader"));
-    }
-
-    #[test]
-    fn asset_proxy_generation_warns_about_query_string_candidates() {
-        let artifact = AuditArtifact {
-            audited_url: "https://publisher.example/page".to_string(),
-            page_title: None,
-            js_asset_count: 1,
-            third_party_asset_count: 1,
-            detected_integrations: Vec::new(),
-            assets: vec![audited_asset(
-                "https://cdn.vendor.example/sdk.js?v=one",
-                AssetParty::ThirdParty,
-                None,
-            )],
-            warnings: Vec::new(),
-        };
-        let mut generator = FixedPathGenerator::new(&["/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js"]);
-
-        let section =
-            build_js_asset_proxy_section(&artifact, &mut generator).expect("should build section");
-
         assert!(
-            section
-                .toml
-                .contains("query string and must remain stable for proxy matching")
+            !draft.toml.contains("example-vendor-loader"),
+            "should remove starter-template placeholder asset"
         );
+        toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
     }
 
     #[test]
     fn run_generate_summary_reports_written_asset_proxy_candidates() {
         let temp = TempDir::new().expect("should create temp dir");
         let config = temp.path().join("trusted-server.toml");
-        let mut args = audit_args("https://publisher.example/page");
+        let mut args = audit_args("https://publisher.example.com/page");
         args.config = Some(config);
         args.no_js_assets = true;
         let collector = FakeCollector::new(collected_page());
@@ -3629,8 +3749,8 @@ mod tests {
         toml::from_str::<toml::Value>(&written).expect("rewritten config is valid TOML");
     }
 
-    /// A full, loadable config with real secrets substituted, so the write-side
-    /// validation gate is live rather than downgraded by a broken baseline.
+    /// A config with fictional resolved secrets and non-placeholder publisher
+    /// values, so both source validation and runtime loading can be exercised.
     fn loadable_config() -> String {
         EXAMPLE_CONFIG
             .replace(
@@ -3644,6 +3764,12 @@ mod tests {
             .replace(
                 "proxy_secret = \"publisher_proxy_secret\"",
                 "proxy_secret = \"test-proxy-secret-32-bytes-minimum\"",
+            )
+            .replace("\"example.com\"", "\"publisher.example.com\"")
+            .replace("\".example.com\"", "\".publisher.example.com\"")
+            .replace(
+                "https://origin.example.com",
+                "https://origin.publisher.example.com",
             )
     }
 

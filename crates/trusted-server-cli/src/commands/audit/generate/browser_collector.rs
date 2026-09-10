@@ -15,7 +15,7 @@ use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
     resolve_chrome, set_browser_cookies,
 };
-use crate::commands::audit::browser_scroll;
+use crate::commands::audit::browser_scroll::{self, CDP_OPERATION_TIMEOUT};
 use crate::commands::audit::collector::{
     GENERATE_SETTLE_MAX_MS, GENERATE_SETTLE_QUIET_MS, GenerateBrowserOpts,
 };
@@ -34,7 +34,6 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// whatever rendered by then.
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Size the page's resource-timing buffer is raised to before navigation, and
 /// therefore also the count at which the buffer is full and entries were lost.
 /// One constant so the script and the warning threshold cannot drift apart.
@@ -617,6 +616,10 @@ async fn collect_open_page(
         )),
     }
 
+    // All settle phases share one clock. Navigation has its own timeout;
+    // scrolling also consumes the remaining settle budget. Read GPT before
+    // metadata so unrelated evidence extraction cannot starve stabilization.
+    let settle_start = std::time::Instant::now();
     if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
@@ -631,7 +634,14 @@ async fn collect_open_page(
                 .into_iter()
                 .map(|failure| failure.to_string()),
         );
-        if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
+        let remaining = settings.settle_max.saturating_sub(settle_start.elapsed());
+        if remaining.is_zero() {
+            warnings.push(
+                "settle budget was exhausted before the post-scroll settle; \
+                 post-scroll evidence may be missing; raise `--settle-max-ms`"
+                    .to_string(),
+            );
+        } else if !wait_for_page_settle(page, settings.settle_quiet, remaining).await? {
             warnings.push(
                 "browser audit timed out while waiting for the page to settle after scroll; \
                  results may be partial"
@@ -640,7 +650,25 @@ async fn collect_open_page(
         }
     }
 
-    match timeout(PAGE_OPERATION_TIMEOUT, page.frames()).await {
+    // GPT can finish registering slots after the document and resource stream
+    // are otherwise quiet. Wait for a non-empty registry to stabilize instead
+    // of treating the first empty read as authoritative.
+    //
+    // The ad-template verifier needs no counterpart wait: its evidence
+    // collector wraps `googletag.defineSlot` before publisher scripts run and
+    // accumulates every slot defined before the read. This command reads a
+    // `getSlots()` snapshot instead and can observe a half-registered registry.
+    // `ts audit page` also takes a snapshot, but reports what it saw rather
+    // than generating config from it.
+    let gpt_slots = collect_stable_gpt_slots(
+        page,
+        settings.settle_quiet,
+        settings.settle_max.saturating_sub(settle_start.elapsed()),
+        &mut warnings,
+    )
+    .await;
+
+    match timeout(CDP_OPERATION_TIMEOUT, page.frames()).await {
         Ok(Ok(frames)) if frames.len() > 1 => warnings.push(format!(
             "browser evidence inspects only the main frame; {} child frame(s) were present",
             frames.len() - 1
@@ -650,22 +678,22 @@ async fn collect_open_page(
         Err(_) => warnings.push("timed out inspecting browser frames".to_string()),
     }
 
-    let final_url = timeout(PAGE_OPERATION_TIMEOUT, page.url())
+    let final_url = timeout(CDP_OPERATION_TIMEOUT, page.url())
         .await
         .map_err(|_| "timed out reading final page URL".to_string())?
         .map_err(|error| format!("failed to read final page URL: {error}"))?
         .ok_or("browser page URL was empty after navigation")?;
-    let page_title = timeout(PAGE_OPERATION_TIMEOUT, page.get_title())
+    let page_title = timeout(CDP_OPERATION_TIMEOUT, page.get_title())
         .await
         .map_err(|_| "timed out reading page title".to_string())?
         .map_err(|error| format!("failed to read page title: {error}"))?;
-    let html = timeout(PAGE_OPERATION_TIMEOUT, page.content())
+    let html = timeout(CDP_OPERATION_TIMEOUT, page.content())
         .await
         .map_err(|_| "timed out reading rendered page HTML".to_string())?
         .map_err(|error| format!("failed to read rendered page HTML: {error}"))?;
 
     let script_tags: Vec<BrowserScriptTag> = timeout(
-        PAGE_OPERATION_TIMEOUT,
+        CDP_OPERATION_TIMEOUT,
         page.evaluate(
             r#"() => Array.from(document.scripts).map((script) => ({
                 src: script.src || null,
@@ -680,7 +708,7 @@ async fn collect_open_page(
     .map_err(|error| format!("failed to decode rendered script tag data: {error}"))?;
 
     let network_requests: Vec<BrowserPerformanceEntry> = timeout(
-        PAGE_OPERATION_TIMEOUT,
+        CDP_OPERATION_TIMEOUT,
         page.evaluate(
             r#"() => performance.getEntriesByType('resource').map((entry) => ({
                 url: entry.name,
@@ -698,11 +726,6 @@ async fn collect_open_page(
         warnings.push(warning.to_string());
     }
 
-    // GPT can finish registering slots after the document and resource stream
-    // are otherwise quiet. Wait for a non-empty registry to stabilize instead
-    // of treating the first empty read as authoritative.
-    let gpt_slots = collect_stable_gpt_slots(page, &mut warnings).await;
-
     // Links come from the hydrated DOM, not the served markup: an app-router
     // page keeps its link graph in the framework payload, so parsing the raw
     // HTML finds only a fraction of the site's sections. Best-effort — an empty
@@ -712,7 +735,7 @@ async fn collect_open_page(
     // loaded, it loaded but the command queue never drained, or slots really
     // are absent — and the operator's next move differs for each.
     if gpt_slots.is_empty() {
-        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(GPT_DIAGNOSTIC_SCRIPT)).await {
+        match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(GPT_DIAGNOSTIC_SCRIPT)).await {
             Ok(Ok(result)) => match result.into_value::<serde_json::Value>() {
                 Ok(state) => warnings.push(format!(
                     "no GPT slots in the registry; googletag state: {state}"
@@ -725,7 +748,7 @@ async fn collect_open_page(
     }
 
     let links: Vec<CollectedLink> =
-        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(LINKS_SCRIPT)).await {
+        match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(LINKS_SCRIPT)).await {
             Ok(Ok(result)) => match result.into_value() {
                 Ok(links) => links,
                 Err(error) => {
@@ -753,7 +776,7 @@ async fn collect_open_page(
             .return_by_value(true)
             .build()
             .map_err(|error| format!("failed to build sitemap evaluation: {error}"))?;
-        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(evaluation)).await {
+        match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(evaluation)).await {
             Ok(Ok(result)) => match result.into_value() {
                 Ok(locations) => locations,
                 Err(error) => {
@@ -959,59 +982,180 @@ const GPT_SLOTS_SCRIPT: &str = r#"() => {
     }
 }"#;
 
-/// Reads GPT until a non-empty registry repeats or the page-operation bound
-/// expires. The latest non-empty snapshot is retained if registration keeps
-/// changing through the bound; an empty result remains best-effort so the
-/// caller can report the more useful GPT state diagnostic.
+/// How one GPT registry reading relates to the previous non-empty reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GptRegistryReading {
+    /// GPT reported no slots, so any stability streak so far is void.
+    Empty,
+    /// The registry differs from the last non-empty reading.
+    Changed,
+    /// The registry matches the last non-empty reading, element for element.
+    Repeated,
+}
+
+/// Classifies one GPT registry reading against the previous non-empty reading.
+///
+/// The comparison is element-wise and order-sensitive because registry order is
+/// load-bearing downstream: slot discovery takes the GAM network id from the
+/// first usable entry and emits slots in registry order, so a reading whose
+/// order still churns has not stabilized even when its slot set has.
+fn gpt_registry_reading(
+    previous_nonempty: Option<&[CollectedGptSlot]>,
+    current: &[CollectedGptSlot],
+) -> GptRegistryReading {
+    if current.is_empty() {
+        GptRegistryReading::Empty
+    } else if previous_nonempty == Some(current) {
+        GptRegistryReading::Repeated
+    } else {
+        GptRegistryReading::Changed
+    }
+}
+
+/// Reads GPT until a non-empty registry holds still for `dwell_target`, or
+/// until `budget` expires.
+///
+/// A single pair of matching reads is not enough: GPT registers in bursts (SRA
+/// batching, consent-gated definitions, lazy slots), so two consecutive reads
+/// can both observe the same burst and miss the next. Requiring the reading to
+/// repeat for a dwell window mirrors [`wait_for_page_settle`], and taking both
+/// the dwell from the operator's quiet flag and the remaining shared settle
+/// budget keeps this phase under the same `--settle-max-ms` control. An
+/// in-flight read may overrun the budget by its own bound. Even an exhausted
+/// budget takes one snapshot; two consecutive empty polls end the wait early.
+///
+/// The latest non-empty snapshot is retained, with a warning, if registration
+/// keeps changing through the budget. An empty result stays silent and
+/// best-effort so the caller can report the more useful GPT state diagnostic.
 async fn collect_stable_gpt_slots(
     page: &chromiumoxide::Page,
+    dwell_target: Duration,
+    budget: Duration,
     warnings: &mut Vec<String>,
 ) -> Vec<CollectedGptSlot> {
-    let start = std::time::Instant::now();
-    let mut previous_nonempty = None;
+    poll_gpt_registry(
+        || async {
+            match timeout(CDP_OPERATION_TIMEOUT, page.evaluate(GPT_SLOTS_SCRIPT)).await {
+                Ok(Ok(result)) => result
+                    .into_value()
+                    .map_err(|error| format!("failed to decode live GPT slots: {error}")),
+                Ok(Err(error)) => Err(format!("failed to evaluate live GPT slots: {error}")),
+                Err(_) => Err(format!(
+                    "timed out evaluating live GPT slots after {}s; results may be partial",
+                    CDP_OPERATION_TIMEOUT.as_secs()
+                )),
+            }
+        },
+        dwell_target,
+        budget,
+        warnings,
+    )
+    .await
+}
+
+/// Polls registry snapshots separately from their browser transport.
+async fn poll_gpt_registry<F, R>(
+    mut read: F,
+    dwell_target: Duration,
+    budget: Duration,
+    warnings: &mut Vec<String>,
+) -> Vec<CollectedGptSlot>
+where
+    F: FnMut() -> R,
+    R: std::future::Future<Output = Result<Vec<CollectedGptSlot>, String>>,
+{
+    let start = tokio::time::Instant::now();
+    let mut previous_nonempty: Option<Vec<CollectedGptSlot>> = None;
     let mut latest_nonempty = Vec::new();
+    let mut stable_since = None;
+    let mut previous_empty = false;
+    let mut first_read = true;
 
     loop {
-        let remaining = PAGE_OPERATION_TIMEOUT.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            return latest_nonempty;
+        if !first_read && start.elapsed() >= budget {
+            return expired_gpt_registry(latest_nonempty, dwell_target, budget, warnings);
         }
 
-        let slots: Vec<CollectedGptSlot> =
-            match timeout(remaining, page.evaluate(GPT_SLOTS_SCRIPT)).await {
-                Ok(Ok(result)) => match result.into_value() {
-                    Ok(slots) => slots,
-                    Err(error) => {
-                        warnings.push(format!("failed to decode live GPT slots: {error}"));
-                        return latest_nonempty;
-                    }
-                },
-                Ok(Err(error)) => {
-                    warnings.push(format!("failed to evaluate live GPT slots: {error}"));
-                    return latest_nonempty;
-                }
-                Err(_) => {
-                    warnings.push("timed out evaluating live GPT slots".to_string());
-                    return latest_nonempty;
-                }
-            };
-
-        if slots.is_empty() {
-            previous_nonempty = None;
-        } else {
-            if previous_nonempty.as_ref() == Some(&slots) {
-                return slots;
+        first_read = false;
+        let slots = match read().await {
+            Ok(slots) => slots,
+            Err(error) => {
+                warnings.push(error);
+                return latest_nonempty;
             }
-            latest_nonempty.clone_from(&slots);
-            previous_nonempty = Some(slots);
+        };
+
+        match gpt_registry_reading(previous_nonempty.as_deref(), &slots) {
+            GptRegistryReading::Empty => {
+                // Two empty snapshots end this best-effort wait; they do not
+                // prove that a publisher can never register a later slot.
+                if previous_empty {
+                    return latest_nonempty;
+                }
+                previous_empty = true;
+                previous_nonempty = None;
+                stable_since = None;
+            }
+            GptRegistryReading::Changed => {
+                previous_empty = false;
+                latest_nonempty.clone_from(&slots);
+                previous_nonempty = Some(slots);
+                stable_since = None;
+            }
+            GptRegistryReading::Repeated => {
+                previous_empty = false;
+                let stable_start = stable_since.get_or_insert_with(tokio::time::Instant::now);
+                if stable_start.elapsed() >= dwell_target {
+                    return slots;
+                }
+            }
         }
 
-        let remaining = PAGE_OPERATION_TIMEOUT.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            return latest_nonempty;
+        let remaining_budget = budget.saturating_sub(start.elapsed());
+        if remaining_budget.is_zero() {
+            return expired_gpt_registry(latest_nonempty, dwell_target, budget, warnings);
         }
-        sleep(SETTLE_POLL_INTERVAL.min(remaining)).await;
+        let remaining_dwell = stable_since
+            .map(|stable_start| dwell_target.saturating_sub(stable_start.elapsed()))
+            .unwrap_or(dwell_target);
+        sleep(
+            SETTLE_POLL_INTERVAL
+                .min(remaining_budget)
+                .min(remaining_dwell.max(Duration::from_millis(1))),
+        )
+        .await;
     }
+}
+
+/// Reports a stability budget that expired before the registry held still, and
+/// hands back the latest snapshot.
+///
+/// The message names both the dwell and the budget rather than asserting that
+/// registration churned: a registry that stopped changing late can also run out
+/// of budget mid-dwell, and the operator's next move — raising the cap — is the
+/// same either way.
+///
+/// An empty registry is left to the caller's GPT state diagnostic, which names
+/// the actual cause; only a partial non-empty snapshot needs its own warning,
+/// because otherwise it is indistinguishable in the output from a cleanly
+/// stabilized read.
+fn expired_gpt_registry(
+    latest_nonempty: Vec<CollectedGptSlot>,
+    dwell_target: Duration,
+    budget: Duration,
+    warnings: &mut Vec<String>,
+) -> Vec<CollectedGptSlot> {
+    if !latest_nonempty.is_empty() {
+        warnings.push(format!(
+            "GPT slot registration did not hold still for {}ms within the {}ms budget; using the \
+             latest snapshot of {} slot(s), so results may be partial; raise `--settle-max-ms` \
+             to wait longer",
+            dwell_target.as_millis(),
+            budget.as_millis(),
+            latest_nonempty.len()
+        ));
+    }
+    latest_nonempty
 }
 
 async fn wait_for_page_settle(
@@ -1025,14 +1169,14 @@ async fn wait_for_page_settle(
 
     while start.elapsed() < max_wait {
         let ready_state: String =
-            timeout(PAGE_OPERATION_TIMEOUT, page.evaluate("document.readyState"))
+            timeout(CDP_OPERATION_TIMEOUT, page.evaluate("document.readyState"))
                 .await
                 .map_err(|_| "timed out reading document ready state".to_string())?
                 .map_err(|error| format!("failed to read document ready state: {error}"))?
                 .into_value()
                 .map_err(|error| format!("failed to decode document ready state: {error}"))?;
         let resource_count: usize = timeout(
-            PAGE_OPERATION_TIMEOUT,
+            CDP_OPERATION_TIMEOUT,
             page.evaluate("performance.getEntriesByType('resource').length"),
         )
         .await
@@ -1121,9 +1265,11 @@ struct BrowserPerformanceEntry {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
+    use std::io::{ErrorKind, Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
 
     use chromiumoxide::cdp::browser_protocol::network::{Headers, RequestId, Response};
     use chromiumoxide::cdp::browser_protocol::security::SecurityState;
@@ -1210,34 +1356,521 @@ mod tests {
   </body>
 </html>"#;
 
-    fn gpt_fixture_url(html: &'static str) -> Url {
+    /// A registry whose second burst lands on a real timer rather than on
+    /// observation, so two consecutive identical reads can straddle the gap.
+    ///
+    /// The first burst is gated on the first `getSlots()` call — otherwise it
+    /// would complete during the settle wait, long before polling starts — but
+    /// the gap that follows is genuine wall-clock time, which is what makes
+    /// this fixture able to detect a criterion that exits on a single matching
+    /// pair.
+    const BATCHED_GPT_FIXTURE: &str = r#"<!doctype html>
+<html>
+  <body>
+    <div id="ad-first-batch-0"></div>
+    <div id="ad-second-batch-0"></div>
+    <script>
+      var firstSlot = {
+        getAdUnitPath: function () { return '/123/first-batch' },
+        getSlotElementId: function () { return 'ad-first-batch-0' },
+        getSizes: function () {
+          return [{
+            getWidth: function () { return 300 },
+            getHeight: function () { return 250 },
+          }]
+        },
+      }
+      var secondSlot = {
+        getAdUnitPath: function () { return '/123/second-batch' },
+        getSlotElementId: function () { return 'ad-second-batch-0' },
+        getSizes: function () {
+          return [{
+            getWidth: function () { return 728 },
+            getHeight: function () { return 90 },
+          }]
+        },
+      }
+      var slots = []
+      var armed = false
+      // Model a metadata read slower than the shared settle budget, while
+      // staying below the individual CDP operation timeout.
+      if (location.hash === '#slow-title') {
+        Object.defineProperty(document, 'title', {
+          get: function () {
+            var start = performance.now()
+            while (performance.now() - start < 4000) {}
+            return 'Slow metadata fixture'
+          },
+        })
+      }
+      window.googletag = {
+        pubads: function () {
+          return {
+            getSlots: function () {
+              if (!armed) {
+                armed = true
+                slots = [firstSlot]
+                setTimeout(function () { slots = [firstSlot, secondSlot] }, 400)
+              }
+              return slots
+            },
+          }
+        },
+      }
+    </script>
+  </body>
+</html>"#;
+
+    /// Local HTTP server that serves one fixture document for a browser test.
+    ///
+    /// Chrome opens several sockets per navigation: the document request, socket
+    /// pool preconnects that close without sending anything, and speculative
+    /// `/favicon.ico`, `/robots.txt`, and `/sitemap.xml` fetches. The server must
+    /// therefore keep accepting connections for as long as the test runs, must
+    /// serve them concurrently so a silent preconnect cannot stall the document
+    /// request, and must treat a connection that carries no request as normal.
+    /// Serving a single connection instead loses the accept race and fails the
+    /// navigation with `net::ERR_CONNECTION_REFUSED`.
+    struct GptFixtureServer {
+        url: Url,
+        address: SocketAddr,
+        shutdown: Arc<AtomicBool>,
+        acceptor: Option<JoinHandle<()>>,
+    }
+
+    impl GptFixtureServer {
+        fn url(&self) -> &Url {
+            &self.url
+        }
+
+        fn address(&self) -> SocketAddr {
+            self.address
+        }
+    }
+
+    impl Drop for GptFixtureServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            // Wake the blocking accept so shutdown can join the listener thread.
+            let _ = TcpStream::connect(self.address);
+            if let Some(acceptor) = self.acceptor.take() {
+                let _ = acceptor.join();
+            }
+        }
+    }
+
+    /// Serves `html` for `GET /` until the returned server is dropped.
+    fn gpt_fixture_server(html: &'static str) -> GptFixtureServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
         let address = listener.local_addr().expect("should read fixture address");
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("should accept browser request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("should set fixture read timeout");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut chunk = [0_u8; 1024];
-                let chunk_len = stream.read(&mut chunk).expect("should read HTTP request");
-                assert!(chunk_len > 0, "request should contain complete headers");
-                request.extend_from_slice(&chunk[..chunk_len]);
-                assert!(
-                    request.len() <= 16 * 1024,
-                    "request headers should be bounded"
-                );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let acceptor_shutdown = Arc::clone(&shutdown);
+        let acceptor = std::thread::spawn(move || {
+            while !acceptor_shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if acceptor_shutdown.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::spawn(move || serve_gpt_fixture_connection(stream, html));
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                }
             }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                html.len(),
-                html,
-            )
-            .expect("should write fixture response");
         });
-        Url::parse(&format!("http://{address}/")).expect("should parse fixture URL")
+
+        GptFixtureServer {
+            url: Url::parse(&format!("http://{address}/")).expect("should parse fixture URL"),
+            address,
+            shutdown,
+            acceptor: Some(acceptor),
+        }
+    }
+
+    /// Answers one fixture connection, ignoring sockets that carry no request.
+    fn serve_gpt_fixture_connection(mut stream: TcpStream, html: &'static str) {
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .is_err()
+        {
+            return;
+        }
+
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut chunk = [0_u8; 1024];
+            match stream.read(&mut chunk) {
+                // A preconnect socket closes without a request; that is not a failure.
+                Ok(0) => return,
+                Ok(chunk_len) => request.extend_from_slice(&chunk[..chunk_len]),
+                Err(_) => return,
+            }
+            if request.len() > 16 * 1024 {
+                return;
+            }
+        }
+
+        if !request.starts_with(b"GET / HTTP") {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            return;
+        }
+
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(),
+            html,
+        );
+    }
+
+    /// Requests a path from a fixture server, failing if no response arrives in time.
+    fn fixture_response(address: SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(address).expect("should connect to the fixture server");
+        // A fixture that stalls behind another connection must fail this read
+        // rather than deliver the document late.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("should bound the fixture client read");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: fixture.example.com\r\n\r\n"
+        )
+        .expect("should send the fixture request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("should read the fixture response before the client timeout");
+        response
+    }
+
+    #[test]
+    fn fixture_server_serves_the_document_after_a_socket_that_sends_no_request() {
+        let fixture = gpt_fixture_server(DELAYED_GPT_FIXTURE);
+
+        // Chrome's socket-pool preconnect opens a socket and closes it without
+        // sending anything, and it can win the accept race with the navigation.
+        drop(TcpStream::connect(fixture.address()).expect("should open a preconnect socket"));
+
+        let response = fixture_response(fixture.address(), "/");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "should still answer the document request: {response}"
+        );
+        assert!(
+            response.contains("ad-z-delayed-0"),
+            "should serve the fixture document body: {response}"
+        );
+    }
+
+    #[test]
+    fn fixture_server_serves_the_document_while_a_silent_socket_stays_open() {
+        let fixture = gpt_fixture_server(DELAYED_GPT_FIXTURE);
+
+        // Held open, sending nothing: serving connections sequentially would
+        // block the document request behind this socket's read timeout.
+        let _silent = TcpStream::connect(fixture.address()).expect("should open a silent socket");
+
+        let response = fixture_response(fixture.address(), "/");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "should answer the document request without waiting for the silent socket: {response}"
+        );
+    }
+
+    #[test]
+    fn fixture_server_answers_every_speculative_browser_request() {
+        let fixture = gpt_fixture_server(LAZY_GPT_FIXTURE);
+
+        // Chrome follows the document with /favicon.ico, /robots.txt and
+        // /sitemap.xml probes on separate connections.
+        for path in ["/favicon.ico", "/robots.txt", "/sitemap.xml"] {
+            let response = fixture_response(fixture.address(), path);
+            assert_eq!(
+                response,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "should return an empty 404 for {path}"
+            );
+        }
+        let response = fixture_response(fixture.address(), "/");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK") && response.ends_with(LAZY_GPT_FIXTURE),
+            "should still serve the document after speculative requests"
+        );
+    }
+
+    fn gpt_slot(unit_path: &str, div_id: &str) -> CollectedGptSlot {
+        CollectedGptSlot {
+            gam_unit_path: unit_path.to_string(),
+            div_id: div_id.to_string(),
+            sizes: vec![(300, 250)],
+        }
+    }
+
+    #[test]
+    fn empty_gpt_reading_voids_the_stability_streak() {
+        let previous = vec![gpt_slot("/123/a", "ad-a-0")];
+
+        assert_eq!(
+            gpt_registry_reading(Some(&previous), &[]),
+            GptRegistryReading::Empty,
+            "an empty read should discard the earlier non-empty reading"
+        );
+        assert_eq!(
+            gpt_registry_reading(None, &[]),
+            GptRegistryReading::Empty,
+            "an empty read with no history should still classify as empty"
+        );
+    }
+
+    #[test]
+    fn first_nonempty_gpt_reading_is_a_change() {
+        let current = vec![gpt_slot("/123/a", "ad-a-0")];
+
+        assert_eq!(
+            gpt_registry_reading(None, &current),
+            GptRegistryReading::Changed,
+            "the first non-empty read has nothing to repeat"
+        );
+    }
+
+    #[test]
+    fn identical_gpt_reading_repeats() {
+        let slots = vec![gpt_slot("/123/a", "ad-a-0"), gpt_slot("/123/b", "ad-b-0")];
+
+        assert_eq!(
+            gpt_registry_reading(Some(&slots), &slots),
+            GptRegistryReading::Repeated,
+            "an unchanged registry should classify as repeated"
+        );
+    }
+
+    #[test]
+    fn gpt_reading_stability_is_order_sensitive() {
+        let previous = vec![gpt_slot("/123/a", "ad-a-0"), gpt_slot("/123/b", "ad-b-0")];
+        let reordered = vec![gpt_slot("/123/b", "ad-b-0"), gpt_slot("/123/a", "ad-a-0")];
+        let grown = vec![
+            gpt_slot("/123/a", "ad-a-0"),
+            gpt_slot("/123/b", "ad-b-0"),
+            gpt_slot("/123/c", "ad-c-0"),
+        ];
+
+        assert_eq!(
+            gpt_registry_reading(Some(&previous), &reordered),
+            GptRegistryReading::Changed,
+            "the same slot set in a different order is not yet stable"
+        );
+        assert_eq!(
+            gpt_registry_reading(Some(&previous), &grown),
+            GptRegistryReading::Changed,
+            "a later registration burst should reset the streak"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_stops_after_two_empty_readings() {
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let start = tokio::time::Instant::now();
+        let slots = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(Vec::new()))
+            },
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert!(slots.is_empty(), "should retain an empty registry");
+        assert_eq!(reads, 2, "should stop after consecutive empty snapshots");
+        assert_eq!(
+            start.elapsed(),
+            SETTLE_POLL_INTERVAL,
+            "should avoid spending the full budget"
+        );
+        assert!(
+            warnings.is_empty(),
+            "should leave the empty-state diagnostic to the caller"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_reads_once_with_zero_budget() {
+        let expected = vec![gpt_slot("/123/a", "ad-a")];
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let slots = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(expected.clone()))
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(reads, 1, "should always collect an initial snapshot");
+        assert_eq!(
+            slots, expected,
+            "should retain actual evidence at zero budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_resets_empty_streak_and_preserves_latest_evidence() {
+        let first = vec![gpt_slot("/123/a", "ad-a")];
+        let latest = vec![gpt_slot("/123/b", "ad-b")];
+        let mut readings = [
+            Vec::new(),
+            first,
+            Vec::new(),
+            latest.clone(),
+            Vec::new(),
+            Vec::new(),
+        ]
+        .into_iter();
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || {
+                std::future::ready(Ok(readings
+                    .next()
+                    .expect("should stop at consecutive empties")))
+            },
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(
+            result, latest,
+            "should retain the latest snapshot through empty readings"
+        );
+        assert!(
+            readings.next().is_none(),
+            "should reset each empty streak on a nonempty reading"
+        );
+        assert!(warnings.is_empty(), "should not report budget exhaustion");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_requires_dwell_after_a_later_registration_burst() {
+        let first = vec![gpt_slot("/123/a", "ad-a")];
+        let latest = vec![gpt_slot("/123/a", "ad-a"), gpt_slot("/123/b", "ad-b")];
+        let start = tokio::time::Instant::now();
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || {
+                std::future::ready(Ok(if start.elapsed() < Duration::from_millis(500) {
+                    first.clone()
+                } else {
+                    latest.clone()
+                }))
+            },
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(
+            result, latest,
+            "should include the second registration burst"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(1500),
+            "should reset the dwell after registration changes"
+        );
+        assert!(warnings.is_empty(), "should stabilize within the budget");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_expiry_preserves_changing_evidence() {
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(vec![gpt_slot("/123/a", &format!("ad-{reads}"))]))
+            },
+            Duration::from_millis(750),
+            Duration::from_millis(600),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(reads, 3, "should stop at the budget without an extra read");
+        assert_eq!(
+            result,
+            [gpt_slot("/123/a", "ad-3")],
+            "should retain the most recent evidence"
+        );
+        assert_eq!(warnings.len(), 1, "should report partial evidence once");
+        assert!(
+            warnings[0].contains("600ms budget"),
+            "should identify budget exhaustion"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_read_failure_preserves_evidence_and_reports_the_cause() {
+        let expected = vec![gpt_slot("/123/a", "ad-a")];
+        let mut readings = [Ok(expected.clone()), Err("read unavailable".to_string())].into_iter();
+        let mut warnings = Vec::new();
+        let result = poll_gpt_registry(
+            || std::future::ready(readings.next().expect("should stop on read failure")),
+            Duration::from_millis(750),
+            Duration::from_secs(12),
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(
+            result, expected,
+            "should preserve evidence on a later read failure"
+        );
+        assert_eq!(
+            warnings,
+            ["read unavailable"],
+            "should distinguish transport failure from expiry"
+        );
+    }
+
+    #[test]
+    fn expired_stability_budget_warns_only_for_partial_evidence() {
+        let mut partial_warnings = Vec::new();
+        let partial = expired_gpt_registry(
+            vec![gpt_slot("/123/a", "ad-a-0")],
+            Duration::from_millis(750),
+            Duration::from_millis(12_000),
+            &mut partial_warnings,
+        );
+
+        assert_eq!(partial.len(), 1, "the latest snapshot should be returned");
+        assert_eq!(
+            partial_warnings,
+            [
+                "GPT slot registration did not hold still for 750ms within the 12000ms budget; \
+                 using the latest snapshot of 1 slot(s), so results may be partial; raise \
+                 `--settle-max-ms` to wait longer"
+            ],
+            "a partial snapshot should name the slot count, the dwell, and the budget"
+        );
+
+        let mut empty_warnings = Vec::new();
+        let empty = expired_gpt_registry(
+            Vec::new(),
+            Duration::from_millis(750),
+            Duration::from_millis(12_000),
+            &mut empty_warnings,
+        );
+
+        assert!(empty.is_empty(), "an empty registry should stay empty");
+        assert!(
+            empty_warnings.is_empty(),
+            "an empty registry is reported by the GPT state diagnostic instead"
+        );
     }
 
     #[test]
@@ -1411,12 +2044,14 @@ mod tests {
             return;
         }
 
+        let unscrolled_fixture = gpt_fixture_server(LAZY_GPT_FIXTURE);
         let without_scroll = BrowserAuditCollector::default()
-            .collect_page(&gpt_fixture_url(LAZY_GPT_FIXTURE), &[])
+            .collect_page(unscrolled_fixture.url(), &[])
             .expect("should collect without scrolling");
+        let scrolled_fixture = gpt_fixture_server(LAZY_GPT_FIXTURE);
         let with_scroll = BrowserAuditCollector::default()
             .with_scroll(true)
-            .collect_page(&gpt_fixture_url(LAZY_GPT_FIXTURE), &[])
+            .collect_page(scrolled_fixture.url(), &[])
             .expect("should collect with scrolling");
 
         assert!(
@@ -1439,8 +2074,9 @@ mod tests {
             return;
         }
 
+        let delayed_fixture = gpt_fixture_server(DELAYED_GPT_FIXTURE);
         let collected = BrowserAuditCollector::default()
-            .collect_page(&gpt_fixture_url(DELAYED_GPT_FIXTURE), &[])
+            .collect_page(delayed_fixture.url(), &[])
             .expect("should collect delayed GPT registry");
 
         assert_eq!(
@@ -1458,6 +2094,129 @@ mod tests {
                 },
             ],
             "collector should wait for stable registration without reordering slots"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn exhausted_page_settle_budget_still_collects_one_gpt_snapshot() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        for scroll in [false, true] {
+            let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+            // A quiet window equal to the maximum cannot finish inside that
+            // maximum, so the initial settle spends the entire shared budget.
+            let options = GenerateBrowserOpts {
+                settle_quiet_ms: 600,
+                settle_max_ms: 600,
+                ..GenerateBrowserOpts::default()
+            };
+            let collected = BrowserAuditCollector::default()
+                .with_browser_options(&options)
+                .with_scroll(scroll)
+                .collect_page(fixture.url(), &[])
+                .expect("should collect a snapshot after the shared budget expires");
+
+            assert_eq!(
+                collected.gpt_slots,
+                [gpt_slot("/123/first-batch", "ad-first-batch-0")],
+                "should take one snapshot without restarting the GPT budget (scroll={scroll})"
+            );
+            assert!(
+                collected
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("within the 0ms budget")),
+                "should report exhausted remaining GPT budget (scroll={scroll})"
+            );
+            assert_eq!(
+                collected.warnings.iter().any(|warning| {
+                    warning.contains("settle budget was exhausted before the post-scroll settle")
+                }),
+                scroll,
+                "should report skipped post-scroll settling only when scrolling (scroll={scroll})"
+            );
+            assert!(
+                !collected.warnings.iter().any(|warning| {
+                    warning.contains("timed out while waiting for the page to settle after scroll")
+                }),
+                "should not report a timeout for a wait that never ran (scroll={scroll})"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn slow_metadata_does_not_consume_gpt_settle_budget() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+        let mut url = fixture.url().clone();
+        url.set_fragment(Some("slow-title"));
+        // The 4s title read exceeds this budget on its own. GPT's second
+        // batch appears only after polling starts, so a single late snapshot
+        // cannot substitute for giving the registry its remaining dwell time.
+        let options = GenerateBrowserOpts {
+            settle_quiet_ms: 750,
+            settle_max_ms: 3500,
+            ..GenerateBrowserOpts::default()
+        };
+        let collected = BrowserAuditCollector::default()
+            .with_browser_options(&options)
+            .collect_page(&url, &[])
+            .expect("should collect GPT slots and slow metadata");
+
+        assert_eq!(
+            collected.page_title.as_deref(),
+            Some("Slow metadata fixture"),
+            "should still extract metadata after stabilizing the registry"
+        );
+        assert_eq!(
+            collected.gpt_slots.len(),
+            2,
+            "should retain both registration batches despite slow metadata extraction"
+        );
+        assert!(
+            !collected
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GPT slot registration did not hold still")),
+            "should let the registry stabilize before reading slow metadata: {:?}",
+            collected.warnings
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn waits_through_a_timer_driven_gpt_registration_gap() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let batched_fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+        let collected = BrowserAuditCollector::default()
+            .collect_page(batched_fixture.url(), &[])
+            .expect("should collect batched GPT registry");
+
+        assert_eq!(
+            collected.gpt_slots,
+            vec![
+                CollectedGptSlot {
+                    gam_unit_path: "/123/first-batch".to_string(),
+                    div_id: "ad-first-batch-0".to_string(),
+                    sizes: vec![(300, 250)],
+                },
+                CollectedGptSlot {
+                    gam_unit_path: "/123/second-batch".to_string(),
+                    div_id: "ad-second-batch-0".to_string(),
+                    sizes: vec![(728, 90)],
+                },
+            ],
+            "the dwell window should outlast a gap between registration bursts"
         );
     }
 

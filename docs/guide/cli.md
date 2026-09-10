@@ -76,6 +76,30 @@ Trusted Server settings JSON. This blob model is intentional because full
 Trusted Server configs can exceed Fastly limits when split into one config-store
 entry per setting.
 
+Reclaim orphaned chunk entries leaked from prior oversized pushes:
+
+```bash
+ts config gc --adapter fastly
+```
+
+Without `--yes`, `config gc` only previews: it reports what it would delete and
+deletes nothing. `--dry-run` states that intent explicitly and conflicts with
+`--yes`. To actually delete, pass `--yes` together with `--older-than <window>`
+(`s`/`m`/`h`/`d` suffixes, e.g. `7d`; a bare number means seconds):
+
+```bash
+ts config gc --adapter fastly --yes --older-than 7d
+```
+
+`config gc` sweeps every root in the selected physical store, so `--older-than`
+is a safety assertion about the whole store: nothing in it changed within the
+window and no writer is targeting it. Unlike the other `config` subcommands,
+`gc` never loads the typed app config; its `--no-env` flag instead ignores
+`EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which physical store to
+sweep, and `--store <id>` overrides the manifest's config-store id outright.
+Both change which store gets swept, so on a destructive run check the store id
+`gc` reports before passing `--yes`.
+
 ### Diagnose ad-template configuration
 
 The static `ts config ad-templates` commands evaluate local configuration
@@ -113,30 +137,6 @@ For CI-oriented assertions, exit code 0 means the assertion passed, 1 means the
 command ran and found drift (`config ad-templates check` or audit verification
 with `--strict`), and 2 means argument parsing, configuration, browser launch,
 or another tool operation failed.
-
-Reclaim orphaned chunk entries leaked from prior oversized pushes:
-
-```bash
-ts config gc --adapter fastly
-```
-
-Without `--yes`, `config gc` only previews: it reports what it would delete and
-deletes nothing. `--dry-run` states that intent explicitly and conflicts with
-`--yes`. To actually delete, pass `--yes` together with `--older-than <window>`
-(`s`/`m`/`h`/`d` suffixes, e.g. `7d`; a bare number means seconds):
-
-```bash
-ts config gc --adapter fastly --yes --older-than 7d
-```
-
-`config gc` sweeps every root in the selected physical store, so `--older-than`
-is a safety assertion about the whole store: nothing in it changed within the
-window and no writer is targeting it. Unlike the other `config` subcommands,
-`gc` never loads the typed app config; its `--no-env` flag instead ignores
-`EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which physical store to
-sweep, and `--store <id>` overrides the manifest's config-store id outright.
-Both change which store gets swept, so on a destructive run check the store id
-`gc` reports before passing `--yes`.
 
 ## Lifecycle commands
 
@@ -573,6 +573,25 @@ to compare both profiles. `--cookie NAME=VALUE` is repeatable and creates
 host-only, root-path cookies; HTTPS targets also mark them Secure. Verification
 refuses cookies when URLs span multiple origins. The quiet settle window must
 not exceed the maximum.
+
+Generation shares one `--settle-max-ms` budget across the initial settle,
+optional post-scroll settle, and GPT registry wait. The clock starts after
+navigation, immediately before the initial settle; scrolling also consumes the
+remaining budget. GPT polling precedes metadata extraction, so those reads cannot
+consume its remaining budget. If the budget is spent before post-scroll settling,
+generation reports that the wait was skipped and post-scroll evidence may be
+missing. Navigation and browser operations have their
+own timeouts, and an in-flight operation can finish after the settle budget, so
+this is not a total page deadline. Even when the budget is exhausted, generation
+takes one GPT snapshot and reports partial non-empty evidence. Two consecutive
+empty GPT polls end the wait early regardless of the budget, so increasing
+`--settle-max-ms` cannot extend that empty-registry wait; slots registered later
+may be missed. Increase the budget when generation warns that a non-empty
+registry did not stabilize.
+
+Verification applies `--settle-max-ms` separately to its initial and optional
+post-scroll settle phases. It performs no GPT wait: its evidence collector is
+injected ahead of publisher scripts and records each slot as it is defined.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform
