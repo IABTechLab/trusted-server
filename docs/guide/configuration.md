@@ -1443,8 +1443,9 @@ module uses the same vendor-neutral surface. The managed `name` must match a
 The module must be present in the built bundle. Name it under
 `[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
 generator's default preset. `ts prebid bundle` resolves each managed `name`
-through the checked-in `user_id_modules.json` registry, rejects unknown or
-ambiguous names, and confirms the required modules in the newly generated
+through the checked-in `user_id_modules.json` registry, rejects unknown names,
+ambiguous names, and two names that resolve to the same module, and confirms the
+required modules in the newly generated
 manifest. A failure identifies the managed name or required module and does not
 update the configured bundle hash or SRI. The browser diagnostic remains a
 fallback for externally hosted, stale, or modified bundles. Trusted Server core

@@ -468,6 +468,126 @@ type TcfApi = (
   parameter?: unknown
 ) => unknown;
 
+/**
+ * Consent namespaces that select Prebid's namespaced `consentManagement` shape.
+ *
+ * `modules/consentManagementTcf.ts` reads the TCF configuration as
+ * `config.gdpr || config.usp || config.gpp ? config.gdpr : config`, so a
+ * truthy value under any of these keys switches Prebid from the legacy
+ * top-level shape to the namespaced one.
+ */
+const CONSENT_MANAGEMENT_NAMESPACES = ['gdpr', 'usp', 'gpp'] as const;
+
+/**
+ * Reports whether Prebid would read `consentManagement` as a legacy top-level
+ * TCF configuration, such as `{ cmpApi: 'static', consentData: ... }`.
+ *
+ * Appending a `gdpr` namespace to such an object flips Prebid to the
+ * namespaced shape and silently discards every legacy key the publisher set.
+ */
+function isLegacyTcfConsentManagement(consentManagement: unknown): boolean {
+  return (
+    isRecord(consentManagement) &&
+    !hasNamespacedConsentManagement(consentManagement) &&
+    Object.keys(consentManagement).length > 0
+  );
+}
+
+/**
+ * Reports whether `consentManagement` carries a truthy own consent namespace.
+ *
+ * Own-property probing is deliberate: a configuration object whose descriptors
+ * cannot be read is one this shim must not rewrite, and letting the throw
+ * propagate keeps the caller's fail-safe path in charge.
+ */
+function hasNamespacedConsentManagement(consentManagement: Record<string, unknown>): boolean {
+  return CONSENT_MANAGEMENT_NAMESPACES.some(
+    (namespace) =>
+      Object.prototype.hasOwnProperty.call(consentManagement, namespace) &&
+      Boolean(consentManagement[namespace])
+  );
+}
+
+/**
+ * Reports whether a `consentManagement` value is a publisher-owned TCF
+ * configuration that the automatic managed-ID activation must not touch.
+ *
+ * Recognizing only an own `gdpr` property would miss the legacy shape, so this
+ * mirrors Prebid's own selection rule instead.
+ */
+function publisherOwnsTcfConsentManagement(consentManagement: unknown): boolean {
+  if (!isRecord(consentManagement)) {
+    // An unreadable value is still a publisher decision; `undefined` alone
+    // means nothing is configured.
+    return consentManagement !== undefined;
+  }
+  if (hasNamespacedConsentManagement(consentManagement)) {
+    return Boolean(consentManagement.gdpr);
+  }
+  return Object.keys(consentManagement).length > 0;
+}
+
+/**
+ * Watches `window.__tcfapi` for a CMP that installs itself after this shim runs.
+ *
+ * TCF activation is a one-time read, so an asynchronous CMP that appears later
+ * would leave managed User ID modules seeded with Prebid's GDPR handler
+ * disabled — the module fires its vendor request with no TCF parameters and no
+ * later reconfiguration can recall it. Watching the property lets managed-ID
+ * seeding wait until CMP discovery resolves.
+ *
+ * Returns a settle function that restores the plain property and reports
+ * discovery, or `undefined` when the property cannot be watched.
+ */
+function watchForLateTcfApi(onDiscovered: () => void): (() => void) | undefined {
+  if (typeof window === 'undefined') return undefined;
+
+  const tcfWindow = window as Window & { __tcfapi?: unknown };
+  let stored: unknown;
+  let settled = false;
+  const read = () => stored;
+
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    try {
+      // A CMP that redefined the property outright owns it now; leave it be.
+      if (Object.getOwnPropertyDescriptor(tcfWindow, '__tcfapi')?.get === read) {
+        if (stored === undefined) {
+          delete tcfWindow.__tcfapi;
+        } else {
+          Object.defineProperty(tcfWindow, '__tcfapi', {
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value: stored,
+          });
+        }
+      }
+    } catch (error) {
+      log.error('[tsjs-prebid] watched window.__tcfapi could not be restored', error);
+    }
+    onDiscovered();
+  };
+
+  try {
+    Object.defineProperty(tcfWindow, '__tcfapi', {
+      configurable: true,
+      enumerable: true,
+      get: read,
+      set: (value: unknown) => {
+        stored = value;
+        if (typeof value === 'function') settle();
+      },
+    });
+  } catch (error) {
+    log.error('[tsjs-prebid] window.__tcfapi could not be watched for a late CMP', error);
+    return undefined;
+  }
+
+  return settle;
+}
+
 function activateManagedUserIdTcfConsent(
   managedUserIds: InjectedManagedUserId[] | undefined,
   setConfig: typeof pbjs.setConfig,
@@ -500,7 +620,7 @@ function activateManagedUserIdTcfConsent(
   const activation: ManagedTcfConsentActivation = { acceptCmpEvents: true };
   try {
     const effectiveConsent = effectiveConsentManagement ?? {};
-    if (Object.prototype.hasOwnProperty.call(effectiveConsent, 'gdpr')) {
+    if (publisherOwnsTcfConsentManagement(effectiveConsentManagement)) {
       return undefined;
     }
 
@@ -573,9 +693,54 @@ function publisherClaimsGdprOwnership(publisherConfig: PbjsConfig): boolean {
   }
 
   const consentManagement = publisherConfig.consentManagement;
-  return (
-    !isRecord(consentManagement) || Object.prototype.hasOwnProperty.call(consentManagement, 'gdpr')
-  );
+  if (consentManagement === undefined) {
+    // Clearing `consentManagement` outright is a publisher decision too.
+    return true;
+  }
+  return publisherOwnsTcfConsentManagement(consentManagement);
+}
+
+/**
+ * Removes the automatic `consentManagement.gdpr` namespace from Prebid's
+ * effective configuration.
+ *
+ * `mergeConfig` deep-merges onto the current configuration, so retiring the
+ * automatic activation with `gdpr: { enabled: false }` would survive a
+ * publisher merge that uses the legacy top-level TCF shape and leave Prebid's
+ * TCF module disabled. `setConfig` replaces a topic outright, which is the only
+ * way to drop the key again.
+ */
+function removeAutomaticGdprNamespace(
+  setConfig: typeof pbjs.setConfig,
+  getConfig: PrebidGetConfig | undefined
+): void {
+  if (typeof getConfig !== 'function') return;
+
+  let effectiveConsentManagement: unknown;
+  try {
+    effectiveConsentManagement = getConfig.call(pbjs, 'consentManagement');
+  } catch (error) {
+    log.error('[tsjs-prebid] effective consentManagement configuration could not be read', error);
+    return;
+  }
+
+  if (
+    !isRecord(effectiveConsentManagement) ||
+    !Object.prototype.hasOwnProperty.call(effectiveConsentManagement, 'gdpr')
+  ) {
+    return;
+  }
+
+  const withoutGdpr: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(effectiveConsentManagement)) {
+    if (key !== 'gdpr') withoutGdpr[key] = entry;
+  }
+
+  try {
+    setConfig({ consentManagement: withoutGdpr } as PbjsConfig);
+  } catch (error) {
+    log.error('[tsjs-prebid] automatic IAB consent namespace could not be removed', error);
+  }
 }
 
 function enableMergedPublisherGdpr(publisherConfig: PbjsConfig): PbjsConfig {
@@ -1712,6 +1877,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
   const managedUserIds = injected?.managedUserIds;
+  let trySeedManagedUserIds: (() => void) | undefined;
   if (
     managedUserIds &&
     managedUserIds.length > 0 &&
@@ -1724,11 +1890,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     const originalMergeConfig = prebidConfigApi.mergeConfig?.bind(pbjs);
     const getConfig = (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig;
 
-    let automaticTcfConsentActivation = activateManagedUserIdTcfConsent(
-      managedUserIds,
-      originalSetConfig,
-      getConfig
-    );
+    let automaticTcfConsentActivation: ManagedTcfConsentActivation | undefined;
+    // Until CMP discovery resolves, managed entries stay out of every
+    // configuration Prebid sees: a module seeded before the CMP is discoverable
+    // would call its vendor with the GDPR handler disabled.
+    let managedUserIdsDeferred = true;
+    let awaitingLateConsent = false;
 
     const retireAutomaticTcfConsent = (
       publisherConfig: PbjsConfig,
@@ -1805,6 +1972,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     };
 
     const normalizePublisherConfig = (publisherConfig: PbjsConfig): PbjsConfig => {
+      if (managedUserIdsDeferred) return publisherConfig;
       try {
         return withManagedUserIds(publisherConfig, managedUserIds);
       } catch (error) {
@@ -1817,17 +1985,23 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
     pbjs.setConfig = ((publisherConfig: PbjsConfig) => {
       retireAutomaticTcfConsent(publisherConfig);
-      return originalSetConfig(normalizePublisherConfig(publisherConfig));
+      const result = originalSetConfig(normalizePublisherConfig(publisherConfig));
+      trySeedManagedUserIds?.();
+      return result;
     }) as typeof pbjs.setConfig;
     if (originalMergeConfig) {
       prebidConfigApi.mergeConfig = ((publisherConfig: PbjsConfig) => {
         const normalizedConfig = normalizePublisherConfig(publisherConfig);
         let mergedConfig = normalizedConfig;
         let cleanupAllowed = true;
+        let publisherUsesLegacyTcfShape = false;
         if (automaticTcfConsentActivation) {
           try {
             if (publisherClaimsGdprOwnership(normalizedConfig)) {
               mergedConfig = enableMergedPublisherGdpr(normalizedConfig);
+              publisherUsesLegacyTcfShape =
+                isRecord(normalizedConfig) &&
+                isLegacyTcfConsentManagement(normalizedConfig.consentManagement);
             }
           } catch (error) {
             cleanupAllowed = false;
@@ -1838,12 +2012,40 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           }
         }
         const retiredAutomaticConsent = retireAutomaticTcfConsent(publisherConfig, cleanupAllowed);
-        return originalMergeConfig(retiredAutomaticConsent ? mergedConfig : normalizedConfig);
+        const result = originalMergeConfig(
+          retiredAutomaticConsent ? mergedConfig : normalizedConfig
+        );
+        if (retiredAutomaticConsent && publisherUsesLegacyTcfShape) {
+          // The deep merge carried the retired `gdpr` namespace forward, which
+          // would demote the publisher's legacy TCF configuration.
+          removeAutomaticGdprNamespace(originalSetConfig, getConfig);
+        }
+        trySeedManagedUserIds?.();
+        return result;
       }) as typeof pbjs.setConfig;
     }
     managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] = true;
 
-    if (typeof getConfig === 'function') {
+    const activateAndSeedManagedUserIds = () => {
+      if (!managedUserIdsDeferred) return;
+      managedUserIdsDeferred = false;
+      automaticTcfConsentActivation = activateManagedUserIdTcfConsent(
+        managedUserIds,
+        originalSetConfig,
+        getConfig
+      );
+
+      if (typeof getConfig !== 'function') {
+        // Without getConfig the effective User ID entries cannot be read, and
+        // seeding the managed entries alone would silently drop every publisher
+        // module already configured. Leave the wrappers installed so the next
+        // publisher userIds call still gets the managed entries.
+        log.error(
+          '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed User ID entries not seeded'
+        );
+        return;
+      }
+
       let effectiveUserIds: PrebidUserIdConfigEntry[] | undefined;
       try {
         effectiveUserIds = configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'));
@@ -1854,16 +2056,50 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         );
       }
       if (effectiveUserIds) {
-        pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
+        const effectiveUserSync = getConfig.call(pbjs, 'userSync');
+        const seed = withManagedUserIds(
+          {
+            userSync: {
+              ...(isRecord(effectiveUserSync) ? effectiveUserSync : {}),
+              userIds: effectiveUserIds,
+            },
+          } as PbjsConfig,
+          managedUserIds
+        );
+        if (awaitingLateConsent && seed.userSync.autoRefresh !== true) {
+          // Let Prebid initialize newly added modules even if its initial pass
+          // already finished. Preserve the publisher's policy after this seed.
+          originalSetConfig({
+            ...seed,
+            userSync: { ...seed.userSync, autoRefresh: true },
+          } as PbjsConfig);
+        }
+        originalSetConfig(seed);
       }
-    } else {
-      // Without getConfig the effective User ID entries cannot be read, and
-      // seeding the managed entries alone would silently drop every publisher
-      // module already configured. Leave the wrappers installed so the next
-      // publisher userIds call still gets the managed entries.
-      log.error(
-        '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed User ID entries not seeded'
-      );
+    };
+
+    trySeedManagedUserIds = () => {
+      if (!managedUserIdsDeferred) return;
+      const tcfApiInstalled =
+        typeof window !== 'undefined' &&
+        typeof (window as { __tcfapi?: unknown }).__tcfapi === 'function';
+      let publisherConsentConfigured = false;
+      try {
+        const consent = getConfig?.call(pbjs, 'consentManagement');
+        publisherConsentConfigured =
+          isRecord(consent) && publisherOwnsTcfConsentManagement(consent);
+      } catch (error) {
+        log.error('[tsjs-prebid] publisher consent configuration could not be read', error);
+      }
+      if (tcfApiInstalled || publisherConsentConfigured) activateAndSeedManagedUserIds();
+    };
+    trySeedManagedUserIds();
+    if (managedUserIdsDeferred) {
+      awaitingLateConsent = true;
+      // Auctions may run before an asynchronous CMP arrives. Keep managed IDs
+      // deferred even when the property cannot be watched; later configuration
+      // and auction calls recheck discovery without treating absence as consent.
+      watchForLateTcfApi(trySeedManagedUserIds);
     }
   }
 
@@ -1937,6 +2173,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // every unowned bidder is left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
+    trySeedManagedUserIds?.();
     recordUserIdModuleDiagnostics();
 
     const opts = { ...(requestObj ?? {}) };

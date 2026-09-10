@@ -176,6 +176,19 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.eval(shimCode);
     const wrappedRequestBids = pageWindow.pbjs.requestBids;
 
+    // Managed IDs remain deferred until the publisher supplies its consent policy.
+    expect(
+      pageWindow.pbjs.getConfig('userSync.userIds').some(({ name }) => name === 'identityLink')
+    ).toBe(false);
+
+    pageWindow.pbjs.setConfig({
+      consentManagement: {
+        gdpr: { cmpApi: 'static', consentData: { gdprApplies: false } },
+      },
+    });
+
+    pageWindow.pbjs.requestBids({ adUnits: [] });
+
     expect(pageWindow.pbjs.getConfig('userSync.userIds')).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: 'sharedId' }),

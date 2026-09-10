@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -165,12 +166,39 @@ fn load_user_id_registry(js_lib_dir: &Path) -> CliResult<(PathBuf, PrebidUserIdM
     Ok((path, registry))
 }
 
+/// Rejects managed User ID names that resolve to one Prebid submodule.
+///
+/// Prebid registers a single submodule for a module's name and each of its
+/// aliases, then selects the first matching `userSync.userIds` entry. Two
+/// managed names sharing a module therefore silently drop one operator
+/// configuration, so reject the pair instead of generating a bundle whose
+/// behaviour does not match the configuration.
+fn reject_managed_user_id_module_collisions(
+    resolved: &[RequiredPrebidUserIdModule],
+    registry_path: &Path,
+) -> CliResult<()> {
+    let mut owners: HashMap<&str, &str> = HashMap::with_capacity(resolved.len());
+    for entry in resolved {
+        let Some(previous) = owners.insert(&entry.module_name, &entry.config_name) else {
+            continue;
+        };
+        return cli_error(format!(
+            "managed User ID names {previous:?} and {:?} both resolve to module {:?} in {}; \
+             Prebid registers one submodule for those names and ignores every entry after the first",
+            entry.config_name,
+            entry.module_name,
+            registry_path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_managed_user_id_modules(
     managed_names: &[String],
     registry: &PrebidUserIdModuleRegistry,
     registry_path: &Path,
 ) -> CliResult<Vec<RequiredPrebidUserIdModule>> {
-    managed_names
+    let resolved = managed_names
         .iter()
         .map(|config_name| {
             let mut candidates = registry
@@ -198,7 +226,10 @@ fn resolve_managed_user_id_modules(
                 )),
             }
         })
-        .collect()
+        .collect::<CliResult<Vec<_>>>()?;
+
+    reject_managed_user_id_module_collisions(&resolved, registry_path)?;
+    Ok(resolved)
 }
 
 pub(crate) fn run_bundle(
@@ -966,7 +997,7 @@ adapters = ["rubicon"]
     }
 
     #[test]
-    fn managed_names_resolve_aliases_to_registered_modules() {
+    fn managed_name_resolves_an_alias_to_its_registered_module() {
         let registry = PrebidUserIdModuleRegistry {
             modules: vec![PrebidUserIdModuleRegistryEntry {
                 module_name: "sharedIdSystem".to_string(),
@@ -975,26 +1006,48 @@ adapters = ["rubicon"]
         };
         let registry_path = Path::new("user_id_modules.json");
 
-        let required = resolve_managed_user_id_modules(
+        let required =
+            resolve_managed_user_id_modules(&["pubCommonId".to_string()], &registry, registry_path)
+                .expect("should resolve the alias");
+
+        assert_eq!(
+            required,
+            [RequiredPrebidUserIdModule {
+                config_name: "pubCommonId".to_string(),
+                module_name: "sharedIdSystem".to_string(),
+            }],
+            "should resolve an alias to its registered module"
+        );
+    }
+
+    #[test]
+    fn managed_names_sharing_one_module_are_rejected() {
+        let registry = PrebidUserIdModuleRegistry {
+            modules: vec![PrebidUserIdModuleRegistryEntry {
+                module_name: "sharedIdSystem".to_string(),
+                config_names: vec!["sharedId".to_string(), "pubCommonId".to_string()],
+            }],
+        };
+        let registry_path = Path::new("registry/user_id_modules.json");
+
+        let error = resolve_managed_user_id_modules(
             &["pubCommonId".to_string(), "sharedId".to_string()],
             &registry,
             registry_path,
         )
-        .expect("should resolve aliases");
+        .expect_err("should reject two names resolving to one module");
 
-        assert_eq!(
-            required,
-            [
-                RequiredPrebidUserIdModule {
-                    config_name: "pubCommonId".to_string(),
-                    module_name: "sharedIdSystem".to_string(),
-                },
-                RequiredPrebidUserIdModule {
-                    config_name: "sharedId".to_string(),
-                    module_name: "sharedIdSystem".to_string(),
-                },
-            ],
-            "should retain each managed name while allowing a shared module"
+        assert!(
+            error.contains("pubCommonId") && error.contains("sharedId"),
+            "should identify both managed names: {error}"
+        );
+        assert!(
+            error.contains("sharedIdSystem"),
+            "should identify the shared module: {error}"
+        );
+        assert!(
+            error.contains(&registry_path.display().to_string()),
+            "should identify the registry: {error}"
         );
     }
 
@@ -1481,8 +1534,9 @@ adapters = ["rubicon", 123]
     }
 
     #[test]
-    fn run_bundle_accepts_two_aliases_backed_by_one_module() {
+    fn run_bundle_rejects_two_aliases_backed_by_one_module() {
         let (_temp, config_path) = write_config(&shared_aliases_config());
+        let original = fs::read_to_string(&config_path).expect("should read original config");
         let output_root = tempfile::tempdir().expect("should create output root");
         let mut generator = FakeGenerator {
             generate_error: None,
@@ -1494,8 +1548,22 @@ adapters = ["rubicon", 123]
             out: output_root.path().join("prebid"),
         };
 
-        run_bundle(&args, &mut generator, &mut Vec::new(), &mut Vec::new())
-            .expect("should accept aliases backed by one module");
+        let error = run_bundle(&args, &mut generator, &mut Vec::new(), &mut Vec::new())
+            .expect_err("should reject aliases backed by one module");
+
+        assert!(
+            error.contains("sharedIdSystem"),
+            "should identify the shared module: {error}"
+        );
+        assert!(
+            generator.generate_calls.is_empty(),
+            "should reject before generating a bundle"
+        );
+        assert_eq!(
+            fs::read_to_string(&args.config).expect("should reread config"),
+            original,
+            "should leave the configured bundle metadata untouched"
+        );
     }
 
     #[test]
