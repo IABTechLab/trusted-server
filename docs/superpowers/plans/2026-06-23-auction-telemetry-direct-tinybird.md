@@ -34,7 +34,8 @@ The implementation must:
 - cover `POST /auction`, `GET /__ts/page-bids`, and initial-navigation SSAT dispatch/collect;
 - emit exactly one summary row per auction candidate per successful Compute execution path;
 - batch all rows for one auction observation into one Tinybird Events API POST;
-- omit EC ID, internal `AuctionRequest.id`, IP, raw user agent, full URL, query strings, and fragments;
+- omit EC ID, internal `AuctionRequest.id`, IP, full URL, query strings, and fragments;
+- preserve the complete User-Agent for downstream data-sync classification;
 - generate a fresh random telemetry UUID unrelated to EC or request IDs;
 - emit provider-call rows for provider launch, parse, transport, timeout/no-response, no-bid, success, and abandoned outcomes where observable;
 - avoid invented seat-level no-bids;
@@ -573,12 +574,12 @@ Do this only if requested for a future implementation PR; auction telemetry alon
 - Launch, parse, transport, timeout, no-bid, success, abandoned statuses map correctly.
 - Mediated winners produce exactly one canonical winning bid row per slot.
 - Telemetry UUID is fresh and independent of `AuctionRequest.id`/EC.
-- Privacy fields are absent from serialized rows:
+- Sensitive identity fields are absent from serialized rows:
   - no EC ID;
   - no internal request ID;
   - no IP;
-  - no raw UA;
   - no full URL/query/fragment.
+- The complete User-Agent is preserved without edge-side classification.
 - Page path normalization is bounded and redacts dynamic segments.
 - NDJSON serialization emits valid single-line JSON rows and a trailing newline.
 
