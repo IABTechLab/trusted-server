@@ -132,7 +132,10 @@ describe('external bundle + served shim evaluated together', () => {
     // Mirror the server's head-injected state, which always precedes the
     // bundle script in document order.
     pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
-    pageWindow.__tsjs_prebid = { clientSideBidders: [] };
+    pageWindow.__tsjs_prebid = {
+      clientSideBidders: [],
+      serverSideBidders: ['appnexus'],
+    };
 
     pageWindow.eval(bundleCode);
 
@@ -176,7 +179,18 @@ describe('external bundle + served shim evaluated together', () => {
         {
           code: 'ad-slot-1',
           mediaTypes: { banner: { sizes: [[300, 250]] } },
-          bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
+          bids: [
+            {
+              bidder: 'trustedServer',
+              params: {
+                bidderParams: {
+                  appnexus: { placementId: 1 },
+                  pbsProviderId: { placementId: 2 },
+                  returnedSeatAlias: { placementId: 3 },
+                },
+              },
+            },
+          ],
         },
       ],
       timeout: 1000,
@@ -203,8 +217,8 @@ describe('external bundle + served shim evaluated together', () => {
     const payload = JSON.parse(body);
     const adUnit = payload.adUnits[0];
     expect(adUnit.code).toBe('ad-slot-1');
-    // The server-side bidder was folded into the trustedServer request
-    // instead of running client-side.
+    // Stored trustedServer params retain only authoritative server-side route
+    // codes; provider IDs and returned aliases cannot reach /auction.
     const trustedServerBid = adUnit.bids.find((bid) => bid.bidder === 'trustedServer');
     expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: { placementId: 1 } });
 

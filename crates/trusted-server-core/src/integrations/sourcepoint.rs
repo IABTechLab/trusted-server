@@ -1122,6 +1122,7 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -1146,6 +1147,7 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -1396,7 +1398,14 @@ mod tests {
             .insert_config(SOURCEPOINT_INTEGRATION_ID, &json!({ "enabled": true }))
             .expect("should insert config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         for method in [Method::GET, Method::POST, Method::HEAD, Method::OPTIONS] {
             assert!(
                 registry.has_route(&method, "/integrations/sourcepoint/cdn/wrapper/v2/messages"),

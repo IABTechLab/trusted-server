@@ -90,8 +90,10 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_adapter_fastly::runtime_env_config;
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -100,8 +102,11 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
@@ -119,7 +124,9 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+};
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -134,9 +141,7 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
+use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -148,6 +153,23 @@ use crate::platform::{
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeStoreConfig {
+    pub(crate) config_store_name: StoreName,
+    pub(crate) config_key: String,
+    pub(crate) secret_store_name: StoreName,
+}
+
+impl RuntimeStoreConfig {
+    pub(crate) fn from_env(env: &EnvConfig) -> Self {
+        Self {
+            config_store_name: StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID)),
+            config_key: env.store_key("config", DEFAULT_CONFIG_STORE_ID),
+            secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
+        }
+    }
+}
 
 /// Application state built once per Wasm instance and shared for its lifetime.
 ///
@@ -167,14 +189,22 @@ pub(crate) struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
-pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(load_settings_from_config_store()?)
+pub(crate) fn build_state(
+    stores: &RuntimeStoreConfig,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_from_settings(load_settings_from_config_store(stores)?)
 }
 
-pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
+pub(crate) fn load_settings_from_config_store(
+    stores: &RuntimeStoreConfig,
+) -> Result<Settings, Report<TrustedServerError>> {
+    get_settings_from_config_store(
+        &FastlyPlatformConfigStore,
+        &FastlyPlatformSecretStore,
+        &stores.config_store_name,
+        &stores.config_key,
+        &stores.secret_store_name,
+    )
 }
 
 pub(crate) fn build_state_from_settings(
@@ -182,8 +212,10 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -422,6 +454,13 @@ fn build_ec_request_state(
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
+                // Orphan-recovery eligibility is intentionally left false here.
+                // Authorizing it during generic pre-routing would let named
+                // routes and request-filter short circuits (e.g. a DataDome
+                // challenge) reach EC finalization and rotate an identity off a
+                // non-publisher response. It is granted only inside the
+                // publisher fallback, after filters pass and the origin start
+                // succeeds — see `dispatch_fallback`.
                 (context, None)
             }
             Err(report) => (EcContext::default(), Some(report)),
@@ -651,7 +690,7 @@ async fn run_named_route(
                 &state.orchestrator,
                 ec.kv_graph.as_ref(),
                 registry_ref,
-                &ec.ec_context,
+                &mut ec.ec_context,
                 &consent_services,
                 req,
             )
@@ -684,7 +723,7 @@ async fn run_named_route(
                 &consent_services,
                 ec.kv_graph.as_ref(),
                 auction,
-                &ec.ec_context,
+                &mut ec.ec_context,
                 req,
             )
             .await
@@ -816,8 +855,8 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        if ec.is_real_browser
-            && is_navigation_request(&req)
+        let is_publisher_navigation = ec.is_real_browser && is_navigation_request(&req);
+        if is_publisher_navigation
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -856,6 +895,14 @@ async fn dispatch_fallback(
                         .await
                         {
                             Ok(pub_response) => {
+                                // Origin start succeeded on the sole publisher-
+                                // page path: authorize orphan recovery now, and
+                                // only for real-browser document navigations.
+                                // Restricting it here keeps identity rotation
+                                // within the publisher-navigation boundary —
+                                // named routes, integration proxies, and filter
+                                // short circuits never reach this point.
+                                ec.ec_context.set_recovery_eligible(is_publisher_navigation);
                                 publisher_response_into_streaming_response(
                                     pub_response,
                                     &method,
@@ -1228,15 +1275,17 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
-    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
-        let (router, state) = Self::router_with_state();
+    pub(crate) fn build_app_with_state(
+        stores: &RuntimeStoreConfig,
+    ) -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state(stores);
         let mut app = App::with_name(router, Self::name());
         Self::configure(&mut app);
         (app, state)
     }
 
-    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
-        let state = match build_state() {
+    fn router_with_state(stores: &RuntimeStoreConfig) -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state(stores) {
             Ok(state) => state,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
@@ -1294,7 +1343,26 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        Self::router_with_state().0
+        let runtime_env = runtime_env_config(Self::stores());
+        let stores = RuntimeStoreConfig::from_env(&runtime_env);
+        Self::router_with_state(&stores).0
+    }
+
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: DEFAULT_CONFIG_STORE_ID,
+                ids: &[DEFAULT_CONFIG_STORE_ID],
+            }),
+            kv: Some(StoreMetadata {
+                default: "trusted_server_kv",
+                ids: &["trusted_server_kv"],
+            }),
+            secrets: Some(StoreMetadata {
+                default: DEFAULT_SECRET_STORE_ID,
+                ids: &[DEFAULT_SECRET_STORE_ID],
+            }),
+        }
     }
 }
 
@@ -1307,14 +1375,17 @@ mod tests {
 
     use super::{
         AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
-        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
-        build_per_request_services, build_state_from_settings, handle_publisher_request,
+        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
+        TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
+        build_state_from_settings, compile_auction_plan, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
+    use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
+    use edgezero_core::env_config::EnvConfig;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::params::PathParams;
@@ -1339,6 +1410,82 @@ mod tests {
         TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
+
+    #[test]
+    fn hooks_store_metadata_matches_edgezero_manifest() {
+        let manifest: toml::Value = toml::from_str(include_str!("../../../edgezero.toml"))
+            .expect("should parse edgezero manifest");
+        let manifest_stores = manifest
+            .get("stores")
+            .and_then(toml::Value::as_table)
+            .expect("manifest should declare stores");
+        let metadata = TrustedServerApp::stores();
+
+        for (kind, runtime_store) in [
+            (
+                "config",
+                metadata.config.expect("should declare config stores"),
+            ),
+            ("kv", metadata.kv.expect("should declare KV stores")),
+            (
+                "secrets",
+                metadata.secrets.expect("should declare secret stores"),
+            ),
+        ] {
+            let manifest_store = manifest_stores
+                .get(kind)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("manifest should declare {kind} stores"));
+            let manifest_default = manifest_store
+                .get("default")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare a default"));
+            let manifest_ids = manifest_store
+                .get("ids")
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare ids"))
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_else(|| panic!("manifest {kind} store ids should be strings"));
+
+            assert_eq!(runtime_store.default, manifest_default);
+            assert_eq!(runtime_store.ids, manifest_ids);
+        }
+    }
+
+    #[test]
+    fn runtime_store_config_maps_logical_store_names_and_config_key() {
+        let env = EnvConfig::from_vars([
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                "physical_config",
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
+                "active_config",
+            ),
+            (
+                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                "ts_secrets",
+            ),
+        ]);
+
+        let stores = RuntimeStoreConfig::from_env(&env);
+
+        assert_eq!(stores.config_store_name.as_ref(), "physical_config");
+        assert_eq!(stores.config_key, "active_config");
+        assert_eq!(stores.secret_store_name.as_ref(), "ts_secrets");
+    }
+
+    #[test]
+    fn runtime_store_config_uses_logical_defaults_without_overrides() {
+        let stores = RuntimeStoreConfig::from_env(&EnvConfig::default());
+
+        assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
+        assert_eq!(stores.config_key, "trusted_server_config");
+        assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
+    }
 
     fn settings_with_missing_consent_store() -> Settings {
         Settings::from_toml(
@@ -1370,7 +1517,6 @@ mod tests {
 
                 [integrations.prebid]
                 enabled = true
-                server_url = "https://test-prebid.com/openrtb2/auction"
                 external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
                 [integrations.datadome]
@@ -1378,7 +1524,10 @@ mod tests {
 
                 [auction]
                 enabled = true
-                providers = ["prebid"]
+                [auction.providers.prebid]
+                protocol = "openrtb-2.6"
+                profile = "prebid-server"
+                endpoint = "https://test-prebid.com/openrtb2/auction"
                 timeout_ms = 2000
             "#,
         )
@@ -1436,12 +1585,14 @@ mod tests {
 
             [integrations.prebid]
             enabled = true
-            server_url = "https://test-prebid.com/openrtb2/auction"
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]
             enabled = true
-            providers = ["prebid"]
+            [auction.providers.prebid]
+            protocol = "openrtb-2.6"
+            profile = "prebid-server"
+            endpoint = "https://test-prebid.com/openrtb2/auction"
             timeout_ms = 2000
             "#,
         )
@@ -1490,8 +1641,13 @@ mod tests {
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     ) -> RouterService {
         let settings = test_settings();
-        let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
-            .expect("should build orchestrator");
+        let plan = Arc::new(
+            trusted_server_core::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan"),
+        );
+        let orchestrator =
+            trusted_server_core::auction::build_orchestrator_with_plan(plan, &settings)
+                .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
@@ -1575,6 +1731,34 @@ mod tests {
                 response_headers: Vec::new(),
             }))
         }
+    }
+
+    #[test]
+    fn startup_registers_aps_renderer_route() {
+        let mut settings = test_settings();
+        settings.auction.providers.clear();
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            trusted_server_core::auction::ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                notifications: trusted_server_core::auction::NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"example-account"}),
+            },
+        );
+
+        let state = build_state_from_settings(settings)
+            .expect("Fastly startup should register APS renderer");
+        assert!(
+            state.registry.has_route(
+                &edgezero_core::http::Method::GET,
+                "/integrations/aps/renderer"
+            ),
+            "Fastly startup registry should expose the APS renderer"
+        );
     }
 
     #[test]
@@ -2551,6 +2735,10 @@ mod tests {
     struct FixedBackend;
 
     impl PlatformBackend for FixedBackend {
+        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
+            trusted_server_core::platform::BackendNamingPolicy::Fastly
+        }
+
         fn predict_name(
             &self,
             spec: &PlatformBackendSpec,
@@ -2775,7 +2963,7 @@ mod tests {
 
                     [auction]
                     enabled = true
-                    providers = []
+                    providers = {}
 
                     [creative_opportunities]
                     gam_network_id = "99999"
@@ -2802,11 +2990,13 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build();
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
         let registry = Arc::new(
-            IntegrationRegistry::new(&settings).expect("should build integration registry"),
+            IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+                .expect("should build integration registry"),
         );
         let orchestrator = Arc::new(
-            trusted_server_core::auction::build_orchestrator(&settings)
+            build_orchestrator_with_plan(plan, &settings)
                 .expect("should build auction orchestrator"),
         );
 
@@ -3057,6 +3247,82 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "x-challenge"),
             "the filter's response-header effect must be threaded out"
+        );
+    }
+
+    fn recovery_eligible_of(response: &Response) -> bool {
+        response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("response should carry EcFinalizeState")
+            .ec_context
+            .recovery_eligible()
+    }
+
+    fn browser_navigation_request(path: &str) -> edgezero_core::http::Request {
+        let uri = format!("https://test-publisher.com{path}");
+        let mut req = request_builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("sec-fetch-dest", "document")
+            .body(Body::empty())
+            .expect("should build request");
+        req.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        req
+    }
+
+    #[test]
+    fn named_route_response_is_not_recovery_eligible() {
+        // Orphan recovery must never be authorized on a named route: it is not a
+        // publisher-page navigation, so a missing KV row must not rotate the
+        // identity there.
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "named-route responses must not authorize orphan recovery"
+        );
+    }
+
+    #[test]
+    fn filter_short_circuit_response_is_not_recovery_eligible() {
+        // A request-filter short circuit (e.g. a DataDome challenge/block) must
+        // not authorize orphan recovery even for a would-be publisher
+        // navigation: no publisher page was served.
+        let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
+        let response = route(&router, browser_navigation_request("/some-page"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the challenge filter should short-circuit routing"
+        );
+        assert!(
+            !recovery_eligible_of(&response),
+            "a short-circuit filter response must not authorize orphan recovery"
+        );
+    }
+
+    #[test]
+    fn publisher_navigation_origin_start_failure_is_not_recovery_eligible() {
+        // Recovery is authorized only after a successful origin start. With no
+        // live backend the publisher origin fails, so even a real-browser
+        // document navigation must leave recovery unauthorized.
+        let router = test_router();
+        let response = route(&router, browser_navigation_request("/some-page"));
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "an origin-start failure must not authorize orphan recovery"
         );
     }
 }
