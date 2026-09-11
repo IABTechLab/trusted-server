@@ -129,14 +129,22 @@ checkout so staged changes are checked before every commit:
 ts dev install-hooks
 ```
 
-This sets `core.hooksPath` to `.githooks` and writes a `pre-commit` hook that
-runs `ts dev lint domains --staged`. If `.git/hooks` already contains hooks, or
-`core.hooksPath` points elsewhere, the command refuses rather than silently
-disabling them; re-run with `--force` to proceed (the displaced hooks and prior
-path are printed so you can restore them). To scan the whole checkout on demand:
+This writes a `pre-commit` hook into git's own hook directory (`.git/hooks`,
+shared by every linked worktree of the clone) that runs
+`ts dev lint domains --staged`. It never edits git configuration and never
+writes into the working tree. If `.git/hooks/pre-commit` already exists and was
+not written by this command, it refuses; re-run with `--force` to replace it
+(the previous hook is backed up next to it and the backup path is printed). If
+`core.hooksPath` is set in any git config scope, git does not run hooks from
+`.git/hooks`, so the command refuses and prints the value; add
+`ts dev lint domains --staged` to the pre-commit hook in that directory instead.
+To uninstall, delete `.git/hooks/pre-commit` (and restore any `pre-commit.bak.*`
+backup). To scan the whole checkout on demand:
 
 ```bash
-ts dev lint domains            # full working-tree audit
+# Full working-tree audit. Diagnostic only for now: it reports the repo's
+# pre-existing violations, so a non-zero exit here is expected today.
+ts dev lint domains
 ts dev lint domains --changed-vs origin/main   # only lines added vs a ref
 ```
 

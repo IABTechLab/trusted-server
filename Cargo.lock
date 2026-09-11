@@ -6550,7 +6550,6 @@ dependencies = [
  "error-stack",
  "futures",
  "gix",
- "gix-config",
  "http-body-util",
  "hyper",
  "hyper-util",

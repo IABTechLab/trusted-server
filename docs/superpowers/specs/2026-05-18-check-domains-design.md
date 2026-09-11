@@ -77,9 +77,11 @@ API assumptions, matches reviewer guidance):
 
 1. **Spike — gix feasibility — DONE.** Completed in Phase 2.
    `gix = 0.83` + `gix-config = 0.56` pinned; three integration
-   tests (`crates/trusted-server-cli/tests/spike_gix_*.rs`) prove
-   staged blob diff, merge-base + tree diff, and durable
-   `core.hooksPath` write — all gix-only, no subprocess. The
+   tests (`crates/trusted-server-cli/tests/spike_gix_*.rs`) proved
+   staged blob diff and merge-base + tree diff — all gix-only, no
+   subprocess. (The spike's `core.hooksPath` write was dropped with
+   the installer redesign; see
+   [Hook installer](#hook-installer-rust-subcommand).) The
    resolved entry points are recorded in
    [Resolved by the Phase 2 spike](#resolved-by-the-phase-2-spike).
 2. **URL extraction + allowlist + suppression.** Pure-function
@@ -92,7 +94,7 @@ API assumptions, matches reviewer guidance):
    then add `dev lint domains` dispatching to the function from
    step 2 plus the diff collectors from step 1.
 4. **`dev install-hooks`.** Wires steps 1 and 2 together for the
-   config write + hook file write + shell-escape path.
+   hook file write + shell-escape path.
 5. **End-to-end `assert_cmd` tests** matching `Testing Strategy`.
 6. **Stage 1 doc cleanup** (separate PR series — see
    [Stage 1 Doc Cleanup Plan](#stage-1-doc-cleanup-plan)).
@@ -628,19 +630,23 @@ gix = { version = "0.83", default-features = false, features = [
     "sha1",          # SHA backend — gix-hash refuses to compile without it
     "tree-editor",   # Repository::edit_tree, used by test fixtures
 ] }
-gix-config = "0.56"   # direct File-level read/write of <repo>/.git/config
-                      # for ts dev install-hooks
 regex = "1"
 ```
 
 Notes:
 
-- **Versions pinned by the Phase 2 feasibility spike: `gix = 0.83`,
-  `gix-config = 0.56`** (the same gitoxide release family — `gix
-0.83` depends on `gix-config 0.56`). Verified with
-  `cargo tree -p gix -p gix-config --duplicates`: only an unrelated
-  `hashbrown` appears twice; `gix` and `gix-config` each resolve to
-  a single version.
+- **Version pinned by the Phase 2 feasibility spike: `gix = 0.83`.**
+  Verified with `cargo tree -p gix --duplicates`: only an unrelated
+  `hashbrown` appears twice; `gix` resolves to a single version.
+- **Dependency weight.** The `gix` umbrella crate adds roughly 85
+  crates to the lockfile even with `default-features = false`, and
+  its non-optional `gix-protocol` → `gix-transport` chain compiles
+  the git wire protocol into `ts` although the linter never opens a
+  socket. Depending on the granular subcrates instead would trim
+  that, but the umbrella is what supplies `discover`, the tree-diff
+  platform with rename tracking, the revspec parser, and the tree
+  editor the fixtures use. Accepted for v1; revisit if `ts` binary
+  size or build time becomes a concern.
 - **`sha1` feature is required.** With `default-features = false`,
   `gix-hash` will not compile without a SHA backend and emits
   `Please set either the sha1 or the sha256 feature flag`.
@@ -649,15 +655,11 @@ Notes:
   Phase 2 spike and Phase 4 unit tests build fixture repos entirely
   through gix (write_blob + edit_tree + commit_as), and `edit_tree`
   is gated behind `tree-editor`.
-- `gix-config` is pulled in **explicitly** for the durable
-  `<repo>/.git/config` write performed by `ts dev install-hooks`.
-  `gix::Repository::config_snapshot_mut()` only modifies an
-  in-memory snapshot and is not the persistence path; the hook
-  installer therefore uses `gix-config::File` directly. Do not
-  rely on `config_snapshot/_mut` for persistence.
 - No networking, credential helpers, or worktree mutation features
-  are enabled — the linter only reads from the local repo and does
-  one targeted config write in `ts dev install-hooks`.
+  are enabled — the linter only reads from the local repo, and
+  `ts dev install-hooks` writes a single hook file under `.git/`.
+  `Repository::config_snapshot()` is used read-only, to see the
+  effective `core.hooksPath` across every config scope.
 - The exact feature names match the `gix` crate's documented features
   (`blob-diff`, `index`, `revision` — see docs.rs/gix). If a feature
   has been renamed or split in the version the spike selects, the
@@ -1204,9 +1206,9 @@ path into the hook:
 
 ```sh
 #!/usr/bin/env bash
-# .githooks/pre-commit — installed by `ts dev install-hooks`. DO NOT EDIT.
-# Generated <timestamp> from <ts_version>.
-exec "/Users/example/.cargo/bin/ts" dev lint domains --staged
+# Installed by `ts dev install-hooks`. DO NOT EDIT.
+# ts-install-hooks: managed
+exec '/Users/example/.cargo/bin/ts' dev lint domains --staged
 ```
 
 If the user later rebuilds or moves the binary, re-running
@@ -1221,160 +1223,63 @@ no `git config` invocation from a script — install via a `ts`
 subcommand:
 
 ```
-ts dev install-hooks
+ts dev install-hooks [--force]
 ```
 
-This is a small Rust subcommand on the `ts` CLI that:
+**Where the hook lives.** The hook is written to
+`<common git dir>/hooks/pre-commit`, git's default hook directory:
+`.git/hooks/` in a normal checkout, and the main repository's
+`.git/hooks/` when run from a linked worktree (gix
+`Repository::common_dir`), where git runs it for every worktree. The
+installer never writes into the working tree and never edits git
+configuration. An earlier revision wrote `.githooks/pre-commit` into
+the checkout and set `core.hooksPath = .githooks`; review showed that
+this made git execute whatever hooks a checked-out branch carried under
+`.githooks/`, left an un-ignored file with a machine-specific path in
+every contributor's checkout, and needed a config write whose
+linked-worktree and file-permission semantics were wrong. Using git's
+own hook directory removes all of that: versioned content can never
+become a hook through this tool, and there is no configuration to get
+wrong.
 
-1. Opens the repo via `gix::open(".")`.
-2. Resolves the absolute path of the current `ts` executable via
+The subcommand:
+
+1. Opens the repository via `gix::discover(".")` so it works from any
+   subdirectory. A bare repository (no working tree) is refused.
+2. Resolves the absolute path of the running `ts` executable via
    `std::env::current_exe()`.
-3. **Preflight: read the existing local `core.hooksPath`** (via
-   `gix-config::File`):
-   - **Unset, empty, or already `.githooks`:** proceed. Idempotent
-     re-run on an existing installation is a no-op for this check.
-   - **Set to a different path** (`hooks`, `.husky`, `.cargo-husky`,
-     anything else): **refuse unless `--force`**. The user likely
-     has another hook chain (husky, cargo-husky, lefthook, a
-     hand-rolled `hooks/` directory). Silently rewriting their
-     `core.hooksPath` would disable that chain. Message:
-     ```
-     ts dev install-hooks: refusing to override existing core.hooksPath
-       current: hooks
-       would set: .githooks
-     This would disable your existing hook chain. Choose one of:
-       1. Re-run with --force (your existing core.hooksPath value is
-          printed above; you can restore it later with
-          `git config --local core.hooksPath hooks`).
-       2. Manually add `exec <path-to-ts> dev lint domains --staged`
-          to your existing pre-commit hook chain. The absolute path
-          for this binary is: <ts_path>
-     ```
-     Exit code: 2 (environment error per the exit-code contract —
-     this is a configuration conflict, not a violation).
-4. **Checks for an existing `.githooks/pre-commit`:**
-   - **Absent:** writes the file fresh.
-   - **Present, and contains the `# ts-install-hooks: managed`
-     marker on a known line:** overwrites silently. This is the
-     managed-file case.
-   - **Present, but content does not match the managed marker:**
-     refuses to overwrite. Prints the path of the existing hook,
-     suggests `--force` to overwrite or merging the contents
-     manually. Exits non-zero. Rationale: the user may have
-     hand-edited a custom hook (lint chain, secret scan, etc.); we
-     never silently clobber.
-5. With `--force`, the existing hook (if any) is renamed to
-   `.githooks/pre-commit.bak.<timestamp>` before writing fresh, and
-   the existing `core.hooksPath` value (if it pointed elsewhere) is
-   printed in the success message so the user can restore it later.
-6. Sets the executable bit via `std::fs::Permissions` /
-   `set_permissions` (Unix `0o755`).
-7. Sets `core.hooksPath = .githooks` in the local repo config via
-   the `gix-config::File` write path described under "Persisting
-   `core.hooksPath`" below (no subprocess).
-8. Prints a confirmation message including the embedded binary path
-   and (under `--force`) any displaced previous `core.hooksPath`.
+3. **Preflight: effective `core.hooksPath`.** Read through
+   `Repository::config_snapshot()`, which resolves every scope git
+   consults (system, global, includes, repository, worktree). If it is
+   set to a non-empty value, git will not run anything from
+   `.git/hooks`, so the installer **refuses, with or without
+   `--force`**, prints the value, and tells the user to add
+   `exec <ts> dev lint domains --staged` to the pre-commit hook in that
+   directory (or to unset the key). Exit code 2. The installer never
+   rewrites the user's hook-chain configuration.
+4. **Hook directory.** `<common dir>/hooks` is created if absent. A
+   symlinked hook directory is refused (writing through it could land
+   the hook anywhere on the filesystem). Exit code 2.
+5. **Existing `pre-commit`**, detected with `symlink_metadata` so a
+   dangling symlink still counts as present:
+   - **Absent:** write fresh.
+   - **`--force`:** rename it to `pre-commit.bak.<pid>.<nanos>`
+     without reading it (it may be binary, non-UTF-8, or a symlink),
+     then write fresh. The backup path is printed.
+   - **Regular file carrying the `# ts-install-hooks: managed` marker
+     in its first ten lines:** overwrite silently. This is the
+     idempotent re-install after moving or rebuilding the binary.
+   - **Anything else:** refuse and suggest `--force`. Exit code 2.
+     Rationale: the user may have a hand-written hook (lint chain,
+     secret scan); it is never silently clobbered.
+6. **Write.** The hook is written atomically: a sibling temp file is
+   created with mode `0755`, fsynced, and renamed over the target. The
+   temp file is removed if any step fails.
+7. Prints the hook path and the embedded binary path.
 
-Pseudocode (managed-file overwrite policy elided for brevity; see
-above):
-
-```rust
-pub fn install_hooks(force: bool) -> Result<(), Report<InstallHooksError>> {
-    let repo = gix::open(".")
-        .change_context(InstallHooksError::OpenRepo)?;
-    let work_dir = repo.work_dir()
-        .ok_or_else(|| Report::new(InstallHooksError::NoWorkdir))?;
-    let ts_path = std::env::current_exe()
-        .change_context(InstallHooksError::CurrentExe)?;
-
-    // Preflight: refuse to clobber a foreign core.hooksPath.
-    let existing_hooks_path = read_local_config_value(
-        &repo, "core", None, "hooksPath",
-    )?;
-    let displaced_hooks_path = match existing_hooks_path.as_deref() {
-        None | Some("") | Some(".githooks") => None,   // safe to proceed
-        Some(other) if !force => {
-            return Err(Report::new(InstallHooksError::ForeignHooksPath {
-                current: other.to_string(),
-                proposed: ".githooks".to_string(),
-            })
-            .attach_printable("re-run with --force to override; existing value will be printed for manual restoration"));
-        }
-        Some(other) => Some(other.to_string()),        // --force; remember to surface
-    };
-
-    let hooks_dir = work_dir.join(".githooks");
-    let hook_path = hooks_dir.join("pre-commit");
-    std::fs::create_dir_all(&hooks_dir)
-        .change_context(InstallHooksError::WriteHook)?;
-
-    if hook_path.exists() && !is_managed(&hook_path)? && !force {
-        return Err(Report::new(InstallHooksError::WouldClobber {
-            path: hook_path,
-        })
-        .attach_printable("re-run with --force to overwrite (existing hook is backed up)"));
-    }
-    if hook_path.exists() && force {
-        // Backup timestamp via std::time, no chrono dependency needed.
-        let ts_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let backup = hook_path.with_extension(format!("bak.{ts_secs}"));
-        std::fs::rename(&hook_path, &backup)
-            .change_context(InstallHooksError::WriteHook)?;
-    }
-
-    let content = render_hook(&ts_path);
-    std::fs::write(&hook_path, content)
-        .change_context(InstallHooksError::WriteHook)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)?;
-    }
-
-    // Persistent local-repo config write: set core.hooksPath = .githooks
-    // in <repo>/.git/config. See "Persisting core.hooksPath" below for
-    // the concrete file-level write plan via the gix-config crate.
-    set_local_config_value(&repo, "core", None, "hooksPath", ".githooks")?;
-
-    println!(
-        "Installed: pre-commit hook → {} (calls {})",
-        hook_path.display(),
-        ts_path.display(),
-    );
-    if let Some(prev) = displaced_hooks_path {
-        eprintln!(
-            "note: previous core.hooksPath was '{prev}'. \
-             To restore: git config --local core.hooksPath {prev}"
-        );
-    }
-    Ok(())
-}
-
-fn render_hook(ts_path: &Path) -> String {
-    format!(
-        "#!/usr/bin/env bash\n\
-         # Installed by `ts dev install-hooks`. DO NOT EDIT.\n\
-         # ts-install-hooks: managed\n\
-         exec {} dev lint domains --staged\n",
-        shell_quote(&ts_path.to_string_lossy()),
-    )
-}
-
-fn is_managed(hook_path: &Path) -> Result<bool, Report<InstallHooksError>> {
-    // Returns true if the file contains the marker line
-    // `# ts-install-hooks: managed` in its first ~10 lines.
-}
-```
-
-The `# ts-install-hooks: managed` marker on a known line is the
-signal `is_managed` uses to detect prior-installed hooks. Hand-written
-hooks won't have this marker, so they're treated as user content and
-preserved unless `--force` is passed.
+**Uninstall** is deleting `.git/hooks/pre-commit` (and restoring any
+`pre-commit.bak.*`). No configuration was changed, so nothing else
+needs undoing.
 
 #### Shell-safe path quoting in the hook
 
@@ -1409,80 +1314,6 @@ fn shell_quote(s: &str) -> String {
 Tests cover paths containing: spaces (`/Users/Alice Q/.cargo/bin/ts`),
 single quotes (`/path/with'quote/ts`), `$` (`/opt/$HOME/ts`),
 backticks, backslashes (on Windows-style installer outputs).
-
-#### Persisting `core.hooksPath`
-
-`gix::Repository::config_snapshot_mut()` modifies an in-memory
-snapshot; persisting back to `<repo>/.git/config` is not a single
-stable call in current `gix`. The plan is to write the file directly
-using the `gix-config` crate's file-level API:
-
-```rust
-fn set_local_config_value(
-    repo: &gix::Repository,
-    section: &str,
-    subsection: Option<&str>,
-    key: &str,
-    value: &str,
-) -> Result<(), Report<InstallHooksError>> {
-    use gix_config::File;
-    let config_path = repo.path().join("config"); // <repo>/.git/config
-
-    // Read existing file. If missing, start with an empty File.
-    let mut file = match File::from_path_no_includes(
-        config_path.clone(),
-        gix_config::Source::Local,
-    ) {
-        Ok(f) => f,
-        Err(_) => File::default(),
-    };
-
-    // Set the value in the requested section/subsection/key.
-    file.set_raw_value_by(section, subsection, key, value.as_bytes())
-        .change_context(InstallHooksError::ConfigWrite)?;
-
-    // Serialize and write back atomically (write to a temp file in
-    // the same directory, then rename).
-    let serialized = file.to_bstring();
-    write_atomic(&config_path, serialized.as_slice())
-        .change_context(InstallHooksError::ConfigWrite)?;
-    Ok(())
-}
-
-/// Read a single value from the local repo config. Returns Ok(None)
-/// if the file or key is absent (i.e., never set). Used by the
-/// install-hooks preflight to detect a foreign `core.hooksPath`.
-fn read_local_config_value(
-    repo: &gix::Repository,
-    section: &str,
-    subsection: Option<&str>,
-    key: &str,
-) -> Result<Option<String>, Report<InstallHooksError>> {
-    use gix_config::File;
-    let config_path = repo.path().join("config");
-    let file = match File::from_path_no_includes(
-        config_path,
-        gix_config::Source::Local,
-    ) {
-        Ok(f) => f,
-        Err(_) => return Ok(None),
-    };
-    Ok(file
-        .raw_value_by(section, subsection, key)
-        .ok()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
-}
-```
-
-`write_atomic` is a small helper that writes to `config.tmp.<rand>`
-then `rename`s to `config` (atomic on the same filesystem). This
-matches git's own behavior of never leaving a partially-written
-`.git/config`.
-
-This replaces the earlier sketch using `config_snapshot_mut` /
-`commit()` which is in-memory only. The `gix-config` file-write
-path is the documented stable way to durably modify a local repo's
-git config without subprocess.
 
 `ts dev install-hooks` is a one-time setup contributors run after cloning,
 alongside `cargo install_cli`. Documented in CONTRIBUTING.md.
@@ -1666,6 +1497,24 @@ and the index with `gix` APIs (no shell), runs the binary with
     confirming `gix` is self-contained).
 47. Run unit tests under `cargo test --package trusted-server-cli`
     on the host target (matches PR #669's split CI lanes).
+
+### `install-hooks` cases
+
+Unit tests (gix fixtures): a fresh install writes
+`.git/hooks/pre-commit` and leaves `.git/config` byte-identical and the
+working tree untouched; re-install is idempotent; unmanaged,
+non-UTF-8, and dangling-symlink hooks are refused without `--force`
+and backed up verbatim with it; a symlinked hooks directory is
+refused; `core.hooksPath` from the repository config or any other
+scope is refused regardless of `--force`.
+
+End-to-end tests (`tests/install_hooks_cli.rs`, real `git`, skipped
+when none is on `PATH`): a branch carrying an executable
+`.githooks/post-checkout` stays inert across `git checkout` after
+install and the installed hook blocks a violating commit; from a
+linked worktree the hook lands in the main `.git/hooks` and fires on
+commits made in the worktree; a global `core.hooksPath` is refused
+with exit 2.
 
 ## Trade-offs
 
@@ -1925,13 +1774,12 @@ the question.
       `Editor::write()`, then the same tree-vs-tree path serves both
       modes.
 
-    - **gix-config:** `File::from_path_no_includes(path, Source::Local)`,
-      `File::set_raw_value` (dotted `AsKey` form — avoids the
-      `File<'event>` invariance that bites `set_raw_value_by`),
-      `File::raw_value`, `File::to_bstring`.
+    - **Configuration:** read-only, via
+      `Repository::config_snapshot().string("core.hooksPath")`. The
+      spike's `gix-config` file write was dropped with the installer
+      redesign; the installer no longer touches `.git/config`.
 
-2.  **`gix` / `gix-config` version pins — RESOLVED.** `gix = 0.83`,
-    `gix-config = 0.56`, same gitoxide release family. See
+2.  **`gix` version pin — RESOLVED.** `gix = 0.83`. See
     [Cargo dependencies](#cargo-dependencies) for the full feature
     set and rationale.
 

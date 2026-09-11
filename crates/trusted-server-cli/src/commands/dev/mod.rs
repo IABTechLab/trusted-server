@@ -32,8 +32,8 @@ pub enum DevCommand {
 /// Arguments for `ts dev install-hooks`.
 #[derive(Debug, Args)]
 pub struct InstallHooksArgs {
-    /// Overwrite an existing unmanaged hook or a non-default
-    /// `core.hooksPath` (the displaced value is backed up / printed).
+    /// Replace an existing unmanaged `.git/hooks/pre-commit` (it is
+    /// backed up next to itself and the backup path is printed).
     #[arg(long)]
     pub force: bool,
 }

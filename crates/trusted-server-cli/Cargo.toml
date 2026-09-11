@@ -47,7 +47,6 @@ gix = { workspace = true, features = [
     # Fixture repos in the unit tests construct trees via gix-only APIs.
     "tree-editor",
 ] }
-gix-config = { workspace = true }
 
 # `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
 # automation via `networksetup`, and a native TLS / networking stack. Scoping

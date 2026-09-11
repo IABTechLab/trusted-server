@@ -70,10 +70,9 @@ fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
 # `ts dev lint domains` / `install-hooks` drive all git access through
-# gitoxide (no `git` subprocess). Pinned as a family; verified via
-# `cargo tree -p gix -p gix-config` to avoid duplicate versions in the lock.
+# gitoxide (no `git` subprocess). Verified via `cargo tree -p gix` to
+# avoid duplicate versions in the lock.
 gix = { version = "0.83", default-features = false }
-gix-config = "0.56"
 glob = "0.3"
 getrandom = "0.2"
 hex = "0.4.3"
