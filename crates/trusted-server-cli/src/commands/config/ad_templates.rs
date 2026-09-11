@@ -565,19 +565,9 @@ mod tests {
     }
 
     fn config_with_slots() -> String {
-        let base_config = EXAMPLE_CONFIG
-            .replace(
-                "replace-with-admin-password-32-bytes",
-                "test-admin-password-32-bytes-minimum",
-            )
-            .replace(
-                "trusted-server-placeholder-secret",
-                "test-ec-passphrase-32-bytes-minimum",
-            )
-            .replace(
-                "change-me-proxy-secret",
-                "test-proxy-secret-32-bytes-minimum",
-            );
+        // The example config carries secret-store key names, so diagnostics
+        // can load it without substituting literal secrets.
+        let base_config = EXAMPLE_CONFIG;
         format!(
             "{base_config}\n\
              [[creative_opportunities.slot]]\n\
@@ -676,6 +666,8 @@ mod tests {
             .as_table_mut()
             .expect("should find the auction table");
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
+        // Remove the provider map and its bidder references structurally to
+        // isolate the runtime verdict from the provider advisory.
         auction.remove("providers");
         auction.remove("bidders");
         let config_text =
@@ -710,7 +702,19 @@ mod tests {
 
     #[test]
     fn lint_reports_configured_slot_count_and_auction_state() {
-        let (_temp, config) = project_with_config(&config_with_slots());
+        // Insert the alphabetically earlier provider after pbs-main in source
+        // order, so the output must sort identifiers rather than preserve input.
+        let config_text = format!(
+            "{}\n[auction.providers.aps-main]\n\
+             protocol = \"openrtb-2.6\"\n\
+             profile = \"aps\"\n\
+             endpoint = \"https://aps.example.com/e/pb/bid\"\n\
+             routing = \"all_eligible\"\n\
+             [auction.providers.aps-main.profile_config]\n\
+             account_id = \"example-aps-account-id\"\n",
+            config_with_slots()
+        );
+        let (_temp, config) = project_with_config(&config_text);
         let mut out = Vec::new();
 
         run_ad_templates_with_writer(
@@ -728,11 +732,51 @@ mod tests {
             output.contains("auction.enabled:"),
             "should report the auction kill-switch state"
         );
-        assert!(
-            output.contains("auction.providers: pbs-main"),
-            "should report provider map identifiers: {output}"
+        assert_eq!(
+            output
+                .lines()
+                .find(|line| line.starts_with("auction.providers:")),
+            Some("auction.providers: aps-main, pbs-main"),
+            "should report provider identifiers in deterministic order: {output}"
         );
         assert!(!output.contains("legacy fallback"));
+    }
+
+    #[test]
+    fn lint_reports_empty_provider_map() {
+        let mut config_value: toml::Value =
+            toml::from_str(&config_with_slots()).expect("should parse the fixture config");
+        let auction = config_value["auction"]
+            .as_table_mut()
+            .expect("should find auction table");
+        auction.insert("enabled".to_string(), toml::Value::Boolean(true));
+        auction.remove("providers");
+        auction.remove("bidders");
+        let config_text =
+            toml::to_string(&config_value).expect("should serialize the fixture config");
+        let (_temp, config) = project_with_config(&config_text);
+        let mut out = Vec::new();
+
+        run_ad_templates_with_writer(
+            &AdTemplatesCommand::Lint(AdTemplatesLintArgs { config }),
+            &mut out,
+        )
+        .expect("should lint a config without providers");
+
+        let output = String::from_utf8(out).expect("should be utf8");
+        assert_eq!(
+            output
+                .lines()
+                .find(|line| line.starts_with("auction.providers:")),
+            Some("auction.providers: (none)"),
+            "should report no providers"
+        );
+        assert!(
+            output.lines().any(
+                |line| line == "status: slots are configured, but [auction].providers is empty"
+            ),
+            "should explain why configured slots are ineligible: {output}"
+        );
     }
 
     #[test]

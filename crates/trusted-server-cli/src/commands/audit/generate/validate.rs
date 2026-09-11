@@ -47,9 +47,17 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
     ))
 }
 
+/// Validates one source config without echoing TOML parser source excerpts.
+///
+/// An operator config may contain literal secrets, so parse failures report
+/// only the location, never the offending line or parser message.
 fn validate_source_config(source: &str) -> CliResult<()> {
-    let config: TrustedServerAppConfig =
-        toml::from_str(source).map_err(|error| error.to_string())?;
+    let config: TrustedServerAppConfig = toml::from_str(source).map_err(|error| {
+        error.span().map_or_else(
+            || "config is not valid TOML".to_string(),
+            |span| format!("config is not valid TOML at byte offset {}", span.start),
+        )
+    })?;
     TrustedServerAppConfig::new(config.into_settings())
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -68,6 +76,43 @@ mod tests {
                 "https://origin.example.com",
                 "https://origin.publisher.example.com",
             )
+    }
+
+    #[test]
+    fn malformed_candidate_does_not_echo_source_bytes() {
+        let source = "passphrase = FICTIONAL_SECRET_SENTINEL";
+        let error =
+            check_candidate(source, &baseline()).expect_err("should refuse malformed candidate");
+
+        assert!(
+            !error.contains("FICTIONAL_SECRET_SENTINEL"),
+            "should not disclose source bytes"
+        );
+        assert!(
+            error.contains("refusing to write"),
+            "should explain refusal"
+        );
+        assert!(
+            error.contains("byte offset"),
+            "should retain parser location"
+        );
+    }
+
+    #[test]
+    fn malformed_baseline_warning_does_not_echo_source_bytes() {
+        let source = "passphrase = FICTIONAL_SECRET_SENTINEL";
+        let warnings =
+            check_candidate(source, source).expect("should warn about a malformed baseline");
+
+        assert_eq!(warnings.len(), 1, "should report one baseline warning");
+        assert!(
+            !warnings[0].contains("FICTIONAL_SECRET_SENTINEL"),
+            "should not disclose source bytes"
+        );
+        assert!(
+            warnings[0].contains("byte offset"),
+            "should retain parser location"
+        );
     }
 
     #[test]
