@@ -104,7 +104,7 @@ fn render_hook(ts_path: &Path) -> String {
 }
 
 /// Whether the regular file at `hook_path` is a hook this tool
-/// previously installed — detected by the [`MANAGED_MARKER`] line near
+/// previously installed, detected by the [`MANAGED_MARKER`] line near
 /// the top of the file. Non-UTF-8 content is simply not managed.
 fn is_managed(hook_path: &Path) -> Result<bool, Report<InstallHooksError>> {
     let bytes = fs::read(hook_path).change_context(InstallHooksError::WriteHook)?;

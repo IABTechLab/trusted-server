@@ -1017,7 +1017,7 @@ const EXCLUDED_LOCKFILES: &[&str] = &[
 const EXCLUDED_DIR_COMPONENTS: &[&str] = &["node_modules", "target", "dist", ".git", ".worktrees"];
 
 /// The linter's own source, E2E test file, design spec, and
-/// implementation plan — excluded so the intentionally disallowed
+/// implementation plan, excluded so the intentionally disallowed
 /// hosts in their allowlist constants, doc comments, fixtures, and
 /// worked examples cannot self-flag. Nothing else is exempt: every
 /// other document under `docs/` is subject to the Markdown policy.
@@ -2309,7 +2309,7 @@ pub struct FileViolation {
     /// The disallowed host.
     pub host: String,
     /// The full text of the line the host appeared on (not just the
-    /// URL — there may be surrounding code or punctuation), with any
+    /// URL, since there may be surrounding code or punctuation), with any
     /// URL userinfo redacted (see [`redact_userinfo`]).
     pub line: String,
 }
