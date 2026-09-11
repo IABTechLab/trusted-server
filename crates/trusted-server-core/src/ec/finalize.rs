@@ -1690,6 +1690,9 @@ mod tests {
         };
         let mut ec_context =
             make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
+        );
         let graph = KvIdentityGraph::failing("unavailable-store");
         let mut response = empty_response();
 

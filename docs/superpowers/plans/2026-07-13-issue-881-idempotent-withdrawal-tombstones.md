@@ -41,8 +41,11 @@ never block the response.
   after the first successful tombstone write.
 - A repeated stale point-read miss uses the strongly consistent completion
   marker to avoid another unconditional root write.
-- Completion-marker failure never suppresses the privacy write, and revival or
-  hard deletion clears the marker before the key can become live again.
+- Completion-marker failure never suppresses the privacy write. Explicit
+  same-key CAS revival and hard deletion clear the marker before replacing or
+  removing the tombstoned generation.
+- Production EC creation and re-consent mint fresh IDs through
+  `create_if_absent`; they do not revive a tombstone or read marker state.
 - When cookie and active EC IDs differ, every valid existing row is withdrawn
   independently; missing or malformed IDs are never created.
 - `ts-ec` and the pull-completeness marker are expired before best-effort KV
@@ -118,10 +121,10 @@ uses `TOMBSTONE_TTL`.
 Each successful root tombstone also creates an add-only completion marker in the
 same EC store with `TOMBSTONE_TTL`. The marker namespace cannot collide with EC
 IDs and is excluded from hash-prefix cluster counts. If a later point read
-misses but the strong root-existence check and marker check both succeed,
-withdrawal returns without rewriting the root. Marker read or write failures
-fall back to the root privacy write. Same-key revival and hard deletion remove
-the marker.
+misses but the exact, strongly read marker exists, withdrawal returns without a
+second strong root-existence check or root rewrite. Marker read or write
+failures fall back to the root privacy write. Explicit same-key CAS revival and
+hard deletion remove the marker. Fresh-ID creation does not read marker state.
 
 ### 2. Contain the unconditional fallback
 
@@ -137,8 +140,9 @@ design documents may remain unchanged.
 ### 3. Prove operation-level idempotency
 
 Use a focused recording backend around the existing in-memory store. It must
-count every lookup and insert attempt, including inserts that return a CAS
-precondition failure, and record each write's mode and TTL. Tests must show:
+count every point lookup, exact existence check, insert, prefix list, and delete
+attempt, including inserts that return a CAS precondition failure, and record
+each write's mode and TTL. Tests must show:
 
 - a supplied matching tombstone returns with zero lookups and zero insert
   attempts;
@@ -201,11 +205,14 @@ Production finalization should not change unless these tests expose a defect.
 - `crates/trusted-server-core/src/ec/kv.rs`
   - Add the matching-tombstone no-op branch.
   - Gate the stale-miss fallback with a same-store completion marker.
-  - Clear completion markers on same-key revival and hard deletion.
+  - Clear completion markers on explicit same-key CAS revival and hard deletion.
+  - Keep fresh-ID creation independent of marker availability.
   - Update withdrawal documentation.
   - Add operation-count, repetition, stale-read, and concurrency tests.
 - `crates/trusted-server-core/src/ec/finalize.rs`
   - Add two-ID, repeated-withdrawal, and KV-failure integration coverage.
+- `docs/guide/edge-cookies.md`
+  - Document that repeated withdrawal preserves the first tombstone TTL.
 
 ### Add
 
@@ -219,8 +226,8 @@ is expected. The EC store gains an internal completion-marker key namespace.
 
 ### Task 1 — Establish failing idempotency tests
 
-- [x] Add a recording withdrawal backend that counts lookups and every insert
-      attempt and captures write mode/TTL.
+- [x] Add a recording withdrawal backend that counts every backend operation
+      and captures each insert's write mode and TTL.
 - [x] Add a supplied-tombstone test proving zero lookups and zero inserts.
 - [x] Add repeated and stale-parallel snapshot tests proving the first insert is
       `IfGenerationMatch` with `TOMBSTONE_TTL`, then no further insert occurs and
@@ -236,8 +243,11 @@ is expected. The EC store gains an internal completion-marker key namespace.
       serialization, or write.
 - [x] Keep live/missing/failed/mismatched/CAS behavior unchanged.
 - [x] Record completion after successful tombstone writes.
+- [x] Check the exact completion marker before strong root existence so a
+      repeated stale miss performs one strong read.
 - [x] Suppress repeated stale-miss overwrites when the completion marker exists.
-- [x] Clear completion state on same-key revival and hard deletion.
+- [x] Clear completion state on explicit same-key CAS revival and hard deletion.
+- [x] Keep fresh-ID creation independent of marker availability.
 - [x] Run focused KV tests until green.
 
 ### Task 3 — Cover concurrent state changes
@@ -339,11 +349,11 @@ git diff --check
   subsequent insert attempt at the wrapper boundary; stable root
   generation/timestamp alone is not sufficient evidence.
 - **Stale-miss completion:** Write the marker only after the root tombstone
-  succeeds. Marker failures must fall back to the privacy write, while revival
-  and hard deletion must remove stale completion state.
-- **Fallback containment:** Keep unconditional overwrite behind strong root
-  existence and completion-marker checks so no other path can refresh a
-  completed tombstone.
+  succeeds. Marker failures must fall back to the privacy write. Explicit
+  same-key CAS revival and hard deletion must remove stale completion state.
+- **Fallback containment:** Check the exact completion marker first. Keep
+  unconditional overwrite behind strong root existence when no marker exists
+  so no other path can refresh a completed tombstone.
 - **Conflict-test realism:** Inject actual generation changes and persisted
   state, not endless synthetic precondition failures.
 - **Stack dependency:** Reconcile changes if PR #885 or draft PR #900 modifies
