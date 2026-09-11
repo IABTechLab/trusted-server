@@ -195,9 +195,10 @@ fn spin_secret_variable_name(
 ///
 /// Delegates all operations through `KvHandle`'s raw-bytes API. Spin KV has no
 /// native TTL support, so [`put_bytes_with_ttl`](KvStore::put_bytes_with_ttl)
-/// returns `KvError::Validation` rather than silently writing a non-expiring
-/// record. Callers of the generic platform KV interface must handle that
-/// capability difference explicitly.
+/// returns `KvError::Unsupported` rather than silently writing a non-expiring
+/// record. `KvHandle` returns `KvError::Validation` for invalid keys, TTLs, or
+/// values before delegating to the backend. Callers of the generic platform KV
+/// interface must handle that capability difference explicitly.
 struct KvHandleAdapter(KvHandle);
 
 #[async_trait::async_trait(?Send)]
