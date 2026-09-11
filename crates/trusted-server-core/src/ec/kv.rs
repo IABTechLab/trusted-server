@@ -108,6 +108,9 @@ pub(crate) enum EidCookieSyncOutcome {
     /// A different stored value had unknown freshness.
     #[display("deferred_freshness")]
     DeferredFreshness,
+    /// An eventually consistent read missed a row already proven to exist.
+    #[display("deferred_stale_read")]
+    DeferredStaleRead,
     /// The identity graph row was missing.
     #[display("missing")]
     Missing,
@@ -169,11 +172,16 @@ fn apply_cookie_partner_id_updates(
 }
 
 fn partner_id_updates_match(entry: &KvEntry, updates: &[PartnerIdUpdate]) -> bool {
-    updates.iter().all(|update| {
+    let mut latest_updates = BTreeMap::new();
+    for update in updates {
+        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+    }
+
+    latest_updates.into_iter().all(|(partner_id, uid)| {
         entry
             .ids
-            .get(&update.partner_id)
-            .is_some_and(|existing| existing.uid == update.uid)
+            .get(partner_id)
+            .is_some_and(|existing| existing.uid == uid)
     })
 }
 
@@ -544,48 +552,6 @@ impl KvIdentityGraph {
         )))
     }
 
-    /// Atomically merges browser partner IDs into an existing entry.
-    ///
-    /// This compatibility entry point has no request-start observation, so it
-    /// can add missing IDs but cannot replace different values. It performs at
-    /// most one conditional write and one follow-up read on conflict.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::KvStore`] on store failure, a missing root,
-    /// or a withdrawn root.
-    pub(crate) fn upsert_partner_ids(
-        &self,
-        ec_id: &str,
-        updates: &[PartnerIdUpdate],
-    ) -> Result<(), Report<TrustedServerError>> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        let (_, outcome) =
-            self.sync_eid_cookie_updates_from_snapshot(ec_id, updates, EcKvSnapshot::NotRead);
-        match outcome {
-            EidCookieSyncOutcome::Missing => Err(self.kv_error(format!(
-                "Cannot upsert {} partner IDs for a missing key",
-                updates.len(),
-            ))),
-            EidCookieSyncOutcome::ConsentWithdrawn => Err(self.kv_error(format!(
-                "Cannot upsert {} partner IDs for a withdrawn key",
-                updates.len(),
-            ))),
-            EidCookieSyncOutcome::Failed => {
-                Err(self.kv_error(format!("Failed to upsert {} partner IDs", updates.len(),)))
-            }
-            EidCookieSyncOutcome::AlreadyMatched
-            | EidCookieSyncOutcome::Written
-            | EidCookieSyncOutcome::WrittenWithDeferredFreshness
-            | EidCookieSyncOutcome::ConflictMatched
-            | EidCookieSyncOutcome::DeferredConflict
-            | EidCookieSyncOutcome::DeferredFreshness => Ok(()),
-        }
-    }
-
     /// Persists browser EID cookies with one conditional write and one conflict read.
     ///
     /// Browser cookies do not carry a value-owned version, so a different
@@ -630,8 +596,13 @@ impl KvIdentityGraph {
                 generation: Some(generation),
             } if snapshot_id == ec_id => (entry.as_ref().clone(), generation),
             EcKvSnapshot::Missing { .. } => {
+                let outcome = if proven.is_some() {
+                    EidCookieSyncOutcome::DeferredStaleRead
+                } else {
+                    EidCookieSyncOutcome::Missing
+                };
                 let kept = Self::keep_proven(ec_id, current, proven.as_ref());
-                return (kept, EidCookieSyncOutcome::Missing);
+                return (kept, outcome);
             }
             EcKvSnapshot::Failed { .. } => {
                 let kept = Self::keep_proven(ec_id, current, proven.as_ref());
@@ -690,7 +661,21 @@ impl KvIdentityGraph {
             Ok(EcKvWriteOutcome::PreconditionFailed) => {
                 let refreshed = self.load_snapshot(ec_id);
                 let Some(refreshed_entry) = refreshed.entry_for(ec_id) else {
-                    let kept = Self::keep_proven(ec_id, refreshed, Some(&current));
+                    // The failed CAS proved `current`'s generation stale. Keep
+                    // only its existence proof so later writes must reread.
+                    let proof = match current {
+                        EcKvSnapshot::Present {
+                            ec_id: proven_id,
+                            entry,
+                            ..
+                        } => EcKvSnapshot::Present {
+                            ec_id: proven_id,
+                            entry,
+                            generation: None,
+                        },
+                        other => other,
+                    };
+                    let kept = Self::keep_proven(ec_id, refreshed, Some(&proof));
                     return (kept, EidCookieSyncOutcome::DeferredConflict);
                 };
                 if !refreshed_entry.consent.ok {
@@ -703,8 +688,8 @@ impl KvIdentityGraph {
                 };
                 (refreshed, outcome)
             }
-            Err(_err) => {
-                log::warn!("EID cookie sync write failed");
+            Err(err) => {
+                log::warn!("EID cookie sync write failed: {err:?}");
                 (
                     EcKvSnapshot::Failed {
                         ec_id: ec_id.to_owned(),
@@ -2230,6 +2215,11 @@ mod tests {
             "the live pre-write row should prevent conflict deferral from entering orphan recovery"
         );
         assert_eq!(
+            snapshot.generation_for(&ec_id),
+            None,
+            "a failed CAS must not return its rejected generation"
+        );
+        assert_eq!(
             lookups.load(std::sync::atomic::Ordering::Relaxed),
             2,
             "the initial refresh and conflict follow-up should be the only reads"
@@ -2238,6 +2228,53 @@ mod tests {
             writes.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the conflict must remain the request's only conditional write"
+        );
+    }
+
+    #[test]
+    fn eid_cookie_sync_reports_proven_refresh_miss_as_deferred() {
+        let ec_id = snapshot_ec_id();
+        let graph = KvIdentityGraph::in_memory("empty-store");
+        let proven = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+
+        let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "desired-uid")],
+            proven,
+        );
+
+        assert!(
+            snapshot.entry_for(&ec_id).is_some(),
+            "the add-confirmed row should survive an eventually consistent miss"
+        );
+        assert_eq!(
+            outcome,
+            EidCookieSyncOutcome::DeferredStaleRead,
+            "a row already proven to exist should report a deferred stale read"
+        );
+    }
+
+    #[test]
+    fn partner_id_conflict_match_uses_last_duplicate_value() {
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "latest-uid".to_owned(),
+            },
+        );
+        let updates = [
+            PartnerIdUpdate::new("ssp_x", "older-uid"),
+            PartnerIdUpdate::new("ssp_x", "latest-uid"),
+        ];
+
+        assert!(
+            partner_id_updates_match(&entry, &updates),
+            "conflict matching should use the same last-value-wins rule as writes"
         );
     }
 
@@ -4034,9 +4071,9 @@ mod tests {
     fn a_locally_built_error_never_carries_the_whole_identifier() {
         // The injected-failure case above covers errors the backend produces.
         // These are built in this module from the identifier itself, on every
-        // path a request can reach: a duplicate create, single and batched
-        // upserts naming a key the store does not hold or has withdrawn, and
-        // the CAS-exhaustion terminal errors.
+        // path a request can reach: a duplicate create, single upserts naming a
+        // key the store does not hold or has withdrawn, and the CAS-exhaustion
+        // terminal errors.
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         kv.create(&ec_id, &live_entry()).expect("should create");
@@ -4047,12 +4084,6 @@ mod tests {
         let missing = kv
             .upsert_partner_id(&format!("{}.ZZZ999", "b".repeat(64)), "partner", "uid")
             .expect_err("an upsert on a missing key should be refused");
-        let batched_missing = kv
-            .upsert_partner_ids(
-                &format!("{}.ZZZ999", "b".repeat(64)),
-                &[PartnerIdUpdate::new("partner", "uid")],
-            )
-            .expect_err("a batched upsert on a missing key should be refused");
         let withdrawn = {
             assert_eq!(
                 kv.write_withdrawal_tombstone(&ec_id, drop)
@@ -4063,9 +4094,6 @@ mod tests {
             kv.upsert_partner_id(&ec_id, "partner", "uid")
                 .expect_err("an upsert on a withdrawn key should be refused")
         };
-        let batched_withdrawn = kv
-            .upsert_partner_ids(&ec_id, &[PartnerIdUpdate::new("partner", "uid")])
-            .expect_err("a batched upsert on a withdrawn key should be refused");
 
         // The remaining CAS-exhaustion paths build their message the same way,
         // and a store that never lets a write land is the only way to reach them.
@@ -4094,9 +4122,7 @@ mod tests {
         for (label, report) in [
             ("duplicate create", duplicate),
             ("missing key", missing),
-            ("batched missing key", batched_missing),
             ("withdrawn key", withdrawn),
-            ("batched withdrawn key", batched_withdrawn),
             ("CAS exhaustion reviving", cas_revive),
             ("CAS exhaustion upserting", cas_upsert),
             ("CAS exhaustion upserting if present", cas_if_exists),
