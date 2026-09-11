@@ -157,64 +157,6 @@ impl StreamProcessor for HtmlWithPostProcessing {
     fn reset(&mut self) {}
 }
 
-/// Run registered full-document post-processors on already rewritten HTML.
-pub(crate) fn run_html_post_processors(
-    full_output: Vec<u8>,
-    post_processors: &[Arc<dyn IntegrationHtmlPostProcessor>],
-    origin_host: &str,
-    request_host: &str,
-    request_scheme: &str,
-    document_state: &IntegrationDocumentState,
-    max_buffered_body_bytes: usize,
-) -> Result<Vec<u8>, io::Error> {
-    if full_output.is_empty() || post_processors.is_empty() {
-        return Ok(full_output);
-    }
-
-    let Ok(output_str) = std::str::from_utf8(&full_output) else {
-        return Ok(full_output);
-    };
-
-    let ctx = IntegrationHtmlContext {
-        request_host,
-        request_scheme,
-        origin_host,
-        document_state,
-    };
-
-    if !post_processors
-        .iter()
-        .any(|processor| processor.should_process(output_str, &ctx))
-    {
-        return Ok(full_output);
-    }
-
-    let mut html = String::from_utf8(full_output).map_err(|e| {
-        io::Error::other(format!(
-            "HTML post-processing expected valid UTF-8 output: {e}"
-        ))
-    })?;
-
-    let mut changed = false;
-    for processor in post_processors {
-        if processor.should_process(&html, &ctx) {
-            changed |= processor.post_process(&mut html, &ctx);
-        }
-    }
-
-    if changed {
-        log::debug!("HTML post-processing complete: output_len={}", html.len());
-    }
-
-    if html.len() > max_buffered_body_bytes {
-        return Err(io::Error::other(
-            "publisher body exceeded maximum buffered size",
-        ));
-    }
-
-    Ok(html.into_bytes())
-}
-
 /// What the `</body>` seam injects.
 ///
 /// This is a decision, not a side effect of whether the `<head>` script exists.
@@ -247,7 +189,7 @@ pub enum BidInjectionMode {
     Placeholder {
         /// Placeholder HTML inserted before the body end tag.
         html: String,
-        /// Shared tracker used for EOF fallback decisions.
+        /// Shared tracker for parser-owned head and body insertion ordering.
         tracker: Arc<HtmlInjectionTracker>,
     },
 }
@@ -411,36 +353,6 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// Build the executable snippet normally inserted at the start of `<head>`.
-#[must_use]
-pub(crate) fn build_head_bootstrap_snippet(
-    integrations: &IntegrationRegistry,
-    origin_host: &str,
-    request_host: &str,
-    request_scheme: &str,
-    document_state: &IntegrationDocumentState,
-    ad_slots_script: Option<&str>,
-) -> String {
-    let mut snippet = String::new();
-    if let Some(slots_script) = ad_slots_script {
-        snippet.push_str(slots_script);
-    }
-    let ctx = IntegrationHtmlContext {
-        request_host,
-        request_scheme,
-        origin_host,
-        document_state,
-    };
-    for insert in integrations.head_inserts(&ctx) {
-        snippet.push_str(&insert);
-    }
-    let immediate_ids = integrations.js_module_ids_immediate();
-    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
-    let deferred_ids = integrations.js_module_ids_deferred();
-    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
-    snippet
-}
-
 /// Create an HTML processor with URL replacement and integration hooks.
 ///
 /// # Panics
@@ -566,11 +478,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 if injected_tsjs.get() {
                     return Ok(());
                 }
-                if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode {
-                    if tracker.head_injected() || tracker.bid_placeholder_inserted() {
-                        injected_tsjs.set(true);
-                        return Ok(());
-                    }
+                if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode
+                    && (tracker.head_injected() || tracker.bid_placeholder_inserted())
+                {
+                    injected_tsjs.set(true);
+                    return Ok(());
                 }
                 {
                     let mut snippet = String::new();

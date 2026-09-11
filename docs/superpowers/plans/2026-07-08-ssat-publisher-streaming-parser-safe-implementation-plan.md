@@ -90,8 +90,9 @@ should land with passing tests for the slice implemented.
   - script/JSON data containing literal or escaped `</body` does not trigger
     collection;
   - real `</body>` split across origin chunks still injects before the close tag;
-  - missing `</body>` appends the fallback tail at EOF;
-  - missing `<head>` plus missing `</body>` appends the minimal executable tail;
+  - missing `</body>` preserves publisher content and emits no bid fallback;
+  - an open `textarea` retains its exact DOM text at EOF;
+  - missing `<head>` plus missing `</body>` emits no fallback tail;
   - multiple body close tags do not inject multiple bid scripts.
 - Routing seams:
   - Fastly request-level SSAT streaming candidates set `stream_response = true`;
@@ -262,7 +263,7 @@ decoded origin bytes
   -> HTML processor configured with placeholder mode and no post-processors
   -> processed uncompressed output
   -> PlaceholderLateBinder
-  -> auction collect / empty bid script / EOF fallback
+  -> auction collect / empty bid script / safe EOF no-op
   -> output cap counter
   -> optional recompression
   -> writer
@@ -271,7 +272,7 @@ decoded origin bytes
 Important behavior:
 
 - If `params.dispatched_auction` exists, collect it when the first placeholder is
-  found; otherwise collect at EOF fallback.
+  found. If EOF arrives without a placeholder, abandon it with a terminal reason.
 - If no auction was dispatched but slots exist, replace the placeholder
   immediately with the current or empty bid script.
 - Existing `collect_stream_auction`, `write_bids_to_state`, and
@@ -281,24 +282,21 @@ Important behavior:
 - Delete or deprecate `BodyCloseHoldBuffer` tests once equivalent placeholder
   tests cover the behavior.
 
-### 1.5 Implement EOF fallback tail
+### 1.5 Handle EOF without an insertion point
 
 On EOF, after finalizing `lol_html`:
 
 1. Feed final processor output through the binder.
 2. If a placeholder appears in final output, replace it normally.
 3. If no placeholder was ever found:
-   - collect any dispatched auction;
-   - if `tracker.head_injected` is true, append only the bids script;
-   - if `tracker.head_injected` is false, append the minimal bootstrap tail in
-     executable order using the extracted head-snippet helper plus the bids
-     script.
+   - emit the remaining rewritten publisher bytes unchanged;
+   - abandon any dispatched auction with a terminal reason;
+   - append no bootstrap or bids markup.
 
-The fallback tail is best-effort malformed-document handling; it must still:
-
-- count against the processed-output cap;
-- never expose placeholders;
-- preserve current privacy behavior for SSAT HTML.
+This is the content-preserving malformed-document policy. EOF can occur inside a
+raw-text or script-data context where appended markup would become publisher
+content rather than executable HTML. DOM-level tests must cover an open
+`textarea`, an ordinary unclosed body, and both buffered and live-stream paths.
 
 ## Phase 2: Streaming pipeline, compression, and caps
 
@@ -618,7 +616,7 @@ Expected behavior:
 
 - they call the default non-streaming publisher handler;
 - they call `buffer_publisher_response_async`;
-- they benefit from parser-safe late binding and EOF fallback;
+- they benefit from parser-safe late binding and content-preserving EOF handling;
 - they enforce the existing buffered cap;
 - they are not described as true streaming.
 
@@ -704,7 +702,8 @@ target in this workspace.
 - [ ] `</body` literals inside scripts, JSON, comments, and attributes do not
       trigger auction collection.
 - [ ] Bids are injected before the first parser-confirmed `</body>`.
-- [ ] Missing `</body>` appends bids or minimal SSAT fallback tail at EOF.
+- [ ] Missing `</body>` preserves publisher content, appends no bid fallback,
+      and abandons any uncollected auction.
 - [ ] gzip, deflate, and brotli stream through decode/rewrite/re-encode.
 - [ ] Decoded-input, processed-output, and held-tail caps are enforced without a
       full-document allocation.

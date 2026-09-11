@@ -35,8 +35,9 @@ and full-document HTML post-processors as buffered mode for this slice.
   contexts.
 - Bid injection remains before the real parser-confirmed `</body>` when one is
   present.
-- If no parser-confirmed body close exists, append the SSAT fallback tail at EOF
-  as a best-effort fallback.
+- If no parser-confirmed body close exists, preserve the rewritten publisher
+  content and skip bid injection rather than appending markup in an unknown
+  parser context.
 - Streaming mode supports gzip, deflate, and brotli origin HTML by decoding,
   rewriting, and re-encoding incrementally.
 - Streaming mode enforces cumulative decoded-input and processed-output caps
@@ -137,8 +138,9 @@ for this issue.
 
 ## Locked decisions
 
-1. **Missing `</body>` fallback:** append the SSAT fallback tail at EOF when no
-   parser-confirmed body close is available.
+1. **Missing `</body>` behavior:** inject bids only at a parser-confirmed body
+   close. If none exists, preserve publisher content, abandon the dispatched
+   auction, and do not append an EOF fallback.
 2. **Post-processors:** full-document HTML post-processors are an acceptable
    buffered-mode tradeoff for this slice. Next.js streaming-safe post-processing
    is deferred.
@@ -168,7 +170,7 @@ Client request
        -> cumulative decoded-input cap
        -> lol_html processor
        -> parser-inserted bid placeholder detection
-       -> auction collect at placeholder, or EOF fallback
+       -> auction collect at placeholder, or abandon at EOF
        -> cumulative processed-output cap
        -> encoder, if response remains compressed
        -> Fastly StreamingBody
@@ -230,10 +232,10 @@ Use `lol_html` as the only authority for detecting the real body end tag.
    - emit the held suffix;
    - resume reading and streaming origin bytes.
 6. At EOF, if no placeholder was found:
-   - collect the dispatched auction if it has not already been collected;
    - finalize the HTML processor;
    - if final processor output contains the placeholder, replace it normally;
-   - otherwise append the SSAT fallback tail at EOF.
+   - otherwise emit the remaining rewritten publisher bytes unchanged and
+     abandon the dispatched auction.
 
 Pausing origin reads while the auction is collected is intentional. The
 implementation should rely on the runtime's normal upstream backpressure rather
@@ -242,14 +244,12 @@ bounded by the existing auction collection timeout/deadline; if collection fails
 or times out, replace the placeholder with the empty/current bids script and
 continue streaming.
 
-The EOF fallback covers both documents that have a `<body>` without a parsed end
-tag and malformed documents that never expose a body end tag. If the normal
-`<head>` injection has already run, the fallback tail may be just the bids
-script. If no head injection ran, the fallback tail must include the minimal SSAT
-bootstrap in executable order — ad slot state, integration head config required
-by the TSJS bundle, the TSJS script tag(s), and then the bids script. This is a
-best-effort malformed-document path; it must still be bounded by the processed
-output cap and must not leak placeholders.
+EOF is not itself a parser-confirmed markup insertion point. A malformed
+response can end inside `textarea`, `title`, `style`, script data, or another
+context where appended `<script>` bytes become publisher text or fail to
+execute. The late binder therefore does not append markup when no placeholder
+exists. It preserves the rewritten bytes, emits no bids script, and abandons any
+uncollected auction with a terminal reason.
 
 The placeholder should be a per-request high-entropy token, such as an HTML
 comment containing a UUID, for example:
@@ -533,7 +533,7 @@ raw placeholder. The bounded buffered pipeline should therefore be:
 ```text
 decode origin body
   -> lol_html rewrite with parser placeholder
-  -> parser-safe late binding / bids replacement or EOF fallback
+  -> parser-safe late binding / bids replacement or safe EOF no-op
   -> full-document post-processors
   -> encode or buffer final body
 ```
@@ -665,9 +665,12 @@ sensitive query parameters.
   replaced exactly once.
 - Multiple body close tags do not inject bids multiple times and do not leak
   placeholders.
-- Missing `</body>` appends bids or the SSAT fallback tail at EOF.
-- Missing `<head>` plus missing `</body>` appends the minimal SSAT fallback tail
-  at EOF without leaking placeholders.
+- Missing `</body>` preserves publisher content, emits no bids script, and
+  abandons the dispatched auction.
+- An open raw-text element such as `textarea` does not receive appended fallback
+  markup; DOM-level assertions verify that its value is unchanged.
+- Missing `<head>` plus missing `</body>` emits no fallback tail and leaks no
+  placeholder.
 - Normal bid injection still places bids before `</body>` when the close tag is
   present.
 
@@ -714,7 +717,8 @@ For gzip, deflate, and brotli:
 - Axum publisher SSAT is explicitly buffered in this slice.
 - Cloudflare publisher SSAT is explicitly buffered in this slice.
 - Spin publisher SSAT is explicitly buffered in this slice.
-- Buffered non-Fastly paths preserve parser-safe bid injection and EOF fallback.
+- Buffered non-Fastly paths preserve parser-safe bid injection and skip unsafe
+  EOF fallback when no parser-confirmed body close exists.
 - Buffered post-processor paths run parser-safe late binding before
   post-processors and never expose placeholders to post-processors or clients.
 
@@ -736,8 +740,8 @@ For gzip, deflate, and brotli:
   output and replaces the parser-inserted placeholder with bids.
 - Replace raw `BodyCloseHoldBuffer` usage for SSAT collection with
   placeholder-triggered collection.
-- Add EOF fallback bid append, including the missing-head minimal SSAT fallback
-  tail when normal head injection never ran.
+- At EOF without a parser placeholder, preserve publisher output and abandon
+  the dispatched auction instead of appending unparsed markup.
 - Keep existing buffered adapters working through the new parser-safe path.
 - Ensure buffered post-processor mode performs late binding before post-processing
   so post-processors see final HTML rather than raw placeholders.
@@ -808,7 +812,7 @@ cd crates/trusted-server-js/lib && npm run format
 | Streaming path enforces a cumulative body cap without requiring a single full-body allocation.                  | Decoded-input and processed-output cumulative caps plus concrete held-tail cap.                                                                                                                                      |
 | Body-close hold is parser-context-aware and does not trigger on `</body` literals inside inline scripts/JSON.   | `lol_html` inserts an opaque placeholder only at parser-confirmed body end tags; streaming loop scans processed output for that placeholder.                                                                         |
 | EdgeZero/non-Fastly adapter behavior is either streaming-safe or explicitly documented/tested as buffered mode. | Fastly EdgeZero is true streaming; Axum, Cloudflare, and Spin are documented/tested buffered mode.                                                                                                                   |
-| Tests cover large HTML, inline-script `</body` literals, missing body close tags, and normal bid injection.     | Core parser-safety and streaming cap test matrix, including missing-head EOF fallback.                                                                                                                               |
+| Tests cover large HTML, inline-script `</body` literals, missing body close tags, and normal bid injection.     | Core parser-safety and streaming cap test matrix, including DOM-level malformed raw-text coverage and content-preserving missing-body behavior.                                                                      |
 | Existing `private, max-age=0` SSAT privacy behavior remains unchanged.                                          | Privacy/cache section, transformed-header normalization, and regression tests.                                                                                                                                       |
 
 ## Follow-up work
