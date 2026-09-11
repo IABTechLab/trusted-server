@@ -20,6 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 const MARKER_VERSION: &str = "v1";
 const MARKER_KEY_LABEL: &[u8] = b"trusted-server/ec-pull-complete/key/v1";
 const MARKER_MAX_AGE_SECS: u64 = 60 * 60;
+const MARKER_CLOCK_SKEW_SECS: u64 = 60;
 const MAX_MARKER_LENGTH: usize = 256;
 
 /// Request-local validation state for the pull-sync completeness marker.
@@ -194,6 +195,9 @@ fn append_cookie(response: &mut Response<EdgeBody>, value: &str) {
 }
 
 fn format_marker_cookie(value: &str, max_age: u64) -> String {
+    // Keep this cookie host-only. The signed payload does not include the
+    // request host, so a Domain attribute would allow replay across sibling
+    // hosts that share the domain-wide EC cookie and passphrase.
     format!(
         "{COOKIE_TS_EC_PULL_COMPLETE}={value}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly"
     )
@@ -260,7 +264,10 @@ fn validate_marker(
     }
 
     let expires_at = expires.parse::<u64>().ok()?;
-    if expires_at <= now || expires_at > now.saturating_add(MARKER_MAX_AGE_SECS) {
+    let max_future = now
+        .saturating_add(MARKER_MAX_AGE_SECS)
+        .saturating_add(MARKER_CLOCK_SKEW_SECS);
+    if expires_at <= now || expires_at > max_future {
         return None;
     }
 
@@ -564,6 +571,33 @@ mod tests {
     }
 
     #[test]
+    fn steady_states_leave_the_marker_cookie_untouched() {
+        let (settings, registry) = settings_and_registry(&["a.example.com"]);
+        let complete = live_snapshot(EC_ID, &["a.example.com"]);
+        let incomplete = live_snapshot(EC_ID, &[]);
+        let cases = [
+            (PullSyncMarkerState::Valid { expires_at: 4_600 }, &complete),
+            (PullSyncMarkerState::Absent, &incomplete),
+        ];
+
+        for (mut state, snapshot) in cases {
+            let mut response = empty_response();
+            reconcile_marker(
+                &settings,
+                &registry,
+                Some(EC_ID),
+                snapshot,
+                &mut state,
+                &mut response,
+            );
+            assert!(
+                marker_cookies(&response).is_empty(),
+                "a steady marker state should not add a Set-Cookie header"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_marker_is_cleared_without_authoritative_snapshot() {
         let (settings, registry) = settings_and_registry(&["a.example.com"]);
         let mut state = PullSyncMarkerState::Invalid;
@@ -582,6 +616,19 @@ mod tests {
     }
 
     #[test]
+    fn marker_allows_sixty_seconds_of_issuer_clock_skew() {
+        let (settings, registry) = settings_and_registry(&["a.example.com"]);
+        let marker =
+            create_marker(&settings, &registry, EC_ID, 4_600).expect("should create marker");
+
+        assert_eq!(
+            validate_marker(&marker, &settings, &registry, EC_ID, 940),
+            Some(4_600),
+            "a marker from an issuer sixty seconds ahead should remain valid"
+        );
+    }
+
+    #[test]
     fn marker_rejects_expired_overlong_and_tampered_values() {
         let (settings, registry) = settings_and_registry(&["a.example.com"]);
         let marker =
@@ -594,8 +641,8 @@ mod tests {
             "expired marker should fail"
         );
         assert!(
-            validate_marker(&marker, &settings, &registry, EC_ID, 999).is_none(),
-            "marker more than one hour in the future should fail"
+            validate_marker(&marker, &settings, &registry, EC_ID, 939).is_none(),
+            "marker beyond the lifetime and clock-skew allowance should fail"
         );
         assert!(
             validate_marker(&tampered, &settings, &registry, EC_ID, 1_000).is_none(),
