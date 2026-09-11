@@ -98,6 +98,9 @@ pub enum EcKvSnapshot {
     /// The store authoritatively reported that this EC ID does not exist.
     Missing { ec_id: String },
     /// Persisted entry data, optionally with a generation usable for CAS.
+    ///
+    /// A generation never authorizes a write by itself. Callers must first
+    /// enforce entry policy such as rejecting a withdrawal tombstone.
     Present {
         ec_id: String,
         entry: Box<KvEntry>,
