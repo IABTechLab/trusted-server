@@ -2444,8 +2444,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for CountingSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             key: &str,

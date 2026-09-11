@@ -50,10 +50,14 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
 use http::Request;
 
 use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
+use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::platform::{KvHandle, RuntimeServices};
+use crate::settings::Settings;
 
 /// Number of deciseconds in one day (86 400 seconds × 10).
 const DECISECONDS_PER_DAY: u64 = 86_400 * 10;
@@ -82,11 +86,11 @@ pub struct ConsentPipelineInput<'a> {
     /// - **Read fallback**: loads consent from KV when cookies are absent.
     /// - **Write-on-change**: persists cookie-sourced consent to KV.
     pub ec_id: Option<&'a str>,
-    /// KV store for consent persistence.
+    /// KV store handle for consent persistence.
     ///
     /// `None` when consent persistence is not configured for this request, or
     /// when the caller intentionally skips consent KV access.
-    pub kv_store: Option<&'a dyn crate::platform::PlatformKvStore>,
+    pub kv_store: Option<crate::platform::KvHandle>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -114,7 +118,7 @@ pub struct ConsentPipelineInput<'a> {
 ///
 /// Decoding failures are logged and the corresponding decoded field is set to
 /// `None` — the raw string is still preserved for proxy-mode forwarding.
-pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext {
+pub async fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext {
     let signals = extract_consent_signals(input.jar, input.req);
     log_consent_signals(&signals);
 
@@ -125,8 +129,8 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     // Read fallback: when the request carries no consent signals, fall back
     // to consent persisted in KV for this EC ID (when persistence is wired).
     if signals.is_empty()
-        && let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store)
-        && let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id)
+        && let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store.as_ref())
+        && let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id).await
     {
         // Jurisdiction is request-local: derive it from the current
         // geo rather than the value stored with the persisted entry.
@@ -171,8 +175,8 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     // Write-on-change: persist cookie-sourced consent for this EC ID (when
     // persistence is wired). The helper skips empty contexts and unchanged
     // fingerprints internally.
-    if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store) {
-        kv::save_consent_to_kv(store, ec_id, &ctx, input.config.max_consent_age_days);
+    if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store.as_ref()) {
+        kv::save_consent_to_kv(store, ec_id, &ctx, input.config.max_consent_age_days).await;
     }
 
     log_consent_context(&ctx);
@@ -644,6 +648,42 @@ fn log_consent_signals(signals: &RawConsentSignals) {
     }
 }
 
+/// Resolves the configured consent KV store from the per-request registry,
+/// failing closed when it is configured but cannot be resolved.
+///
+/// This is the single place the consent-store availability policy lives, shared
+/// by every adapter:
+///
+/// - `consent.consent_store` **configured and resolvable** → `Ok(Some(handle))`.
+/// - `consent.consent_store` **configured but unresolved** (no KV registry wired,
+///   or the id is not declared/openable) → `Err`. Consent-dependent routes
+///   surface this as a 503 rather than silently proceeding without consent.
+/// - `consent.consent_store` **unconfigured** → `Ok(None)`. Consent persistence
+///   is intentionally disabled, which is not a failure.
+///
+/// A silent `None` for the configured-but-unresolved case would turn a wiring or
+/// provisioning fault into "consent persistence quietly off", so it is an error.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::KvStore`] when `settings.consent.consent_store`
+/// names a store the request's KV registry cannot resolve.
+pub fn resolve_consent_kv(
+    settings: &Settings,
+    services: &RuntimeServices,
+) -> Result<Option<KvHandle>, Report<TrustedServerError>> {
+    let Some(id) = settings.consent.consent_store.as_deref() else {
+        return Ok(None);
+    };
+
+    services.kv_handle_named(id).map(Some).ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: id.to_owned(),
+            message: "configured consent store could not be resolved".to_owned(),
+        })
+    })
+}
+
 /// Logs a one-time warning when request geolocation is unavailable.
 fn log_missing_geo_warning_once() {
     if MISSING_GEO_WARNING_LOGGED.swap(true, Ordering::Relaxed) {
@@ -703,7 +743,7 @@ mod tests {
     use super::{
         ConsentPipelineInput, allows_ec_creation, apply_expiration_check,
         apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
-        consent_allows_server_side_auction, has_explicit_ec_withdrawal,
+        consent_allows_server_side_auction, has_explicit_ec_withdrawal, resolve_consent_kv,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
@@ -898,14 +938,14 @@ mod tests {
         let req = build_request();
         let config = ConsentConfig::default();
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: None,
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
             kv_store: None,
-        });
+        }));
 
         assert_eq!(
             ctx.jurisdiction,
@@ -927,14 +967,14 @@ mod tests {
             ..ConsentConfig::default()
         };
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
             kv_store: None,
-        });
+        }));
 
         assert!(
             ctx.gdpr_applies,
@@ -957,14 +997,14 @@ mod tests {
             ..ConsentConfig::default()
         };
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
             kv_store: None,
-        });
+        }));
 
         assert!(
             ctx.gdpr_applies,
@@ -1489,6 +1529,12 @@ mod tests {
         }
     }
 
+    /// Wrap a fresh [`InMemoryKvStore`] double in a [`KvHandle`] for consent
+    /// persistence tests.
+    fn kv_handle() -> crate::platform::KvHandle {
+        crate::platform::KvHandle::new(std::sync::Arc::new(InMemoryKvStore::new()))
+    }
+
     #[async_trait::async_trait(?Send)]
     impl crate::platform::PlatformKvStore for InMemoryKvStore {
         async fn get_bytes(
@@ -1547,24 +1593,27 @@ mod tests {
         let jar = parse_cookies_to_jar("us_privacy=1YNN");
         let req = build_request();
         let config = ConsentConfig::default();
-        let store = InMemoryKvStore::new();
+        let store = kv_handle();
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
-            kv_store: Some(&store),
-        });
+            kv_store: Some(store.clone()),
+        }));
 
         assert_eq!(
             ctx.raw_us_privacy.as_deref(),
             Some("1YNN"),
             "should build cookie-sourced consent"
         );
-        let persisted = crate::consent::kv::load_consent_from_kv(&store, "test-ec-id")
-            .expect("should persist cookie-sourced consent to KV");
+        let persisted = futures::executor::block_on(crate::consent::kv::load_consent_from_kv(
+            &store,
+            "test-ec-id",
+        ))
+        .expect("should persist cookie-sourced consent to KV");
         assert_eq!(
             persisted.raw_us_privacy.as_deref(),
             Some("1YNN"),
@@ -1575,30 +1624,30 @@ mod tests {
     #[test]
     fn pipeline_falls_back_to_kv_consent_when_request_has_no_signals() {
         let config = ConsentConfig::default();
-        let store = InMemoryKvStore::new();
+        let store = kv_handle();
 
         // First request carries a consent cookie — persisted to KV.
         let jar = parse_cookies_to_jar("us_privacy=1YNN");
         let req = build_request();
-        build_consent_context(&ConsentPipelineInput {
+        futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
-            kv_store: Some(&store),
-        });
+            kv_store: Some(store.clone()),
+        }));
 
         // Second request has no consent signals — must fall back to KV.
         let bare_req = build_request();
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: None,
             req: &bare_req,
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
-            kv_store: Some(&store),
-        });
+            kv_store: Some(store.clone()),
+        }));
 
         assert_eq!(
             ctx.raw_us_privacy.as_deref(),
@@ -1612,21 +1661,121 @@ mod tests {
         let jar = parse_cookies_to_jar("us_privacy=1YNN");
         let req = build_request();
         let config = ConsentConfig::default();
-        let store = InMemoryKvStore::new();
+        let store = kv_handle();
 
         // ec_id is absent, so the pipeline must not touch the KV store.
-        build_consent_context(&ConsentPipelineInput {
+        futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
-            kv_store: Some(&store),
-        });
+            kv_store: Some(store.clone()),
+        }));
 
         assert!(
-            crate::consent::kv::load_consent_from_kv(&store, "test-ec-id").is_none(),
+            futures::executor::block_on(crate::consent::kv::load_consent_from_kv(
+                &store,
+                "test-ec-id"
+            ))
+            .is_none(),
             "should not persist consent without an EC ID"
+        );
+    }
+
+    /// Settings whose consent store id is `id` (or unconfigured when `None`).
+    fn settings_with_consent_store(id: Option<&str>) -> crate::settings::Settings {
+        let mut settings = crate::settings::Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "example.com"
+            cookie_domain = ".example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse consent-guard test settings");
+        settings.consent.consent_store = id.map(str::to_owned);
+        settings
+    }
+
+    #[test]
+    fn resolve_consent_kv_errors_when_configured_store_is_unresolved() {
+        // Arrange: a consent store is configured but no KV registry is wired,
+        // so the named lookup cannot resolve it.
+        let settings = settings_with_consent_store(Some("consent_store"));
+        let services = crate::platform::test_support::noop_services();
+
+        // Act
+        let result = resolve_consent_kv(&settings, &services);
+
+        // Assert: fail closed — never a silent `None`.
+        let report = result.expect_err("a configured-but-unresolved consent store should error");
+        assert!(
+            matches!(
+                report.current_context(),
+                crate::error::TrustedServerError::KvStore { .. }
+            ),
+            "should surface a KvStore error so consent routes fail closed with 503"
+        );
+    }
+
+    #[test]
+    fn resolve_consent_kv_returns_none_when_unconfigured() {
+        let settings = settings_with_consent_store(None);
+        let services = crate::platform::test_support::noop_services();
+
+        let resolved = resolve_consent_kv(&settings, &services)
+            .expect("an unconfigured consent store should not error");
+
+        assert!(
+            resolved.is_none(),
+            "consent persistence is intentionally off when no consent store is configured"
+        );
+    }
+
+    #[test]
+    fn resolve_consent_kv_returns_the_named_handle_when_registered() {
+        let settings = settings_with_consent_store(Some("consent_store"));
+        let registry = edgezero_core::store_registry::KvRegistry::single_id(
+            "consent_store".to_owned(),
+            kv_handle(),
+        );
+        let services = crate::platform::RuntimeServices::builder()
+            .config_store(std::sync::Arc::new(
+                crate::platform::test_support::NoopConfigStore,
+            ))
+            .secret_store(std::sync::Arc::new(
+                crate::platform::test_support::NoopSecretStore,
+            ))
+            .kv_store(std::sync::Arc::new(
+                edgezero_core::key_value_store::NoopKvStore,
+            ))
+            .kv_registry(Some(registry))
+            .backend(std::sync::Arc::new(
+                crate::platform::test_support::NoopBackend,
+            ))
+            .http_client(std::sync::Arc::new(
+                crate::platform::test_support::NoopHttpClient,
+            ))
+            .geo(std::sync::Arc::new(crate::platform::test_support::NoopGeo))
+            .client_info(crate::platform::ClientInfo::default())
+            .build();
+
+        let resolved = resolve_consent_kv(&settings, &services)
+            .expect("a declared consent store should resolve");
+
+        assert!(
+            resolved.is_some(),
+            "a consent store present in the KV registry should resolve to a handle"
         );
     }
 }

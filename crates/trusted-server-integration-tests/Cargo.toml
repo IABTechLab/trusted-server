@@ -27,12 +27,14 @@ toml = { workspace = true }
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 derive_more = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 env_logger = { workspace = true }
 error-stack = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 libc = { workspace = true }

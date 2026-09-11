@@ -71,26 +71,26 @@ The server will be available at `http://localhost:7676`.
 
 No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
 
-The Axum adapter reads the EdgeZero config blob and secret store from
-environment variables — it does **not** auto-load `.env` files. You must export
-the variables into your shell before starting the server.
+The Axum adapter reads the EdgeZero config blob from a local config-store file
+and secrets from key-named environment variables — it does **not** auto-load
+`.env` files. You must export the secret variables into your shell before
+starting the server.
 
 ```bash
 # Create the local app config and apply the non-secret development overlay.
 cp trusted-server.example.toml trusted-server.toml
 set -a && source .env.dev && set +a
 
-# Create the local blob-backed config-store entry.
+# Create the local blob-backed config-store entry. The dev server reads it
+# directly from .edgezero/local-config-trusted_server_config.json.
 ts config push --adapter axum --local --yes
-export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
-  jq -r '.trusted_server_config' .edgezero/local-config-trusted_server_config.json
-)"
 
 # Populate the three secret references from the starter config for this shell.
+# Each env var is named exactly after the secret key referenced in the config.
 # Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE="$(openssl rand -base64 32)"
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD="$(openssl rand -base64 32)"
+export publisher_proxy_secret="$(openssl rand -base64 32)"
+export ec_passphrase="$(openssl rand -base64 32)"
+export handler_password="$(openssl rand -base64 32)"
 
 # Build and start the dev server in the same shell.
 cargo run -p trusted-server-adapter-axum
@@ -99,18 +99,24 @@ cargo run -p trusted-server-adapter-axum
 The server will be available at `http://localhost:8787`. Set `PORT=<port>` before
 `cargo run` to bind the dev server to a different local port.
 
-**Environment variable conventions used by the Axum adapter:**
+**How the Axum adapter loads config and secrets:**
 
-| Purpose            | Pattern                               | Example                                                               |
-| ------------------ | ------------------------------------- | --------------------------------------------------------------------- |
-| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=…` |
-| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PROXY_KEY=…`            |
+The Axum dev server reads through the same `EdgeZero` store registry as the other
+adapters, backed by local files and environment variables:
 
-The config-store value is the verified app-config blob. Secret-store values are
-looked up by the key names in that blob. Store names and key names are uppercased
-with hyphens and dots replaced by underscores. The quick-start exports ephemeral
-secret-store values only into the current shell; do not put secret values in the
+| Purpose    | Source                                                                                                                                                                                                                       |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| App config | The `EdgeZero` config store on disk: `.edgezero/local-config-<store-id>.json` (a JSON object of `key → value`). The default app-config store also honors `TRUSTED_SERVER_AXUM_CONFIG_PATH`, pointing it at an explicit file. |
+| Secrets    | Environment variables named exactly after the secret **key** in the config blob (e.g. a `proxy_secret` reference of `dev_proxy_secret` reads `dev_proxy_secret`). Set them before starting the server.                       |
+
+The config-store value is the verified app-config blob. Secret references in
+that blob are resolved from the environment at startup. Export ephemeral
+secret values only into the current shell; do not put secret values in the
 TOML config, config-store blob, or a source-controlled environment file.
+
+> The older `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` / `TRUSTED_SERVER_SECRET_{STORE}_{KEY}`
+> env conventions no longer apply — config now comes from the config-store file and
+> secrets from key-named env vars.
 
 > **Dev server limitations:** The Axum adapter does not support KV store,
 > geo lookup, config/secret-store writes, or admin key-management routes.

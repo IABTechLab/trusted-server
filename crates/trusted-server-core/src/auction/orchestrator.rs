@@ -394,11 +394,10 @@ impl AuctionOrchestratorHarness {
         }
 
         // Signing admission deliberately precedes every backend call.
-        let signer = self
-            .plan
-            .signing_enabled()
-            .then(|| RequestSigner::from_services(context.services))
-            .transpose()?;
+        let signer = match self.plan.signing_enabled() {
+            true => Some(RequestSigner::from_services(context.services).await?),
+            false => None,
+        };
         self.run_routed(request, &routed, context, signer.as_ref(), auction_start)
             .await
     }
@@ -1629,12 +1628,12 @@ impl AuctionOrchestrator {
         // A zero request budget is terminal before signing admission. In the
         // split path, signer initialization would otherwise read config and
         // secret stores even though every provider is materialized as timeout.
-        let signer_result = if context.timeout_ms == 0 {
+        let signer_result = if context.timeout_ms == 0 || !plan.signing_enabled() {
             Ok(None)
         } else {
-            plan.signing_enabled()
-                .then(|| RequestSigner::from_services(context.services))
-                .transpose()
+            RequestSigner::from_services(context.services)
+                .await
+                .map(Some)
         };
         let signer = match signer_result {
             Ok(signer) => signer,
@@ -3164,8 +3163,9 @@ mod tests {
         reads: AtomicUsize,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for FailingCountingConfigStore {
-        fn get(
+        async fn get(
             &self,
             _store_name: &StoreName,
             _key: &str,
@@ -3194,8 +3194,13 @@ mod tests {
         delay: Duration,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for CountingConfigStore {
-        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        async fn get(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<String, Report<PlatformError>> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             if !self.delay.is_zero() {
                 std::thread::sleep(self.delay);
@@ -3224,8 +3229,9 @@ mod tests {
         key: Vec<u8>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for CountingSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             _key: &str,
@@ -3294,8 +3300,9 @@ mod tests {
 
     struct UnusedSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for UnusedSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             _key: &str,

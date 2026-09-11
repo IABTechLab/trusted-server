@@ -35,6 +35,7 @@
 use std::time::Duration;
 
 mod backend_naming;
+mod composite;
 mod error;
 mod http;
 mod image_optimizer;
@@ -50,8 +51,9 @@ pub use backend_naming::{
     AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
     BackendNamingPolicy, PredictedBackend,
 };
+pub use composite::{CompositeConfigStore, CompositeSecretStore};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
-pub use error::PlatformError;
+pub use error::{PlatformError, is_not_found};
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSelectResult, UnavailableHttpClient,
@@ -72,7 +74,10 @@ pub use template_cache::{
     TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
     VaryHeaderValues, VarySpec,
 };
-pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
+pub use traits::{
+    PlatformBackend, PlatformConfigStore, PlatformConfigWriter, PlatformGeo, PlatformSecretStore,
+    PlatformSecretWriter,
+};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,

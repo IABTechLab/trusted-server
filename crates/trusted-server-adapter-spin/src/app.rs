@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoresMetadata};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
@@ -94,16 +94,23 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
         })?;
     let config_handle = ConfigStoreHandle::new(Arc::new(config_store));
     let config_adapter = ConfigStoreHandleAdapter(config_handle);
-    let raw_envelope = config_adapter
-        .get(&config_store_name, &config_key)
-        .map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: "failed to read Spin Trusted Server app-config blob".to_string(),
-            })
-            .attach(error.to_string())
-        })?;
+    // Startup-only reads: this runs during component construction, outside the
+    // request executor, so a top-level `block_on` cannot nest executors.
+    let raw_envelope = futures::executor::block_on(
+        config_adapter.get(&config_store_name, &config_key),
+    )
+    .map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: "failed to read Spin Trusted Server app-config blob".to_string(),
+        })
+        .attach(error.to_string())
+    })?;
     let secret_store = SpinSecretStoreAdapter;
-    settings_from_config_blob(&raw_envelope, &secret_store, &default_secret_store_name())
+    futures::executor::block_on(settings_from_config_blob(
+        &raw_envelope,
+        &secret_store,
+        &default_secret_store_name(),
+    ))
 }
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
@@ -397,7 +404,11 @@ fn health_response() -> Response {
 /// the request carries TCF consent. A malformed consent string is logged and
 /// falls back to the default (fail-closed) context rather than being silently
 /// swallowed.
-fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
+async fn build_ec_context(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request,
+) -> EcContext {
     let geo_info = services
         .geo()
         .lookup(services.client_info().client_ip)
@@ -406,6 +417,7 @@ fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Reque
             None
         });
     EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+        .await
         .unwrap_or_else(|e| {
             log::warn!("EC context read failed: {e:?}");
             EcContext::default()
@@ -529,6 +541,10 @@ impl Hooks for TrustedServerApp {
 
         build_router(&state)
     }
+
+    fn stores() -> StoresMetadata {
+        trusted_server_core::stores::STORES_METADATA
+    }
 }
 
 impl TrustedServerApp {
@@ -562,6 +578,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
+                    .await
                     .unwrap_or_else(|e| http_error(&e)))
             }
         };
@@ -574,6 +591,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
+                    .await
                     .unwrap_or_else(|e| http_error(&e)))
             }
         };
@@ -622,7 +640,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
-                let mut ec_context = build_ec_context(&s.settings, &services, &req);
+                let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
                 Ok(handle_auction(
                     &s.settings,
                     &s.orchestrator,
@@ -652,7 +670,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 {
                     return Ok(http_error(&error));
                 }
-                let mut ec_context = build_ec_context(&s.settings, &services, &req);
+                let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
@@ -775,7 +793,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                let mut ec_context = build_ec_context(&state.settings, &services, &req);
+                let mut ec_context = build_ec_context(&state.settings, &services, &req).await;
                 let auction = AuctionDispatch {
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),

@@ -68,6 +68,7 @@ pub mod secret_resolution;
 pub mod settings;
 pub mod settings_data;
 pub mod storage;
+pub mod stores;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;

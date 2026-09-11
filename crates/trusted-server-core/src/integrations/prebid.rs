@@ -3184,7 +3184,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         let signer_with_signature =
             if let Some(request_signing_config) = &context.settings.request_signing {
                 if request_signing_config.enabled {
-                    let signer = RequestSigner::from_services(context.services)?;
+                    let signer = RequestSigner::from_services(context.services).await?;
                     let params = SigningParams::new(
                         request.id.clone(),
                         request_info.host.clone(),
@@ -9332,7 +9332,7 @@ set = { networkId = 42 }
             HashMapSecretStore::new(secret_data),
             Arc::new(NoopHttpClient),
         );
-        let signer = RequestSigner::from_services(&signing_services)
+        let signer = futures::executor::block_on(RequestSigner::from_services(&signing_services))
             .expect("should load deterministic test signer");
         let signing = SigningParams {
             request_id: "fictional-auction".to_string(),

@@ -35,11 +35,13 @@ pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
 
 pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
     let envelope = integration_app_config_envelope(origin_port)?;
-    serde_json::to_string(&serde_json::json!({ "app_config": envelope })).map_err(|error| {
-        Report::new(TestError::ConfigGeneration).attach(format!(
-            "failed to serialize Cloudflare config binding: {error}"
-        ))
-    })
+    serde_json::to_string(&serde_json::json!({ "trusted_server_config": envelope })).map_err(
+        |error| {
+            Report::new(TestError::ConfigGeneration).attach(format!(
+                "failed to serialize Cloudflare config binding: {error}"
+            ))
+        },
+    )
 }
 
 #[cfg(test)]

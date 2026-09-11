@@ -11,25 +11,28 @@ use std::process::{Child, Command, Stdio};
 const AXUM_DEFAULT_PORT: u16 = 8787;
 
 /// Secret-store entries referenced by the integration app-config fixture.
+///
+/// The Axum dev server resolves secrets through the `EdgeZero` `EnvSecretStore`,
+/// which reads an environment variable named exactly after the secret key.
 const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_ADMIN_PASSWORD",
+        "integration_admin_password",
         "integration-admin-password-32-bytes-ok",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PROXY_SECRET",
+        "integration_proxy_secret",
         "integration-test-proxy-secret-32-bytes-ok",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_EC_PASSPHRASE",
+        "integration_ec_passphrase",
         "integration-test-ec-secret-padded-32",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_ALPHA",
+        "integration_partner_token_alpha",
         "integration-test-token-alpha-32-bytes-ok",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_BRAVO",
+        "integration_partner_token_bravo",
         "integration-test-token-bravo-32-bytes-ok",
     ),
 ];
@@ -58,12 +61,26 @@ impl RuntimeEnvironment for AxumDevServer {
 
         let app_config = integration_app_config_envelope(origin_port())?;
 
+        // Seed the app-config blob into a JSON file and point the Axum config
+        // store at it via TRUSTED_SERVER_AXUM_CONFIG_PATH — a file-location
+        // pointer, not a config-value override. The file holds a flat
+        // `{ "trusted_server_config": "<blob envelope>" }` object, matching the shape the
+        // EdgeZero Axum config store reads.
+        let config_path = std::env::temp_dir().join(format!(
+            "trusted-server-axum-config-{}-{port}.json",
+            std::process::id()
+        ));
+        let config_file = serde_json::json!({ "trusted_server_config": app_config }).to_string();
+        std::fs::write(&config_path, config_file)
+            .change_context(TestError::RuntimeSpawn)
+            .attach(format!(
+                "Failed to write Axum config file at {}",
+                config_path.display()
+            ))?;
+
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
-            .env(
-                "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
-                app_config,
-            )
+            .env("TRUSTED_SERVER_AXUM_CONFIG_PATH", &config_path)
             .envs(INTEGRATION_SECRET_ENV.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -85,7 +102,7 @@ impl RuntimeEnvironment for AxumDevServer {
             });
         }
 
-        let handle = AxumHandle { child };
+        let handle = AxumHandle { child, config_path };
         let base_url = format!("http://127.0.0.1:{port}");
 
         // The Axum dev server returns 403 at root (no publisher config in test env),
@@ -143,6 +160,7 @@ fn wait_for_any_response(base_url: &str) -> TestResult<()> {
 /// Implements [`Drop`] to ensure the process is killed on test cleanup.
 struct AxumHandle {
     child: Child,
+    config_path: std::path::PathBuf,
 }
 
 impl RuntimeProcessHandle for AxumHandle {}
@@ -151,5 +169,6 @@ impl Drop for AxumHandle {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.config_path);
     }
 }

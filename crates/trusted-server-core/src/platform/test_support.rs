@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt as _};
@@ -18,8 +19,13 @@ use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
 pub(crate) struct NoopConfigStore;
 
+#[async_trait(?Send)]
 impl PlatformConfigStore for NoopConfigStore {
-    fn get(&self, _store_name: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
+    async fn get(
+        &self,
+        _store_name: &StoreName,
+        _key: &str,
+    ) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
 
@@ -39,8 +45,9 @@ impl PlatformConfigStore for NoopConfigStore {
 
 pub(crate) struct NoopSecretStore;
 
+#[async_trait(?Send)]
 impl PlatformSecretStore for NoopSecretStore {
-    fn get_bytes(
+    async fn get_bytes(
         &self,
         _store_name: &StoreName,
         _key: &str,
@@ -72,8 +79,13 @@ impl HashMapConfigStore {
     }
 }
 
+#[async_trait(?Send)]
 impl PlatformConfigStore for HashMapConfigStore {
-    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+    async fn get(
+        &self,
+        _store_name: &StoreName,
+        key: &str,
+    ) -> Result<String, Report<PlatformError>> {
         self.data
             .get(key)
             .cloned()
@@ -104,8 +116,9 @@ impl HashMapSecretStore {
     }
 }
 
+#[async_trait(?Send)]
 impl PlatformSecretStore for HashMapSecretStore {
-    fn get_bytes(
+    async fn get_bytes(
         &self,
         _store_name: &StoreName,
         key: &str,
@@ -940,6 +953,24 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] carrying a caller-supplied KV registry, so tests
+/// can exercise named-store resolution via
+/// [`RuntimeServices::kv_handle_named`].
+pub(crate) fn noop_services_with_kv_registry(
+    kv_registry: edgezero_core::store_registry::KvRegistry,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .kv_registry(Some(kv_registry))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo::default())
+        .build()
+}
+
 /// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
 /// recording (or otherwise custom) sink, so tests can assert which terminal
 /// auction events were emitted.
@@ -1303,10 +1334,13 @@ mod tests {
         let services = build_services_with_config_and_secret(NoopConfigStore, NoopSecretStore);
 
         // Act: both stores return Unsupported (confirming the injected impls are active)
-        let config_result = services.config_store().get(&StoreName::from("s"), "k");
-        let secret_result = services
-            .secret_store()
-            .get_bytes(&StoreName::from("s"), "k");
+        let config_result =
+            futures::executor::block_on(services.config_store().get(&StoreName::from("s"), "k"));
+        let secret_result = futures::executor::block_on(
+            services
+                .secret_store()
+                .get_bytes(&StoreName::from("s"), "k"),
+        );
 
         assert!(
             config_result.is_err(),
@@ -1332,17 +1366,19 @@ mod tests {
         );
 
         assert_eq!(
-            services
-                .config_store()
-                .get(&JWKS_STORE_NAME, "current-kid")
-                .expect("should read current-kid from config test store"),
+            futures::executor::block_on(
+                services.config_store().get(&JWKS_STORE_NAME, "current-kid")
+            )
+            .expect("should read current-kid from config test store"),
             "test-kid"
         );
         assert_eq!(
-            services
-                .secret_store()
-                .get_bytes(&SIGNING_STORE_NAME, "test-kid")
-                .expect("should read signing key bytes from secret test store"),
+            futures::executor::block_on(
+                services
+                    .secret_store()
+                    .get_bytes(&SIGNING_STORE_NAME, "test-kid")
+            )
+            .expect("should read signing key bytes from secret test store"),
             b"secret-material".to_vec()
         );
     }
@@ -1351,14 +1387,14 @@ mod tests {
     fn build_request_signing_services_provides_current_kid_and_signing_key() {
         let services = build_request_signing_services();
 
-        let kid = services
-            .config_store()
-            .get(&JWKS_STORE_NAME, "current-kid")
-            .expect("should expose current-kid in config store");
-        let key_bytes = services
-            .secret_store()
-            .get_bytes(&SIGNING_STORE_NAME, &kid)
-            .expect("should expose signing key bytes in secret store");
+        let kid = futures::executor::block_on(
+            services.config_store().get(&JWKS_STORE_NAME, "current-kid"),
+        )
+        .expect("should expose current-kid in config store");
+        let key_bytes = futures::executor::block_on(
+            services.secret_store().get_bytes(&SIGNING_STORE_NAME, &kid),
+        )
+        .expect("should expose signing key bytes in secret store");
 
         assert_eq!(kid, "test-kid", "should use the standard signing test kid");
         assert!(

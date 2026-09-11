@@ -1,7 +1,7 @@
 use core::future::Future;
 use std::sync::Arc;
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -14,6 +14,7 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
@@ -33,14 +34,23 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
+use trusted_server_core::settings_data::get_settings_from_config_store;
 
+use edgezero_adapter_axum::config_store::AxumConfigStore;
+use edgezero_core::config_store::ConfigStoreHandle;
 use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
+use crate::platform::build_runtime_services;
+
+/// Logical id of the `EdgeZero` config store holding the Trusted Server
+/// app-config blob. Resolves to `.edgezero/local-config-trusted_server_config.json`.
+const AXUM_CONFIG_STORE_ID: &str = "trusted_server_config";
+
+/// Environment variable naming an explicit JSON config-store file to load
+/// instead of the default `.edgezero/local-config-<id>.json`. This is a
+/// file-location pointer only — it does not carry any config value.
+const AXUM_CONFIG_PATH_ENV: &str = "TRUSTED_SERVER_AXUM_CONFIG_PATH";
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -60,16 +70,50 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    let settings = get_settings_from_config_store(
-        &AxumPlatformConfigStore,
-        &AxumPlatformSecretStore,
-        &store_name,
-        &config_key,
+    let config_store = open_config_store()?;
+    // Boot-time secret resolution reads through the same EdgeZero secret
+    // registry as request-time reads: locally, secrets are environment
+    // variables named exactly after the secret key.
+    let secret_store = trusted_server_core::platform::CompositeSecretStore::new(
+        crate::registries::build_secret_registry_axum(
+            &trusted_server_core::stores::STORES_METADATA,
+        ),
+        std::sync::Arc::new(crate::platform::AxumPlatformSecretStore),
+    );
+    // Startup-only read: `routes()` runs during dev-server setup, outside any
+    // request handler, so driving the async boot read with a top-level
+    // `block_on` here never nests inside a request executor.
+    let settings = futures::executor::block_on(get_settings_from_config_store(
+        &config_store,
+        CONFIG_BLOB_KEY,
+        &secret_store,
         &trusted_server_core::settings_data::default_secret_store_name(),
-    )?;
+    ))?;
     build_state_with_settings(settings)
+}
+
+/// Opens the `EdgeZero` Axum config store for the app-config blob.
+///
+/// When [`AXUM_CONFIG_PATH_ENV`] is set, the store is read from that explicit
+/// JSON file; otherwise it reads the default
+/// `.edgezero/local-config-trusted_server_config.json`. The env var is a
+/// file-location pointer only and never carries a config value.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the backing file exists
+/// but cannot be read or parsed.
+fn open_config_store() -> Result<ConfigStoreHandle, Report<TrustedServerError>> {
+    let store = match std::env::var(AXUM_CONFIG_PATH_ENV) {
+        Ok(path) => AxumConfigStore::from_path(std::path::Path::new(&path)),
+        Err(_) => AxumConfigStore::from_local_file(AXUM_CONFIG_STORE_ID),
+    }
+    .map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("failed to open Trusted Server config store: {error}"),
+        })
+    })?;
+    Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
 
 /// Build the application state from explicit settings.
@@ -168,7 +212,11 @@ where
 /// jurisdiction stays Unknown there unless the request carries TCF consent). A
 /// malformed consent string is logged and falls back to the default
 /// (fail-closed) context rather than being silently swallowed.
-fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request) -> EcContext {
+async fn build_ec_context(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &Request,
+) -> EcContext {
     let geo_info = services
         .geo()
         .lookup(services.client_info().client_ip)
@@ -177,6 +225,7 @@ fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request)
             None
         });
     EcContext::read_from_request_with_geo(&state.settings, req, services, geo_info.as_ref())
+        .await
         .unwrap_or_else(|e| {
             log::warn!("EC context read failed: {e:?}");
             EcContext::default()
@@ -227,7 +276,7 @@ async fn dispatch_fallback(
 
     // Run the server-side auction with the configured creative-opportunity
     // slots; `handle_publisher_request` matches them against the request path.
-    let mut ec_context = build_ec_context(state, services, &req);
+    let mut ec_context = build_ec_context(state, services, &req).await;
     let auction = AuctionDispatch {
         orchestrator: &state.orchestrator,
         slots: state.settings.creative_opportunity_slots(),
@@ -427,10 +476,10 @@ fn named_route_handler(
             move |state, services, req| async move {
                 match handler {
                     NamedRouteHandler::TrustedServerDiscovery => {
-                        handle_trusted_server_discovery(&state.settings, &services, req)
+                        handle_trusted_server_discovery(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::VerifySignature => {
-                        handle_verify_signature(&state.settings, &services, req)
+                        handle_verify_signature(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::AdminNotSupported => {
                         // Config/secret-store writes are backed by read-only env vars on the
@@ -463,7 +512,7 @@ fn named_route_handler(
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
                         // fails it closed for consented users.
-                        let mut ec_context = build_ec_context(&state, &services, &req);
+                        let mut ec_context = build_ec_context(&state, &services, &req).await;
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
@@ -482,7 +531,7 @@ fn named_route_handler(
                         if req.method() == Method::OPTIONS {
                             Ok(page_bids_preflight_denied())
                         } else {
-                            let mut ec_context = build_ec_context(&state, &services, &req);
+                            let mut ec_context = build_ec_context(&state, &services, &req).await;
                             let auction = AuctionDispatch {
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),
@@ -583,6 +632,10 @@ impl Hooks for TrustedServerApp {
         };
 
         build_router(&state)
+    }
+
+    fn stores() -> StoresMetadata {
+        trusted_server_core::stores::STORES_METADATA
     }
 }
 

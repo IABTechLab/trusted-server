@@ -203,11 +203,12 @@ mod tests {
     fn inject_cloudflare_config_replaces_single_placeholder() {
         let template = format!("[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n");
 
-        let generated = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#)
+        let generated = inject_cloudflare_config(&template, r#"{"trusted_server_config":"blob"}"#)
             .expect("should inject Cloudflare config");
 
         assert!(
-            generated.contains("TRUSTED_SERVER_CONFIG = '''{\"app_config\":\"blob\"}'''"),
+            generated
+                .contains("TRUSTED_SERVER_CONFIG = '''{\"trusted_server_config\":\"blob\"}'''"),
             "should inject generated config JSON"
         );
         assert!(
@@ -218,7 +219,7 @@ mod tests {
 
     #[test]
     fn inject_cloudflare_config_rejects_missing_placeholder() {
-        let result = inject_cloudflare_config("[vars]\n", r#"{"app_config":"blob"}"#);
+        let result = inject_cloudflare_config("[vars]\n", r#"{"trusted_server_config":"blob"}"#);
 
         assert!(result.is_err(), "should reject missing placeholder");
     }
@@ -229,7 +230,7 @@ mod tests {
             "[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n"
         );
 
-        let result = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#);
+        let result = inject_cloudflare_config(&template, r#"{"trusted_server_config":"blob"}"#);
 
         assert!(result.is_err(), "should reject duplicate placeholders");
     }

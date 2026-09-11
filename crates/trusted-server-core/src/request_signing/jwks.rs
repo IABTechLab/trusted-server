@@ -69,13 +69,16 @@ impl Keypair {
 /// unavailable, the `active-kids` key is missing, or any referenced JWK entry
 /// cannot be read. The underlying [`crate::platform::PlatformError`] is
 /// preserved as context in the error chain.
-pub fn get_active_jwks(services: &RuntimeServices) -> Result<String, Report<TrustedServerError>> {
-    let active_kids = read_active_kids(services)?;
+pub async fn get_active_jwks(
+    services: &RuntimeServices,
+) -> Result<String, Report<TrustedServerError>> {
+    let active_kids = read_active_kids(services).await?;
     let mut jwks = Vec::new();
     for kid in active_kids {
         let jwk = services
             .config_store()
             .get(&JWKS_STORE_NAME, &kid)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: format!("failed to get JWK for kid: {kid}"),
             })?;
@@ -105,8 +108,9 @@ mod tests {
 
     struct FailingConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for FailingConfigStore {
-        fn get(
+        async fn get(
             &self,
             _store_name: &StoreName,
             _key: &str,
@@ -135,7 +139,7 @@ mod tests {
     #[test]
     fn get_active_jwks_fails_with_configuration_error_when_store_unavailable() {
         let services = build_services_with_config(FailingConfigStore);
-        let result = get_active_jwks(&services);
+        let result = futures::executor::block_on(get_active_jwks(&services));
 
         assert!(
             result.is_err(),

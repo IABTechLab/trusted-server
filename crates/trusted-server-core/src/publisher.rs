@@ -54,7 +54,9 @@ use crate::auction::types::{
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{
+    consent_allows_server_side_auction, gate_eids_by_consent, resolve_consent_kv,
+};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
@@ -4081,8 +4083,9 @@ pub struct AuctionDispatch<'a> {
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if the proxy request fails or the
-/// origin backend is unreachable.
+/// Returns a [`TrustedServerError`] if the configured consent KV store cannot be
+/// resolved (fail closed), the proxy request fails, or the origin backend is
+/// unreachable.
 pub async fn handle_publisher_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -4092,6 +4095,11 @@ pub async fn handle_publisher_request(
     mut req: Request<EdgeBody>,
     edge_header: EdgeCacheHeader,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    // Fail-closed consent guard — see [`resolve_consent_kv`]. Publisher pages
+    // act on consent data, so a configured-but-unresolvable consent store makes
+    // the page unavailable (503) instead of serving it without consent.
+    let _consent_kv = resolve_consent_kv(settings, services)?;
+
     log::debug!("Proxying request to publisher_origin");
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
@@ -6429,7 +6437,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] if cookie parsing or EC ID generation fails.
+/// Returns [`TrustedServerError`] if the configured consent KV store cannot be
+/// resolved (fail closed), or if cookie parsing or EC ID generation fails.
 pub async fn handle_page_bids(
     settings: &Settings,
     services: &RuntimeServices,
@@ -6451,6 +6460,10 @@ pub async fn handle_page_bids(
         );
         return Ok(page_bids_preflight_denied());
     }
+
+    // Fail-closed consent guard — like the auction, page-bids acts on consent
+    // data, so it must not run with a configured-but-unresolvable consent store.
+    let _consent_kv = resolve_consent_kv(settings, services)?;
 
     // Deprecation signal for the transition alias. Evaluated after the
     // cross-site gate, so the count reflects genuine SPA clients still running a
@@ -8368,8 +8381,12 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build test request");
 
-        let ec_context = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec_context = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert_eq!(
             ec_context.ec_value(),
@@ -8396,8 +8413,9 @@ mod tests {
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        let mut ec_context =
-            EcContext::read_from_request(settings, &req, services).expect("should read EC context");
+        let mut ec_context = EcContext::read_from_request(settings, &req, services)
+            .await
+            .expect("should read EC context");
         handle_publisher_request(
             settings,
             services,
@@ -20563,6 +20581,7 @@ mod tests {
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
             let mut ec_context = EcContext::read_from_request(settings, &req, &noop_services())
+                .await
                 .expect("should read EC context");
             run_page_bids_response_with_ec(settings, orchestrator, slots, &mut ec_context, req)
                 .await

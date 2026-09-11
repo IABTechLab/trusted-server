@@ -2,7 +2,7 @@ use core::future::Future;
 use core::pin::Pin;
 use std::sync::Arc;
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -105,7 +105,9 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
-        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+        .attach(
+            "set TRUSTED_SERVER_CONFIG to JSON containing the trusted_server_config blob envelope",
+        )
     })?;
     let value: serde_json::Value = serde_json::from_str(&raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -114,11 +116,12 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
     })?;
     let envelope = value
-        .get("app_config")
+        .get(trusted_server_core::config_payload::CONFIG_BLOB_KEY)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             Report::new(TrustedServerError::Configuration {
-                message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
+                message: "Cloudflare TRUSTED_SERVER_CONFIG missing trusted_server_config"
+                    .to_string(),
             })
         })?;
     let env = CLOUDFLARE_ENV
@@ -130,7 +133,14 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         })?;
     let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
     let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
-    settings_from_config_blob(envelope, &secret_store, &default_secret_store)
+    // Startup-only read: the Worker environment secret accessor is synchronous
+    // underneath, so driving the async resolution with a top-level `block_on`
+    // here cannot stall the JS event loop.
+    futures::executor::block_on(settings_from_config_blob(
+        envelope,
+        &secret_store,
+        &default_secret_store,
+    ))
 }
 
 /// Build the application state from explicit settings.
@@ -170,7 +180,11 @@ fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
 /// users. Geo comes from the Workers `cf` object when deployed. A malformed
 /// consent string is logged and falls back to the default (fail-closed) context
 /// rather than being silently swallowed.
-fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
+async fn build_ec_context(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request,
+) -> EcContext {
     let geo_info = services
         .geo()
         .lookup(services.client_info().client_ip)
@@ -179,6 +193,7 @@ fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Reque
             None
         });
     EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+        .await
         .unwrap_or_else(|e| {
             log::warn!("EC context read failed: {e:?}");
             EcContext::default()
@@ -377,6 +392,10 @@ impl Hooks for TrustedServerApp {
 
         build_router(&state)
     }
+
+    fn stores() -> StoresMetadata {
+        trusted_server_core::stores::STORES_METADATA
+    }
 }
 
 impl TrustedServerApp {
@@ -449,7 +468,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                let mut ec_context = build_ec_context(&state.settings, &services, &req);
+                let mut ec_context = build_ec_context(&state.settings, &services, &req).await;
                 let auction = AuctionDispatch {
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
@@ -503,13 +522,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(
                 "/.well-known/trusted-server.json",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_trusted_server_discovery(&s.settings, &services, req)
+                    handle_trusted_server_discovery(&s.settings, &services, req).await
                 }),
             )
             .post(
                 "/verify-signature",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_verify_signature(&s.settings, &services, req)
+                    handle_verify_signature(&s.settings, &services, req).await
                 }),
             )
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
@@ -554,7 +573,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     // Build the geo-aware EC context so the auction consent gate
                     // sees the caller's jurisdiction — `EcContext::default()`
                     // fails it closed for consented users.
-                    let mut ec_context = build_ec_context(&s.settings, &services, &req);
+                    let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
@@ -618,7 +637,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // preflight fall through to a permissive origin would reopen exactly
         // the cross-site hole the canonical path closes.
         let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
-            let mut ec_context = build_ec_context(&s.settings, &services, &req);
+            let mut ec_context = build_ec_context(&s.settings, &services, &req).await;
             let auction = AuctionDispatch {
                 orchestrator: &s.orchestrator,
                 slots: s.settings.creative_opportunity_slots(),

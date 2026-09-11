@@ -222,8 +222,9 @@ mod tests {
 
     struct NoopConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for NoopConfigStore {
-        fn get(
+        async fn get(
             &self,
             _store_name: &StoreName,
             _key: &str,
@@ -247,8 +248,9 @@ mod tests {
 
     struct MapSecretStore(HashMap<String, Vec<u8>>);
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for MapSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             key: &str,

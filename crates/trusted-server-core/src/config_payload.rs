@@ -30,7 +30,7 @@ pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
 /// Returns [`TrustedServerError::Configuration`] when the envelope cannot be
 /// parsed, fails integrity verification, secret resolution fails, or resolved
 /// settings are invalid.
-pub fn settings_from_config_blob(
+pub async fn settings_from_config_blob(
     envelope_json: &str,
     secret_store: &dyn PlatformSecretStore,
     default_secret_store_name: &StoreName,
@@ -54,7 +54,8 @@ pub fn settings_from_config_blob(
         &mut data,
         secret_store,
         default_secret_store_name,
-    )?;
+    )
+    .await?;
     let settings = Settings::from_json_value(data)?;
     crate::config::validate_settings_for_runtime(&settings)?;
     Ok(settings)
@@ -145,8 +146,9 @@ mod tests {
 
     struct EchoSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for EchoSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             key: &str,
@@ -175,8 +177,9 @@ mod tests {
 
     struct UnifiedSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for UnifiedSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             store_name: &StoreName,
             key: &str,
@@ -237,11 +240,11 @@ mod tests {
     }
 
     fn load_settings(envelope_json: &str) -> Result<Settings, Report<TrustedServerError>> {
-        settings_from_config_blob(
+        futures::executor::block_on(settings_from_config_blob(
             envelope_json,
             &EchoSecretStore,
             &StoreName::from("trusted_server_secrets"),
-        )
+        ))
     }
 
     fn settings_with_browser_bidder_overlap(auction_enabled: bool) -> Settings {
@@ -360,11 +363,11 @@ mod tests {
             .partners
             .push(partner_with_pull_sync(true, "partner-pull-token-key"));
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should resolve every static credential from the mapped store");
 
         assert_eq!(
@@ -445,11 +448,11 @@ mod tests {
             shared_secret: Redacted::new("trusted-client-ip-key".to_owned()),
         });
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should resolve the trusted client IP shared secret");
 
         assert_eq!(
@@ -473,11 +476,11 @@ mod tests {
             shared_secret: Redacted::new("unused-trusted-client-ip-key".to_owned()),
         });
 
-        let error = settings_from_config_blob(
+        let error = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect_err("should reject a missing trusted client IP shared secret");
         let message = error.to_string();
 
@@ -503,11 +506,11 @@ mod tests {
         ));
         original.proxy.asset_routes.push(route);
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should resolve default S3 secret keys");
 
         let AssetOriginAuth::S3SigV4(auth) = reconstructed.proxy.asset_routes[0]
@@ -532,11 +535,11 @@ mod tests {
         .expect("should build partner without API token");
         original.ec.partners.push(partner);
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should load partner without resolving an API token");
 
         assert!(
@@ -558,11 +561,11 @@ mod tests {
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
         let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json,
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should resolve a pull token enabled by a string boolean");
 
         assert_eq!(
@@ -589,11 +592,11 @@ mod tests {
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
         let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json,
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should skip a pull token disabled by a string boolean");
 
         assert!(
@@ -610,11 +613,11 @@ mod tests {
             .partners
             .push(partner_with_pull_sync(true, "unused-partner-pull-token"));
 
-        let error = settings_from_config_blob(
+        let error = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect_err("should reject a missing active pull-sync token");
 
         assert!(error.to_string().contains("ec.partners[0].ts_pull_token"));
@@ -645,11 +648,11 @@ mod tests {
             .partners
             .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should skip inactive optional feature references");
 
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
@@ -685,11 +688,11 @@ mod tests {
             )
             .expect("should configure disabled DataDome references");
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = futures::executor::block_on(settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
-        )
+        ))
         .expect("should skip stale DataDome protection references");
 
         assert!(

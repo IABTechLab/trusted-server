@@ -1,14 +1,16 @@
 use std::net::IpAddr;
 
+use async_trait::async_trait;
 use error_stack::Report;
 
 use super::{BackendNamingPolicy, GeoInfo, PlatformBackendSpec, PlatformError, StoreId, StoreName};
 
-/// Synchronous, object-safe access to a key-value config store.
+/// Object-safe access to a key-value config store.
 ///
-/// Reads use the edge-visible store name. Writes use the platform management
-/// store identifier because Fastly separates the runtime store name from the
-/// management API store ID.
+/// Reads are async and use the edge-visible store name. Writes stay
+/// synchronous and use the platform management store identifier because Fastly
+/// separates the runtime store name from the management API store ID.
+#[async_trait(?Send)]
 pub trait PlatformConfigStore: Send + Sync {
     /// Retrieve a string value from `store_name` by `key`.
     ///
@@ -16,7 +18,8 @@ pub trait PlatformConfigStore: Send + Sync {
     ///
     /// Returns [`PlatformError::ConfigStore`] when the key does not exist or
     /// the store cannot be opened.
-    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>>;
+    async fn get(&self, store_name: &StoreName, key: &str)
+    -> Result<String, Report<PlatformError>>;
 
     /// Store a string value in the management store identified by `store_id`.
     ///
@@ -35,10 +38,11 @@ pub trait PlatformConfigStore: Send + Sync {
     fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>>;
 }
 
-/// Synchronous, object-safe access to a secret store.
+/// Object-safe access to a secret store.
 ///
-/// Reads use the edge-visible store name. Writes use the platform management
-/// store identifier.
+/// Reads are async and use the edge-visible store name. Writes stay
+/// synchronous and use the platform management store identifier.
+#[async_trait(?Send)]
 pub trait PlatformSecretStore: Send + Sync {
     /// Retrieve a secret value as raw bytes from `store_name` by `key`.
     ///
@@ -46,7 +50,7 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the store cannot be opened,
     /// the key does not exist, or decryption fails.
-    fn get_bytes(
+    async fn get_bytes(
         &self,
         store_name: &StoreName,
         key: &str,
@@ -58,18 +62,71 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the secret cannot be
     /// retrieved or is not valid UTF-8.
-    fn get_string(
+    async fn get_string(
         &self,
         store_name: &StoreName,
         key: &str,
     ) -> Result<String, Report<PlatformError>> {
-        let bytes = self.get_bytes(store_name, key)?;
+        let bytes = self.get_bytes(store_name, key).await?;
         String::from_utf8(bytes).map_err(|error| {
             Report::new(PlatformError::SecretStore)
                 .attach(format!("secret is not valid UTF-8: {error}"))
         })
     }
 
+    /// Create or overwrite a secret in the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::SecretStore`] when the create fails or the
+    /// platform management API is unreachable.
+    fn create(
+        &self,
+        store_id: &StoreId,
+        name: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>>;
+
+    /// Delete a secret from the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::SecretStore`] when the delete fails or the
+    /// platform management API is unreachable.
+    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
+}
+
+/// Write-only view of a config store, keyed by management [`StoreId`].
+///
+/// Extracted from [`PlatformConfigStore`] so the registry-backed composite
+/// store can delegate writes to a management-path implementation without also
+/// depending on that implementation's read path. Reads flow through the
+/// `EdgeZero` registry instead (see `platform::composite`).
+pub trait PlatformConfigWriter: Send + Sync {
+    /// Store a string value in the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::ConfigStore`] when the write fails or the
+    /// platform management API is unreachable.
+    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>>;
+
+    /// Delete a key from the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::ConfigStore`] when the delete fails or the
+    /// platform management API is unreachable.
+    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>>;
+}
+
+/// Write-only view of a secret store, keyed by management [`StoreId`].
+///
+/// Extracted from [`PlatformSecretStore`] so the registry-backed composite
+/// store can delegate writes to a management-path implementation without also
+/// depending on that implementation's read path. Reads flow through the
+/// `EdgeZero` registry instead (see `platform::composite`).
+pub trait PlatformSecretWriter: Send + Sync {
     /// Create or overwrite a secret in the management store identified by `store_id`.
     ///
     /// # Errors

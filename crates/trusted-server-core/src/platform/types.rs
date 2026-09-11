@@ -3,11 +3,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use edgezero_core::store_registry::KvRegistry;
+
 use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
-    PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore,
+    KvHandle, PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient,
+    PlatformKvStore, PlatformSecretStore,
 };
 
 /// Geographic information extracted from a request.
@@ -69,12 +71,18 @@ pub struct ClientInfo {
     pub server_region: Option<String>,
 }
 
-/// Edge-visible name used to open a config or secret store at runtime.
+/// Logical runtime store id used to resolve a config or secret store on read.
 ///
 /// Passed to read methods on [`super::PlatformConfigStore`] and
-/// [`super::PlatformSecretStore`]. Distinct from [`StoreId`] to prevent
-/// accidentally passing a management API identifier where a runtime name is
-/// expected.
+/// [`super::PlatformSecretStore`]. Under the registry-backed composite store
+/// (`platform::composite`) this value is resolved as a **logical store id** via
+/// `ConfigRegistry::named` / `SecretRegistry::named` — i.e. the `[stores.*]` id
+/// declared in `edgezero.toml` (`trusted_server_config`, `jwks_store`,
+/// `ts_secrets`, `datadome_ip_bypass`, …), not a physical platform store name.
+/// Under the D7 convention the logical id equals the platform store name, so
+/// existing call sites need no change. Distinct from [`StoreId`] (the
+/// management-API write identifier) to prevent passing a write identifier where
+/// a read id is expected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, derive_more::Display)]
 pub struct StoreName(String);
 
@@ -168,6 +176,14 @@ pub struct RuntimeServices {
     /// per-request basis by cloning [`RuntimeServices`] with
     /// [`RuntimeServices::with_kv_store`].
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
+    /// Per-request registry of KV stores keyed by logical id.
+    ///
+    /// Populated by adapters from the `EdgeZero`
+    /// [`KvRegistry`](edgezero_core::store_registry::KvRegistry) in request
+    /// extensions and consumed by [`RuntimeServices::kv_handle_named`] to
+    /// resolve a named store (e.g. `consent_store`). `None` when no registry is
+    /// wired, in which case named lookups return `None`.
+    pub(crate) kv_registry: Option<KvRegistry>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
     /// per request rather than failing. Spike-only; see
@@ -282,6 +298,19 @@ impl RuntimeServices {
         super::KvHandle::new(self.kv_store.clone())
     }
 
+    /// Resolve a KV store by its logical `id` from the per-request registry.
+    ///
+    /// Returns a [`KvHandle`] for the named store, or `None` when no registry
+    /// is wired or `id` is not declared. Distinct from [`kv_handle`](Self::kv_handle),
+    /// which returns the default request-path store; use this to select a
+    /// non-default store such as the consent store.
+    #[must_use]
+    pub fn kv_handle_named(&self, id: &str) -> Option<KvHandle> {
+        self.kv_registry
+            .as_ref()
+            .and_then(|registry| registry.named(id))
+    }
+
     /// Returns a clone of this instance with the KV store replaced by `store`.
     ///
     /// Adapters use this to lazily inject the request-specific KV store for
@@ -335,6 +364,7 @@ pub struct RuntimeServicesBuilder {
     config_store: Option<Arc<dyn PlatformConfigStore>>,
     secret_store: Option<Arc<dyn PlatformSecretStore>>,
     kv_store: Option<Arc<dyn PlatformKvStore>>,
+    kv_registry: Option<KvRegistry>,
     template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
     backend: Option<Arc<dyn PlatformBackend>>,
@@ -350,6 +380,7 @@ impl RuntimeServicesBuilder {
             config_store: None,
             secret_store: None,
             kv_store: None,
+            kv_registry: None,
             template_cache: None,
             template_assembler: None,
             backend: None,
@@ -395,6 +426,16 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn kv_store(mut self, kv_store: Arc<dyn PlatformKvStore>) -> Self {
         self.kv_store = Some(kv_store);
+        self
+    }
+
+    /// Set the per-request KV registry used by
+    /// [`RuntimeServices::kv_handle_named`] to resolve named stores.
+    ///
+    /// Optional: when unset, named lookups return `None`.
+    #[must_use]
+    pub fn kv_registry(mut self, kv_registry: Option<KvRegistry>) -> Self {
+        self.kv_registry = kv_registry;
         self
     }
 
@@ -453,6 +494,7 @@ impl RuntimeServicesBuilder {
             kv_store: self
                 .kv_store
                 .expect("should set kv_store before building RuntimeServices"),
+            kv_registry: self.kv_registry,
             // Defaulted rather than required: an adapter with no template cache
             // should degrade to transforming per request, not fail to build.
             template_cache: self

@@ -9,7 +9,7 @@ kind = "http"
 name = "trusted_server_kv"
 
 [stores.kv.adapters.cloudflare]
-name = "TRUSTED_SERVER_KV"
+name = "trusted_server_kv"
 
 [stores.config]
 name = "trusted_server_config"

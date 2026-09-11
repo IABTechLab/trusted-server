@@ -51,7 +51,7 @@ impl DataDomeIntegration {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
 
-        if !self.config.enable_protection || !self.is_request_protected(&mut input) {
+        if !self.config.enable_protection || !self.is_request_protected(&mut input).await {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
 
@@ -129,7 +129,7 @@ impl DataDomeIntegration {
         Ok(decision)
     }
 
-    fn is_request_protected(&self, input: &mut RequestFilterInput<'_>) -> bool {
+    async fn is_request_protected(&self, input: &mut RequestFilterInput<'_>) -> bool {
         let req = &*input.request;
         if req.method() == Method::OPTIONS {
             return false;
@@ -151,7 +151,7 @@ impl DataDomeIntegration {
             client_ip: input.services.client_info().client_ip,
             asn: input.geo_info.and_then(|geo| geo.asn),
         };
-        match self.protection_scope.evaluate(&facts, input.services) {
+        match self.protection_scope.evaluate(&facts, input.services).await {
             ProtectionScopeDecision::Protect => {}
             ProtectionScopeDecision::Skip {
                 rule_id,

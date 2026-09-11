@@ -14,18 +14,33 @@ compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 [build]
 command = "bash build.sh"
 
+# One KV namespace binding per logical KV store id declared in edgezero.toml
+# ([stores.kv].ids). The EdgeZero dispatcher opens every declared id at request
+# time and fails the request when a binding is missing, so all four must exist.
+# Run `wrangler kv:namespace create <binding>` for each and paste the returned
+# ids here before `wrangler deploy` or `wrangler dev --remote`.
+# `wrangler dev --local` (Miniflare default) tolerates these placeholders.
 [[kv_namespaces]]
-binding = "TRUSTED_SERVER_KV"
-# Run `wrangler kv:namespace create TRUSTED_SERVER_KV` and paste the returned
-# id here before `wrangler deploy` or `wrangler dev --remote`.
-# `wrangler dev --local` (Miniflare default) tolerates this placeholder.
+binding = "trusted_server_kv"
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+[[kv_namespaces]]
+binding = "ec_identity_store"
+id = "REPLACE_WITH_YOUR_EC_KV_NAMESPACE_ID"
+
+[[kv_namespaces]]
+binding = "consent_store"
+id = "REPLACE_WITH_YOUR_CONSENT_KV_NAMESPACE_ID"
+
+[[kv_namespaces]]
+binding = "creative_store"
+id = "REPLACE_WITH_YOUR_CREATIVE_KV_NAMESPACE_ID"
 
 [vars]
 # TRUSTED_SERVER_CONFIG is required at startup. Replace this intentionally
 # invalid placeholder with JSON containing an `app_config` blob envelope before
 # deploying or running `wrangler dev` against real traffic.
-TRUSTED_SERVER_CONFIG = '{"app_config":""}'
+TRUSTED_SERVER_CONFIG = '{"trusted_server_config":""}'
 
 # App-config secret values are provisioned as Worker secrets with
 # `wrangler secret put <key-name>`. The pushed blob contains only those key

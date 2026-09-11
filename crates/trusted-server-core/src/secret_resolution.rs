@@ -6,6 +6,7 @@
 
 use edgezero_core::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
+use futures::future::LocalBoxFuture;
 use serde_json::Value;
 
 use crate::error::TrustedServerError;
@@ -21,7 +22,7 @@ use crate::platform::{PlatformSecretStore, StoreName};
 /// Returns [`TrustedServerError::Configuration`] when a required path or key
 /// is malformed, a secret is unavailable, is not valid UTF-8, or resolves to an
 /// empty value.
-pub fn resolve_secret_references<C: AppConfigMeta>(
+pub async fn resolve_secret_references<C: AppConfigMeta>(
     data: &mut Value,
     secret_store: &dyn PlatformSecretStore,
     default_store_name: &StoreName,
@@ -38,106 +39,118 @@ pub fn resolve_secret_references<C: AppConfigMeta>(
             "",
             secret_store,
             default_store_name,
-        )?;
+        )
+        .await?;
     }
     *data = resolved_data;
     Ok(())
 }
 
-fn resolve_field(
-    node: &mut Value,
-    field: &SecretField,
-    remaining: &[SecretPathSegment],
-    rendered_path: &str,
-    secret_store: &dyn PlatformSecretStore,
-    default_store_name: &StoreName,
-) -> Result<(), Report<TrustedServerError>> {
-    match remaining.split_first() {
-        Some((SecretPathSegment::Field(name), [])) => resolve_leaf(
-            node,
-            field,
-            name.as_ref(),
-            rendered_path,
-            secret_store,
-            default_store_name,
-        ),
-        Some((SecretPathSegment::OptionalField(name), [])) => {
-            if matches!(node.get(name.as_ref()), None | Some(Value::Null)) {
-                return Ok(());
-            }
-            resolve_leaf(
-                node,
-                field,
-                name.as_ref(),
-                rendered_path,
-                secret_store,
-                default_store_name,
-            )
-        }
-        Some((SecretPathSegment::Field(name), rest)) => {
-            let next_path = join_field(rendered_path, name.as_ref());
-            let child = node
-                .as_object_mut()
-                .and_then(|object| object.get_mut(name.as_ref()))
-                .ok_or_else(|| missing_path(&next_path))?;
-            if child.is_null() {
-                return Err(missing_path(&next_path));
-            }
-            resolve_field(
-                child,
-                field,
-                rest,
-                &next_path,
-                secret_store,
-                default_store_name,
-            )
-        }
-        Some((SecretPathSegment::OptionalField(name), rest)) => {
-            let next_path = join_field(rendered_path, name.as_ref());
-            let Some(child) = node
-                .as_object_mut()
-                .and_then(|object| object.get_mut(name.as_ref()))
-            else {
-                return Ok(());
-            };
-            if child.is_null() {
-                return Ok(());
-            }
-            resolve_field(
-                child,
-                field,
-                rest,
-                &next_path,
-                secret_store,
-                default_store_name,
-            )
-        }
-        Some((SecretPathSegment::ArrayEach, rest)) => {
-            let items = node.as_array_mut().ok_or_else(|| {
-                configuration_error(format!("expected an array at `{rendered_path}`"))
-            })?;
-            for (index, item) in items.iter_mut().enumerate() {
-                let indexed_path = format!("{rendered_path}[{index}]");
-                resolve_field(
-                    item,
+// Boxed rather than an `async fn` because the walk recurses through nested
+// path segments, and a recursive `async fn` has an infinitely sized future.
+fn resolve_field<'a>(
+    node: &'a mut Value,
+    field: &'a SecretField,
+    remaining: &'a [SecretPathSegment],
+    rendered_path: &'a str,
+    secret_store: &'a dyn PlatformSecretStore,
+    default_store_name: &'a StoreName,
+) -> LocalBoxFuture<'a, Result<(), Report<TrustedServerError>>> {
+    Box::pin(async move {
+        match remaining.split_first() {
+            Some((SecretPathSegment::Field(name), [])) => {
+                resolve_leaf(
+                    node,
                     field,
-                    rest,
-                    &indexed_path,
+                    name.as_ref(),
+                    rendered_path,
                     secret_store,
                     default_store_name,
-                )?;
+                )
+                .await
             }
-            Ok(())
+            Some((SecretPathSegment::OptionalField(name), [])) => {
+                if matches!(node.get(name.as_ref()), None | Some(Value::Null)) {
+                    return Ok(());
+                }
+                resolve_leaf(
+                    node,
+                    field,
+                    name.as_ref(),
+                    rendered_path,
+                    secret_store,
+                    default_store_name,
+                )
+                .await
+            }
+            Some((SecretPathSegment::Field(name), rest)) => {
+                let next_path = join_field(rendered_path, name.as_ref());
+                let child = node
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut(name.as_ref()))
+                    .ok_or_else(|| missing_path(&next_path))?;
+                if child.is_null() {
+                    return Err(missing_path(&next_path));
+                }
+                resolve_field(
+                    child,
+                    field,
+                    rest,
+                    &next_path,
+                    secret_store,
+                    default_store_name,
+                )
+                .await
+            }
+            Some((SecretPathSegment::OptionalField(name), rest)) => {
+                let next_path = join_field(rendered_path, name.as_ref());
+                let Some(child) = node
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut(name.as_ref()))
+                else {
+                    return Ok(());
+                };
+                if child.is_null() {
+                    return Ok(());
+                }
+                resolve_field(
+                    child,
+                    field,
+                    rest,
+                    &next_path,
+                    secret_store,
+                    default_store_name,
+                )
+                .await
+            }
+            Some((SecretPathSegment::ArrayEach, rest)) => {
+                let items = node.as_array_mut().ok_or_else(|| {
+                    configuration_error(format!("expected an array at `{rendered_path}`"))
+                })?;
+                for (index, item) in items.iter_mut().enumerate() {
+                    let indexed_path = format!("{rendered_path}[{index}]");
+                    resolve_field(
+                        item,
+                        field,
+                        rest,
+                        &indexed_path,
+                        secret_store,
+                        default_store_name,
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            Some(_) => Err(configuration_error(format!(
+                "unsupported secret path segment in `{}`",
+                field.dotted_path()
+            ))),
+            None => Ok(()),
         }
-        Some(_) => Err(configuration_error(format!(
-            "unsupported secret path segment in `{}`",
-            field.dotted_path()
-        ))),
-        None => Ok(()),
-    }
+    })
 }
 
-fn resolve_leaf(
+async fn resolve_leaf(
     parent: &mut Value,
     field: &SecretField,
     key: &str,
@@ -168,6 +181,7 @@ fn resolve_leaf(
 
     let resolved = secret_store
         .get_string(default_store_name, &key_name)
+        .await
         .map_err(|_| {
             configuration_error(format!(
                 "failed to resolve secret reference at `{leaf_path}` from secret store \
@@ -204,14 +218,17 @@ fn configuration_error(message: String) -> Report<TrustedServerError> {
 mod tests {
     use super::*;
     use crate::platform::{PlatformError, StoreId};
+    use async_trait::async_trait;
+    use futures::executor::block_on;
     use std::collections::BTreeMap;
 
     struct MemorySecretStore {
         values: BTreeMap<String, Vec<u8>>,
     }
 
+    #[async_trait(?Send)]
     impl PlatformSecretStore for MemorySecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             key: &str,
@@ -290,8 +307,12 @@ mod tests {
             ]
         });
 
-        resolve_secret_references::<Fixture>(&mut data, &store(), &StoreName::from("secrets"))
-            .expect("should resolve nested array secrets");
+        block_on(resolve_secret_references::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+        ))
+        .expect("should resolve nested array secrets");
 
         assert_eq!(data["outer"][0]["token"], "resolved-a");
         assert_eq!(data["outer"][1]["token"], "resolved-b");
@@ -303,15 +324,23 @@ mod tests {
         let mut absent = serde_json::json!({
             "outer": [{"token": "token-a"}]
         });
-        resolve_secret_references::<Fixture>(&mut absent, &store(), &StoreName::from("secrets"))
-            .expect("should skip absent optional intermediate");
+        block_on(resolve_secret_references::<Fixture>(
+            &mut absent,
+            &store(),
+            &StoreName::from("secrets"),
+        ))
+        .expect("should skip absent optional intermediate");
 
         let mut present = serde_json::json!({
             "outer": [{"token": "token-a"}],
             "feature": {"credential": "feature-key"}
         });
-        resolve_secret_references::<Fixture>(&mut present, &store(), &StoreName::from("secrets"))
-            .expect("should resolve present optional intermediate");
+        block_on(resolve_secret_references::<Fixture>(
+            &mut present,
+            &store(),
+            &StoreName::from("secrets"),
+        ))
+        .expect("should resolve present optional intermediate");
 
         assert_eq!(present["feature"]["credential"], "resolved-feature");
     }
@@ -322,11 +351,11 @@ mod tests {
             serde_json::json!({"outer": [{}]}),
             serde_json::json!({"outer": [{"token": null}]}),
         ] {
-            let err = resolve_secret_references::<Fixture>(
+            let err = block_on(resolve_secret_references::<Fixture>(
                 &mut data,
                 &store(),
                 &StoreName::from("secrets"),
-            )
+            ))
             .expect_err("should reject missing required secret path");
 
             assert!(err.to_string().contains("missing required secret path"));
@@ -338,9 +367,12 @@ mod tests {
     #[test]
     fn rejects_non_string_required_leaf() {
         let mut data = serde_json::json!({"outer": [{"token": true}]});
-        let err =
-            resolve_secret_references::<Fixture>(&mut data, &store(), &StoreName::from("secrets"))
-                .expect_err("should reject non-string secret reference");
+        let err = block_on(resolve_secret_references::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+        ))
+        .expect_err("should reject non-string secret reference");
 
         assert!(err.to_string().contains("must be a string"));
         assert!(err.to_string().contains("outer[0].token"));
@@ -357,9 +389,12 @@ mod tests {
             )]),
         };
 
-        let err =
-            resolve_secret_references::<Fixture>(&mut data, &store, &StoreName::from("secrets"))
-                .expect_err("should reject a missing secret key");
+        let err = block_on(resolve_secret_references::<Fixture>(
+            &mut data,
+            &store,
+            &StoreName::from("secrets"),
+        ))
+        .expect_err("should reject a missing secret key");
         let diagnostic = format!("{err:?}");
 
         assert!(diagnostic.contains("outer[0].token"));
@@ -372,9 +407,12 @@ mod tests {
     #[test]
     fn rejects_malformed_array_path_without_resolving_values() {
         let mut data = serde_json::json!({"outer": {"token": "token-a"}});
-        let err =
-            resolve_secret_references::<Fixture>(&mut data, &store(), &StoreName::from("secrets"))
-                .expect_err("should reject a non-array intermediate path");
+        let err = block_on(resolve_secret_references::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+        ))
+        .expect_err("should reject a non-array intermediate path");
 
         assert!(err.to_string().contains("expected an array"));
         assert!(!err.to_string().contains("resolved-a"));
@@ -385,18 +423,24 @@ mod tests {
         let mut invalid = store();
         invalid.values.insert("token-a".to_owned(), vec![0xff]);
         let mut data = serde_json::json!({"outer": [{"token": "token-a"}]});
-        let err =
-            resolve_secret_references::<Fixture>(&mut data, &invalid, &StoreName::from("secrets"))
-                .expect_err("should reject invalid UTF-8");
+        let err = block_on(resolve_secret_references::<Fixture>(
+            &mut data,
+            &invalid,
+            &StoreName::from("secrets"),
+        ))
+        .expect_err("should reject invalid UTF-8");
         assert!(err.to_string().contains("outer[0].token"));
 
         let empty = MemorySecretStore {
             values: BTreeMap::from([("token-a".to_owned(), Vec::new())]),
         };
         let mut data = serde_json::json!({"outer": [{"token": "token-a"}]});
-        let err =
-            resolve_secret_references::<Fixture>(&mut data, &empty, &StoreName::from("secrets"))
-                .expect_err("should reject empty resolved value");
+        let err = block_on(resolve_secret_references::<Fixture>(
+            &mut data,
+            &empty,
+            &StoreName::from("secrets"),
+        ))
+        .expect_err("should reject empty resolved value");
         assert!(err.to_string().contains("outer[0].token"));
     }
 
@@ -404,8 +448,11 @@ mod tests {
     fn does_not_mutate_data_when_resolution_fails() {
         let mut data = serde_json::json!({"outer": [{"token": "missing"}]});
         let original = data.clone();
-        let result =
-            resolve_secret_references::<Fixture>(&mut data, &store(), &StoreName::from("secrets"));
+        let result = block_on(resolve_secret_references::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+        ));
         assert!(result.is_err(), "should fail for missing secret key");
         assert_eq!(data, original, "should preserve unresolved data on failure");
     }

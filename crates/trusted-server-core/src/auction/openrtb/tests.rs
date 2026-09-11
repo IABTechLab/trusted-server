@@ -168,7 +168,8 @@ fn deterministic_signer() -> RequestSigner {
         HashMapSecretStore::new(secret_data),
         Arc::new(NoopHttpClient),
     );
-    RequestSigner::from_services(&services).expect("should load deterministic signer")
+    futures::executor::block_on(RequestSigner::from_services(&services))
+        .expect("should load deterministic signer")
 }
 
 #[test]
