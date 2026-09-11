@@ -19,7 +19,7 @@ import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, TsjsApi } from '../../core/types';
 
-import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
+import { PREBID_USER_ID_MODULE_REGISTRY, userIdConfigNameAliases } from './user_id_modules';
 
 /**
  * Prebid.js public API surface (type-only; erased at build time).
@@ -289,9 +289,16 @@ function withManagedUserIds(
 ): PbjsConfig {
   if (!hasUserIdsPath(config)) return config;
 
-  const managedNames = new Set(managedUserIds.map((managed) => managed.name));
+  // Prebid resolves a `userSync.userIds` entry to a submodule on either its
+  // name or its alias, case-insensitively, and takes the first matching entry.
+  // A retained publisher entry sits ahead of the managed one, so it must be
+  // filtered on any spelling Prebid would resolve to the same submodule —
+  // otherwise the publisher's configuration silently wins.
+  const managedNames = new Set(
+    managedUserIds.flatMap((managed) => userIdConfigNameAliases(managed.name))
+  );
   const retained = configuredUserIdEntries(config.userSync.userIds).filter(
-    (entry) => !managedNames.has(entry.name)
+    (entry) => !managedNames.has(entry.name.toLowerCase())
   );
   return {
     ...config,
@@ -535,6 +542,10 @@ function watchForLateTcfApi(onDiscovered: () => void): (() => void) | undefined 
   if (typeof window === 'undefined') return undefined;
 
   const tcfWindow = window as Window & { __tcfapi?: unknown };
+  // The accessor pair below starts with no stored value, so installing it over
+  // a CMP that is already present would hide that CMP from every later reader.
+  // Discovery has already resolved in that case; there is nothing to watch for.
+  if (typeof tcfWindow.__tcfapi === 'function') return undefined;
   let stored: unknown;
   let settled = false;
   const read = () => stored;
@@ -578,6 +589,107 @@ function watchForLateTcfApi(onDiscovered: () => void): (() => void) | undefined 
   }
 
   return settle;
+}
+
+/** TCF v2 event statuses that report a settled consent decision. */
+const TERMINAL_TCF_EVENT_STATUSES = ['tcloaded', 'useractioncomplete'];
+
+/**
+ * Reports whether a TCF event payload settles GDPR applicability for this page.
+ *
+ * `cmpuishown` and a missing status both mean the CMP is still deciding. Only
+ * an out-of-scope result or a loaded/completed consent string is terminal.
+ */
+function isTerminalTcfResult(result: unknown): boolean {
+  if (!isRecord(result)) return false;
+  if (result.gdprApplies === false) return true;
+  return (
+    typeof result.eventStatus === 'string' &&
+    TERMINAL_TCF_EVENT_STATUSES.includes(result.eventStatus)
+  );
+}
+
+/**
+ * Waits for the CMP to settle GDPR applicability and consent, then reports once.
+ *
+ * A callable `__tcfapi` is not a consent decision. Prebid's GDPR handler times
+ * out after its default ten seconds and then proceeds with null consent and
+ * `gdprApplies: false`, which is indistinguishable from a user outside GDPR
+ * scope — an operator-managed User ID module seeded on that result would call
+ * its vendor and write storage with no jurisdiction or consent behind it.
+ * Automatic TCF activation is Trusted Server's own configuration, so it fails
+ * closed here and managed seeding waits for a terminal result. A publisher's
+ * own GDPR configuration keeps Prebid's timeout semantics untouched.
+ *
+ * Returns a function that removes the subscription, or `undefined` when no
+ * subscription could be made. Retiring before the CMP has answered cannot send
+ * the removal yet — the listener id arrives only with a callback — so the
+ * subscription is removed on the CMP's first event instead.
+ */
+function awaitTerminalTcfConsent(
+  onSettled: () => void,
+  onRefused: () => void
+): (() => void) | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const tcfApi = (window as { __tcfapi?: unknown }).__tcfapi;
+  if (typeof tcfApi !== 'function') return undefined;
+
+  let settled = false;
+  let retired = false;
+  let listenerId: unknown;
+
+  const removeListener = () => {
+    if (listenerId === undefined || listenerId === null) return;
+    const pendingId = listenerId;
+    listenerId = undefined;
+    try {
+      // CMP bootstrap stubs are commonly replaced before callbacks drain.
+      // Prefer the current live API so removal does not enter a stale queue.
+      const currentTcfApi = (window as { __tcfapi?: unknown }).__tcfapi;
+      const removalTcfApi =
+        typeof currentTcfApi === 'function' ? (currentTcfApi as TcfApi) : (tcfApi as TcfApi);
+      removalTcfApi.call(window, 'removeEventListener', 2, () => {}, pendingId);
+    } catch (error) {
+      log.error('[tsjs-prebid] terminal TCF consent listener could not be removed', error);
+    }
+  };
+
+  const onCmpEvent = (result: unknown, success: boolean) => {
+    // Capture the id before any early return. It only ever arrives with a
+    // callback, and without it the subscription can never be removed — so a
+    // retirement that happened before the CMP first answered has to wait for
+    // this moment to do the real removal.
+    if (isRecord(result)) listenerId = result.listenerId;
+    if (retired) {
+      removeListener();
+      return;
+    }
+    if (settled) return;
+    if (success === false) {
+      // A refusal is not an absence of GDPR, so managed IDs stay deferred. It
+      // is not final either: report it so a later call can subscribe again.
+      log.warn('[tsjs-prebid] CMP rejected the TCF consent subscription; managed IDs deferred');
+      onRefused();
+      return;
+    }
+    if (!isTerminalTcfResult(result)) return;
+    settled = true;
+    removeListener();
+    onSettled();
+  };
+
+  try {
+    (tcfApi as TcfApi).call(window, 'addEventListener', 2, onCmpEvent);
+  } catch (error) {
+    log.error('[tsjs-prebid] CMP consent result could not be awaited', error);
+    return undefined;
+  }
+
+  return () => {
+    retired = true;
+    settled = true;
+    removeListener();
+  };
 }
 
 function activateManagedUserIdTcfConsent(
@@ -1534,6 +1646,10 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     // would call its vendor with the GDPR handler disabled.
     let managedUserIdsDeferred = true;
     let awaitingLateConsent = false;
+    let retireLateTcfWatch: (() => void) | undefined;
+    let awaitingTerminalTcfConsent = false;
+    let terminalTcfConsentSettled = false;
+    let retireTerminalTcfWatch: (() => void) | undefined;
 
     const retireAutomaticTcfConsent = (
       publisherConfig: PbjsConfig,
@@ -1667,6 +1783,15 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     const activateAndSeedManagedUserIds = () => {
       if (!managedUserIdsDeferred) return;
       managedUserIdsDeferred = false;
+      // Seeding can also resolve through publisher consent configuration with
+      // no CMP ever appearing. Restore the plain `window.__tcfapi` property
+      // rather than leaving an accessor pair installed for the page lifetime.
+      // The restorer is idempotent, and the callback it fires re-enters a
+      // `trySeedManagedUserIds` that now returns on the flag above.
+      retireLateTcfWatch?.();
+      retireLateTcfWatch = undefined;
+      retireTerminalTcfWatch?.();
+      retireTerminalTcfWatch = undefined;
       automaticTcfConsentActivation = activateManagedUserIdTcfConsent(
         managedUserIds,
         originalSetConfig,
@@ -1718,9 +1843,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
     trySeedManagedUserIds = () => {
       if (!managedUserIdsDeferred) return;
-      const tcfApiInstalled =
-        typeof window !== 'undefined' &&
-        typeof (window as { __tcfapi?: unknown }).__tcfapi === 'function';
       let publisherConsentConfigured = false;
       try {
         const consent = getConfig?.call(pbjs, 'consentManagement');
@@ -1729,15 +1851,57 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       } catch (error) {
         log.error('[tsjs-prebid] publisher consent configuration could not be read', error);
       }
-      if (tcfApiInstalled || publisherConsentConfigured) activateAndSeedManagedUserIds();
+      // A publisher-owned GDPR configuration carries the publisher's own
+      // timeout posture, so seeding under it leaves Prebid's semantics alone.
+      if (publisherConsentConfigured || terminalTcfConsentSettled) {
+        activateAndSeedManagedUserIds();
+        return;
+      }
+      // Automatic TCF activation is ours, so it fails closed: subscribe once
+      // and wait for a settled CMP result rather than for a callable API.
+      if (awaitingTerminalTcfConsent) return;
+      // A previous attempt the CMP refused leaves its subscription behind.
+      // Retire it before subscribing again so only one is ever outstanding.
+      retireTerminalTcfWatch?.();
+      retireTerminalTcfWatch = undefined;
+      awaitingTerminalTcfConsent = true;
+      const retire = awaitTerminalTcfConsent(
+        () => {
+          terminalTcfConsentSettled = true;
+          trySeedManagedUserIds?.();
+        },
+        () => {
+          // Reopen the wait. A CMP that refuses one subscription may accept a
+          // later one — a TCF stub commonly gives way to the real CMP — and
+          // leaving the flag set would defer managed IDs for the page lifetime
+          // with no path back.
+          awaitingTerminalTcfConsent = false;
+        }
+      );
+      if (!retire) {
+        // No CMP to subscribe to yet; a later call retries once one appears.
+        awaitingTerminalTcfConsent = false;
+        return;
+      }
+      if (managedUserIdsDeferred) {
+        retireTerminalTcfWatch = retire;
+      } else {
+        // A synchronous terminal result already seeded; retire the subscription
+        // the seeding path could not yet see.
+        retire();
+      }
     };
     trySeedManagedUserIds();
     if (managedUserIdsDeferred) {
       awaitingLateConsent = true;
-      // Auctions may run before an asynchronous CMP arrives. Keep managed IDs
-      // deferred even when the property cannot be watched; later configuration
-      // and auction calls recheck discovery without treating absence as consent.
-      watchForLateTcfApi(trySeedManagedUserIds);
+      // Auctions may run before an asynchronous CMP arrives. Watching the
+      // property catches one that installs itself later; it is a no-op when a
+      // CMP is already present and the wait is for its result instead. When a
+      // present CMP rejects the subscription outright neither watch arms, and
+      // recovery is by recheck alone. Either way managed IDs stay deferred, and
+      // later configuration and auction calls recheck without treating absence
+      // as consent.
+      retireLateTcfWatch = watchForLateTcfApi(trySeedManagedUserIds);
     }
   }
 

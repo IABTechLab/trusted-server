@@ -224,8 +224,9 @@ const GPC_US_PRIVACY: &str = "1YYN";
 /// Rejects a Prebid User ID identifier that Prebid.js could not address.
 ///
 /// Applies only the constraints Prebid itself imposes on a `userSync.userIds`
-/// entry name and on a storage key: a non-empty, untrimmed-free ASCII token.
-/// Anything narrower would encode one vendor's rules into core.
+/// entry name and on a storage key: a non-empty ASCII token with no
+/// surrounding whitespace. Anything narrower would encode one vendor's rules
+/// into core.
 fn validate_prebid_user_id_token(value: &str) -> Result<(), ValidationError> {
     let is_valid = !value.is_empty()
         && value.trim() == value
@@ -281,25 +282,29 @@ pub struct PrebidManagedUserIdStorage {
     pub refresh_in_seconds: Option<u32>,
 }
 
-/// Rejects a managed User ID list that names the same module twice.
+/// Rejects a managed User ID list whose names address one module twice.
 ///
-/// Prebid keys `userSync.userIds` by entry name, so two entries sharing a name
-/// give one submodule two conflicting configurations with no defined winner.
+/// Prebid matches `userSync.userIds` entry names to submodules
+/// case-insensitively and takes the first matching entry, so two entries whose
+/// names differ only by case give one submodule two conflicting configurations
+/// with no defined winner.
 fn validate_unique_managed_user_id_names(
     entries: &[PrebidManagedUserIdConfig],
 ) -> Result<(), ValidationError> {
     let mut seen = HashSet::with_capacity(entries.len());
     let Some(duplicate) = entries
         .iter()
-        .find(|entry| !seen.insert(entry.name.as_str()))
+        .find(|entry| !seen.insert(entry.name.to_ascii_lowercase()))
     else {
         return Ok(());
     };
 
     let mut error = ValidationError::new("duplicate_managed_user_id_name");
+    // Name the matching rule: for a collision that differs only by case, the
+    // printed name alone does not look repeated in the operator's config.
     error.message = Some(
         format!(
-            "managed Prebid User ID module `{}` is configured more than once",
+            "managed Prebid User ID module `{}` is configured more than once (names are matched case-insensitively)",
             duplicate.name
         )
         .into(),
@@ -4238,6 +4243,29 @@ params = { pid = "2" }
         assert!(
             result.is_err(),
             "should reject the same module configured twice"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_reject_a_case_variant_module_name() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+params = { pid = "1" }
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleid"
+params = { pid = "2" }
+"#,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject two names that address the same submodule under Prebid's case-insensitive match"
         );
     }
 

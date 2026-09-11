@@ -217,23 +217,61 @@ TCF activation reads `window.__tcfapi` once, so a CMP that installs itself after
 the deferred shim runs would otherwise leave managed modules seeded with
 Prebid's GDPR handler disabled — the module fires its vendor request with no TCF
 parameters, and no later reconfiguration can recall it. Managed entries
-therefore stay out of every configuration Prebid sees until CMP discovery
+therefore stay out of every configuration Prebid sees until consent discovery
 concludes:
 
-| Event                                              | Result                                                       |
-| -------------------------------------------------- | ------------------------------------------------------------ |
-| `window.__tcfapi` is callable at shim time         | The collector activates and managed entries seed immediately |
-| A CMP installs `window.__tcfapi` later             | The collector activates before managed entries seed          |
-| The publisher supplies TCF configuration           | Managed entries seed under the publisher's policy            |
-| No CMP or publisher TCF configuration is available | Auctions proceed with managed entries deferred               |
+| Event                                              | Result                                                         |
+| -------------------------------------------------- | -------------------------------------------------------------- |
+| A CMP returns a settled TCF result                 | The collector activates and managed entries seed               |
+| A CMP is callable but has not answered yet         | Managed entries stay deferred; the shim awaits a result        |
+| A CMP installs `window.__tcfapi` later             | Its first settled result activates the collector, then seeding |
+| The publisher supplies TCF configuration           | Managed entries seed under the publisher's policy              |
+| No CMP or publisher TCF configuration is available | Auctions proceed with managed entries deferred                 |
 
 An auction does not establish that TCF does not apply. Discovery remains open
 across auctions, including when the CMP property cannot be watched. Publisher
-`setConfig`, `mergeConfig`, and auction calls recheck whether a callable CMP or
-publisher-owned TCF configuration is now available. Until then, publisher
-configuration passes through without adding managed entries. Once ready, managed
-entries are merged onto the effective configuration. Pages without a CMP must
-supply their own explicit Prebid TCF policy to enable managed IDs.
+`setConfig`, `mergeConfig`, and auction calls recheck whether a settled CMP
+result or publisher-owned TCF configuration is now available. Until then,
+publisher configuration passes through without adding managed entries. Once
+ready, managed entries are merged onto the effective configuration. Pages
+without a CMP must supply their own explicit Prebid TCF policy to enable managed
+IDs.
+
+### A settled CMP result, not a callable API
+
+A callable `__tcfapi` is not a consent decision. Prebid's own GDPR handler gives
+up after its default ten-second timeout and then proceeds with null consent and
+`gdprApplies: false`, which `tcfControl` cannot distinguish from a user outside
+GDPR scope. A managed module seeded on a callable-but-silent CMP would therefore
+contact its vendor and write its identity storage with no jurisdiction result
+and no consent behind it.
+
+Automatic TCF activation is Trusted Server's own configuration, so it fails
+closed. The shim subscribes to the CMP with `addEventListener` and seeds managed
+entries only once the result is settled:
+
+| CMP result                                   | Terminal | Managed entries |
+| -------------------------------------------- | -------- | --------------- |
+| `gdprApplies: false`                         | Yes      | Seeded          |
+| `eventStatus: "tcloaded"`                    | Yes      | Seeded          |
+| `eventStatus: "useractioncomplete"`          | Yes      | Seeded          |
+| `eventStatus: "cmpuishown"`                  | No       | Deferred        |
+| No response, or the CMP refuses the listener | No       | Deferred        |
+
+A settled result that denies consent still seeds the managed entry; `tcfControl`
+then blocks the vendor call and the storage write, which is the enforcement path
+this integration relies on. A CMP that recovers later — the user completes its
+UI, or a delayed first response arrives — activates the managed entries at that
+point, with `userSync.autoRefresh` briefly enabled so Prebid initializes modules
+added after its first pass.
+
+This scope is deliberately narrow. It applies only to the automatic TCF
+collector that Trusted Server configures for its own managed modules. A
+publisher-owned `consentManagement` configuration carries the publisher's own
+timeout posture, and Prebid's standard timeout semantics continue to govern
+publisher bidders, analytics, and every other controlled activity on the page.
+The tradeoff is that a CMP which never settles leaves managed identity
+unresolved for the page lifetime. Auctions are unaffected.
 
 ## Debug Mode
 
@@ -671,7 +709,13 @@ When entries are configured, Trusted Server owns one deterministic entry per
 configured `name` for publisher configuration applied through the public
 `pbjs.setConfig` and `pbjs.mergeConfig` APIs. Other publisher-configured User ID
 entries are preserved, but calls through those APIs that add, remove, or replace
-a managed name are normalized back to the operator-managed values. This is a
+a managed name are normalized back to the operator-managed values. Ownership
+follows Prebid's own matching rule rather than exact string equality: Prebid
+resolves a `userSync.userIds` entry to a submodule on either its name or its
+alias, case-insensitively, then takes the first matching entry. A managed name
+therefore claims every spelling that resolves to the same submodule — `sharedId`
+also claims `pubCommonId` and any casing of either — because a retained
+publisher entry would otherwise sit ahead of the managed one and win. This is a
 configuration-ownership convention, not a security boundary against same-origin
 code that retained a pre-wrapper function reference or directly mutates Prebid's
 internal configuration. Including a module in a bundle is inert until a managed
@@ -721,16 +765,18 @@ server-to-server ATS API.
 
 ### Degraded behavior
 
-| Condition                                          | Result                                                                  |
-| -------------------------------------------------- | ----------------------------------------------------------------------- |
-| TCF Purpose 1 or LiveRamp vendor consent is denied | Default `tcfControl` blocks IdentityLink resolution and storage         |
-| TCF Purpose 3 or 4 alone is denied                 | Resolution/storage continues under defaults; publisher rules may differ |
-| The user opts out under a US state signal          | No LiveRamp EID is forwarded; the auction continues                     |
-| LiveRamp cannot recognize the browser              | IdentityLink yields no EID; the auction continues                       |
-| LiveRamp network resolution fails                  | The current auction continues without RampID                            |
-| The managed module is missing from the bundle      | Existing diagnostics report the missing module; auctions continue       |
-| The origin is not approved by LiveRamp             | Resolution yields no usable EID; the auction continues                  |
-| EC/KV is unavailable                               | A current-request EID can still reach `/auction`; persistence degrades  |
+| Condition                                                | Result                                                                                             |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| TCF Purpose 1 or LiveRamp vendor consent is denied       | Default `tcfControl` blocks IdentityLink resolution and storage                                    |
+| TCF Purpose 3 or 4 alone is denied                       | Resolution/storage continues under defaults; publisher rules may differ                            |
+| The user opts out under a US state signal                | No LiveRamp EID is forwarded; the auction continues                                                |
+| LiveRamp cannot recognize the browser                    | IdentityLink yields no EID; the auction continues                                                  |
+| LiveRamp network resolution fails                        | The current auction continues without RampID                                                       |
+| The managed module is missing from the bundle            | Existing diagnostics report the missing module; auctions continue                                  |
+| The origin is not approved by LiveRamp                   | Resolution yields no usable EID; the auction continues                                             |
+| EC/KV is unavailable                                     | A current-request EID can still reach `/auction`; persistence degrades                             |
+| The resolved envelope exceeds the 512-byte EID value cap | The envelope is dropped from both the `/auction` payload and EC persistence; the auction continues |
+| The CMP is callable but never returns a settled result   | The managed entry is never seeded; no vendor call, no identity storage, and the auction continues  |
 
 The TCF rows assume either the managed-ID automatic setup described above or a
 publisher-owned Prebid GDPR configuration. A CMP API and its policy remain
@@ -746,15 +792,18 @@ domain, booleans, source names, counts, and status codes:
 1. Build a bundle containing `identityLinkIdSystem` and configure a managed
    `identityLink` entry with the test Placement ID.
 2. With positive consent, confirm `idl_env` is created or refreshed.
-3. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
+3. Record the byte length of the resolved envelope — the length only, never the
+   value — and confirm it is at or below the 512-byte EID value cap. Anything
+   above it is dropped as described in the degraded-behavior table.
+4. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
    recording its value.
-4. Confirm a controlled Prebid Server request contains that source in
+5. Confirm a controlled Prebid Server request contains that source in
    `user.ext.eids`.
-5. Confirm a later request ingests the source into the configured
+6. Confirm a later request ingests the source into the configured
    `liveramp.com` EC partner.
-6. Repeat with denied consent and confirm the envelope endpoint is not called,
+7. Repeat with denied consent and confirm the envelope endpoint is not called,
    `idl_env` is not written, and no LiveRamp EID is forwarded.
-7. Repeat on an unapproved origin and confirm identity resolution degrades
+8. Repeat on an unapproved origin and confirm identity resolution degrades
    without blocking the auction.
 
 This integration forwards RampID identity envelopes through the Prebid auction
