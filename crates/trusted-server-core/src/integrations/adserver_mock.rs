@@ -313,6 +313,7 @@ impl AdServerMockProvider {
                     width,
                     height,
                     bidder: restored_bidder,
+                    returned_seat: original.and_then(|bid| bid.returned_seat.clone()),
                     adomain: bid["adomain"].as_array().map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str().map(String::from))
@@ -399,7 +400,7 @@ impl AdServerMockProvider {
 
 #[async_trait(?Send)]
 impl AuctionProvider for AdServerMockProvider {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "adserver_mock"
     }
 
@@ -466,14 +467,14 @@ impl AuctionProvider for AdServerMockProvider {
             }
         }
 
-        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
-        // timeout in ensure_integration_backend, which is for proxy endpoints.
-        // Send async with auction-scoped timeout
+        // Uses the auction-scoped canonical transport timeout rather than the
+        // 15 s fixed timeout in ensure_integration_backend, which is for proxy
+        // endpoints. The exact logical budget remains in context.timeout_ms.
         let backend_name = ensure_integration_backend_with_timeout(
             context.services,
             &self.config.endpoint,
             "adserver_mock",
-            Duration::from_millis(u64::from(context.timeout_ms)),
+            Duration::from_millis(u64::from(context.transport_timeout_ms)),
         )
         .change_context(TrustedServerError::Auction {
             message: format!(
@@ -535,12 +536,16 @@ impl AuctionProvider for AdServerMockProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+    fn backend_name(
+        &self,
+        services: &RuntimeServices,
+        transport_timeout_ms: u32,
+    ) -> Option<String> {
         predict_integration_backend_name(
             services,
             &self.config.endpoint,
             "adserver_mock",
-            Duration::from_millis(u64::from(timeout_ms)),
+            Duration::from_millis(u64::from(transport_timeout_ms)),
         )
         .inspect_err(|e| {
             log::error!(
@@ -638,6 +643,7 @@ mod tests {
             width: 728,
             height: 90,
             bidder: "aps".to_string(),
+            returned_seat: None,
             adomain: Some(vec!["advertiser.example".to_string()]),
             nurl: None,
             burl: None,
@@ -687,6 +693,7 @@ mod tests {
                     width: 728,
                     height: 90,
                     bidder: "aps".to_string(),
+                    returned_seat: None,
                     adomain: Some(vec!["advertiser.example".to_string()]),
                     nurl: None,
                     burl: None,
@@ -713,6 +720,7 @@ mod tests {
                     width: 728,
                     height: 90,
                     bidder: "test-bidder".to_string(),
+                    returned_seat: None,
                     adomain: None,
                     nurl: Some("https://ssp.example/win?id=mock-bid-001".to_string()),
                     burl: Some("https://ssp.example/bill?id=mock-bid-001".to_string()),
@@ -797,6 +805,49 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_mediator_seats_do_not_become_upstream_returned_seats() {
+        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+        let mediation_response = json!({
+            "seatbid": [
+                {
+                    "seat": "provider-instance",
+                    "bid": [{
+                        "id": "bid-provider",
+                        "impid": "slot-provider",
+                        "price": 1.0,
+                        "adm": "<div>Provider</div>",
+                        "w": 300,
+                        "h": 250,
+                        "crid": "uncorrelated-provider-creative"
+                    }]
+                },
+                {
+                    "seat": "unknown",
+                    "bid": [{
+                        "id": "bid-unknown",
+                        "impid": "slot-unknown",
+                        "price": 2.0,
+                        "adm": "<div>Unknown</div>",
+                        "w": 728,
+                        "h": 90,
+                        "crid": "uncorrelated-unknown-creative"
+                    }]
+                }
+            ]
+        });
+
+        let response = provider.parse_mediation_response(&mediation_response, 10, &BidIndex::new());
+
+        assert_eq!(response.bids.len(), 2);
+        assert_eq!(response.bids[0].bidder, "provider-instance");
+        assert_eq!(response.bids[1].bidder, "unknown");
+        assert!(
+            response.bids.iter().all(|bid| bid.returned_seat.is_none()),
+            "an unmatched mediator seat is provider correlation identity, not an upstream seat"
+        );
+    }
+
+    #[test]
     fn parse_mediation_response_restores_original_bid_render_fields() {
         let provider = AdServerMockProvider::new(AdServerMockConfig::default());
         let mediation_response = json!({
@@ -834,6 +885,7 @@ mod tests {
                 creative: Some("<div>Original Ad</div>".to_string()),
                 adomain: Some(vec!["example.com".to_string()]),
                 bidder: "mocktioneer".to_string(),
+                returned_seat: Some("upstream-seat".to_string()),
                 width: 728,
                 height: 90,
                 nurl: Some("https://ssp.example/win".to_string()),
@@ -906,6 +958,11 @@ mod tests {
             Some("/cache"),
             "should restore PBS cache path"
         );
+        assert_eq!(
+            bid.returned_seat.as_deref(),
+            Some("upstream-seat"),
+            "should restore returned seat only from the matched original bid"
+        );
     }
 
     #[test]
@@ -942,6 +999,7 @@ mod tests {
                 creative: Some("<div>Original Ad</div>".to_string()),
                 adomain: None,
                 bidder: "example-bidder".to_string(),
+                returned_seat: None,
                 width: 728,
                 height: 90,
                 nurl: None,
@@ -1103,6 +1161,7 @@ mod tests {
                 width: 300,
                 height: 250,
                 bidder: "aps".to_string(),
+                returned_seat: None,
                 adomain: Some(vec!["advertiser.example".to_string()]),
                 nurl: None,
                 burl: None,

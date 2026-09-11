@@ -26,3 +26,7 @@ id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 # invalid placeholder with JSON containing an `app_config` blob envelope before
 # deploying or running `wrangler dev` against real traffic.
 TRUSTED_SERVER_CONFIG = '{"app_config":""}'
+
+# App-config secret values are provisioned as Worker secrets with
+# `wrangler secret put <key-name>`. The pushed blob contains only those key
+# names; never add secret values to this file.
