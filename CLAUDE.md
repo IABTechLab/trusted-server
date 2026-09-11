@@ -351,28 +351,14 @@ IntegrationRegistration::builder(ID)
 
 ## CI Gates
 
-<!-- docs-parity:gates:start -->
-
-### Documentation parity
-
-<!-- docs-parity:owner:documentation-maintainers -->
-
-- `cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check`
-- `cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets --all-features -- -D warnings`
-- `cargo test --manifest-path tools/docs-parity/Cargo.toml`
-- `cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all`
-- `cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check`
-
 ### JavaScript and documentation site
 
-<!-- docs-parity:owner:documentation-maintainers -->
 
 - `cd crates/trusted-server-js/lib && npm ci && npm run lint && npx vitest run && npm run format && npm run build`
 - `cd docs && npm ci && npm run lint && npm run format && npm run build`
 
 ### Rust formatting and linting
 
-<!-- docs-parity:owner:rust-maintainers -->
 
 - `cargo fmt --all -- --check`
 - `cargo clippy-fastly`
@@ -388,7 +374,6 @@ IntegrationRegistration::builder(ID)
 
 ### Rust tests and release builds
 
-<!-- docs-parity:owner:rust-maintainers -->
 
 - `cargo test-fastly`
 - `cargo test-axum`
@@ -403,7 +388,6 @@ IntegrationRegistration::builder(ID)
 
 ### Rust API documentation
 
-<!-- docs-parity:owner:documentation-maintainers -->
 
 - `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p trusted-server-core -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1`
 - `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p trusted-server-adapter-fastly --target wasm32-wasip1`
@@ -413,7 +397,6 @@ IntegrationRegistration::builder(ID)
 - `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p trusted-server-cli -p trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p')`
 - `cargo test --doc -p trusted-server-core`
 
-<!-- docs-parity:gates:end -->
 
 ---
 

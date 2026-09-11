@@ -12,12 +12,6 @@ updates:
       interval: "weekly"
     target-branch: "main"
 
-  - package-ecosystem: "cargo"
-    directory: "/tools/docs-parity"
-    schedule:
-      interval: "weekly"
-    target-branch: "main"
-
   - package-ecosystem: "npm"
     directory: "/crates/trusted-server-js/lib"
     schedule:

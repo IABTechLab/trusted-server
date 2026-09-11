@@ -16,16 +16,12 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ## Adapter and startup support
 
-<!-- docs-parity:start api-adapter-support -->
-
 | Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
 | ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
 | `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
 | `cloudflare` | development    | absent     | `500`          | no             | single           | outermost sanitize             | none                             |
 | `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
 | `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
-
-<!-- docs-parity:end api-adapter-support -->
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
@@ -35,8 +31,6 @@ that configuration. Spin additionally normalizes its runtime-provided
 authority, scheme, and client-address headers in the innermost middleware.
 
 ## Route availability
-
-<!-- docs-parity:start api-route-availability -->
 
 | Router  | Path                                   | Methods                                                    | Shape          | Predicate                             | Fastly                | Axum                  | Cloudflare            | Spin                  |
 | ------- | -------------------------------------- | ---------------------------------------------------------- | -------------- | ------------------------------------- | --------------------- | --------------------- | --------------------- | --------------------- |
@@ -72,14 +66,10 @@ authority, scheme, and client-address headers in the innermost middleware.
 | startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
 | startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
 
-<!-- docs-parity:end api-route-availability -->
-
 `real`, `unsupported`, `guarded`, `publisher fallback`, and `startup error` are
 distinct observable dispositions. An em dash means that the adapter has no
 local route; the publisher fallback can therefore receive that path. The
 startup rows are a separate degraded router, not additional normal routes.
-
-<!-- docs-parity:ownership api-contract-details owner=documentation-maintainers -->
 
 ## Contract conventions
 
@@ -177,7 +167,9 @@ curl -i "https://edge.example.com/_ts/clear-tester"
 ### POST /auction
 
 Browser and programmatic auction endpoint. It accepts the Trusted Server ad-unit
-request shape and returns an OpenRTB response with sanitized creatives.
+request shape and returns an OpenRTB response. Creative markup follows the
+independent `[auction].sanitize_creatives` and `[auction].rewrite_creatives`
+settings; sanitization is opt-in and rewriting is enabled by default.
 
 **Contract:** Auth: none. The buffered JSON body is limited to 256 KiB. A
 successful auction and an intentional no-bid both return `200` JSON; disabling
@@ -917,7 +909,7 @@ Trusted Server policy. There is no built-in endpoint rate limiter. Example:
 When startup fails, the degraded router replaces normal routing: Fastly,
 Axum, and Cloudflare return `500` for both fallback shapes and all seven
 methods; Spin returns a generic `503`. Only the health behavior shown in the
-generated table survives.
+table survives.
 
 ---
 
@@ -951,8 +943,8 @@ returns `200 application/javascript`; conditional requests can return `304`;
 unknown/disabled filenames return `404`. When `v` exactly equals the generated
 content hash, the response is public and immutable for one year. Other bundle
 responses retain validator-based static caching without the immutable promise.
-The route defines no CORS policy or rate limiter. Its module gate is the checked
-integration registry, not an arbitrary filename lookup.
+The route defines no CORS policy or rate limiter. Its module gate is the
+compiled integration registry, not an arbitrary filename lookup.
 
 **Example:**
 
@@ -970,11 +962,9 @@ All integration modules are built at compile time. At runtime, the server concat
 
 ## Integration Endpoints
 
-Every row below is generated from the checked integration predicate matrix.
+Every row below records a compiled integration registration predicate.
 An integration with no HTTP route can still contribute a browser module,
 rewriter, injector, post-processor, request filter, or auction mediator.
-
-<!-- docs-parity:start api-integration-route-families -->
 
 | Integration          | Registration predicate                                           | HTTP routes                                       |
 | -------------------- | ---------------------------------------------------------------- | ------------------------------------------------- |
@@ -1028,11 +1018,9 @@ rewriter, injector, post-processor, request filter, or auction mediator.
 | `sourcepoint`        | `enabled=true`                                                   | `POST /integrations/sourcepoint/cdn/*`            |
 | `testlight`          | `enabled=true`                                                   | `POST /integrations/testlight/auction`            |
 
-<!-- docs-parity:end api-integration-route-families -->
-
 ### Integration proxy contracts
 
-All integration routes are registered only when the generated predicate is
+All integration routes are registered only when the documented predicate is
 true. A disabled integration registers no route, so its path continues through
 normal routing and can reach the publisher fallback. Duplicate registrations
 are startup errors. None of these routes has built-in caller authentication or

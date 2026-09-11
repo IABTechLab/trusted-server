@@ -1,171 +1,114 @@
 # Documentation Refresh Decisions
 
-- **Decision date:** 2026-08-31
-- **Approver:** `aram356`
-- **Status:** Approved for implementation
+- Decision date: 2026-08-31
+- Last revised: 2026-09-11
+- Approver: `aram356`
+- Delivery: PR #1049 to `rc/202608`
+- Audited base: `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`
 
-This record fixes the owner-gated choices for the documentation refresh. It
-does not record operational receipts; those belong in
-`documentation-refresh-evidence.md` and its referenced external captures.
+This record contains decisions that cannot be inferred from product source. It
+does not treat a moving branch head as immutable evidence.
 
-## Audited tips
+## Delivery boundary
 
-| Name                        | Full commit SHA                            | Use                                                           |
-| --------------------------- | ------------------------------------------ | ------------------------------------------------------------- |
-| `audited_target_tip`        | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Exact required `origin/rc/202608` tip for every package       |
-| `implementation_start_head` | `01bf84a4beb4a1be4f26965478a0211f59392962` | Program-record alignment package start on `spec-docs-refresh` |
+All repository changes ship through
+https://github.com/IABTechLab/trusted-server/pull/1049. No individual,
+containment, tooling, activation, or release-handoff PR is created.
 
-The program-record alignment package fetched `origin/rc/202608` and
-`origin/spec-docs-refresh` on 2026-09-01. The rc ref equaled
-`audited_target_tip`, and the implementation branch contained that commit.
-Every later package repeats both checks and stops for a focused delta audit if
-the target advances.
+PR #1104 is closed and superseded. Its reviewed containment changes were moved
+to PR #1049; it has no merge or deployment claim.
 
-## Owner-gated decisions
+## Documentation tooling scope
 
-### 1. Temporary Fastly service-ID exception
+The custom analysis workspace, generator manifests, scheduled link writer, and
+dependency-submission writer are not part of this refresh. They require a
+separate architecture decision before they may enter the repository. PR #1049
+retains the documentation, existing CI mechanisms, documentation snippets, and
+adapter regression/smoke tests without coupling product tests to documentation
+records.
 
-- Selection: retain the checked-in `fastly.toml` `service_id` only through a
-  typed, temporary scanner allowlist entry.
-- Owner: `aram356`.
-- Rationale: preserve the existing Fastly service binding during this refresh;
-  removing the source-controlled identifier is an independent operation.
-- Expiry: `2026-09-30T00:00:00Z`.
-- Control: check mode fails at or after the expiry instant. Renewal requires a
-  reviewed, committed replacement before expiry. This is not the ops migration
-  deadline, and the migration does not block this refresh.
+## Public and internal content
 
-### 2. CNAME
+### Repository-team onboarding
 
-- Selection: delete `docs/public/CNAME` and retain the project-path base.
-- Owner: `aram356`.
-- Decision date: 2026-08-31.
-- Rejected alternative: adopt a custom domain with `base: '/'`, verified
-  Pages/DNS/TLS configuration, URL inventory changes, and live smokes.
-- Rollback: never restore the placeholder CNAME. Keep the CNAME deleted and
-  re-smoke project URLs, or restore only a previously verified custom-domain
-  DNS/CNAME/TLS tuple without weakening containment exclusions.
+Move maintainer onboarding from `docs/guide/onboarding.md` to
+`docs/internal/onboarding.md` and exclude it from the public build. Preserve the
+public installation and setup journey in the landing, getting-started,
+configuration, and adapter guides.
 
-### 3. `FAQ_POC.md`
+### CNAME
 
-- Selection: move it to `docs/superpowers/archive/FAQ_POC.md`.
-- Owner: `aram356`.
-- Decision date: 2026-08-31.
-- Rejected alternatives: delete it, or rewrite it as the active public page
-  `docs/guide/faq.md` with the rewrite-specific verification contract.
-- Result: no active-set FAQ page and no FAQ route to preserve. The independent
-  gam/kargo tombstone requirements remain unchanged.
+Delete `docs/public/CNAME` and retain VitePress's `/trusted-server` project base.
+Do not restore the old placeholder. A future custom domain requires separately
+verified Pages, DNS, TLS, redirects, canonical URLs, and asset paths.
 
-### 4. `business-use-cases.md`
+### FAQ proof of concept
 
-- State: closed.
-- Selection: exclude it from the public build and add the source-level
-  unverified banner.
-- Rejected alternative: rewrite and republish it inside this refresh.
+Archive `FAQ_POC.md` under `docs/superpowers/archive/`. Do not publish it as an
+active FAQ. Existing integration tombstones remain independently maintained.
 
-### 5. CHANGELOG release cut
+### Business use cases
 
-- State: explicitly non-blocking and out of scope.
-- Selection: apply the deterministic no-release edit in the design unless a
-  release lands first; a release requires rebase and focused re-audit.
+Keep `docs/business-use-cases.md` source-visible with an unverified-content
+banner and exclude it from the public site. A verified rewrite can republish it
+later.
 
-### 6. Governance ownership
+## Governance
 
-- Owner: none named.
-- Selection: factual-governance fallback.
-- Decision date: 2026-08-31.
-- Required edit: correct `ProjectGovernance.md` to current evidence—no minutes
-  exist and releases are not continuous—without adding CODEOWNERS or minutes
-  commitments. Naming owners remains a maintainer follow-up.
+Describe only current governance evidence. Do not invent meeting minutes,
+release cadence, CODEOWNERS, or named maintainers. Governance expansion is a
+maintainer decision outside this refresh.
 
-### 7. Delivery shape and external controls
+## Fastly service ID exception
 
-`aram356` approved the following on 2026-08-31:
+- Type: service ID
+- Scope: the existing `service_id` in root `fastly.toml`
+- Owner: `aram356`
+- Rationale: preserve the active service binding during the documentation
+  refresh
+- Expiry: `2026-09-30T00:00:00Z`
 
-- all repository implementation work remains on `spec-docs-refresh` and
-  existing PR #1049, targeted at `rc/202608`;
-- no separate containment, CNAME, controller, activation, or release-handoff
-  implementation PR is created;
-- PR #1104 remains closed and superseded, with only its two reviewed source
-  commits retained for transfer into #1049 during Task 2; and
-- live Pages/CNAME behavior, the first real schedule, dependency submission
-  and graph visibility, and any optional `main` protection change remain
-  external release operations.
+This is not a blanket sensitive-data exception. The owner must remove the value
+or approve a new explicit expiry before that date.
 
-The immutable-baseline, exact-SHA binding, and durable external-capture
-requirements in the design remain mandatory. Local builds and fixture output
-may prove repository behavior but cannot substitute for release receipts.
+## Examples and sensitive material
 
-### 8. CodeQL rc push coverage
+Use fictional credentials, `example.com` domains, and non-customer identifiers.
+Do not include private contacts, internal access instructions, live tokens,
+cookies, or deployable secrets. Public vendor URLs are allowed when necessary
+to document an integration.
 
-- State: explicitly non-blocking.
-- Selection: no additional decision is required for implementation to start.
+## CI gate ownership
 
-### 9. Sensitive-data exception taxonomy
+`CLAUDE.md#ci-gates` is the single complete command matrix. `AGENTS.md` points
+to `CLAUDE.md`; `TESTING.md` and the public testing guide add focused navigation
+without copying the matrix.
 
-- Allowed types: vendor URL, hash-pinned fake-credential fixture, historical
-  example, service ID, and project-owned public domain.
-- Required fields: exact type and scope, owner, rationale, and expiry timestamp.
-- Control: ownerless, expired, broad, or untyped exceptions fail closed. An
-  allowed type is not a blanket exemption; each occurrence requires its own
-  narrow record.
-- Current historical-example exception: the exact
-  `your-custom-domain.com` literal occurs only in the approved
-  `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md` audit and
-  this decision row. Owner: `aram356`. Rationale: preserve the approved audit's
-  exact record of the deleted placeholder CNAME. Expiry:
-  `2027-08-31T00:00:00Z`.
-- Current service-ID exception: the `fastly.toml` `service_id` record in
-  decision 1. These are the only two active WP1 sensitive-data exceptions.
+Pull-request workflows remain read-only. Actions use exact release tags. New
+workflow steps containing more than one line of executable logic must call a
+repository script.
 
-## Delivery records
+The aggregate documentation checker is available through a manual-only GitHub
+Actions workflow. It is not a required core or adapter status check.
 
-PR #1049 is the only implementation row. Its head is a timestamped remote
-capture, not a permanent final SHA.
+## Adapter smoke and logging decisions
 
-| Implementation PR                                      | Target      | Audited base                               | Captured remote head                       | Capture time         | State       |
-| ------------------------------------------------------ | ----------- | ------------------------------------------ | ------------------------------------------ | -------------------- | ----------- |
-| https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | `bbfd078b4f4d04eeba39560dc485bf72993ccc60` | 2026-09-08T15:56:32Z | OPEN, draft |
+Every adapter smoke uses isolated temporary state and a real local runtime.
 
-### PR #1049 metadata capture
+Fastly smoke operates on copied manifests in a per-run project. It does not
+lock, modify, or restore the root manifest because it never writes it.
 
-- Capture timestamp: 2026-09-08T15:56:32Z.
-- URL: https://github.com/IABTechLab/trusted-server/pull/1049.
-- State: OPEN, draft.
-- Base: ref `rc/202608`, SHA
-  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
-- Remote head: ref `spec-docs-refresh`, captured SHA
-  `bbfd078b4f4d04eeba39560dc485bf72993ccc60`.
+Spin emits the one startup-failure diagnostic directly to component stderr.
+The adapter does not install a global logger, lower the maximum log level, or
+claim ownership of application logging.
 
-This is the final pre-record implementation checkpoint. The acceptance-record
-commit necessarily advances the PR head; PR #1049's bounded final-acceptance
-region records and validates that exact later head.
+## Evidence policy
 
-### Superseded reviewed source
+Historical receipts name immutable commit SHAs and remain true only for those
+commits. Final acceptance is the exact pushed SHA and hosted checks visible on
+PR #1049. Internal records do not embed a self-referential “current exact head”
+claim.
 
-PR #1104 is closed and superseded. Its base is
-`d516a9e94249e10cbc36e41beb4269f9255cf407`. The reviewed source commits are
-`34b0613dc603ba6529396dad4dd4b7e68b1e11a9` and
-`e6554f24f58f6122fb806ce25432f66033765c65`. Its source branch exists only for
-their later transfer into #1049 in Task 2. PR #1104 has no live merge or deploy
-receipt, and this record claims none.
-
-## Release-pending records
-
-These rows require real post-`main` external captures under the evidence
-ledger's durable hashed-body contract.
-
-| Surface                     | Required external evidence                                                                                                    | Capture owner                                    | Canonical capture destination                                       | State                       |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------- | --------------------------- |
-| Pages and CNAME             | Deployed `main` SHA, live response matrix and headers, project-path assets, and observed CNAME behavior                       | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
-| First scheduled link run    | Default-branch run, attempt, jobs, URLs, app identities, bounded artifact, and resulting issue-reconciliation state           | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
-| Dependency submission/graph | Authenticated `main` SHA, redacted submission and response bodies with hashes, detector/correlator, and graph API JSON        | `aram356`                                        | New append-only PR #1049 comment using the durable capture template | `release-pending`           |
-| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies with hashes, and planted-failure proof | Not selected; no owner unless maintainers opt in | No capture destination unless maintainers opt in                    | `release-pending`, optional |
-
-Local builds, CI simulations, mocked API responses, and fixture output cannot
-complete any release-pending row.
-
-Task 17 replaced every applicable pending owner with `aram356` and every
-applicable pending destination with a new append-only PR #1049 comment under
-the durable capture contract. Optional protection was not selected, so it has
-no fabricated owner or destination.
+Live Pages behavior can only be confirmed after deployment from `main`. Local
+VitePress output proves build structure, not DNS, TLS, redirects, or hosted
+content.

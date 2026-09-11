@@ -5,10 +5,8 @@ configuration, page audits, and EdgeZero-backed lifecycle commands.
 
 ## Command index
 
-The table is generated from authenticated native `--help` captures on Linux and
-macOS. Platform-only commands are shown explicitly.
-
-<!-- docs-parity:start cli-command-union -->
+The table summarizes native `--help` output on Linux and macOS. Platform-only
+commands are shown explicitly.
 
 | Command                          | Availability  | Summary                                                                                          | Usage                                                                                                          |
 | -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
@@ -50,8 +48,6 @@ macOS. Platform-only commands are shown explicitly.
 | `ts provision`                   | Linux + macOS | Provision platform resources through a target adapter                                            | `ts provision [OPTIONS] --adapter <ADAPTER>`                                                                   |
 | `ts rollback`                    | Linux + macOS | Roll a service back to a previously active deployment version                                    | `ts rollback [OPTIONS] --adapter <ADAPTER> --service-id <SERVICE_ID> --version <VERSION>`                      |
 | `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
-
-<!-- docs-parity:end cli-command-union -->
 
 ## Install from source
 

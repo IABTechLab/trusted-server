@@ -1,49 +1,19 @@
-//! Spin-specific logging backend.
+//! Spin startup diagnostics.
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-use std::io::Write as _;
+use std::io;
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-use log::{Level, Log, Metadata, Record};
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use log::{LevelFilter, SetLoggerError};
-
-/// Target reserved for startup diagnostics consumed by the Spin smoke oracle.
-pub(crate) const STARTUP_DIAGNOSTIC_TARGET: &str = "trusted_server_adapter_spin::startup";
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-struct SpinStartupLogger;
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-impl Log for SpinStartupLogger {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() == Level::Error && metadata.target() == STARTUP_DIAGNOSTIC_TARGET
-    }
-
-    fn log(&self, record: &Record<'_>) {
-        if self.enabled(record.metadata()) {
-            // Spin's supported component-log channel is stdout/stderr. EdgeZero's
-            // Spin logger initializer is a no-op, so this adapter backend owns the
-            // write while callers continue to use the `log` facade.
-            let _ = writeln!(std::io::stderr().lock(), "{}", record.args());
-        }
-    }
-
-    fn flush(&self) {}
+/// Emits a startup diagnostic without claiming the process-global logger.
+///
+/// Spin captures component stderr as its supported runtime log. Writing this
+/// one boot failure directly keeps the diagnostic observable even while the
+/// `EdgeZero` Spin logger initializer is a no-op, without filtering application
+/// logs or preventing a future backend from installing the global logger.
+pub(crate) fn emit_startup_diagnostic(message: &str) {
+    let _ = write_startup_diagnostic(&mut io::stderr().lock(), message);
 }
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-static SPIN_STARTUP_LOGGER: SpinStartupLogger = SpinStartupLogger;
-
-/// Installs the target-filtered logger used by the startup smoke oracle.
-///
-/// A repeated request may find the process-global logger already installed;
-/// that is the expected steady state.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub(crate) fn init_logger() -> Result<(), SetLoggerError> {
-    log::set_logger(&SPIN_STARTUP_LOGGER)?;
-    log::set_max_level(LevelFilter::Error);
-    Ok(())
+fn write_startup_diagnostic(writer: &mut impl io::Write, message: &str) -> io::Result<()> {
+    writeln!(writer, "{message}")
 }
 
 #[cfg(test)]
@@ -51,22 +21,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logger_enables_only_the_startup_error_target() {
-        let startup_error = Metadata::builder()
-            .level(Level::Error)
-            .target(STARTUP_DIAGNOSTIC_TARGET)
-            .build();
-        let startup_warning = Metadata::builder()
-            .level(Level::Warn)
-            .target(STARTUP_DIAGNOSTIC_TARGET)
-            .build();
-        let unrelated_error = Metadata::builder()
-            .level(Level::Error)
-            .target("trusted_server_adapter_spin::app")
-            .build();
+    fn stderr_fallback_writes_one_complete_diagnostic() {
+        let mut output = Vec::new();
 
-        assert!(SPIN_STARTUP_LOGGER.enabled(&startup_error));
-        assert!(!SPIN_STARTUP_LOGGER.enabled(&startup_warning));
-        assert!(!SPIN_STARTUP_LOGGER.enabled(&unrelated_error));
+        write_startup_diagnostic(&mut output, "Spin startup failed")
+            .expect("should write the startup diagnostic");
+
+        assert_eq!(output, b"Spin startup failed\n");
     }
 }

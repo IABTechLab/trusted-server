@@ -4,16 +4,12 @@ This guide covers setting up your Fastly account and Compute service for Trusted
 
 ## Support status
 
-<!-- docs-parity:start adapter-support-fastly -->
-
 | Adapter  | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization |
 | -------- | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | --------------------- |
 | `fastly` | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                  |
 
-<!-- docs-parity:end adapter-support-fastly -->
-
-The row above is generated from the checked
-[adapter-support record](./api-reference#adapter-and-startup-support). A healthy
+The row above summarizes the
+[adapter-support contract](./api-reference#adapter-and-startup-support). A healthy
 response does not prove that configuration loaded: Fastly serves `/health`
 before it constructs the application.
 
@@ -378,12 +374,12 @@ Finally, the publisher request must return 200, retain the stub-origin
 sentinel, rewrite an origin URL to the Fastly listener, and omit the original
 URL. A green health response cannot satisfy that final assertion.
 
-The trap stops Viceroy and the stub origin, restores `fastly.toml` byte for
-byte, restores or removes `.fastly.toml.edgezero-lock` according to its initial
-state, and removes the isolated temporary directory. The synthetic credentials
-exist only in that local configuration. For a deployed service, provision and
-link the stores described above and write the three secrets through Fastly's
-secret-store interface.
+The script copies `edgezero.toml` and `fastly.toml` into a per-run temporary
+project before pushing local configuration or adding synthetic secrets. The
+tracked manifests remain untouched, including when smoke runs overlap. Its trap
+stops Viceroy and the stub origin and removes the temporary project. For a
+deployed service, provision and link the stores described above and write the
+three secrets through Fastly's secret-store interface.
 
 ## Next Steps
 

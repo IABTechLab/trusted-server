@@ -13,32 +13,25 @@ smoke_require_command fastly
 smoke_require_command python3
 
 WORKSPACE=$(smoke_make_workspace fastly)
+FASTLY_PROJECT="$WORKSPACE/project"
+FASTLY_MANIFEST="$FASTLY_PROJECT/fastly.toml"
+EDGEZERO_MANIFEST="$FASTLY_PROJECT/edgezero.toml"
 ORIGIN_PORT=${FASTLY_SMOKE_ORIGIN_PORT:-18880}
 BASE_PORT=${FASTLY_SMOKE_PORT:-18980}
 ORIGIN_PID=""
 APP_PID=""
-FASTLY_BACKUP="$WORKSPACE/fastly.toml.original"
-FASTLY_LOCK="$REPO_ROOT/.fastly.toml.edgezero-lock"
-FASTLY_LOCK_BACKUP="$WORKSPACE/fastly.toml.edgezero-lock.original"
-FASTLY_LOCK_EXISTED=false
-cp "$REPO_ROOT/fastly.toml" "$FASTLY_BACKUP"
-if [ -f "$FASTLY_LOCK" ]; then
-    cp "$FASTLY_LOCK" "$FASTLY_LOCK_BACKUP"
-    FASTLY_LOCK_EXISTED=true
-fi
 
 cleanup() {
     smoke_stop_process "$APP_PID"
     smoke_stop_process "$ORIGIN_PID"
-    cp "$FASTLY_BACKUP" "$REPO_ROOT/fastly.toml"
-    if [ "$FASTLY_LOCK_EXISTED" = true ]; then
-        cp "$FASTLY_LOCK_BACKUP" "$FASTLY_LOCK"
-    else
-        rm -f -- "$FASTLY_LOCK"
-    fi
     smoke_remove_workspace "$WORKSPACE"
 }
 trap cleanup EXIT INT TERM
+
+mkdir -p "$FASTLY_PROJECT"
+cp "$REPO_ROOT/edgezero.toml" "$EDGEZERO_MANIFEST"
+cp "$REPO_ROOT/fastly.toml" "$FASTLY_MANIFEST"
+ln -s "$REPO_ROOT/crates" "$FASTLY_PROJECT/crates"
 
 smoke_resolve_ts_binary "$REPO_ROOT"
 WASM_BINARY=${WASM_BINARY_PATH:-$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm}
@@ -53,7 +46,7 @@ fi
 
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
-smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
+smoke_initialize_config "$FASTLY_PROJECT" "$WORKSPACE" "$ORIGIN_PORT"
 
 run_case() {
     local case_name="$1"
@@ -67,7 +60,7 @@ run_case() {
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
 
     fastly compute serve \
-        --dir "$REPO_ROOT" \
+        --dir "$FASTLY_PROJECT" \
         --file "$WASM_BINARY" \
         --addr "127.0.0.1:$port" >"$log_path" 2>&1 &
     APP_PID=$!
@@ -95,36 +88,47 @@ write_without_secret() {
     local source="$1"
     local destination="$2"
     local missing_key="$3"
-    python3 - "$source" "$destination" "$missing_key" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-source, destination, missing_key = sys.argv[1:]
-text = Path(source).read_text(encoding="utf-8")
-pattern = (
-    r'\n\[\[local_server\.secret_stores\.ts_secrets\]\]\n'
-    r'key = "' + re.escape(missing_key) + r'"\n'
-    r'data = "[^"]*"\n'
-)
-updated, count = re.subn(pattern, "\n", text, count=1)
-if count != 1:
-    raise SystemExit(f"expected one Fastly secret block for {missing_key}; found {count}")
-Path(destination).write_text(updated, encoding="utf-8")
-PY
+    awk -v missing_key="$missing_key" '
+        $0 == "[[local_server.secret_stores.ts_secrets]]" {
+            header = $0
+            if ((getline key_line) <= 0 || (getline data_line) <= 0) {
+                exit 2
+            }
+            if (key_line == "key = \"" missing_key "\"" &&
+                data_line ~ /^data = "[^"]*"$/) {
+                removed++
+                next
+            }
+            print header
+            print key_line
+            print data_line
+            next
+        }
+        { print }
+        END {
+            if (removed != 1) {
+                print "expected one Fastly secret block for " missing_key \
+                    "; found " (removed + 0) > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' "$source" >"$destination"
 }
 
 run_case missing-config "$BASE_PORT" 500 \
     "key 'trusted_server_config' not found in config store 'trusted_server_config'"
 
-"$SMOKE_TS_BIN" config push \
-    --adapter fastly \
-    --local \
-    --manifest "$REPO_ROOT/edgezero.toml" \
-    --app-config "$SMOKE_APP_CONFIG" \
-    --yes \
-    --no-diff
-cat >>"$REPO_ROOT/fastly.toml" <<EOF
+(
+    cd "$FASTLY_PROJECT"
+    "$SMOKE_TS_BIN" config push \
+        --adapter fastly \
+        --local \
+        --manifest "$EDGEZERO_MANIFEST" \
+        --app-config "$SMOKE_APP_CONFIG" \
+        --yes \
+        --no-diff
+)
+cat >>"$FASTLY_MANIFEST" <<EOF
 
 [[local_server.secret_stores.ts_secrets]]
 key = "handler_password"
@@ -139,19 +143,19 @@ key = "ec_passphrase"
 data = "$SMOKE_EC_VALUE"
 EOF
 CONFIGURED_FASTLY="$WORKSPACE/fastly.toml.configured"
-cp "$REPO_ROOT/fastly.toml" "$CONFIGURED_FASTLY"
+cp "$FASTLY_MANIFEST" "$CONFIGURED_FASTLY"
 
-write_without_secret "$CONFIGURED_FASTLY" "$REPO_ROOT/fastly.toml" handler_password
+write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" handler_password
 run_case missing-handler "$((BASE_PORT + 1))" 500 \
     "failed to resolve secret reference at \`handlers[0].password\`"
-write_without_secret "$CONFIGURED_FASTLY" "$REPO_ROOT/fastly.toml" publisher_proxy_secret
+write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" publisher_proxy_secret
 run_case missing-proxy "$((BASE_PORT + 2))" 500 \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
-write_without_secret "$CONFIGURED_FASTLY" "$REPO_ROOT/fastly.toml" ec_passphrase
+write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" ec_passphrase
 run_case missing-ec "$((BASE_PORT + 3))" 500 \
     "failed to resolve secret reference at \`ec.passphrase\`"
 
-cp "$CONFIGURED_FASTLY" "$REPO_ROOT/fastly.toml"
+cp "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST"
 run_case positive "$((BASE_PORT + 4))" 200
 
 echo "Fastly first-success smoke passed"

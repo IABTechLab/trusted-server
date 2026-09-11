@@ -474,11 +474,7 @@ fn legacy_admin_alias_denied() -> Response {
 /// 503 Service Unavailable. The startup error is logged but not echoed in the
 /// response body so that deployment state is not leaked to anonymous callers.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    log::error!(
-        target: crate::logging::STARTUP_DIAGNOSTIC_TARGET,
-        "{}",
-        startup_error_diagnostic(e)
-    );
+    crate::logging::emit_startup_diagnostic(&startup_error_diagnostic(e));
 
     let handler = |_ctx: RequestContext| {
         let body = edgezero_core::body::Body::from("Service Unavailable\n");

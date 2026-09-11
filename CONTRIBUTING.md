@@ -32,9 +32,9 @@ release responsibilities.
 
 ## Verify
 
-Run the target-matched checks in [TESTING.md](TESTING.md). That file is the
-canonical command surface for local and CI verification; this guide does not
-duplicate the gate list.
+Run the target-matched checks in [CLAUDE.md](CLAUDE.md#ci-gates), the
+canonical command surface for local and CI verification. [TESTING.md](TESTING.md)
+links focused runbooks without duplicating that matrix.
 
 Keep a pull request in draft while required checks or known changes remain.
 Before requesting review, inspect the complete diff, resolve all failures, and

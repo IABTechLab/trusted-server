@@ -6,15 +6,11 @@ production deployment target.
 
 ## Support status
 
-<!-- docs-parity:start adapter-support-axum -->
-
 | Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
 | ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
 | `axum`  | development    | real   | `500`          | no             | multiple         | outermost sanitize         | none                  |
 
-<!-- docs-parity:end adapter-support-axum -->
-
-This generated row is the canonical status summary. Axum supports multiple
+This row is the canonical status summary. Axum supports multiple
 auction providers and exposes a real `/health` handler. A startup failure
 replaces every route with a 500 response, including `/health`.
 
@@ -54,7 +50,7 @@ config, local-push output, bodies, headers, and logs.
 Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
 and key rotation are registered but return not-supported responses because the
 adapter has no request-time KV implementation. It sanitizes forwarded client-IP
-headers but does not resolve `[trusted_client_ip]`; see the generated
+headers but does not resolve `[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
 For an edge deployment, use the [Fastly](./fastly),

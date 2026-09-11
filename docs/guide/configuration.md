@@ -87,11 +87,8 @@ output is not safe for the current terminal or CI log. The flag suppresses the
 diff; it does not move inline values to a secret store.
 :::
 
-The independent lifecycle, key-identity, serialization, runtime, and secret
-axes for every exceptional field are generated from the checked settings
-record:
-
-<!-- docs-parity:start settings-field-dispositions -->
+The following table records the independent lifecycle, key-identity,
+serialization, runtime, and secret axes for every exceptional field:
 
 | Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
 | ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
@@ -113,8 +110,6 @@ record:
 | `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
 | `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
 | `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | deliberately inline      |
-
-<!-- docs-parity:end settings-field-dispositions -->
 
 Migrate an existing deployment in this order:
 
@@ -190,8 +185,6 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-<!-- docs-parity:start settings-roots -->
-
 | Section                    | Purpose                                                                 |
 | -------------------------- | ----------------------------------------------------------------------- |
 | `[auction]`                | Auction orchestration, provider instances, bidder routes, and mediation |
@@ -211,8 +204,6 @@ fail and the service will return its startup-error response.
 | `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
 | `[tinybird]`               | Direct Tinybird auction telemetry                                       |
 | `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
-
-<!-- docs-parity:end settings-roots -->
 
 ## Example: Production Setup
 
@@ -263,8 +254,6 @@ provider = "pbs-main"
 ## Detailed Reference
 
 The sections below consolidate the full configuration reference on this page.
-
-<!-- docs-parity:ownership configuration-reference owner=documentation-maintainers -->
 
 ## Environment Variable Overrides (Typed CLI)
 
@@ -1484,8 +1473,6 @@ Every deploy-validated integration ID is listed here. A section is optional
 unless its integration is enabled or a CLI workflow retains an explicit
 disabled stub.
 
-<!-- docs-parity:start integration-configurations -->
-
 | Section                             | Reference                                                    |
 | ----------------------------------- | ------------------------------------------------------------ |
 | `[integrations.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)          |
@@ -1502,8 +1489,6 @@ disabled stub.
 | `[integrations.prebid]`             | [Prebid](/guide/integrations/prebid)                         |
 | `[integrations.sourcepoint]`        | [Sourcepoint](/guide/integrations/sourcepoint)               |
 | `[integrations.testlight]`          | [Testlight](/guide/integrations/testlight)                   |
-
-<!-- docs-parity:end integration-configurations -->
 
 ### Common Fields
 
@@ -2032,10 +2017,8 @@ timeout_ms = 500
 
 ### Profile configuration
 
-The generated table is bound to the extracted typed schemas. `Required` refers
-to the selected profile's `profile_config` object, not to the provider wrapper.
-
-<!-- docs-parity:start provider-profile-fields -->
+The table reflects the typed profile schemas. `Required` refers to the selected
+profile's `profile_config` object, not to the provider wrapper.
 
 | Profile         | Field                      | Required | Default | Provider timeout default | Constraints                                                                                                      |
 | --------------- | -------------------------- | -------- | ------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
@@ -2053,8 +2036,6 @@ to the selected profile's `profile_config` object, not to the provider wrapper.
 | `prebid-server` | `test_mode`                | No       | `false` | `1000 ms`                | Sets OpenRTB `test = 1`                                                                                          |
 | `standard`      | `imp_ext`                  | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object                                               |
 | `standard`      | `request_ext`              | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object; `trusted_server` is reserved                 |
-
-<!-- docs-parity:end provider-profile-fields -->
 
 Timeout defaults are 1000 ms for `prebid-server`, 800 ms for `aps`, and the
 auction timeout for `standard`. An explicit provider timeout overrides the

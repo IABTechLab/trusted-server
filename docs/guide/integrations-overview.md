@@ -8,8 +8,6 @@ loaded by a separate tag.
 
 ## Adapter support
 
-<!-- docs-parity:start product-adapter-support -->
-
 | Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
 | ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
 | `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
@@ -17,10 +15,8 @@ loaded by a separate tag.
 | `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
 | `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
 
-<!-- docs-parity:end product-adapter-support -->
-
-This table is generated from the checked adapter-support record. “Startup
-health” means the degraded startup router still serves `/health`; it does not
+This table summarizes the adapter implementations. “Startup health” means the
+degraded startup router still serves `/health`; it does not
 mean configuration loaded. “Provider fan-out” describes whether the adapter
 can dispatch one auction to multiple configured providers. See the individual
 [Fastly](/guide/fastly), [Axum](/guide/axum-dev),
@@ -28,8 +24,6 @@ can dispatch one auction to multiple configured providers. See the individual
 their operational procedures.
 
 ## Integration inventory
-
-<!-- docs-parity:start product-integration-inventory -->
 
 | Integration                                                    | Operational status | Deploy ID | Registration       | Browser loading |
 | -------------------------------------------------------------- | ------------------ | --------- | ------------------ | --------------- |
@@ -49,10 +43,8 @@ their operational procedures.
 | [`sourcepoint`](/guide/integrations/sourcepoint)               | development        | yes       | settings builder   | bundled         |
 | [`testlight`](/guide/integrations/testlight)                   | development        | yes       | settings builder   | bundled         |
 
-<!-- docs-parity:end product-integration-inventory -->
-
-The inventory is generated from source-checked registration sets and manually
-reviewed maturity records. A deploy ID means the deployment validator accepts
+The inventory summarizes compiled registration sets and reviewed maturity
+records. A deploy ID means the deployment validator accepts
 that identifier; it does not imply that every adapter implements the same
 runtime capability. `creative` is a browser capability, not a deploy ID.
 
@@ -65,7 +57,7 @@ Browser loading has three distinct modes:
 - `none` means the capability has no integration browser module.
 
 See [Trusted Server JavaScript](/guide/tsjs) for the exact 12-module,
-13-bundle model and [API Reference](/guide/api-reference) for generated route
+13-bundle model and [API Reference](/guide/api-reference) for route
 families and adapter availability.
 
 ## How capabilities compose
@@ -79,7 +71,7 @@ that any arbitrary combination is conflict-free.
 
 Configuration is loaded when the process starts. Change it through the
 [EdgeZero configuration lifecycle](/guide/edgezero), then restart or deploy the
-adapter as required. Exact fields and defaults live in the generated
+adapter as required. Exact fields and defaults live in the
 [Configuration Reference](/guide/configuration).
 
 ## Adding an integration

@@ -83,36 +83,42 @@ write_runtime_config() {
     local destination="$1"
     local config_json="$2"
     local missing_key="${3:-}"
-    python3 - \
-        "$CLOUDFLARE_WORK/wrangler.ci.toml" \
-        "$destination" \
-        "$config_json" \
-        "$missing_key" \
-        "$SMOKE_HANDLER_VALUE" \
-        "$SMOKE_PROXY_VALUE" \
-        "$SMOKE_EC_VALUE" <<'PY'
-from pathlib import Path
-import sys
-
-template_path, destination, config_json, missing_key, handler, proxy, ec = sys.argv[1:]
-placeholder = 'TRUSTED_SERVER_CONFIG = "{}"'
-text = Path(template_path).read_text(encoding="utf-8")
-if text.count(placeholder) != 1:
-    raise SystemExit("Cloudflare smoke template must contain one config placeholder")
-if config_json:
-    text = text.replace(placeholder, f"TRUSTED_SERVER_CONFIG = '''{config_json}'''")
-else:
-    text = text.replace(placeholder, "")
-values = {
-    "handler_password": handler,
-    "publisher_proxy_secret": proxy,
-    "ec_passphrase": ec,
-}
-for key, value in values.items():
-    if key != missing_key:
-        text += f'{key} = "{value}"\n'
-Path(destination).write_text(text, encoding="utf-8")
-PY
+    local config_line=""
+    if [ -n "$config_json" ]; then
+        config_line="TRUSTED_SERVER_CONFIG = '''$config_json'''"
+    fi
+    CLOUDFLARE_SMOKE_CONFIG_LINE="$config_line" awk \
+        -v missing_key="$missing_key" \
+        -v handler="$SMOKE_HANDLER_VALUE" \
+        -v proxy="$SMOKE_PROXY_VALUE" \
+        -v ec="$SMOKE_EC_VALUE" '
+        BEGIN {
+            config_line = ENVIRON["CLOUDFLARE_SMOKE_CONFIG_LINE"]
+        }
+        $0 == "TRUSTED_SERVER_CONFIG = \"{}\"" {
+            placeholders++
+            if (config_line != "") {
+                print config_line
+            }
+            next
+        }
+        { print }
+        END {
+            if (placeholders != 1) {
+                print "Cloudflare smoke template must contain one config placeholder" > "/dev/stderr"
+                exit 1
+            }
+            if (missing_key != "handler_password") {
+                print "handler_password = \"" handler "\""
+            }
+            if (missing_key != "publisher_proxy_secret") {
+                print "publisher_proxy_secret = \"" proxy "\""
+            }
+            if (missing_key != "ec_passphrase") {
+                print "ec_passphrase = \"" ec "\""
+            }
+        }
+    ' "$CLOUDFLARE_WORK/wrangler.ci.toml" >"$destination"
 }
 
 run_case() {

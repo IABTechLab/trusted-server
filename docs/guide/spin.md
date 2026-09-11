@@ -6,15 +6,11 @@ through Spin variables.
 
 ## Support status
 
-<!-- docs-parity:start adapter-support-spin -->
-
 | Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization            |
 | ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | -------------------------------- |
 | `spin`  | experimental   | real   | `503`          | yes            | single           | outermost sanitize         | innermost Spin-header derivation |
 
-<!-- docs-parity:end adapter-support-spin -->
-
-This generated row is the canonical status summary. Spin supports one enabled
+This row is the canonical status summary. Spin supports one enabled
 auction provider. When startup fails, its hardened router preserves `/health`
 but answers publisher routes with 503; neither response proves successful
 configuration.

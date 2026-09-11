@@ -7,15 +7,11 @@ config that `ts config push` writes into KV to the nested
 
 ## Support status
 
-<!-- docs-parity:start adapter-support-cloudflare -->
-
 | Adapter      | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
 | ------------ | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
 | `cloudflare` | development    | absent | `500`          | no             | single           | outermost sanitize         | none                  |
 
-<!-- docs-parity:end adapter-support-cloudflare -->
-
-This generated row is the canonical status summary. Cloudflare has no
+This row is the canonical status summary. Cloudflare has no
 `/health` route, supports one enabled auction provider, and returns 500 on
 every route when startup fails.
 

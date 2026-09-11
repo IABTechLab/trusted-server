@@ -20,9 +20,9 @@ registry.
 | `telemetry.rs` | Emit bounded auction telemetry where the adapter supports it |
 | `config.rs`, `context.rs`, `types.rs` | Shared configuration aliases, request context, and domain types |
 
-Adapters register the public route with their own route tables. The canonical
-route inventory is checked in `tools/docs-parity/manifests/routes.toml`; this
-README does not duplicate unrelated adapter routes or line numbers.
+Adapters register the public route with their own route tables. The
+[API reference](../../../../docs/guide/api-reference.md) documents availability
+without duplicating route definitions or source line numbers here.
 
 ## Configuration ownership
 
