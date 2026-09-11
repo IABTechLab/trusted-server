@@ -165,15 +165,21 @@ sequenceDiagram
     TSJS->>TSJS: Base64 encode full OpenRTB-style EID array<br/>[{source, uids:[{id, atype, ext?}]}]
     TSJS->>B: document.cookie = "ts-eids=..."
 
-    Note over B,TS: Next page request
-    B->>TS: Request with ts-eids cookie
+    Note over B,TS: Next eligible EID-sync request
+    B->>TS: Document navigation, POST /auction,<br/>or admitted GET /_ts/page-bids
     TS->>TS: Base64 decode → parse OpenRTB-style EIDs<br/>match source domains to partners
-    TS->>KV: upsert_partner_id() per match<br/>(skips write when UID unchanged)
+    TS->>KV: Add missing partner IDs in one conditional write<br/>skip when UIDs already match
 ```
 
 Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shape in `ts-eids`. The server remains backward-compatible with earlier flattened `{source, id, atype}` cookies during rollout, but new cookies use the structured `uids[]` form.
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
+
+Returning-user cookie persistence runs only on publisher document navigations, `POST /auction`, and admitted `GET /_ts/page-bids` SPA navigations. Static assets, analytics, integration requests, filter short circuits, and other subresources do not decode or persist these cookies. New EC creation remains eligible regardless of route because its backing row must include the request's initial IDs.
+
+Each eligible request attempts at most one conditional cookie update. If another writer wins, Trusted Server reads the row once and does not write again from that request. A matching value completes the sync; an absent or different value is deferred.
+
+Browser cookies do not carry a trustworthy value timestamp or sequence. Trusted Server therefore adds missing partner IDs but does not replace a different stored UID from a browser cookie, even on later eligible requests. Pull- or push-enabled partners can replace that value through their authoritative synchronization path. A cookie-only partner retains the stored UID until an authoritative freshness rule is introduced or the EC row expires.
 
 ### EID Seeding and Prebid Bidstream Forwarding
 
@@ -196,8 +202,8 @@ sequenceDiagram
         B->>B: Prebid User ID modules resolve IDs
         B->>TSJS: getUserIdsAsEids()
         TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs
-        B->>TS: Next request with ts-eids
-        TS->>KV: Decode cookie and upsert matched partner UIDs
+        B->>TS: Next eligible request with ts-eids
+        TS->>KV: Add missing matched partner UIDs<br/>defer different stored values
     end
 
     Note over B,TS: Prebid-routed auction

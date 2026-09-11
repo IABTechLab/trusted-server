@@ -87,6 +87,104 @@ impl PartnerIdUpdate {
     }
 }
 
+/// Terminal result of one browser EID-cookie persistence attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub(crate) enum EidCookieSyncOutcome {
+    /// The stored values already matched without a write.
+    #[display("already_matched")]
+    AlreadyMatched,
+    /// The one conditional write succeeded.
+    #[display("written")]
+    Written,
+    /// The write added missing IDs while deferring different values of unknown freshness.
+    #[display("written_with_deferred_freshness")]
+    WrittenWithDeferredFreshness,
+    /// A conflicting writer persisted every desired value.
+    #[display("conflict_matched")]
+    ConflictMatched,
+    /// A conflict left at least one desired value absent or different.
+    #[display("deferred_conflict")]
+    DeferredConflict,
+    /// A different stored value had unknown freshness.
+    #[display("deferred_freshness")]
+    DeferredFreshness,
+    /// An eventually consistent read missed a row already proven to exist.
+    #[display("deferred_stale_read")]
+    DeferredStaleRead,
+    /// The identity graph row was missing.
+    #[display("missing")]
+    Missing,
+    /// Consent had been withdrawn in the identity graph.
+    #[display("consent_withdrawn")]
+    ConsentWithdrawn,
+    /// KV or serialization failed.
+    #[display("failed")]
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CookieUpdateApplication {
+    AlreadyMatched,
+    Changed { deferred: bool },
+    DeferredFreshness,
+}
+
+fn apply_cookie_partner_id_updates(
+    entry: &mut KvEntry,
+    updates: &[PartnerIdUpdate],
+) -> CookieUpdateApplication {
+    let mut latest_updates = BTreeMap::new();
+    for update in updates {
+        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+    }
+
+    let mut changed = false;
+    let mut deferred = false;
+    for (partner_id, uid) in latest_updates {
+        match entry.ids.get(partner_id) {
+            Some(existing) if existing.uid == uid => continue,
+            // Browser EID cookies carry no value-owned sequence or timestamp.
+            // A different value therefore has unknown freshness and must not
+            // replace the stored value.
+            Some(_) => {
+                deferred = true;
+                continue;
+            }
+            None => {}
+        }
+
+        entry.ids.insert(
+            partner_id.to_owned(),
+            super::kv_types::KvPartnerId {
+                uid: uid.to_owned(),
+            },
+        );
+        changed = true;
+    }
+
+    if changed {
+        CookieUpdateApplication::Changed { deferred }
+    } else if deferred {
+        CookieUpdateApplication::DeferredFreshness
+    } else {
+        CookieUpdateApplication::AlreadyMatched
+    }
+}
+
+fn partner_id_updates_match(entry: &KvEntry, updates: &[PartnerIdUpdate]) -> bool {
+    let mut latest_updates = BTreeMap::new();
+    for update in updates {
+        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+    }
+
+    latest_updates.into_iter().all(|(partner_id, uid)| {
+        entry
+            .ids
+            .get(partner_id)
+            .is_some_and(|existing| existing.uid == uid)
+    })
+}
+
 pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
@@ -454,88 +552,152 @@ impl KvIdentityGraph {
         )))
     }
 
-    /// Atomically merges multiple partner IDs into the existing entry.
+    /// Persists browser EID cookies with one conditional write and one conflict read.
     ///
-    /// Uses one read-modify-write operation for all updates so request-local
-    /// EID cookie ingestion does not perform a KV read per matched partner.
-    /// Duplicate partner IDs are collapsed with the last value winning.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::KvStore`] on store error, missing root
-    /// entry, withdrawn root entry, or CAS exhaustion after
-    /// [`MAX_CAS_RETRIES`] attempts.
-    pub(crate) fn upsert_partner_ids(
+    /// Browser cookies do not carry a value-owned version, so a different
+    /// existing value has unknown freshness and is always deferred. After a CAS
+    /// conflict this method never writes again. A live follow-up becomes the
+    /// authoritative snapshot; a missing or failed follow-up retains the live
+    /// pre-write snapshot as proof and defers the update.
+    pub(crate) fn sync_eid_cookie_updates_from_snapshot(
         &self,
         ec_id: &str,
         updates: &[PartnerIdUpdate],
-    ) -> Result<(), Report<TrustedServerError>> {
+        snapshot: EcKvSnapshot,
+    ) -> (EcKvSnapshot, EidCookieSyncOutcome) {
         if updates.is_empty() {
-            return Ok(());
+            return (snapshot, EidCookieSyncOutcome::AlreadyMatched);
         }
 
-        for attempt in 0..MAX_CAS_RETRIES {
-            let (mut entry, generation) = match self.get(ec_id)? {
-                Some(pair) => pair,
-                None => {
-                    log::info!(
-                        "upsert_partner_ids: no entry for '{}', rejecting {} partner updates",
-                        log_id(ec_id),
-                        updates.len(),
-                    );
-                    return Err(self.kv_error(format!(
-                        "Cannot upsert {} partner IDs for missing key '{}'",
-                        updates.len(),
-                        log_id(ec_id),
-                    )));
-                }
-            };
+        let proven = match snapshot {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                ..
+            } if snapshot_id == ec_id => Some(snapshot.clone()),
+            _ => None,
+        };
 
-            // Reject upserts on withdrawn entries — a late sync must not
-            // repopulate partner IDs after consent withdrawal.
-            if !entry.consent.ok {
-                log::info!(
-                    "upsert_partner_ids: entry for '{}' is a tombstone, rejecting {} partner updates",
-                    log_id(ec_id),
-                    updates.len(),
+        let current = match snapshot {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                generation: Some(_),
+                ..
+            } if snapshot_id == ec_id => snapshot,
+            EcKvSnapshot::Failed {
+                ec_id: ref snapshot_id,
+            } if snapshot_id == ec_id => return (snapshot, EidCookieSyncOutcome::Failed),
+            _ => self.load_snapshot(ec_id),
+        };
+
+        let (mut entry, generation) = match current {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                ref entry,
+                generation: Some(generation),
+            } if snapshot_id == ec_id => (entry.as_ref().clone(), generation),
+            EcKvSnapshot::Missing { .. } => {
+                let outcome = if proven.is_some() {
+                    EidCookieSyncOutcome::DeferredStaleRead
+                } else {
+                    EidCookieSyncOutcome::Missing
+                };
+                let kept = Self::keep_proven(ec_id, current, proven.as_ref());
+                return (kept, outcome);
+            }
+            EcKvSnapshot::Failed { .. } => {
+                let kept = Self::keep_proven(ec_id, current, proven.as_ref());
+                return (kept, EidCookieSyncOutcome::Failed);
+            }
+            EcKvSnapshot::Present { .. } | EcKvSnapshot::NotRead => {
+                return (
+                    EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    },
+                    EidCookieSyncOutcome::Failed,
                 );
-                return Err(self.kv_error(format!(
-                    "Cannot upsert {} partner IDs for withdrawn key '{}'",
-                    updates.len(),
-                    log_id(ec_id),
-                )));
             }
+        };
 
-            if !apply_partner_id_updates(&mut entry, updates) {
-                return Ok(());
+        if !entry.consent.ok {
+            return (current, EidCookieSyncOutcome::ConsentWithdrawn);
+        }
+        let deferred_freshness = match apply_cookie_partner_id_updates(&mut entry, updates) {
+            CookieUpdateApplication::AlreadyMatched => {
+                return (current, EidCookieSyncOutcome::AlreadyMatched);
             }
+            CookieUpdateApplication::DeferredFreshness => {
+                return (current, EidCookieSyncOutcome::DeferredFreshness);
+            }
+            CookieUpdateApplication::Changed { deferred } => deferred,
+        };
 
-            let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
-
-            match self.write_entry(
-                ec_id,
-                &body,
-                &meta_str,
-                ENTRY_TTL,
-                EcKvWriteMode::IfGenerationMatch(generation),
-            )? {
-                EcKvWriteOutcome::Written => return Ok(()),
-                EcKvWriteOutcome::PreconditionFailed => {
-                    log::debug!(
-                        "upsert_partner_ids: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}'",
-                        attempt + 1,
-                        log_id(ec_id),
-                    );
-                    // Retry immediately; sleeping here blocks the edge worker.
+        let Ok((body, meta_str)) = Self::serialize_entry(&entry, self.store_name()) else {
+            return (
+                EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                },
+                EidCookieSyncOutcome::Failed,
+            );
+        };
+        match self.write_entry(
+            ec_id,
+            &body,
+            &meta_str,
+            ENTRY_TTL,
+            EcKvWriteMode::IfGenerationMatch(generation),
+        ) {
+            Ok(EcKvWriteOutcome::Written) => (
+                EcKvSnapshot::Present {
+                    ec_id: ec_id.to_owned(),
+                    entry: Box::new(entry),
+                    generation: None,
+                },
+                if deferred_freshness {
+                    EidCookieSyncOutcome::WrittenWithDeferredFreshness
+                } else {
+                    EidCookieSyncOutcome::Written
+                },
+            ),
+            Ok(EcKvWriteOutcome::PreconditionFailed) => {
+                let refreshed = self.load_snapshot(ec_id);
+                let Some(refreshed_entry) = refreshed.entry_for(ec_id) else {
+                    // The failed CAS proved `current`'s generation stale. Keep
+                    // only its existence proof so later writes must reread.
+                    let proof = match current {
+                        EcKvSnapshot::Present {
+                            ec_id: proven_id,
+                            entry,
+                            ..
+                        } => EcKvSnapshot::Present {
+                            ec_id: proven_id,
+                            entry,
+                            generation: None,
+                        },
+                        other => other,
+                    };
+                    let kept = Self::keep_proven(ec_id, refreshed, Some(&proof));
+                    return (kept, EidCookieSyncOutcome::DeferredConflict);
+                };
+                if !refreshed_entry.consent.ok {
+                    return (refreshed, EidCookieSyncOutcome::ConsentWithdrawn);
                 }
+                let outcome = if partner_id_updates_match(refreshed_entry, updates) {
+                    EidCookieSyncOutcome::ConflictMatched
+                } else {
+                    EidCookieSyncOutcome::DeferredConflict
+                };
+                (refreshed, outcome)
+            }
+            Err(err) => {
+                log::warn!("EID cookie sync write failed: {err:?}");
+                (
+                    EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    },
+                    EidCookieSyncOutcome::Failed,
+                )
             }
         }
-
-        Err(self.kv_error(format!(
-            "CAS conflict after {MAX_CAS_RETRIES} retries upserting {} partner IDs for '{}'",
-            updates.len(),
-            log_id(ec_id),
-        )))
     }
 
     /// Merges partner IDs using request-scoped persisted state as the first CAS input.
@@ -753,7 +915,6 @@ impl KvIdentityGraph {
                 return Ok(());
             }
 
-            // Merge the partner ID.
             entry.ids.insert(
                 partner_id.to_owned(),
                 super::kv_types::KvPartnerId {
@@ -1720,6 +1881,123 @@ mod tests {
         }
     }
 
+    /// Store that replaces the row during the first EID CAS write and records
+    /// the request's reads and conditional writes.
+    struct EidConflictEcKv {
+        inner: InMemoryEcKv,
+        concurrent_entry: KvEntry,
+        lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        conditional_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        follow_up_miss: bool,
+        miss_next_lookup: std::sync::atomic::AtomicBool,
+    }
+
+    impl EidConflictEcKv {
+        fn new(
+            concurrent_entry: KvEntry,
+            lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            conditional_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("eid-conflict-store"),
+                concurrent_entry,
+                lookups,
+                conditional_writes,
+                follow_up_miss: false,
+                miss_next_lookup: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn with_follow_up_miss(mut self) -> Self {
+            self.follow_up_miss = true;
+            self
+        }
+
+        fn seed_live(&self, ec_id: &str) {
+            let (body, meta) =
+                KvIdentityGraph::serialize_entry(&live_entry(), self.inner.store_name())
+                    .expect("should serialize initial entry");
+            self.inner
+                .insert(
+                    ec_id,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &meta,
+                        ttl: ENTRY_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed initial entry");
+        }
+    }
+
+    impl EcKvStore for EidConflictEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .miss_next_lookup
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(None);
+            }
+            self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+                self.conditional_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (body, meta) = KvIdentityGraph::serialize_entry(
+                    &self.concurrent_entry,
+                    self.inner.store_name(),
+                )
+                .expect("should serialize concurrent entry");
+                self.inner
+                    .insert(
+                        key,
+                        EcKvWrite {
+                            body: &body,
+                            metadata: &meta,
+                            ttl: ENTRY_TTL,
+                            mode: EcKvWriteMode::Overwrite,
+                        },
+                    )
+                    .expect("should write concurrent entry");
+                if self.follow_up_miss {
+                    self.miss_next_lookup
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(EcKvWriteOutcome::PreconditionFailed);
+            }
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
     #[test]
     fn create_or_revive_retries_cas_conflict_and_succeeds() {
         let store = ConflictInjectingEcKv::new(2, false);
@@ -1859,6 +2137,287 @@ mod tests {
             "should not write when the final duplicate value matches existing state"
         );
         assert_eq!(entry.ids["ssp_x"].uid, "original");
+    }
+
+    #[test]
+    fn eid_cookie_sync_conflict_matching_value_stops_after_one_write() {
+        let ec_id = snapshot_ec_id();
+        let mut concurrent = live_entry();
+        concurrent.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "desired-uid".to_owned(),
+            },
+        );
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = EidConflictEcKv::new(
+            concurrent,
+            std::sync::Arc::clone(&lookups),
+            std::sync::Arc::clone(&writes),
+        );
+        store.seed_live(&ec_id);
+        let graph = KvIdentityGraph::new(store);
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "desired-uid")],
+            snapshot,
+        );
+
+        assert_eq!(outcome, EidCookieSyncOutcome::ConflictMatched);
+        assert_eq!(
+            snapshot
+                .entry_for(&ec_id)
+                .and_then(|entry| entry.ids.get("ssp_x"))
+                .map(|id| id.uid.as_str()),
+            Some("desired-uid"),
+            "the authoritative follow-up snapshot should replace stale request state"
+        );
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a conflict should perform exactly one follow-up read"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a conflict must not trigger another conditional write"
+        );
+    }
+
+    #[test]
+    fn eid_cookie_sync_keeps_live_proof_when_conflict_follow_up_misses() {
+        let ec_id = snapshot_ec_id();
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = EidConflictEcKv::new(
+            live_entry(),
+            std::sync::Arc::clone(&lookups),
+            std::sync::Arc::clone(&writes),
+        )
+        .with_follow_up_miss();
+        store.seed_live(&ec_id);
+        let graph = KvIdentityGraph::new(store);
+
+        let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "desired-uid")],
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert_eq!(outcome, EidCookieSyncOutcome::DeferredConflict);
+        assert!(
+            snapshot.entry_for(&ec_id).is_some(),
+            "the live pre-write row should prevent conflict deferral from entering orphan recovery"
+        );
+        assert_eq!(
+            snapshot.generation_for(&ec_id),
+            None,
+            "a failed CAS must not return its rejected generation"
+        );
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the initial refresh and conflict follow-up should be the only reads"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the conflict must remain the request's only conditional write"
+        );
+    }
+
+    #[test]
+    fn eid_cookie_sync_reports_proven_refresh_miss_as_deferred() {
+        let ec_id = snapshot_ec_id();
+        let graph = KvIdentityGraph::in_memory("empty-store");
+        let proven = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+
+        let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "desired-uid")],
+            proven,
+        );
+
+        assert!(
+            snapshot.entry_for(&ec_id).is_some(),
+            "the add-confirmed row should survive an eventually consistent miss"
+        );
+        assert_eq!(
+            outcome,
+            EidCookieSyncOutcome::DeferredStaleRead,
+            "a row already proven to exist should report a deferred stale read"
+        );
+    }
+
+    #[test]
+    fn partner_id_conflict_match_uses_last_duplicate_value() {
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "latest-uid".to_owned(),
+            },
+        );
+        let updates = [
+            PartnerIdUpdate::new("ssp_x", "older-uid"),
+            PartnerIdUpdate::new("ssp_x", "latest-uid"),
+        ];
+
+        assert!(
+            partner_id_updates_match(&entry, &updates),
+            "conflict matching should use the same last-value-wins rule as writes"
+        );
+    }
+
+    #[test]
+    fn eid_cookie_sync_conflicting_value_defers_after_one_write() {
+        let ec_id = snapshot_ec_id();
+        let mut concurrent = live_entry();
+        concurrent.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "concurrent-uid".to_owned(),
+            },
+        );
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = EidConflictEcKv::new(
+            concurrent,
+            std::sync::Arc::clone(&lookups),
+            std::sync::Arc::clone(&writes),
+        );
+        store.seed_live(&ec_id);
+        let graph = KvIdentityGraph::new(store);
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let (_, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "stale-uid")],
+            snapshot,
+        );
+
+        assert_eq!(outcome, EidCookieSyncOutcome::DeferredConflict);
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a conflict should perform exactly one follow-up read"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a conflict must not trigger another conditional write"
+        );
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read concurrent row")
+            .expect("row should remain");
+        assert_eq!(stored.ids["ssp_x"].uid, "concurrent-uid");
+    }
+
+    #[test]
+    fn eid_cookie_sync_preserves_concurrent_withdrawal_after_conflict() {
+        let ec_id = snapshot_ec_id();
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = EidConflictEcKv::new(
+            KvEntry::tombstone(2_000),
+            std::sync::Arc::clone(&lookups),
+            std::sync::Arc::clone(&writes),
+        );
+        store.seed_live(&ec_id);
+        let graph = KvIdentityGraph::new(store);
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "desired-uid")],
+            snapshot,
+        );
+
+        assert_eq!(outcome, EidCookieSyncOutcome::ConsentWithdrawn);
+        assert!(
+            snapshot
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "the refreshed withdrawal tombstone must remain authoritative"
+        );
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a conflict should perform exactly one follow-up read"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a conflict must not trigger another conditional write"
+        );
+    }
+
+    #[test]
+    fn eid_cookie_sync_defers_different_values_without_value_owned_freshness() {
+        let ec_id = snapshot_ec_id();
+        let graph = KvIdentityGraph::in_memory("freshness-store");
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "protected-uid".to_owned(),
+            },
+        );
+        graph.create(&ec_id, &entry).expect("should seed entry");
+
+        let (_, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "incoming-uid")],
+            graph.load_snapshot(&ec_id),
+        );
+
+        assert_eq!(outcome, EidCookieSyncOutcome::DeferredFreshness);
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read protected row")
+            .expect("row should remain");
+        assert_eq!(stored.ids["ssp_x"].uid, "protected-uid");
+    }
+
+    #[test]
+    fn eid_cookie_sync_adds_missing_ids_while_deferring_different_values() {
+        let ec_id = snapshot_ec_id();
+        let graph = KvIdentityGraph::in_memory("mixed-freshness-store");
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "protected-uid".to_owned(),
+            },
+        );
+        graph.create(&ec_id, &entry).expect("should seed entry");
+
+        let (_, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+            &ec_id,
+            &[
+                PartnerIdUpdate::new("ssp_x", "different-uid"),
+                PartnerIdUpdate::new("ssp_y", "new-uid"),
+            ],
+            graph.load_snapshot(&ec_id),
+        );
+
+        assert_eq!(outcome, EidCookieSyncOutcome::WrittenWithDeferredFreshness);
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read updated row")
+            .expect("row should remain");
+        assert_eq!(stored.ids["ssp_x"].uid, "protected-uid");
+        assert_eq!(stored.ids["ssp_y"].uid, "new-uid");
     }
 
     #[test]
@@ -3512,9 +4071,9 @@ mod tests {
     fn a_locally_built_error_never_carries_the_whole_identifier() {
         // The injected-failure case above covers errors the backend produces.
         // These are built in this module from the identifier itself, on every
-        // path a request can reach: a duplicate create, single and batched
-        // upserts naming a key the store does not hold or has withdrawn, and
-        // the CAS-exhaustion terminal errors.
+        // path a request can reach: a duplicate create, single upserts naming a
+        // key the store does not hold or has withdrawn, and the CAS-exhaustion
+        // terminal errors.
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         kv.create(&ec_id, &live_entry()).expect("should create");
@@ -3525,12 +4084,6 @@ mod tests {
         let missing = kv
             .upsert_partner_id(&format!("{}.ZZZ999", "b".repeat(64)), "partner", "uid")
             .expect_err("an upsert on a missing key should be refused");
-        let batched_missing = kv
-            .upsert_partner_ids(
-                &format!("{}.ZZZ999", "b".repeat(64)),
-                &[PartnerIdUpdate::new("partner", "uid")],
-            )
-            .expect_err("a batched upsert on a missing key should be refused");
         let withdrawn = {
             assert_eq!(
                 kv.write_withdrawal_tombstone(&ec_id, drop)
@@ -3541,12 +4094,9 @@ mod tests {
             kv.upsert_partner_id(&ec_id, "partner", "uid")
                 .expect_err("an upsert on a withdrawn key should be refused")
         };
-        let batched_withdrawn = kv
-            .upsert_partner_ids(&ec_id, &[PartnerIdUpdate::new("partner", "uid")])
-            .expect_err("a batched upsert on a withdrawn key should be refused");
 
-        // The CAS-exhaustion paths build their message the same way, and a
-        // store that never lets a write land is the only way to reach them.
+        // The remaining CAS-exhaustion paths build their message the same way,
+        // and a store that never lets a write land is the only way to reach them.
         let cas_revive = {
             let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
             store.seed_tombstone(&ec_id);
@@ -3561,13 +4111,6 @@ mod tests {
                 .upsert_partner_id(&ec_id, "partner", "uid")
                 .expect_err("should exhaust CAS retries")
         };
-        let cas_batched = {
-            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
-            store.seed_live(&ec_id);
-            KvIdentityGraph::new(store)
-                .upsert_partner_ids(&ec_id, &[PartnerIdUpdate::new("partner", "uid")])
-                .expect_err("should exhaust CAS retries")
-        };
         let cas_if_exists = {
             let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
             store.seed_live(&ec_id);
@@ -3579,12 +4122,9 @@ mod tests {
         for (label, report) in [
             ("duplicate create", duplicate),
             ("missing key", missing),
-            ("batched missing key", batched_missing),
             ("withdrawn key", withdrawn),
-            ("batched withdrawn key", batched_withdrawn),
             ("CAS exhaustion reviving", cas_revive),
             ("CAS exhaustion upserting", cas_upsert),
-            ("CAS exhaustion batch upserting", cas_batched),
             ("CAS exhaustion upserting if present", cas_if_exists),
         ] {
             let rendered = format!("{report:?}");

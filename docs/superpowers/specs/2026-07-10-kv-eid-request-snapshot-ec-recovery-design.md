@@ -174,10 +174,27 @@ empty identity payload.
 ## Finalization Contract
 
 EC finalization accepts the request snapshot and returns an outcome containing
-the current EC context and updated snapshot. Returning-user EID ingestion uses
-the carried entry and generation for its first CAS attempt. It rereads only on
-CAS conflict. After a successful write, it returns the updated entry with no
-usable generation because the backend does not expose the new token.
+the current EC context and updated snapshot. Partner-owned snapshot upserts use
+the carried entry and generation for their first CAS attempt and preserve the
+bounded re-merge behavior described below.
+
+Browser EID-cookie synchronization was later narrowed by
+[#993](https://github.com/IABTechLab/trusted-server/issues/993). Returning-user
+persistence runs only for publisher document navigations, `POST /auction`, and
+admitted `GET /_ts/page-bids` SPA navigations. New EC creation also persists
+initial browser IDs. Other subresources neither decode nor persist the cookies.
+
+An eligible browser-cookie sync makes at most one conditional write. A CAS
+conflict performs one follow-up read and never writes again from that request.
+A live follow-up replaces the request snapshot. A missing or failed follow-up
+keeps prior proof of the row without retaining the rejected generation. A
+matching concurrent value completes the sync; any other update is deferred.
+
+Browser cookies have no trustworthy value timestamp or sequence. A different
+stored UID is therefore preserved on every browser-cookie sync, not only after
+a conflict. Later browser requests do not converge that value by themselves;
+only an authoritative partner pull or push may replace it until a freshness
+rule is defined.
 
 The updated in-memory entry must include partner IDs written during finalization
 so post-send pull sync does not dispatch a partner that was just populated.
@@ -186,9 +203,9 @@ and entry-point layers.
 
 Mutation outcomes contain only state known to be persisted. An unchanged merge
 returns the original entry and generation. A successful write returns the
-persisted updated entry with no generation. A store error or exhausted CAS
-retry returns a failed snapshot rather than claiming request-local updates were
-stored. Pull sync does not dispatch from failed state.
+persisted updated entry with no generation. A store error returns a failed
+snapshot rather than claiming request-local updates were stored. Pull sync does
+not dispatch from failed state.
 
 ## Pull Sync
 
@@ -228,7 +245,8 @@ implementations so future adapters cannot accidentally regress auction timing.
 - No unverified incoming EC ID can create a KV root.
 - A cookie is emitted only after its backing row exists.
 - Tombstones are never converted to live entries by enrichment.
-- CAS conflicts re-merge rather than overwrite concurrent data.
+- Partner-owned CAS conflicts re-merge rather than overwrite concurrent data.
+- Browser-cookie CAS conflicts perform one follow-up read and never retry the write.
 - Consent-denied requests expose no EC or EID data.
 - Post-send failures never change the client response.
 - Logs use redacted EC identifiers through the existing `log_id` helper.
