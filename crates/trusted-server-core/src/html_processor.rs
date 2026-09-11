@@ -21,6 +21,7 @@ use crate::integrations::{
     IntegrationScriptContext, ScriptRewriteAction,
 };
 use crate::publisher::build_empty_bids_script;
+use crate::publisher_late_binding::HtmlInjectionTracker;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
@@ -179,6 +180,29 @@ pub enum BodyCloseInjection {
     Marker(String),
 }
 
+/// How SSAT bids are inserted into parser-confirmed body end tags.
+#[derive(Clone)]
+pub enum BidInjectionMode {
+    /// Read the current bids script from shared state at the body end tag.
+    DirectState,
+    /// Insert an opaque placeholder for a later parser-safe replacement pass.
+    Placeholder {
+        /// Placeholder HTML inserted before the body end tag.
+        html: String,
+        /// Shared tracker for parser-owned head and body insertion ordering.
+        tracker: Arc<HtmlInjectionTracker>,
+    },
+}
+
+/// Whether full-document HTML post-processors run inside this processor.
+#[derive(Clone, Copy)]
+pub enum HtmlPostProcessingMode {
+    /// Run registered full-document post-processors at EOF.
+    Enabled,
+    /// Skip post-processors so callers can run them after bid late binding.
+    Disabled,
+}
+
 /// Configuration for HTML processing
 #[derive(Clone)]
 pub struct HtmlProcessorConfig {
@@ -209,6 +233,13 @@ pub struct HtmlProcessorConfig {
     /// `None` on every path that cannot store a shared template, so an ordinary inline
     /// request does not pay for handlers whose only consumer is the template-cache gate.
     pub csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// Bid insertion strategy for parser-confirmed body end tags.
+    pub bid_injection_mode: BidInjectionMode,
+    /// Controls whether full-document post-processors run inside this processor.
+    pub post_processing_mode: HtmlPostProcessingMode,
+    /// Per-document integration state shared by script rewriters and optional
+    /// post-processors.
+    pub document_state: IntegrationDocumentState,
 }
 
 impl HtmlProcessorConfig {
@@ -233,6 +264,9 @@ impl HtmlProcessorConfig {
             body_close: BodyCloseInjection::None,
             suppress_datadome_client_side_tag: false,
             csp_nonce_observed: None,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         }
     }
 
@@ -288,6 +322,35 @@ impl HtmlProcessorConfig {
         self.suppress_datadome_client_side_tag = suppress;
         self
     }
+
+    /// Insert `placeholder_html` at the parser-confirmed body end tag instead
+    /// of reading bids directly from shared state.
+    #[must_use]
+    pub fn with_bid_placeholder(
+        mut self,
+        placeholder_html: String,
+        tracker: Arc<HtmlInjectionTracker>,
+    ) -> Self {
+        self.bid_injection_mode = BidInjectionMode::Placeholder {
+            html: placeholder_html,
+            tracker,
+        };
+        self
+    }
+
+    /// Disable full-document post-processors for a caller-managed buffered pass.
+    #[must_use]
+    pub fn without_post_processing(mut self) -> Self {
+        self.post_processing_mode = HtmlPostProcessingMode::Disabled;
+        self
+    }
+
+    /// Use caller-provided document state for multi-phase processing.
+    #[must_use]
+    pub fn with_document_state(mut self, document_state: IntegrationDocumentState) -> Self {
+        self.document_state = document_state;
+        self
+    }
 }
 
 /// Create an HTML processor with URL replacement and integration hooks.
@@ -298,8 +361,11 @@ impl HtmlProcessorConfig {
 /// normal operation since no code holds the lock across a panic boundary.
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
-    let post_processors = config.integrations.html_post_processors();
-    let document_state = IntegrationDocumentState::default();
+    let post_processors = match config.post_processing_mode {
+        HtmlPostProcessingMode::Enabled => config.integrations.html_post_processors(),
+        HtmlPostProcessingMode::Disabled => Vec::new(),
+    };
+    let document_state = config.document_state.clone();
     if config.suppress_datadome_client_side_tag {
         document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
     }
@@ -374,6 +440,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let ad_slots_script = config.ad_slots_script.clone();
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
+    let bid_injection_mode = config.bid_injection_mode.clone();
+    let head_bid_injection_mode = bid_injection_mode.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
@@ -405,8 +473,18 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
+            let head_bid_injection_mode = head_bid_injection_mode.clone();
             move |el| {
-                if !injected_tsjs.get() {
+                if injected_tsjs.get() {
+                    return Ok(());
+                }
+                if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode
+                    && (tracker.head_injected() || tracker.bid_placeholder_inserted())
+                {
+                    injected_tsjs.set(true);
+                    return Ok(());
+                }
+                {
                     let mut snippet = String::new();
                     // Inject ad slots script first so it appears before tsjs bundle.
                     if let Some(ref slots_script) = ad_slots_script {
@@ -449,6 +527,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     let deferred_ids = integrations.js_module_ids_deferred();
                     snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
                     el.prepend(&snippet, ContentType::Html);
+                    if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode
+                    {
+                        tracker.mark_head_injected();
+                    }
                     injected_tsjs.set(true);
                 }
                 Ok(())
@@ -465,35 +547,47 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let state = ad_bids_state.clone();
             let injected_bids = injected_bids.clone();
             let body_close = body_close.clone();
+            let bid_injection_mode = bid_injection_mode.clone();
             move |el| {
-                if matches!(body_close, BodyCloseInjection::None) {
+                let placeholder_mode =
+                    matches!(&bid_injection_mode, BidInjectionMode::Placeholder { .. });
+                if matches!(body_close, BodyCloseInjection::None) && !placeholder_mode {
                     return Ok(());
                 }
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
                 let body_close = body_close.clone();
+                let bid_injection_mode = bid_injection_mode.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
                     let handler: EndTagHandler<'static> =
                         Box::new(move |end_tag: &mut EndTag<'_>| {
                             if injected_bids.swap(true, Ordering::SeqCst) {
                                 return Ok(());
                             }
-                            let markup = match &body_close {
-                                // Verbatim, and identical on every request that
-                                // reaches the transform — that is what makes the
-                                // cached template shared-safe.
-                                BodyCloseInjection::Marker(marker) => marker.clone(),
-                                BodyCloseInjection::InlineBids => {
-                                    let script_guard = state.lock().expect("should lock bid state");
-                                    match &*script_guard {
-                                        Some(s) => s.clone(),
-                                        None => build_empty_bids_script(),
+                            let markup = if let BidInjectionMode::Placeholder { html, tracker } =
+                                &bid_injection_mode
+                            {
+                                tracker.mark_bid_placeholder_inserted();
+                                html.clone()
+                            } else {
+                                match &body_close {
+                                    // Verbatim, and identical on every request that
+                                    // reaches the transform — that is what makes the
+                                    // cached template shared-safe.
+                                    BodyCloseInjection::Marker(marker) => marker.clone(),
+                                    BodyCloseInjection::InlineBids => {
+                                        let script_guard =
+                                            state.lock().expect("should lock bid state");
+                                        match &*script_guard {
+                                            Some(s) => s.clone(),
+                                            None => build_empty_bids_script(),
+                                        }
                                     }
+                                    // Unreachable: the element handler returned early
+                                    // above. Kept exhaustive rather than using `_` so a
+                                    // new variant is a compile error here.
+                                    BodyCloseInjection::None => return Ok(()),
                                 }
-                                // Unreachable: the element handler returned early
-                                // above. Kept exhaustive rather than using `_` so a
-                                // new variant is a compile error here.
-                                BodyCloseInjection::None => return Ok(()),
                             };
                             end_tag.before(&markup, ContentType::Html);
                             Ok(())
@@ -843,6 +937,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         }
     }
 
@@ -1839,6 +1936,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1916,6 +2016,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1955,6 +2058,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -1993,6 +2099,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2049,6 +2158,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2079,6 +2191,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2104,6 +2219,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         }
     }
 
@@ -2240,6 +2358,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let source =
             format!(r#"<html><head></head><script>var collision="{MARKER}";</script></html>"#);

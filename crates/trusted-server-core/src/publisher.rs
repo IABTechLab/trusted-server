@@ -19,7 +19,7 @@
 //! the streaming route). It is not a content-rewriting concern.
 
 use std::borrow::Cow;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -70,6 +70,10 @@ use crate::platform::{
     contains_publisher_esi_directive,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
+use crate::publisher_late_binding::{
+    BidPlaceholder, HtmlInjectionTracker, PlaceholderLateBinder, PlaceholderScan,
+    SSAT_HELD_TAIL_CAP_BYTES,
+};
 use crate::response_privacy::{
     apply_inactive_ad_stack_browser_cache_policy, cache_control_forbids_shared_storage,
     enforce_synthesized_html_cache_privacy, enforce_terminal_private_cache_privacy,
@@ -1384,8 +1388,20 @@ pub(crate) fn body_close_injection(
     }
 }
 
+struct HtmlLateBindingOptions<'a> {
+    placeholder: &'a BidPlaceholder,
+    tracker: Arc<HtmlInjectionTracker>,
+}
+
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
+) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
+    create_html_stream_processor_with_late_binding(params, None)
+}
+
+fn create_html_stream_processor_with_late_binding<'a>(
+    params: HtmlStreamProcessorParams<'a>,
+    late_binding: Option<HtmlLateBindingOptions<'a>>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
 
@@ -1398,7 +1414,11 @@ fn create_html_stream_processor(
     );
 
     let assembly_mode = effective_assembly_mode(params.settings, params.shared_template_authorized);
-    let body_close = body_close_injection(assembly_mode, params.ad_slots_script.is_some());
+    let body_close = if late_binding.is_some() {
+        BodyCloseInjection::None
+    } else {
+        body_close_injection(assembly_mode, params.ad_slots_script.is_some())
+    };
 
     let gpt_diagnostics = template_gpt_diagnostics(assembly_mode, params.gpt_diagnostics);
 
@@ -1409,12 +1429,19 @@ fn create_html_stream_processor(
         .then_some(params.csp_nonce_observed)
         .flatten();
 
-    let config = config
+    let mut config = config
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
         .with_gpt_diagnostics(gpt_diagnostics)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
         .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
+
+    if let Some(late_binding) = late_binding {
+        config = config.with_bid_placeholder(
+            late_binding.placeholder.as_html().to_owned(),
+            late_binding.tracker,
+        );
+    }
 
     Ok(create_html_processor(config))
 }
@@ -2871,10 +2898,13 @@ pub async fn stream_publisher_body_async<W: Write>(
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
 
-    // HTML: build the processor once and drive it chunk by chunk.
-    // One-behind buffer: stream chunk N-1 immediately; hold chunk N until origin
-    // EOF, then await auction and process chunk N (which contains </body>).
-    let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
+    // HTML: build the processor once and drive it chunk by chunk. When slots
+    // matched, use an opaque placeholder emitted by the HTML parser rather than
+    // scanning origin bytes for a `</body>` sequence.
+    let parser_safe_late_binding = params.ad_slots_script.is_some() && !body.is_stream();
+    let placeholder = parser_safe_late_binding.then(BidPlaceholder::new);
+    let tracker = parser_safe_late_binding.then(|| Arc::new(HtmlInjectionTracker::default()));
+    let processor_params = HtmlStreamProcessorParams {
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
@@ -2886,19 +2916,28 @@ pub async fn stream_publisher_body_async<W: Write>(
         gpt_diagnostics: params.gpt_diagnostics.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.clone(),
-    }) {
-        Ok(processor) => processor,
-        Err(err) => {
-            emit_abandoned_auction(
-                services,
-                telemetry.observation,
-                dispatched,
-                "processor_init_error",
-            )
-            .await;
-            return Err(err);
-        }
     };
+    let late_binding = placeholder
+        .as_ref()
+        .zip(tracker.as_ref())
+        .map(|(placeholder, tracker)| HtmlLateBindingOptions {
+            placeholder,
+            tracker: Arc::clone(tracker),
+        });
+    let mut processor =
+        match create_html_stream_processor_with_late_binding(processor_params, late_binding) {
+            Ok(processor) => processor,
+            Err(err) => {
+                emit_abandoned_auction(
+                    services,
+                    telemetry.observation,
+                    dispatched,
+                    "processor_init_error",
+                )
+                .await;
+                return Err(err);
+            }
+        };
 
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -2906,24 +2945,38 @@ pub async fn stream_publisher_body_async<W: Write>(
     } else {
         input_compression
     };
+    let collect_ctx = AuctionCollectCtx {
+        dispatched,
+        telemetry,
+        deps: AuctionCollectDeps {
+            price_granularity: params.price_granularity,
+            ad_bids_state: &params.ad_bids_state,
+            orchestrator,
+            services,
+            settings,
+            request_origin: request_origin(&params.request_scheme, &params.request_host),
+        },
+    };
+    if let Some(placeholder) = placeholder.as_ref() {
+        return stream_html_with_placeholder_late_binding(
+            body,
+            output,
+            &mut processor,
+            input_compression,
+            output_compression,
+            collect_ctx,
+            placeholder,
+        )
+        .await;
+    }
+
     stream_html_with_auction_hold(
         body,
         output,
         &mut processor,
         input_compression,
         output_compression,
-        AuctionCollectCtx {
-            dispatched,
-            telemetry,
-            deps: AuctionCollectDeps {
-                price_granularity: params.price_granularity,
-                ad_bids_state: &params.ad_bids_state,
-                orchestrator,
-                services,
-                settings,
-                request_origin: request_origin(&params.request_scheme, &params.request_host),
-            },
-        },
+        collect_ctx,
     )
     .await
 }
@@ -3626,6 +3679,276 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             Ok(())
         }
     }
+}
+
+struct LateBindingState<'a> {
+    dispatched: Option<DispatchedAuction>,
+    telemetry: AuctionTelemetryCarry,
+    deps: AuctionCollectDeps<'a>,
+    decoded_input_bytes: usize,
+    processed_output_bytes: usize,
+}
+
+/// Run parser-safe placeholder late binding for a buffered HTML body.
+async fn stream_html_with_placeholder_late_binding<W: Write>(
+    body: EdgeBody,
+    output: &mut W,
+    processor: &mut impl StreamProcessor,
+    input_compression: Compression,
+    output_compression: Compression,
+    ctx: AuctionCollectCtx<'_>,
+    placeholder: &BidPlaceholder,
+) -> Result<(), Report<TrustedServerError>> {
+    let max_body_bytes = ctx.deps.settings.publisher.max_buffered_body_bytes;
+    let body = body_as_reader(body)?;
+
+    if output_compression == Compression::None {
+        return match input_compression {
+            Compression::None => {
+                placeholder_late_binding_loop(body, output, processor, ctx, placeholder).await
+            }
+            Compression::Gzip => {
+                let decoder = GzipDecodeReader::new(body, max_body_bytes);
+                placeholder_late_binding_loop(decoder, output, processor, ctx, placeholder).await
+            }
+            Compression::Deflate => {
+                let decoder = ZlibDecoder::new(body);
+                placeholder_late_binding_loop(decoder, output, processor, ctx, placeholder).await
+            }
+            Compression::Brotli => {
+                let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
+                placeholder_late_binding_loop(decoder, output, processor, ctx, placeholder).await
+            }
+        };
+    }
+
+    debug_assert_eq!(input_compression, output_compression);
+    match input_compression {
+        Compression::None => {
+            placeholder_late_binding_loop(body, output, processor, ctx, placeholder).await
+        }
+        Compression::Gzip => {
+            let decoder = GzipDecodeReader::new(body, max_body_bytes);
+            let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
+            placeholder_late_binding_loop(decoder, &mut encoder, processor, ctx, placeholder)
+                .await?;
+            encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize gzip encoder".to_string(),
+            })?;
+            Ok(())
+        }
+        Compression::Deflate => {
+            let decoder = ZlibDecoder::new(body);
+            let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
+            placeholder_late_binding_loop(decoder, &mut encoder, processor, ctx, placeholder)
+                .await?;
+            encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize deflate encoder".to_string(),
+            })?;
+            Ok(())
+        }
+        Compression::Brotli => {
+            let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
+            let params = BrotliEncoderParams {
+                quality: 4,
+                lgwin: 22,
+                ..Default::default()
+            };
+            let mut encoder =
+                CompressorWriter::with_params(&mut *output, STREAM_CHUNK_SIZE, &params);
+            placeholder_late_binding_loop(decoder, &mut encoder, processor, ctx, placeholder)
+                .await?;
+            let _ = encoder.into_inner();
+            Ok(())
+        }
+    }
+}
+
+/// Process buffered HTML output while replacing the parser-owned placeholder.
+async fn placeholder_late_binding_loop<R: Read, W: Write>(
+    mut reader: R,
+    writer: &mut W,
+    processor: &mut impl StreamProcessor,
+    ctx: AuctionCollectCtx<'_>,
+    placeholder: &BidPlaceholder,
+) -> Result<(), Report<TrustedServerError>> {
+    let AuctionCollectCtx {
+        dispatched,
+        telemetry,
+        deps,
+    } = ctx;
+    let mut state = LateBindingState {
+        dispatched: Some(dispatched),
+        telemetry,
+        deps,
+        decoded_input_bytes: 0,
+        processed_output_bytes: 0,
+    };
+    let held_tail_cap =
+        SSAT_HELD_TAIL_CAP_BYTES.min(state.deps.settings.publisher.max_buffered_body_bytes);
+    let mut binder = PlaceholderLateBinder::new(placeholder, held_tail_cap);
+    let mut buffer = vec![0_u8; STREAM_CHUNK_SIZE];
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                let final_output =
+                    processor
+                        .process_chunk(&[], true)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to finalize processor".to_string(),
+                        });
+                let final_output = match final_output {
+                    Ok(output) => output,
+                    Err(err) => {
+                        abandon_late_binding_auction(&mut state, "stream_finalize_error").await;
+                        return Err(err);
+                    }
+                };
+                write_late_bound_output(writer, &mut binder, &final_output, &mut state).await?;
+
+                let found_placeholder = binder.replaced();
+                let remainder = binder.finish();
+                write_checked_late_bound_output(
+                    writer,
+                    &remainder,
+                    &mut state,
+                    "processed_output_error",
+                )
+                .await?;
+                if !found_placeholder {
+                    log::warn!(
+                        "publisher HTML had no parser-confirmed bid insertion point; skipping EOF bid fallback"
+                    );
+                    abandon_late_binding_auction(&mut state, "unsafe_eof_insertion").await;
+                }
+                break;
+            }
+            Ok(n) => {
+                state.decoded_input_bytes = state.decoded_input_bytes.saturating_add(n);
+                if state.decoded_input_bytes > state.deps.settings.publisher.max_buffered_body_bytes
+                {
+                    abandon_late_binding_auction(&mut state, "decoded_input_cap_exceeded").await;
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message: "publisher decoded input exceeded maximum streaming size"
+                            .to_string(),
+                    }));
+                }
+                let processed = processor.process_chunk(&buffer[..n], false).change_context(
+                    TrustedServerError::Proxy {
+                        message: "Failed to process publisher chunk".to_string(),
+                    },
+                );
+                let processed = match processed {
+                    Ok(output) => output,
+                    Err(err) => {
+                        abandon_late_binding_auction(&mut state, "stream_process_error").await;
+                        return Err(err);
+                    }
+                };
+                write_late_bound_output(writer, &mut binder, &processed, &mut state).await?;
+            }
+            Err(err) => {
+                abandon_late_binding_auction(&mut state, "stream_read_error").await;
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("Failed to read origin body: {err}"),
+                }));
+            }
+        }
+    }
+
+    writer.flush().change_context(TrustedServerError::Proxy {
+        message: "Failed to flush output".to_string(),
+    })?;
+    Ok(())
+}
+
+async fn write_late_bound_output<W: Write>(
+    writer: &mut W,
+    binder: &mut PlaceholderLateBinder,
+    processed: &[u8],
+    state: &mut LateBindingState<'_>,
+) -> Result<(), Report<TrustedServerError>> {
+    let scan = match binder.push(processed) {
+        Ok(scan) => scan,
+        Err(err) => {
+            abandon_late_binding_auction(state, "placeholder_scan_error").await;
+            return Err(err);
+        }
+    };
+    match scan {
+        PlaceholderScan::Emit(bytes) => {
+            write_checked_late_bound_output(writer, &bytes, state, "processed_output_error").await
+        }
+        PlaceholderScan::Found { before, after } => {
+            write_checked_late_bound_output(writer, &before, state, "processed_output_error")
+                .await?;
+            resolve_late_binding_auction(state).await;
+            let replacement = current_late_binding_bids_script(state);
+            write_checked_late_bound_output(
+                writer,
+                replacement.as_bytes(),
+                state,
+                "processed_output_error",
+            )
+            .await?;
+            write_checked_late_bound_output(writer, &after, state, "processed_output_error").await
+        }
+    }
+}
+
+async fn resolve_late_binding_auction(state: &mut LateBindingState<'_>) {
+    let Some(dispatched) = state.dispatched.take() else {
+        return;
+    };
+    collect_stream_auction(dispatched, state.telemetry.take(), &state.deps).await;
+}
+
+async fn abandon_late_binding_auction(state: &mut LateBindingState<'_>, reason: &'static str) {
+    let Some(dispatched) = state.dispatched.take() else {
+        return;
+    };
+    emit_abandoned_auction(
+        state.deps.services,
+        state.telemetry.observation.take(),
+        dispatched,
+        reason,
+    )
+    .await;
+}
+
+async fn write_checked_late_bound_output<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    state: &mut LateBindingState<'_>,
+    reason: &'static str,
+) -> Result<(), Report<TrustedServerError>> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    state.processed_output_bytes = state.processed_output_bytes.saturating_add(bytes.len());
+    if state.processed_output_bytes > state.deps.settings.publisher.max_buffered_body_bytes {
+        abandon_late_binding_auction(state, reason).await;
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "publisher processed output exceeded maximum streaming size".to_string(),
+        }));
+    }
+    writer
+        .write_all(bytes)
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to write processed publisher output".to_string(),
+        })
+}
+
+fn current_late_binding_bids_script(state: &LateBindingState<'_>) -> String {
+    state
+        .deps
+        .ad_bids_state
+        .script_cell()
+        .lock()
+        .expect("should lock bid state")
+        .clone()
+        .unwrap_or_else(build_empty_bids_script)
 }
 
 /// Async-pull variant of [`body_close_hold_loop`] for live origin streams.
@@ -8483,6 +8806,9 @@ mod tests {
                 gpt_diagnostics,
                 body_close,
                 suppress_datadome_client_side_tag: false,
+                bid_injection_mode: crate::html_processor::BidInjectionMode::DirectState,
+                post_processing_mode: crate::html_processor::HtmlPostProcessingMode::Enabled,
+                document_state: crate::integrations::IntegrationDocumentState::default(),
             };
 
             let mut processor = create_html_processor(config);
@@ -17315,6 +17641,198 @@ mod tests {
                 "cancelled pull must not lose the origin stream"
             );
         });
+    }
+
+    #[test]
+    fn buffered_missing_body_close_preserves_open_textarea_without_bid_fallback() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = html_stream_params(
+                "",
+                Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    10,
+                )),
+            );
+            let body = EdgeBody::from(b"<html><head></head><body><textarea>draft".to_vec());
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("buffered malformed HTML should process");
+
+            let html = String::from_utf8(output).expect("should be valid UTF-8");
+            let document = scraper::Html::parse_document(&html);
+            let textarea_selector =
+                scraper::Selector::parse("textarea").expect("should parse textarea selector");
+            let textarea = document
+                .select(&textarea_selector)
+                .next()
+                .expect("output should retain textarea");
+            assert_eq!(
+                textarea.text().collect::<String>(),
+                "draft",
+                "missing body close must not add publisher textarea content. Got: {html}"
+            );
+            let script_selector =
+                scraper::Selector::parse("script").expect("should parse script selector");
+            assert!(
+                !document
+                    .select(&script_selector)
+                    .any(|script| script.inner_html().contains("var b=JSON.parse(")),
+                "missing body close must not synthesize a bids script. Got: {html}"
+            );
+        });
+    }
+
+    #[test]
+    fn buffered_missing_body_close_preserves_content_without_bid_fallback() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = html_stream_params(
+                "",
+                Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    10,
+                )),
+            );
+            let body = EdgeBody::from(b"<html><head></head><body><p>draft".to_vec());
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("buffered unclosed body should process");
+
+            let html = String::from_utf8(output).expect("should be valid UTF-8");
+            let document = scraper::Html::parse_document(&html);
+            let paragraph_selector =
+                scraper::Selector::parse("p").expect("should parse paragraph selector");
+            let paragraph = document
+                .select(&paragraph_selector)
+                .next()
+                .expect("output should retain paragraph");
+            assert_eq!(paragraph.text().collect::<String>(), "draft");
+            let script_selector =
+                scraper::Selector::parse("script").expect("should parse script selector");
+            assert!(
+                !document
+                    .select(&script_selector)
+                    .any(|script| script.inner_html().contains("var b=JSON.parse(")),
+                "missing parser-confirmed body close must skip bid fallback. Got: {html}"
+            );
+        });
+    }
+
+    #[test]
+    fn streaming_missing_body_close_preserves_open_textarea_without_bid_fallback() {
+        let params = html_stream_params(
+            "",
+            Some(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                10,
+            )),
+        );
+        let body = streaming_finalize_response(
+            params,
+            EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                b"<html><head></head><body><textarea>draft",
+            )])),
+        );
+        let output = futures::executor::block_on(body.into_bytes_bounded(16 * 1024 * 1024))
+            .expect("streaming malformed HTML should drain");
+        let html = String::from_utf8(output.to_vec()).expect("should be valid UTF-8");
+        let document = scraper::Html::parse_document(&html);
+        let textarea_selector =
+            scraper::Selector::parse("textarea").expect("should parse textarea selector");
+        let textarea = document
+            .select(&textarea_selector)
+            .next()
+            .expect("output should retain textarea");
+        assert_eq!(
+            textarea.text().collect::<String>(),
+            "draft",
+            "streaming EOF handling must preserve publisher textarea content. Got: {html}"
+        );
+        let script_selector =
+            scraper::Selector::parse("script").expect("should parse script selector");
+        assert!(
+            !document
+                .select(&script_selector)
+                .any(|script| script.inner_html().contains("var b=JSON.parse(")),
+            "streaming EOF handling must not synthesize a bids script. Got: {html}"
+        );
+    }
+
+    #[test]
+    fn streaming_missing_body_close_preserves_content_without_bid_fallback() {
+        let params = html_stream_params(
+            "",
+            Some(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                10,
+            )),
+        );
+        let body = streaming_finalize_response(
+            params,
+            EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                b"<html><head></head><body><p>draft",
+            )])),
+        );
+        let output = futures::executor::block_on(body.into_bytes_bounded(16 * 1024 * 1024))
+            .expect("streaming unclosed body should drain");
+        let html = String::from_utf8(output.to_vec()).expect("should be valid UTF-8");
+        let document = scraper::Html::parse_document(&html);
+        let paragraph_selector =
+            scraper::Selector::parse("p").expect("should parse paragraph selector");
+        let paragraph = document
+            .select(&paragraph_selector)
+            .next()
+            .expect("output should retain paragraph");
+        assert_eq!(paragraph.text().collect::<String>(), "draft");
+        let script_selector =
+            scraper::Selector::parse("script").expect("should parse script selector");
+        assert!(
+            !document
+                .select(&script_selector)
+                .any(|script| script.inner_html().contains("var b=JSON.parse(")),
+            "streaming EOF without a parser-confirmed body close must skip bid fallback. Got: {html}"
+        );
     }
 
     #[test]

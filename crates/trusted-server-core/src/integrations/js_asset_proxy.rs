@@ -640,6 +640,9 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            bid_injection_mode: crate::html_processor::BidInjectionMode::DirectState,
+            post_processing_mode: crate::html_processor::HtmlPostProcessingMode::Enabled,
+            document_state: crate::integrations::IntegrationDocumentState::default(),
         });
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
