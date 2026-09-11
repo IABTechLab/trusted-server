@@ -30,14 +30,33 @@ fn test_signature() -> gix::actor::Signature {
     }
 }
 
-/// Initialise a fresh repository at `path`.
+/// Initialise a fresh repository at `path`, on an unborn `main`.
 ///
 /// [`create_and_checkout_branch`] calls `repo.reference(...)`, whose reflog
 /// write needs a committer identity. Clean CI machines have no ambient
 /// `user.name` / `user.email`, so pin a fixed identity in the repo-local
 /// config (no subprocess), then reopen so the returned handle picks it up.
 pub(crate) fn init_repo(path: &Path) -> gix::Repository {
-    let repo = gix::init(path).expect("should init gix repo");
+    init_repo_with(path, gix::open::Options::default())
+}
+
+/// [`init_repo`] with explicit open options, so a test can inject
+/// configuration (for example `init.defaultBranch=master`) and prove
+/// the fixture does not depend on it.
+pub(crate) fn init_repo_with(path: &Path, open_options: gix::open::Options) -> gix::Repository {
+    let repo = gix::ThreadSafeRepository::init_opts(
+        path,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        open_options,
+    )
+    .expect("should init gix repo")
+    .to_thread_local();
+    // `gix::init` names the initial branch after `init.defaultBranch`,
+    // which a developer's global config may set to `master`; the
+    // `--changed-vs main` fixtures need `main` unconditionally.
+    fs::write(repo.git_dir().join("HEAD"), "ref: refs/heads/main\n")
+        .expect("should pin HEAD to refs/heads/main");
     let config_path = repo.git_dir().join("config");
     let mut config = fs::read_to_string(&config_path).expect("should read fresh repo config");
     config.push_str("\n[user]\n\tname = ts dev lint tests\n\temail = tests@example.com\n");
@@ -213,4 +232,38 @@ pub(crate) fn create_and_checkout_branch(repo: &gix::Repository, branch: &str) {
     };
     repo.edit_reference(edit)
         .expect("should move HEAD to the new branch");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fixture must sit on `main` even where `init.defaultBranch`
+    /// says otherwise; four `--changed-vs main` tests depend on it.
+    #[test]
+    fn fixture_head_is_main_regardless_of_init_default_branch() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = init_repo_with(
+            temp.path(),
+            gix::open::Options::isolated().config_overrides(["init.defaultBranch=master"]),
+        );
+
+        let head = repo
+            .head_name()
+            .expect("should read HEAD")
+            .expect("HEAD should be symbolic");
+        assert_eq!(head.as_bstr(), "refs/heads/main");
+
+        fs::write(temp.path().join("a.rs"), "let ok = 1;\n").expect("should write file");
+        stage_all(&repo);
+        commit_all(&repo, "base");
+        assert!(
+            repo.find_reference("refs/heads/main").is_ok(),
+            "the first commit should land on main"
+        );
+        assert!(
+            repo.find_reference("refs/heads/master").is_err(),
+            "no master branch should exist"
+        );
+    }
 }
