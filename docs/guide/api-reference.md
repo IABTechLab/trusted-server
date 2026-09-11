@@ -185,10 +185,10 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
   group and each unprocessed valid group is rejected as `kv_unavailable`; no
   later group is updated. Already processed groups keep their outcomes, and
   validation errors are preserved.
-- `errors` is sorted by original input index. Therefore each input has exactly
-  one outcome and `accepted + rejected` equals the number of submitted
-  mappings. The endpoint returns `200 OK` only when all mappings are accepted;
-  otherwise it returns `207 Multi-Status`.
+- Each input receives exactly one outcome, so `accepted + rejected` equals the
+  number of submitted mappings. `errors` is sorted by original input index. The
+  endpoint returns `200 OK` only when all mappings are accepted; otherwise it
+  returns `207 Multi-Status`.
 
 Groupwise failure behavior is intentional: for `A(valid), B(valid), A(valid)`,
 if A's group succeeds and B's group has an infrastructure failure, both A
