@@ -165,13 +165,13 @@ fn set_executable(_file: &fs::File) -> io::Result<()> {
 }
 
 /// The effective `core.hooksPath`, from any config scope git would
-/// consult (system, global, includes, repo, worktree). Empty counts as
-/// unset.
+/// consult (system, global, includes, repo, worktree). An empty value
+/// is a configured override, not an unset key: git still stops reading
+/// `.git/hooks`, so it is reported like any other foreign path.
 fn effective_hooks_path(repo: &gix::Repository) -> Option<String> {
     repo.config_snapshot()
         .string("core.hooksPath")
         .map(|value| value.to_string())
-        .filter(|value| !value.is_empty())
 }
 
 /// Make sure `dir` is a real directory: create it if absent, refuse a
@@ -621,6 +621,32 @@ mod install_hooks_tests {
             other => panic!("should be ForeignHooksPath, got {other:?}"),
         }
         assert!(!hook_path(&repo).exists(), "refused install writes nothing");
+    }
+
+    /// An explicitly empty `core.hooksPath` is a configured override,
+    /// not an unset key: git stops reading `.git/hooks` entirely, so
+    /// installing there would claim success while doing nothing.
+    #[test]
+    fn refuses_when_hooks_path_is_explicitly_empty() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        let mut config =
+            fs::read_to_string(temp.path().join(".git/config")).expect("should read repo config");
+        config.push_str("[core]\n\thooksPath = \n");
+        fs::write(temp.path().join(".git/config"), config).expect("should write repo config");
+
+        let err = install_hooks(temp.path(), false).expect_err("empty core.hooksPath is refused");
+        match err.current_context() {
+            InstallHooksError::ForeignHooksPath { current } => assert_eq!(current, ""),
+            other => panic!("should be ForeignHooksPath, got {other:?}"),
+        }
+        assert!(!hook_path(&repo).exists(), "refused install writes nothing");
+
+        let err = install_hooks(temp.path(), true).expect_err("--force does not override config");
+        assert!(matches!(
+            err.current_context(),
+            InstallHooksError::ForeignHooksPath { .. }
+        ));
     }
 
     /// `core.hooksPath` from outside the repo config (global or

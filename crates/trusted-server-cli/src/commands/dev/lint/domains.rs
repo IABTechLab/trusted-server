@@ -330,13 +330,19 @@ mod allow_check_tests {
 }
 
 /// Characters that can form a URL authority (host and optional port)
-/// as browsers and resolvers read it. Beyond ASCII letters, digits,
-/// `-` and `.`, this admits everything WHATWG host parsing turns into
-/// a plain host: percent escapes (`%2e` is a dot), underscores (many
-/// resolvers accept them), non-ASCII letters and marks (IDNA-mapped),
-/// and the ideographic full stops IDNA maps to `.`. Stopping at any of
-/// these would hand the allowlist a prefix of the real host.
-const AUTHORITY_CLASS: &str = r"[\p{L}\p{N}\p{M}\-._%:\x{3002}\x{FF0E}\x{FF61}]";
+/// as browsers and resolvers read it.
+///
+/// This is a *delimiter* class, not an allow-list: the authority runs
+/// to the first character that genuinely ends it in a URL or in
+/// surrounding source (`/`, `?`, `#`, whitespace, quotes, brackets,
+/// backslash, and the like). An allow-list of "host-ish" characters
+/// stops early on anything it forgot -- an IDNA-mapped symbol, a
+/// percent escape -- and hands the allowlist a prefix of the real
+/// host, so the full token is taken here and judged after
+/// canonicalisation by [`canonical_host`].
+/// The inner text of that class (no enclosing brackets), so callers can
+/// splice it into either a negated or a positive character class.
+const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#&=$*!\s"'`(){}\[\],;<>|\\"#;
 
 /// Regex for absolute `http(s)://` URLs. Captures the whole authority
 /// (bracketed IPv6, or a host that starts with a letter or digit so
@@ -353,7 +359,8 @@ fn absolute_url_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(&format!(
-            r"(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[\p{{L}}\p{{N}}]{AUTHORITY_CLASS}*)"
+            r"(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[^{TERM}]+)",
+            TERM = AUTHORITY_TERMINATOR_INNER
         ))
         .expect("should compile absolute URL regex")
     })
@@ -383,11 +390,17 @@ fn canonical_host(authority: &str) -> String {
 }
 
 /// Extract and normalise every host from absolute URLs on `line`.
+///
+/// The scheme itself marks these as URLs, so an authority that merely
+/// fails to parse is still reported as written (a bare prefix would be
+/// worse). Only tokens with no alphanumeric start -- `https://...` and
+/// friends -- are dropped as placeholders.
 fn extract_absolute_hosts(line: &str) -> Vec<String> {
     let line = unescape_solidus(line);
     absolute_url_regex()
         .captures_iter(&line)
         .filter_map(|c| c.get(1).map(|m| canonical_host(m.as_str())))
+        .filter(|host| host.chars().any(char::is_alphanumeric))
         .collect()
 }
 
@@ -416,6 +429,26 @@ mod absolute_url_tests {
         assert_eq!(
             extract_absolute_hosts("HTTPS://Example.COM/x"),
             vec!["example.com"]
+        );
+    }
+
+    #[test]
+    fn percent_encoded_label_is_decoded_not_truncated() {
+        // `%65vil` is `evil`; the authority starts with a percent escape,
+        // so a first-character letter/digit requirement would miss it.
+        assert_eq!(
+            extract_absolute_hosts(r#"const url = "https://%65vil.com/x";"#),
+            vec!["evil.com"]
+        );
+    }
+
+    #[test]
+    fn idna_symbol_does_not_truncate_to_allowlisted_prefix() {
+        // The pile-of-poo is `So`, outside any "host-ish" letter class;
+        // stopping there would report the allowlisted `github.com`.
+        assert_eq!(
+            extract_absolute_hosts("const url = \"https://github.com\u{1F4A9}.com/x\";"),
+            vec!["github.xn--com-md23b.com"]
         );
     }
 
@@ -555,10 +588,32 @@ fn protocol_relative_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(&format!(
-            r#"(?i)(?:^|[\s"'(=<>{{,\[\]`])//(?:[^/?\s#]+@)?([\p{{L}}\p{{N}}]{AUTHORITY_CLASS}*\.[A-Za-z]{{2,}})"#
+            r#"(?i)(?:^|[\s"'(=<>{{,\[\]`])//(?:[^/?\s#]+@)?([^{TERM}]+)"#,
+            TERM = AUTHORITY_TERMINATOR_INNER
         ))
         .expect("should compile protocol-relative URL regex")
     })
+}
+
+/// Whether a canonical host is a real registrable name rather than a
+/// code-comment divider or a placeholder.
+///
+/// The protocol-relative pattern cannot demand a dotted suffix while
+/// matching: a trailing `\.[A-Za-z]{2,}` backtracks into an allowlisted
+/// prefix when the real suffix is percent-encoded (`//github.com%2eevil%2ecom`
+/// would report `github.com`). So the whole token is captured and the
+/// dotted-suffix rule is applied here, to the canonical host, where
+/// `%2e` has already become `.`.
+fn is_reportable_host(host: &str) -> bool {
+    match host.rsplit_once('.') {
+        Some((label, tld)) => {
+            !label.is_empty()
+                && tld.len() >= 2
+                && tld.chars().all(|c| c.is_ascii_alphabetic())
+                && host.chars().next().is_some_and(char::is_alphanumeric)
+        }
+        None => false,
+    }
 }
 
 /// Extract and normalise every host from protocol-relative URLs.
@@ -567,6 +622,7 @@ fn extract_protocol_relative_hosts(line: &str) -> Vec<String> {
     protocol_relative_regex()
         .captures_iter(&line)
         .filter_map(|c| c.get(1).map(|m| canonical_host(m.as_str())))
+        .filter(|host| is_reportable_host(host))
         .collect()
 }
 
@@ -610,6 +666,16 @@ mod protocol_relative_tests {
     fn does_not_match_colon_prefix() {
         // http://foo.com — // is preceded by ':', NOT in the boundary class.
         assert!(extract_protocol_relative_hosts("http://foo.com/x").is_empty());
+    }
+
+    #[test]
+    fn percent_encoded_dots_do_not_backtrack_to_prefix() {
+        // A trailing `\.[A-Za-z]{2,}` anchor would backtrack past the
+        // encoded dots and report the allowlisted `github.com`.
+        assert_eq!(
+            extract_protocol_relative_hosts(r#"const url = "//github.com%2eevil%2ecom/x";"#),
+            vec!["github.com.evil.com"]
+        );
     }
 
     #[test]
@@ -1192,7 +1258,20 @@ pub(crate) fn staged_added_lines(
 // reclaims it, but a future move to a memory-backed ODB would keep the
 // linter read-only. See spec §"Staged mode".
 fn write_index_to_tree(repo: &gix::Repository) -> Result<ObjectId, Report<DomainsLintError>> {
-    let index = repo.index().change_context(DomainsLintError::Index)?;
+    // Git points `GIT_INDEX_FILE` at a temporary index when it runs hooks
+    // for `git commit -a` and `git commit -- <path>`; the commit being
+    // created lives there, not in `<git dir>/index`. Honour it so the
+    // hook inspects the commit it is gating rather than the old index.
+    let index_path = env::var_os("GIT_INDEX_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo.index_path());
+    let index = gix::index::File::at(
+        index_path,
+        repo.object_hash(),
+        false,
+        gix::index::decode::Options::default(),
+    )
+    .change_context(DomainsLintError::Index)?;
     let empty_tree_id = repo.empty_tree().id;
     let mut editor = repo
         .edit_tree(empty_tree_id)
@@ -2316,10 +2395,15 @@ pub struct FileViolation {
 
 /// Regex for a URL `userinfo@` span, in absolute or protocol-relative
 /// form; the same span the host regexes skip to find the authority.
+///
+/// Each solidus may carry a backslash escape, as it does inside JSON
+/// (`https:\/\/user:pw@host`). The extraction paths unescape those
+/// before matching a host, so the redactor has to recognise them too or
+/// it echoes credentials the linter already flagged.
 fn userinfo_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)((?:https?:)?//)[^/?\s#]+@").expect("should compile userinfo regex")
+        Regex::new(r"(?i)((?:https?:)?\\?/\\?/)[^/?\s#]+@").expect("should compile userinfo regex")
     })
 }
 
@@ -2344,6 +2428,29 @@ mod redact_userinfo_tests {
         assert_eq!(
             redact_userinfo("src=\"//token@cdn.example.evil/x\""),
             "src=\"//<redacted>@cdn.example.evil/x\""
+        );
+    }
+
+    #[test]
+    fn masks_userinfo_behind_escaped_soliduses() {
+        // The extraction paths unescape `\/` before finding a host, so
+        // the redactor has to see these as URLs too; otherwise the JSON
+        // report echoes a credential the linter itself flagged.
+        assert_eq!(
+            redact_userinfo(r#"{"url":"https:\/\/user:fake-password@partner.com/v1"}"#),
+            r#"{"url":"https:\/\/<redacted>@partner.com/v1"}"#
+        );
+        assert_eq!(
+            redact_userinfo(r#"{"src":"\/\/token@cdn.example.evil/x"}"#),
+            r#"{"src":"\/\/<redacted>@cdn.example.evil/x"}"#
+        );
+    }
+
+    #[test]
+    fn masks_userinfo_with_mixed_slash_escaping() {
+        assert_eq!(
+            redact_userinfo(r#"{"url":"https:\//user:fake-password@partner.com"}"#),
+            r#"{"url":"https:\//<redacted>@partner.com"}"#
         );
     }
 

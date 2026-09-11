@@ -123,6 +123,60 @@ fn commit_is_blocked_by_hook(env: &GitEnv, dir: &Path) {
     );
 }
 
+/// Regression: git hands hooks a temporary index via `GIT_INDEX_FILE`
+/// for `git commit -a` and `git commit -- <path>`. Reading
+/// `<git dir>/index` unconditionally inspects the pre-commit state
+/// instead, so both forms committed violations that the equivalent
+/// `git add` + `git commit` correctly rejected.
+#[test]
+fn commits_using_a_temporary_index_are_blocked() {
+    let Some(env) = GitEnv::new() else {
+        eprintln!("skipping: no git on PATH");
+        return;
+    };
+    let repo = env.repo();
+    env.ts(&repo)
+        .arg("dev")
+        .arg("install-hooks")
+        .assert()
+        .success();
+
+    // `git commit -a`: the violation is tracked but never staged.
+    fs::write(repo.join("ok.rs"), BAD_SOURCE).expect("should write ok.rs");
+    let out = env.git(&repo, &["commit", "-qam", "bad via -a"]);
+    assert!(
+        !out.status.success(),
+        "`git commit -a` should be blocked: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `git commit -- <path>`: git builds a temporary index for the path.
+    let out = env.git(&repo, &["commit", "-qm", "bad via pathspec", "--", "ok.rs"]);
+    assert!(
+        !out.status.success(),
+        "`git commit -- <path>` should be blocked: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Neither attempt may have landed.
+    let head = env.git_ok(&repo, &["show", "HEAD:ok.rs"]);
+    let head = String::from_utf8_lossy(&head.stdout);
+    assert!(
+        !head.contains("test.com"),
+        "no violating content should be committed: {head}"
+    );
+
+    // A clean commit through the same path still succeeds.
+    env.git_ok(&repo, &["checkout", "--", "ok.rs"]);
+    fs::write(repo.join("ok.rs"), "fn ok2() {}\n").expect("should write ok.rs");
+    let out = env.git(&repo, &["commit", "-qam", "clean via -a"]);
+    assert!(
+        out.status.success(),
+        "a clean `git commit -a` should pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Regression for the branch-controlled hook execution path: a branch
 /// carrying an executable `.githooks/post-checkout` must stay inert
 /// after install, and the installed hook must actually run.

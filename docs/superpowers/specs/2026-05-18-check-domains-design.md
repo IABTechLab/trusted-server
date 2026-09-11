@@ -1325,9 +1325,11 @@ The subcommand:
    `std::env::current_exe()`.
 3. **Preflight: effective `core.hooksPath`.** Read through
    `Repository::config_snapshot()`, which resolves every scope git
-   consults (system, global, includes, repository, worktree). If it is
-   set to a non-empty value, git will not run anything from
-   `.git/hooks`, so the installer **refuses, with or without
+   consults (system, global, includes, repository, worktree). If the
+   key is set at all, git will not run anything from `.git/hooks`:
+   an empty value is a configured override rather than an unset key,
+   and git honours it the same way. The installer **refuses, with or
+   without
    `--force`**, prints the value, and tells the user to add
    `exec <ts> dev lint domains --staged` to the pre-commit hook in that
    directory (or to unset the key). Exit code 2. The installer never
