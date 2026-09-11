@@ -57,7 +57,9 @@ struct PullSyncResponse {
 
 /// Builds post-send pull-sync context from the route EC context.
 ///
-/// Returns `None` when consent denies EC or there is no active EC ID.
+/// Returns `None` when there are no pull-enabled partners, when consent denies
+/// EC, when there is no valid active EC ID, or when the request snapshot holds
+/// no consented row that is still missing at least one pull-partner UID.
 #[must_use]
 pub fn build_pull_sync_context(
     ec_context: &EcContext,
@@ -287,7 +289,8 @@ pub fn dispatch_pull_sync(
     }
 }
 
-/// Returns whether a live entry contains every pull-enabled partner ID.
+/// Returns whether a consented live entry holds an ID for every pull-enabled
+/// partner. Always returns `false` when there are no pull-enabled partners.
 #[must_use]
 pub(crate) fn entry_is_pull_complete(entry: &KvEntry, registry: &PartnerRegistry) -> bool {
     let pull_partners = registry.pull_enabled_partners();

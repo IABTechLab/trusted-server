@@ -2962,7 +2962,6 @@ struct EcSnapshotPreloadInput {
     auction_needs_row: bool,
     eid_cookie_may_need_persistence: bool,
     privacy_needs_row: bool,
-    snapshot_already_read: bool,
 }
 
 fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
@@ -2970,8 +2969,7 @@ fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
     let marker_can_skip = input.marker_valid
         && !input.auction_needs_row
         && !input.eid_cookie_may_need_persistence
-        && !input.privacy_needs_row
-        && !input.snapshot_already_read;
+        && !input.privacy_needs_row;
     eligible && !marker_can_skip
 }
 
@@ -4409,6 +4407,10 @@ pub async fn handle_publisher_request(
     let eid_cookie_may_need_persistence = cookie_jar
         .as_ref()
         .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
+    // This decision also gates the concurrent origin send below. A marker skip
+    // cannot currently delay the origin behind an auction because marker
+    // validation requires a non-empty registry, and every such auction sets
+    // `auction_needs_row` and retains the preload.
     let should_preload_ec = should_preload_ec_snapshot(&EcSnapshotPreloadInput {
         is_navigation,
         is_get,
@@ -4421,10 +4423,6 @@ pub async fn handle_publisher_request(
                 .is_some_and(|registry| !registry.is_empty()),
         eid_cookie_may_need_persistence,
         privacy_needs_row: crate::ec::consent::ec_consent_withdrawn(&consent_context),
-        snapshot_already_read: !matches!(
-            ec_context.kv_snapshot(),
-            crate::ec::EcKvSnapshot::NotRead
-        ),
     });
     let mut pending_origin = None;
     // A shared-template hit skips the origin entirely, and an in-flight request
@@ -6883,7 +6881,6 @@ mod tests {
             auction_needs_row: false,
             eid_cookie_may_need_persistence: false,
             privacy_needs_row: false,
-            snapshot_already_read: false,
         };
         assert!(should_preload_ec_snapshot(&baseline));
         assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
@@ -6915,7 +6912,6 @@ mod tests {
             auction_needs_row: false,
             eid_cookie_may_need_persistence: false,
             privacy_needs_row: false,
-            snapshot_already_read: false,
         };
         assert!(!should_preload_ec_snapshot(&marker_only));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
@@ -6924,10 +6920,6 @@ mod tests {
         }));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
             eid_cookie_may_need_persistence: true,
-            ..marker_only
-        }));
-        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
-            snapshot_already_read: true,
             ..marker_only
         }));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
@@ -7332,8 +7324,16 @@ mod tests {
         }
     }
 
-    async fn run_marker_lookup_probe(probe: MarkerProbe, has_eid_cookie: bool) -> usize {
-        let mut settings = create_test_settings();
+    async fn run_marker_lookup_probe(
+        probe: MarkerProbe,
+        has_eid_cookie: bool,
+        has_matched_auction_slot: bool,
+    ) -> usize {
+        let mut settings = if has_matched_auction_slot {
+            scheduling_settings()
+        } else {
+            create_test_settings()
+        };
         settings.ec.partners = vec![marker_partner("ssp.example.com")];
         let registry = PartnerRegistry::from_config(&settings.ec.partners)
             .expect("should build pull partner registry");
@@ -7389,6 +7389,10 @@ mod tests {
             crate::ec::pull_sync_marker::PullSyncMarkerState::from_cookie(Some(marker)),
         );
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let slots = has_matched_auction_slot
+            .then(scheduling_slot)
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut request = navigation_request();
         if has_eid_cookie {
             request
@@ -7403,7 +7407,7 @@ mod tests {
             &mut ec_context,
             AuctionDispatch {
                 orchestrator: &orchestrator,
-                slots: &[],
+                slots: &slots,
                 registry: Some(&registry),
             },
             request,
@@ -7417,7 +7421,10 @@ mod tests {
 
     #[tokio::test]
     async fn valid_completeness_marker_skips_pull_only_snapshot_lookup() {
-        assert_eq!(run_marker_lookup_probe(MarkerProbe::Valid, false).await, 0);
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, false, false).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -7429,7 +7436,7 @@ mod tests {
             MarkerProbe::PartnerSetMismatch,
         ] {
             assert_eq!(
-                run_marker_lookup_probe(probe, false).await,
+                run_marker_lookup_probe(probe, false, false).await,
                 1,
                 "invalid marker should retain the normal preload"
             );
@@ -7438,7 +7445,18 @@ mod tests {
 
     #[tokio::test]
     async fn valid_marker_does_not_skip_eid_cookie_persistence_lookup() {
-        assert_eq!(run_marker_lookup_probe(MarkerProbe::Valid, true).await, 1);
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, true, false).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_marker_does_not_skip_auction_snapshot_lookup() {
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, false, true).await,
+            1
+        );
     }
 
     #[tokio::test]

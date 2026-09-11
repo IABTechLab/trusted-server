@@ -986,6 +986,58 @@ mod tests {
     }
 
     #[test]
+    fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
+        let settings = create_test_settings();
+        let orphaned_ec = sample_ec_id("orphn2");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(orphaned_ec.clone()),
+            consent,
+            Some("192.0.2.10".to_owned()),
+        );
+        ec_context.set_recovery_eligible(true);
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::Valid { expires_at: 4_600 },
+        );
+        let mut partner = make_partner("pull.example.com");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
+        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            ec_context.ec_value(),
+            Some(orphaned_ec.as_str()),
+            "an unread snapshot should defer orphan rotation until marker expiry"
+        );
+        assert!(
+            matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead),
+            "a marker-skipped request should leave the snapshot unread"
+        );
+        assert!(
+            response.headers().get(http::header::SET_COOKIE).is_none(),
+            "bounded orphan deferral should not rewrite browser identity state"
+        );
+    }
+
+    #[test]
     fn finalize_named_route_transient_miss_still_persists_eid_updates() {
         // `/auction` and `/_ts/page-bids` save their first lookup into the
         // context and are never recovery eligible, so a stale miss there has no

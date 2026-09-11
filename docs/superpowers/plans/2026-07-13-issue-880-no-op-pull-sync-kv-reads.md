@@ -13,9 +13,9 @@ there are no pull-enabled partners, and let browsers carry a short-lived signed
 proof that their EC row was recently complete for the current pull-partner set.
 
 The change must preserve PR #885's single request-scoped [`EcKvSnapshot`],
-auction EID resolution, request EID ingestion, orphan recovery, withdrawal,
-missing-UID-only dispatch, rate limits, CAS protection, and best-effort
-post-send failure policy.
+auction EID resolution, request EID ingestion, withdrawal, missing-UID-only
+dispatch, rate limits, CAS protection, best-effort post-send failure policy, and
+orphan recovery after the bounded marker-based detection delay described below.
 
 ## Baseline After PR #885
 
@@ -34,11 +34,13 @@ PR #885 changes the original issue context:
 
 Accordingly, “zero EC KV operations” in this plan means **zero operations caused
 solely by pull sync**. A request still reads KV when auction EIDs, EID-cookie
-persistence, withdrawal, generation, orphan detection, or another identity
-lifecycle consumer needs the row. In particular, a zero-partner registry does
-not by itself disable PR #885's navigation preload: doing so would indefinitely
-suppress orphan detection on sites without pull partners. The no-partner fast
-path instead eliminates the entire post-send pull-sync graph/operation path.
+persistence, withdrawal, generation, or another current-request identity
+consumer needs the row. A valid marker is the one exception for orphan
+detection: it defers discovery of a row deleted after marker issuance until the
+marker expires. A zero-partner registry does not by itself disable PR #885's
+navigation preload because it provides no bounded proof of recent existence.
+The no-partner fast path instead eliminates the entire post-send pull-sync
+graph/operation path.
 
 ## Clarified Contract
 
