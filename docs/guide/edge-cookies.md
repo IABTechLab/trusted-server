@@ -250,6 +250,16 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 
 Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `ts-eids` cookie carries a different value for the same configured partner source.
 
+### Pull-Sync Completeness Marker
+
+When the identity graph contains a UID for every pull-enabled partner, Trusted Server sets a signed, host-only `ts-ec-pull-complete` cookie. The cookie contains no partner UID or EC ID. It authenticates a one-hour expiration and a fingerprint of the current pull-partner source-domain set, bound to the active EC ID with key material derived from `ec.passphrase`.
+
+A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, and generation continue to use KV. The marker acts as recent proof that the row existed, so deletion of a previously complete row is not detected until the marker expires, at most one hour after issuance. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and restore the normal lookup and orphan-recovery path.
+
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker even when KV is unavailable.
+
+Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
+
 ## Configuration
 
 Configure EC settings in the `[ec]` section of `trusted-server.toml`. See the [Configuration Reference](/guide/configuration) for the full surface and environment variable overrides.
