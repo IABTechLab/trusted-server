@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
 use crate::platform::TemplateCookieValue;
 
 /// Whether the request can share a template and its explicit cookie dimensions.
@@ -28,6 +29,13 @@ pub(crate) fn validate_cookie_names(
         for name in names {
             if !is_cookie_name(name.as_bytes()) {
                 return Err(format!("{field} contains invalid cookie name `{name}`"));
+            }
+            if field == "template_cache_key_cookies"
+                && [COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_SHAREDID].contains(&name.as_str())
+            {
+                return Err(format!(
+                    "{field} must not key on Trusted Server identity cookie `{name}`"
+                ));
             }
             if !seen.insert(name.as_str()) {
                 return Err(format!(
@@ -70,13 +78,13 @@ pub(crate) fn evaluate_cookie_policy(
             if !is_cookie_name(name) {
                 return TemplateCookieDecision::Bypass;
             }
-            if parsed.insert(name, value).is_some() {
+            let keyed = key_names.iter().any(|item| item.as_bytes() == name);
+            if keyed && parsed.insert(name, value).is_some() {
                 return TemplateCookieDecision::Bypass;
             }
             if bypass_names.iter().any(|item| item.as_bytes() == name) {
                 return TemplateCookieDecision::Bypass;
             }
-            let keyed = key_names.iter().any(|item| item.as_bytes() == name);
             if keyed {
                 if !is_cookie_value(value) {
                     return TemplateCookieDecision::Bypass;
@@ -222,6 +230,61 @@ mod tests {
     }
 
     #[test]
+    fn template_cookie_policy_rejects_identity_keys_but_allows_bypass() {
+        for name in [COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_SHAREDID] {
+            let error = validate_cookie_names(&names(&[name]), &[])
+                .expect_err("should reject identity cookie keys");
+            assert!(
+                error.contains("template_cache_key_cookies") && error.contains(name),
+                "should identify the forbidden key cookie"
+            );
+            assert!(
+                validate_cookie_names(&[], &names(&[name])).is_ok(),
+                "should allow identity cookie bypass policies"
+            );
+        }
+    }
+
+    #[test]
+    fn template_cookie_policy_allows_only_independent_unlisted_duplicates() {
+        for fields in [
+            vec![b"a=1; a=1".as_slice()],
+            vec![b"a=1; a=2".as_slice()],
+            vec![b"a=1".as_slice(), b"a=2".as_slice()],
+            vec![br#"a={"value":1}; a={"value":2}"#.as_slice()],
+        ] {
+            for key in [vec![], names(&["ab_bucket"])] {
+                for independent in [false, true] {
+                    let expected = if independent {
+                        TemplateCookieDecision::Eligible(
+                            key.iter().map(|name| dimension(name, None)).collect(),
+                        )
+                    } else {
+                        TemplateCookieDecision::Bypass
+                    };
+                    assert_eq!(
+                        evaluate_cookie_policy(
+                            &headers(&fields),
+                            &key,
+                            &names(&["session"]),
+                            independent
+                        ),
+                        expected,
+                        "should ignore duplicates only with unlisted-cookie independence"
+                    );
+                }
+            }
+            for (key, bypass) in [(names(&["a"]), vec![]), (vec![], names(&["a"]))] {
+                assert_eq!(
+                    evaluate_cookie_policy(&headers(&fields), &key, &bypass, true),
+                    TemplateCookieDecision::Bypass,
+                    "should bypass repeated key or bypass cookies"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn template_cookie_policy_legacy_boolean_matrix() {
         for fields in [
             vec![],
@@ -332,10 +395,16 @@ mod tests {
                 "should preserve representation and ignore pair order and splitting"
             );
         }
-        for value in [b"".as_slice(), b"\"\"", b"!#$%&'()*+-./0123456789:<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~"] {
+        let every_octet: &[u8] =
+            b"!#$%&'()*+-./0123456789:<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+        for value in [b"".as_slice(), b"\"\"", every_octet] {
             let mut field = b"ab_bucket=".to_vec();
             field.extend_from_slice(value);
-            assert_eq!(evaluate_cookie_policy(&headers(&[&field]), &names(&["ab_bucket"]), &[], false), TemplateCookieDecision::Eligible(vec![dimension("ab_bucket", Some(value))]), "should accept every cookie-octet and preserve quotes");
+            assert_eq!(
+                evaluate_cookie_policy(&headers(&[&field]), &names(&["ab_bucket"]), &[], false),
+                TemplateCookieDecision::Eligible(vec![dimension("ab_bucket", Some(value))]),
+                "should accept every cookie-octet and preserve quotes"
+            );
         }
     }
 
@@ -389,7 +458,6 @@ mod tests {
             r#"ignored="; ab_bucket=A"#,
             r#"ignored={"value":"x;session=login"}; ab_bucket=A"#,
             r#"ignored={"value":"x\y"}; ab_bucket=A"#,
-            r#"ignored={"value":1}; ignored={"value":2}; ab_bucket=A"#,
         ] {
             assert_eq!(
                 evaluate_cookie_policy(
@@ -427,10 +495,10 @@ mod tests {
             vec![b"a=x\\y"],
             vec![b"a=\xff"],
             vec![b"\xff=1"],
-            vec![b"a=1; a=1"],
-            vec![b"a=1; a=2"],
-            vec![b"a=1", b"a=1"],
-            vec![b"a=1", b"a=2"],
+            vec![b"ab_bucket=1; ab_bucket=1"],
+            vec![b"ab_bucket=1; ab_bucket=2"],
+            vec![b"ab_bucket=1", b"ab_bucket=1"],
+            vec![b"ab_bucket=1", b"ab_bucket=2"],
             vec![b"ab_bucket=A", b""],
             vec![b"ab_bucket=A", b"a=\xff"],
             vec![b"ab_bucket=A", b"session="],

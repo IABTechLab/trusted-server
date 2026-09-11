@@ -112,6 +112,8 @@ Validate configuration at the existing creative-opportunities validation boundar
   control bytes, and non-ASCII bytes are invalid.
 - Match names exactly and case-sensitively. Do not lowercase them as header names
   are lowercased; `session` and `Session` are distinct cookie names.
+- Reject TS identity cookie names (`ts-ec`, `ts-eids`, `sharedId`) in the key list;
+  allow them in the bypass list.
 - Reject duplicates within either list and overlap between the two lists. Report
   the offending field and name as a configuration error, using existing error
   handling conventions.
@@ -234,9 +236,10 @@ For the named-policy path:
   percent escapes, and any surrounding quotes. Do not URL-decode, unquote, or
   otherwise normalize values. Quoted and unquoted representations may use
   separate keys; over-separation is safer than merging distinct inputs.
-- Any repeated cookie name anywhere in the request causes bypass, even when the
-  values match or the cookie is unlisted. Different origins can interpret
-  duplicates differently; this design does not choose first or last wins.
+- Repeated key-cookie names cause bypass even when their values match. Different
+  origins can interpret duplicates differently; this design does not choose first
+  or last wins. Repeated unlisted names are allowed only with independence asserted
+  and every value passing framing checks. Bypass names always bypass.
 - For requests reaching this evaluator, malformed input or an unsupported byte
   sequence causes cache bypass. The evaluator introduces no new request error.
   Existing earlier validation errors remain unchanged for fields surviving
@@ -367,7 +370,9 @@ this change does not require a new public diagnostic value or metrics subsystem.
   key unchanged.
 - Empty bypass values disqualify. A bypass cookie in a later header also
   disqualifies; it must not be hidden by first-header extraction.
-- Duplicate names with equal or different values, across pairs or fields, bypass.
+- Duplicate key names with equal or different values, across pairs or fields, bypass.
+  Duplicate unlisted names remain eligible only with independence asserted and valid
+  framing for every value.
 - At the evaluator level, bare names, invalid names, empty pairs/fields, invalid
   quoting, forbidden value bytes, and non-ASCII input bypass under a named policy.
 - At the evaluator level, preserve legacy boolean decisions for those same

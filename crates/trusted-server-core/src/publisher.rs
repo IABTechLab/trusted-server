@@ -4302,6 +4302,12 @@ pub async fn handle_publisher_request(
         TemplateCookieDecision::Bypass => (true, Vec::new()),
         TemplateCookieDecision::Eligible(values) => (false, values),
     };
+    if cookie_disqualifies && matches!(assembly_mode, AssemblyMode::Esi) {
+        log::debug!(
+            "template_cache bypass: {}",
+            TemplateCacheBypassReason::CookiePolicy
+        );
+    }
     let suppress_datadome_client_side_tag = req
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
@@ -5724,7 +5730,7 @@ pub(crate) enum TemplateCacheBypassReason {
     /// Named bypass cookies, unlisted cookies without an independence assertion,
     /// or ambiguous input under a named policy prohibit both lookup and storage.
     #[display("request cookies disqualified by template cache policy")]
-    CookieForwarded,
+    CookiePolicy,
     /// The origin varies on a header the cache key does not cover.
     ///
     /// The key is built *before* the fetch from a configured [`VarySpec`], because a
@@ -6148,7 +6154,7 @@ fn template_cache_ttl(
         return Err(TemplateCacheBypassReason::AuthorizedRequest);
     }
     if cookie_disqualifies {
-        return Err(TemplateCacheBypassReason::CookieForwarded);
+        return Err(TemplateCacheBypassReason::CookiePolicy);
     }
     if response_headers.contains_key(header::SET_COOKIE) {
         return Err(TemplateCacheBypassReason::OriginSetCookie);
@@ -9568,12 +9574,31 @@ mod tests {
             .await
             .expect("should proxy publisher request");
 
+            finalize_test_publisher_response(
+                publisher_response,
+                settings,
+                services,
+                &registry,
+                orchestrator,
+                finalizer,
+            )
+            .await
+        }
+
+        async fn finalize_test_publisher_response(
+            publisher_response: PublisherResponse,
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            registry: &IntegrationRegistry,
+            orchestrator: Arc<AuctionOrchestrator>,
+            finalizer: Finalizer,
+        ) -> Response<EdgeBody> {
             match finalizer {
                 Finalizer::Streaming => publisher_response_into_streaming_response(
                     publisher_response,
                     &Method::GET,
                     Arc::clone(settings),
-                    &registry,
+                    registry,
                     orchestrator,
                     services.clone(),
                 )
@@ -9583,7 +9608,7 @@ mod tests {
                     publisher_response,
                     &Method::GET,
                     settings,
-                    &registry,
+                    registry,
                     &orchestrator,
                     services,
                 )
@@ -11713,7 +11738,9 @@ mod tests {
                     );
                 }
                 for (index, arm) in ["A", "B", "A", "B"].iter().enumerate() {
-                    let cookies = format!("ab_bucket={arm}; ts-ec=reader{index}");
+                    let cookies = format!(
+                        "ab_bucket={arm}; ts-ec=reader{index}; ignored=scope{index}; ignored=other{index}"
+                    );
                     let request = cookie_policy_request(&[cookies.as_bytes()]);
                     assert!(
                         !request.headers().contains_key("x-exp-variant"),
@@ -11859,7 +11886,7 @@ mod tests {
             for fields in [
                 vec![b"ab_bucket=A".as_slice(), b"unknown=\xff".as_slice()],
                 vec![b"ab_bucket=A".as_slice(), b"ab_bucket=B".as_slice()],
-                vec![b"ab_bucket=A; unknown=1; unknown=1".as_slice()],
+                vec![b"ab_bucket=A; ab_bucket=A".as_slice()],
                 vec![b"ab_bucket=A; broken".as_slice()],
                 vec![b"ab_bucket=A;".as_slice()],
                 vec![b"ab_bucket=A".as_slice(), b"".as_slice()],
@@ -12349,28 +12376,15 @@ mod tests {
                         ec_context.kv_snapshot().entry_for(identity).is_some(),
                         "should preload this reader's identity even during withdrawal on a hit"
                     );
-                    let mut response = match finalizer {
-                        Finalizer::Streaming => publisher_response_into_streaming_response(
-                            response,
-                            &Method::GET,
-                            Arc::clone(&settings),
-                            &registry,
-                            orchestrator,
-                            services.clone(),
-                        )
-                        .await
-                        .expect("should finalize streaming reader response"),
-                        Finalizer::Buffered => buffer_publisher_response_async(
-                            response,
-                            &Method::GET,
-                            &settings,
-                            &registry,
-                            &orchestrator,
-                            &services,
-                        )
-                        .await
-                        .expect("should finalize buffered reader response"),
-                    };
+                    let mut response = finalize_test_publisher_response(
+                        response,
+                        &settings,
+                        &services,
+                        &registry,
+                        orchestrator,
+                        finalizer,
+                    )
+                    .await;
                     crate::ec::finalize::ec_finalize_response(
                         &settings,
                         &mut ec_context,
@@ -14072,7 +14086,7 @@ mod tests {
         }
 
         #[test]
-        fn a_forwarded_request_cookie_disqualifies_even_without_set_cookie() {
+        fn cookie_policy_disqualifies_even_without_set_cookie() {
             // The dangerous case: session established on an earlier request, so this
             // response carries no Set-Cookie, has no Cache-Control at all, is a 200,
             // and is HTML — yet is personalized because TS forwarded the Cookie to
@@ -14088,7 +14102,7 @@ mod tests {
                     &no_cache_control,
                     &nothing_covered(),
                 ),
-                Some(TemplateCacheBypassReason::CookieForwarded),
+                Some(TemplateCacheBypassReason::CookiePolicy),
                 "cookie-personalized HTML must not become a shared template"
             );
         }

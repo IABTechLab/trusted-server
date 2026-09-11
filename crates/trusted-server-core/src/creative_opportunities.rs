@@ -341,7 +341,7 @@ pub struct CreativeOpportunitiesConfig {
     /// Cookie names whose presence forces inline processing, with no lookup or store.
     ///
     /// Empty values still count as present. Names must be unique and must not overlap
-    /// [`Self::template_cache_key_cookies`]. Unset or empty names no bypass cookies.
+    /// [`Self::template_cache_key_cookies`]. Unset or empty means no bypass cookies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_bypass_cookies: Option<Vec<String>>,
     /// Assertion that cookies outside the key and bypass lists do not affect origin HTML.

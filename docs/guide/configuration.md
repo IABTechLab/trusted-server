@@ -1909,7 +1909,9 @@ template_cache_max_age_seconds = 1200
 template_cache_key_cookies = ["ab_bucket"]
 template_cache_bypass_cookies = ["session"]
 
-# Default false. Enable only after proving unlisted cookies do not change HTML.
+# Default false. With the lists above, false still bypasses every request that
+# carries any other cookie, including the TS identity cookie. Set true only
+# after proving those unlisted cookies do not change origin HTML.
 origin_is_cookie_independent = false
 ```
 
@@ -1982,10 +1984,12 @@ The optional cookie lists control both template lookup and storage:
 Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
-within a list, and overlap between lists. Wildcards, prefixes, and regular
-expressions are not supported. With either list nonempty, parsing of all
-`Cookie` fields after existing request preparation bypasses duplicate names,
+within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
+`sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
+`Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
 invalid names, and malformed key-cookie values. When independence is `true`,
+duplicate unlisted names are allowed if every value passes framing checks, and
 unlisted values may also contain commas and balanced double quotes, supporting
 compact JSON cookies such as `g_state` and comma-separated experiment metadata.
 Unmatched quotes, whitespace within values, backslashes, controls, non-ASCII bytes,
