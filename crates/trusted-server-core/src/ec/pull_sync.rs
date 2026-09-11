@@ -767,6 +767,7 @@ mod tests {
     // Snapshot-driven eligibility and request-wide aggregation
     // -----------------------------------------------------------------------
 
+    use crate::ec::kv::TombstoneOutcome;
     use crate::error::TrustedServerError;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::settings::EcPartner;
@@ -967,9 +968,13 @@ mod tests {
         let snapshot = seed_present_snapshot(&graph, &ec_id);
 
         // Concurrent withdrawal lands after the snapshot was captured.
-        graph
-            .write_withdrawal_tombstone(&ec_id)
-            .expect("should tombstone the row");
+        assert_eq!(
+            graph
+                .write_withdrawal_tombstone(&ec_id, drop)
+                .expect("should tombstone the row"),
+            TombstoneOutcome::Written,
+            "should tombstone the row the snapshot still reports as present"
+        );
 
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, br#"{"uid":"leaked-uid"}"#.to_vec());

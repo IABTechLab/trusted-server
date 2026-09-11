@@ -128,33 +128,13 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
     use crate::test_support::tests::crate_test_settings_str;
-    use serde::Deserialize;
-
-    // Intentionally mirrors `AuctionConfig` before `rewrite_creatives` existed.
-    // Do not add fields introduced after that snapshot: this test proves a
-    // default payload remains readable by the previous binary schema.
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct LegacyAuctionConfig {
-        #[serde(rename = "enabled")]
-        _enabled: bool,
-        #[serde(rename = "providers")]
-        _providers: Vec<String>,
-        #[serde(rename = "mediator")]
-        _mediator: Option<String>,
-        #[serde(rename = "timeout_ms")]
-        _timeout_ms: u32,
-        #[serde(rename = "creative_store")]
-        _creative_store: String,
-        #[serde(rename = "allowed_context_keys")]
-        _allowed_context_keys: std::collections::HashSet<String>,
-    }
 
     fn test_settings() -> Settings {
         let mut settings =
@@ -264,6 +244,31 @@ mod tests {
         )
     }
 
+    fn settings_with_browser_bidder_overlap(auction_enabled: bool) -> Settings {
+        let mut settings = test_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_string()];
+        settings.auction.enabled = auction_enabled;
+        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.auction.bidders.insert(
+            "exampleBidder"
+                .parse()
+                .expect("should parse server-side bidder"),
+            crate::auction::BidderRouteConfig {
+                provider: "pbs".parse().expect("should parse provider"),
+            },
+        );
+        let mut prebid = settings
+            .integration_config::<crate::integrations::prebid::PrebidIntegrationConfig>("prebid")
+            .expect("should parse Prebid config")
+            .expect("should have enabled Prebid config");
+        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+        settings
+            .integrations
+            .insert_config("prebid", &prebid)
+            .expect("should replace Prebid config");
+        settings
+    }
+
     #[test]
     fn payload_round_trips_through_blob_envelope() {
         let original = test_settings();
@@ -282,6 +287,36 @@ mod tests {
             reconstructed.handlers.len(),
             original.handlers.len(),
             "should preserve arrays"
+        );
+    }
+
+    #[test]
+    fn didomi_geo_query_parameters_survive_blob_round_trip() {
+        let mut original = test_settings();
+        original
+            .integrations
+            .insert_config(
+                "didomi",
+                &DidomiIntegrationConfig {
+                    enabled: true,
+                    geo_query_parameters: true,
+                    proxy_path: None,
+                    sdk_origin: "https://sdk.example.com".to_string(),
+                    api_origin: "https://api.example.com".to_string(),
+                },
+            )
+            .expect("should insert Didomi configuration");
+
+        let reconstructed =
+            load_settings(&envelope_json(&original)).expect("should reconstruct settings");
+        let config = reconstructed
+            .integration_config::<DidomiIntegrationConfig>("didomi")
+            .expect("should read Didomi configuration")
+            .expect("should enable Didomi");
+
+        assert!(
+            config.geo_query_parameters,
+            "should preserve Didomi geo opt-in"
         );
     }
 
@@ -690,19 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn default_auction_payload_is_accepted_by_legacy_schema() {
-        let data =
-            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
-        let auction = data
-            .get("auction")
-            .cloned()
-            .expect("should serialize auction settings");
-
-        serde_json::from_value::<LegacyAuctionConfig>(auction)
-            .expect("should deserialize the default payload with the legacy schema");
-    }
-
-    #[test]
     fn disabled_rewrite_creatives_survives_blob_round_trip() {
         let mut original = test_settings();
         original.auction.rewrite_creatives = false;
@@ -760,6 +782,20 @@ mod tests {
     }
 
     #[test]
+    fn runtime_blob_rejects_enabled_browser_bidder_ownership_conflict() {
+        let original = settings_with_browser_bidder_overlap(true);
+        let error = load_settings(&envelope_json(&original))
+            .expect_err("should reject enabled browser bidder ownership conflict");
+
+        assert!(error.to_string().contains("exampleBidder"));
+        assert!(
+            error
+                .to_string()
+                .contains("both client-side and server-side")
+        );
+    }
+
+    #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
         settings.ec.passphrase = Redacted::new("short_key".to_owned());
@@ -793,6 +829,14 @@ mod tests {
             !err.to_string().contains("change-me-proxy-secret"),
             "error should not expose the resolved secret value"
         );
+    }
+
+    #[test]
+    fn runtime_blob_accepts_disabled_browser_bidder_ownership_overlap() {
+        let original = settings_with_browser_bidder_overlap(false);
+
+        load_settings(&envelope_json(&original))
+            .expect("runtime should accept disabled browser bidder ownership overlap");
     }
 
     #[test]

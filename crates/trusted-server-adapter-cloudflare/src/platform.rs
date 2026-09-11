@@ -5,18 +5,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-    PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore, PlatformSecretStore,
-    RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
+    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
 use trusted_server_core::platform::UnavailableHttpClient;
 
-#[cfg(target_arch = "wasm32")]
-use error_stack::ResultExt as _;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
@@ -61,27 +59,15 @@ impl PlatformSecretStore for NoopSecretStore {
 struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Cloudflare
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        let port = spec
-            .port
-            .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
-        let timeout_ms = spec.first_byte_timeout.as_millis();
-        let cert_suffix = if spec.certificate_check {
-            ""
-        } else {
-            "_nocert"
-        };
-        // Keep two providers that share an origin on distinct names so auction
-        // response correlation cannot cross providers.
-        let discriminator = spec
-            .discriminator
-            .as_deref()
-            .map(|d| format!("_p_{d}"))
-            .unwrap_or_default();
-        Ok(format!(
-            "{}_{}_{}_{timeout_ms}ms{cert_suffix}{discriminator}",
-            spec.scheme, spec.host, port
-        ))
+        self.naming_policy()
+            .predict(spec)
+            .map(|prediction| prediction.name)
+            .change_context(PlatformError::Backend)
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -285,12 +271,21 @@ fn outbound_cache_mode(bypass_cache: bool) -> OutboundCacheMode {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn outbound_request_init(method: worker::Method, headers: worker::Headers) -> worker::RequestInit {
+    let mut init = worker::RequestInit::new();
+    init.with_method(method)
+        .with_headers(headers)
+        .with_redirect(worker::RequestRedirect::Manual);
+    init
+}
+
+#[cfg(target_arch = "wasm32")]
 impl CloudflareHttpClient {
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use worker::{CacheMode, Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
+        use worker::{CacheMode, Fetch, Headers, Method, Request};
 
         // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
         // metadata, and it always buffers the response body (see below). The
@@ -340,7 +335,6 @@ impl CloudflareHttpClient {
             }
         };
 
-        let mut init = RequestInit::new();
         // Force manual redirect handling: the Workers runtime otherwise defaults
         // to `RequestRedirect::Follow` and transparently chases 3xx responses to
         // any host inside `Fetch::send()`. Core's `proxy_with_redirects` does its
@@ -348,9 +342,7 @@ impl CloudflareHttpClient {
         // `allowed_domains`; auto-following here would bypass that allowlist
         // (SSRF). `Manual` surfaces the 3xx + Location back to core unfollowed,
         // matching the Axum adapter's `redirect::Policy::none()`.
-        init.with_method(method)
-            .with_headers(headers)
-            .with_redirect(RequestRedirect::Manual);
+        let mut init = outbound_request_init(method, headers);
         // Setting the `cache` field requires the `cache_option_enabled`
         // compatibility flag, which is only on by default from compatibility
         // date 2024-11-11. `wrangler.toml`/`wrangler.ci.toml` pin an earlier
@@ -762,6 +754,25 @@ fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>>
 mod tests {
     use super::*;
     use edgezero_core::context::RequestContext;
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn outbound_request_creation_sets_manual_redirect_mode() {
+        let init = outbound_request_init(worker::Method::Get, worker::Headers::new());
+        assert!(matches!(init.redirect, worker::RequestRedirect::Manual));
+    }
+
+    #[test]
+    fn auction_http_capabilities_are_explicit() {
+        let capabilities = trusted_server_core::platform::AuctionTargetId::Cloudflare
+            .descriptor()
+            .capabilities();
+        assert!(!capabilities.supports_concurrent_provider_fanout());
+        assert!(
+            !capabilities.has_enforceable_total_request_deadline(),
+            "Workers fetch does not expose an enforceable hard total request deadline"
+        );
+    }
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
 
