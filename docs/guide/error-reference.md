@@ -633,7 +633,7 @@ Warning: viceroy version mismatch
 **Solution:**
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 ```
 
 ---
