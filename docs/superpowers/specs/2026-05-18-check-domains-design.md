@@ -476,6 +476,12 @@ Extension and lockfile-basename matching is ASCII case-insensitive
 checkouts are case-insensitive, so a differently-cased spelling must
 not move a file out of scope.
 
+**Known gap (v1):** shell scripts (`.sh`), `Makefile`s, `.py`, `.jsx`
+and `.scss` are not scanned, although `scripts/*.sh` is where several
+real network calls live today. This is a deliberate boundary of the
+extension list, not a bug, and it is recorded here so the threat model
+is honest; extend the list before Stage 2 makes the linter a CI gate.
+
 **`.md` is scanned.** Markdown documentation files (`README.md`,
 `CHANGELOG.md`, `CONTRIBUTING.md`, everything under `docs/`) are real
 publishing surfaces and accidental hardcoded third-party hosts there
@@ -545,6 +551,7 @@ fenced code blocks.
   file under `docs/superpowers/` is exempt.** Every other spec and
   plan is Markdown under the policy above, and quotes example hosts
   with reserved TLDs or a per-line `allow-domain:` marker.
+
 - **`crates/trusted-server-core/src/integrations/**/fixtures/**` —
   publisher-capture HTML/JS fixtures.** Real-world snapshots used as
   test inputs for the HTML processor; they contain hundreds of
