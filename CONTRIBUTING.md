@@ -118,6 +118,40 @@ Consistency is the most important. Following the existing Rust style, formatting
 
 Style and format will be enforced with a linter when PR is created.
 
+## :lock: Pre-commit URL-host linter
+
+The `ts` CLI ships a source/config/docs linter that flags non-allowlisted URL
+hosts (`ts dev lint domains`). Install the managed pre-commit hook once per
+checkout so staged changes are checked before every commit:
+
+```bash
+# Build/install the host CLI first (see the README Quick Start), then:
+ts dev install-hooks
+```
+
+This writes a `pre-commit` hook into git's own hook directory (`.git/hooks`,
+shared by every linked worktree of the clone) that runs
+`ts dev lint domains --staged`. It never edits git configuration and never
+writes into the working tree. If `.git/hooks/pre-commit` already exists and was
+not written by this command, it refuses; re-run with `--force` to replace it
+(the previous hook is backed up next to it and the backup path is printed). If
+`core.hooksPath` is set in any git config scope, git does not run hooks from
+`.git/hooks`, so the command refuses and prints the value; add
+`ts dev lint domains --staged` to the pre-commit hook in that directory instead.
+To uninstall, delete `.git/hooks/pre-commit` (and restore any `pre-commit.bak.*`
+backup). To scan the whole checkout on demand:
+
+```bash
+# Full working-tree audit. Diagnostic only for now: it reports the repo's
+# pre-existing violations, so a non-zero exit here is expected today.
+ts dev lint domains
+ts dev lint domains --changed-vs origin/main   # only lines added vs a ref
+```
+
+To allow a new host, add it to the allowlist constants in
+`crates/trusted-server-cli/src/commands/dev/lint/domains.rs`; to suppress a
+single line, append `// allow-domain: <host>` in a comment.
+
 ## :warning: Error Handling
 
 We use [error-stack](https://docs.rs/error-stack/latest/error_stack/) for error handling to provide rich context and traceability.
