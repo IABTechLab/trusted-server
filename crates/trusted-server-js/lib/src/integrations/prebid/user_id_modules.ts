@@ -65,6 +65,26 @@ export function knownUserIdConfigNames(): string[] {
   return [...new Set(PREBID_USER_ID_MODULE_REGISTRY.flatMap((entry) => entry.configNames))].sort();
 }
 
+/**
+ * Returns every lowercased config name that addresses the same submodule as
+ * `configName`, including `configName` itself.
+ *
+ * Prebid matches a `userSync.userIds` entry to a submodule on either its
+ * `name` or its `aliasName`, case-insensitively, and then takes the first
+ * matching entry (`modules/userId/index.ts`, `generateSubmoduleContainers`).
+ * A registry entry's `configNames` is that full set for one module, so an
+ * operator-managed name must claim all of them or a publisher entry naming an
+ * alias would be retained ahead of it and win.
+ */
+export function userIdConfigNameAliases(configName: string): string[] {
+  const normalized = configName.toLowerCase();
+  const entry = PREBID_USER_ID_MODULE_REGISTRY.find((candidate) =>
+    candidate.configNames.some((name) => name.toLowerCase() === normalized)
+  );
+  if (!entry) return [normalized];
+  return entry.configNames.map((name) => name.toLowerCase());
+}
+
 export function resolvePrebidUserIdModulesFromEids(
   eids: PrebidUserIdEidLike[]
 ): PrebidUserIdModuleResolution {
