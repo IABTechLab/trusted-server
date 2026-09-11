@@ -1211,6 +1211,60 @@ describe('prebid/installPrebidNpm', () => {
       );
     });
 
+    it.each([
+      {},
+      { storedRequest: true },
+      { storedRequest: false },
+      { storedRequest: null },
+      { storedRequest: 'false' },
+      { storedRequest: 0 },
+      { storedRequest: [] },
+      { storedRequest: { invalid: true } },
+    ])('preserves authored stored intent through repeated JSON requests: %j', (intent) => {
+      const pbjs = installPrebidNpm();
+      const unit = {
+        code: 'example-authored',
+        bids: [{ bidder: 'trustedServer', params: { bidderParams: {}, ...intent } }],
+      };
+      const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+      for (let call = 0; call < 2; call++) {
+        pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg);
+        const wire = JSON.parse(
+          spec.buildRequests([
+            {
+              adUnitCode: unit.code,
+              mediaTypes: { banner: { sizes: [[300, 250]] } },
+              ...unit.bids[0],
+            },
+          ]).data
+        );
+        expect(wire.adUnits[0].bids[0].params).toEqual({ bidderParams: {}, ...intent });
+      }
+    });
+
+    it('serializes disabled stored demand on generated envelopes including inline candidates', () => {
+      const pbjs = installPrebidNpm();
+      const adUnits = [
+        { code: 'empty', bids: [] },
+        { code: 'inline', bids: [{ bidder: 'appnexus', params: { placementId: 1 } }] },
+      ];
+      for (let call = 0; call < 2; call++) {
+        pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
+        const payload = JSON.parse(
+          (mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec).buildRequests(
+            adUnits.map((unit) => ({
+              adUnitCode: unit.code,
+              mediaTypes: { banner: { sizes: [[300, 250]] } },
+              ...unit.bids.find((bid: TestBid) => bid.bidder === 'trustedServer'),
+            }))
+          ).data
+        );
+        expect(
+          payload.adUnits.map((unit: { bids: TestBid[] }) => unit.bids[0].params?.storedRequest)
+        ).toEqual([false, false]);
+      }
+    });
+
     it('injects trustedServer bidder into every ad unit', () => {
       const pbjs = installPrebidNpm();
 
@@ -1372,7 +1426,9 @@ describe('prebid/installPrebidNpm', () => {
 
       expect(() => pbjs.requestBids({ adUnits } as unknown as RequestBidsArg)).not.toThrow();
 
-      expect(adUnits[0].bids).toEqual([{ bidder: 'trustedServer', params: { bidderParams: {} } }]);
+      expect(adUnits[0].bids).toEqual([
+        { bidder: 'trustedServer', params: { storedRequest: false, bidderParams: {} } },
+      ]);
     });
 
     it('preserves the empty stored-request envelope on initial and repeated requests', () => {
@@ -1651,7 +1707,7 @@ describe('prebid/installRefreshHandler', () => {
                 ],
               },
             },
-            bids: [{ bidder: 'trustedServer', params: { zone: 'homepage' } }],
+            bids: [{ bidder: 'trustedServer', params: { storedRequest: false, zone: 'homepage' } }],
           }),
         ],
       })
@@ -1875,6 +1931,7 @@ describe('prebid/installRefreshHandler', () => {
               {
                 bidder: 'trustedServer',
                 params: {
+                  storedRequest: false,
                   zone: 'homepage',
                   bidderParams: { appnexus: { placementId: 12345 } },
                 },
@@ -1944,6 +2001,7 @@ describe('prebid/installRefreshHandler', () => {
               {
                 bidder: 'trustedServer',
                 params: {
+                  storedRequest: false,
                   zone: 'homepage',
                   bidderParams: { appnexus: { placementId: 12345 } },
                 },
@@ -2091,7 +2149,7 @@ describe('prebid/installRefreshHandler', () => {
                 ],
               },
             },
-            bids: [{ bidder: 'trustedServer', params: { zone: 'homepage' } }],
+            bids: [{ bidder: 'trustedServer', params: { storedRequest: false, zone: 'homepage' } }],
           }),
         ],
       })
@@ -2674,6 +2732,119 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     return lastCall?.[0]?.adUnits?.[0];
   }
 
+  it.each([
+    {},
+    { storedRequest: true },
+    { storedRequest: false },
+    { storedRequest: null },
+    { storedRequest: 'false' },
+    { storedRequest: 1 },
+    { storedRequest: [] },
+    { storedRequest: { invalid: true } },
+  ])(
+    'preserves authored intent in snapshot refresh JSON and lets live intent replace it: %j',
+    (intent) => {
+      const code = 'example-stored-intent';
+      const slot = {
+        getSlotElementId: () => `${code}-container`,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      };
+      testWindow.tsjs = {
+        adSlots: [{ id: 'example', div_id: code, formats: [[300, 250]], targeting: {} }],
+      };
+      const { pubads } = installGpt([slot]);
+      const pbjs = installPrebidNpm();
+      const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+      const unit = {
+        code,
+        bids: [
+          { bidder: 'trustedServer', params: { bidderParams: {}, ...intent } },
+          { bidder: 'exampleBrowser', params: { placement: 'browser' } },
+        ],
+      };
+      pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg);
+      const refreshParams = () => {
+        pubads.refresh([slot]);
+        const refresh = refreshAdUnitFromLastRequest();
+        expect(refresh.code).toBe(`${code}-container`);
+        expect(refresh.bids[1]).toEqual({
+          bidder: 'exampleBrowser',
+          params: { placement: 'browser' },
+        });
+        const wire = JSON.parse(
+          spec.buildRequests([
+            { adUnitCode: refresh.code, mediaTypes: refresh.mediaTypes, ...refresh.bids[0] },
+          ]).data
+        );
+        return wire.adUnits[0].bids[0].params;
+      };
+      expect(mockPbjs.adUnits).toEqual([]);
+      expect(refreshParams()).toEqual({ bidderParams: {}, ...intent });
+      expect(refreshParams()).toEqual({ bidderParams: {}, ...intent });
+      // Live omission is authoritative, even when a prior snapshot explicitly opted in.
+      mockPbjs.adUnits = [
+        {
+          code,
+          bids: [
+            { bidder: 'trustedServer', params: { bidderParams: {}, storedRequest: true } },
+            unit.bids[1],
+          ],
+        },
+      ];
+      expect(refreshParams()).toEqual({ bidderParams: {}, storedRequest: true });
+      mockPbjs.adUnits = [
+        { code, bids: [{ bidder: 'trustedServer', params: { bidderParams: {} } }, unit.bids[1]] },
+      ];
+      expect(refreshParams()).toEqual({ bidderParams: {} });
+      mockPbjs.adUnits = [
+        {
+          code,
+          bids: [
+            { bidder: 'trustedServer', params: { bidderParams: {}, storedRequest: false } },
+            unit.bids[1],
+          ],
+        },
+      ];
+      expect(refreshParams()).toEqual({ bidderParams: {}, storedRequest: false });
+    }
+  );
+
+  it('snapshots invalid authored intent immutably and defaults unrecovered refresh JSON to false', () => {
+    const code = 'example-intent-snapshot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+    const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+    const readRefresh = () => {
+      pubads.refresh([slot]);
+      const refresh = refreshAdUnitFromLastRequest();
+      return JSON.parse(
+        spec.buildRequests([
+          { adUnitCode: refresh.code, mediaTypes: refresh.mediaTypes, ...refresh.bids[0] },
+        ]).data
+      ).adUnits[0].bids[0].params;
+    };
+    expect(readRefresh()).toEqual({ bidderParams: {}, storedRequest: false });
+    const invalid = { nested: ['original'] };
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code,
+          bids: [{ bidder: 'trustedServer', params: { bidderParams: {}, storedRequest: invalid } }],
+        },
+      ],
+    } as unknown as RequestBidsArg);
+    invalid.nested[0] = 'mutated';
+    expect(readRefresh()).toEqual({ bidderParams: {}, storedRequest: { nested: ['original'] } });
+  });
+
   function completePublisherAuction(
     opts?: { adUnits?: Array<{ code?: string }>; bidsBackHandler?: (...args: unknown[]) => void },
     options: { auctionId?: string; applyTargeting?: boolean } = {}
@@ -3042,6 +3213,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
         {
           bidder: 'trustedServer',
           params: {
+            storedRequest: false,
             bidderParams: { exampleServer: { placement: 'effective' } },
             zone: 'example-zone',
           },
@@ -3082,7 +3254,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(refreshAdUnitFromLastRequest().bids).toEqual([
       {
         bidder: 'trustedServer',
-        params: { bidderParams: { exampleServer: { placement: 'server' } } },
+        params: { storedRequest: false, bidderParams: { exampleServer: { placement: 'server' } } },
       },
       { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
     ]);
@@ -3133,6 +3305,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       {
         bidder: 'trustedServer',
         params: {
+          storedRequest: false,
           bidderParams: {
             exampleServer: {
               placement: {
@@ -3182,12 +3355,14 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     } as unknown as RequestBidsArg);
     pubads.refresh([slot]);
     expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      storedRequest: false,
       bidderParams: { exampleServer: { placement: 'one' } },
       zone: 'example-zone-one',
     });
 
     pubads.refresh([slot]);
     expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      storedRequest: false,
       bidderParams: { exampleServer: { placement: 'one' } },
       zone: 'example-zone-one',
     });
@@ -3204,6 +3379,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     pubads.refresh([slot]);
 
     expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      storedRequest: false,
       bidderParams: { exampleServer: { placement: 'two' } },
       zone: 'example-zone-two',
     });
@@ -3294,7 +3470,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(refreshAdUnitFromLastRequest().bids).toEqual([
       {
         bidder: 'trustedServer',
-        params: { bidderParams: { exampleServer: { placement: 'live-server' } } },
+        params: {
+          storedRequest: false,
+          bidderParams: { exampleServer: { placement: 'live-server' } },
+        },
       },
       { bidder: 'exampleBrowser', params: { placement: 'live-browser' } },
     ]);
@@ -3363,7 +3542,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     pubads.refresh([slot]);
 
     expect(refreshAdUnitFromLastRequest().bids).toEqual([
-      { bidder: 'trustedServer', params: { bidderParams: {} } },
+      { bidder: 'trustedServer', params: { storedRequest: false, bidderParams: {} } },
     ]);
   });
 
@@ -3392,9 +3571,15 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     ]);
 
     pubads.refresh([slots[0]]);
-    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({ bidderParams: {} });
+    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      storedRequest: false,
+      bidderParams: {},
+    });
     pubads.refresh([slots[1]]);
-    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({ bidderParams: {} });
+    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      storedRequest: false,
+      bidderParams: {},
+    });
     pubads.refresh([slots[2]]);
     expect(refreshAdUnitFromLastRequest().bids[0].params.bidderParams).toEqual({
       exampleServer: { placement: codes[2] },
@@ -3402,7 +3587,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
 
     (pbjs as unknown as { removeAdUnit: (adUnitCode?: string | string[]) => void }).removeAdUnit();
     pubads.refresh([slots[2]]);
-    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({ bidderParams: {} });
+    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      storedRequest: false,
+      bidderParams: {},
+    });
   });
 
   it('bounds snapshots with LRU eviction while retaining a recently refreshed entry', () => {
@@ -3446,7 +3634,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     } as unknown as RequestBidsArg);
 
     pubads.refresh([oldestSlot]);
-    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({ bidderParams: {} });
+    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      storedRequest: false,
+      bidderParams: {},
+    });
     pubads.refresh([activeSlot]);
     expect(refreshAdUnitFromLastRequest().bids[0].params.bidderParams).toEqual({
       exampleServer: { placement: capacity - 1 },

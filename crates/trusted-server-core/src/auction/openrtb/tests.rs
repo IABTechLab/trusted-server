@@ -547,6 +547,180 @@ fn pbs_pairs_each_impression_with_its_routed_slot_params() {
 }
 
 #[test]
+fn pbs_stored_intent_is_applied_after_overrides_with_inline_first() {
+    for intent in [None, Some(false), Some(true)] {
+        for inline in [false, true] {
+            for fill_override in [false, true] {
+                let profile = if fill_override {
+                    json!({"bid_param_overrides":{"exampleBidder":{"filled":1}}})
+                } else {
+                    json!({})
+                };
+                let plan = AuctionPlan::compile(config("prebid-server", profile))
+                    .expect("should compile plan");
+                let mut request = canonical_parity_auction_request();
+                let mut envelope = json!({"bidderParams":{"exampleBidder":if inline { json!({"original":1}) } else { json!({}) }}});
+                if let Some(intent) = intent {
+                    envelope["storedRequest"] = json!(intent);
+                }
+                request.slots[0].bidders = HashMap::from([("trustedServer".to_string(), envelope)]);
+                let inbound = Request::new(EdgeBody::empty());
+                let routed = route_auction(request, &inbound, &plan, None);
+                let result = build_request(
+                    &routed.inputs()[0],
+                    &routed,
+                    &plan.providers()[0],
+                    321,
+                    &finalization(None),
+                )
+                .expect("should build request");
+                if !inline && !fill_override && intent == Some(false) {
+                    assert!(matches!(result, OpenRtbBuildOutcome::NoImpressions));
+                    continue;
+                }
+                let OpenRtbBuildOutcome::Ready(request) = result else {
+                    panic!("should retain demand")
+                };
+                let wire = serde_json::to_value(request).expect("should serialize request");
+                let prebid = &wire["imp"][0]["ext"]["prebid"];
+                if inline || fill_override {
+                    assert!(prebid.get("storedrequest").is_none());
+                    assert_eq!(
+                        prebid["bidder"]["exampleBidder"].get("original"),
+                        inline.then_some(&json!(1))
+                    );
+                    assert_eq!(
+                        prebid["bidder"]["exampleBidder"].get("filled"),
+                        fill_override.then_some(&json!(1))
+                    );
+                } else {
+                    assert_eq!(prebid["storedrequest"]["id"], "fictional-slot");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pbs_filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
+    let plan =
+        AuctionPlan::compile(config("prebid-server", json!({}))).expect("should compile plan");
+    let mut request = canonical_parity_auction_request();
+    let template = request.slots[0].clone();
+    request.slots = [
+        (
+            "drop-first",
+            json!({"storedRequest":false,"bidderParams":{"exampleBidder":{}}}),
+        ),
+        (
+            "keep-inline",
+            json!({"storedRequest":false,"bidderParams":{"exampleBidder":{"id":2}}}),
+        ),
+        (
+            "drop-trusted",
+            json!({"storedRequest":false,"bidderParams":{}}),
+        ),
+        (
+            "keep-stored",
+            json!({"storedRequest":true,"bidderParams":{}}),
+        ),
+    ]
+    .into_iter()
+    .map(|(id, envelope)| AdSlot {
+        id: id.to_string(),
+        bidders: HashMap::from([("trustedServer".to_string(), envelope)]),
+        ..template.clone()
+    })
+    .collect();
+    let inbound = Request::new(EdgeBody::empty());
+    let routes = crate::auction::routing::TrustedProviderRoutes::new(vec![
+        vec![],
+        vec![],
+        vec![plan.providers()[0].id.clone()],
+        vec![],
+    ]);
+    let routed = crate::auction::routing::route_auction_with_trusted_routes(
+        request, &inbound, &plan, None, &routes,
+    );
+    assert_eq!(
+        routed.inputs()[0].slots().len(),
+        4,
+        "should preserve server-owned route admission"
+    );
+    let result = build_request(
+        &routed.inputs()[0],
+        &routed,
+        &plan.providers()[0],
+        321,
+        &finalization(None),
+    )
+    .expect("should build request");
+    let OpenRtbBuildOutcome::Ready(request) = result else {
+        panic!("should retain siblings")
+    };
+    let wire = serde_json::to_value(request).expect("should serialize request");
+    assert_eq!(
+        wire["imp"]
+            .as_array()
+            .expect("should have impressions")
+            .len(),
+        2
+    );
+    assert_eq!(wire["imp"][0]["id"], "keep-inline");
+    assert_eq!(
+        wire["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
+        json!({"id":2})
+    );
+    assert_eq!(wire["imp"][1]["id"], "keep-stored");
+    assert_eq!(
+        wire["imp"][1]["ext"]["prebid"]["storedrequest"]["id"],
+        "keep-stored"
+    );
+}
+
+#[test]
+fn pbs_disabled_empty_candidate_does_not_become_stored_demand() {
+    let mut raw = config("prebid-server", json!({}));
+    raw.providers
+        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
+        .expect("should find provider")
+        .routing = RoutingMode::Explicit;
+    raw.bidders.insert(
+        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
+        BidderRouteConfig {
+            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
+        },
+    );
+    let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
+    let mut request = canonical_parity_auction_request();
+    request.slots[0].bidders = HashMap::from([(
+        "trustedServer".to_string(),
+        json!({"bidderParams":{"exampleBidder":{}}, "storedRequest": false}),
+    )]);
+    let inbound = Request::builder()
+        .uri("https://publisher.example.com/auction")
+        .body(EdgeBody::empty())
+        .expect("should build inbound request");
+    let routed = route_auction(request, &inbound, &plan, None);
+    assert_eq!(
+        routed.inputs().len(),
+        1,
+        "should route candidate for overrides"
+    );
+    assert!(matches!(
+        build_request(
+            &routed.inputs()[0],
+            &routed,
+            &plan.providers()[0],
+            321,
+            &finalization(None),
+        )
+        .expect("should build request"),
+        OpenRtbBuildOutcome::NoImpressions
+    ));
+}
+
+#[test]
 fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
     let mut raw = config("prebid-server", json!({}));
     raw.providers
