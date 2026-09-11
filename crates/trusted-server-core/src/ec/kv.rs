@@ -39,6 +39,9 @@ const ENTRY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// TTL for withdrawal tombstones (24 hours).
 const TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Namespace for completion markers written after a withdrawal tombstone.
+const WITHDRAWAL_MARKER_PREFIX: &str = "__ts_ec_withdrawal_complete__:";
+
 /// Outcome of an [`KvIdentityGraph::upsert_partner_id_if_exists`] call.
 ///
 /// Like [`KvIdentityGraph::upsert_partner_id`], this method fails closed when
@@ -135,7 +138,7 @@ impl fmt::Debug for KvIdentityGraph {
 /// Result of [`KvIdentityGraph::write_withdrawal_tombstone`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
-pub enum TombstoneOutcome {
+pub(crate) enum TombstoneOutcome {
     /// The identity was found and is now tombstoned.
     Written,
     /// No such identity is held, so there was nothing to mark withdrawn.
@@ -364,9 +367,8 @@ impl KvIdentityGraph {
     /// - **Existing tombstone** (`consent.ok = false`) — CAS overwrite with
     ///   the new entry. Retries up to [`MAX_CAS_RETRIES`] on conflict.
     ///
-    /// Called by `generate_if_needed()` instead of `create()` so that a
-    /// user who re-consents within the 24-hour tombstone window recovers
-    /// immediately.
+    /// This method is reserved for explicit same-key revival. Production EC
+    /// generation uses [`Self::create_if_absent`] with a freshly generated ID.
     ///
     /// # Errors
     ///
@@ -411,6 +413,11 @@ impl KvIdentityGraph {
 
         let mut current_gen = generation;
         for attempt in 0..MAX_CAS_RETRIES {
+            // A completion marker belongs to the tombstone generation. Remove
+            // it before making this key live so a later withdrawal cannot be
+            // suppressed by stale fallback state.
+            self.clear_withdrawal_marker(ec_id)?;
+
             match self.write_entry(
                 ec_id,
                 &body,
@@ -862,11 +869,65 @@ impl KvIdentityGraph {
         self.store.key_exists(ec_id)
     }
 
+    fn withdrawal_marker_key(ec_id: &str) -> String {
+        format!("{WITHDRAWAL_MARKER_PREFIX}{ec_id}")
+    }
+
+    fn withdrawal_marker_exists(&self, ec_id: &str) -> Result<bool, Report<TrustedServerError>> {
+        let marker_key = Self::withdrawal_marker_key(ec_id);
+        self.store.key_exists(&marker_key)
+    }
+
+    fn write_withdrawal_marker(&self, ec_id: &str) -> Result<(), Report<TrustedServerError>> {
+        let marker_key = Self::withdrawal_marker_key(ec_id);
+        match self.store.insert(
+            &marker_key,
+            EcKvWrite {
+                body: "1",
+                metadata: "{}",
+                ttl: TOMBSTONE_TTL,
+                mode: EcKvWriteMode::Add,
+            },
+        )? {
+            EcKvWriteOutcome::Written | EcKvWriteOutcome::PreconditionFailed => Ok(()),
+        }
+    }
+
+    fn clear_withdrawal_marker(&self, ec_id: &str) -> Result<(), Report<TrustedServerError>> {
+        if !self.withdrawal_marker_exists(ec_id)? {
+            return Ok(());
+        }
+
+        let marker_key = Self::withdrawal_marker_key(ec_id);
+        match self.store.delete(&marker_key) {
+            Ok(()) => Ok(()),
+            Err(delete_err) => match self.withdrawal_marker_exists(ec_id) {
+                // Another request removed the marker first.
+                Ok(false) => Ok(()),
+                Ok(true) | Err(_) => Err(delete_err),
+            },
+        }
+    }
+
+    fn record_withdrawal_completion(&self, ec_id: &str) {
+        if let Err(err) = self.write_withdrawal_marker(ec_id) {
+            // The root is already tombstoned. Preserve that successful privacy
+            // write even if the cost-control marker cannot be recorded.
+            log::warn!(
+                "withdrawal completion marker failed for '{}': {err:?}",
+                log_id(ec_id)
+            );
+        }
+    }
+
     /// Writes a withdrawal tombstone for consent enforcement.
     ///
     /// Overwrites the entry with `consent.ok = false`, empty partner IDs,
     /// and a 24-hour TTL. Uses unconditional overwrite (no CAS) since the
     /// entry is being withdrawn regardless of concurrent state.
+    ///
+    /// A successful write records a same-TTL completion marker so repeated
+    /// stale misses do not overwrite the root or refresh its tombstone TTL.
     ///
     /// The tombstone preserves consent enforcement for batch sync clients
     /// (`POST /_ts/api/v1/batch-sync`) during the 24-hour revocation window.
@@ -910,7 +971,7 @@ impl KvIdentityGraph {
     /// [`EcKvSnapshot::Failed`]. Callers on the browser path should log at
     /// `error` level and continue: cookie deletion is the primary enforcement
     /// mechanism.
-    pub fn write_withdrawal_tombstone(
+    pub(crate) fn write_withdrawal_tombstone(
         &self,
         ec_id: &str,
         record_snapshot: impl FnOnce(EcKvSnapshot),
@@ -931,13 +992,17 @@ impl KvIdentityGraph {
             },
         });
 
-        written.map(|entry| {
+        let outcome = written.map(|entry| {
             if entry.is_some() {
                 TombstoneOutcome::Written
             } else {
                 TombstoneOutcome::UnknownIdentity
             }
-        })
+        });
+        if matches!(outcome, Ok(TombstoneOutcome::Written)) {
+            self.record_withdrawal_completion(ec_id);
+        }
+        outcome
     }
 
     /// Tombstones a held identity, returning the entry written.
@@ -973,6 +1038,190 @@ impl KvIdentityGraph {
                 message: format!("Failed to write tombstone for key '{}'", log_id(ec_id)),
             })
         })
+    }
+
+    /// Resolves a tombstone attempt whose point read reported the row absent.
+    ///
+    /// A completion marker proves an earlier withdrawal finished and avoids a
+    /// second root existence check. Otherwise, a proven-absent key is a no-op:
+    /// there is nothing to withdraw, and a forged cookie must not mint a row. A
+    /// key that provably exists is tombstoned unconditionally because no CAS
+    /// generation is available after a missed read. Marker-check failure falls
+    /// back to that privacy write; root-existence failure leaves withdrawal
+    /// unresolved rather than silently dropped.
+    fn tombstone_unproven_missing(&self, ec_id: &str, missing: EcKvSnapshot) -> EcKvSnapshot {
+        match self.withdrawal_marker_exists(ec_id) {
+            Ok(true) => {
+                log::debug!(
+                    "withdrawal tombstone for '{}': completion marker already exists",
+                    log_id(ec_id)
+                );
+                return missing;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                // Marker failure must not weaken withdrawal. Fall back to the
+                // existing root existence check and unconditional privacy write.
+                log::warn!(
+                    "withdrawal completion marker lookup failed for '{}': {err:?}",
+                    log_id(ec_id)
+                );
+            }
+        }
+
+        match self.key_exists_confirmed(ec_id) {
+            Ok(false) => missing,
+            Ok(true) => {
+                log::warn!(
+                    "withdrawal tombstone for '{}': point read missed a row the store still \
+                     lists; writing an unconditional tombstone",
+                    log_id(ec_id)
+                );
+                let mut outcome_snapshot = EcKvSnapshot::NotRead;
+                match self.write_withdrawal_tombstone(ec_id, |snapshot| {
+                    outcome_snapshot = snapshot;
+                }) {
+                    Ok(TombstoneOutcome::Written) => outcome_snapshot,
+                    Ok(TombstoneOutcome::UnknownIdentity) => EcKvSnapshot::Missing {
+                        ec_id: ec_id.to_owned(),
+                    },
+                    Err(err) => {
+                        log::warn!(
+                            "unconditional withdrawal tombstone failed for '{}': {err:?}",
+                            log_id(ec_id)
+                        );
+                        EcKvSnapshot::Failed {
+                            ec_id: ec_id.to_owned(),
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "withdrawal tombstone for '{}': existence check failed, cannot confirm \
+                     absence: {err:?}",
+                    log_id(ec_id)
+                );
+                EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                }
+            }
+        }
+    }
+
+    /// Writes a tombstone only when an existing row can be confirmed.
+    ///
+    /// Existing-key-only behavior is deliberate: a forged or expired `ts-ec`
+    /// cookie must not mint a row. But a *point read* cannot prove absence on
+    /// an eventually-consistent store, and dropping a withdrawal is worse than
+    /// a redundant read, so absence is established in two stages:
+    ///
+    /// 1. Any snapshot that is not a usable `Present` for this EC ID — a
+    ///    publisher preload that read `Missing`, a read that `Failed`, or one
+    ///    lacking a CAS generation — is re-read. On the publisher path that
+    ///    re-read is separated from the preload by the full origin round trip,
+    ///    which gives replication time to converge.
+    /// 2. A re-read that still reports the row absent is checked against
+    ///    [`key_exists_confirmed`](Self::key_exists_confirmed), which reads
+    ///    the primary data source.
+    ///
+    /// Resolving the initial snapshot happens outside the retry counter, so all
+    /// [`MAX_CAS_RETRIES`] iterations stay available for the tombstone write.
+    pub(crate) fn tombstone_existing_from_snapshot(
+        &self,
+        ec_id: &str,
+        snapshot: EcKvSnapshot,
+    ) -> EcKvSnapshot {
+        let mut current = match snapshot {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                ref entry,
+                ..
+            } if snapshot_id == ec_id && !entry.consent.ok => return snapshot,
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                generation: Some(_),
+                ..
+            } if snapshot_id == ec_id => snapshot,
+            _ => self.load_snapshot(ec_id),
+        };
+
+        for _attempt in 0..MAX_CAS_RETRIES {
+            let generation = match current {
+                EcKvSnapshot::Present {
+                    ec_id: ref snapshot_id,
+                    ref entry,
+                    ..
+                } if snapshot_id == ec_id && !entry.consent.ok => return current,
+                EcKvSnapshot::Present {
+                    ec_id: ref snapshot_id,
+                    generation: Some(generation),
+                    ..
+                } if snapshot_id == ec_id => generation,
+                // A missing row (including one that disappeared mid-retry) is
+                // only a no-op once absence is proven against the primary data
+                // source.
+                EcKvSnapshot::Missing {
+                    ec_id: ref snapshot_id,
+                } if snapshot_id == ec_id => {
+                    return self.tombstone_unproven_missing(ec_id, current);
+                }
+                // A refreshed read that failed (or any other unusable state)
+                // fails closed rather than silently dropping the withdrawal.
+                _ => {
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            };
+
+            let tombstone = KvEntry::tombstone(current_timestamp());
+            let Ok((body, meta_str)) = Self::serialize_entry(&tombstone, self.store_name()) else {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            };
+            match self.write_entry(
+                ec_id,
+                &body,
+                &meta_str,
+                TOMBSTONE_TTL,
+                EcKvWriteMode::IfGenerationMatch(generation),
+            ) {
+                Ok(EcKvWriteOutcome::Written) => {
+                    self.record_withdrawal_completion(ec_id);
+                    return EcKvSnapshot::Present {
+                        ec_id: ec_id.to_owned(),
+                        entry: Box::new(tombstone),
+                        generation: None,
+                    };
+                }
+                Ok(EcKvWriteOutcome::PreconditionFailed) => {
+                    current = self.load_snapshot(ec_id);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "conditional withdrawal tombstone failed for '{}': {err:?}",
+                        log_id(ec_id)
+                    );
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            }
+        }
+
+        // Withdrawal enforcement lost every CAS race, so the row can still be
+        // live with consent granted while the browser cookie is cleared. That
+        // divergence is only visible to operators if it is logged here.
+        log::warn!(
+            "withdrawal tombstone for '{}': CAS conflict after {MAX_CAS_RETRIES} retries; the \
+             identity-graph row may still be live with consent granted",
+            log_id(ec_id)
+        );
+        EcKvSnapshot::Failed {
+            ec_id: ec_id.to_owned(),
+        }
     }
 
     /// Counts the number of keys sharing the same EC hash prefix.
@@ -1076,7 +1325,7 @@ impl KvIdentityGraph {
         Ok(Some(cluster_size))
     }
 
-    /// Hard-deletes the entry.
+    /// Hard-deletes the entry and any withdrawal completion marker.
     ///
     /// Reserved for the IAB data deletion framework (deferred). For consent
     /// withdrawal, use [`write_withdrawal_tombstone`](Self::write_withdrawal_tombstone).
@@ -1087,7 +1336,8 @@ impl KvIdentityGraph {
     pub fn delete(&self, ec_id: &str) -> Result<(), Report<TrustedServerError>> {
         // The backend's delete already attaches store context, so propagate
         // without re-wrapping the same message.
-        self.store.delete(ec_id)
+        self.store.delete(ec_id)?;
+        self.clear_withdrawal_marker(ec_id)
     }
 }
 
@@ -1146,6 +1396,85 @@ impl KvIdentityGraph {
 mod tests {
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
+
+    /// [`EcKvStore`] wrapper whose first CAS write both fails the precondition
+    /// and deletes the key, simulating a concurrent withdrawal that removes the
+    /// row between this writer's read and its write.
+    struct DisappearOnConflictEcKv {
+        inner: InMemoryEcKv,
+        conflicts_remaining: std::sync::Mutex<u32>,
+    }
+
+    impl DisappearOnConflictEcKv {
+        fn new(conflicts: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("disappear-store"),
+                conflicts_remaining: std::sync::Mutex::new(conflicts),
+            }
+        }
+
+        fn seed_live(&self, ec_id: &str) {
+            let (body, meta) =
+                KvIdentityGraph::serialize_entry(&live_entry(), self.inner.store_name())
+                    .expect("should serialize seeded entry");
+            self.inner
+                .insert(
+                    ec_id,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &meta,
+                        ttl: ENTRY_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed live entry");
+        }
+    }
+
+    impl EcKvStore for DisappearOnConflictEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+                let mut remaining = self
+                    .conflicts_remaining
+                    .lock()
+                    .expect("should lock conflict counter");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    self.inner.delete(key).expect("should delete on conflict");
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
 
     fn snapshot_ec_id() -> String {
         format!("{}.ABC123", "a".repeat(64))
@@ -1240,6 +1569,21 @@ mod tests {
         entry
     }
 
+    fn concurrent_live_entry() -> KvEntry {
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "concurrent.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "concurrent-uid".to_owned(),
+            },
+        );
+        entry
+    }
+
+    // -----------------------------------------------------------------------
+    // CAS-conflict injection tests
+    // -----------------------------------------------------------------------
+
     /// [`EcKvStore`] wrapper that injects generation conflicts: the first
     /// `conflicts_remaining` `IfGenerationMatch` inserts return
     /// [`EcKvWriteOutcome::PreconditionFailed`] without writing, optionally
@@ -1248,6 +1592,7 @@ mod tests {
         inner: InMemoryEcKv,
         conflicts_remaining: std::sync::Mutex<u32>,
         revive_on_conflict: bool,
+        partner_update_on_conflict: bool,
     }
 
     impl ConflictInjectingEcKv {
@@ -1256,6 +1601,16 @@ mod tests {
                 inner: InMemoryEcKv::new("conflict-store"),
                 conflicts_remaining: std::sync::Mutex::new(conflicts),
                 revive_on_conflict,
+                partner_update_on_conflict: false,
+            }
+        }
+
+        fn with_partner_update_on_conflict(conflicts: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("partner-conflict-store"),
+                conflicts_remaining: std::sync::Mutex::new(conflicts),
+                revive_on_conflict: true,
+                partner_update_on_conflict: true,
             }
         }
 
@@ -1324,8 +1679,13 @@ mod tests {
                     if self.revive_on_conflict {
                         // Simulate a concurrent writer reviving the entry
                         // between this writer's read and its CAS write.
+                        let concurrent_entry = if self.partner_update_on_conflict {
+                            concurrent_live_entry()
+                        } else {
+                            live_entry()
+                        };
                         let (body, meta) = KvIdentityGraph::serialize_entry(
-                            &live_entry(),
+                            &concurrent_entry,
                             self.inner.store_name(),
                         )
                         .expect("should serialize concurrent live entry");
@@ -1615,6 +1975,165 @@ mod tests {
     }
 
     #[test]
+    fn create_or_revive_fresh_entry_ignores_marker_store_failure() {
+        let kv = KvIdentityGraph::new(MarkerFailingEcKv::new(0));
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+
+        kv.create_or_revive(&ec_id, &live_entry())
+            .expect("should create without reading withdrawal markers");
+
+        assert!(
+            kv.get(&ec_id)
+                .expect("should read entry")
+                .is_some_and(|(entry, _)| entry.consent.ok),
+            "fresh create should persist a live entry"
+        );
+    }
+
+    #[test]
+    fn create_or_revive_clears_withdrawal_marker() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry())
+            .expect("should create live entry");
+        let snapshot = kv.load_snapshot(&ec_id);
+        kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+        assert!(
+            kv.withdrawal_marker_exists(&ec_id)
+                .expect("should read withdrawal marker"),
+            "withdrawal should record completion"
+        );
+
+        kv.create_or_revive(&ec_id, &live_entry())
+            .expect("should revive tombstone");
+
+        let (loaded, _) = kv
+            .get(&ec_id)
+            .expect("should read revived entry")
+            .expect("should find revived entry");
+        assert!(loaded.consent.ok, "should be live after revive");
+        assert!(
+            !kv.withdrawal_marker_exists(&ec_id)
+                .expect("should read withdrawal marker"),
+            "revival should clear stale withdrawal completion"
+        );
+    }
+
+    #[test]
+    fn withdrawal_marker_existence_requires_an_exact_key() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let marker_key = KvIdentityGraph::withdrawal_marker_key(&ec_id);
+        let longer_key = format!("{marker_key}-longer");
+        let store = InMemoryEcKv::new("test_store");
+        store
+            .insert(
+                &longer_key,
+                EcKvWrite {
+                    body: "1",
+                    metadata: "{}",
+                    ttl: TOMBSTONE_TTL,
+                    mode: EcKvWriteMode::Add,
+                },
+            )
+            .expect("should seed longer marker key");
+        let kv = KvIdentityGraph::new(store);
+
+        assert!(
+            !kv.withdrawal_marker_exists(&ec_id)
+                .expect("should check exact withdrawal marker"),
+            "a longer marker key must not answer for this identity"
+        );
+    }
+
+    #[test]
+    fn clear_withdrawal_marker_accepts_concurrent_removal_after_delete_error() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let kv = KvIdentityGraph::new(MarkerFailingEcKv::with_marker_delete_failure(true));
+        kv.create(&ec_id, &live_entry())
+            .expect("should create live entry");
+        let snapshot = kv.load_snapshot(&ec_id);
+        kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        kv.clear_withdrawal_marker(&ec_id)
+            .expect("should accept a marker removed by another request");
+
+        assert!(
+            !kv.withdrawal_marker_exists(&ec_id)
+                .expect("should confirm marker removal"),
+            "completion marker should remain absent"
+        );
+    }
+
+    #[test]
+    fn clear_withdrawal_marker_preserves_delete_error_when_marker_remains() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let kv = KvIdentityGraph::new(MarkerFailingEcKv::with_marker_delete_failure(false));
+        kv.create(&ec_id, &live_entry())
+            .expect("should create live entry");
+        let snapshot = kv.load_snapshot(&ec_id);
+        kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            kv.clear_withdrawal_marker(&ec_id).is_err(),
+            "a marker that remains after delete failure should block revival"
+        );
+        assert!(
+            kv.withdrawal_marker_exists(&ec_id)
+                .expect("should confirm marker remains"),
+            "completion marker should remain present"
+        );
+    }
+
+    #[test]
+    fn withdrawal_marker_is_excluded_from_hash_prefix_count() {
+        let hash = "a".repeat(64);
+        let ec_id = format!("{hash}.ABC123");
+        let kv = KvIdentityGraph::in_memory("test_store");
+        kv.create(&ec_id, &live_entry())
+            .expect("should create live entry");
+        assert_eq!(
+            kv.count_hash_prefix_keys(&hash)
+                .expect("should count live root"),
+            1,
+            "the root should be the only hash-prefix key"
+        );
+
+        let snapshot = kv.load_snapshot(&ec_id);
+        kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            kv.withdrawal_marker_exists(&ec_id)
+                .expect("should read withdrawal marker"),
+            "withdrawal should record completion"
+        );
+        assert_eq!(
+            kv.count_hash_prefix_keys(&hash)
+                .expect("should count tombstoned root"),
+            1,
+            "the marker namespace must not affect cluster counts"
+        );
+    }
+
+    #[test]
+    fn delete_removes_withdrawal_marker() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry())
+            .expect("should create live entry");
+        let snapshot = kv.load_snapshot(&ec_id);
+        kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        kv.delete(&ec_id).expect("should delete entry and marker");
+
+        assert!(kv.get(&ec_id).expect("should read store").is_none());
+        assert!(
+            !kv.withdrawal_marker_exists(&ec_id)
+                .expect("should read withdrawal marker"),
+            "hard delete should remove withdrawal completion"
+        );
+    }
+
+    #[test]
     fn upsert_partner_id_if_exists_reports_missing_key() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -1698,6 +2217,45 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_existing_from_snapshot_never_creates_missing_key() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let snapshot = EcKvSnapshot::Missing {
+            ec_id: ec_id.clone(),
+        };
+
+        let outcome = kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(matches!(outcome, EcKvSnapshot::Missing { .. }));
+        assert!(
+            kv.get(&ec_id).expect("should read store").is_none(),
+            "withdrawal must not create a tombstone for an absent key"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_uses_existing_generation() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry()).expect("should create");
+        let snapshot = kv.load_snapshot(&ec_id);
+
+        let outcome = kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "should return the persisted tombstone"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve existing key");
+        assert!(!stored.consent.ok, "should persist withdrawal state");
+    }
+
+    #[test]
     fn write_withdrawal_tombstone_overwrites_live_entry() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -1715,6 +2273,299 @@ mod tests {
             .expect("should read entry back")
             .expect("should find tombstone entry");
         assert!(!loaded.consent.ok, "should be withdrawn after tombstone");
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot-aware mutation stores and tests
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RecordedEcKvInsert {
+        mode: EcKvWriteMode,
+        ttl: Duration,
+    }
+
+    #[derive(Default)]
+    struct RecordedEcKvOperations {
+        lookups: std::sync::atomic::AtomicUsize,
+        exact_checks: std::sync::atomic::AtomicUsize,
+        inserts: std::sync::Mutex<Vec<RecordedEcKvInsert>>,
+        lists: std::sync::atomic::AtomicUsize,
+        deletes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordedEcKvOperations {
+        fn reset(&self) {
+            self.lookups.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.exact_checks
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.inserts
+                .lock()
+                .expect("should lock recorded inserts")
+                .clear();
+            self.lists.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.deletes.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn lookup_count(&self) -> usize {
+            self.lookups.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn exact_check_count(&self) -> usize {
+            self.exact_checks.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn list_count(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn delete_count(&self) -> usize {
+            self.deletes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn operation_count(&self) -> usize {
+            self.lookup_count()
+                + self.exact_check_count()
+                + self.inserts().len()
+                + self.list_count()
+                + self.delete_count()
+        }
+
+        fn inserts(&self) -> Vec<RecordedEcKvInsert> {
+            self.inserts
+                .lock()
+                .expect("should lock recorded inserts")
+                .clone()
+        }
+    }
+
+    /// In-memory store that records every backend operation before delegation.
+    struct RecordingEcKv {
+        inner: InMemoryEcKv,
+        operations: Arc<RecordedEcKvOperations>,
+        stale_lookups_remaining: std::sync::Mutex<u32>,
+    }
+
+    impl RecordingEcKv {
+        fn new(operations: Arc<RecordedEcKvOperations>) -> Self {
+            Self::with_stale_lookups(operations, 0)
+        }
+
+        fn with_stale_lookups(operations: Arc<RecordedEcKvOperations>, stale_lookups: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("recording-store"),
+                operations,
+                stale_lookups_remaining: std::sync::Mutex::new(stale_lookups),
+            }
+        }
+    }
+
+    impl EcKvStore for RecordingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.operations
+                .lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut stale_lookups = self
+                .stale_lookups_remaining
+                .lock()
+                .expect("should lock stale lookup counter");
+            if *stale_lookups > 0 {
+                *stale_lookups -= 1;
+                return Ok(None);
+            }
+            self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.operations
+                .exact_checks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.key_exists(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.operations
+                .inserts
+                .lock()
+                .expect("should lock recorded inserts")
+                .push(RecordedEcKvInsert {
+                    mode: write.mode,
+                    ttl: write.ttl,
+                });
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.operations
+                .lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.operations
+                .deletes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store whose completion-marker operations fail while root operations work.
+    struct MarkerFailingEcKv {
+        inner: InMemoryEcKv,
+        stale_lookups_remaining: std::sync::Mutex<u32>,
+        marker_operations_fail: bool,
+        root_check_fails: bool,
+        marker_delete_failure_removes_key: Option<bool>,
+    }
+
+    impl MarkerFailingEcKv {
+        fn new(stale_lookups: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("marker-failing-store"),
+                stale_lookups_remaining: std::sync::Mutex::new(stale_lookups),
+                marker_operations_fail: true,
+                root_check_fails: false,
+                marker_delete_failure_removes_key: None,
+            }
+        }
+
+        fn completed_with_root_check_failure(ec_id: &str) -> Self {
+            let store = Self {
+                inner: InMemoryEcKv::new("completed-withdrawal-store"),
+                stale_lookups_remaining: std::sync::Mutex::new(u32::MAX),
+                marker_operations_fail: false,
+                root_check_fails: true,
+                marker_delete_failure_removes_key: None,
+            };
+            let tombstone = KvEntry::tombstone(1_000);
+            let (body, metadata) =
+                KvIdentityGraph::serialize_entry(&tombstone, store.inner.store_name())
+                    .expect("should serialize tombstone");
+            store
+                .inner
+                .insert(
+                    ec_id,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &metadata,
+                        ttl: TOMBSTONE_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed tombstone");
+            store
+                .inner
+                .insert(
+                    &KvIdentityGraph::withdrawal_marker_key(ec_id),
+                    EcKvWrite {
+                        body: "1",
+                        metadata: "{}",
+                        ttl: TOMBSTONE_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed completion marker");
+            store
+        }
+
+        fn with_marker_delete_failure(remove_before_error: bool) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("marker-delete-failing-store"),
+                stale_lookups_remaining: std::sync::Mutex::new(0),
+                marker_operations_fail: false,
+                root_check_fails: false,
+                marker_delete_failure_removes_key: Some(remove_before_error),
+            }
+        }
+
+        fn marker_error(&self, operation: &str) -> Report<TrustedServerError> {
+            Report::new(TrustedServerError::KvStore {
+                store_name: self.inner.store_name().to_owned(),
+                message: format!("completion marker {operation} failed"),
+            })
+        }
+
+        fn root_check_error(&self) -> Report<TrustedServerError> {
+            Report::new(TrustedServerError::KvStore {
+                store_name: self.inner.store_name().to_owned(),
+                message: "root existence check failed".to_owned(),
+            })
+        }
+    }
+
+    impl EcKvStore for MarkerFailingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            let mut stale_lookups = self
+                .stale_lookups_remaining
+                .lock()
+                .expect("should lock stale lookup counter");
+            if *stale_lookups > 0 {
+                *stale_lookups -= 1;
+                return Ok(None);
+            }
+            self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            if key.starts_with(WITHDRAWAL_MARKER_PREFIX) && self.marker_operations_fail {
+                return Err(self.marker_error("lookup"));
+            }
+            if !key.starts_with(WITHDRAWAL_MARKER_PREFIX) && self.root_check_fails {
+                return Err(self.root_check_error());
+            }
+            self.inner.key_exists(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if key.starts_with(WITHDRAWAL_MARKER_PREFIX) && self.marker_operations_fail {
+                return Err(self.marker_error("write"));
+            }
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            if prefix.starts_with(WITHDRAWAL_MARKER_PREFIX) && self.marker_operations_fail {
+                return Err(self.marker_error("lookup"));
+            }
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            if key.starts_with(WITHDRAWAL_MARKER_PREFIX)
+                && let Some(remove_before_error) = self.marker_delete_failure_removes_key
+            {
+                if remove_before_error {
+                    self.inner.delete(key)?;
+                }
+                return Err(self.marker_error("delete"));
+            }
+            self.inner.delete(key)
+        }
     }
 
     /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
@@ -2021,6 +2872,506 @@ mod tests {
             matches!(outcome, EcKvSnapshot::Failed { .. }),
             "a store write failure must not claim request-local IDs were persisted"
         );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_skips_backend_for_authoritative_tombstone() {
+        for generation in [Some(7), None] {
+            let operations = Arc::new(RecordedEcKvOperations::default());
+            let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+            let ec_id = snapshot_ec_id();
+            let snapshot = EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(KvEntry::tombstone(1_000)),
+                generation,
+            };
+
+            let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot.clone());
+
+            assert_eq!(
+                outcome, snapshot,
+                "should preserve authoritative tombstone state"
+            );
+            assert_eq!(
+                operations.operation_count(),
+                0,
+                "an authoritative tombstone should not access the backend"
+            );
+        }
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_repeated_request_preserves_first_write() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        let live_snapshot = graph.load_snapshot(&ec_id);
+        operations.reset();
+
+        graph.tombstone_existing_from_snapshot(&ec_id, live_snapshot);
+
+        assert_eq!(
+            operations.lookup_count(),
+            0,
+            "usable generation should avoid a read"
+        );
+        assert_eq!(
+            operations.inserts(),
+            vec![
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::IfGenerationMatch(1),
+                    ttl: TOMBSTONE_TTL,
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Add,
+                    ttl: TOMBSTONE_TTL,
+                },
+            ],
+            "first withdrawal should write the root and its completion marker"
+        );
+        let first_snapshot = graph.load_snapshot(&ec_id);
+        let (first_entry, first_generation) = match &first_snapshot {
+            EcKvSnapshot::Present {
+                entry, generation, ..
+            } => (entry.as_ref().clone(), *generation),
+            other => panic!("should load first tombstone, got {other:?}"),
+        };
+        operations.reset();
+
+        let second_outcome = graph.tombstone_existing_from_snapshot(&ec_id, first_snapshot);
+
+        assert_eq!(
+            operations.operation_count(),
+            0,
+            "repeated withdrawal should not access the backend"
+        );
+        assert_eq!(
+            second_outcome.generation_for(&ec_id),
+            first_generation,
+            "repeated withdrawal should preserve the stored generation"
+        );
+        assert_eq!(
+            second_outcome
+                .entry_for(&ec_id)
+                .map(|entry| entry.consent.updated),
+            Some(first_entry.consent.updated),
+            "repeated withdrawal should preserve the first tombstone timestamp"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_repeated_stale_miss_preserves_first_write() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::with_stale_lookups(
+            Arc::clone(&operations),
+            2,
+        ));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        operations.reset();
+
+        let first_outcome = graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+        let first_updated = first_outcome
+            .entry_for(&ec_id)
+            .expect("should return first tombstone")
+            .consent
+            .updated;
+        operations.reset();
+
+        graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert_eq!(
+            operations.lookup_count(),
+            1,
+            "a repeated stale miss should retry its point read once"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            1,
+            "the completion marker should avoid a second strong existence check"
+        );
+        assert_eq!(
+            operations.list_count(),
+            0,
+            "exact marker checks should not use the prefix-count operation"
+        );
+        assert_eq!(
+            operations.delete_count(),
+            0,
+            "a repeated withdrawal should not delete marker state"
+        );
+        assert!(
+            operations.inserts().is_empty(),
+            "a repeated stale miss should not rewrite the completed tombstone"
+        );
+        let (stored, generation) = graph
+            .get(&ec_id)
+            .expect("should read stored tombstone")
+            .expect("should preserve tombstone");
+        assert_eq!(
+            generation, 2,
+            "only the first withdrawal should advance the root generation"
+        );
+        assert_eq!(
+            stored.consent.updated, first_updated,
+            "repeated withdrawal should preserve the first tombstone timestamp"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_stale_parallel_snapshot_stops_after_conflict() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        let stale_snapshot = graph.load_snapshot(&ec_id);
+        operations.reset();
+
+        let first_outcome = graph.tombstone_existing_from_snapshot(&ec_id, stale_snapshot.clone());
+        let second_outcome = graph.tombstone_existing_from_snapshot(&ec_id, stale_snapshot);
+
+        assert_eq!(
+            operations.inserts(),
+            vec![
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::IfGenerationMatch(1),
+                    ttl: TOMBSTONE_TTL,
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Add,
+                    ttl: TOMBSTONE_TTL,
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::IfGenerationMatch(1),
+                    ttl: TOMBSTONE_TTL,
+                },
+            ],
+            "parallel loser should attempt stale CAS once and never replace the winner"
+        );
+        assert_eq!(
+            operations.lookup_count(),
+            1,
+            "parallel loser should reread exactly once after its conflict"
+        );
+        assert_eq!(
+            second_outcome.generation_for(&ec_id),
+            Some(2),
+            "parallel loser should return the winner's stored generation"
+        );
+        assert_eq!(
+            second_outcome
+                .entry_for(&ec_id)
+                .map(|entry| entry.consent.updated),
+            first_outcome
+                .entry_for(&ec_id)
+                .map(|entry| entry.consent.updated),
+            "parallel loser should preserve the winner's tombstone"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_succeeds_without_backend_for_tombstone() {
+        let graph = KvIdentityGraph::failing("unavailable-store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(KvEntry::tombstone(1_000)),
+            generation: Some(3),
+        };
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot.clone());
+
+        assert_eq!(
+            outcome, snapshot,
+            "authoritative tombstone should not touch unavailable backend"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_non_authoritative_states_reread_live_row() {
+        let ec_id = snapshot_ec_id();
+        let states = [
+            EcKvSnapshot::NotRead,
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+            EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(live_entry()),
+                generation: None,
+            },
+            EcKvSnapshot::Present {
+                ec_id: "different-ec-id".to_owned(),
+                entry: Box::new(KvEntry::tombstone(1_000)),
+                generation: Some(9),
+            },
+        ];
+
+        for state in states {
+            let operations = Arc::new(RecordedEcKvOperations::default());
+            let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+            graph
+                .create(&ec_id, &live_entry())
+                .expect("should seed live row");
+            operations.reset();
+
+            let outcome = graph.tombstone_existing_from_snapshot(&ec_id, state);
+
+            assert_eq!(
+                operations.lookup_count(),
+                1,
+                "state should force one reread"
+            );
+            assert_eq!(
+                operations.inserts().len(),
+                2,
+                "live reread should write the root and completion marker"
+            );
+            assert!(
+                outcome
+                    .entry_for(&ec_id)
+                    .is_some_and(|entry| !entry.consent.ok),
+                "reread live row should be tombstoned"
+            );
+        }
+    }
+
+    #[test]
+    fn tombstone_stale_miss_accepts_marker_when_root_check_fails() {
+        let ec_id = snapshot_ec_id();
+        let graph =
+            KvIdentityGraph::new(MarkerFailingEcKv::completed_with_root_check_failure(&ec_id));
+
+        let outcome = graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "a completion marker should resolve a repeated stale miss"
+        );
+    }
+
+    #[test]
+    fn tombstone_stale_miss_still_writes_when_marker_operations_fail() {
+        let graph = KvIdentityGraph::new(MarkerFailingEcKv::new(1));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+
+        let outcome = graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "marker failures must not suppress the withdrawal write"
+        );
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read stored row")
+            .expect("should preserve the root");
+        assert!(!stored.consent.ok, "root should remain tombstoned");
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_retries_cas_conflict() {
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, false));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "should retry the conflict and persist the tombstone"
+        );
+    }
+
+    #[test]
+    fn tombstone_gen_unavailable_survives_four_conflicts_then_writes() {
+        // A generation-unavailable snapshot refreshes once before its CAS. That
+        // refresh must not spend a CAS attempt, so a withdrawal tombstone still
+        // persists after four conflicts and a successful fifth write.
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(4, false));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "the fifth CAS attempt must persist the tombstone after a refresh and four conflicts"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_returns_failed_after_cas_exhaustion() {
+        // Every CAS attempt loses its race, so the row stays live with consent
+        // granted while the browser cookie is already cleared. The caller must
+        // see a failure it can report rather than a silent no-op.
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(MAX_CAS_RETRIES, false));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Failed { .. }),
+            "CAS exhaustion must report a failed withdrawal"
+        );
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert!(
+            stored.consent.ok,
+            "the row is still live, which is exactly why the failure must be reported"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_overrides_concurrent_live_update() {
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::with_partner_update_on_conflict(1));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        let entry = outcome
+            .entry_for(&ec_id)
+            .expect("should return persisted tombstone");
+        assert!(!entry.consent.ok, "withdrawal should win after retry");
+        assert!(
+            entry.ids.is_empty(),
+            "withdrawal should clear concurrent partner IDs"
+        );
+    }
+
+    #[test]
+    fn upsert_partner_id_rejects_tombstone() {
+        let graph = KvIdentityGraph::in_memory("test-store");
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &KvEntry::tombstone(1_000))
+            .expect("should seed tombstone");
+
+        let result = graph.upsert_partner_id(&ec_id, "ssp.example.com", "uid-1");
+
+        assert!(result.is_err(), "public upsert should reject a tombstone");
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve tombstone");
+        assert!(!stored.consent.ok, "entry should remain withdrawn");
+        assert!(
+            stored.ids.is_empty(),
+            "upsert should not repopulate partner IDs"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_store_failure_returns_failed() {
+        let graph = KvIdentityGraph::new(WriteFailingEcKv::new());
+        let ec_id = snapshot_ec_id();
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: Some(1),
+        };
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(matches!(outcome, EcKvSnapshot::Failed { .. }));
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_noop_when_row_disappears_on_retry() {
+        let store = DisappearOnConflictEcKv::new(1);
+        store.seed_live(&snapshot_ec_id());
+        let graph = KvIdentityGraph::new(store);
+        let ec_id = snapshot_ec_id();
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "a row that disappears during retry becomes a no-op"
+        );
+        assert!(
+            graph.get(&ec_id).expect("should read store").is_none(),
+            "must not recreate the disappeared key"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_reretries_failed_snapshot_read() {
+        // A prior request-scoped read failed, so the snapshot is `Failed`. A
+        // withdrawal must not silently drop consent removal: re-read the store
+        // and tombstone the row if it is authoritatively present.
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        kv.create(&ec_id, &live_entry()).expect("should seed live");
+
+        let outcome = kv.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "a failed snapshot must re-read and persist the tombstone"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve existing key");
+        assert!(!stored.consent.ok, "withdrawal must reach the store");
     }
 
     #[test]
