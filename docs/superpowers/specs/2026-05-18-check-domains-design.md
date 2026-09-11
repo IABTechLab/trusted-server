@@ -903,9 +903,13 @@ operations:
    then `repo.find_tree(id)?`. On an unborn HEAD use
    `repo.empty_tree()`.
 3. Materialise the index as a tree — iterate `index.entries()`
-   filtered to `Mode::FILE`, `editor.upsert(entry.path(&index),
-EntryKind::Blob, entry.id)` on `repo.edit_tree(empty)`, then
-   `editor.write()`. This lets the same tree-vs-tree machinery
+   filtered to stage-0 `Mode::FILE` entries, `editor.upsert(
+entry.path(&index), kind, entry.id)` on `repo.edit_tree(empty)`
+   with `kind` preserving the executable bit
+   (`EntryKind::BlobExecutable` for `FILE_EXECUTABLE`), then
+   `editor.write()`. Conflict stages 1/2/3 are skipped: during an
+   unresolved merge they share a path, and admitting them would scan
+   one arbitrary side. This lets the same tree-vs-tree machinery
    serve both staged and `--changed-vs` modes.
 4. Run a tree-vs-tree diff with rename detection —
    `old_tree.changes()?` →
@@ -980,10 +984,16 @@ in order and returns the first one that resolves to an object id:
 3. `refs/remotes/origin/<reference>` (remote-tracking branch — the
    common CI case where `<reference> == "main"`).
 4. `refs/tags/<reference>` (tag — covers release-gate use).
+5. Finally, the argument as a full revspec (`Repository::
+rev_parse_single`), which accepts raw object ids (`$GITHUB_SHA`,
+   `github.event.pull_request.base.sha`) and revision expressions
+   (`HEAD~1`, `main@{upstream}`). Tried last so the remote-tracking
+   fallback keeps priority over revspec disambiguation for a bare
+   branch name.
 
-If none resolve, the linter exits **2** with a message naming all
-four candidates that were tried, so the CI failure mode is
-diagnosable from log output alone.
+If nothing resolves, the linter exits **2** with a message naming
+the reference, so the CI failure mode is diagnosable from log output
+alone.
 
 **CI requirements (documented when Stage 2 lands):**
 
@@ -1236,6 +1246,14 @@ Run `ts dev lint domains` (no args) for a full-repo audit.
   "files_affected": 1
 }
 ```
+
+`line` is the full source line so a consumer can show context, with
+one redaction: any URL `userinfo@` span (`https://user:pw@host`) is
+replaced by `<redacted>@`. The linter already treats that span as a
+credential position when it skips past it to find the real host, and
+`.env*` files are in scope by design, so the machine-readable report
+that CI archives must not echo it. The human format prints only
+`path:line: disallowed host <host>` and never the excerpt.
 
 ### Pre-commit hook
 

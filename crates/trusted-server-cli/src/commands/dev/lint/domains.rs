@@ -20,6 +20,7 @@ use gix::ObjectId;
 use gix::diff::Rewrites;
 use gix::diff::blob::{Algorithm, Diff, InternedInput};
 use gix::index::entry::Mode as IndexEntryMode;
+use gix::index::entry::Stage;
 use gix::object::tree::EntryKind;
 use gix::object::tree::diff::Change;
 use regex::Regex;
@@ -1196,13 +1197,21 @@ fn write_index_to_tree(repo: &gix::Repository) -> Result<ObjectId, Report<Domain
     let mut editor = repo
         .edit_tree(empty_tree_id)
         .change_context(DomainsLintError::Index)?;
+    // Only resolved (stage 0) entries: during an unresolved merge the
+    // index holds stages 1/2/3 for the same path, and `upsert` is keyed
+    // on path, so admitting them would scan whichever side came last.
     for entry in index.entries() {
-        if !entry.mode.contains(IndexEntryMode::FILE) {
+        if entry.stage() != Stage::Unconflicted || !entry.mode.contains(IndexEntryMode::FILE) {
             continue;
         }
+        let kind = if entry.mode.contains(IndexEntryMode::FILE_EXECUTABLE) {
+            EntryKind::BlobExecutable
+        } else {
+            EntryKind::Blob
+        };
         let path = entry.path(&index);
         editor
-            .upsert(path, EntryKind::Blob, entry.id)
+            .upsert(path, kind, entry.id)
             .change_context(DomainsLintError::Index)?;
     }
     Ok(editor
@@ -1323,13 +1332,18 @@ fn collect_added_from_trees(
     Ok(out.into_inner())
 }
 
-/// Resolve a base reference to an object id, trying four candidate
+/// Resolve a base reference to an object id, trying four named-ref
 /// forms in order: the name as given, then `refs/heads/<name>`,
-/// `refs/remotes/origin/<name>`, and `refs/tags/<name>`.
+/// `refs/remotes/origin/<name>`, and `refs/tags/<name>`. If none
+/// resolves, the argument is parsed as a full revspec so raw object ids
+/// (`$GITHUB_SHA`, `github.event.pull_request.base.sha`) and revision
+/// expressions (`HEAD~1`, `main@{upstream}`) work too. The revspec is
+/// tried last so the remote-tracking fallback keeps priority over
+/// revspec disambiguation for a bare branch name.
 ///
 /// # Errors
 ///
-/// Returns [`DomainsLintError::Reference`] if no candidate resolves.
+/// Returns [`DomainsLintError::Reference`] if nothing resolves.
 fn resolve_base_ref(
     repo: &gix::Repository,
     reference: &str,
@@ -1346,6 +1360,9 @@ fn resolve_base_ref(
         {
             return Ok(id.detach());
         }
+    }
+    if let Ok(id) = repo.rev_parse_single(reference) {
+        return Ok(id.detach());
     }
     Err(Report::new(DomainsLintError::Reference(
         reference.to_string(),
@@ -1648,6 +1665,59 @@ mod staged_added_lines_tests {
             "must surface the URL for scanning: {lines:?}"
         );
     }
+
+    /// The synthesized index tree records the executable bit and
+    /// ignores conflict stages, so it stands in for `git write-tree`.
+    #[test]
+    fn index_tree_keeps_executable_bit_and_skips_conflict_stages() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        let blob = repo
+            .write_blob(b"let bad = \"https://test.com\";\n")
+            .expect("should write blob")
+            .detach();
+        let mut state = gix::index::State::new(repo.object_hash());
+        let mut push = |flags: gix::index::entry::Flags, mode: IndexEntryMode, path: &str| {
+            state.dangerously_push_entry(
+                gix::index::entry::Stat::default(),
+                blob,
+                flags,
+                mode,
+                path.into(),
+            );
+        };
+        push(
+            gix::index::entry::Flags::empty(),
+            IndexEntryMode::FILE_EXECUTABLE,
+            "run.rs",
+        );
+        for stage in [Stage::Base, Stage::Ours, Stage::Theirs] {
+            push(
+                gix::index::entry::Flags::from_stage(stage),
+                IndexEntryMode::FILE,
+                "merge.rs",
+            );
+        }
+        state.sort_entries();
+        gix::index::File::from_state(state, repo.index_path())
+            .write(gix::index::write::Options::default())
+            .expect("should write index");
+
+        let tree_id = write_index_to_tree(&repo).expect("should synthesize tree");
+        let tree = repo.find_tree(tree_id).expect("should load tree");
+        let run = tree
+            .find_entry("run.rs")
+            .expect("executable entry should be in the tree");
+        assert_eq!(run.mode().kind(), EntryKind::BlobExecutable);
+        assert!(
+            tree.find_entry("merge.rs").is_none(),
+            "conflicted entries must not enter the tree"
+        );
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        let paths: Vec<_> = lines.iter().map(|l| l.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("run.rs")]);
+    }
 }
 
 #[cfg(test)]
@@ -1723,6 +1793,36 @@ mod changed_vs_tests {
             .expect("should compute changed-vs added lines");
         let added: Vec<_> = lines.iter().map(|l| (l.path.clone(), l.line_no)).collect();
         assert_eq!(added, vec![(PathBuf::from("endpoint.ts"), 1)]);
+    }
+
+    /// Raw object ids and revision expressions resolve through the
+    /// revspec fallback, after the named-ref ladder.
+    #[test]
+    fn resolves_object_ids_and_revision_expressions() {
+        let temp = two_branch_fixture();
+        let repo = gix::open(temp.path()).expect("should open repo");
+        let main_id = repo
+            .find_reference("refs/heads/main")
+            .expect("main should exist")
+            .peel_to_id()
+            .expect("main should peel")
+            .detach();
+        let expected = changed_vs_added_lines(temp.path(), "main")
+            .expect("should resolve by name")
+            .len();
+        assert_eq!(expected, 1);
+
+        for spec in [main_id.to_string(), "HEAD~1".to_string()] {
+            let lines = changed_vs_added_lines(temp.path(), &spec)
+                .unwrap_or_else(|e| panic!("`{spec}` should resolve: {e:?}"));
+            assert_eq!(lines.len(), expected, "spec `{spec}` should match `main`");
+        }
+        let err = changed_vs_added_lines(temp.path(), "no-such-ref")
+            .expect_err("an unknown name still fails");
+        assert!(matches!(
+            err.current_context(),
+            DomainsLintError::Reference(_)
+        ));
     }
 
     #[test]
@@ -2199,19 +2299,59 @@ mod explicit_path_tests {
 // === CLI entry point (Phase 5) ===
 
 /// One reported violation, with full file context for the report.
+/// Field names are the JSON keys.
 #[derive(Debug, Serialize)]
 pub struct FileViolation {
     /// Repo-relative path of the file.
     pub path: PathBuf,
     /// 1-based line number.
-    #[serde(rename = "line_no")]
-    pub line: usize,
+    pub line_no: usize,
     /// The disallowed host.
     pub host: String,
     /// The full text of the line the host appeared on (not just the
-    /// URL — there may be surrounding code or punctuation).
-    #[serde(rename = "line")]
-    pub line_excerpt: String,
+    /// URL — there may be surrounding code or punctuation), with any
+    /// URL userinfo redacted (see [`redact_userinfo`]).
+    pub line: String,
+}
+
+/// Regex for a URL `userinfo@` span, in absolute or protocol-relative
+/// form; the same span the host regexes skip to find the authority.
+fn userinfo_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)((?:https?:)?//)[^/?\s#]+@").expect("should compile userinfo regex")
+    })
+}
+
+/// Mask any URL `userinfo@` span in a line before it is reported. The
+/// linter already recognises that span as a credential position when
+/// it looks past it for the real host; the JSON report, which CI logs
+/// and archives, must not echo it.
+fn redact_userinfo(line: &str) -> Cow<'_, str> {
+    userinfo_regex().replace_all(line, "${1}<redacted>@")
+}
+
+#[cfg(test)]
+mod redact_userinfo_tests {
+    use super::*;
+
+    #[test]
+    fn masks_absolute_and_protocol_relative_userinfo() {
+        assert_eq!(
+            redact_userinfo("AUTH=https://user:pa55word@partner.com/v1"),
+            "AUTH=https://<redacted>@partner.com/v1"
+        );
+        assert_eq!(
+            redact_userinfo("src=\"//token@cdn.example.evil/x\""),
+            "src=\"//<redacted>@cdn.example.evil/x\""
+        );
+    }
+
+    #[test]
+    fn leaves_lines_without_userinfo_untouched() {
+        let line = "API_URL=https://partner.com/v1 // see docs@example";
+        assert_eq!(redact_userinfo(line), line);
+    }
 }
 
 /// Run `ts dev lint domains`.
@@ -2268,9 +2408,9 @@ pub fn run(args: &DomainsArgs) -> Result<(), Report<CliError>> {
         for v in outcome.violations {
             violations.push(FileViolation {
                 path: line.path.clone(),
-                line: line.line_no,
+                line_no: line.line_no,
                 host: v.host,
-                line_excerpt: line.content.clone(),
+                line: redact_userinfo(&line.content).into_owned(),
             });
         }
     }
@@ -2301,7 +2441,7 @@ fn emit_human(violations: &[FileViolation]) -> Result<(), Report<CliError>> {
         write_stdout_line(format!(
             "{}:{}: disallowed host {}",
             v.path.display(),
-            v.line,
+            v.line_no,
             v.host
         ))?;
     }
