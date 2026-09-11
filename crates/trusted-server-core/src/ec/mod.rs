@@ -88,7 +88,9 @@ use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
 /// Bounded request classifications that may persist browser EID cookies.
 ///
-/// Adapters assign a source only after pre-route filters allow dispatch.
+/// Adapters classify publisher navigations and `POST /auction` only after
+/// pre-route filters allow dispatch. The shared page-bids handler classifies an
+/// admitted SPA navigation, while EC finalization classifies new identities.
 /// Challenged or blocked requests remain unclassified and cannot persist EIDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
@@ -98,7 +100,10 @@ pub enum EidSyncSource {
     /// `POST /auction` request.
     #[display("auction")]
     Auction,
-    /// Request that generated a new EC identity.
+    /// Admitted `GET /_ts/page-bids` SPA navigation.
+    #[display("page_bids")]
+    PageBids,
+    /// Request that generated a new EC identity during finalization.
     #[display("new_ec")]
     NewEc,
 }

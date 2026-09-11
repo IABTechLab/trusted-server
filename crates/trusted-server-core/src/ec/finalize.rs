@@ -168,6 +168,7 @@ impl EidSyncMeasurement {
                 EidCookieSyncOutcome::WrittenWithDeferredFreshness
                     | EidCookieSyncOutcome::DeferredConflict
                     | EidCookieSyncOutcome::DeferredFreshness
+                    | EidCookieSyncOutcome::DeferredStaleRead
             )),
         }
     }
@@ -1118,43 +1119,49 @@ mod tests {
     }
 
     #[test]
-    fn finalize_navigation_persists_returning_user_eid_updates() {
-        let settings = create_test_settings();
-        let ec_id = sample_ec_id("naveid");
-        let graph = KvIdentityGraph::in_memory("test_store");
-        let live = KvEntry::new(
-            &granting_consent(),
-            None,
-            current_timestamp(),
-            &settings.publisher.domain,
-        );
-        graph
-            .create(&ec_id, &live)
-            .expect("should seed the live row");
-        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
-        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
-        let partners = vec![make_partner("sharedid.org")];
-        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
-        let mut response = empty_response();
+    fn finalize_navigation_routes_persist_returning_user_eid_updates() {
+        for (source, suffix, cookie_id) in [
+            (EidSyncSource::Navigation, "naveid", "navigation-cookie-id"),
+            (EidSyncSource::PageBids, "spaeid", "page-bids-cookie-id"),
+        ] {
+            let settings = create_test_settings();
+            let ec_id = sample_ec_id(suffix);
+            let graph = KvIdentityGraph::in_memory("test_store");
+            let live = KvEntry::new(
+                &granting_consent(),
+                None,
+                current_timestamp(),
+                &settings.publisher.domain,
+            );
+            graph
+                .create(&ec_id, &live)
+                .expect("should seed the live row");
+            let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+            ec_context.set_eid_sync_source(source);
+            let partners = vec![make_partner("sharedid.org")];
+            let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+            let mut response = empty_response();
 
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&graph),
-            &registry,
-            None,
-            Some("navigation-cookie-id"),
-            &mut response,
-        );
+            ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &registry,
+                None,
+                Some(cookie_id),
+                &mut response,
+            );
 
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should remain");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("navigation-cookie-id")
-        );
+            let (stored, _) = graph
+                .get(&ec_id)
+                .expect("should read store")
+                .expect("row should remain");
+            assert_eq!(
+                stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+                Some(cookie_id),
+                "{source} should persist the returning-user EID cookie"
+            );
+        }
     }
 
     #[test]
@@ -1203,6 +1210,7 @@ mod tests {
         let sources = [
             EidSyncSource::Navigation,
             EidSyncSource::Auction,
+            EidSyncSource::PageBids,
             EidSyncSource::NewEc,
         ];
         let outcomes = [
@@ -1212,6 +1220,7 @@ mod tests {
             EidCookieSyncOutcome::ConflictMatched,
             EidCookieSyncOutcome::DeferredConflict,
             EidCookieSyncOutcome::DeferredFreshness,
+            EidCookieSyncOutcome::DeferredStaleRead,
             EidCookieSyncOutcome::Missing,
             EidCookieSyncOutcome::ConsentWithdrawn,
             EidCookieSyncOutcome::Failed,
@@ -1219,7 +1228,7 @@ mod tests {
 
         assert_eq!(
             sources.map(|source| source.to_string()),
-            ["navigation", "auction", "new_ec"]
+            ["navigation", "auction", "page_bids", "new_ec"]
         );
         assert_eq!(
             outcomes.map(|outcome| outcome.to_string()),
@@ -1230,6 +1239,7 @@ mod tests {
                 "conflict_matched",
                 "deferred_conflict",
                 "deferred_freshness",
+                "deferred_stale_read",
                 "missing",
                 "consent_withdrawn",
                 "failed",
@@ -1273,6 +1283,20 @@ mod tests {
                 written: 0,
                 conflict_duplicate: 1,
                 deferred: 0,
+            }
+        );
+        assert_eq!(
+            EidSyncMeasurement::new(
+                EidSyncSource::PageBids,
+                EidCookieSyncOutcome::DeferredStaleRead,
+            ),
+            EidSyncMeasurement {
+                source: EidSyncSource::PageBids,
+                outcome: EidCookieSyncOutcome::DeferredStaleRead,
+                already_matched: 0,
+                written: 0,
+                conflict_duplicate: 0,
+                deferred: 1,
             }
         );
     }
