@@ -471,6 +471,11 @@ extension):
 
 - `Dockerfile`, `Dockerfile.*` (e.g., `Dockerfile.prod`)
 
+Extension and lockfile-basename matching is ASCII case-insensitive
+(`README.MD`, `config.JSON`, `PACKAGE-LOCK.JSON`): macOS and Windows
+checkouts are case-insensitive, so a differently-cased spelling must
+not move a file out of scope.
+
 **`.md` is scanned.** Markdown documentation files (`README.md`,
 `CHANGELOG.md`, `CONTRIBUTING.md`, everything under `docs/`) are real
 publishing surfaces and accidental hardcoded third-party hosts there
@@ -526,8 +531,20 @@ fenced code blocks.
 - `dist/`
 - `.git/`
 - `.worktrees/`, `.claude/worktrees/`
-- `crates/trusted-server-cli/src/commands/dev/lint/domains.rs` itself (so the
-  module's own allowlist constants and doc comments cannot self-flag)
+- The linter's own files, whose allowlist constants, doc comments,
+  fixtures, and worked examples name disallowed hosts on purpose:
+  - `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
+  - `crates/trusted-server-cli/tests/lint_domains_cli.rs`
+  - this design spec,
+    `docs/superpowers/specs/2026-05-18-check-domains-design.md`
+  - its implementation plan,
+    `docs/superpowers/plans/2026-05-18-ts-dev-lint-domains.md`
+
+  These four are listed one by one in `SELF_EXCLUDED_PATHS`, which
+  cites this section; the two lists must stay in sync. **No other
+  file under `docs/superpowers/` is exempt.** Every other spec and
+  plan is Markdown under the policy above, and quotes example hosts
+  with reserved TLDs or a per-line `allow-domain:` marker.
 - **`crates/trusted-server-core/src/integrations/**/fixtures/**` —
   publisher-capture HTML/JS fixtures.** Real-world snapshots used as
   test inputs for the HTML processor; they contain hundreds of

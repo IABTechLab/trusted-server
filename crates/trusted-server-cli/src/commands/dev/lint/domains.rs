@@ -1015,12 +1015,17 @@ const EXCLUDED_LOCKFILES: &[&str] = &[
 /// Path components that exclude any path containing them.
 const EXCLUDED_DIR_COMPONENTS: &[&str] = &["node_modules", "target", "dist", ".git", ".worktrees"];
 
-/// The linter's own source and E2E test file — excluded so the
-/// intentionally disallowed hosts in their allowlist constants, doc
-/// comments, and test fixtures cannot self-flag.
+/// The linter's own source, E2E test file, design spec, and
+/// implementation plan — excluded so the intentionally disallowed
+/// hosts in their allowlist constants, doc comments, fixtures, and
+/// worked examples cannot self-flag. Nothing else is exempt: every
+/// other document under `docs/` is subject to the Markdown policy.
+/// This list and spec §"Always excluded (paths)" must stay in sync.
 const SELF_EXCLUDED_PATHS: &[&str] = &[
     "crates/trusted-server-cli/src/commands/dev/lint/domains.rs",
     "crates/trusted-server-cli/tests/lint_domains_cli.rs",
+    "docs/superpowers/specs/2026-05-18-check-domains-design.md",
+    "docs/superpowers/plans/2026-05-18-ts-dev-lint-domains.md",
 ];
 
 /// Whether a path should be scanned. Accepts either a repo-relative
@@ -1052,12 +1057,6 @@ fn path_is_scanned(rel_path: &str) -> bool {
     if components.windows(2).any(|w| w == [".claude", "worktrees"]) {
         return false;
     }
-    // `docs/superpowers/` — this linter's own design docs (spec + plan)
-    // quote fixture hosts (`test.com`, `evil.com`) as examples of what it
-    // catches; they are internal design prose, not shipped source.
-    if components.windows(2).any(|w| w == ["docs", "superpowers"]) {
-        return false;
-    }
     // Publisher-capture HTML fixtures: the narrow
     // trusted-server-core/src/integrations/**/fixtures/** path.
     if rel_path.contains("crates/trusted-server-core/src/integrations/")
@@ -1067,8 +1066,13 @@ fn path_is_scanned(rel_path: &str) -> bool {
     }
 
     let basename = components.last().copied().unwrap_or("");
-    // Excluded lockfiles (exact basename).
-    if EXCLUDED_LOCKFILES.contains(&basename) {
+    // Excluded lockfiles (exact basename). Name comparisons below are
+    // ASCII case-insensitive: macOS and Windows checkouts are
+    // case-insensitive, so `README.MD` must not slip out of scope.
+    if EXCLUDED_LOCKFILES
+        .iter()
+        .any(|lockfile| lockfile.eq_ignore_ascii_case(basename))
+    {
         return false;
     }
     // Dockerfile and Dockerfile.* are scanned (no extension).
@@ -1081,7 +1085,9 @@ fn path_is_scanned(rel_path: &str) -> bool {
     }
     // Otherwise scan by extension.
     match basename.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => SCANNED_EXTENSIONS.contains(&ext),
+        Some((stem, ext)) if !stem.is_empty() => {
+            SCANNED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        }
         _ => false,
     }
 }
@@ -1983,6 +1989,11 @@ mod path_is_scanned_tests {
             "CHANGELOG.md",
             "CONTRIBUTING.md",
             "docs/guide/onboarding.md",
+            "docs/superpowers/specs/unrelated-design.md",
+            "docs/superpowers/plans/unrelated-plan.md",
+            "README.MD",
+            "config.JSON",
+            "App.TSX",
         ] {
             assert!(path_is_scanned(p), "should be scanned: {p}");
         }
@@ -1997,6 +2008,7 @@ mod path_is_scanned_tests {
             ".worktrees/x/y.rs",
             ".claude/worktrees/x/y.rs",
             "package-lock.json",
+            "PACKAGE-LOCK.JSON",
             "pnpm-lock.yaml",
             "Cargo.lock",
             "crates/trusted-server-cli/src/commands/dev/lint/domains.rs",
@@ -2004,7 +2016,6 @@ mod path_is_scanned_tests {
             "docs/superpowers/specs/2026-05-18-check-domains-design.md",
             "docs/superpowers/plans/2026-05-18-ts-dev-lint-domains.md",
             "foo.markdown",
-            "foo.MD",
             "target/debug/build.rs",
             "image.png",
         ] {
