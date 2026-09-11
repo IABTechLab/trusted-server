@@ -272,7 +272,11 @@ fn process_mappings(
     }
 
     errors.sort_by_key(|error| error.index);
-    debug_assert_eq!(accepted + errors.len(), mappings.len());
+    debug_assert_eq!(
+        accepted + errors.len(),
+        mappings.len(),
+        "should report exactly one outcome per submitted mapping"
+    );
     (accepted, errors)
 }
 
@@ -422,7 +426,7 @@ mod tests {
             .into_body()
             .into_bytes()
             .expect("should contain batch-sync response");
-        serde_json::from_slice(&body).expect("should serialize batch-sync response")
+        serde_json::from_slice(&body).expect("should deserialize batch-sync response")
     }
 
     fn test_registry() -> PartnerRegistry {
@@ -548,7 +552,6 @@ mod tests {
                 store_name: "ec_store".to_owned(),
                 message: "down".to_owned(),
             })),
-            Ok(UpsertResult::Written),
         ]);
 
         let mappings = vec![
@@ -569,6 +572,11 @@ mod tests {
         assert_eq!(errors[0].reason, REASON_KV_UNAVAILABLE);
         assert_eq!(errors[1].index, 2);
         assert_eq!(errors[1].reason, REASON_KV_UNAVAILABLE);
+        assert_eq!(
+            writer.calls().len(),
+            2,
+            "should stop after the failing group"
+        );
     }
 
     #[test]
@@ -738,6 +746,32 @@ mod tests {
     }
 
     #[test]
+    fn process_mappings_bounds_writer_calls_at_max_batch_size() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mappings = (0..MAX_BATCH_SIZE)
+            .map(|index| mapping(&ec_id, &format!("uid-{index}"), index as u64))
+            .collect::<Vec<_>>();
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(
+            accepted, MAX_BATCH_SIZE,
+            "should accept every mapping in the repeated group"
+        );
+        assert!(errors.is_empty(), "should report no errors");
+        assert_eq!(
+            writer.calls(),
+            vec![WriterCall {
+                ec_id,
+                partner_id: "partner".to_owned(),
+                uid: format!("uid-{}", MAX_BATCH_SIZE - 1),
+            }],
+            "should call the writer once with the last UID"
+        );
+    }
+
+    #[test]
     fn process_mappings_keeps_suffix_case_distinct() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
         let upper_suffix = format!("{}.ABC123", "a".repeat(64));
@@ -880,60 +914,70 @@ mod tests {
     }
 
     #[test]
-    fn handle_batch_sync_reports_grouped_success_and_rejection_counts() {
+    fn handle_batch_sync_accepts_every_member_of_a_written_group() {
         let registry = test_registry();
         let limiter = MockRateLimiter {
             should_exceed: false,
         };
-        let ec_id_a = format!("{}.ABC123", "a".repeat(64));
-        let ec_id_b = format!("{}.ABC123", "b".repeat(64));
-        let success_writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
-        let success_body = format!(
-            r#"{{"mappings":[{{"ec_id":"{ec_id_a}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id_a}","partner_uid":"two","timestamp":2}}]}}"#
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let body = format!(
+            r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
         );
-        let success_response = handle_batch_sync_with_writer(
-            &success_writer,
+
+        let response = handle_batch_sync_with_writer(
+            &writer,
             &registry,
             &limiter,
-            authorized_batch_request(&success_body),
+            authorized_batch_request(&body),
         )
         .expect("should return success response");
-        assert_eq!(success_response.status(), StatusCode::OK);
-        let success_body = success_response
-            .into_body()
-            .into_bytes()
-            .expect("should contain grouped success response");
-        let success_json: serde_json::Value = serde_json::from_slice(&success_body)
-            .expect("should serialize grouped success response");
-        assert_eq!(success_json["accepted"], 2);
-        assert_eq!(success_json["rejected"], 0);
 
-        let rejected_writer = MockWriter::new(vec![Ok(UpsertResult::NotFound)]);
-        let rejected_body = format!(
-            r#"{{"mappings":[{{"ec_id":"{ec_id_b}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id_b}","partner_uid":"two","timestamp":2}}]}}"#
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should return success when every mapping is accepted"
         );
-        let rejected_response = handle_batch_sync_with_writer(
-            &rejected_writer,
+        let json = response_json(response);
+        assert_eq!(json["accepted"], 2, "should accept both group members");
+        assert_eq!(json["rejected"], 0, "should reject no group members");
+    }
+
+    #[test]
+    fn handle_batch_sync_rejects_every_member_of_an_ineligible_group() {
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let ec_id = format!("{}.ABC123", "b".repeat(64));
+        let writer = MockWriter::new(vec![Ok(UpsertResult::NotFound)]);
+        let body = format!(
+            r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
+        );
+
+        let response = handle_batch_sync_with_writer(
+            &writer,
             &registry,
             &limiter,
-            authorized_batch_request(&rejected_body),
+            authorized_batch_request(&body),
         )
         .expect("should return multi-status response");
-        assert_eq!(rejected_response.status(), StatusCode::MULTI_STATUS);
-        let rejected_body = rejected_response
-            .into_body()
-            .into_bytes()
-            .expect("should contain grouped multi-status response");
-        let rejected_json: serde_json::Value = serde_json::from_slice(&rejected_body)
-            .expect("should serialize grouped multi-status response");
-        assert_eq!(rejected_json["accepted"], 0);
-        assert_eq!(rejected_json["rejected"], 2);
+
         assert_eq!(
-            rejected_json["errors"],
+            response.status(),
+            StatusCode::MULTI_STATUS,
+            "should return multi-status when every mapping is ineligible"
+        );
+        let json = response_json(response);
+        assert_eq!(json["accepted"], 0, "should accept no group members");
+        assert_eq!(json["rejected"], 2, "should reject both group members");
+        assert_eq!(
+            json["errors"],
             serde_json::json!([
                 {"index": 0, "reason": REASON_INELIGIBLE},
                 {"index": 1, "reason": REASON_INELIGIBLE},
-            ])
+            ]),
+            "should report one ineligible error per group member"
         );
     }
 
