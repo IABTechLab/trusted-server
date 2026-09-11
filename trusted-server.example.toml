@@ -499,6 +499,7 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # can flip `enabled` to true when Didomi is detected on the audited page.
 [integrations.didomi]
 enabled = false
+geo_query_parameters = false
 # sdk_origin = "https://sdk.example.com"
 # api_origin = "https://api.example.com"
 
