@@ -115,51 +115,68 @@ impl Iterator for EscapeSequenceIter<'_> {
                 return Some(EscapeElement { byte_count: 1 });
             }
 
-            if esc == b'x' && self.pos + 3 < self.bytes.len() {
+            // Only the boundary is checked, not the hex digits: validating the
+            // digits would change the unescaped byte count of malformed but
+            // previously scannable input such as `\xZZ`, and that count drives
+            // T-chunk length recomputation. Inputs that are rejected here are
+            // exactly the ones that used to advance into a character and panic.
+            if esc == b'x'
+                && self.pos + 3 < self.bytes.len()
+                && self.str_ref.is_char_boundary(self.pos + 4)
+            {
                 self.pos += 4;
                 return Some(EscapeElement { byte_count: 1 });
             }
 
-            if esc == b'u' && self.pos + 5 < self.bytes.len() {
-                let hex = &self.str_ref[self.pos + 2..self.pos + 6];
-                if hex.chars().all(|c| c.is_ascii_hexdigit())
-                    && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+            // `str::get` yields `None` when the escape body straddles a character,
+            // which falls through to literal handling exactly as invalid hex does.
+            if esc == b'u'
+                && self.pos + 5 < self.bytes.len()
+                && let Some(hex) = self.str_ref.get(self.pos + 2..self.pos + 6)
+                && hex.chars().all(|c| c.is_ascii_hexdigit())
+                && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+            {
+                if (0xD800..=0xDBFF).contains(&code_unit)
+                    && self.pos + 11 < self.bytes.len()
+                    && self.bytes[self.pos + 6] == b'\\'
+                    && self.bytes[self.pos + 7] == b'u'
                 {
-                    if (0xD800..=0xDBFF).contains(&code_unit)
-                        && self.pos + 11 < self.bytes.len()
-                        && self.bytes[self.pos + 6] == b'\\'
-                        && self.bytes[self.pos + 7] == b'u'
+                    let hex2 = self.str_ref.get(self.pos + 8..self.pos + 12);
+                    if let Some(hex2) = hex2
+                        && hex2.chars().all(|c| c.is_ascii_hexdigit())
+                        && let Ok(code_unit2) = u16::from_str_radix(hex2, 16)
+                        && (0xDC00..=0xDFFF).contains(&code_unit2)
                     {
-                        let hex2 = &self.str_ref[self.pos + 8..self.pos + 12];
-                        if hex2.chars().all(|c| c.is_ascii_hexdigit())
-                            && let Ok(code_unit2) = u16::from_str_radix(hex2, 16)
-                            && (0xDC00..=0xDFFF).contains(&code_unit2)
-                        {
-                            self.pos += 12;
-                            return Some(EscapeElement { byte_count: 4 });
-                        }
+                        self.pos += 12;
+                        return Some(EscapeElement { byte_count: 4 });
                     }
-
-                    let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
-                    self.pos += 6;
-                    return Some(EscapeElement {
-                        byte_count: c.len_utf8(),
-                    });
                 }
+
+                let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
+                self.pos += 6;
+                return Some(EscapeElement {
+                    byte_count: c.len_utf8(),
+                });
             }
         }
 
         if self.bytes[self.pos] < 0x80 {
             self.pos += 1;
             Some(EscapeElement { byte_count: 1 })
-        } else {
-            let c = self.str_ref[self.pos..]
-                .chars()
-                .next()
-                .unwrap_or('\u{FFFD}');
+        } else if let Some(c) = self
+            .str_ref
+            .get(self.pos..)
+            .and_then(|remainder| remainder.chars().next())
+        {
             let len = c.len_utf8();
             self.pos += len;
             Some(EscapeElement { byte_count: len })
+        } else {
+            // Defensive: the escape guards above keep `pos` on a character
+            // boundary, so a continuation byte here is unreachable. Advance one
+            // byte rather than slicing so the iterator cannot panic or stall.
+            self.pos += 1;
+            Some(EscapeElement { byte_count: 1 })
         }
     }
 }
@@ -206,73 +223,126 @@ pub(super) enum TChunkScan {
     Invalid,
 }
 
-/// Find all T-chunks in content, optionally skipping markers.
-fn scan_tchunks_impl(content: &str, skip_markers: bool) -> TChunkScan {
-    let mut chunks = Vec::new();
-    let mut search_pos = 0;
-    let marker = skip_markers.then(|| RSC_MARKER.as_bytes());
+/// Longest escape sequence in source bytes: `\uD83D\uDE00`.
+const MAX_ESCAPE_SEQUENCE_BYTES: usize = 12;
 
-    while search_pos < content.len() {
-        if let Some(cap) = TCHUNK_PATTERN.captures(&content[search_pos..]) {
-            let m = cap.get(0).expect("T-chunk match should exist");
-            let match_start = search_pos + m.start();
-            let header_end = search_pos + m.end();
+/// A T-chunk whose header has been parsed but whose content has not fully arrived.
+pub(super) struct PendingTChunk {
+    match_start: usize,
+    id_end: usize,
+    header_end: usize,
+    declared_length: usize,
+    consumed: usize,
+    pos: usize,
+}
 
+/// Outcome of advancing a T-chunk scan by one chunk.
+pub(super) enum TChunkStep {
+    /// A chunk's declared content is fully present.
+    Found(TChunkInfo),
+    /// The text ends inside this chunk's content; resume with more text.
+    Pending(PendingTChunk),
+    /// No further chunk header begins in the text.
+    Exhausted,
+    Invalid,
+}
+
+/// Advance a T-chunk scan by one chunk.
+///
+/// Passing the [`TChunkStep::Pending`] chunk back resumes content consumption
+/// where it stopped, so growing text is walked once rather than re-walked from
+/// the chunk header on every call.
+///
+/// `hold_back_partial_escape` stops the scan at a trailing backslash that could
+/// still grow into a longer escape sequence. A resumed scan would otherwise
+/// commit to reading that backslash as a literal byte.
+pub(super) fn next_tchunk(
+    content: &str,
+    search_pos: usize,
+    pending: Option<PendingTChunk>,
+    marker: Option<&[u8]>,
+    hold_back_partial_escape: bool,
+) -> TChunkStep {
+    let mut chunk = match pending {
+        Some(chunk) => chunk,
+        None => {
+            if search_pos >= content.len() {
+                return TChunkStep::Exhausted;
+            }
+            let Some(cap) = TCHUNK_PATTERN.captures(&content[search_pos..]) else {
+                return TChunkStep::Exhausted;
+            };
+            let call = cap.get(0).expect("T-chunk match should exist");
             let id_match = cap.get(1).expect("T-chunk id should exist");
-            let id_end = search_pos + id_match.end();
             let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
             let Some(declared_length) = usize::from_str_radix(length_hex, 16)
                 .ok()
                 .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)
             else {
-                return TChunkScan::Invalid;
+                return TChunkStep::Invalid;
             };
-
-            let content_end = if let Some(marker_bytes) = marker {
-                let mut iter = EscapeSequenceIter::from_position_with_marker(
-                    content,
-                    header_end,
-                    marker_bytes,
-                );
-                let mut consumed = 0;
-                while consumed < declared_length {
-                    match iter.next() {
-                        Some(elem) => consumed += elem.byte_count,
-                        None => break,
-                    }
-                }
-                if consumed > declared_length {
-                    return TChunkScan::Invalid;
-                }
-                if consumed < declared_length {
-                    return TChunkScan::NeedMore;
-                }
-                iter.position()
-            } else {
-                let (pos, consumed) = consume_unescaped_bytes(content, header_end, declared_length);
-                if consumed > declared_length {
-                    return TChunkScan::Invalid;
-                }
-                if consumed < declared_length {
-                    return TChunkScan::NeedMore;
-                }
-                pos
-            };
-
-            chunks.push(TChunkInfo {
-                match_start,
-                id_end,
+            let header_end = search_pos + call.end();
+            PendingTChunk {
+                match_start: search_pos + call.start(),
+                id_end: search_pos + id_match.end(),
                 header_end,
-                content_end,
-            });
+                declared_length,
+                consumed: 0,
+                pos: header_end,
+            }
+        }
+    };
 
-            search_pos = content_end;
-        } else {
+    let mut iter = match marker {
+        Some(marker) => EscapeSequenceIter::from_position_with_marker(content, chunk.pos, marker),
+        None => EscapeSequenceIter::from_position(content, chunk.pos),
+    };
+    while chunk.consumed < chunk.declared_length {
+        let position = iter.position();
+        if hold_back_partial_escape
+            && content.as_bytes()[position..].first() == Some(&b'\\')
+            && content.len() - position < MAX_ESCAPE_SEQUENCE_BYTES
+        {
             break;
         }
+        match iter.next() {
+            Some(element) => chunk.consumed += element.byte_count,
+            None => break,
+        }
     }
+    chunk.pos = iter.position();
 
-    TChunkScan::Complete(chunks)
+    if chunk.consumed > chunk.declared_length {
+        return TChunkStep::Invalid;
+    }
+    if chunk.consumed < chunk.declared_length {
+        return TChunkStep::Pending(chunk);
+    }
+    TChunkStep::Found(TChunkInfo {
+        match_start: chunk.match_start,
+        id_end: chunk.id_end,
+        header_end: chunk.header_end,
+        content_end: chunk.pos,
+    })
+}
+
+/// Find all T-chunks in content, optionally skipping markers.
+fn scan_tchunks_impl(content: &str, skip_markers: bool) -> TChunkScan {
+    let marker = skip_markers.then(|| RSC_MARKER.as_bytes());
+    let mut chunks = Vec::new();
+    let mut search_pos = 0;
+
+    loop {
+        match next_tchunk(content, search_pos, None, marker, false) {
+            TChunkStep::Found(chunk) => {
+                search_pos = chunk.content_end;
+                chunks.push(chunk);
+            }
+            TChunkStep::Pending(_) => return TChunkScan::NeedMore,
+            TChunkStep::Exhausted => return TChunkScan::Complete(chunks),
+            TChunkStep::Invalid => return TChunkScan::Invalid,
+        }
+    }
 }
 
 pub(super) fn scan_tchunks(content: &str) -> TChunkScan {

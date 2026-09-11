@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -9,15 +8,15 @@ use crate::integrations::{
 use crate::streaming_processor::StreamProcessor;
 
 use super::rsc::{
-    DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, TChunkScan, rewrite_rsc_scripts_combined_with_limit,
-    scan_tchunks,
+    DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, PendingTChunk, TChunkStep, next_tchunk,
+    rewrite_rsc_scripts_combined_with_limit,
 };
 use super::shared::RscUrlRewriter;
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_PREFIX: &str = "__ts_rsc_";
 pub(super) const RSC_PAYLOAD_PLACEHOLDER_SUFFIX: &str = "__";
-const MAX_UNRESOLVED_RSC_PAYLOADS: usize = 256;
+pub(super) const MAX_UNRESOLVED_RSC_PAYLOADS: usize = 256;
 
 #[derive(Debug, Default)]
 pub(super) enum FragmentState {
@@ -39,6 +38,13 @@ pub(super) struct NextJsDocumentState {
     pub(super) next_data: FragmentState,
     pub(super) rsc_script: FragmentState,
     pub(super) rsc_probe: String,
+    /// Tail of script text already released for the current text node, kept so a
+    /// `self.`/`window.` receiver that streamed before its `__next_f` identifier
+    /// was recognized can still be verified.
+    pub(super) rsc_receiver_context: String,
+    /// The active claim begins at a bare `__next_f` whose receiver was verified
+    /// from [`NextJsDocumentState::rsc_receiver_context`].
+    pub(super) rsc_receiver_trimmed: bool,
     pub(super) captured_payloads: VecDeque<CapturedPayload>,
     pub(super) captured_payload_bytes: usize,
     pub(super) next_placeholder_index: usize,
@@ -52,6 +58,8 @@ impl Default for NextJsDocumentState {
             next_data: FragmentState::Idle,
             rsc_script: FragmentState::Idle,
             rsc_probe: String::new(),
+            rsc_receiver_context: String::new(),
+            rsc_receiver_trimmed: false,
             captured_payloads: VecDeque::new(),
             captured_payload_bytes: 0,
             next_placeholder_index: 0,
@@ -175,6 +183,7 @@ pub(super) struct NextJsRscStreamProcessor {
     pending_candidate: Vec<u8>,
     held_output: Vec<u8>,
     group: Vec<CapturedPayload>,
+    classifier: RscGroupClassifier,
     rewriter: RscUrlRewriter,
 }
 
@@ -195,6 +204,7 @@ impl NextJsRscStreamProcessor {
             pending_candidate: Vec::new(),
             held_output: Vec::new(),
             group: Vec::new(),
+            classifier: RscGroupClassifier::new(limit),
             rewriter: RscUrlRewriter::new(),
         }
     }
@@ -271,6 +281,7 @@ impl NextJsRscStreamProcessor {
             &self.namespace_prefix(),
         )?;
         self.group.clear();
+        self.classifier.reset();
         let mut state = self
             .state
             .lock()
@@ -282,9 +293,9 @@ impl NextJsRscStreamProcessor {
     }
 
     fn resolve_group(&mut self) -> io::Result<Option<Vec<u8>>> {
-        // Classification scans the logical group. Bound its segment count as
-        // well as its bytes so adversarial tiny scripts cannot amplify that
-        // work quadratically; the hydration-safe fallback restores originals.
+        // Classification is incremental, but each completed chunk still costs a
+        // segment inspection and a boundary check, so bound the segment count;
+        // the hydration-safe fallback restores originals.
         if self.group.len() > MAX_UNRESOLVED_RSC_PAYLOADS {
             log::warn!(
                 "Next.js RSC fallback: segment limit, {} payloads",
@@ -296,14 +307,24 @@ impl NextJsRscStreamProcessor {
                 .bypass_rsc = true;
             return self.release_group(None).map(Some);
         }
-        let payloads: Vec<&str> = self
+        let payload = self
             .group
-            .iter()
-            .map(|payload| payload.original.as_str())
-            .collect();
-        match classify_rsc_group(&payloads, self.limit) {
+            .last()
+            .expect("should resolve a group only after a payload joined it");
+        let status = self.classifier.push(&payload.original);
+        self.resolve_status(status)
+    }
+
+    /// Act on a group status: release the group, or hold for more payloads.
+    fn resolve_status(&mut self, status: RscGroupStatus) -> io::Result<Option<Vec<u8>>> {
+        match status {
             RscGroupStatus::NeedMore => Ok(None),
             RscGroupStatus::CompleteRewritable => {
+                let payloads: Vec<&str> = self
+                    .group
+                    .iter()
+                    .map(|payload| payload.original.as_str())
+                    .collect();
                 let rewritten = rewrite_rsc_scripts_combined_with_limit(
                     &payloads,
                     &self.rewriter,
@@ -343,6 +364,14 @@ impl NextJsRscStreamProcessor {
         }
     }
 
+    /// Restore every captured payload and hand back the bytes unchanged.
+    ///
+    /// Draining the whole queue is safe because capture and placeholder emission
+    /// are atomic: `NextJsRscPlaceholderRewriter::rewrite_complete` pushes a
+    /// payload and returns the script carrying its placeholder in the same call,
+    /// so a queued payload's placeholder is always already in the held output or
+    /// in `current`. A queued payload whose placeholder had not yet been emitted
+    /// would fail substitution rather than degrade to unchanged bytes.
     fn release_bypass(&mut self, current: &[u8]) -> io::Result<Vec<u8>> {
         if !self.group.is_empty() || self.next_captured().is_some() {
             log::warn!(
@@ -474,11 +503,20 @@ impl StreamProcessor for NextJsRscStreamProcessor {
                 }
             }
             if !self.group.is_empty() {
-                log::warn!(
-                    "Next.js RSC fallback: incomplete group at EOF, {} payloads",
-                    self.group.len()
-                );
-                output.extend(self.release_group(None)?);
+                // No further payload can arrive, so reclassify with nothing
+                // held back before giving up on the group.
+                let status = self.classifier.finalize();
+                if matches!(status, RscGroupStatus::CompleteRewritable) {
+                    if let Some(released) = self.resolve_status(status)? {
+                        output.extend(released);
+                    }
+                } else {
+                    log::warn!(
+                        "Next.js RSC fallback: incomplete group at EOF, {} payloads",
+                        self.group.len()
+                    );
+                    output.extend(self.release_group(None)?);
+                }
             }
             if self.next_captured().is_some() {
                 return Err(io::Error::other(
@@ -558,125 +596,258 @@ enum HeaderSuffixStatus {
     Invalid,
 }
 
+/// Incremental classifier for one logical RSC group.
+///
+/// Payloads are appended once and scanned once: a chunk whose content has not
+/// fully arrived is resumed where consumption stopped, and the trailing
+/// non-chunk segment is inspected from where inspection stopped. Re-deriving
+/// the whole group on every payload made a large but permitted response cost
+/// CPU quadratic in its segment count.
+pub(super) struct RscGroupClassifier {
+    max_combined_payload_bytes: usize,
+    combined: String,
+    /// Offsets in [`Self::combined`] where one payload meets the next.
+    boundaries: Vec<usize>,
+    /// A completed chunk's header straddled a payload boundary, so the group
+    /// cannot be rewritten even once it completes.
+    header_split: bool,
+    /// Where the next chunk-header search begins.
+    scan_from: usize,
+    /// A chunk whose declared content is still incomplete.
+    pending: Option<PendingTChunk>,
+    /// Start of the trailing non-chunk segment.
+    segment_start: usize,
+    inspector: SegmentInspector,
+    invalid: bool,
+}
+
+impl RscGroupClassifier {
+    pub(super) fn new(max_combined_payload_bytes: usize) -> Self {
+        Self {
+            max_combined_payload_bytes,
+            combined: String::new(),
+            boundaries: Vec::new(),
+            header_split: false,
+            scan_from: 0,
+            pending: None,
+            segment_start: 0,
+            inspector: SegmentInspector::default(),
+            invalid: false,
+        }
+    }
+
+    /// Append the next payload of the group and reclassify.
+    pub(super) fn push(&mut self, payload: &str) -> RscGroupStatus {
+        if self.invalid {
+            return RscGroupStatus::Invalid;
+        }
+        let exceeds_limit = self
+            .combined
+            .len()
+            .checked_add(payload.len())
+            .is_none_or(|total| total > self.max_combined_payload_bytes);
+        if exceeds_limit {
+            self.invalid = true;
+            return RscGroupStatus::Invalid;
+        }
+        if !self.combined.is_empty() {
+            self.boundaries.push(self.combined.len());
+        }
+        self.combined.push_str(payload);
+        self.advance(false)
+    }
+
+    /// Reclassify knowing no further payload can arrive, so no trailing escape
+    /// needs to be held back.
+    pub(super) fn finalize(&mut self) -> RscGroupStatus {
+        self.advance(true)
+    }
+
+    /// Drop all group state, ready for the next group.
+    pub(super) fn reset(&mut self) {
+        self.combined.clear();
+        self.boundaries.clear();
+        self.header_split = false;
+        self.scan_from = 0;
+        self.pending = None;
+        self.segment_start = 0;
+        self.inspector = SegmentInspector::default();
+        self.invalid = false;
+    }
+
+    fn advance(&mut self, finalize: bool) -> RscGroupStatus {
+        if self.invalid {
+            return RscGroupStatus::Invalid;
+        }
+        loop {
+            let step = next_tchunk(
+                &self.combined,
+                self.scan_from,
+                self.pending.take(),
+                None,
+                !finalize,
+            );
+            match step {
+                TChunkStep::Found(chunk) => {
+                    // Text between chunks is final once the chunk after it
+                    // completes, so it is inspected exactly once.
+                    let mut settled = SegmentInspector::default();
+                    if settled.inspect(&self.combined[self.segment_start..chunk.match_start], false)
+                        == HeaderSuffixStatus::Invalid
+                    {
+                        self.invalid = true;
+                        return RscGroupStatus::Invalid;
+                    }
+                    if self.boundaries.iter().any(|boundary| {
+                        chunk.match_start < *boundary && *boundary < chunk.header_end
+                    }) {
+                        self.header_split = true;
+                    }
+                    self.segment_start = chunk.content_end;
+                    self.scan_from = chunk.content_end;
+                    self.inspector = SegmentInspector::default();
+                }
+                TChunkStep::Pending(chunk) => {
+                    self.pending = Some(chunk);
+                    return RscGroupStatus::NeedMore;
+                }
+                TChunkStep::Exhausted => break,
+                TChunkStep::Invalid => {
+                    self.invalid = true;
+                    return RscGroupStatus::Invalid;
+                }
+            }
+        }
+
+        match self
+            .inspector
+            .inspect(&self.combined[self.segment_start..], true)
+        {
+            HeaderSuffixStatus::Complete => {
+                if self.header_split {
+                    RscGroupStatus::CompleteUnrewritable
+                } else {
+                    RscGroupStatus::CompleteRewritable
+                }
+            }
+            HeaderSuffixStatus::NeedMore => {
+                // A header can only start inside the pending candidate, so the
+                // next search resumes there rather than at the scanned end.
+                //
+                // This is the one step still proportional to accumulated bytes
+                // rather than to the new payload: a group that is one long hex
+                // run keeps the candidate at its start, so the header search
+                // re-scans it. That search is a literal prefilter bounded by
+                // `max_combined_payload_bytes` (~13ms over 4MiB in 256
+                // payloads), unlike the escape walk this classifier replaced.
+                self.scan_from = self.segment_start + self.inspector.partial_header_start();
+                RscGroupStatus::NeedMore
+            }
+            HeaderSuffixStatus::Invalid => {
+                self.invalid = true;
+                RscGroupStatus::Invalid
+            }
+        }
+    }
+}
+
+/// Classify a complete group in one call.
 pub(super) fn classify_rsc_group(
     payloads: &[&str],
     max_combined_payload_bytes: usize,
 ) -> RscGroupStatus {
-    let Some(total_size) = payloads
-        .iter()
-        .try_fold(0usize, |total, payload| total.checked_add(payload.len()))
-    else {
-        return RscGroupStatus::Invalid;
-    };
-    if total_size > max_combined_payload_bytes {
-        return RscGroupStatus::Invalid;
+    let mut classifier = RscGroupClassifier::new(max_combined_payload_bytes);
+    for payload in payloads {
+        classifier.push(payload);
     }
-
-    let mut boundaries = Vec::with_capacity(payloads.len().saturating_sub(1));
-    let combined = if let [payload] = payloads {
-        Cow::Borrowed(*payload)
-    } else {
-        let mut combined = String::with_capacity(total_size);
-        for (index, payload) in payloads.iter().enumerate() {
-            combined.push_str(payload);
-            if index + 1 < payloads.len() {
-                boundaries.push(combined.len());
-            }
-        }
-        Cow::Owned(combined)
-    };
-
-    let chunks = match scan_tchunks(combined.as_ref()) {
-        TChunkScan::Complete(chunks) => chunks,
-        TChunkScan::NeedMore => return RscGroupStatus::NeedMore,
-        TChunkScan::Invalid => return RscGroupStatus::Invalid,
-    };
-
-    let mut segment_start = 0;
-    for chunk in &chunks {
-        if inspect_non_chunk_segment(&combined[segment_start..chunk.match_start], false)
-            == HeaderSuffixStatus::Invalid
-        {
-            return RscGroupStatus::Invalid;
-        }
-        segment_start = chunk.content_end;
-    }
-
-    match inspect_non_chunk_segment(&combined[segment_start..], true) {
-        HeaderSuffixStatus::Complete => {}
-        HeaderSuffixStatus::NeedMore => return RscGroupStatus::NeedMore,
-        HeaderSuffixStatus::Invalid => return RscGroupStatus::Invalid,
-    }
-
-    if chunks.iter().any(|chunk| {
-        boundaries
-            .iter()
-            .any(|boundary| chunk.match_start < *boundary && *boundary < chunk.header_end)
-    }) {
-        RscGroupStatus::CompleteUnrewritable
-    } else {
-        RscGroupStatus::CompleteRewritable
-    }
+    classifier.finalize()
 }
 
-fn inspect_non_chunk_segment(segment: &str, terminal: bool) -> HeaderSuffixStatus {
-    let bytes = segment.as_bytes();
-    let mut index = 0;
+/// Resumable inspection of text outside T-chunk content.
+///
+/// Retains how far the text has been proven free of an incomplete
+/// `id:Tlength,` header so growing text is not re-inspected from the start.
+#[derive(Debug, Clone, Copy, Default)]
+struct SegmentInspector {
+    /// Where the next inspection resumes.
+    index: usize,
+    /// How far the hex run starting at [`Self::index`] has been verified.
+    run_cursor: usize,
+}
 
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_hexdigit() || index > 0 && bytes[index - 1].is_ascii_hexdigit() {
-            index += 1;
-            continue;
-        }
-
-        let mut cursor = index;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
-            cursor += 1;
-        }
-        if cursor == bytes.len() {
-            return if terminal {
-                HeaderSuffixStatus::NeedMore
-            } else {
-                HeaderSuffixStatus::Complete
-            };
-        }
-        if terminal && &bytes[cursor..] == b":" {
-            return HeaderSuffixStatus::NeedMore;
-        }
-        if bytes.get(cursor..cursor + 2) != Some(b":T") {
-            index = cursor + 1;
-            continue;
-        }
-
-        cursor += 2;
-        if cursor == bytes.len() {
-            return if terminal {
-                HeaderSuffixStatus::NeedMore
-            } else {
-                HeaderSuffixStatus::Invalid
-            };
-        }
-        if !bytes[cursor].is_ascii_hexdigit() {
-            return HeaderSuffixStatus::Invalid;
-        }
-        while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
-            cursor += 1;
-        }
-        if cursor == bytes.len() {
-            return if terminal {
-                HeaderSuffixStatus::NeedMore
-            } else {
-                HeaderSuffixStatus::Invalid
-            };
-        }
-        if bytes[cursor] != b',' {
-            return HeaderSuffixStatus::Invalid;
-        }
-
-        index = cursor + 1;
+impl SegmentInspector {
+    /// Offset at which a partial header could still begin.
+    fn partial_header_start(&self) -> usize {
+        self.index
     }
 
-    HeaderSuffixStatus::Complete
+    fn inspect(&mut self, segment: &str, terminal: bool) -> HeaderSuffixStatus {
+        let bytes = segment.as_bytes();
+
+        while self.index < bytes.len() {
+            if !bytes[self.index].is_ascii_hexdigit()
+                || self.index > 0 && bytes[self.index - 1].is_ascii_hexdigit()
+            {
+                self.advance_to(self.index + 1);
+                continue;
+            }
+
+            let mut cursor = self.run_cursor.max(self.index);
+            while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                // The run may still grow, so keep its verified extent.
+                self.run_cursor = cursor;
+                return if terminal {
+                    HeaderSuffixStatus::NeedMore
+                } else {
+                    HeaderSuffixStatus::Complete
+                };
+            }
+            if terminal && &bytes[cursor..] == b":" {
+                return HeaderSuffixStatus::NeedMore;
+            }
+            if bytes.get(cursor..cursor + 2) != Some(b":T") {
+                self.advance_to(cursor + 1);
+                continue;
+            }
+
+            cursor += 2;
+            if cursor == bytes.len() {
+                return if terminal {
+                    HeaderSuffixStatus::NeedMore
+                } else {
+                    HeaderSuffixStatus::Invalid
+                };
+            }
+            if !bytes[cursor].is_ascii_hexdigit() {
+                return HeaderSuffixStatus::Invalid;
+            }
+            while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                return if terminal {
+                    HeaderSuffixStatus::NeedMore
+                } else {
+                    HeaderSuffixStatus::Invalid
+                };
+            }
+            if bytes[cursor] != b',' {
+                return HeaderSuffixStatus::Invalid;
+            }
+
+            self.advance_to(cursor + 1);
+        }
+
+        HeaderSuffixStatus::Complete
+    }
+
+    fn advance_to(&mut self, index: usize) {
+        self.index = index;
+        self.run_cursor = index;
+    }
 }
 
 #[cfg(test)]
@@ -1026,6 +1197,110 @@ mod tests {
                 .expect("should lock document state")
                 .bypass_rsc,
             "excessive segment count should enable document-wide fallback"
+        );
+    }
+
+    /// A T-chunk spread over many payloads must classify the same whether it is
+    /// fed incrementally or all at once. Feeding it incrementally is what keeps
+    /// the cost linear in the group's bytes instead of bytes times segments.
+    #[test]
+    fn incremental_classification_matches_whole_group_classification() {
+        // Each repetition unescapes to `ab` + newline + `cd` + `A` = 6 bytes.
+        let repetitions = 64;
+        let content = r"ab\ncd\x41".repeat(repetitions);
+        let declared = repetitions * 6;
+        let document = format!("1:T{declared:x},{content}\n");
+
+        for segments in [2usize, 7, 64] {
+            let per = document.len().div_ceil(segments);
+            let payloads: Vec<&str> = document
+                .as_bytes()
+                .chunks(per)
+                .map(|chunk| std::str::from_utf8(chunk).expect("fixture should be ASCII"))
+                .collect();
+
+            let mut classifier = RscGroupClassifier::new(usize::MAX);
+            for payload in &payloads {
+                classifier.push(payload);
+            }
+            let incremental = classifier.finalize();
+
+            assert_eq!(
+                incremental,
+                classify_rsc_group(&payloads, usize::MAX),
+                "incremental classification of {segments} segments should match the whole group"
+            );
+            assert_eq!(
+                incremental,
+                RscGroupStatus::CompleteRewritable,
+                "a complete T-chunk split into {segments} segments should stay rewritable"
+            );
+        }
+    }
+
+    /// Classification must not depend on how a group was split, except for the
+    /// one rule that is defined in terms of splits: a header straddling a
+    /// payload boundary is complete but unrewritable.
+    #[test]
+    fn classification_is_independent_of_payload_split() {
+        // Each fixture lists the byte span of every `id:Tlength,` header in it.
+        for (document, headers) in [
+            (r"1:T6,ab\ncdx", &[(0usize, 5usize)][..]),
+            (r"1:T6,ab\ncdx\nplain text", &[(0, 5)][..]),
+            (r"1:T6,ab\ncdx\ndead", &[(0, 5)][..]),
+            (r"1:T6,ab\ncdx2:T2,zz", &[(0, 5), (12, 17)][..]),
+            ("plain text with no chunk", &[][..]),
+            ("trailing hex dead", &[][..]),
+            ("5:T", &[][..]),
+        ] {
+            let whole = classify_rsc_group(&[document], usize::MAX);
+
+            for split in 1..document.len() {
+                let parts = [&document[..split], &document[split..]];
+                let actual = classify_rsc_group(&parts, usize::MAX);
+                // A straddling header only downgrades a group that is otherwise
+                // rewritable; an incomplete group stays incomplete.
+                let straddles = headers
+                    .iter()
+                    .any(|(start, end)| *start < split && split < *end);
+                let expected = match whole {
+                    RscGroupStatus::CompleteRewritable if straddles => {
+                        RscGroupStatus::CompleteUnrewritable
+                    }
+                    other => other,
+                };
+                assert_eq!(
+                    actual, expected,
+                    "`{document}` split at byte {split} should classify as {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// The byte limit must trip at the same accumulation point whether payloads
+    /// are fed one at a time or classified as a whole group.
+    #[test]
+    fn incremental_classification_honors_the_byte_limit() {
+        let first = "1:T6,ab";
+        let second = r"\ncdx";
+        // One byte short of holding both payloads.
+        let limit = first.len() + second.len() - 1;
+
+        let mut classifier = RscGroupClassifier::new(limit);
+        assert_eq!(
+            classifier.push(first),
+            RscGroupStatus::NeedMore,
+            "a payload within the limit should await the rest of its chunk"
+        );
+        assert_eq!(
+            classifier.push(second),
+            RscGroupStatus::Invalid,
+            "the payload that crosses the limit should invalidate the group"
+        );
+        assert_eq!(
+            classify_rsc_group(&[first, second], limit),
+            RscGroupStatus::Invalid,
+            "whole-group classification should reach the same verdict"
         );
     }
 }

@@ -64,7 +64,7 @@ Final verification passed:
 - `crates/trusted-server-core/src/integrations/nextjs/rsc.rs` — expose/refine T-chunk scan primitives needed by the boundary-aware classifier without changing the legacy public rewrite API.
 - `crates/trusted-server-core/src/integrations/nextjs/rsc_placeholders.rs` — make RSC script capture fragment-safe, bounded, request-namespaced, and per-document.
 - `crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs` — move `__NEXT_DATA__` fragment state out of the shared registry object and enforce bounded unchanged fallback.
-- `crates/trusted-server-core/src/integrations/nextjs/html_post_process.rs` — remove the production `NextJsHtmlPostProcessor`; retain the deprecated public compatibility functions and their direct tests.
+- `crates/trusted-server-core/src/integrations/nextjs/html_post_process.rs` — remove the production `NextJsHtmlPostProcessor`. **Amended during review:** the whole module and its `pub use` in `nextjs/mod.rs` were deleted instead. Once the post-processor was gone the deprecated compatibility functions had no callers anywhere in `crates/`, and their doc comments pointed at the deleted type, so retaining them would have compiled ~674 lines of dead code (including a second full `lol_html` re-parse) into every wasm build.
 - `crates/trusted-server-core/src/publisher.rs` — generate and expose the inline seam token, move seam detection after HTML processing, rewire auction collection, and remove `BodyCloseHoldBuffer`.
 - `crates/trusted-server-core/src/integrations/google_tag_manager.rs` — supply the new script-context limit in existing unit fixtures if `IntegrationScriptContext` gains that field.
 - `docs/guide/integrations/nextjs.md` — document bounded RSC-group streaming and unchanged fallback.
@@ -80,7 +80,7 @@ Tests remain beside their implementation under each file's existing `#[cfg(test)
 - Use `IntegrationDocumentState` for request-progress state. Registry-owned `Arc` values must remain immutable between documents.
 - Check every configured limit before extending a retained `String` or `Vec<u8>`.
 - Never emit a generated inline token or Next.js placeholder on success, unchanged fallback, or error recovery.
-- Preserve the deprecated `post_process_rsc_html` and `post_process_rsc_html_in_place` public functions.
+- ~~Preserve the deprecated `post_process_rsc_html` and `post_process_rsc_html_in_place` public functions.~~ **Amended during review:** deleted with the rest of `html_post_process.rs`; they had no remaining callers.
 - Use `log` macros and `expect("should ...")`; do not introduce `anyhow`, `thiserror`, `println!`, or `unwrap()`.
 - Each task ends with its focused test, `cargo fmt --all -- --check`, and `cargo test-fastly`. Commit only after those pass.
 
@@ -544,7 +544,7 @@ Once no registration uses it:
 - remove `HtmlWithPostProcessing` fields `accumulated_output`, `decoded_input_len`, and its EOF branch;
 - rename the wrapper to `HtmlWithStreamingProcessors` if not already done;
 - delete production-only placeholder substitution from `html_post_process.rs` after moving needed helpers;
-- retain deprecated public `post_process_rsc_html` APIs and their tests.
+- ~~retain deprecated public `post_process_rsc_html` APIs and their tests.~~ **Amended during review:** deleted — see Task 1.
 
 - [ ] **Step 6: Replace old buffering tests with streaming assertions**
 
@@ -846,12 +846,22 @@ matches the core expected bytes: rewritten RSC URL and length, preserved script 
 markup immediately before structural `</body>`, and no generated seam or RSC placeholder.
 These are final-byte assertions because these adapters collect the core stream.
 
+**Amended during review:** the fixture is shared rather than copied three times. It lives in
+`trusted_server_core::test_support::nextjs_auction` behind the existing `test-utils` feature,
+which each adapter enables as a dev-dependency; the cross-adapter parity suite consumes the
+same fixture. The per-adapter regressions are
+`nextjs_auction_output_holds_until_the_structural_body_close` in each
+`crates/trusted-server-adapter-{axum,cloudflare,spin}/tests/routes.rs`, so CI gate 3 covers
+this path on every adapter. The cross-adapter byte-for-byte comparison stays in
+`crates/trusted-server-integration-tests/tests/parity.rs`
+(`adapter_buffers_nextjs_auction_output`), where it can compare adapters against each other.
+
 Run:
 
 ```bash
-cargo test-axum adapter_buffers_nextjs_auction_output -- --nocapture
-cargo test-cloudflare adapter_buffers_nextjs_auction_output -- --nocapture
-cargo test-spin adapter_buffers_nextjs_auction_output -- --nocapture
+cargo test-axum nextjs_auction_output -- --nocapture
+cargo test-cloudflare nextjs_auction_output -- --nocapture
+cargo test-spin nextjs_auction_output -- --nocapture
 ```
 
 Expected: compilation fails because `routes_with_settings` always constructs platform

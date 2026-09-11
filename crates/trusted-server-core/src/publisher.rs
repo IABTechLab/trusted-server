@@ -635,15 +635,20 @@ struct ProcessResponseParams<'a> {
 
 struct PublisherBodyProcessor {
     inner: Box<dyn StreamProcessor>,
-    inline_seam_token: Option<Vec<u8>>,
 }
 
 impl PublisherBodyProcessor {
+    /// Build the body processor, returning any deferred inline seam token it
+    /// installed alongside it.
+    ///
+    /// The token is returned rather than stored so a caller that has no seam
+    /// controller has to discard it visibly. Dropping it silently would ship the
+    /// raw marker comment to the browser and inject no bids.
     fn new(
         params: &OwnedProcessResponseParams,
         settings: &Settings,
         integration_registry: &IntegrationRegistry,
-    ) -> Result<Self, Report<TrustedServerError>> {
+    ) -> Result<(Self, Option<Vec<u8>>), Report<TrustedServerError>> {
         let is_html = is_html_content_type(&params.content_type);
         let is_rsc_flight =
             content_type_contains_ascii_case_insensitive(&params.content_type, "text/x-component");
@@ -686,14 +691,7 @@ impl PublisherBodyProcessor {
             ))
         };
 
-        Ok(Self {
-            inner,
-            inline_seam_token,
-        })
-    }
-
-    fn take_inline_seam_token(&mut self) -> Option<Vec<u8>> {
-        self.inline_seam_token.take()
+        Ok((Self { inner }, inline_seam_token))
     }
 }
 
@@ -810,7 +808,19 @@ async fn process_response_streaming_async<W: Write>(
     } else {
         input_compression
     };
-    let mut processor = PublisherBodyProcessor::new(params, settings, integration_registry)?;
+    // This path has no seam controller, so it must never be reached with a
+    // pending auction; `deferred_inline_seam_token` returns `None` for it.
+    let (mut processor, inline_seam_token) =
+        PublisherBodyProcessor::new(params, settings, integration_registry)?;
+    if inline_seam_token.is_some() {
+        // A `debug_assert!` would be compiled out of the release wasm builds that
+        // actually ship, which is exactly where an unresolved token would reach a
+        // browser as a raw marker comment with no bids injected.
+        log::error!(
+            "publisher body-close seam token minted on a path with no seam controller; dropping it"
+        );
+    }
+    drop(inline_seam_token);
     process_body_chunks_async(
         body,
         output,
@@ -2542,9 +2552,9 @@ pub async fn publisher_response_into_streaming_response(
 
             response.headers_mut().remove(header::CONTENT_LENGTH);
             let mut params = *params;
-            let mut processor =
+            let (mut processor, inline_seam_token) =
                 match PublisherBodyProcessor::new(&params, &settings, integration_registry) {
-                    Ok(processor) => processor,
+                    Ok(built) => built,
                     Err(err) => {
                         // Parity with the buffered finalizer: a processor
                         // construction failure abandons the dispatched auction
@@ -2562,7 +2572,6 @@ pub async fn publisher_response_into_streaming_response(
                         return Err(err);
                     }
                 };
-            let inline_seam_token = processor.take_inline_seam_token();
             // The guard is created before the lazy stream so an auction whose
             // response body is dropped unpolled still logs the loss.
             let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {

@@ -8,31 +8,20 @@
 
 // Both adapters define `TrustedServerApp` — alias both to avoid name collision.
 // axum::http re-exports from the `http` crate, so HeaderMap types are identical.
-use std::net::IpAddr;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
-use error_stack::Report;
 use http::HeaderMap;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
-use trusted_server_adapter_axum::platform::{
-    AxumPlatformBackend, AxumPlatformConfigStore, AxumPlatformSecretStore,
-};
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
-use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-    PlatformPendingRequest, PlatformResponse, PlatformSelectResult, RuntimeServices,
-};
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::nextjs_auction;
 
 /// Shared test settings for all adapters.
 ///
@@ -935,142 +924,11 @@ async fn legacy_admin_aliases_are_denied_locally_not_proxied() {
 }
 
 /// A known non-regulated location permits the fixture's server-side auction.
-struct ParityGeo;
-
-impl PlatformGeo for ParityGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        Ok(Some(GeoInfo {
-            country: "AU".to_owned(),
-            city: "Example City".to_owned(),
-            continent: "Oceania".to_owned(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
-            region: None,
-            asn: None,
-        }))
-    }
-}
-
-struct NextJsAuctionOrigin {
-    auction_requests: AtomicUsize,
-}
-
-fn nextjs_auction_origin_html() -> String {
-    let content = r#"{"url":"https://origin.test-publisher.example.com/app","text":"</body>"}"#;
-    let split = content.find("/app").expect("should locate content split");
-    let first = serde_json::json!(format!("1:T{:x},{}", content.len(), &content[..split]));
-    let second = serde_json::json!(&content[split..]);
-    format!(
-        "<html><head></head><body><p>prefix</p><script>self.__next_f.push([1,{first}])</script><script>window.between=true</script><script>self.__next_f.push([1,{second}])</script><p>suffix</p></body></html>"
-    )
-}
-
-#[async_trait::async_trait(?Send)]
-impl PlatformHttpClient for NextJsAuctionOrigin {
-    async fn send(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        let (content_type, body) = match request.request.uri().host() {
-            Some("origin.test-publisher.example.com") => {
-                ("text/html", nextjs_auction_origin_html())
-            }
-            Some("auction.example.com") => {
-                self.auction_requests.fetch_add(1, Ordering::SeqCst);
-                (
-                    "application/json",
-                    serde_json::json!({
-                        "id": "parity-auction",
-                        "seatbid": [{"seat": "example", "bid": [{
-                            "id": "parity-bid", "impid": "parity-slot", "price": 1.25,
-                            "adm": "<div>parity-creative</div>", "w": 300, "h": 250,
-                            "crid": "example-creative", "adomain": ["advertiser.example.com"]
-                        }]}]
-                    })
-                    .to_string(),
-                )
-            }
-            host => {
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach(format!("unexpected fixture upstream: {host:?}")));
-            }
-        };
-        Ok(PlatformResponse::new(
-            http::Response::builder()
-                .status(200)
-                .header("content-type", content_type)
-                .body(edgezero_core::body::Body::from(body))
-                .expect("should build deterministic upstream response"),
-        )
-        .with_backend_name(request.backend_name))
-    }
-
-    async fn send_async(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        let backend = request.backend_name.clone();
-        Ok(PlatformPendingRequest::new(request).with_backend_name(backend))
-    }
-
-    async fn select(
-        &self,
-        mut pending_requests: Vec<PlatformPendingRequest>,
-    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        let request = pending_requests
-            .remove(0)
-            .downcast::<PlatformHttpRequest>()
-            .expect("should recover fixture pending request");
-        Ok(PlatformSelectResult {
-            ready: self.send(request).await,
-            remaining: pending_requests,
-            failed_backend_name: None,
-        })
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adapter_buffers_nextjs_auction_output() {
-    let mut settings = test_settings();
-    settings
-        .integrations
-        .insert("nextjs".to_owned(), serde_json::json!({"enabled": true}));
-    settings.auction.enabled = true;
-    settings.auction.mediator = None;
-    settings.auction.providers = serde_json::from_value(serde_json::json!({
-        "parity": {
-            "protocol": "openrtb-2.6",
-            "endpoint": "https://auction.example.com/bid",
-            "routing": "all_eligible",
-            "timeout_ms": 5000
-        }
-    }))
-    .expect("should configure parity auction provider");
-    settings.creative_opportunities = Some(
-        toml::from_str(
-            r#"
-        gam_network_id = "12345"
-        [[slot]]
-        id = "parity-slot"
-        page_patterns = ["/article"]
-        formats = [{ width = 300, height = 250 }]
-    "#,
-        )
-        .expect("should parse fixture creative opportunities"),
-    );
-    let client = Arc::new(NextJsAuctionOrigin {
-        auction_requests: AtomicUsize::new(0),
-    });
-    let services = RuntimeServices::builder()
-        .config_store(Arc::new(AxumPlatformConfigStore))
-        .secret_store(Arc::new(AxumPlatformSecretStore))
-        .kv_store(Arc::new(trusted_server_core::platform::UnavailableKvStore))
-        .backend(Arc::new(AxumPlatformBackend))
-        .http_client(client.clone())
-        .geo(Arc::new(ParityGeo))
-        .client_info(ClientInfo::default())
-        .build();
+    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let settings = nextjs_auction::settings();
+    let services = nextjs_auction::services(Arc::clone(&client));
     let routers = [
         (
             "Axum",
@@ -1086,7 +944,10 @@ async fn adapter_buffers_nextjs_auction_output() {
         ),
     ];
     let mut expected_html = None;
-    for (index, (adapter, router)) in routers.into_iter().enumerate() {
+    for (adapter, router) in routers {
+        // Reset per adapter so each count is independently meaningful rather
+        // than a running total that a positional assertion cannot distinguish.
+        client.reset_auction_requests();
         let request = request_builder()
             .method("GET")
             .uri("https://test-publisher.example.com/article")
@@ -1110,11 +971,10 @@ async fn adapter_buffers_nextjs_auction_output() {
             .expect("should buffer adapter output");
         let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
         assert_eq!(
-            client.auction_requests.load(Ordering::SeqCst),
-            index + 1,
-            "{adapter} should dispatch one auction"
+            client.auction_requests(),
+            1,
+            "{adapter} should dispatch exactly one auction"
         );
-        let content = r#"{"url":"http://test-publisher.example.com/app","text":"</body>"}"#;
         let document = scraper::Html::parse_document(&html);
         let scripts = scraper::Selector::parse("script").expect("should parse script selector");
         let payload: String = document
@@ -1136,7 +996,7 @@ async fn adapter_buffers_nextjs_auction_output() {
             .collect();
         assert_eq!(
             payload,
-            format!("1:T{:x},{}", content.len(), content),
+            nextjs_auction::expected_rewritten_flight_payload(),
             "{adapter} should rewrite the URL and T length while preserving complete payload bytes"
         );
         assert!(
@@ -1168,7 +1028,7 @@ async fn adapter_buffers_nextjs_auction_output() {
             "{adapter} should inject bids at the structural body close"
         );
         assert!(
-            html.contains("parity-creative"),
+            html.contains("fixture-creative"),
             "{adapter} should include deterministic auction creative"
         );
         assert!(
@@ -1179,6 +1039,10 @@ async fn adapter_buffers_nextjs_auction_output() {
             !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
             "{adapter} should not leak placeholders: {html}"
         );
+        // Cross-adapter agreement only. The bytes that matter — the reconstructed
+        // Flight payload with its recomputed T length, script order, and the
+        // body-close tail — are pinned absolutely above, so a shared-core
+        // regression is caught there rather than here.
         if let Some(expected) = &expected_html {
             assert_eq!(
                 &html, expected,
