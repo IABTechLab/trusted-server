@@ -571,7 +571,7 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 
 ### Migrating from `consent_store`
 
-The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading. Remove the field before upgrading; it is not accepted as an ignored or deprecated option.
+The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading and prevent normal application state from being built. This is not partial consent degradation: user routes return adapter-specific 5xx startup-error responses until the field is removed. Run `ts config validate` before `ts config push` to catch the stale field before deployment.
 
 Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
