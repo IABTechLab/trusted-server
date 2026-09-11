@@ -818,12 +818,12 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        let is_publisher_navigation = is_navigation_request(&req);
-        if is_publisher_navigation {
+        let is_navigation = is_navigation_request(&req);
+        if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         }
-        if ec.is_real_browser
-            && is_publisher_navigation
+        let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        if is_publisher_navigation
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -2249,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_limits_returning_user_eid_sync_to_navigation_and_auction() {
+    fn dispatch_limits_returning_user_eid_sync_to_eligible_routes() {
         let router = test_router();
 
         let navigation = route(
@@ -2275,6 +2275,28 @@ mod tests {
 
         let auction = route(&router, browser_request(Method::POST, "/auction", "empty"));
         assert_eq!(eid_sync_source_of(&auction), Some(EidSyncSource::Auction));
+
+        let mut page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        let page_bids = route(&router, page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&page_bids),
+            Some(EidSyncSource::PageBids),
+            "an admitted SPA page-bids request should persist returning-user EID cookies"
+        );
+
+        let mut denied_page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        denied_page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        let denied_page_bids = route(&router, denied_page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&denied_page_bids),
+            None,
+            "a denied cross-site page-bids request must not persist EID cookies"
+        );
 
         for request in [
             browser_request(Method::GET, "/static/tsjs=prebid", "script"),
