@@ -686,3 +686,36 @@ git commit -m "Retire non-Fastly per-adapter config/secret read impls; reads via
 - **R11 (open):** whether EdgeZero should expose a **public** registry-builder helper (so Fastly need not maintain local builders, Task 6). Decide with the edgezero maintainer; not assumed here.
 - **Not in this phase:** `RuntimeServices` removal (Phase 4); Cloudflare/Spin `include_str!`/side-channel config removal (Phase 2); `from_toml_and_env` + `config` dep (Phase 2); `Redacted<T>` / secret externalization (Phase 3); `management_api.rs` deletion (only under a future D6-b).
 - **No dependency on edgezero #305** — Phase 1 uses shipped EdgeZero store APIs only.
+
+---
+
+## 2026-09-10 closing amendment (plan EXECUTED — read this last; it supersedes the pin and Task 2 secret declarations)
+
+This plan is complete. Tasks 1–8 shipped on PR
+[IABTechLab/trusted-server#839](https://github.com/IABTechLab/trusted-server/pull/839),
+which then merged `main` (merge `7aa144daa`) and landed post-merge CI fixes
+(`85ad552be`). Three later facts supersede text above:
+
+- **The pin sections are obsolete.** The dependency moved from the PR #306
+  branch pin (`d8f71a4a` → `ff530286`) to the released **tag `v0.0.8`**, which
+  contains the #306 squash plus twenty follow-ups. The "Lockfile guard" no
+  longer applies — the tag is immutable. Verify any API question against
+  `git show v0.0.8:…` in the edgezero repo.
+- **Task 2's "full id lists in `edgezero.toml`" is superseded for SECRETS.**
+  The v0.0.8 CLI marks the axum/cloudflare/spin adapters Single-capable for
+  secrets and runs that check across every declared adapter on `ts config
+push`, so `[stores.secrets].ids` now holds only `trusted_server_secrets`.
+  The management-provisioned `signing_keys` store binds registry-locally via
+  `trusted_server_core::stores::RUNTIME_ONLY_SECRET_IDS` in the Fastly and
+  Axum builders; the `ts_secrets`/`s3_auth` logical ids were retired when
+  mainline #1036 moved those credentials to startup resolution from the
+  default store. Config and KV id lists stand as written — but v0.0.8's
+  Cloudflare dispatcher hard-requires a binding per declared KV id, so the
+  wrangler manifests bind all four KV ids by their lowercase logical names.
+- **R11 resolved and Task 6 narrowed.** v0.0.8 makes `FastlyService` and
+  `dispatch_with_registries` public and its builders apply the runtime-env
+  name mapping; the Task 6 local builders now also apply that mapping and
+  survive only for the plain-vs-envelope config split (edgezero#324, still
+  open), the `signing_keys` runtime-only binding, and the custom `oneshot`'s
+  access to core response extensions. See the umbrella spec's 2026-09-10
+  amendment for the Phase 4 rescope (P0-C/P0-D shipped in v0.0.8).
