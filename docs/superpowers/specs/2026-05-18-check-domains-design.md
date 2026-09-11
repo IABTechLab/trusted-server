@@ -669,38 +669,65 @@ Notes:
 ### URL extraction (without lookahead)
 
 Rust's standard `regex` crate does not support lookahead. The patterns
-are designed to work without it — host character classes naturally bound
-the match.
+are designed to work without it: the regex captures the **whole
+authority**, and a second step canonicalises it.
+
+**Authority character class** (shared by both regexes):
+
+```
+[\p{L}\p{N}\p{M}\-._%:\x{3002}\x{FF0E}\x{FF61}]
+```
+
+This admits everything WHATWG host parsing turns into a plain host,
+not just ASCII letters, digits, `-` and `.`: percent escapes (`%2e`
+decodes to a dot), underscores (accepted by many resolvers), non-ASCII
+letters and combining marks (IDNA-mapped), the ideographic full stops
+IDNA maps to `.`, and `:` for a port. Review found that a narrower
+class let `https://github.com%2eevil.com`, `https://github.com。evil.com`
+and `https://github.com_evil.com` through: the match stopped at the
+unexpected character and handed the allowlist the prefix `github.com`.
+The rule is that **matching never stops early inside a host**; the
+match ends only at a character that cannot be part of one (`/`, `?`,
+`#`, whitespace, quotes, brackets, and similar).
 
 **Absolute URL regex:**
 
 ```
-(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)
+(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[\p{L}\p{N}]<authority-class>*)
 ```
 
 - `(?:[^/?\s#]+@)?` is a non-capturing optional group that consumes
-  any RFC 3986 `userinfo@` prefix so the captured host is the real
-  authority. Without it, `https://github.com@test.com/path` would
+  any RFC 3986 `userinfo@` prefix so the captured authority is the
+  real one. Without it, `https://github.com@test.com/path` would
   extract the allowlisted `github.com` and miss the actual host
   `test.com` — a real bypass for a security-relevant linter.
   Multi-`@` userinfo is handled by regex backtracking: the engine
   consumes as much as possible while still finding an `@` followed
   by a valid host token.
-- The non-IPv6 host branch `[A-Za-z0-9][A-Za-z0-9.\-]*` requires the
-  host to **start with an alphanumeric** character. This rejects
-  placeholder noise like `https://...` (which the earlier
-  `[A-Za-z0-9.\-]+` would have matched, producing the bogus host
-  `...`). A leading `-` or `.` is rejected by the same rule; that's
-  fine, both are invalid per RFC 1035 anyway.
-- Greedy match stops at the first character outside the class
-  (e.g., `/`, `:`, `?`, `"`, `>`).
-- Bracketed IPv6 is captured as `[…]`; surrounding brackets stripped
-  in normalisation.
+- The non-IPv6 branch requires the authority to **start with a letter
+  or digit**. This rejects placeholder noise like `https://...`
+  (which an unanchored class would match, producing the bogus host
+  `...`). A leading `-` or `.` is rejected by the same rule.
+- Bracketed IPv6 is captured as `[…]`; the brackets are stripped in
+  normalisation.
+
+**Canonicalisation.** Each captured authority is parsed as
+`http://<authority>` with the `url` crate (WHATWG URL Standard) and
+the parsed `host_str()` is what the allowlist sees: percent-decoded,
+IDNA-mapped to ASCII (`gıthub.com` becomes an `xn--` name, not
+`github.com`), lowercased, port removed, then run through the trailing
+dot / bracket normalisation below. An authority the parser rejects
+(for example a dangling `%`) is reported **as written**, never trimmed
+to an allowlisted prefix.
+
+**Escaped solidus.** JSON may escape `/` as `\/`, so a line is
+unescaped (`\/` → `/`) before either regex runs; `"https:\/\/partner.com"`
+is then seen as the URL it decodes to.
 
 **Protocol-relative URL regex:**
 
 ```
-(?i)(?:^|[\s"'(=<>{,\[\]`])//(?:[^/?\s#]+@)?([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})
+(?i)(?:^|[\s"'(=<>{,\[\]`])//(?:[^/?\s#]+@)?([\p{L}\p{N}]<authority-class>*\.[A-Za-z]{2,})
 ```
 
 - The non-capturing group `(?:^|[\s"'(=<>{,\[\]` + backtick + `])`
@@ -720,9 +747,10 @@ the match.
 - Prevents matching `// comment text` (the `//` is at column 0 or
   preceded by code, but the trailing TLD constraint also filters
   out comment dividers like `// foo bar`).
-- The host capture `[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}`
+- The host capture `[\p{L}\p{N}]<authority-class>*\.[A-Za-z]{2,}`
   requires at least one dot followed by a TLD-like suffix and a
-  leading alphanumeric character.
+  leading letter or digit, and is canonicalised exactly like an
+  absolute URL's authority.
 - **Intentional asymmetry with the absolute-URL regex**: the
   absolute pattern accepts single-label hosts (`http://myservice/`,
   no dot), while this protocol-relative pattern requires a dotted

@@ -13,7 +13,7 @@ use std::process::{Command, Output};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-const BAD_SOURCE: &str = "let bad = \"https://test.com\";\n";
+const BAD_SOURCE: &str = "let bad = \"https://test.com\";\n"; // allow-domain: test.com
 
 /// A git environment isolated from the developer's own configuration:
 /// `GIT_CONFIG_GLOBAL` points at a file this test owns and the system

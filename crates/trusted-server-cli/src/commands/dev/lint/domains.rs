@@ -4,6 +4,7 @@
 
 use core::error::Error;
 use core::ops::ControlFlow;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
 use std::env;
@@ -24,6 +25,7 @@ use gix::object::tree::diff::Change;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
+use url::Url;
 
 use crate::commands::dev::lint::{DomainsArgs, OutputFormat};
 use crate::error::CliError;
@@ -326,28 +328,65 @@ mod allow_check_tests {
     }
 }
 
-/// Regex for absolute `http(s)://` URLs. Case-insensitive; the host
-/// must start with an alphanumeric character so placeholders like
-/// `https://...` are rejected.
+/// Characters that can form a URL authority (host and optional port)
+/// as browsers and resolvers read it. Beyond ASCII letters, digits,
+/// `-` and `.`, this admits everything WHATWG host parsing turns into
+/// a plain host: percent escapes (`%2e` is a dot), underscores (many
+/// resolvers accept them), non-ASCII letters and marks (IDNA-mapped),
+/// and the ideographic full stops IDNA maps to `.`. Stopping at any of
+/// these would hand the allowlist a prefix of the real host.
+const AUTHORITY_CLASS: &str = r"[\p{L}\p{N}\p{M}\-._%:\x{3002}\x{FF0E}\x{FF61}]";
+
+/// Regex for absolute `http(s)://` URLs. Captures the whole authority
+/// (bracketed IPv6, or a host that starts with a letter or digit so
+/// placeholders like `https://...` are rejected) for
+/// [`canonical_host`] to parse; matching never stops early inside a
+/// host.
 ///
 /// `(?:[^/?\s#]+@)?` skips any RFC 3986 `userinfo@` prefix so the
-/// captured host is the real authority, not a deceiving `user@`
+/// captured authority is the real one, not a deceiving `user@`
 /// part. Without this, `https://github.com@test.com/path` would
 /// extract the allowlisted `github.com` and miss the actual host
 /// `test.com`.
 fn absolute_url_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)")
-            .expect("should compile absolute URL regex")
+        Regex::new(&format!(
+            r"(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[\p{{L}}\p{{N}}]{AUTHORITY_CLASS}*)"
+        ))
+        .expect("should compile absolute URL regex")
     })
+}
+
+/// Undo JSON's optional solidus escape so `https:\/\/host` is seen as
+/// the URL it decodes to.
+fn unescape_solidus(line: &str) -> Cow<'_, str> {
+    if line.contains("\\/") {
+        Cow::Owned(line.replace("\\/", "/"))
+    } else {
+        Cow::Borrowed(line)
+    }
+}
+
+/// Reduce a captured authority to the canonical hostname a browser
+/// would connect to: percent-decoded, IDNA-mapped to ASCII,
+/// lowercased, port dropped, brackets and trailing dot stripped. An
+/// authority the WHATWG parser rejects is reported as written rather
+/// than trimmed to an allowlisted prefix.
+fn canonical_host(authority: &str) -> String {
+    let parsed = Url::parse(&format!("http://{authority}"));
+    match parsed.as_ref().ok().and_then(Url::host_str) {
+        Some(host) => normalise_host(host),
+        None => normalise_host(authority),
+    }
 }
 
 /// Extract and normalise every host from absolute URLs on `line`.
 fn extract_absolute_hosts(line: &str) -> Vec<String> {
+    let line = unescape_solidus(line);
     absolute_url_regex()
-        .captures_iter(line)
-        .filter_map(|c| c.get(1).map(|m| normalise_host(m.as_str())))
+        .captures_iter(&line)
+        .filter_map(|c| c.get(1).map(|m| canonical_host(m.as_str())))
         .collect()
 }
 
@@ -430,6 +469,76 @@ mod absolute_url_tests {
             vec!["example.com"]
         );
     }
+
+    /// The authority must be canonicalised as a whole: every form
+    /// below resolves to a host under `evil.com`, and a prefix match
+    /// on `github.com` would have let each one through.
+    #[test]
+    fn lookalike_authorities_are_canonicalised_not_prefix_matched() {
+        for (input, expected) in [
+            ("https://github.com.evil.com/x", "github.com.evil.com"),
+            ("https://github.com%2eevil.com/x", "github.com.evil.com"),
+            ("https://github.com%2Eevil.com/x", "github.com.evil.com"),
+            ("https://GITHUB.COM%2Eevil.com/x", "github.com.evil.com"),
+            (
+                "https://github.com\u{3002}evil.com/x",
+                "github.com.evil.com",
+            ),
+            (
+                "https://github.com\u{FF0E}evil.com/x",
+                "github.com.evil.com",
+            ),
+            ("https://github.com_evil.com/x", "github.com_evil.com"),
+        ] {
+            assert_eq!(
+                extract_absolute_hosts(input),
+                vec![expected],
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_json_solidus_is_decoded() {
+        assert_eq!(
+            extract_absolute_hosts(r#"{"url": "https:\/\/partner.com\/v1"}"#),
+            vec!["partner.com"]
+        );
+    }
+
+    #[test]
+    fn idna_lookalike_reports_punycode_not_allowlisted_name() {
+        // Dotless i: looks like github.com in many fonts.
+        let hosts = extract_absolute_hosts("https://g\u{131}thub.com/x");
+        assert_eq!(hosts.len(), 1);
+        assert!(
+            hosts[0].starts_with("xn--"),
+            "should be punycode: {hosts:?}"
+        );
+        assert_ne!(hosts[0], "github.com");
+    }
+
+    #[test]
+    fn trailing_dot_and_port_are_dropped() {
+        assert_eq!(
+            extract_absolute_hosts("see https://example.com. Then"),
+            vec!["example.com"]
+        );
+        assert_eq!(
+            extract_absolute_hosts("https://example.com:"),
+            vec!["example.com"]
+        );
+    }
+
+    #[test]
+    fn unparseable_authority_is_reported_as_written() {
+        // A dangling percent sign is rejected by the host parser; the
+        // raw authority is reported instead of a trimmed prefix.
+        assert_eq!(
+            extract_absolute_hosts("https://github.com%zz/x"),
+            vec!["github.com%zz"]
+        );
+    }
 }
 
 /// Regex for protocol-relative `//host/...` URLs. The `//` must be
@@ -438,23 +547,25 @@ mod absolute_url_tests {
 /// NOT `:`, which would double-match the `//` in an absolute URL.
 /// `(?:[^/?\s#]+@)?` skips any RFC 3986 userinfo so a deceiving
 /// `//user@evil.com` pattern reports `evil.com`, not `user`. The
-/// host requires a dotted TLD-like suffix to filter out code
-/// comment dividers.
+/// authority uses the same [`AUTHORITY_CLASS`] as absolute URLs and
+/// requires a dotted TLD-like suffix to filter out code comment
+/// dividers.
 fn protocol_relative_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:^|[\s"'(=<>{,\[\]`])//(?:[^/?\s#]+@)?([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})"#,
-        )
+        Regex::new(&format!(
+            r#"(?i)(?:^|[\s"'(=<>{{,\[\]`])//(?:[^/?\s#]+@)?([\p{{L}}\p{{N}}]{AUTHORITY_CLASS}*\.[A-Za-z]{{2,}})"#
+        ))
         .expect("should compile protocol-relative URL regex")
     })
 }
 
 /// Extract and normalise every host from protocol-relative URLs.
 fn extract_protocol_relative_hosts(line: &str) -> Vec<String> {
+    let line = unescape_solidus(line);
     protocol_relative_regex()
-        .captures_iter(line)
-        .filter_map(|c| c.get(1).map(|m| normalise_host(m.as_str())))
+        .captures_iter(&line)
+        .filter_map(|c| c.get(1).map(|m| canonical_host(m.as_str())))
         .collect()
 }
 
@@ -527,6 +638,32 @@ mod protocol_relative_tests {
         assert_eq!(
             extract_protocol_relative_hosts("//support@test.com"),
             vec!["test.com"]
+        );
+    }
+
+    #[test]
+    fn lookalike_authorities_are_canonicalised_not_prefix_matched() {
+        for (input, expected) in [
+            ("src=\"//github.com%2eevil.com/x\"", "github.com.evil.com"),
+            (
+                "src=\"//github.com\u{3002}evil.com/x\"",
+                "github.com.evil.com",
+            ),
+            ("src=\"//github.com_evil.com/x\"", "github.com_evil.com"),
+        ] {
+            assert_eq!(
+                extract_protocol_relative_hosts(input),
+                vec![expected],
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_json_solidus_is_decoded() {
+        assert_eq!(
+            extract_protocol_relative_hosts(r#"{"src": "\/\/cdn.example.evil\/x"}"#),
+            vec!["cdn.example.evil"]
         );
     }
 }
