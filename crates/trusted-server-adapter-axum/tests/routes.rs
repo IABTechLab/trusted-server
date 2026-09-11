@@ -4,6 +4,8 @@
 //! and self-contained. Each test builds the full `TrustedServerApp` router and
 //! drives it through the Tower `Service` interface.
 
+use std::collections::BTreeSet;
+
 use axum::body::Body as AxumBody;
 use axum::http::Request;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
@@ -139,6 +141,42 @@ fn all_explicit_routes_are_registered() {
     for (method, path) in expected {
         assert_route_registered(method, path);
     }
+}
+
+#[test]
+fn complete_route_registration_set_matches_the_prechange_contract() {
+    let named_paths = [
+        "/.well-known/trusted-server.json",
+        "/verify-signature",
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/_ts/admin/ec",
+        "/_ts/admin/ec/{id}",
+        "/_ts/admin/eids",
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+        "/auction",
+        "/_ts/page-bids",
+        "/__ts/page-bids",
+        "/first-party/proxy",
+        "/first-party/click",
+        "/first-party/sign",
+        "/first-party/proxy-rebuild",
+    ];
+    let fallback_methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
+    let mut expected = BTreeSet::new();
+    for path in named_paths.into_iter().chain(["/", "/{*rest}"]) {
+        for method in fallback_methods {
+            expected.insert((method.to_owned(), path.to_owned()));
+        }
+    }
+    expected.insert(("GET".to_owned(), "/health".to_owned()));
+
+    assert_eq!(
+        registered_routes().into_iter().collect::<BTreeSet<_>>(),
+        expected,
+        "Axum route registration must preserve every named/fallback method exactly"
+    );
 }
 
 /// Verify the legacy non-`/_ts` admin aliases ARE registered — to the local

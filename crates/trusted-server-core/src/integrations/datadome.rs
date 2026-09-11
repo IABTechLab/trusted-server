@@ -3,6 +3,8 @@
 //! This module provides transparent proxying for `DataDome`'s JavaScript tag and signal
 //! collection API, enabling first-party bot protection while maintaining the permissionless
 //! Trusted Server approach (no DNS/CNAME changes required).
+//! Runtime registration owns the proxy routes, script rewriting, request filter,
+//! and client-tag suppression decision as one integration contract.
 //!
 //! # Overview
 //!

@@ -1,3 +1,8 @@
+//! Local-development command namespace.
+//!
+//! The production-hostname proxy is exposed only on macOS because it integrates
+//! with the login keychain and system proxy configuration.
+
 // `ts dev proxy` is macOS-only; its dependencies are scoped to macOS in
 // `Cargo.toml`, so the module and the `Proxy` subcommand only exist there. On
 // other host targets `ts dev` parses but exposes no subcommands.

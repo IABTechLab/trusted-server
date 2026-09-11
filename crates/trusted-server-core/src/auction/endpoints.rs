@@ -76,7 +76,7 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ## Context passthrough (`config`)
 ///
 /// The optional `config` object is filtered through
-/// [`auction.allowed_context_keys`][`crate::settings::AuctionConfig::allowed_context_keys`].
+/// [`auction.allowed_context_keys`][`crate::auction_config_types::AuctionConfig::allowed_context_keys`].
 /// Only keys listed there reach the auction providers (e.g. `"permutive_segments"`).
 /// All other keys are silently dropped. Values must be either strings or arrays of
 /// strings.
@@ -84,9 +84,11 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ## Response
 ///
 /// Returns an `OpenRTB 2.x` response. Creative HTML is inlined in each bid's
-/// `adm` field after mandatory server-side sanitization. First-party resource
-/// and click URL rewriting plus creative TSJS injection are enabled by default;
-/// setting [`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`]
+/// `adm` field. Sanitization is opt-in through
+/// [`auction.sanitize_creatives`][`crate::auction_config_types::AuctionConfig::sanitize_creatives`].
+/// First-party resource and click URL rewriting plus creative TSJS injection
+/// are enabled by default; setting
+/// [`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`]
 /// to `false` skips only that rewrite pass.
 ///
 /// ## Scroll, refresh, and SPA navigation

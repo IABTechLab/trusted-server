@@ -1,3 +1,8 @@
+//! Static ad-template configuration commands.
+//!
+//! Lint, match, and assertion paths load finalized settings and reuse the core
+//! creative-opportunity matcher without launching a browser.
+
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 

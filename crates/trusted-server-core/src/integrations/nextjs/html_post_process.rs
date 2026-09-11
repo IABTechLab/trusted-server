@@ -1,3 +1,8 @@
+//! Buffered final pass for cross-script Next.js RSC payload rewriting.
+//!
+//! Streaming hooks leave placeholders for complete payloads; this processor
+//! combines them under a configured size limit and restores rewritten scripts.
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;

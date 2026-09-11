@@ -474,7 +474,7 @@ fn legacy_admin_alias_denied() -> Response {
 /// 503 Service Unavailable. The startup error is logged but not echoed in the
 /// response body so that deployment state is not leaked to anonymous callers.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    log::error!("startup failed, serving error fallback: {:?}", e);
+    crate::logging::emit_startup_diagnostic(&startup_error_diagnostic(e));
 
     let handler = |_ctx: RequestContext| {
         let body = edgezero_core::body::Body::from("Service Unavailable\n");
@@ -504,6 +504,13 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         builder = builder.route("/{*rest}", method, handler);
     }
     builder.build()
+}
+
+fn startup_error_diagnostic(error: &Report<TrustedServerError>) -> String {
+    format!(
+        "Spin startup failed, serving error fallback: {}",
+        error.current_context()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,5 +1339,38 @@ mod tests {
             b"ok",
             "startup-fallback health body should be `ok`"
         );
+    }
+
+    #[test]
+    fn startup_error_diagnostic_preserves_the_specific_adapter_error() {
+        let report = Report::new(TrustedServerError::Configuration {
+            message: "failed to read Spin Trusted Server app-config blob".to_owned(),
+        });
+
+        assert!(
+            startup_error_diagnostic(&report)
+                .contains("failed to read Spin Trusted Server app-config blob"),
+            "the runtime log must preserve the specific startup failure"
+        );
+    }
+
+    #[test]
+    fn startup_error_route_set_matches_the_prechange_contract() {
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "startup failure".to_owned(),
+        });
+        let observed = startup_error_router(&report)
+            .routes()
+            .into_iter()
+            .map(|route| (route.method().to_string(), route.path().to_owned()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected = std::collections::BTreeSet::new();
+        for path in ["/", "/{*rest}"] {
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                expected.insert((method.to_owned(), path.to_owned()));
+            }
+        }
+        expected.insert(("GET".to_owned(), "/health".to_owned()));
+        assert_eq!(observed, expected);
     }
 }

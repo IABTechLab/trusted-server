@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up shared integration build environment
         uses: ./.github/actions/setup-integration-test-env
@@ -49,7 +49,7 @@ jobs:
             test-wordpress:latest test-nextjs:latest
 
       - name: Upload integration test artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up integration test runtime
         id: shared-setup
@@ -74,7 +74,7 @@ jobs:
           build-test-images: "false"
 
       - name: Download integration test artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
@@ -83,20 +83,18 @@ jobs:
         run: chmod +x "$AXUM_ARTIFACT_PATH"
 
       - name: Restore Cloudflare Workers bundle
-        run: |
-          mkdir -p crates/trusted-server-adapter-cloudflare/build
-          cp -r "$CF_BUILD_ARTIFACT_PATH/." crates/trusted-server-adapter-cloudflare/build/
+        run: ./scripts/restore-cloudflare-build.sh
 
       - name: Load integration test Docker images
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.shared-setup.outputs.node-version }}
 
-      - name: Install wrangler
-        run: npm install -g wrangler
+      - name: Install pinned Wrangler
+        run: ./scripts/install-wrangler.sh
 
       - name: Run integration tests
         run: >-
@@ -114,13 +112,78 @@ jobs:
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           RUST_LOG: info
 
+  adapter-first-success-smokes:
+    name: adapter first success (${{ matrix.adapter }})
+    needs: prepare-artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [axum, fastly, cloudflare]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Set up smoke runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: "false"
+          build-wasm: "false"
+          build-axum: "false"
+          build-test-images: "false"
+
+      - name: Download integration test artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+
+      - name: Prepare Axum artifact
+        if: matrix.adapter == 'axum'
+        run: chmod +x "$AXUM_ARTIFACT_PATH"
+
+      - name: Restore Cloudflare Workers bundle
+        if: matrix.adapter == 'cloudflare'
+        run: ./scripts/restore-cloudflare-build.sh
+
+      - name: Set up Node.js
+        if: matrix.adapter == 'cloudflare'
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+
+      - name: Install pinned Wrangler
+        if: matrix.adapter == 'cloudflare'
+        run: ./scripts/install-wrangler.sh
+
+      - name: Read pinned Fastly tool versions
+        if: matrix.adapter == 'fastly'
+        id: fastly-versions
+        run: ./scripts/read-tool-versions.sh
+
+      - name: Install pinned Fastly CLI
+        if: matrix.adapter == 'fastly'
+        uses: fastly/compute-actions/setup@v14
+        with:
+          cli_version: ${{ steps.fastly-versions.outputs.fastly }}
+          viceroy_version: ${{ steps.fastly-versions.outputs.viceroy }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run adapter first-success smoke
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}
+        run: ./scripts/smoke-${{ matrix.adapter }}.sh
+
   integration-tests-fastly-ec:
     name: integration tests (Fastly EC lifecycle)
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up integration test runtime
         id: shared-setup
@@ -132,7 +195,7 @@ jobs:
           build-test-images: "false"
 
       - name: Download integration test artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
@@ -158,7 +221,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up browser test runtime
         id: shared-setup
@@ -170,7 +233,7 @@ jobs:
           build-test-images: "false"
 
       - name: Download integration test artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
@@ -179,7 +242,7 @@ jobs:
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.shared-setup.outputs.node-version }}
           cache: npm
@@ -211,7 +274,7 @@ jobs:
         run: npx playwright test
 
       - name: Upload Playwright report (Next.js)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: playwright-report-nextjs
@@ -230,7 +293,7 @@ jobs:
         run: npx playwright test
 
       - name: Upload Playwright report (WordPress)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: playwright-report-wordpress
@@ -238,7 +301,7 @@ jobs:
           retention-days: 7
 
       - name: Upload Playwright traces and screenshots
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         if: failure()
         with:
           name: playwright-traces

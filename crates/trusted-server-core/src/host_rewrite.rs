@@ -1,3 +1,8 @@
+//! Boundary-aware host replacement shared by HTML and RSC rewriting.
+//!
+//! The matcher refuses suffix and subdomain collisions and preserves numeric
+//! ports, preventing broad string replacement from corrupting unrelated hosts.
+
 /// Rewrite bare host occurrences (e.g. `origin.example.com/news`) only when the match is a full
 /// hostname token, not part of a larger hostname like `cdn.origin.example.com`.
 ///

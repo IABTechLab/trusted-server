@@ -1,3 +1,8 @@
+//! Static analysis of collected pages into a deterministic audit artifact.
+//!
+//! Detection combines parsed markup, observed requests, and bounded identifier
+//! matching without performing browser I/O.
+
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 

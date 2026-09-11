@@ -709,7 +709,7 @@ impl CreativeOpportunitySlot {
     }
 
     /// Compile [`page_patterns`](Self::page_patterns) into the
-    /// [`compiled_patterns`](Self::compiled_patterns) cache.
+    /// private `compiled_patterns` cache.
     ///
     /// Patterns that fail to compile (either directly or after the `**`→`*`
     /// normalisation that [`matches_path`](Self::matches_path) does) are
@@ -784,7 +784,7 @@ impl CreativeOpportunitySlot {
     ///
     /// # Performance
     ///
-    /// The hot path reads the [`compiled_unit`](Self::compiled_unit) cache. A
+    /// The hot path reads the private `compiled_unit` cache. A
     /// slot with an explicit `gam_unit_path` but no cache (built by hand, or
     /// deserialized without [`CreativeOpportunitiesConfig::compile_unit_templates`])
     /// re-parses its template on every call — same fallback shape as

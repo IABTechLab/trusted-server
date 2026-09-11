@@ -537,7 +537,12 @@ formats = [{ width = 300, height = 250 }]
                     .strip_prefix("# ")
                     .or_else(|| line.strip_prefix('#'))
                     .unwrap_or(line);
-                out.push(bare.to_owned());
+                let syntax = bare.trim_start();
+                if syntax.starts_with('[') || syntax.contains('=') {
+                    out.push(bare.to_owned());
+                } else {
+                    out.push(line.to_owned());
+                }
             } else {
                 out.push(line.to_owned());
             }

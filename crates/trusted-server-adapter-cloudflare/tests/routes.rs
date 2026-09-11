@@ -4,6 +4,8 @@
 //! `TrustedServerApp::routes()` builds without panicking. Does not exercise
 //! the platform layer or outbound network calls.
 
+use std::collections::BTreeSet;
+
 use edgezero_core::app::Hooks as _;
 use edgezero_core::http::{Request, Response, request_builder};
 use edgezero_core::router::RouterService;
@@ -283,6 +285,49 @@ fn all_explicit_routes_are_registered() {
             assert_route_registered(method, path);
         }
     }
+}
+
+#[test]
+fn complete_route_registration_set_matches_the_prechange_contract() {
+    let mut expected = BTreeSet::from([
+        (
+            "GET".to_owned(),
+            "/.well-known/trusted-server.json".to_owned(),
+        ),
+        ("POST".to_owned(), "/verify-signature".to_owned()),
+        ("POST".to_owned(), "/_ts/admin/keys/rotate".to_owned()),
+        ("POST".to_owned(), "/_ts/admin/keys/deactivate".to_owned()),
+        ("GET".to_owned(), "/_ts/admin/ec".to_owned()),
+        ("GET".to_owned(), "/_ts/admin/ec/{id}".to_owned()),
+        ("GET".to_owned(), "/_ts/admin/eids".to_owned()),
+        ("POST".to_owned(), "/auction".to_owned()),
+        ("GET".to_owned(), "/_ts/page-bids".to_owned()),
+        ("OPTIONS".to_owned(), "/_ts/page-bids".to_owned()),
+        ("GET".to_owned(), "/__ts/page-bids".to_owned()),
+        ("OPTIONS".to_owned(), "/__ts/page-bids".to_owned()),
+        ("GET".to_owned(), "/first-party/proxy".to_owned()),
+        ("GET".to_owned(), "/first-party/click".to_owned()),
+        ("GET".to_owned(), "/first-party/sign".to_owned()),
+        ("POST".to_owned(), "/first-party/sign".to_owned()),
+        ("GET".to_owned(), "/first-party/proxy-rebuild".to_owned()),
+        ("POST".to_owned(), "/first-party/proxy-rebuild".to_owned()),
+    ]);
+    for path in [
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+        "/",
+        "/{*rest}",
+    ] {
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            expected.insert(((*method).to_owned(), path.to_owned()));
+        }
+    }
+    assert_eq!(expected.len(), 46);
+    assert_eq!(
+        registered_routes().into_iter().collect::<BTreeSet<_>>(),
+        expected,
+        "Cloudflare inline builder must preserve every route and method exactly"
+    );
 }
 
 // ---------------------------------------------------------------------------

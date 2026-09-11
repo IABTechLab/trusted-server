@@ -22,7 +22,6 @@ fn main() {
     fs::create_dir_all(&tmp).expect("should create temp directory");
 
     // Phase 1: Compile proto with prost-build.
-    eprintln!("Compiling {}...", proto_path.display());
     prost_build::Config::new()
         .out_dir(&tmp)
         .compile_protos(
@@ -47,8 +46,6 @@ fn main() {
     );
 
     fs::write(&output_path, output).expect("should write generated.rs");
-    eprintln!("Wrote {}", output_path.display());
-
     // Clean up temp files.
     let _ = fs::remove_dir_all(&tmp);
 }

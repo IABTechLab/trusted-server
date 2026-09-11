@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The workspace intentionally has no global target; select the host explicitly.
 HOST_TARGET="${1:-$(rustc -vV | awk '/host:/ { print $2 }')}"
 if [ -z "$HOST_TARGET" ]; then
   echo "Failed to detect host target" >&2

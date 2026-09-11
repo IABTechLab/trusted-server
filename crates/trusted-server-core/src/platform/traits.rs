@@ -1,3 +1,8 @@
+//! Object-safe service ports implemented by each deployment adapter.
+//!
+//! Store operations are synchronous because supported edge runtimes expose
+//! different async models; outbound HTTP remains async through boxed futures.
+
 use std::net::IpAddr;
 
 use error_stack::Report;

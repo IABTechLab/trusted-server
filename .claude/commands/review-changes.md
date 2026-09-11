@@ -1,5 +1,8 @@
 Review all staged and unstaged changes in the working tree.
 
+Use the [canonical CI gate list](/CLAUDE.md#ci-gates) as the sole source for
+required verification. Do not copy its commands into this file.
+
 1. Run `git diff` and `git diff --cached` to see all changes.
 2. Review each changed file for:
    - Correctness and logic errors

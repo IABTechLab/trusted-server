@@ -1,3 +1,9 @@
+//! Prebid.js and Prebid Server integration.
+//!
+//! This module registers browser assets and proxy routes, builds provider
+//! requests from auction plans, forwards bounded consent and identity context,
+//! and normalizes Prebid Server responses for orchestration.
+
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;

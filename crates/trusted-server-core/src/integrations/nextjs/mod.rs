@@ -1,3 +1,8 @@
+//! Next.js origin rewriting for `__NEXT_DATA__` and RSC Flight payloads.
+//!
+//! Streaming script hooks handle complete payloads, while a bounded buffered
+//! post-process joins fragmented RSC scripts that span HTML chunks.
+
 use std::sync::Arc;
 
 use error_stack::Report;

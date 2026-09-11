@@ -359,7 +359,7 @@ impl EcContext {
     /// include the [`KvDevice`] record. The adapter derives these from
     /// `req.get_tls_ja4()`, `req.get_client_h2_fingerprint()`, and UA.
     ///
-    /// [`KvDevice`]: super::kv_types::KvDevice
+    /// [`KvDevice`]: crate::ec::kv_types::KvDevice
     /// [`generate_if_needed`]: Self::generate_if_needed
     pub fn set_device_signals(&mut self, signals: DeviceSignals) {
         self.device_signals = Some(signals);

@@ -154,6 +154,12 @@ pub(crate) fn build_browser_config(
     let mut builder = BrowserConfig::builder()
         .chrome_executable(options.chrome)
         .user_data_dir(options.profile_dir);
+    #[cfg(test)]
+    if browser_fixture_tests_enabled()
+        && std::env::var("TS_AUDIT_BROWSER_FIXTURE_NO_SANDBOX").as_deref() == Ok("1")
+    {
+        builder = builder.no_sandbox();
+    }
     if !options.accept_invalid_certs {
         builder = builder.respect_https_errors();
     }
@@ -181,6 +187,12 @@ pub(crate) fn build_browser_config(
     builder
         .build()
         .map_err(|error| format!("failed to build browser config: {error}"))
+}
+
+/// Reports whether the ignored browser fixtures were explicitly selected.
+#[cfg(test)]
+pub(crate) fn browser_fixture_tests_enabled() -> bool {
+    std::env::var("TS_AUDIT_BROWSER_TESTS").as_deref() == Ok("1")
 }
 
 fn browser_profile(profile: BrowserProfile) -> (Viewport, Option<&'static str>) {

@@ -1,6 +1,7 @@
 [package]
 name = "trusted-server-js"
 description = "Trusted Server tsjs — TypeScript-built JS embedded in a Rust crate."
+readme = "README.md"
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

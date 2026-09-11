@@ -1,3 +1,8 @@
+//! Platform-neutral outbound HTTP requests, responses, and fan-out handles.
+//!
+//! Adapters translate these values to provider APIs while core request handlers
+//! retain ownership of cache, streaming, and image-optimization policy.
+
 use std::any::Any;
 use std::fmt;
 

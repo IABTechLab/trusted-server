@@ -1,3 +1,9 @@
+//! Cloudflare Workers adapter for Trusted Server.
+//!
+//! The fetch entry point exposes the Workers environment to the request
+//! adapter, installs nested-variable startup configuration when present, and
+//! delegates routing to the shared `EdgeZero` application.
+
 // The `cloudflare` feature activates the `worker` crate which requires
 // wasm-bindgen and only compiles for `wasm32-unknown-unknown`. Enabling it on
 // a native target produces cryptic linker errors — catch it early instead.

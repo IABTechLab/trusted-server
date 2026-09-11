@@ -6,6 +6,8 @@
 //! that depends on external stores assert routing only; deterministic auth and
 //! method gates assert exact status codes.
 
+use std::collections::BTreeSet;
+
 use edgezero_core::app::Hooks as _;
 use edgezero_core::http::{Request, Response, request_builder};
 use edgezero_core::router::RouterService;
@@ -44,6 +46,14 @@ fn test_router() -> RouterService {
         .expect("should build router from test settings")
 }
 
+fn registered_routes() -> BTreeSet<(String, String)> {
+    test_router()
+        .routes()
+        .into_iter()
+        .map(|route| (route.method().to_string(), route.path().to_owned()))
+        .collect()
+}
+
 async fn route(router: RouterService, req: Request) -> Response {
     router.oneshot(req).await.expect("should route request")
 }
@@ -53,6 +63,42 @@ fn routes_build_without_panic() {
     // build_state() may fail (no real settings in CI) — startup_error_router
     // is the fallback. Either way, routes() must not panic.
     let _router = TrustedServerApp::routes();
+}
+
+#[test]
+fn complete_route_registration_set_matches_the_prechange_contract() {
+    let named_paths = [
+        "/.well-known/trusted-server.json",
+        "/verify-signature",
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/_ts/admin/ec",
+        "/_ts/admin/ec/{id}",
+        "/_ts/admin/eids",
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+        "/auction",
+        "/_ts/page-bids",
+        "/__ts/page-bids",
+        "/first-party/proxy",
+        "/first-party/click",
+        "/first-party/sign",
+        "/first-party/proxy-rebuild",
+    ];
+    let fallback_methods = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
+    let mut expected = BTreeSet::new();
+    for path in named_paths.into_iter().chain(["/", "/{*rest}"]) {
+        for method in fallback_methods {
+            expected.insert((method.to_owned(), path.to_owned()));
+        }
+    }
+    expected.insert(("GET".to_owned(), "/health".to_owned()));
+
+    assert_eq!(
+        registered_routes(),
+        expected,
+        "Spin route registration must preserve every named/fallback method exactly"
+    );
 }
 
 #[test]

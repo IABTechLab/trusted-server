@@ -1,3 +1,9 @@
+//! First-party asset and content proxying.
+//!
+//! Routes in this module validate signed destinations, apply origin auth,
+//! enforce body limits, remove private edge-cache metadata, and stream eligible
+//! responses through the rewrite pipeline.
+
 use crate::http_util::{
     RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
 };

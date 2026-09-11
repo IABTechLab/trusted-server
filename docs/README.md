@@ -41,13 +41,20 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 
 ### Custom Domain Setup
 
-1. **Update CNAME file**: Edit `docs/public/CNAME` with your domain:
+The current deployment is a GitHub Pages project site with VitePress `base` set
+to `/trusted-server`. It is not configured for a custom domain.
 
-   ```
-   docs.yourdomain.com
-   ```
+Before enabling a custom domain:
 
-2. **Configure DNS**: Add DNS records at your domain provider:
+1. **Change and verify the site base**: Set VitePress `base` to `/` (or remove
+   it to use that default), build the site, and verify asset and navigation
+   URLs. Review this change together with the domain configuration.
+
+2. **Set the custom domain**: In repository **Settings** → **Pages**, enter the
+   verified domain. This repository intentionally tracks no
+   `docs/public/CNAME` file; do not add one.
+
+3. **Configure DNS**: Add DNS records at your domain provider:
 
    **Option A - CNAME Record** (recommended for subdomains):
 
@@ -68,7 +75,7 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
    Value: 185.199.111.153
    ```
 
-3. **Verify in GitHub**:
+4. **Verify in GitHub**:
    - Go to **Settings** → **Pages**
    - Enter your custom domain
    - Wait for DNS check to pass
@@ -78,7 +85,8 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 
 **Trigger**:
 
-- Push to `main` branch (only when `docs/**` changes)
+- Push to `main` when `docs/**`, `.tool-versions`, or the deployment workflow
+  changes
 - Manual trigger via Actions tab
 
 **Build Process**:
@@ -116,26 +124,26 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 
 **Check**:
 
-- DNS records propagated (use `dig docs.yourdomain.com`)
-- CNAME file exists in `docs/public/CNAME`
-- Custom domain verified in GitHub Pages settings
+- DNS records propagated (use `dig docs.example.com`)
+- Custom domain configured and verified in GitHub Pages settings
 - HTTPS enforced (may take up to 24 hours)
 
 **DNS Verification**:
 
 ```bash
 # Check CNAME record
-dig docs.yourdomain.com CNAME
+dig docs.example.com CNAME
 
 # Check A records (for apex domain)
-dig yourdomain.com A
+dig example.com A
 ```
 
 ### 404 Errors
 
 **Check**:
 
-- VitePress `base` config (should not be set for custom domains)
+- VitePress `base` is `/trusted-server` for the project site or `/` for a
+  verified custom-domain deployment
 - Links use correct paths (start with `/`)
 - Build output in `docs/.vitepress/dist` is correct
 
@@ -151,7 +159,6 @@ docs/
 │   ├── configuration.md
 │   └── ...
 ├── public/                 # Static assets
-│   └── CNAME              # Custom domain file
 ├── index.md               # Homepage
 ├── package.json           # Dependencies
 └── README.md             # This file
@@ -169,6 +176,6 @@ When adding new documentation:
 
 ## Links
 
-- **Production**: (Configure your custom domain)
+- **Deployment**: GitHub Pages project site under `/trusted-server/`
 - **GitHub Repo**: https://github.com/IABTechLab/trusted-server
 - **VitePress Docs**: https://vitepress.dev

@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - ".tool-versions"
       - ".github/workflows/deploy-docs.yml"
   workflow_dispatch: # Allow manual triggers
 
@@ -24,23 +25,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0 # For lastUpdated feature
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
           cache-dependency-path: docs/package-lock.json
 
       - name: Setup Pages
-        uses: actions/configure-pages@v4
+        uses: actions/configure-pages@v6.0.0
 
       - name: Install dependencies
         working-directory: docs
@@ -48,10 +49,18 @@ jobs:
 
       - name: Build with VitePress
         working-directory: docs
+        env:
+          GITHUB_SHA: ${{ github.sha }}
         run: npm run build
 
+      - name: Assert exact source provenance
+        working-directory: docs
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: grep -R --fixed-strings --quiet "$GITHUB_SHA" .vitepress/dist
+
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: docs/.vitepress/dist
 
@@ -64,4 +73,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5.0.1

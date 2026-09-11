@@ -1,3 +1,8 @@
+//! Lock-free process metrics for the local development proxy.
+//!
+//! Counters and fixed duration buckets keep observation bounded and avoid
+//! introducing an async metrics dependency into request forwarding.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 

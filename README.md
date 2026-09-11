@@ -1,91 +1,72 @@
 # Trusted Server
 
-Trusted Server is an open-source, cloud based orchestration framework and runtime for publishers. It moves code execution and operations that traditionally occurs in browsers (via 3rd party JS) to secure, zero-cold-start WASM binaries running in WASI supported environments.
-
-Trusted Server is the new execution layer for the open-web, returning control of 1st party data, security, and overall user-experience back to publishers.
+Trusted Server is an open-source publisher runtime for moving selected
+advertising, identity, consent, and security work from third-party browser code
+into a publisher-controlled edge service. A portable Rust core runs through
+Fastly Compute, Cloudflare Workers, Fermyon Spin, or the native Axum development
+adapter.
 
 ## Documentation
 
-The guide in `docs/guide/` (published at the link below) is the source of truth for human-readable documentation. This README is a brief overview.
+The [published guide](https://iabtechlab.github.io/trusted-server/) is the
+reader-facing source of truth. Start with:
 
-**[Read the full documentation →](https://iabtechlab.github.io/trusted-server/)**
+| Guide                                                                                                 | Purpose                                                            |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| [Getting Started](https://iabtechlab.github.io/trusted-server/guide/getting-started)                  | Install prerequisites and create a working configuration.          |
+| [Configuration](https://iabtechlab.github.io/trusted-server/guide/configuration)                      | Exact settings, defaults, validation, and secret handling.         |
+| [CLI](https://iabtechlab.github.io/trusted-server/guide/cli)                                          | Host installation and the generated Linux/macOS command inventory. |
+| [Deployment](https://iabtechlab.github.io/trusted-server/guide/integrations-overview#adapter-support) | Adapter support and first-success journeys.                        |
+| [Integrations](https://iabtechlab.github.io/trusted-server/guide/integrations-overview)               | Server and browser capability inventory.                           |
 
-| Guide                                                                                   | Description                                |
-| --------------------------------------------------------------------------------------- | ------------------------------------------ |
-| [Getting Started](https://iabtechlab.github.io/trusted-server/guide/getting-started)    | Installation and setup                     |
-| [Architecture](https://iabtechlab.github.io/trusted-server/guide/architecture)          | System architecture overview               |
-| [Configuration](https://iabtechlab.github.io/trusted-server/guide/configuration)        | Configuration reference                    |
-| [Trusted Server CLI](https://iabtechlab.github.io/trusted-server/guide/cli)             | `ts` CLI install and command reference     |
-| [Integrations](https://iabtechlab.github.io/trusted-server/guide/integrations-overview) | Partner integrations (Prebid, Lockr, etc.) |
+## Fastest local proof
 
-## Quick Start
-
-See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guide/getting-started) for installation and setup instructions.
+Install the Rust toolchain declared by `rust-toolchain.toml`; the smoke also
+requires `curl` and Python. Then run:
 
 ```bash
-# Build per adapter (target-matched aliases from .cargo/config.toml)
-cargo build-fastly       # Fastly adapter + core (wasm32-wasip1)
-cargo build-axum         # Axum dev server (native)
-cargo build-cloudflare   # Cloudflare Workers (wasm32-unknown-unknown)
-
-# Install the host-target CLI for your current platform
-cargo install-cli
-
-# If your shell cannot find `ts`, add Cargo's bin directory to PATH
-export PATH="$HOME/.cargo/bin:$PATH"
-ts --help
-
-# Create local config, then edit placeholders before validation
-ts config init
-# Edit trusted-server.toml. Server auctions use map-shaped
-# [auction.providers.<id>] and [auction.bidders.<id>] tables.
-ts config validate
-
-# Audit a public page with Chrome/Chromium to bootstrap a draft config
-ts audit generate https://publisher.example
-
-# Run tests (Fastly/WASM crates — requires Viceroy)
-cargo test-fastly
-
-# Run tests (Axum native adapter)
-cargo test-axum
-
-# Run tests (Cloudflare Workers adapter — native host)
-cargo test-cloudflare
-
-# Run tests (Spin adapter — native host)
-cargo test-spin
-
-# Start local server — Axum (no Fastly CLI or Viceroy required)
-cargo run -p trusted-server-adapter-axum
-
-# Start local server — Fastly (requires Fastly CLI + Viceroy)
-fastly compute serve
+./scripts/smoke-axum.sh
 ```
+
+The script builds the host `ts` CLI and Axum adapter, creates isolated
+configuration and secrets, proves the missing-config and missing-secret
+failures, proxies a request through a local stub origin, and removes its
+temporary processes and files. It does not require an edge account.
+
+For another runtime, install the pinned tool from `.tool-versions` and use its
+equivalent checked journey:
+
+| Runtime            | Command                         | Guide                                  |
+| ------------------ | ------------------------------- | -------------------------------------- |
+| Fastly Compute     | `./scripts/smoke-fastly.sh`     | [Fastly](docs/guide/fastly.md)         |
+| Cloudflare Workers | `./scripts/smoke-cloudflare.sh` | [Cloudflare](docs/guide/cloudflare.md) |
+| Fermyon Spin       | `./scripts/smoke-spin.sh`       | [Spin](docs/guide/spin.md)             |
+
+## Operator CLI
+
+Install the native CLI and create a configuration from the repository root:
+
+```bash
+cargo install-cli
+ts config init
+ts config validate
+```
+
+Edit `trusted-server.toml` before validation. The generated template uses
+intentional placeholders that fail closed until replaced. Read the
+[CLI guide](docs/guide/cli.md) before pushing configuration or invoking a
+platform lifecycle command.
 
 ## Development
 
-```bash
-# Format code
-cargo fmt
+This workspace has no global Cargo target because its packages span native,
+`wasm32-wasip1`, and `wasm32-unknown-unknown`. Use the target-matched commands
+in [TESTING.md](TESTING.md). Contribution, documentation, error-handling, and
+commit conventions are in [CONTRIBUTING.md](CONTRIBUTING.md) and
+[CLAUDE.md](CLAUDE.md).
 
-# Lint — use target-matched aliases (workspace has multiple WASM runtimes;
-# broad --all-features clippy is not a reliable gate across adapters)
-cargo clippy-fastly
-cargo clippy-axum
-cargo clippy-cloudflare
-cargo clippy-spin-native
-cargo clippy-spin-wasm
+## Governance and license
 
-# Run all tests
-cargo test-fastly      # Fastly/WASM (requires Viceroy)
-cargo test-axum        # Axum native adapter
-cargo test-cloudflare  # Cloudflare Workers adapter (native host)
-cargo test-spin        # Spin adapter (native host)
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
-
-## License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Project roles and decision responsibilities are described in
+[ProjectGovernance.md](ProjectGovernance.md). Trusted Server is licensed under
+the [Apache License 2.0](LICENSE).

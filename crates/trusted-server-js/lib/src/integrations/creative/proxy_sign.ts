@@ -1,8 +1,11 @@
+/** @file Validates and signs dynamic external creative resource URLs. */
+
 import { log } from '../../core/log';
 import { hasOpaqueOrigin } from '../../shared/origin';
 
 const PROXY_PREFIX = '/first-party/proxy';
 
+/** Return whether a URL is external, HTTP(S), and not already proxied. */
 export function shouldProxyExternalUrl(raw: string): boolean {
   const value = String(raw || '').trim();
   if (!value) return false;
@@ -20,6 +23,7 @@ export function shouldProxyExternalUrl(raw: string): boolean {
   }
 }
 
+/** Fail-closed result of requesting a first-party proxy signature. */
 export type ProxySignOutcome =
   | { outcome: 'signed'; href: string }
   | { outcome: 'fallback' }
@@ -27,6 +31,12 @@ export type ProxySignOutcome =
 
 const FALLBACK: ProxySignOutcome = { outcome: 'fallback' };
 
+/**
+ * Request a signed first-party proxy URL.
+ *
+ * Opaque creative origins and operational failures return `fallback`; policy
+ * denials return `blocked` so callers do not restore the rejected raw URL.
+ */
 export async function signProxyUrl(raw: string): Promise<ProxySignOutcome> {
   if (typeof fetch !== 'function') return FALLBACK;
   // A sandboxed srcdoc creative without `allow-same-origin` has an opaque

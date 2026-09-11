@@ -13,23 +13,33 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1,wasm32-unknown-unknown
           components: "clippy, rustfmt"
           cache-shared-key: cargo-${{ runner.os }}
 
+      - name: Use Node.js for Rust build scripts
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+
       - name: Run cargo fmt
-        uses: actions-rust-lang/rustfmt@v1
+        uses: actions-rust-lang/rustfmt@v1.1.2
 
       - name: Run cargo clippy (Fastly — wasm32-wasip1)
         run: cargo clippy-fastly
@@ -64,20 +74,20 @@ jobs:
         working-directory: crates/trusted-server-js/lib
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
-          cache-dependency-path: crates/trusted-server-js/lib/package.json
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -95,20 +105,20 @@ jobs:
         working-directory: docs
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
-          cache-dependency-path: docs/package.json
+          cache-dependency-path: docs/package-lock.json
 
       - name: Install dependencies
         run: npm ci

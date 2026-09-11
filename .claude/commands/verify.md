@@ -1,12 +1,5 @@
-Full verification: build, test, and lint the entire project.
+Run full repository verification from the
+[canonical CI gate list](/CLAUDE.md#ci-gates). That region is the sole source
+for required gate commands; do not maintain a copy here.
 
-1. `cargo build-fastly && cargo build-axum && cargo build-cloudflare`
-2. `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
-3. `cargo fmt --all -- --check`
-4. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare`
-5. `cargo test-fastly && cargo test-axum && cargo test-cloudflare`
-6. `cd crates/trusted-server-js/lib && npx vitest run`
-7. `cd crates/trusted-server-js/lib && npm run format`
-8. `cd docs && npm run format`
-
-Report results for each step. Stop and investigate if any step fails.
+Report every canonical gate result. Stop and investigate if any gate fails.

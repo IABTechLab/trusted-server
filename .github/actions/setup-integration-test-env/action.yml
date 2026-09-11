@@ -44,6 +44,11 @@ runs:
       shell: bash
       run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
+    - name: Set up Node.js
+      uses: actions/setup-node@v7.0.0
+      with:
+        node-version: ${{ steps.node-version.outputs.node-version }}
+
     - name: Retrieve Viceroy version
       id: viceroy-version
       if: ${{ inputs.install-viceroy == 'true' }}
@@ -52,7 +57,7 @@ runs:
       run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
     - name: Set up Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
       with:
         toolchain: ${{ steps.rust-version.outputs.rust-version }}
         target: wasm32-wasip1
@@ -61,7 +66,7 @@ runs:
     - name: Cache Viceroy binary
       if: ${{ inputs.install-viceroy == 'true' }}
       id: cache-viceroy
-      uses: actions/cache@v4
+      uses: actions/cache@v6.1.0
       with:
         path: ~/.cargo/bin/viceroy
         key: viceroy-${{ runner.os }}-v${{ steps.viceroy-version.outputs.viceroy-version }}
