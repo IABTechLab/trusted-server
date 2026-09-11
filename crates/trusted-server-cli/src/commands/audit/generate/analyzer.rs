@@ -5,8 +5,10 @@ use regex::Regex;
 use scraper::{Html, Selector};
 use url::Url;
 
-use crate::commands::audit::collector::CollectedPage;
-use crate::commands::audit::{AssetParty, AuditArtifact, AuditedAsset, DetectedIntegration};
+use crate::commands::audit::generate::collector::CollectedPage;
+use crate::commands::audit::generate::{
+    AssetParty, AuditArtifact, AuditedAsset, DetectedIntegration,
+};
 use crate::error::{CliResult, report_error};
 
 static GTM_REGEX: LazyLock<Regex> =
@@ -256,7 +258,7 @@ pub(crate) fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::audit::collector::{CollectedRequest, CollectedScriptTag};
+    use crate::commands::audit::generate::collector::{CollectedRequest, CollectedScriptTag};
 
     fn page_url() -> Url {
         Url::parse("https://publisher.example/page").expect("should parse URL")
@@ -283,6 +285,9 @@ mod tests {
                 url: "https://cdn.example.com/dynamic.js".to_string(),
                 resource_type: Some("Script".to_string()),
             }],
+            gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: vec!["partial settle".to_string()],
         };
 
@@ -319,6 +324,9 @@ mod tests {
             html: "<html><head><title>HTML Title</title></head></html>".to_string(),
             script_tags: Vec::new(),
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -336,6 +344,9 @@ mod tests {
             html: "<html><head><title>HTML Title</title></head></html>".to_string(),
             script_tags: Vec::new(),
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -360,6 +371,9 @@ mod tests {
                 url: "https://cdn.example.com/prebid.js".to_string(),
                 resource_type: Some("script".to_string()),
             }],
+            gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -394,6 +408,9 @@ mod tests {
                 },
             ],
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -424,6 +441,9 @@ mod tests {
             html: "<html><head></head></html>".to_string(),
             script_tags: Vec::new(),
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
