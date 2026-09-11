@@ -32,11 +32,11 @@ pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
     IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationDocumentState,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
-    IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy, IntegrationRegistration,
-    IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
-    IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
-    RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome, ScriptRewriteAction,
+    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationMetadata,
+    IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
+    IntegrationRequestFilter, IntegrationScriptContext, IntegrationScriptRewriter,
+    ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
+    RequestFilterRegistryInput, RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
 
 /// Registers or retrieves a platform backend for the given URL.

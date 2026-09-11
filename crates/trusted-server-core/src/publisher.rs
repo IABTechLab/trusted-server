@@ -638,14 +638,26 @@ struct PublisherBodyProcessor {
 }
 
 impl PublisherBodyProcessor {
+    /// Build the body processor, returning any deferred inline seam token it
+    /// installed alongside it.
+    ///
+    /// The token is returned rather than stored so a caller that has no seam
+    /// controller has to discard it visibly. Dropping it silently would ship the
+    /// raw marker comment to the browser and inject no bids.
     fn new(
         params: &OwnedProcessResponseParams,
         settings: &Settings,
         integration_registry: &IntegrationRegistry,
-    ) -> Result<Self, Report<TrustedServerError>> {
+    ) -> Result<(Self, Option<Vec<u8>>), Report<TrustedServerError>> {
         let is_html = is_html_content_type(&params.content_type);
         let is_rsc_flight =
             content_type_contains_ascii_case_insensitive(&params.content_type, "text/x-component");
+        let inline_seam_token = deferred_inline_seam_token(
+            settings,
+            params.template_cache_key.is_some(),
+            params.ad_slots_script.is_some(),
+            is_html && params.dispatched_auction.is_some(),
+        );
         let inner: Box<dyn StreamProcessor> = if is_html {
             Box::new(create_html_stream_processor(HtmlStreamProcessorParams {
                 origin_host: &params.origin_host,
@@ -659,6 +671,9 @@ impl PublisherBodyProcessor {
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
+                deferred_inline_marker: inline_seam_token
+                    .as_ref()
+                    .map(|token| String::from_utf8_lossy(token).into_owned()),
             })?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -676,7 +691,7 @@ impl PublisherBodyProcessor {
             ))
         };
 
-        Ok(Self { inner })
+        Ok((Self { inner }, inline_seam_token))
     }
 }
 
@@ -740,6 +755,7 @@ fn process_response_streaming<W: Write>(
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
+            deferred_inline_marker: None,
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -792,7 +808,19 @@ async fn process_response_streaming_async<W: Write>(
     } else {
         input_compression
     };
-    let mut processor = PublisherBodyProcessor::new(params, settings, integration_registry)?;
+    // This path has no seam controller, so it must never be reached with a
+    // pending auction; `deferred_inline_seam_token` returns `None` for it.
+    let (mut processor, inline_seam_token) =
+        PublisherBodyProcessor::new(params, settings, integration_registry)?;
+    if inline_seam_token.is_some() {
+        // A `debug_assert!` would be compiled out of the release wasm builds that
+        // actually ship, which is exactly where an unresolved token would reach a
+        // browser as a raw marker comment with no bids injected.
+        log::error!(
+            "publisher body-close seam token minted on a path with no seam controller; dropping it"
+        );
+    }
+    drop(inline_seam_token);
     process_body_chunks_async(
         body,
         output,
@@ -967,15 +995,19 @@ impl Drop for DispatchedAuctionGuard {
 
 /// Mutable auction-hold state threaded through the streaming hold pipeline.
 struct AuctionHoldState {
-    hold: Option<BodyCloseHoldBuffer>,
+    hold: Option<InlineBodyCloseSeam>,
     dispatched: DispatchedAuctionGuard,
     telemetry: AuctionTelemetryCarry,
 }
 
 impl AuctionHoldState {
-    fn new(dispatched: DispatchedAuctionGuard, telemetry: AuctionTelemetryCarry) -> Self {
+    fn new(
+        dispatched: DispatchedAuctionGuard,
+        telemetry: AuctionTelemetryCarry,
+        seam_token: Option<Vec<u8>>,
+    ) -> Self {
         Self {
-            hold: Some(BodyCloseHoldBuffer::new()),
+            hold: seam_token.map(InlineBodyCloseSeam::new),
             dispatched,
             telemetry,
         }
@@ -1004,13 +1036,13 @@ async fn abandon_hold_auction(
     }
 }
 
-/// Output of a single close-body hold step, split at the auction-collection
+/// Output of one parser-confirmed seam step, split at the auction-collection
 /// barrier.
 ///
 /// `ready` is the prefix the caller must emit *before* collecting the auction,
 /// so a small page whose `</body>` lands in the first source chunk still
 /// streams its document prefix immediately instead of stalling behind the
-/// auction. `close_found` signals that `</body` was seen: the caller emits
+/// auction. `close_found` signals that the parser marker was seen: the caller emits
 /// `ready`, then awaits [`hold_collect_close_tail`] to collect the auction and
 /// emit the held closing tail.
 struct HoldStepSegments {
@@ -1018,15 +1050,15 @@ struct HoldStepSegments {
     close_found: bool,
 }
 
-/// Feed one decoded chunk through the close-body hold and processor.
+/// Process one decoded chunk, then scan its output for the parser marker.
 ///
 /// Returns the ready prefix for the caller to emit — written to a client stream
 /// by [`body_close_hold_loop_stream`], yielded from the lazy body by
 /// [`publisher_response_into_streaming_response`]. Both async hold paths share
 /// this function so their behavior cannot drift apart.
 ///
-/// This step never awaits auction collection: it processes only the bytes the
-/// hold buffer releases as ready and reports whether `</body` was seen. Holding
+/// This step never awaits auction collection: it processes the bytes the
+/// parser emits and reports whether its structural body marker was seen. Holding
 /// the collection out of this step is what lets callers emit the prefix before
 /// the auction resolves. On processing failure the pending auction is abandoned
 /// before the error is returned.
@@ -1038,37 +1070,45 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
     collect_refs: &AuctionCollectDeps<'_>,
 ) -> Result<HoldStepSegments, Report<TrustedServerError>> {
     let mut ready = Vec::new();
+    let processed =
+        match processor
+            .process_chunk(chunk, false)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to process chunk".to_string(),
+            }) {
+            Ok(processed) => processed,
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+                return Err(err);
+            }
+        };
     let bytes: Cow<'_, [u8]> = match state.hold.as_mut() {
-        // Once the hold has been released the chunk streams straight through,
-        // borrowed rather than copied.
-        None => Cow::Borrowed(chunk),
-        Some(hold_buffer) => Cow::Owned(hold_buffer.push(chunk)),
+        None => Cow::Borrowed(&processed),
+        Some(seam) => Cow::Owned(seam.push(&processed)),
     };
-    match process_and_encode_chunk(processor, encoder, &bytes, false, "Failed to process chunk") {
-        Ok(Some(encoded)) => ready.push(encoded),
-        Ok(None) => {}
+    match encoder.encode_chunk(bytes.into_owned()) {
+        Ok(encoded) if !encoded.is_empty() => ready.push(bytes::Bytes::from(encoded)),
+        Ok(_) => {}
         Err(err) => {
-            abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
-            return Err(err);
+            abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
+            return Err(err.change_context(TrustedServerError::Proxy {
+                message: "Failed to encode processed chunk".to_string(),
+            }));
         }
     }
-    let close_found = state
-        .hold
-        .as_ref()
-        .is_some_and(BodyCloseHoldBuffer::found_close);
+    let close_found = state.hold.as_ref().is_some_and(InlineBodyCloseSeam::found);
     Ok(HoldStepSegments { ready, close_found })
 }
 
-/// Collect the dispatched auction and process the held `</body>` tail.
+/// Collect the dispatched auction and emit bids before the parsed closing tail.
 ///
 /// Call only after [`hold_step_decoded_chunk`] (or
 /// [`hold_finish_ready_segments`]) reports `close_found` and the ready prefix
 /// has already been emitted:
 /// collecting here — after the prefix streams — is what keeps the auction
-/// riding alongside transfer instead of blocking it. Collection runs before the
-/// tail is processed so `lol_html` sees live bids at the injection point.
-async fn hold_collect_close_tail<P: StreamProcessor>(
-    processor: &mut P,
+/// riding alongside transfer instead of blocking it. The parser has already
+/// transformed the tail; replace its marker with the collected bids before encoding.
+async fn hold_collect_close_tail(
     encoder: &mut BodyStreamEncoder,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
@@ -1083,24 +1123,25 @@ async fn hold_collect_close_tail<P: StreamProcessor>(
     // collect await above was still pending is reported.
     state.dispatched.disarm();
 
+    let bids = inline_bids_script(collect_refs.ad_bids_state);
+    let encoded = encoder.encode_chunk(bids.into_bytes())?;
+    if !encoded.is_empty() {
+        segments.push(bytes::Bytes::from(encoded));
+    }
+
     let held = state
         .hold
         .take()
-        .expect("should have close-body hold buffer")
+        .expect("should have inline body seam")
         .finish();
-    if let Some(encoded) = process_and_encode_chunk(
-        processor,
-        encoder,
-        &held,
-        false,
-        "Failed to process held body close",
-    )? {
-        segments.push(encoded);
+    let encoded = encoder.encode_chunk(held)?;
+    if !encoded.is_empty() {
+        segments.push(bytes::Bytes::from(encoded));
     }
     Ok(segments)
 }
 
-/// Pull and decode the next chunk of the close-body hold pipeline, feeding it
+/// Pull, decode, process, and scan the next chunk of the inline seam pipeline.
 /// through [`hold_step_decoded_chunk`].
 ///
 /// Returns `Ok(None)` when the source is exhausted; the caller must then emit
@@ -1160,7 +1201,7 @@ async fn hold_finish_ready_segments<P: StreamProcessor>(
     encoder: &mut BodyStreamEncoder,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
-) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
+) -> Result<HoldStepSegments, Report<TrustedServerError>> {
     let decoded_tail = match decoder.finish() {
         Ok(decoded_tail) => decoded_tail,
         Err(err) => {
@@ -1168,42 +1209,77 @@ async fn hold_finish_ready_segments<P: StreamProcessor>(
             return Err(err);
         }
     };
-    if decoded_tail.is_empty() {
-        return Ok(Vec::new());
-    }
-    let step =
+    let mut step =
         hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?;
-    Ok(step.ready)
+
+    let final_processed =
+        match processor
+            .process_chunk(&[], true)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize processor".to_string(),
+            }) {
+            Ok(processed) => processed,
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+                return Err(err);
+            }
+        };
+    let final_ready = match state.hold.as_mut() {
+        Some(seam) => seam.push(&final_processed),
+        None => final_processed,
+    };
+    let encoded = match encoder.encode_chunk(final_ready) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
+            return Err(err.change_context(TrustedServerError::Proxy {
+                message: "Failed to encode finalized HTML".to_string(),
+            }));
+        }
+    };
+    if !encoded.is_empty() {
+        step.ready.push(bytes::Bytes::from(encoded));
+    }
+    step.close_found = state.hold.as_ref().is_some_and(InlineBodyCloseSeam::found);
+
+    if !step.close_found
+        && let Some(seam) = state.hold.take()
+    {
+        let encoded = match encoder.encode_chunk(seam.finish()) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
+                return Err(err);
+            }
+        };
+        if !encoded.is_empty() {
+            step.ready.push(bytes::Bytes::from(encoded));
+        }
+    }
+    Ok(step)
 }
 
-/// Finalize the close-body hold pipeline after [`hold_finish_ready_segments`].
+/// Finalize the inline seam pipeline after [`hold_finish_ready_segments`].
 ///
-/// Collects the auction if the close-body tag never streamed, processes the held
-/// tail plus the processor's final chunk, and emits the encoder trailer. Returns
+/// Collects the auction if the body-end marker never streamed, releases any
+/// remaining seam bytes, and emits the encoder trailer. Returns
 /// the encoded segments for the caller to emit.
-async fn hold_finish_tail_segments<P: StreamProcessor>(
-    processor: &mut P,
+async fn hold_finish_tail_segments(
     encoder: &mut BodyStreamEncoder,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
 ) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
     let mut segments = Vec::new();
 
-    // If the hold is still armed the auction was never collected mid-stream:
-    // `</body>` arrived only in the decoder tail, or the document had none at
-    // all. Collect now and flush the held remainder before finalizing.
-    if state.hold.is_some() {
-        segments.extend(hold_collect_close_tail(processor, encoder, state, collect_refs).await?);
+    if let Some(dispatched) = state.dispatched.take() {
+        collect_stream_auction(dispatched, state.telemetry.take(), collect_refs).await;
+        state.dispatched.disarm();
     }
-
-    if let Some(encoded) = process_and_encode_chunk(
-        processor,
-        encoder,
-        &[],
-        true,
-        "Failed to finalize processor",
-    )? {
-        segments.push(encoded);
+    if let Some(seam) = state.hold.take() {
+        let encoded = encoder.encode_chunk(seam.finish())?;
+        if !encoded.is_empty() {
+            segments.push(bytes::Bytes::from(encoded));
+        }
     }
     let trailer = encoder.finish()?;
     if !trailer.is_empty() {
@@ -1241,6 +1317,8 @@ struct HtmlStreamProcessorParams<'a> {
     shared_template_authorized: bool,
     /// Where the transform records a response-bound CSP nonce, when one matters.
     csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// Request-specific parser marker used by a pending inline auction.
+    deferred_inline_marker: Option<String>,
 }
 
 /// The diagnostics decision the template may carry.
@@ -1384,6 +1462,27 @@ pub(crate) fn body_close_injection(
     }
 }
 
+fn deferred_inline_seam_token(
+    settings: &Settings,
+    shared_template_authorized: bool,
+    head_script_present: bool,
+    auction_pending: bool,
+) -> Option<Vec<u8>> {
+    (auction_pending
+        && head_script_present
+        && matches!(
+            effective_assembly_mode(settings, shared_template_authorized),
+            AssemblyMode::Inline
+        ))
+    .then(|| {
+        format!(
+            "<!--ts-inline-body-close-{}-->",
+            uuid::Uuid::new_v4().simple()
+        )
+        .into_bytes()
+    })
+}
+
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
@@ -1398,7 +1497,12 @@ fn create_html_stream_processor(
     );
 
     let assembly_mode = effective_assembly_mode(params.settings, params.shared_template_authorized);
-    let body_close = body_close_injection(assembly_mode, params.ad_slots_script.is_some());
+    let body_close = match (assembly_mode, params.deferred_inline_marker) {
+        (AssemblyMode::Inline, Some(marker)) if params.ad_slots_script.is_some() => {
+            BodyCloseInjection::DeferredInlineMarker(marker)
+        }
+        _ => body_close_injection(assembly_mode, params.ad_slots_script.is_some()),
+    };
 
     let gpt_diagnostics = template_gpt_diagnostics(assembly_mode, params.gpt_diagnostics);
 
@@ -2448,9 +2552,9 @@ pub async fn publisher_response_into_streaming_response(
 
             response.headers_mut().remove(header::CONTENT_LENGTH);
             let mut params = *params;
-            let mut processor =
+            let (mut processor, inline_seam_token) =
                 match PublisherBodyProcessor::new(&params, &settings, integration_registry) {
-                    Ok(processor) => processor,
+                    Ok(built) => built,
                     Err(err) => {
                         // Parity with the buffered finalizer: a processor
                         // construction failure abandons the dispatched auction
@@ -2485,7 +2589,7 @@ pub async fn publisher_response_into_streaming_response(
                 let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE)
                     .with_max_bytes(max_body_bytes);
 
-                // HTML rides the close-body hold so bids land before `</body>`;
+                // HTML rides the parser-confirmed seam so bids land before `</body>`;
                 // non-HTML has no injection point, so its auction is collected
                 // before any byte streams (matching the buffered finalizer).
                 let mut hold_auction = None;
@@ -2510,7 +2614,11 @@ pub async fn publisher_response_into_streaming_response(
                 }
 
                 if let Some((guard, telemetry)) = hold_auction {
-                    let mut state = AuctionHoldState::new(guard, telemetry);
+                    let mut state = AuctionHoldState::new(
+                        guard,
+                        telemetry,
+                        inline_seam_token,
+                    );
                     let collect_refs = AuctionCollectDeps {
                         price_granularity: params.price_granularity,
                         ad_bids_state: &params.ad_bids_state,
@@ -2542,7 +2650,6 @@ pub async fn publisher_response_into_streaming_response(
                         }
                         if step.close_found {
                             for encoded in hold_collect_close_tail(
-                                &mut processor,
                                 &mut encoder,
                                 &mut state,
                                 &collect_refs,
@@ -2559,7 +2666,7 @@ pub async fn publisher_response_into_streaming_response(
                     // before collection, for the same reason as the mid-stream
                     // prefix above: a small compressed page can surface its
                     // whole document here.
-                    for encoded in hold_finish_ready_segments(
+                    let final_step = hold_finish_ready_segments(
                         &mut processor,
                         &mut decoder,
                         &mut encoder,
@@ -2567,12 +2674,23 @@ pub async fn publisher_response_into_streaming_response(
                         &collect_refs,
                     )
                     .await
-                    .map_err(publisher_stream_error)?
-                    {
+                    .map_err(publisher_stream_error)?;
+                    for encoded in final_step.ready {
                         yield encoded;
                     }
+                    if final_step.close_found {
+                        for encoded in hold_collect_close_tail(
+                            &mut encoder,
+                            &mut state,
+                            &collect_refs,
+                        )
+                        .await
+                        .map_err(publisher_stream_error)?
+                        {
+                            yield encoded;
+                        }
+                    }
                     for encoded in hold_finish_tail_segments(
-                        &mut processor,
                         &mut encoder,
                         &mut state,
                         &collect_refs,
@@ -2794,17 +2912,16 @@ pub fn stream_publisher_body<W: Write>(
     process_response_streaming(body, output, &borrowed, output_compression)
 }
 
-/// Stream publisher body with a `</body` tail hold for live bid injection.
+/// Stream publisher body with parser-confirmed live bid injection.
 ///
-/// Drives the origin body through the HTML pipeline one chunk at a time, using a
-/// small buffer that holds the first raw `</body` tail. When the origin body is
-/// exhausted (`read` returns `Ok(0)`):
+/// Drives the origin body through the HTML pipeline one chunk at a time. The
+/// parser inserts a request-specific marker at the structural body end, and a
+/// small exact-token scanner holds only the output after that marker.
 ///
 /// 1. [`collect_dispatched_auction`](AuctionOrchestrator::collect_dispatched_auction)
 ///    is awaited with the remaining deadline.
 /// 2. Winning bids are written to `ad_bids_state`.
-/// 3. The held tail is fed through the pipeline so `lol_html` fires its
-///    `</body>` handler with bids now in state.
+/// 3. The generated marker is replaced with the collected bid script.
 ///
 /// For non-HTML content types the auction is collected before any body bytes
 /// are written (no `</body>` to inject).  If `params.dispatched_auction` is
@@ -2871,9 +2988,13 @@ pub async fn stream_publisher_body_async<W: Write>(
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
 
-    // HTML: build the processor once and drive it chunk by chunk.
-    // One-behind buffer: stream chunk N-1 immediately; hold chunk N until origin
-    // EOF, then await auction and process chunk N (which contains </body>).
+    // HTML: let lol_html mark the structural body end for the auction seam.
+    let inline_seam_token = deferred_inline_seam_token(
+        settings,
+        params.template_cache_key.is_some(),
+        params.ad_slots_script.is_some(),
+        true,
+    );
     let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
         origin_host: &params.origin_host,
         request_host: &params.request_host,
@@ -2886,6 +3007,9 @@ pub async fn stream_publisher_body_async<W: Write>(
         gpt_diagnostics: params.gpt_diagnostics.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.clone(),
+        deferred_inline_marker: inline_seam_token
+            .as_ref()
+            .map(|token| String::from_utf8_lossy(token).into_owned()),
     }) {
         Ok(processor) => processor,
         Err(err) => {
@@ -2910,6 +3034,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         body,
         output,
         &mut processor,
+        inline_seam_token,
         input_compression,
         output_compression,
         AuctionCollectCtx {
@@ -3541,12 +3666,13 @@ struct AuctionCollectDeps<'a> {
     request_origin: String,
 }
 
-/// Run the close-body hold loop for HTML bodies, collecting the auction before
-/// the raw `</body` tail is processed so `lol_html` sees live bids.
+/// Run the inline seam loop for HTML bodies, collecting the auction after the
+/// parser emits its request-specific structural marker.
 async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     output: &mut W,
     processor: &mut P,
+    inline_seam_token: Option<Vec<u8>>,
     input_compression: Compression,
     output_compression: Compression,
     ctx: AuctionCollectCtx<'_>,
@@ -3561,6 +3687,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             output_compression,
             ctx,
             max_body_bytes,
+            inline_seam_token,
         )
         .await;
     }
@@ -3571,25 +3698,29 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     let body = body_as_reader(body)?;
     if output_compression == Compression::None {
         return match input_compression {
-            Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
+            Compression::None => {
+                body_close_hold_loop(body, output, processor, ctx, inline_seam_token).await
+            }
             Compression::Gzip => {
                 let decoder = GzipDecodeReader::new(body, max_body_bytes);
-                body_close_hold_loop(decoder, output, processor, ctx).await
+                body_close_hold_loop(decoder, output, processor, ctx, inline_seam_token).await
             }
             Compression::Deflate => {
                 let decoder = ZlibDecoder::new(body);
-                body_close_hold_loop(decoder, output, processor, ctx).await
+                body_close_hold_loop(decoder, output, processor, ctx, inline_seam_token).await
             }
             Compression::Brotli => {
                 let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
-                body_close_hold_loop(decoder, output, processor, ctx).await
+                body_close_hold_loop(decoder, output, processor, ctx, inline_seam_token).await
             }
         };
     }
 
     debug_assert_eq!(input_compression, output_compression);
     match input_compression {
-        Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
+        Compression::None => {
+            body_close_hold_loop(body, output, processor, ctx, inline_seam_token).await
+        }
         Compression::Gzip => {
             // `GzipDecodeReader` decodes concatenated gzip members (RFC 1952)
             // and bounds decoded output, unlike `flate2::read::GzDecoder`, which
@@ -3597,7 +3728,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             // markup (potentially including `</body>`) on buffered adapters.
             let decoder = GzipDecodeReader::new(body, max_body_bytes);
             let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx, inline_seam_token).await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize gzip encoder".to_string(),
             })?;
@@ -3606,7 +3737,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
         Compression::Deflate => {
             let decoder = ZlibDecoder::new(body);
             let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx, inline_seam_token).await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize deflate encoder".to_string(),
             })?;
@@ -3621,7 +3752,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             };
             let mut encoder =
                 CompressorWriter::with_params(&mut *output, STREAM_CHUNK_SIZE, &params);
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx, inline_seam_token).await?;
             let _ = encoder.into_inner();
             Ok(())
         }
@@ -3639,6 +3770,10 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
 /// Cloudflare, Spin) never produce `Body::Stream` because the publisher fetch
 /// is gated on `supports_streaming_responses()`. It is groundwork for those
 /// adapters' streaming cutover; Fastly uses the lazy stream instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stream state remains explicit across the shared adapter driver"
+)]
 async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     writer: &mut W,
@@ -3647,6 +3782,7 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     output_compression: Compression,
     ctx: AuctionCollectCtx<'_>,
     max_body_bytes: usize,
+    inline_seam_token: Option<Vec<u8>>,
 ) -> Result<(), Report<TrustedServerError>> {
     let AuctionCollectCtx {
         dispatched,
@@ -3656,84 +3792,107 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     let mut decoder = BodyStreamDecoder::new(input_compression, max_body_bytes);
     let mut encoder = BodyStreamEncoder::new(output_compression);
     let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(max_body_bytes);
-    let mut state = AuctionHoldState::new(DispatchedAuctionGuard::new(dispatched), telemetry);
+    let mut state = AuctionHoldState::new(
+        DispatchedAuctionGuard::new(dispatched),
+        telemetry,
+        inline_seam_token,
+    );
 
-    while let Some(step) = hold_step_next_chunk(
-        &mut source,
-        &mut decoder,
-        &mut encoder,
-        processor,
-        &mut state,
-        &collect_refs,
-    )
-    .await?
-    {
-        // Write the ready prefix before collecting the auction, matching the
-        // lazy Fastly stream: only the held `</body>` tail waits on collection.
-        for encoded in step.ready {
+    let result = async {
+        while let Some(step) = hold_step_next_chunk(
+            &mut source,
+            &mut decoder,
+            &mut encoder,
+            processor,
+            &mut state,
+            &collect_refs,
+        )
+        .await?
+        {
+            // Write the ready prefix before collecting the auction, matching the
+            // lazy Fastly stream: only the held `</body>` tail waits on collection.
+            for encoded in step.ready {
+                write_encoded_segment(writer, &encoded)?;
+            }
+            if step.close_found {
+                writer.flush().change_context(TrustedServerError::Proxy {
+                    message: "Failed to flush output before auction collection".to_string(),
+                })?;
+                for encoded in
+                    hold_collect_close_tail(&mut encoder, &mut state, &collect_refs).await?
+                {
+                    write_encoded_segment(writer, &encoded)?;
+                }
+            }
+        }
+
+        // Write the decoder-finalized prefix before collection, matching the lazy
+        // Fastly stream: only the held `</body>` tail waits on the auction.
+        let final_step = hold_finish_ready_segments(
+            processor,
+            &mut decoder,
+            &mut encoder,
+            &mut state,
+            &collect_refs,
+        )
+        .await?;
+        for encoded in final_step.ready {
             write_encoded_segment(writer, &encoded)?;
         }
-        if step.close_found {
-            for encoded in
-                hold_collect_close_tail(processor, &mut encoder, &mut state, &collect_refs).await?
-            {
+        writer.flush().change_context(TrustedServerError::Proxy {
+            message: "Failed to flush output before auction collection".to_string(),
+        })?;
+        if final_step.close_found {
+            for encoded in hold_collect_close_tail(&mut encoder, &mut state, &collect_refs).await? {
                 write_encoded_segment(writer, &encoded)?;
             }
         }
+        for encoded in hold_finish_tail_segments(&mut encoder, &mut state, &collect_refs).await? {
+            write_encoded_segment(writer, &encoded)?;
+        }
+        writer.flush().change_context(TrustedServerError::Proxy {
+            message: "Failed to flush output".to_string(),
+        })?;
+        Ok(())
     }
-
-    // Write the decoder-finalized prefix before collection, matching the lazy
-    // Fastly stream: only the held `</body>` tail waits on the auction.
-    for encoded in hold_finish_ready_segments(
-        processor,
-        &mut decoder,
-        &mut encoder,
-        &mut state,
-        &collect_refs,
-    )
-    .await?
-    {
-        write_encoded_segment(writer, &encoded)?;
+    .await;
+    if result.is_err() {
+        abandon_hold_auction(&mut state, collect_refs.services, "stream_write_error").await;
     }
-    for encoded in
-        hold_finish_tail_segments(processor, &mut encoder, &mut state, &collect_refs).await?
-    {
-        write_encoded_segment(writer, &encoded)?;
-    }
-    writer.flush().change_context(TrustedServerError::Proxy {
-        message: "Failed to flush output".to_string(),
-    })?;
-    Ok(())
+    result
 }
 
-const BODY_CLOSE_PREFIX: &[u8] = b"</body";
-
-struct BodyCloseHoldBuffer {
+struct InlineBodyCloseSeam {
+    token: Vec<u8>,
     buffered: Vec<u8>,
-    found_close: bool,
+    found: bool,
 }
 
-impl BodyCloseHoldBuffer {
-    fn new() -> Self {
+impl InlineBodyCloseSeam {
+    fn new(token: Vec<u8>) -> Self {
+        debug_assert!(!token.is_empty());
         Self {
+            token,
             buffered: Vec::new(),
-            found_close: false,
+            found: false,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.buffered.extend_from_slice(chunk);
 
-        if self.found_close {
+        if self.found {
             return Vec::new();
         }
 
-        if let Some(pos) = find_ascii_case_insensitive(&self.buffered, BODY_CLOSE_PREFIX) {
-            self.found_close = true;
-            return self.buffered.drain(..pos).collect();
+        if let Some(pos) = find_bytes(&self.buffered, &self.token) {
+            self.found = true;
+            let ready = self.buffered.drain(..pos).collect();
+            self.buffered.drain(..self.token.len());
+            return ready;
         }
 
-        let keep_len = BODY_CLOSE_PREFIX.len().saturating_sub(1);
+        let keep_len = longest_suffix_prefix(&self.buffered, &self.token);
         if self.buffered.len() <= keep_len {
             return Vec::new();
         }
@@ -3742,8 +3901,8 @@ impl BodyCloseHoldBuffer {
         self.buffered.drain(..split_at).collect()
     }
 
-    fn found_close(&self) -> bool {
-        self.found_close
+    fn found(&self) -> bool {
+        self.found
     }
 
     fn finish(self) -> Vec<u8> {
@@ -3751,26 +3910,40 @@ impl BodyCloseHoldBuffer {
     }
 }
 
-fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| {
-        window
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty())
+        .then(|| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .flatten()
 }
 
-/// Core close-body hold loop.
-///
-/// Streams processed output until the first case-insensitive `</body` prefix is
-/// seen, then collects the auction, writes bids, and processes the held tail
-/// before reading post-body chunks. If no close-body tag is found, collection
-/// happens at EOF before finalization.
+fn longest_suffix_prefix(bytes: &[u8], pattern: &[u8]) -> usize {
+    let maximum = bytes.len().min(pattern.len().saturating_sub(1));
+    (1..=maximum)
+        .rev()
+        .find(|length| bytes.ends_with(&pattern[..*length]))
+        .unwrap_or(0)
+}
+
+fn inline_bids_script(ad_bids_state: &AdBidsState) -> String {
+    ad_bids_state
+        .script_cell()
+        .lock()
+        .expect("should lock bid state")
+        .clone()
+        .unwrap_or_else(build_empty_bids_script)
+}
+
+/// Core parser-confirmed inline-seam loop for reader-backed bodies.
 async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     mut reader: R,
     writer: &mut W,
     processor: &mut P,
     ctx: AuctionCollectCtx<'_>,
+    inline_seam_token: Option<Vec<u8>>,
 ) -> Result<(), Report<TrustedServerError>> {
     let AuctionCollectCtx {
         dispatched,
@@ -3778,94 +3951,180 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         deps,
     } = ctx;
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
-    let mut hold = Some(BodyCloseHoldBuffer::new());
+    let mut hold = inline_seam_token.map(InlineBodyCloseSeam::new);
     let mut dispatched = Some(dispatched);
 
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                if let Some(hold) = hold.take() {
+                let final_out = match processor.process_chunk(&[], true).change_context(
+                    TrustedServerError::Proxy {
+                        message: "Failed to finalize processor".to_string(),
+                    },
+                ) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_process_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
+                let ready = match hold.as_mut() {
+                    Some(seam) => seam.push(&final_out),
+                    None => final_out,
+                };
+                if let Err(err) =
+                    writer
+                        .write_all(&ready)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write finalized output".to_string(),
+                        })
+                {
+                    abandon_reader_auction(
+                        &mut dispatched,
+                        &mut telemetry,
+                        deps.services,
+                        "stream_write_error",
+                    )
+                    .await;
+                    return Err(err);
+                }
+
+                if hold.as_ref().is_some_and(InlineBodyCloseSeam::found) {
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
+                        message: "Failed to flush output before auction collection".to_string(),
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     let dispatched = dispatched
                         .take()
                         .expect("should have dispatched auction to collect");
                     collect_stream_auction(dispatched, telemetry.take(), &deps).await;
-
-                    let held = hold.finish();
-                    write_processed_chunk(
-                        writer,
-                        processor,
-                        &held,
-                        false,
-                        "Failed to process held body close",
-                        "Failed to write held body close",
-                    )?;
-                }
-                // Signal EOF to lol_html (fires end() which flushes remaining state).
-                let final_out = processor.process_chunk(&[], true).change_context(
-                    TrustedServerError::Proxy {
-                        message: "Failed to finalize processor".to_string(),
-                    },
-                )?;
-                if !final_out.is_empty() {
                     writer
-                        .write_all(&final_out)
+                        .write_all(inline_bids_script(deps.ad_bids_state).as_bytes())
                         .change_context(TrustedServerError::Proxy {
-                            message: "Failed to write finalized output".to_string(),
+                            message: "Failed to write inline bids".to_string(),
                         })?;
+                    writer
+                        .write_all(&hold.take().expect("should have inline body seam").finish())
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write held body tail".to_string(),
+                        })?;
+                } else {
+                    if let Some(seam) = hold.take()
+                        && let Err(err) = writer.write_all(&seam.finish()).change_context(
+                            TrustedServerError::Proxy {
+                                message: "Failed to write terminal HTML output".to_string(),
+                            },
+                        )
+                    {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
+                        message: "Failed to flush output before auction collection".to_string(),
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                    if let Some(pending) = dispatched.take() {
+                        collect_stream_auction(pending, telemetry.take(), &deps).await;
+                    }
                 }
                 break;
             }
             Ok(n) => {
-                if let Some(hold_buffer) = hold.as_mut() {
-                    let ready = hold_buffer.push(&buffer[..n]);
-                    if let Err(err) = write_processed_chunk(
-                        writer,
-                        processor,
-                        &ready,
-                        false,
-                        "Failed to process chunk",
-                        "Failed to write chunk",
-                    ) {
-                        if let Some(dispatched) = dispatched.take() {
+                let processed = match processor.process_chunk(&buffer[..n], false).change_context(
+                    TrustedServerError::Proxy {
+                        message: "Failed to process chunk".to_string(),
+                    },
+                ) {
+                    Ok(processed) => processed,
+                    Err(err) => {
+                        if let Some(pending) = dispatched.take() {
                             emit_abandoned_auction(
                                 deps.services,
                                 telemetry.observation.take(),
-                                dispatched,
+                                pending,
                                 "stream_process_error",
                             )
                             .await;
                         }
                         return Err(err);
                     }
+                };
+                let ready = match hold.as_mut() {
+                    Some(seam) => seam.push(&processed),
+                    None => processed,
+                };
+                if let Err(err) =
+                    writer
+                        .write_all(&ready)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write processed chunk".to_string(),
+                        })
+                {
+                    abandon_reader_auction(
+                        &mut dispatched,
+                        &mut telemetry,
+                        deps.services,
+                        "stream_write_error",
+                    )
+                    .await;
+                    return Err(err);
+                }
 
-                    if hold_buffer.found_close() {
-                        let dispatched = dispatched
-                            .take()
-                            .expect("should have dispatched auction to collect");
-                        collect_stream_auction(dispatched, telemetry.take(), &deps).await;
-
-                        let held = hold
-                            .take()
-                            .expect("should have close-body hold buffer")
-                            .finish();
-                        write_processed_chunk(
-                            writer,
-                            processor,
-                            &held,
-                            false,
-                            "Failed to process held body close",
-                            "Failed to write held body close",
-                        )?;
+                if hold.as_ref().is_some_and(InlineBodyCloseSeam::found) {
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
+                        message: "Failed to flush output before auction collection".to_string(),
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
                     }
-                } else {
-                    write_processed_chunk(
-                        writer,
-                        processor,
-                        &buffer[..n],
-                        false,
-                        "Failed to process chunk",
-                        "Failed to write chunk",
-                    )?;
+                    let pending = dispatched
+                        .take()
+                        .expect("should have dispatched auction to collect");
+                    collect_stream_auction(pending, telemetry.take(), &deps).await;
+                    writer
+                        .write_all(inline_bids_script(deps.ad_bids_state).as_bytes())
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write inline bids".to_string(),
+                        })?;
+                    writer
+                        .write_all(&hold.take().expect("should have inline body seam").finish())
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write held body tail".to_string(),
+                        })?;
                 }
             }
             Err(e) => {
@@ -3889,6 +4148,17 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         message: "Failed to flush output".to_string(),
     })?;
     Ok(())
+}
+
+async fn abandon_reader_auction(
+    dispatched: &mut Option<DispatchedAuction>,
+    telemetry: &mut AuctionTelemetryCarry,
+    services: &RuntimeServices,
+    reason: &'static str,
+) {
+    if let Some(pending) = dispatched.take() {
+        emit_abandoned_auction(services, telemetry.observation.take(), pending, reason).await;
+    }
 }
 
 async fn emit_abandoned_auction(
@@ -4028,35 +4298,6 @@ async fn collect_stream_auction(
             &settings.debug.auction_html_comment_options,
         );
     }
-}
-
-fn write_processed_chunk<W: Write, P: StreamProcessor>(
-    writer: &mut W,
-    processor: &mut P,
-    chunk: &[u8],
-    is_last: bool,
-    process_error: &str,
-    write_error: &str,
-) -> Result<(), Report<TrustedServerError>> {
-    if chunk.is_empty() && !is_last {
-        return Ok(());
-    }
-
-    let out =
-        processor
-            .process_chunk(chunk, is_last)
-            .change_context(TrustedServerError::Proxy {
-                message: process_error.to_string(),
-            })?;
-    if !out.is_empty() {
-        writer
-            .write_all(&out)
-            .change_context(TrustedServerError::Proxy {
-                message: write_error.to_string(),
-            })?;
-    }
-
-    Ok(())
 }
 
 /// Auction dispatch context passed to [`handle_publisher_request`].
@@ -8109,7 +8350,7 @@ mod tests {
 
     impl StreamProcessor for RecordingProcessor {
         fn process_chunk(&mut self, chunk: &[u8], _is_last: bool) -> Result<Vec<u8>, io::Error> {
-            if find_ascii_case_insensitive(chunk, BODY_CLOSE_PREFIX).is_some() {
+            if find_bytes(chunk, b"</body").is_some() {
                 self.body_close_processed_at
                     .store(self.read_count.load(Ordering::SeqCst), Ordering::SeqCst);
             }
@@ -15588,16 +15829,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_close_hold_loop_processes_close_tail_before_reading_post_body_chunks() {
+    async fn parser_seam_loop_collects_before_writing_post_body_chunks() {
         let settings = create_test_settings();
         let services = noop_services();
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let dispatched = DispatchedAuction::empty_for_test(test_auction_request(), 500);
         let read_count = Arc::new(AtomicUsize::new(0));
         let body_close_processed_at = Arc::new(AtomicUsize::new(0));
+        let token = b"<!--ts-inline-body-close-test-->";
         let reader = ChunkedReader::new(
             &[
-                b"<html><body>painted</body>",
+                b"<html><body>painted<!--ts-inline-body-close-test--></body>",
                 b"<script>late()</script>",
                 b"</html>",
             ],
@@ -15625,20 +15867,219 @@ mod tests {
         };
         let mut output = Vec::new();
 
-        body_close_hold_loop(reader, &mut output, &mut processor, ctx)
-            .await
-            .expect("should stream body with auction hold");
+        body_close_hold_loop(
+            reader,
+            &mut output,
+            &mut processor,
+            ctx,
+            Some(token.to_vec()),
+        )
+        .await
+        .expect("should stream body with auction hold");
 
         assert_eq!(
             body_close_processed_at.load(Ordering::SeqCst),
             1,
             "close-body tail should be processed as soon as it is found, before later chunks are read"
         );
-        assert_eq!(
-            std::str::from_utf8(&output).expect("should be utf8"),
-            "<html><body>painted</body><script>late()</script></html>",
-            "post-body chunks should still stream in order"
+        let output = std::str::from_utf8(&output).expect("should be utf8");
+        let painted = output
+            .find("painted")
+            .expect("should preserve body content");
+        let bids = output
+            .find("var b=JSON.parse(")
+            .expect("should inject collected bids");
+        let close = output.find("</body>").expect("should preserve body close");
+        let late = output
+            .find("late()")
+            .expect("should preserve trailing script");
+        assert!(
+            painted < bids && bids < close && close < late,
+            "output order: {output}"
         );
+    }
+
+    #[tokio::test]
+    async fn parser_seam_write_failure_abandons_auction_once() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected write failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let settings = create_test_settings();
+        let sink = Arc::new(RecordingTelemetrySink::default());
+        let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let ad_bids_state = AdBidsState::default();
+        let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+        let ctx = AuctionCollectCtx {
+            dispatched: DispatchedAuction::empty_for_test(test_auction_request(), 500),
+            telemetry: AuctionTelemetryCarry {
+                observation: Some(AuctionObservationContext::from_parts(
+                    AuctionSource::InitialNavigation,
+                    "proxy.example.com",
+                    "/article",
+                    1,
+                    None,
+                    &ec_context,
+                )),
+                auction_request: None,
+            },
+            deps: AuctionCollectDeps {
+                price_granularity: PriceGranularity::default(),
+                ad_bids_state: &ad_bids_state,
+                orchestrator: &orchestrator,
+                services: &services,
+                settings: &settings,
+                request_origin: String::new(),
+            },
+        };
+        let mut processor = RecordingProcessor {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            body_close_processed_at: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let error = body_close_hold_loop(
+            std::io::Cursor::new(b"<html><body>ready"),
+            &mut FailingWriter,
+            &mut processor,
+            ctx,
+            Some(b"<!--ts-inline-body-close-test-->".to_vec()),
+        )
+        .await
+        .expect_err("injected writer failure should surface");
+        assert!(format!("{error:?}").contains("Failed to write processed chunk"));
+
+        let batches = sink.batches.lock().expect("should lock telemetry batches");
+        let summaries: Vec<_> = batches
+            .iter()
+            .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+            .filter(|row| row.event_kind == "summary")
+            .collect();
+        assert_eq!(summaries.len(), 1, "should emit one terminal summary");
+        assert_eq!(summaries[0].terminal_status.as_deref(), Some("abandoned"));
+        assert_eq!(
+            summaries[0].terminal_reason.as_deref(),
+            Some("stream_write_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn parser_seam_async_sink_failures_abandon_auction_once() {
+        struct FailingWriter {
+            fail_flush: bool,
+        }
+
+        impl Write for FailingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.fail_flush {
+                    Ok(buf.len())
+                } else {
+                    Err(io::Error::other("injected write failure"))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("injected flush failure"))
+            }
+        }
+
+        for fail_flush in [false, true] {
+            for with_close in [false, true] {
+                let settings = create_test_settings();
+                let sink = Arc::new(RecordingTelemetrySink::default());
+                let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+                let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                let ad_bids_state = AdBidsState::default();
+                let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+                let ctx = AuctionCollectCtx {
+                    dispatched: DispatchedAuction::empty_for_test(test_auction_request(), 500),
+                    telemetry: AuctionTelemetryCarry {
+                        observation: Some(AuctionObservationContext::from_parts(
+                            AuctionSource::InitialNavigation,
+                            "proxy.example.com",
+                            "/article",
+                            1,
+                            None,
+                            &ec_context,
+                        )),
+                        auction_request: None,
+                    },
+                    deps: AuctionCollectDeps {
+                        price_granularity: PriceGranularity::default(),
+                        ad_bids_state: &ad_bids_state,
+                        orchestrator: &orchestrator,
+                        services: &services,
+                        settings: &settings,
+                        request_origin: String::new(),
+                    },
+                };
+                let mut processor = RecordingProcessor {
+                    read_count: Arc::new(AtomicUsize::new(0)),
+                    body_close_processed_at: Arc::new(AtomicUsize::new(0)),
+                };
+                let html = if with_close {
+                    "<html><body>ready<!--ts-inline-body-close-test--></body></html>"
+                } else {
+                    "<html><body>ready"
+                };
+                let body =
+                    EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                        html.as_bytes(),
+                    )]));
+
+                let error = body_close_hold_loop_stream(
+                    body,
+                    &mut FailingWriter { fail_flush },
+                    &mut processor,
+                    Compression::None,
+                    Compression::None,
+                    ctx,
+                    settings.publisher.max_buffered_body_bytes,
+                    Some(b"<!--ts-inline-body-close-test-->".to_vec()),
+                )
+                .await
+                .expect_err("should propagate the sink failure before collecting");
+                let expected_error = if fail_flush {
+                    "Failed to flush output before auction collection"
+                } else {
+                    "Failed to write encoded chunk"
+                };
+                assert!(
+                    format!("{error:?}").contains(expected_error),
+                    "should preserve the sink error: {error:?}"
+                );
+
+                let batches = sink.batches.lock().expect("should lock telemetry batches");
+                let summaries: Vec<_> = batches
+                    .iter()
+                    .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+                    .filter(|row| row.event_kind == "summary")
+                    .collect();
+                assert_eq!(
+                    summaries.len(),
+                    1,
+                    "should emit one terminal summary for fail_flush={fail_flush}, with_close={with_close}"
+                );
+                assert_eq!(
+                    summaries[0].terminal_status.as_deref(),
+                    Some("abandoned"),
+                    "should abandon the uncollected auction"
+                );
+                assert_eq!(
+                    summaries[0].terminal_reason.as_deref(),
+                    Some("stream_write_error"),
+                    "should classify write and flush failures consistently"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -15653,6 +16094,7 @@ mod tests {
         let services = noop_services();
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let ad_bids_state = AdBidsState::default();
+        let token = b"<!--ts-inline-body-close-test-->";
         let mut state = AuctionHoldState::new(
             DispatchedAuctionGuard::new(DispatchedAuction::empty_for_test(
                 test_auction_request(),
@@ -15662,6 +16104,7 @@ mod tests {
                 observation: None,
                 auction_request: None,
             },
+            Some(token.to_vec()),
         );
         let collect_refs = AuctionCollectDeps {
             price_granularity: PriceGranularity::default(),
@@ -15682,7 +16125,7 @@ mod tests {
         let step = hold_step_decoded_chunk(
             &mut processor,
             &mut encoder,
-            b"<html><body>painted</body></html>",
+            b"<html><body>painted<!--ts-inline-body-close-test--></body></html>",
             &mut state,
             &collect_refs,
         )
@@ -15691,7 +16134,7 @@ mod tests {
 
         assert!(
             step.close_found,
-            "</body> in the first chunk must be detected"
+            "parser marker in the first chunk must be detected"
         );
         let ready: Vec<u8> = step.ready.iter().flat_map(|b| b.to_vec()).collect();
         assert_eq!(
@@ -15708,14 +16151,14 @@ mod tests {
             "auction must not be collected while the ready prefix is emitted"
         );
 
-        let tail = hold_collect_close_tail(&mut processor, &mut encoder, &mut state, &collect_refs)
+        let tail = hold_collect_close_tail(&mut encoder, &mut state, &collect_refs)
             .await
             .expect("collect should succeed");
         let tail_bytes: Vec<u8> = tail.iter().flat_map(|b| b.to_vec()).collect();
-        assert_eq!(
-            std::str::from_utf8(&tail_bytes).expect("held tail should be utf8"),
-            "</body></html>",
-            "the held close tail must be emitted after collection"
+        let tail = std::str::from_utf8(&tail_bytes).expect("held tail should be utf8");
+        assert!(
+            tail.contains("var b=JSON.parse(") && tail.ends_with("</body></html>"),
+            "collected bids and the held close tail must be emitted together: {tail}"
         );
         assert!(
             ad_bids_state
@@ -15728,10 +16171,11 @@ mod tests {
     }
 
     #[test]
-    fn body_close_hold_buffer_holds_close_body_tail_in_single_chunk() {
-        let mut hold = BodyCloseHoldBuffer::new();
+    fn inline_body_close_seam_holds_tail_in_single_chunk() {
+        let token = b"<!--ts-inline-body-close-test-->";
+        let mut hold = InlineBodyCloseSeam::new(token.to_vec());
 
-        let ready = hold.push(b"<html><body>painted</body></html>");
+        let ready = hold.push(b"<html><body>painted<!--ts-inline-body-close-test--></body></html>");
         let held = hold.finish();
 
         assert_eq!(
@@ -15747,11 +16191,12 @@ mod tests {
     }
 
     #[test]
-    fn body_close_hold_buffer_holds_close_body_tail_across_chunks() {
-        let mut hold = BodyCloseHoldBuffer::new();
+    fn inline_body_close_seam_holds_tail_across_chunks() {
+        let token = b"<!--ts-inline-body-close-test-->";
+        let mut hold = InlineBodyCloseSeam::new(token.to_vec());
 
-        let first = hold.push(b"<html><body>painted</bo");
-        let second = hold.push(b"dy></html>");
+        let first = hold.push(b"<html><body>painted<!--ts-inline-body-");
+        let second = hold.push(b"close-test--></body></html>");
         let held = hold.finish();
 
         let streamed = [first, second].concat();
@@ -15765,6 +16210,29 @@ mod tests {
             "</body></html>",
             "split close-body tag should be held intact"
         );
+    }
+
+    #[test]
+    fn inline_body_close_seam_matches_every_token_split_and_ignores_other_tokens() {
+        let token = b"<!--ts-inline-body-close-00000000000000000000000000000001-->";
+        for split in 0..=token.len() {
+            let mut seam = InlineBodyCloseSeam::new(token.to_vec());
+            let mut ready = seam.push(b"<script>const x='</body>';</script>");
+            ready.extend(seam.push(&token[..split]));
+            ready.extend(seam.push(&token[split..]));
+            assert!(seam.found(), "should match token split at {split}");
+            assert_eq!(
+                ready, b"<script>const x='</body>';</script>",
+                "should release all bytes before split {split}"
+            );
+            assert!(seam.finish().is_empty());
+        }
+
+        let other = b"<!--ts-inline-body-close-00000000000000000000000000000002-->";
+        let mut seam = InlineBodyCloseSeam::new(token.to_vec());
+        let ready = seam.push(other);
+        assert!(!seam.found());
+        assert_eq!([ready, seam.finish()].concat(), other);
     }
 
     #[test]
@@ -17809,11 +18277,20 @@ mod tests {
 
     #[test]
     fn streaming_finalize_auction_hold_emits_prefix_before_origin_eof() {
-        // The auction-hold path must stream the document prefix (up to the held
-        // `</body>` tail) before the origin finishes and before the auction is
-        // collected — otherwise the hold reintroduces the FCP regression. The
-        // origin sends the head/body prefix (no `</body>`) then stays Pending.
-        let page = b"<html><head></head><body><p>hello</p><p>more streamed content here</p>";
+        // A body-close literal in script data must not stop streaming. Only the
+        // request token emitted by lol_html at the structural end is a seam.
+        let page = br#"<html><head></head><body><script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","text":"</body>"}'])</script><article>still streaming</article>"#;
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should enable Next.js");
         let params = html_stream_params(
             "",
             Some(DispatchedAuction::empty_for_test(
@@ -17821,16 +18298,21 @@ mod tests {
                 10,
             )),
         );
-        let body = streaming_finalize_response(
+        let body = streaming_finalize_response_with_settings(
             params,
             origin_chunk_then_pending(bytes::Bytes::from(&page[..])),
+            settings,
         );
 
         let first = first_lazy_body_chunk(body);
         let html = String::from_utf8(first.to_vec()).expect("should be valid UTF-8");
         assert!(
-            html.contains("hello"),
-            "auction-hold path must stream the prefix before EOF. Got: {html}"
+            html.contains("</body>") && html.contains("still streaming"),
+            "RSC script data and later article bytes must stream before EOF. Got: {html}"
+        );
+        assert!(
+            html.contains("proxy.example.com/app") && !html.contains("origin.example.com/app"),
+            "Next.js rewriting must complete before the parser seam: {html}"
         );
         assert!(
             html.contains(".adSlots=JSON.parse"),
@@ -17882,6 +18364,270 @@ mod tests {
             !decoded.contains("var b=JSON.parse("),
             "bids inject only at </body> after collection, which the first poll must not wait for. Got: {decoded}"
         );
+    }
+
+    struct GatedAuctionHttpClient {
+        inner: StubHttpClient,
+        released: std::sync::atomic::AtomicBool,
+        collections: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformHttpClient for GatedAuctionHttpClient {
+        async fn send(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
+        {
+            self.inner.send(request).await
+        }
+
+        async fn send_async(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformPendingRequest, Report<crate::platform::PlatformError>>
+        {
+            self.inner.send_async(request).await
+        }
+
+        async fn select(
+            &self,
+            pending: Vec<crate::platform::PlatformPendingRequest>,
+        ) -> Result<crate::platform::PlatformSelectResult, Report<crate::platform::PlatformError>>
+        {
+            self.collections.fetch_add(1, Ordering::SeqCst);
+            futures::future::poll_fn(|_| {
+                if self.released.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            self.inner.select(pending).await
+        }
+    }
+
+    struct GatedAuctionProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for GatedAuctionProvider {
+        fn provider_name(&self) -> &'static str {
+            "seam-test"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            context
+                .services
+                .http_client()
+                .send_async(crate::platform::PlatformHttpRequest::new(
+                    Request::builder()
+                        .uri("https://bidder.example.com/bid")
+                        .body(EdgeBody::empty())
+                        .expect("should build test bid request"),
+                    "seam-test",
+                ))
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "Failed to dispatch test auction".to_string(),
+                })
+                .map(ProviderRequestOutcome::pending)
+        }
+
+        async fn parse_response(
+            &self,
+            _response: crate::platform::PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                "seam-test",
+                Vec::new(),
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            60_000
+        }
+    }
+
+    #[test]
+    fn parser_confirmed_auction_seam_streams_nextjs_for_every_encoding() {
+        for encoding in ["", "gzip", "deflate", "br"] {
+            let mut settings = create_test_settings();
+            settings.auction.enabled = true;
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&["seam-test"]);
+            settings.auction.timeout_ms = 60_000;
+            settings.auction.mediator = None;
+            settings
+                .integrations
+                .insert_config(
+                    "nextjs",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "rewrite_attributes": ["href", "link", "url"],
+                    }),
+                )
+                .expect("should enable Next.js");
+            let client = Arc::new(GatedAuctionHttpClient {
+                inner: StubHttpClient::new(),
+                released: std::sync::atomic::AtomicBool::new(false),
+                collections: AtomicUsize::new(0),
+            });
+            client.inner.push_response(200, Vec::new());
+            let services = build_services_with_http_client(Arc::clone(&client) as _);
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(GatedAuctionProvider));
+            let request = Request::new(EdgeBody::empty());
+            let dispatched = futures::executor::block_on(orchestrator.dispatch_auction(
+                &test_auction_request(),
+                &AuctionContext {
+                    settings: &settings,
+                    request: &request,
+                    timeout_ms: 60_000,
+                    transport_timeout_ms: 60_000,
+                    provider_responses: None,
+                    services: &services,
+                },
+            ));
+            let crate::auction::orchestrator::DispatchAuctionOutcome::Dispatched(dispatched) =
+                dispatched
+            else {
+                panic!("should dispatch a pending auction");
+            };
+            let payload = r#"{"url":"https://origin.example.com/path","text":"</body>"}"#;
+            let split = payload.find("/path").expect("should find payload split");
+            let first_payload = format!("1:T{:x},{}", payload.len(), &payload[..split]);
+            let first_script =
+                serde_json::to_string(&first_payload).expect("should encode first payload");
+            let second_script =
+                serde_json::to_string(&payload[split..]).expect("should encode second payload");
+            let prefix = format!(
+                "<html><head></head><body><p>before RSC</p><script>self.__next_f.push([1,{first_script}])</script><span>between scripts</span><script>self.__next_f.push([1,{second_script}])</script><article>still streaming</article>"
+            );
+            let page = format!("{prefix}</body></html>");
+            let encoded = match encoding {
+                "gzip" => [
+                    gzip_encode(prefix.as_bytes()),
+                    gzip_encode(b"</body></html>"),
+                ]
+                .concat(),
+                "deflate" => deflate_encode(page.as_bytes()),
+                "br" => brotli_encode(page.as_bytes()),
+                _ => page.as_bytes().to_vec(),
+            };
+            let params = html_stream_params(encoding, Some(dispatched));
+            let state = params.ad_bids_state.clone();
+            let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+            let response = Response::builder()
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(EdgeBody::empty())
+                .expect("should build response");
+            let response = futures::executor::block_on(publisher_response_into_streaming_response(
+                PublisherResponse::Stream {
+                    response,
+                    body: EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(
+                        encoded,
+                    )])),
+                    params: Box::new(params),
+                },
+                &Method::GET,
+                Arc::new(settings),
+                &registry,
+                Arc::new(orchestrator),
+                services,
+            ))
+            .expect("should create lazy response");
+            let mut stream = response
+                .into_body()
+                .into_stream()
+                .expect("should retain lazy body");
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut output = Vec::new();
+            loop {
+                match futures::Stream::poll_next(stream.as_mut(), &mut context) {
+                    std::task::Poll::Ready(Some(Ok(chunk))) => output.extend_from_slice(&chunk),
+                    std::task::Poll::Pending => break,
+                    other => {
+                        panic!("should wait on the unresolved auction for {encoding}: {other:?}")
+                    }
+                }
+            }
+            let mut decoder =
+                BodyStreamDecoder::new(Compression::from_content_encoding(encoding), 1024 * 1024);
+            let decoded = decoder
+                .decode_chunk(bytes::Bytes::from(output.clone()))
+                .expect("should decode flushed prefix");
+            let prefix = String::from_utf8(decoded.to_vec()).expect("should decode UTF-8 prefix");
+            assert!(
+                prefix.contains("still streaming") && prefix.contains("</body>"),
+                "should emit false literal and later article before auction completes for {encoding}: {prefix}"
+            );
+            assert!(
+                prefix.contains("proxy.example.com") && !prefix.contains("origin.example.com"),
+                "should rewrite the split RSC group for {encoding}: {prefix}"
+            );
+            assert!(
+                !prefix.contains("var b=JSON.parse("),
+                "should hold bids until auction completes"
+            );
+            assert_eq!(
+                client.collections.load(Ordering::SeqCst),
+                1,
+                "should begin collection at the real seam"
+            );
+            assert!(
+                state
+                    .script_cell()
+                    .lock()
+                    .expect("should lock bids")
+                    .is_none(),
+                "should keep auction unresolved at seam"
+            );
+            client.released.store(true, Ordering::SeqCst);
+            futures::executor::block_on(async {
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    output.extend_from_slice(&chunk.expect("should stream completed auction"));
+                }
+            });
+            let decoded = match encoding {
+                "gzip" => gzip_decode(&output),
+                "deflate" => deflate_decode(&output),
+                "br" => brotli_decode(&output),
+                _ => output,
+            };
+            let html = String::from_utf8(decoded).expect("should emit UTF-8 HTML");
+            let bids = html
+                .find("var b=JSON.parse(")
+                .expect("should inject collected bids");
+            let close = html
+                .rfind("</body>")
+                .expect("should retain real body close");
+            assert!(
+                html.find("still streaming").expect("should retain article") < bids && bids < close,
+                "should inject bids only before the real close for {encoding}"
+            );
+            assert_eq!(
+                html.matches("var b=JSON.parse(").count(),
+                1,
+                "should inject once"
+            );
+            assert!(
+                !html.contains("ts-inline-body-close-") && !html.contains("__ts_rsc_"),
+                "should remove internal markers for {encoding}: {html}"
+            );
+            assert_eq!(
+                client.collections.load(Ordering::SeqCst),
+                1,
+                "should collect once"
+            );
+        }
     }
 
     // (method, status, expected Content-Length, expected Transfer-Encoding)
@@ -18523,12 +19269,11 @@ mod tests {
         );
     }
 
-    /// Streaming dispatch contract: HTML with a registered post-processor still
-    /// routes through `Stream`, and the shared processor pipeline still applies
-    /// the post-processor rewrite.
+    /// Streaming dispatch contract: HTML with a registered stream processor
+    /// routes through `Stream`, and the shared processor pipeline applies it.
     #[test]
-    fn streaming_html_with_post_processors_rewrites_body() {
-        // Configure nextjs so a post-processor is registered.
+    fn streaming_html_with_stream_processors_rewrites_body() {
+        // Configure nextjs so a stream processor is registered.
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -18551,8 +19296,8 @@ mod tests {
         .expect("should create integration registry");
 
         assert!(
-            registry.has_html_post_processors(),
-            "nextjs integration must register an HTML post-processor"
+            !registry.html_stream_processor_factories().is_empty(),
+            "nextjs integration must register an HTML stream processor"
         );
         assert_eq!(
             classify_response_route(
@@ -18562,7 +19307,7 @@ mod tests {
                 "proxy.example.com",
             ),
             ResponseRoute::Stream,
-            "HTML with post-processors must route to Stream"
+            "HTML with stream processors must route to Stream"
         );
 
         // Feed a small HTML body through the same pipeline the Stream arm uses.
@@ -18609,13 +19354,12 @@ mod tests {
         );
     }
 
-    /// Document-state survives from the streaming pass into the post-processor.
+    /// Document-state survives from the parser pass into the stream processor.
     /// `NextJsRscPlaceholderRewriter` writes into `IntegrationDocumentState`
-    /// during streaming; `NextJsHtmlPostProcessor` reads it and substitutes.
-    /// Regression test: with post-processors registered, placeholders must
-    /// be inserted during streaming and substituted out of the final output.
+    /// during parsing; the request-local stream processor reads it and substitutes.
+    /// Regression test: placeholders must be inserted and removed from final output.
     #[test]
-    fn document_state_placeholders_substitute_through_accumulating_path() {
+    fn document_state_placeholders_substitute_through_streaming_path() {
         let mut settings = create_test_settings();
         settings
             .integrations

@@ -13,12 +13,57 @@ use crate::host_rewrite::rewrite_bare_host_at_boundaries;
 // intentionally remain lazy statics instead of participating in
 // `Settings::prepare_runtime`.
 /// RSC push script call pattern for extracting payload string boundaries.
+///
+/// The `self.`/`window.` receiver is required. A fragmented script keeps its
+/// receiver out of the output stream via [`RSC_RECEIVER_CANDIDATES`] instead of
+/// relaxing this pattern, because an unqualified `__next_f.push([1,"…"])`
+/// cannot be distinguished from an unrelated publisher script that happens to
+/// own a property of the same name.
 pub(crate) static RSC_PUSH_CALL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?s)(?:(?:self|window)\.__next_f\.push|\(\s*(?:self|window)\.__next_f\s*=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.push)\(\[\s*1\s*,\s*(['"])"#,
+        r#"(?s)(?:(?:self|window)\.__next_f\.push|(?:\(\s*)?(?:self|window)\.__next_f\s*=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.push)\(\[\s*1\s*,\s*(['"])"#,
     )
     .expect("valid RSC push call regex")
 });
+
+/// RSC push call pattern for a claim whose receiver already streamed.
+///
+/// Anchored to the start of the claimed fragment and only usable once the
+/// receiver has been verified out of band by
+/// [`receiver_context_is_flight_push`], so it cannot widen what an
+/// unfragmented script is allowed to match.
+pub(crate) static RSC_PUSH_CALL_PATTERN_TRIMMED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?s)^__next_f(?:\.push|\s*=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.push)\(\[\s*1\s*,\s*(['"])"#,
+    )
+    .expect("valid trimmed RSC push call regex")
+});
+
+/// Longest receiver context worth retaining: `(window.` plus one boundary byte.
+pub(crate) const RSC_RECEIVER_CONTEXT_BYTES: usize = 9;
+
+/// Whether text preceding a bare `__next_f` proves a Next.js Flight receiver.
+///
+/// `context` is the tail of the script text already released for the current
+/// text node. An empty context is *not* accepted: a script that opens with an
+/// unqualified `__next_f.push` is not something Next.js emits, and accepting it
+/// would let any global of that name be rewritten.
+pub(crate) fn receiver_context_is_flight_push(context: &str) -> bool {
+    ["self.", "window."].iter().any(|receiver| {
+        context.strip_suffix(receiver).is_some_and(|leading| {
+            leading
+                .as_bytes()
+                .last()
+                .is_none_or(|byte| !is_receiver_continuation(*byte))
+        })
+    })
+}
+
+/// Characters that would make a matched receiver the tail of a longer member
+/// expression or identifier, as in `myself.__next_f` or `foo.window.__next_f`.
+fn is_receiver_continuation(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')
+}
 
 /// Find the payload string boundaries within an RSC push script.
 ///
@@ -26,6 +71,25 @@ pub(crate) static RSC_PUSH_CALL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// and `end` is the position of the closing quote.
 pub(crate) fn find_rsc_push_payload_range(script: &str) -> Option<(usize, usize)> {
     let cap = RSC_PUSH_CALL_PATTERN.captures(script)?;
+    let call = cap.get(0)?;
+    // The receiver must stand alone: `myAnalytics.__next_f` and `foo.window.__next_f`
+    // are unrelated member expressions, not Next.js Flight receivers.
+    if call.start() > 0 && is_receiver_continuation(script.as_bytes()[call.start() - 1]) {
+        return None;
+    }
+    payload_range_after_call(script, &cap)
+}
+
+/// Find the payload string boundaries of a claim whose receiver already streamed.
+///
+/// Callers must first prove the receiver with [`receiver_context_is_flight_push`];
+/// `script` has to begin at the `__next_f` identifier.
+pub(crate) fn find_trimmed_rsc_push_payload_range(script: &str) -> Option<(usize, usize)> {
+    let cap = RSC_PUSH_CALL_PATTERN_TRIMMED.captures(script)?;
+    payload_range_after_call(script, &cap)
+}
+
+fn payload_range_after_call(script: &str, cap: &regex::Captures<'_>) -> Option<(usize, usize)> {
     let quote_match = cap.get(1)?;
     let quote = quote_match
         .as_str()
@@ -374,5 +438,51 @@ mod tests {
             strip_origin_host_with_optional_port("[2001:db8::1]/path", "2001:db8::1"),
             None
         );
+    }
+
+    #[test]
+    fn find_rsc_push_payload_range_accepts_qualified_receivers() {
+        for script in [
+            r#"self.__next_f.push([1,"payload"])"#,
+            r#"window.__next_f.push([1,"payload"])"#,
+            r#";(self.__next_f=self.__next_f||[]).push([1,"payload"])"#,
+        ] {
+            let (start, end) = find_rsc_push_payload_range(script)
+                .unwrap_or_else(|| panic!("should match qualified receiver in `{script}`"));
+            assert_eq!(
+                &script[start..end],
+                "payload",
+                "should capture the Flight payload of `{script}`"
+            );
+        }
+    }
+
+    #[test]
+    fn find_rsc_push_payload_range_requires_a_qualified_receiver() {
+        assert_eq!(
+            find_rsc_push_payload_range(r#"__next_f.push([1,"payload"])"#),
+            None,
+            "should not claim an unqualified push whose receiver cannot be verified"
+        );
+    }
+
+    #[test]
+    fn find_rsc_push_payload_range_rejects_foreign_receivers() {
+        for script in [
+            r#"myAnalytics.__next_f.push([1,"https://origin.example.com/track"])"#,
+            r#"foo.bar.__next_f.push([1,"payload"])"#,
+            r#"window.myapp.__next_f.push([1,"payload"])"#,
+            r#"a__next_f.push([1,"payload"])"#,
+            r#"var x=1; other.__next_f.push([1,"payload"])"#,
+            r#"foo.window.__next_f.push([1,"payload"])"#,
+            r#"myself.__next_f.push([1,"payload"])"#,
+            r#"(myself.__next_f=self.__next_f||[]).push([1,"payload"])"#,
+        ] {
+            assert_eq!(
+                find_rsc_push_payload_range(script),
+                None,
+                "should not treat `{script}` as a Next.js Flight push"
+            );
+        }
     }
 }
