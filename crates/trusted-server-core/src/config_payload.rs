@@ -17,8 +17,13 @@ use crate::settings::Settings;
 /// Canonical logical secret store used by Trusted Server app-config secrets.
 pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 
+/// Default logical config-store id, from `[stores.config].default` in `edgezero.toml`.
+///
+/// Derived at build time so every adapter uses the repository manifest's default.
+pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID");
+
 /// Default config-store key containing the Trusted Server app-config blob.
-pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
+pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
 ///

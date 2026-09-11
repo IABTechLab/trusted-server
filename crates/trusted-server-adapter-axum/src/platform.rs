@@ -26,7 +26,9 @@ fn normalize_env_segment(s: &str) -> String {
     s.to_uppercase().replace(['-', '.', ' '], "_")
 }
 
-fn config_env_var(store_name: &str, key: &str) -> String {
+/// Returns the environment-variable name for a config store entry.
+#[must_use]
+pub fn config_env_var(store_name: &str, key: &str) -> String {
     format!(
         "TRUSTED_SERVER_CONFIG_{}_{}",
         normalize_env_segment(store_name),
@@ -605,6 +607,15 @@ mod tests {
         assert!(
             !capabilities.has_enforceable_total_request_deadline(),
             "reqwest's transport timeout is not an adapter-enforced auction deadline"
+        );
+    }
+
+    #[test]
+    fn config_env_var_normalizes_store_and_key() {
+        assert_eq!(
+            config_env_var("my-store.name", "my key"),
+            "TRUSTED_SERVER_CONFIG_MY_STORE_NAME_MY_KEY",
+            "should normalize environment-variable segments"
         );
     }
 
