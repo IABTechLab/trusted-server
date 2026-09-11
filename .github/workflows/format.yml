@@ -9,6 +9,36 @@ permissions:
   contents: read
 
 jobs:
+  check-claude-md-symlink:
+    name: CLAUDE.md symlink guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # AGENTS.md is the source of truth and CLAUDE.md must stay a symlink to
+      # it. A checkout with core.symlinks=false (the Git for Windows default)
+      # materializes the symlink as a plain text file containing "AGENTS.md";
+      # if that file is committed, agents silently load it as the entire
+      # project instructions. Guard the tree entry so the broken form cannot
+      # land (see issue #1091).
+      - name: Verify CLAUDE.md is a symlink to AGENTS.md
+        shell: bash
+        run: |
+          mode=$(git ls-tree HEAD CLAUDE.md | awk '{print $1}')
+          if [ "$mode" != "120000" ]; then
+            echo "::error file=CLAUDE.md::CLAUDE.md must be a symlink to AGENTS.md (tree mode 120000), found mode ${mode:-<missing>}. This usually means a checkout with core.symlinks=false committed the materialized text file; re-add the symlink with core.symlinks=true."
+            exit 1
+          fi
+          target=$(git cat-file blob HEAD:CLAUDE.md)
+          if [ "$target" != "AGENTS.md" ]; then
+            echo "::error file=CLAUDE.md::CLAUDE.md must point at AGENTS.md, found '${target}'."
+            exit 1
+          fi
+          if [ ! -f AGENTS.md ]; then
+            echo "::error file=AGENTS.md::CLAUDE.md points at AGENTS.md, but AGENTS.md does not exist."
+            exit 1
+          fi
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
