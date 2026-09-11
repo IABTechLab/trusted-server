@@ -1207,8 +1207,10 @@ fn write_index_to_tree(repo: &gix::Repository) -> Result<ObjectId, Report<Domain
 
 /// Diff `old_tree` against `new_tree` with rename tracking and return
 /// the added new-side lines for every Addition / Modification /
-/// Rename (true renames diff old-blob vs new-blob; pure renames thus
-/// add nothing). Copies and Deletions are skipped.
+/// Rename. A rename diffs old-blob vs new-blob, so a pure rename adds
+/// nothing, unless its source path was outside the scanned set: then
+/// every line is newly in scope and the destination is diffed against
+/// an empty source. Copies and Deletions are skipped.
 ///
 /// Shared by [`staged_added_lines`] (HEAD-tree vs index-tree) and
 /// [`changed_vs_added_lines`] (merge-base tree vs HEAD tree). Both
@@ -1249,11 +1251,18 @@ fn collect_added_from_trees(
                 } => (location, Some(previous_id.detach()), id.detach()),
                 Change::Rewrite {
                     location,
+                    source_location,
                     source_id,
                     id,
                     copy: false,
                     ..
-                } => (location, Some(source_id.detach()), id.detach()),
+                } => {
+                    let source_bytes: &[u8] = source_location.as_ref();
+                    let (source_path, _) = bytes_to_pathbuf(source_bytes);
+                    let old_id =
+                        path_is_scanned(&source_path.to_string_lossy()).then(|| source_id.detach());
+                    (location, old_id, id.detach())
+                }
                 Change::Rewrite { copy: true, .. } | Change::Deletion { .. } => {
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -1443,6 +1452,38 @@ mod staged_added_lines_tests {
         assert!(
             lines.is_empty(),
             "pure rename should add no lines, got: {lines:?}"
+        );
+    }
+
+    /// A pure rename out of an unscanned path (`.txt`) into a scanned
+    /// one must report every line: none of them was ever checked.
+    #[test]
+    fn rename_from_unscanned_path_reports_every_line() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(
+            temp.path().join("legacy.txt"),
+            "let bad = \"https://test.com\";\n",
+        )
+        .expect("should write legacy file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        fs::remove_file(temp.path().join("legacy.txt")).expect("should remove legacy");
+        fs::create_dir_all(temp.path().join("src")).expect("should create src");
+        fs::write(
+            temp.path().join("src/endpoint.ts"),
+            "let bad = \"https://test.com\";\n",
+        )
+        .expect("should write endpoint file");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        let added: Vec<_> = lines.iter().map(|l| (l.path.clone(), l.line_no)).collect();
+        assert_eq!(
+            added,
+            vec![(PathBuf::from("src/endpoint.ts"), 1)],
+            "every line of the newly in-scope file should be reported"
         );
     }
 
@@ -1645,6 +1686,37 @@ mod changed_vs_tests {
             vec![(2, "let bad = \"https://test.com\";".to_string())],
             "should report only the line the feature branch added"
         );
+    }
+
+    /// The scope-boundary rename rule applies to `--changed-vs` too: a
+    /// feature branch that moves `legacy.txt` to `endpoint.ts` unchanged
+    /// has brought every line into scope.
+    #[test]
+    fn rename_from_unscanned_path_reports_every_line() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(
+            temp.path().join("legacy.txt"),
+            "let bad = \"https://test.com\";\n",
+        )
+        .expect("should write legacy file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "base");
+
+        test_support::create_and_checkout_branch(&repo, "feature");
+        fs::remove_file(temp.path().join("legacy.txt")).expect("should remove legacy");
+        fs::write(
+            temp.path().join("endpoint.ts"),
+            "let bad = \"https://test.com\";\n",
+        )
+        .expect("should write endpoint file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "move into scope");
+
+        let lines = changed_vs_added_lines(temp.path(), "main")
+            .expect("should compute changed-vs added lines");
+        let added: Vec<_> = lines.iter().map(|l| (l.path.clone(), l.line_no)).collect();
+        assert_eq!(added, vec![(PathBuf::from("endpoint.ts"), 1)]);
     }
 
     #[test]

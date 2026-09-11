@@ -897,7 +897,11 @@ EntryKind::Blob, entry.id)` on `repo.edit_tree(empty)`, then
 Some(0.5), limit: 1000, track_empty: false }))`. The callback
    matches `Change::{Addition, Modification, Rewrite, Deletion}` —
    pure renames (same blob, new path) yield no added lines, and
-   rename + edit diffs the matched old blob vs the new blob.
+   rename + edit diffs the matched old blob vs the new blob. A rename
+   whose **source path was not scanned** (a `.txt`, a lockfile, an
+   excluded fixture) is diffed against an empty source instead, so
+   every line the move brought into scope is checked; otherwise
+   unreviewed content could enter runtime source by being renamed.
 5. Read each blob's content — `repo.find_object(id)?.data`.
 6. Run a line-level diff — `gix::diff::blob::Diff::compute(
 Algorithm::Myers, &InternedInput::new(old, new))`, then walk
@@ -912,7 +916,8 @@ Algorithm::Myers, &InternedInput::new(old, new))`, then walk
 - Renamed files are handled by `gix`'s built-in rename detection
   (`track_rewrites` on the tree-diff `Platform`) — pure renames
   introduce no added lines; rename + edit reports only the truly new
-  lines.
+  lines. The exception is a rename from an unscanned path, which is
+  treated as an addition (see step 4 above).
 - Filenames with spaces or non-UTF8 characters: `gix` paths are
   `BString` (byte strings). The script lossy-converts to UTF-8 for
   output and emits a stderr warning for non-UTF-8 paths.
