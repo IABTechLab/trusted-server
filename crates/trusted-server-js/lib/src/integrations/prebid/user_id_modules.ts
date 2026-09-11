@@ -4,7 +4,6 @@ export interface PrebidUserIdModuleRegistryEntry {
   moduleName: string;
   configNames: string[];
   eidSources: string[];
-  importPath: string;
   notes?: string;
 }
 
