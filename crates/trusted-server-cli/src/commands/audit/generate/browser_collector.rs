@@ -1022,8 +1022,8 @@ fn gpt_registry_reading(
 /// batching, consent-gated definitions, lazy slots), so two consecutive reads
 /// can both observe the same burst and miss the next. Requiring the reading to
 /// repeat for a dwell window mirrors [`wait_for_page_settle`], and taking both
-/// the dwell from the operator's quiet flag and the remaining shared settle
-/// budget keeps this phase under the same `--settle-max-ms` control. An
+/// the dwell from the operator's quiet flag and the budget from the remaining
+/// shared allowance, floored at that quiet window, bounds this phase. An
 /// in-flight read may overrun the budget by its own bound. Even an exhausted
 /// budget takes one snapshot; two consecutive empty polls end the wait early.
 ///
@@ -1410,6 +1410,15 @@ mod tests {
         pubads: function () {
           return {
             getSlots: function () {
+              // The budget-floor test observes read count, independently of
+              // the real timer exercised by the other fixture users.
+              if (location.hash === '#poll-driven') {
+                if (!armed) {
+                  armed = true
+                  return [firstSlot]
+                }
+                return [firstSlot, secondSlot]
+              }
               if (!armed) {
                 armed = true
                 slots = [firstSlot]
@@ -2154,6 +2163,10 @@ mod tests {
 
         for scroll in [false, true] {
             let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+            let mut url = fixture.url().clone();
+            // A second read exposes the second batch without racing the
+            // browser's 400ms timer against the 600ms budget on busy runners.
+            url.set_fragment(Some("poll-driven"));
             // A quiet window equal to the maximum cannot finish inside that
             // maximum, so the initial settle spends the entire shared budget.
             let options = GenerateBrowserOpts {
@@ -2164,7 +2177,7 @@ mod tests {
             let collected = BrowserAuditCollector::default()
                 .with_browser_options(&options)
                 .with_scroll(scroll)
-                .collect_page(fixture.url(), &[])
+                .collect_page(&url, &[])
                 .expect("should poll the registry after the shared budget expires");
 
             assert_eq!(
