@@ -629,8 +629,10 @@ if ! [[ "$FIRST_BODY" =~ ^[0-9]+$ && "$COMPLETE" =~ ^[0-9]+$ ]]; then
   bad "socket probe did not return numeric body timings: '$B_LINE'"
 else
   if [ "$MODE" = "inline" ]; then
-    check "inline delivers the article before the auction resolves" \
-      "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+    # Inline HTML emits the immutable auction projection in `<head>`, so the first
+    # body byte must not precede the deliberately delayed bid response.
+    check "inline seals the auction projection before the first body byte" \
+      "$(awk -v f="$FIRST_BODY" -v delay="$BID_DELAY" 'BEGIN { print (f >= delay * 1000) ? "yes" : "no" }')" \
       "yes"
   else
     # The property the unit tests cannot reach: in-process there is no bid provider, so

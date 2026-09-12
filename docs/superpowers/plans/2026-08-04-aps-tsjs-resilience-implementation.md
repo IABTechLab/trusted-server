@@ -34,7 +34,7 @@ The sole design authority is
 `docs/superpowers/specs/2026-08-04-aps-render-fix-and-tsjs-resilience-design.md`
 revision 44. This is the sole implementation plan for that design.
 
-The implementation branch is `feature/aps-tsjs-resilience-rc202608`. It is created
+The implementation branch is `spec/aps-tsjs-resilience-design`. It is created
 directly from fetched `origin/rc/202608` commit
 `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`. Previously reviewed feature and merge
 SHAs are historical review references only; their approved changes were replayed
@@ -1797,8 +1797,8 @@ and rerun this task from the start.
 
   ```bash
   test -z "$(git status --porcelain)"
-  git push origin HEAD:feature/aps-tsjs-resilience-rc202608
-  test "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/feature/aps-tsjs-resilience-rc202608 | awk '{print $1}')"
+  git push origin HEAD:spec/aps-tsjs-resilience-design
+  test "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/spec/aps-tsjs-resilience-design | awk '{print $1}')"
   ```
 
 - [ ] **Step 8: Verify paired rc performance evidence on that exact remote HEAD.**
@@ -1810,7 +1810,7 @@ and rerun this task from the start.
       head, base, and mode bindings:
 
   ```bash
-  node scripts/ci/dispatch-aps-tsjs-gate.mjs performance --ref feature/aps-tsjs-resilience-rc202608 --base-sha "$(git rev-parse origin/rc/202608)" --mode postswitch --output-dir target/aps-tsjs-final-performance
+  node scripts/ci/dispatch-aps-tsjs-gate.mjs performance --ref spec/aps-tsjs-resilience-design --base-sha "$(git rev-parse origin/rc/202608)" --mode postswitch --output-dir target/aps-tsjs-final-performance
   ```
 
   Validation must finish and evidence must be written even when a soft Playwright
@@ -1824,7 +1824,7 @@ and rerun this task from the start.
 
   ```bash
   test -n "${APS_REAL_GAM_PREVIOUS_ARTIFACT_ID:-}"
-  node scripts/ci/dispatch-aps-tsjs-gate.mjs real-gam --ref feature/aps-tsjs-resilience-rc202608 --previous-artifact-id "${APS_REAL_GAM_PREVIOUS_ARTIFACT_ID}" --output-dir target/aps-tsjs-final-real-gam
+  node scripts/ci/dispatch-aps-tsjs-gate.mjs real-gam --ref spec/aps-tsjs-resilience-design --previous-artifact-id "${APS_REAL_GAM_PREVIOUS_ARTIFACT_ID}" --output-dir target/aps-tsjs-final-real-gam
   ```
 
   The helper derives the dispatched release id from the clean local artifact; the
