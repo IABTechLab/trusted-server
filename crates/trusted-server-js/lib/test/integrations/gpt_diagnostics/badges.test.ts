@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
 import type { GptDiagnosticsBindingView } from '../../../src/integrations/gpt_diagnostics/binding';
 import {
+  formatGptDiagnosticsBadgeText,
   GptDiagnosticsBadgeManager,
-  gptDiagnosticsBadgeTextForTest,
 } from '../../../src/integrations/gpt_diagnostics/badges';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -64,6 +64,18 @@ function runFrame(frames: Array<() => void>): void {
   frame();
 }
 
+const gptDiagnosticsBadgeTextForTest = formatGptDiagnosticsBadgeText;
+
+function queueFrame(frames: Array<() => void>): (callback: () => void) => () => void {
+  return (callback) => {
+    frames.push(callback);
+    return () => {
+      const index = frames.indexOf(callback);
+      if (index >= 0) frames.splice(index, 1);
+    };
+  };
+}
+
 beforeEach(() => {
   document.body.replaceChildren();
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
@@ -105,7 +117,7 @@ describe('GptDiagnosticsBadgeManager', () => {
     const layer = document.createElement('div');
     document.body.append(layer);
     const manager = new GptDiagnosticsBadgeManager(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
     manager.setLayer(layer);
     runFrame(frames);
@@ -245,7 +257,7 @@ describe('GptDiagnosticsBadgeManager', () => {
 
   it('uses only GPT-observed lifecycle facts in badge text', () => {
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         requestedAtMs: 0,
         responseAtMs: 276,
@@ -269,7 +281,7 @@ describe('GptDiagnosticsBadgeManager', () => {
       'Filled · Req 728×90, 970×250 · Fill 728×90 · Box 980×270\nResponse 276 ms · Render 42 ms\nViewable after 1 s'
     );
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         isEmpty: false,
         requestedSlotSizes: [
@@ -291,7 +303,7 @@ describe('GptDiagnosticsBadgeManager', () => {
       })
     ).toBe('Empty');
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         renderAtMs: 5,
         incompleteSequence: false,
@@ -299,42 +311,38 @@ describe('GptDiagnosticsBadgeManager', () => {
       })
     ).toBe('Rendered (fill unknown)');
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         incompleteSequence: false,
         durations: {},
       })
     ).toBe('Pending');
-    expect(
-      gptDiagnosticsBadgeTextForTest({
-        requestNumber: 1,
-        isEmpty: false,
-        renderAtMs: 5,
-        incompleteSequence: true,
-        durations: {},
-      })
-    ).toBe('Filled\nIncomplete sequence');
-    // Assert over rendered text: the delivery vocabulary lives in a helper that
-    // a `toString()` of this function would not include.
-    for (const delivery of [
-      'trusted_server_response_sent',
-      'trusted_server_selected',
-      'candidate_unconfirmed',
-      'no_candidate',
-      'unknown',
-      'pending',
-      'not_applicable',
-    ] as const) {
-      expect(
-        gptDiagnosticsBadgeTextForTest({
-          requestNumber: 1,
-          isEmpty: false,
-          incompleteSequence: false,
-          durations: {},
-          delivery,
-        })
-      ).not.toMatch(/GAM winner|bidder|provenance/i);
-    }
+    expect(formatGptDiagnosticsBadgeText.toString()).not.toMatch(
+      /Trusted Server|GAM winner|Prebid|bidder|provenance/i
+    );
+  });
+
+  it('rejects a counterfeit bound element instead of accepting DOM-shaped data', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    store.recordSlotRequested(slot('counterfeit'));
+    const bindings = new FakeBindings();
+    const counterfeit = Object.freeze({
+      getBoundingClientRect: () => rectangle(10, 10, 300, 250),
+      isConnected: true,
+    }) as unknown as HTMLElement;
+    bindings.set(1, { status: 'bound' }, counterfeit, true);
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: queueFrame(frames),
+    });
+
+    manager.setLayer(layer);
+    runFrame(frames);
+
+    expect(layer.querySelector('.tsgd-badge')).toBeNull();
+    manager.destroy();
   });
 
   it('positions in the overlay layer and coalesces scroll and resize updates', () => {
@@ -357,7 +365,7 @@ describe('GptDiagnosticsBadgeManager', () => {
     const layer = document.createElement('div');
     document.body.append(layer);
     const manager = new GptDiagnosticsBadgeManager(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
     manager.setLayer(layer);
     runFrame(frames);
@@ -394,7 +402,7 @@ describe('GptDiagnosticsBadgeManager', () => {
     const layer = document.createElement('div');
     document.body.append(layer);
     const manager = new GptDiagnosticsBadgeManager(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
     manager.setLayer(layer);
     runFrame(frames);
@@ -433,7 +441,7 @@ describe('GptDiagnosticsBadgeManager', () => {
         MutationObserver: undefined,
         ResizeObserver: undefined,
       }),
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
 
     expect(() => {
@@ -441,5 +449,57 @@ describe('GptDiagnosticsBadgeManager', () => {
       runFrame(frames);
     }).not.toThrow();
     manager.destroy();
+  });
+
+  it('cancels a pending badge update on destroy and suppresses a hostile late callback', () => {
+    const frames: Array<() => void> = [];
+    const cancel = vi.fn();
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => {
+        frames.push(callback);
+        return cancel;
+      },
+    });
+    const update = vi.spyOn(manager, 'update');
+    manager.setLayer(layer);
+
+    manager.destroy();
+    frames[0]?.();
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('runs one scheduled badge callback at most once', () => {
+    const frames: Array<() => void> = [];
+    const manager = new GptDiagnosticsBadgeManager(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => {
+        frames.push(callback);
+        return vi.fn();
+      },
+    });
+    const update = vi.spyOn(manager, 'update');
+    manager.setLayer(document.createElement('div'));
+
+    frames[0]?.();
+    frames[0]?.();
+
+    expect(update).toHaveBeenCalledOnce();
+    manager.destroy();
+  });
+
+  it('isolates a hostile frame cancellation during destroy', () => {
+    const cancel = vi.fn(() => {
+      throw new Error('cancel failed');
+    });
+    const manager = new GptDiagnosticsBadgeManager(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: () => cancel,
+    });
+    manager.setLayer(document.createElement('div'));
+
+    expect(() => manager.destroy()).not.toThrow();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

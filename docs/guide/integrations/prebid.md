@@ -431,8 +431,8 @@ owned by Trusted Server.
 
 ### How it works
 
-1. The server injects the `clientSideBidders` list into the page via `window.__tsjs_prebid`.
-2. When `pbjs.requestBids()` is called, the TSJS shim checks each bid against the list.
+1. The server emits `clientSideBidders` as release-bound typed integration configuration; the module loader validates, freezes, and consumes it before committing the public API.
+2. When `pbjs.requestBids()` is called, the Prebid adapter checks each bid against the immutable list.
 3. **Client-side bidders** are left as standalone bids — their native Prebid.js adapters handle them in the browser.
 4. **Bidders present in `[auction.bidders]`** are absorbed into the
    `trustedServer` adapter and routed through `/auction` to their configured

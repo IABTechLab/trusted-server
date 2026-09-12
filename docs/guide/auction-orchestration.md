@@ -156,13 +156,8 @@ sequenceDiagram
   %% === Creative Rendering ===
   rect rgb(239,246,255)
     Note over Client,Mock: Creative Rendering
-    alt APS winner
-      Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer
-      Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
-    else Ordinary creative
-      Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative resources
-      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: accepted external URLs remain direct
-    end
+    Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer/v2
+    Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
     deactivate Client
   end
 ```
@@ -704,7 +699,7 @@ Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See 
 
 ### Full example
 
-```toml
+````toml
 [auction]
 enabled = true
 sanitize_creatives = false     # Opt-in; blanks script-based creatives when enabled
@@ -739,12 +734,61 @@ account_id = "example-aps-account"
 debug = false
 allow_script_creatives = false
 
-[integrations.aps]
-enabled = true
-rendering_mode = "trusted_server"
 
-[auction.bidders.example-server]
-provider = "pbs-main"
+### Configuration Reference
+
+#### `[auction]`
+
+| Field                | Type     | Default | Description                                                     |
+| -------------------- | -------- | ------- | --------------------------------------------------------------- |
+| `enabled`            | bool     | `false` | Enable the auction system                                       |
+| `sanitize_creatives` | bool     | `false` | Strip executable markup from winning-bid `adm` before delivery  |
+| `rewrite_creatives`  | bool     | `true`  | Rewrite winning-bid `adm` through first-party endpoints         |
+| `providers`          | string[] | `[]`    | Ordered list of provider names to call                          |
+| `mediator`           | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`) |
+| `timeout_ms`         | u32      | `2000`  | Overall auction timeout in milliseconds                         |
+
+Both creative-processing fields must be present in the TOML for their
+environment overrides to apply; see
+[Environment Variable Overrides](#environment-variable-overrides).
+
+#### `[integrations.prebid]`
+
+| Field            | Type     | Default           | Description                                                                            |
+| ---------------- | -------- | ----------------- | -------------------------------------------------------------------------------------- |
+| `enabled`        | bool     | `true`            | Enable Prebid provider                                                                 |
+| `server_url`     | string   | —                 | Prebid Server URL (required)                                                           |
+| `timeout_ms`     | u32      | `1000`            | Request timeout                                                                        |
+| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot                                            |
+| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts                                              |
+| `debug`          | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`) |
+| `test_mode`      | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                                    |
+
+#### APS provider profile
+
+APS is enabled only by an `[auction.providers.<id>]` row with
+`profile = "aps"`. Its common `endpoint` and `timeout_ms` fields belong on that
+provider row. Put `account_id`, `debug`, `inventory_domain`,
+`inventory_page_origin`, and `allow_script_creatives` under the provider's
+`profile_config` table. The compiled plan also owns browser renderer and runner
+route registration; there is no separate browser-mode switch.
+
+#### `[integrations.adserver_mock]`
+
+| Field         | Type   | Default                                  | Description               |
+| ------------- | ------ | ---------------------------------------- | ------------------------- |
+| `enabled`     | bool   | `false`                                  | Enable mediator           |
+| `endpoint`    | string | `http://localhost:6767/adserver/mediate` | Mediator service endpoint |
+| `timeout_ms`  | u32    | `500`                                    | Request timeout           |
+| `price_floor` | f64?   | `null`                                   | Global price floor CPM    |
+
+### Timeout Tuning
+
+The orchestrator timeout should exceed the sum of provider timeouts to allow all providers to respond. Providers that exceed their individual timeouts are collected as they finish — the orchestrator doesn't wait indefinitely.
+
+```toml
+[auction]
+timeout_ms = 2000              # Overall ceiling
 
 [integrations.prebid]
 enabled = true
@@ -760,7 +804,7 @@ allowed_domains = ["assets.example.com"]
 enabled = true
 endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
-```
+````
 
 `[auction.providers]` is a map, not a provider-name list. Each provider ID owns
 endpoint/backend correlation and telemetry. `[auction.bidders]` maps each

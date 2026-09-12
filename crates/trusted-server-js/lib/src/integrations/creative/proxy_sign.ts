@@ -21,9 +21,7 @@ export function shouldProxyExternalUrl(raw: string): boolean {
 }
 
 export type ProxySignOutcome =
-  | { outcome: 'signed'; href: string }
-  | { outcome: 'fallback' }
-  | { outcome: 'blocked' };
+  { outcome: 'signed'; href: string } | { outcome: 'fallback' } | { outcome: 'blocked' };
 
 const FALLBACK: ProxySignOutcome = { outcome: 'fallback' };
 

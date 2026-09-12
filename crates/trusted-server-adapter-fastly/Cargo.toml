@@ -10,6 +10,10 @@ version = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+default = []
+aps-runner-proxy-integration-test = ["trusted-server-core/test-utils"]
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -30,6 +34,7 @@ serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn invalid_setting_outside_the_section_still_yields_creative_config() {
         let document = "unknown_runtime_key = true\n\
-            [creative_opportunities]\ngam_network_id = \"123\"\n";
+            [creative_opportunities]\nenabled = true\ngam_network_id = \"123\"\n";
 
         let creative = creative_config(document, std::path::Path::new("trusted-server.toml"))
             .expect("an unrelated invalid setting must not hide creative config")

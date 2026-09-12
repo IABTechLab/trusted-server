@@ -1,0 +1,511 @@
+{
+  "schemaVersion": 1,
+  "publisherOrigin": "https://publisher.example",
+  "baseDescriptor": {
+    "type": "aps",
+    "version": 1,
+    "accountId": "example-account-id",
+    "bidId": "fictional-selected-bid-id",
+    "creativeId": "fictional-creative-id",
+    "tagType": "iframe",
+    "creativeUrl": "https://creative.example/render",
+    "width": 300,
+    "height": 250
+  },
+  "vectors": [
+    {
+      "id": "valid-complete",
+      "expected": "accepted",
+      "operation": {
+        "kind": "none"
+      }
+    },
+    {
+      "id": "valid-without-optional-creative-id",
+      "expected": "accepted",
+      "operation": {
+        "kind": "descriptor-delete",
+        "field": "creativeId"
+      }
+    },
+    {
+      "id": "missing-required-account-id",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-delete",
+        "field": "accountId"
+      }
+    },
+    {
+      "id": "unknown-descriptor-key",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "adm",
+        "value": "<div>forbidden</div>"
+      }
+    },
+    {
+      "id": "account-id-utf8-byte-limit",
+      "expected": "accepted",
+      "operation": {
+        "kind": "descriptor-repeat",
+        "field": "accountId",
+        "unit": "é",
+        "count": 512
+      }
+    },
+    {
+      "id": "account-id-utf8-byte-over-limit",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-repeat",
+        "field": "accountId",
+        "unit": "é",
+        "count": 512,
+        "suffix": "x"
+      }
+    },
+    {
+      "id": "creative-id-utf8-byte-limit",
+      "expected": "accepted",
+      "operation": {
+        "kind": "descriptor-repeat",
+        "field": "creativeId",
+        "unit": "é",
+        "count": 512
+      }
+    },
+    {
+      "id": "creative-id-utf8-byte-over-limit",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-repeat",
+        "field": "creativeId",
+        "unit": "é",
+        "count": 512,
+        "suffix": "x"
+      }
+    },
+    {
+      "id": "bid-id-utf8-byte-limit",
+      "expected": "accepted",
+      "operation": {
+        "kind": "bid-id-repeat",
+        "unit": "é",
+        "count": 32
+      }
+    },
+    {
+      "id": "bid-id-utf8-byte-over-limit",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "bid-id-repeat",
+        "unit": "é",
+        "count": 32,
+        "suffix": "x"
+      }
+    },
+    {
+      "id": "bid-id-nul",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "bid-id-repeat",
+        "unit": "bid\u0000id",
+        "count": 1
+      }
+    },
+    {
+      "id": "bid-id-ascii-control",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "bid-id-repeat",
+        "unit": "bid\n-id",
+        "count": 1
+      }
+    },
+    {
+      "id": "width-zero",
+      "expected": "invalid_dimensions",
+      "operation": {
+        "kind": "dimension",
+        "field": "width",
+        "value": 0
+      }
+    },
+    {
+      "id": "height-negative",
+      "expected": "invalid_dimensions",
+      "operation": {
+        "kind": "dimension",
+        "field": "height",
+        "value": -1
+      }
+    },
+    {
+      "id": "width-fractional",
+      "expected": "invalid_dimensions",
+      "operation": {
+        "kind": "dimension",
+        "field": "width",
+        "value": 1.5
+      }
+    },
+    {
+      "id": "height-wrong-type",
+      "expected": "invalid_dimensions",
+      "operation": {
+        "kind": "dimension",
+        "field": "height",
+        "value": "250"
+      }
+    },
+    {
+      "id": "dimensions-minimum",
+      "expected": "accepted",
+      "operation": {
+        "kind": "dimensions",
+        "width": 1,
+        "height": 1
+      }
+    },
+    {
+      "id": "dimensions-maximum",
+      "expected": "accepted",
+      "operation": {
+        "kind": "dimensions",
+        "width": 4096,
+        "height": 4096
+      }
+    },
+    {
+      "id": "width-over-maximum",
+      "expected": "dimensions_out_of_range",
+      "operation": {
+        "kind": "dimension",
+        "field": "width",
+        "value": 4097
+      }
+    },
+    {
+      "id": "height-over-maximum",
+      "expected": "dimensions_out_of_range",
+      "operation": {
+        "kind": "dimension",
+        "field": "height",
+        "value": 4097
+      }
+    },
+    {
+      "id": "creative-url-http",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "creative-url",
+        "value": "http://creative.example/render"
+      }
+    },
+    {
+      "id": "creative-url-credentials",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "creative-url",
+        "value": "https://user:password@creative.example/render"
+      }
+    },
+    {
+      "id": "creative-url-publisher-origin",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "creative-url",
+        "value": "https://publisher.example/render"
+      }
+    },
+    {
+      "id": "creative-url-byte-limit",
+      "expected": "accepted",
+      "operation": {
+        "kind": "creative-url-bytes",
+        "bytes": 4096
+      }
+    },
+    {
+      "id": "creative-url-byte-over-limit",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "creative-url-bytes",
+        "bytes": 4097
+      }
+    },
+    {
+      "id": "aax-empty",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-literal",
+        "value": ""
+      }
+    },
+    {
+      "id": "aax-invalid-alphabet",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-literal",
+        "value": "not-base64"
+      }
+    },
+    {
+      "id": "aax-missing-padding",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-literal",
+        "value": "e30"
+      }
+    },
+    {
+      "id": "aax-noncanonical-trailing-bits",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-literal",
+        "value": "Zh=="
+      }
+    },
+    {
+      "id": "aax-invalid-utf8",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-bytes",
+        "values": [195, 40]
+      }
+    },
+    {
+      "id": "aax-malformed-json",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-raw-json",
+        "value": "{not json}"
+      }
+    },
+    {
+      "id": "aax-decoded-byte-limit",
+      "expected": "accepted",
+      "operation": {
+        "kind": "aax-decoded-bytes",
+        "bytes": 262144
+      }
+    },
+    {
+      "id": "aax-decoded-byte-over-limit",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-decoded-bytes",
+        "bytes": 262145
+      }
+    },
+    {
+      "id": "envelope-unknown-root-key",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["forbidden"],
+        "value": true
+      }
+    },
+    {
+      "id": "envelope-missing-seatbid",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-delete",
+        "path": ["seatbid"]
+      }
+    },
+    {
+      "id": "envelope-zero-seats",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["seatbid"],
+        "value": []
+      }
+    },
+    {
+      "id": "envelope-two-seats",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "duplicate-seat"
+      }
+    },
+    {
+      "id": "envelope-unknown-seat-key",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["seatbid", 0, "seat"],
+        "value": "forbidden"
+      }
+    },
+    {
+      "id": "envelope-missing-bid-array",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-delete",
+        "path": ["seatbid", 0, "bid"]
+      }
+    },
+    {
+      "id": "envelope-zero-bids",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["seatbid", 0, "bid"],
+        "value": []
+      }
+    },
+    {
+      "id": "envelope-two-bids",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "duplicate-bid"
+      }
+    },
+    {
+      "id": "envelope-unknown-bid-key",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["seatbid", 0, "bid", 0, "adm"],
+        "value": "<div>forbidden</div>"
+      }
+    },
+    {
+      "id": "envelope-missing-ext",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-delete",
+        "path": ["seatbid", 0, "bid", 0, "ext"]
+      }
+    },
+    {
+      "id": "envelope-unknown-ext-key",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["seatbid", 0, "bid", 0, "ext", "forbidden"],
+        "value": true
+      }
+    },
+    {
+      "id": "envelope-missing-tagtype",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-delete",
+        "path": ["seatbid", 0, "bid", 0, "ext", "tagtype"]
+      }
+    },
+    {
+      "id": "bid-id-disagreement",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "bidId",
+        "value": "different-bid-id"
+      }
+    },
+    {
+      "id": "width-disagreement",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "width",
+        "value": 728
+      }
+    },
+    {
+      "id": "height-disagreement",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "height",
+        "value": 90
+      }
+    },
+    {
+      "id": "creative-url-disagreement",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "creativeUrl",
+        "value": "https://different.example/render"
+      }
+    },
+    {
+      "id": "tag-type-disagreement",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "tagType",
+        "value": "script"
+      }
+    },
+    {
+      "id": "price-negative",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["seatbid", 0, "bid", 0, "price"],
+        "value": -0.01
+      }
+    },
+    {
+      "id": "price-wrong-type",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "envelope-set",
+        "path": ["seatbid", 0, "bid", 0, "price"],
+        "value": "1.23"
+      }
+    },
+    {
+      "id": "price-nonfinite",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "aax-raw-price",
+        "value": "1e400"
+      }
+    },
+    {
+      "id": "unknown-descriptor-type",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "type",
+        "value": "renderer"
+      }
+    },
+    {
+      "id": "equivalent-decimal-version",
+      "expected": "accepted",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "version",
+        "value": 1.0
+      }
+    },
+    {
+      "id": "unknown-descriptor-version",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "version",
+        "value": 2
+      }
+    },
+    {
+      "id": "unknown-tag-type",
+      "expected": "descriptor_invalid",
+      "operation": {
+        "kind": "descriptor-set",
+        "field": "tagType",
+        "value": "video"
+      }
+    }
+  ]
+}

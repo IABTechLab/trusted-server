@@ -99,7 +99,7 @@ With this configuration, requests are served at `/my-custom-consent/*` instead o
 - `"privacy/manage"` → serves at `/privacy/manage/*`
 - `"/my-cmp-path"` → serves at `/my-cmp-path/*`
 
-The custom path is automatically passed to the client-side JavaScript bundle via `window.__tsjs_didomi.proxyPath`, so the Didomi SDK URL rewriting continues to work without additional frontend configuration.
+The custom path is passed as release-bound typed integration configuration. The module loader validates, snapshots, freezes, and consumes it before the public TSJS API commits, so Didomi URL rewriting needs no frontend configuration and exposes no mutable window flag.
 
 ## Endpoints
 

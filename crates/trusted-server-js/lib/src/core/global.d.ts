@@ -1,9 +1,8 @@
-import type { TsjsApi } from './types';
-
 declare global {
   interface Window {
-    tsjs?: TsjsApi;
-    pbjs?: TsjsApi;
+    /** Bootstrap input before the runtime atomically publishes its exact API. */
+    tsjs?: unknown;
+    pbjs?: unknown;
   }
 }
 

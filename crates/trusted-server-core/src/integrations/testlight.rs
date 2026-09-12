@@ -158,6 +158,7 @@ pub fn register(
         IntegrationRegistration::builder(TESTLIGHT_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration)
+            .with_empty_browser_config_v1()?
             .build(),
     ))
 }

@@ -873,11 +873,16 @@ fetches never carry Basic credentials, so every visitor gets `401` — on
 `/_ts/page-bids` that means no ads after any client-side navigation. Match the
 admin routes specifically (`^/_ts/admin`) instead.
 
-Upgrading from a release before `/_ts/page-bids` existed: if any handler
-pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
-to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
-scheduled for removal
-([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
+If an older deployment used a different SPA auction path, update its handler
+rules at the same time as the TSJS cutover. `/_ts/page-bids` is the only SPA
+auction endpoint; older path spellings are unknown routes.
+
+The `/integrations/aps/*` family is different: its renderer and live-runner
+routes are reserved before `[[handlers]]` is evaluated. They are browser-facing
+resources and are intentionally anonymous, so a handler pattern that matches
+`/integrations/aps/` does **not** add Basic Auth. Apply any admission control,
+rate limiting, or request shielding for those routes in the deployment platform,
+not through `[[handlers]]`.
 
 :::
 
@@ -1816,37 +1821,9 @@ Defines the ad slots the trusted server offers on a page: which pages each slot
 appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
 unit it maps to (`gam_unit_path`).
 
-`enabled` is the dedicated server-side ad-template switch. It defaults to `true`
-for compatibility with existing configurations. Set it to `false` to stop
-publisher HTML and SPA page-bids template delivery while retaining the slot
-configuration and direct `POST /auction` endpoint.
-
-#### Publisher document cache policy
-
-For a successful GET publisher document, Trusted Server applies the
-browser-only `Cache-Control: private, max-age=60` policy from
-[#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
-server-side ad stack is structurally inactive. Trusted Server also applies this
-policy to a subsequent `304 Not Modified` response so revalidation cannot
-restore the origin freshness policy. This includes an absent
-`[creative_opportunities]` section, `enabled = false`, no slot matching the
-path, or a disabled auction. The `private` directive prevents shared caches
-that use `Cache-Control` from storing the document. The policy replaces the
-origin browser cache policy except when the origin sends `private` or
-`no-store`, which are preserved. Bot, prefetch, and consent-denied requests
-also retain the origin policy because they can produce a request-specific
-representation for the same URL. Error responses and non-document requests
-retain the origin policy.
-
-Trusted Server leaves origin validators and CDN-specific cache headers
-unchanged. Those headers continue to control supporting CDNs independently of
-the browser-only policy. If a response using the generated inactive-stack
-policy later carries `Set-Cookie`, cookie privacy finalization replaces it with
-`Cache-Control: private, max-age=0` and removes the CDN-specific cache headers.
-
 ```toml
 [creative_opportunities]
-enabled = true # set to false to disable server-side ad templates
+enabled = true
 gam_network_id = "123456789"
 price_granularity = "dense"
 
@@ -2073,9 +2050,18 @@ publisher-specific. Startup fails if `{section}` is used without a valid
 `section_root`. Startup rejects a blank `gam_network_id` only when an absent
 path/default or a `{network_id}` template consumes it; static paths and
 templates without `{network_id}` do not consume it. A
-`[creative_opportunities]` block with `enabled = false` or no slots is
-inactive, so no publisher templates are delivered and its `gam_network_id` is
-not checked when no slot uses it.
+`enabled = false` explicitly disables publisher and page-bids template delivery:
+Trusted Server performs no publisher slot matching or automatic auction, injects no
+initial slot/auction projection, and does not install SPA page-bids navigation hooks.
+`/_ts/page-bids` returns the canonical empty projection. Direct `POST /auction`
+remains live under its ordinary auction and consent gates. A successful inactive
+publisher HTML `GET` receives `Cache-Control: max-age=60` unless the origin policy
+contains `private` or `no-store` (case-insensitive); origin validators and
+surrogate/CDN directives remain intact. Non-HTML, failed, and non-`GET` responses
+retain the origin cache policy. An enabled block with no slots has no templates to
+match, so its `gam_network_id` is not checked. The `enabled` key is required whenever
+the table is present, and disabling delivery does not bypass startup validation of
+its slots, assembly mode, or template-cache fields.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and

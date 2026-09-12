@@ -7,12 +7,27 @@ export function formatSizes(sizes: ReadonlyArray<Size>): string {
 
 /** Schedules presentation work in the target window's next animation frame. */
 export function scheduleFrame(
-  window: Pick<Window, 'requestAnimationFrame'>,
+  window: Pick<Window, 'requestAnimationFrame' | 'cancelAnimationFrame'>,
   callback: () => void
-): void {
+): () => void {
   if (typeof window.requestAnimationFrame === 'function') {
-    window.requestAnimationFrame(() => callback());
-  } else {
-    queueMicrotask(callback);
+    let active = true;
+    const frame = window.requestAnimationFrame(() => {
+      if (active) callback();
+    });
+    return () => {
+      active = false;
+      if (typeof window.cancelAnimationFrame === 'function') {
+        window.cancelAnimationFrame(frame);
+      }
+    };
   }
+
+  let active = true;
+  queueMicrotask(() => {
+    if (active) callback();
+  });
+  return () => {
+    active = false;
+  };
 }

@@ -1,0 +1,7 @@
+name = "aps-runner-proxy-fixture"
+main = "../cloudflare/aps-runner-proxy-service.js"
+compatibility_date = "2024-09-23"
+
+[vars]
+# Replaced in a temporary copy by the integration-test controller.
+APS_RUNNER_PROXY_TEST_ENDPOINT = "__APS_RUNNER_PROXY_TEST_ENDPOINT__"

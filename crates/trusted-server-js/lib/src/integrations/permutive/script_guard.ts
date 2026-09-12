@@ -6,12 +6,19 @@ import { createScriptGuard } from '../../shared/script_guard';
  */
 function isPermutiveSdkUrl(url: string): boolean {
   if (!url) return false;
-
-  const lower = url.toLowerCase();
-  return (
-    (lower.includes('.edge.permutive.app') || lower.includes('cdn.permutive.com')) &&
-    lower.endsWith('-web.js')
-  );
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname.toLowerCase();
+    return (
+      parsed.protocol === 'https:' &&
+      (hostname === 'cdn.permutive.com' || hostname.endsWith('.edge.permutive.app')) &&
+      parsed.pathname.toLowerCase().endsWith('-web.js') &&
+      parsed.search === '' &&
+      parsed.hash === ''
+    );
+  } catch {
+    return false;
+  }
 }
 
 const guard = createScriptGuard({

@@ -629,6 +629,9 @@ fn extract_standard_bid(value: &Value, returned_seat: Option<&str>) -> Option<Bi
         .map(str::to_string)?;
     Some(Bid {
         slot_id,
+        candidate_id: None,
+        candidate_provider: None,
+        renderer_reservation_id: None,
         price: Some(price),
         currency: DEFAULT_CURRENCY.to_string(),
         creative: Some(creative),

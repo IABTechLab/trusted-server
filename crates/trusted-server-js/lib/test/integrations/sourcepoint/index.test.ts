@@ -1,21 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mirrorSourcepointConsent } from '../../../src/integrations/sourcepoint';
-
-type SourcepointWindow = Window & {
-  __tsjs_sourcepoint?: {
-    rewriteSdk?: boolean;
-  };
-  __tsjs_installSourcepointGuard?: unknown;
-};
+import {
+  disposeSourcepointConsentMirror,
+  initializeSourcepointConsentMirror,
+  mirrorSourcepointConsent,
+} from '../../../src/integrations/sourcepoint/consent_mirror';
+import { createSourcepointRuntime } from '../../../src/integrations/sourcepoint/module';
 
 describe('Sourcepoint integration initialization', () => {
-  let win: SourcepointWindow;
-
   beforeEach(async () => {
-    win = window as SourcepointWindow;
-    delete win.__tsjs_sourcepoint;
-
     const guard = await import('../../../src/integrations/sourcepoint/script_guard');
     guard.resetGuardState();
   });
@@ -23,37 +16,22 @@ describe('Sourcepoint integration initialization', () => {
   afterEach(async () => {
     const guard = await import('../../../src/integrations/sourcepoint/script_guard');
     guard.resetGuardState();
-    delete win.__tsjs_sourcepoint;
-    delete win.__tsjs_installSourcepointGuard;
   });
 
   it('installs the guard when rewriteSdk is enabled', async () => {
-    vi.resetModules();
-    win.__tsjs_sourcepoint = { rewriteSdk: true };
-
     const guard = await import('../../../src/integrations/sourcepoint/script_guard');
-    await import('../../../src/integrations/sourcepoint/index');
+    const release = createSourcepointRuntime().activate(Object.freeze({ rewriteSdk: true }));
 
     expect(guard.isGuardInstalled()).toBe(true);
+    release();
   });
 
   it('skips the guard when rewriteSdk is disabled', async () => {
-    vi.resetModules();
-    win.__tsjs_sourcepoint = { rewriteSdk: false };
-
     const guard = await import('../../../src/integrations/sourcepoint/script_guard');
-    await import('../../../src/integrations/sourcepoint/index');
+    const release = createSourcepointRuntime().activate(Object.freeze({ rewriteSdk: false }));
 
     expect(guard.isGuardInstalled()).toBe(false);
-  });
-
-  it('defaults to installing the guard when rewriteSdk is missing for backward compatibility', async () => {
-    vi.resetModules();
-
-    const guard = await import('../../../src/integrations/sourcepoint/script_guard');
-    await import('../../../src/integrations/sourcepoint/index');
-
-    expect(guard.isGuardInstalled()).toBe(true);
+    release();
   });
 });
 
@@ -71,7 +49,7 @@ function sourcepointPayload(gppString = 'DBABLA~BVQqAAAAAgA.QA', applicableSecti
 describe('integrations/sourcepoint', () => {
   function clearAllCookies(): void {
     document.cookie.split(';').forEach((c) => {
-      const name = c.split('=')[0].trim();
+      const name = c.split('=')[0]?.trim() ?? '';
       if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
     });
   }
@@ -83,11 +61,13 @@ describe('integrations/sourcepoint', () => {
 
   beforeEach(() => {
     // Clear cookies and localStorage before each test.
+    disposeSourcepointConsentMirror();
     clearAllCookies();
     localStorage.clear();
   });
 
   afterEach(() => {
+    disposeSourcepointConsentMirror();
     vi.useRealTimers();
     Object.defineProperty(document, 'readyState', { value: 'complete', configurable: true });
     clearAllCookies();
@@ -277,7 +257,7 @@ describe('integrations/sourcepoint', () => {
       JSON.stringify(sourcepointPayload('initial-gpp', [7]))
     );
 
-    mirrorSourcepointConsent();
+    initializeSourcepointConsentMirror();
     localStorage.setItem(
       '_sp_user_consent_12345',
       JSON.stringify(sourcepointPayload('updated-gpp', [8]))
@@ -294,7 +274,7 @@ describe('integrations/sourcepoint', () => {
       JSON.stringify(sourcepointPayload('initial-gpp', [7]))
     );
 
-    mirrorSourcepointConsent();
+    initializeSourcepointConsentMirror();
     localStorage.removeItem('_sp_user_consent_12345');
     window.dispatchEvent(new Event('focus'));
 
@@ -309,7 +289,7 @@ describe('integrations/sourcepoint', () => {
     localStorage.clear();
     clearAllCookies();
 
-    await import('../../../src/integrations/sourcepoint');
+    initializeSourcepointConsentMirror();
 
     localStorage.setItem(
       '_sp_user_consent_12345',
@@ -328,13 +308,13 @@ describe('integrations/sourcepoint', () => {
     clearAllCookies();
     Object.defineProperty(document, 'readyState', { value: 'loading', configurable: true });
 
-    const sourcepoint = await import('../../../src/integrations/sourcepoint');
+    initializeSourcepointConsentMirror();
 
     localStorage.setItem(
       '_sp_user_consent_12345',
       JSON.stringify(sourcepointPayload('manual-gpp', [7]))
     );
-    expect(sourcepoint.mirrorSourcepointConsent()).toBe(true);
+    expect(mirrorSourcepointConsent()).toBe(true);
 
     localStorage.setItem(
       '_sp_user_consent_12345',
@@ -354,7 +334,7 @@ describe('integrations/sourcepoint', () => {
     clearAllCookies();
     Object.defineProperty(document, 'readyState', { value: 'loading', configurable: true });
 
-    await import('../../../src/integrations/sourcepoint');
+    initializeSourcepointConsentMirror();
 
     localStorage.setItem(
       '_sp_user_consent_12345',
