@@ -21,6 +21,14 @@ pub mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            # A gdpr-eu country, where every permission requires a signal. This
+            # reproduces the prior no-default floor, so existing tests are
+            # unaffected by the now-required default.
+            # Tests run with no geo provider, so single-jurisdiction operation
+            # is acknowledged the same way a deployment would.
+            assume_single_jurisdiction = true
+
             [integrations.prebid]
             enabled = true
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
@@ -33,7 +41,11 @@ pub mod tests {
             rewrite_attributes = ["href", "link", "url"]
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"

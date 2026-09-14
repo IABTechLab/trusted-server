@@ -1,0 +1,24 @@
+[package]
+name = "trusted-server-permission-signal-gpp"
+description = "The GPP US sale opt-out as a permission signal provider."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. The scheme's own body is the natural owner, and
+# until one adopts the crate the Trusted Server maintainers hold it.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "seeking vendor owner"
