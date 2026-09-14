@@ -76,6 +76,12 @@ pub struct AppState {
     /// `None` for a deployment that selects no provider, and for one whose
     /// provider must be resolved per request.
     resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// The permission signal providers `[permission_signal] sources` selects
+    /// from the scheme crates this adapter links, in the order they run.
+    /// Selected once here so a name no crate answers to fails startup rather
+    /// than the first request, and handed to every request's services.
+    permission_signal_providers:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -168,13 +174,38 @@ pub fn build_state_with_registrations(
     // this deployment can in fact satisfy. This adapter supplies no host
     // signals, so that argument stays `None` until it does.
     let resolved_ec_provider = build_reusable_provider(&settings.ec, None, registry.ec_provider())?;
+    let permission_signal_providers =
+        trusted_server_core::permission_signal::build_permission_signal_providers(
+            &settings,
+            &shipped_signal_providers(),
+        )?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         resolved_ec_provider,
+        permission_signal_providers,
     }))
+}
+
+/// The permission signal providers this adapter links, in the order they run
+/// when configuration names none. Global Privacy Control is first because it
+/// is a browser setting with no interface of its own, and the three that
+/// carry a choice someone made through an interface follow, so an answer
+/// given at a prompt amends the header the visitor arrived with.
+///
+/// Core supplies no provider of its own, so this is where a deployment's
+/// schemes are decided. A scheme is added by linking its crate here, and a
+/// scheme core has never heard of plugs in the same way.
+fn shipped_signal_providers()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+    vec![
+        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +225,9 @@ pub fn build_state_with_registrations(
 /// other key names an integration module that declares a geo provider. Identity
 /// and device are applied the same way when a module supplies them.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    let mut services = build_runtime_services(ctx, &state.settings)
-        .with_resolved_ec_provider(state.resolved_ec_provider.clone());
+    let mut services =
+        build_runtime_services(ctx, &state.settings, &state.permission_signal_providers)
+            .with_resolved_ec_provider(state.resolved_ec_provider.clone());
     if let Some(provider) = state.registry.geo_provider() {
         services = services.with_geo(provider);
     }
@@ -792,7 +824,7 @@ mod tests {
         // No resolved provider is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
-        let services = build_runtime_services(&ctx, &settings);
+        let services = build_runtime_services(&ctx, &settings, &Arc::default());
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)

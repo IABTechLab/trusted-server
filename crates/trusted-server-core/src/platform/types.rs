@@ -12,6 +12,7 @@ use super::{
 use crate::ec::device::DeviceProvider;
 use crate::ec::provider::EdgeCookieProvider;
 use crate::evidence::HostSignals;
+use crate::permission_signal::PermissionSignalProvider;
 
 /// Geographic information extracted from a request.
 ///
@@ -204,6 +205,13 @@ pub struct RuntimeServices {
     /// selects no provider, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
     pub(crate) device_provider: Option<Arc<dyn DeviceProvider>>,
+    /// The permission signal providers this deployment runs, in the order
+    /// they are asked, selected at the composition root from the scheme
+    /// crates the adapter links. Empty when the adapter offers none, in which
+    /// case every permission stays at its country and region baseline. Shared,
+    /// so building the services for a request bumps a reference count rather
+    /// than copying the list, and cloning the services does the same.
+    pub(crate) permission_signal_providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
 }
 
 impl RuntimeServices {
@@ -316,6 +324,12 @@ impl RuntimeServices {
     #[must_use]
     pub fn resolved_ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
         self.resolved_ec_provider.clone()
+    }
+
+    /// The permission signal providers this deployment runs, in order.
+    #[must_use]
+    pub fn permission_signal_providers(&self) -> &[Arc<dyn PermissionSignalProvider>] {
+        &self.permission_signal_providers
     }
 
     /// The device provider a module supplied, when `[device] provider` selected
@@ -469,6 +483,7 @@ pub struct RuntimeServicesBuilder {
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
     device_provider: Option<Arc<dyn DeviceProvider>>,
+    permission_signal_providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
 }
 
 impl RuntimeServicesBuilder {
@@ -487,6 +502,7 @@ impl RuntimeServicesBuilder {
             host_signals: None,
             resolved_ec_provider: None,
             device_provider: None,
+            permission_signal_providers: Arc::default(),
         }
     }
 
@@ -589,6 +605,25 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the permission signal providers this deployment runs, in the order
+    /// they are asked.
+    ///
+    /// Optional, and empty when unset. An adapter hands in the shared list
+    /// [`build_permission_signal_providers`] selected from the scheme crates it
+    /// links, so the request path asks exactly the providers configuration
+    /// named, in that order, and core supplies none of its own.
+    ///
+    /// [`build_permission_signal_providers`]:
+    ///     crate::permission_signal::build_permission_signal_providers
+    #[must_use]
+    pub fn permission_signal_providers(
+        mut self,
+        providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
+    ) -> Self {
+        self.permission_signal_providers = providers;
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -632,6 +667,7 @@ impl RuntimeServicesBuilder {
             host_signals: self.host_signals,
             resolved_ec_provider: self.resolved_ec_provider,
             device_provider: self.device_provider,
+            permission_signal_providers: self.permission_signal_providers,
         }
     }
 }

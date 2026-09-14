@@ -601,6 +601,9 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
+    permission_signal_providers: &Arc<
+        [Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>],
+    >,
 ) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
@@ -647,6 +650,10 @@ pub fn build_runtime_services(
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
         .geo(geo)
+        // The signal providers were selected once at startup from the scheme
+        // crates this adapter links, so every request asks exactly the ones
+        // configuration named, in that order.
+        .permission_signal_providers(Arc::clone(permission_signal_providers))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -799,7 +806,11 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        build_runtime_services(&ctx, &trusted_server_core::settings::Settings::default())
+        build_runtime_services(
+            &ctx,
+            &trusted_server_core::settings::Settings::default(),
+            &Arc::default(),
+        )
     }
 
     fn make_ctx_with_header(name: &str, value: &str) -> RequestContext {

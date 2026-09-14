@@ -541,6 +541,9 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
+    permission_signal_providers: &Arc<
+        [Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>],
+    >,
 ) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
@@ -592,6 +595,10 @@ pub fn build_runtime_services(
             settings,
             Arc::clone(GEO.get_or_init(|| Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>)),
         ))
+        // The signal providers were selected once at startup from the scheme
+        // crates this adapter links, so every request asks exactly the ones
+        // configuration named, in that order.
+        .permission_signal_providers(Arc::clone(permission_signal_providers))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -622,7 +629,11 @@ mod tests {
             req,
             edgezero_core::params::PathParams::default(),
         );
-        build_runtime_services(&ctx, &trusted_server_core::settings::Settings::default())
+        build_runtime_services(
+            &ctx,
+            &trusted_server_core::settings::Settings::default(),
+            &Arc::default(),
+        )
     }
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

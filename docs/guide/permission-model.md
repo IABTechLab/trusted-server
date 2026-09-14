@@ -33,9 +33,11 @@ onto them where no Data Use exists yet.
 That matters for reading the rest of this guide. When a provider declares the
 permissions its data use requires, it is naming a Data Use from that taxonomy,
 so an operator or an auditor can check the declaration against the taxonomy
-rather than against our interpretation of it. The mapping from TCF purposes is
-recorded in `permissions.yaml` alongside the rules, so no signal-to-permission
-policy is hidden in code.
+rather than against our interpretation of it. What a deployment decides about a
+signal, whether a TCF record answers and what an opt-out takes away, is recorded
+in `permissions.yaml` alongside the rules. What a scheme's own signal means, such
+as which TCF purpose grants which Data Use, belongs to that scheme's
+[permission signal provider](./permission-signals) and is tested there.
 
 ## Separating legal policy from the core
 
@@ -97,8 +99,11 @@ is one source among many, not the basis for every permission:
   country is identified, or the country has no rule either, the baseline at the
   top of the rules tree applies. That top baseline is required, so there is
   always one.
-- **Consent signals.** TCF, GPP, or GPC decoded from the request, mapped onto
-  permissions as a grant or a revoke on top of the baseline.
+- **Consent and privacy signals.** TCF, GPP, GPC or a US Privacy string read
+  from the request, mapped onto permissions as a grant or a revoke on top of
+  the baseline. Each is answered by a [permission signal
+  provider](./permission-signals), a crate outside the core, asked in the
+  order configuration gives.
 - **Interaction with the user.** A publisher may establish a preference because
   it chooses to, not only because a law requires it.
 - **Data from another source.** For example a browser extension, or a person's
@@ -126,15 +131,20 @@ Europe purposes and used **only** as technical identifiers. No CMP or TCF policy
 is implemented in the core. Two purposes have no Data Use yet. Purpose 1 (device
 storage) uses a proposed `necessary.operations.storage` key, and purpose 11
 keeps its TCF identifier `select-basic-content`. Both are flagged for an upstream
-taxonomy addition. All eleven purposes are now resolved against the incoming
+taxonomy addition. All eleven purposes are resolved against the incoming
 consent and privacy signals. A present TCF record grants or revokes each purpose
 directly, and a US-style opt-out (GPC, a GPP sale opt-out, or a US Privacy
-opt-out) revokes whether or not a TCF record is present. The remaining taxonomy Data Uses
+opt-out) revokes the Data Uses the policy lists, each answered by its own
+provider in the order configuration gives, so which of them stands when they
+disagree is that order. The remaining taxonomy Data Uses
 have no TCF purpose, so no signal maps to them and their configured baseline
-stands. The mapping itself, which TCF purpose grants which Data Use and what a
-US-style opt-out revokes, is declared in the `signals` section of
-`permissions.yaml`, not in the code, so a deployer changes policy by editing that
-file.
+stands. What a US-style opt-out revokes, and whether a TCF record answers for
+the deployment at all, are declared in the `signals` section of
+`permissions.yaml`, so a deployer changes that policy by editing the file.
+Which TCF purpose grants which Data Use is not policy but the TCF scheme's own
+meaning, so it lives in the TCF [permission signal
+provider](./permission-signals) crate, and the core carries no table of another
+scheme's numbers.
 
 `permissions.yaml` carries a policy flag for **every** Data Use in the taxonomy,
 not only the eleven below. The eleven have a dedicated identifier because a
@@ -143,7 +153,8 @@ where no informed policy decision has been made, is `denied` by default. Trusted
 Server is not the policy authority, so a deployer sets the flags to match its own
 jurisdiction rules.
 
-The eleven named Data Uses, with the TCF purpose each maps from:
+The eleven named Data Uses, with the TCF purpose each maps from, as the TCF
+provider crate maps them:
 
 | #   | Data Use identifier                             | IAB TCF Europe purpose                          |
 | --- | ----------------------------------------------- | ----------------------------------------------- |
@@ -341,16 +352,23 @@ unset otherwise. The Edge Cookie provider runs only when every permission it
 requires is set, which is the one place a declaration currently decides whether
 a provider runs.
 
-Signal precedence is fixed in code, most restrictive first. A US-style opt-out
-(GPC, a GPP sale opt-out, or a US Privacy opt-out) suppresses the Data Uses
-the policy revokes even when a TCF record consents, because an explicit
-opt-out is never overridden by another signal. A consent record that is
-present but cannot be decoded blocks baseline grants (fail-closed) rather
-than degrading to the no-signal baseline. Only then does a TCF record decide
-the Data Uses its purposes map to. Opt-outs suppress use for the request;
-they never destroy an already-issued identifier. Destructive withdrawal (the
-cookie expired and the identity-graph row tombstoned) happens only when a TCF
-record refuses storage in a jurisdiction whose baseline did not grant it.
+A consent record that is present but cannot be decoded blocks baseline grants
+(fail-closed) rather than degrading to the no-signal baseline, ahead of every
+signal provider and whichever are configured. The providers are then asked in
+the order `[permission_signal] sources` gives, each amending what the ones
+before it settled, and the last with an opinion decides. So which of a US-style
+opt-out (GPC, a GPP sale opt-out, or a US Privacy opt-out) and a consenting TCF
+record stands when they disagree is the configured order, not a rule in code.
+The default order asks Global Privacy Control first, because it is a browser
+setting with no interface of its own, and the schemes carrying a choice
+someone made through an interface after, so an answer given at a prompt
+amends the header the visitor arrived with, and a deployment wanting the
+opposite puts the provider it wants to win last. See
+[Permission Signals](./permission-signals). Opt-outs suppress use for the
+request and never destroy an already-issued identifier. Destructive
+withdrawal (the cookie expired and the identity-graph row tombstoned) happens
+only when a TCF record refuses storage in a jurisdiction whose baseline did not
+grant it.
 
 ```mermaid
 flowchart TD
@@ -425,7 +443,9 @@ classified as a bot, or for whom the auction was gated off, still receives the
 state resolved for the request rather than nothing.
 
 Because the arrival point moves, a page module must not read `tsjs.permissions`
-directly at load. TSJS core defaults the value to `{ set: [] }` and exposes
+directly at load. TSJS core defaults the value to `{ set: [], tdls: [] }`, where
+`tdls` are the terms documents the request's data is available under as
+declared by the signal providers, and exposes
 `tsjs.whenPermissions()`, a promise that resolves when the real value arrives,
 immediately in the head-first case or at the body seam, with a
 `DOMContentLoaded` fallback. That promise is the waiting point for a vendor page

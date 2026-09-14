@@ -905,6 +905,40 @@ impl DeviceConfig {
     }
 }
 
+/// Which permission signal providers run, and in what order.
+///
+/// Mapped from the `[permission_signal]` TOML section. Unlike the `[ec]`,
+/// `[geo]` and `[device]` selectors, which each name one provider, signals
+/// compose: a request can carry a TCF string and a Global Privacy Control
+/// header at once and both have something to say. So this names a list, and
+/// the order is the policy, because the last provider with an opinion decides.
+///
+/// See `crates/trusted-server-core/src/permission_signal/README.md`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionSignalConfig {
+    /// The providers to run, in order, named by the identifier each provider
+    /// crate declares, for example `gpc`, `gpp-sale-opt-out`, `us-privacy` and
+    /// `tcf` for the four that ship.
+    ///
+    /// Absent means every provider the adapter offers, in the order it offers
+    /// them. A publisher who does not want to act on one removes it from the
+    /// list, and there is no separate switch, because a provider that is not
+    /// listed does not run. An empty list runs none of them, leaving every
+    /// permission at its country and region baseline.
+    ///
+    /// Which names are valid is only known where the provider crates are
+    /// linked, so the check that each name matches an available provider and
+    /// none is repeated happens at the adapter's composition root, through
+    /// [`build_permission_signal_providers`], and refuses startup rather than
+    /// silently ignoring a typo.
+    ///
+    /// [`build_permission_signal_providers`]:
+    ///     crate::permission_signal::build_permission_signal_providers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<String>>,
+}
+
 /// Geo / IP intelligence configuration.
 ///
 /// Mapped from the `[geo]` TOML section. Selects which provider resolves a
@@ -3010,6 +3044,10 @@ fn is_default_geo_config(value: &GeoConfig) -> bool {
     *value == GeoConfig::default()
 }
 
+fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
+    *value == PermissionSignalConfig::default()
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -3306,6 +3344,9 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "is_default_geo_config")]
     #[validate(nested)]
     pub geo: GeoConfig,
+    #[serde(default, skip_serializing_if = "is_default_permission_signal_config")]
+    #[validate(nested)]
+    pub permission_signal: PermissionSignalConfig,
 }
 
 impl Settings {
@@ -8736,5 +8777,53 @@ formats = [{{ width = 300, height = 250 }}]
                  Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod permission_signal_config_tests {
+    use super::*;
+
+    // Which names are valid is only known where the scheme crates are linked,
+    // so the checks that a name matches an available provider, and that none
+    // is repeated, live with the seam in `permission_signal::select`. What is
+    // tested here is the shape of the section itself.
+
+    #[test]
+    fn no_section_is_allowed_and_means_every_provider() {
+        let config = PermissionSignalConfig::default();
+        assert!(
+            config.sources.is_none(),
+            "absent rather than empty, because the two mean opposite things"
+        );
+    }
+
+    #[test]
+    fn the_section_round_trips_through_toml() {
+        let parsed: PermissionSignalConfig =
+            toml::from_str(r#"sources = ["gpc", "tcf"]"#).expect("should parse the section");
+        assert_eq!(
+            parsed.sources.as_deref(),
+            Some(["gpc".to_owned(), "tcf".to_owned()].as_slice()),
+            "the order written is the order read, because the order is the policy"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_is_kept_apart_from_no_list() {
+        let parsed: PermissionSignalConfig =
+            toml::from_str("sources = []").expect("should parse an empty list");
+        assert_eq!(
+            parsed.sources.as_deref(),
+            Some(&[][..]),
+            "a publisher acting on no signal at all writes an empty list, and it must \
+             not read back as having written nothing"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused() {
+        toml::from_str::<PermissionSignalConfig>(r#"source = ["gpc"]"#)
+            .expect_err("should refuse a misspelled key rather than silently ignore it");
     }
 }
