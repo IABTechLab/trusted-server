@@ -102,11 +102,13 @@ Key rotation uses the Fastly API to manage store contents. You need to create an
 Store the API token in the `api-keys` secret store:
 
 ```bash
-# Store the API key
-fastly secret-store-entry create \
+# Read without echoing, then send the API key over stdin rather than argv.
+read -rsp 'Fastly API token: ' FASTLY_ROTATION_API_TOKEN && printf '\n'
+printf '%s' "$FASTLY_ROTATION_API_TOKEN" | fastly secret-store-entry create \
   --store-id=<your-api-keys-store-id> \
   --name=api_key \
-  --secret=<your-fastly-api-token>
+  --stdin
+unset FASTLY_ROTATION_API_TOKEN
 ```
 
 ::: warning Keep Your API Token Secure
