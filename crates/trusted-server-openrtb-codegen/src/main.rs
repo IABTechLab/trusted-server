@@ -11,6 +11,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+// This is a host-only developer codegen tool with no logger installed, so its
+// progress output goes straight to stderr.
+#[allow(clippy::print_stderr)]
 fn main() {
     let openrtb_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../trusted-server-openrtb");
     let proto_path = openrtb_dir.join("proto/openrtb.proto");
@@ -20,6 +23,8 @@ fn main() {
     // Use a temporary directory for raw prost-build output.
     let tmp = std::env::temp_dir().join("trusted-server-openrtb-codegen");
     fs::create_dir_all(&tmp).expect("should create temp directory");
+
+    eprintln!("Compiling {}...", proto_path.display());
 
     // Phase 1: Compile proto with prost-build.
     prost_build::Config::new()
@@ -46,6 +51,7 @@ fn main() {
     );
 
     fs::write(&output_path, output).expect("should write generated.rs");
+    eprintln!("Wrote {}", output_path.display());
     // Clean up temp files.
     let _ = fs::remove_dir_all(&tmp);
 }

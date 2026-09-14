@@ -59,17 +59,16 @@ Describe only current governance evidence. Do not invent meeting minutes,
 release cadence, CODEOWNERS, or named maintainers. Governance expansion is a
 maintainer decision outside this refresh.
 
-## Fastly service ID exception
+## Policy and governance changes split out
 
-- Type: service ID
-- Scope: the existing `service_id` in root `fastly.toml`
-- Owner: `aram356`
-- Rationale: preserve the active service binding during the documentation
-  refresh
-- Expiry: `2026-09-30T00:00:00Z`
-
-This is not a blanket sensitive-data exception. The owner must remove the value
-or approve a new explicit expiry before that date.
+The sensitive-data policy rewrite in `CLAUDE.md` (typed, owned, expiring
+exceptions) and the `ProjectGovernance.md` changes were removed from this
+refresh after review. Both require sign-off independent of this PR's author:
+the policy change needs a maintainer other than the exception owner, and
+governance changes belong to the Task Force. Each will be proposed in its own
+pull request. Until then the base policy text and the base governance charter
+stand, and the pre-existing `service_id` in root `fastly.toml` remains exactly
+as it exists on the release branch.
 
 ## Examples and sensitive material
 
@@ -89,11 +88,21 @@ workflow steps containing more than one line of executable logic must call a
 repository script.
 
 The aggregate documentation checker is available through a manual-only GitHub
-Actions workflow. It is not a required core or adapter status check.
+Actions workflow. It is not a required core or adapter status check, and
+`CLAUDE.md` lists its rustdoc commands under "Manual documentation gates"
+rather than under "CI Gates" so the heading matches enforcement.
 
 ## Adapter smoke and logging decisions
 
 Every adapter smoke uses isolated temporary state and a real local runtime.
+
+The Spin release-build job no longer sets `TRUSTED_SERVER__` boot overrides;
+build-time embedding was superseded by the `ts` CLI config-store path. As a
+result no CI workflow proves the Spin artifact boots, only that it compiles.
+Boot is exercised by the manually run `scripts/smoke-spin.sh`. Closing the gap
+means adding `spin` to the adapter-first-success matrix, which first needs a
+`spin` pin in `.tool-versions` and an EdgeZero-verified Spin version; that is
+tracked as follow-up work rather than done in this refresh.
 
 Fastly smoke operates on copied manifests in a per-run project. It does not
 lock, modify, or restore the root manifest because it never writes it.

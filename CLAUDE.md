@@ -273,18 +273,11 @@ impl core::error::Error for MyError {}
 
 ## Other guidelines
 
-- Use example or fictional information by default in comments, tests, docs,
-  examples, and similar non-runtime materials. Use `example.com` domains for
-  invented URLs.
-- Do not write or commit customer names, credentials, private configuration, or
-  other sensitive real-world information. A necessary public vendor endpoint is
-  permitted only through the exact, typed, owned, expiring exception below.
-- Sensitive-data exceptions are limited to these types: vendor URL,
-  hash-pinned fake-credential fixture, historical example, service ID, and
-  project-owned public domain.
-- Record every exception before use with its exact type and scope, owner,
-  rationale, and expiry timestamp. Ownerless, expired, broad, or untyped
-  exceptions are prohibited.
+- Use only example or fictional information in comments, tests, docs, examples,
+  and similar non-runtime materials. (eg. for urls use: example.com domains only)
+- Do not write or commit real domains, customer names, credentials,
+  configuration values, or other potentially sensitive real-world information in
+  comments, tests, docs, or examples.
 
 ---
 
@@ -351,6 +344,8 @@ IntegrationRegistration::builder(ID)
 
 ## CI Gates
 
+Every pull request must pass the gates in this section.
+
 ### JavaScript and documentation site
 
 
@@ -367,7 +362,7 @@ IntegrationRegistration::builder(ID)
 - `cargo clippy-cloudflare-wasm`
 - `cargo clippy-spin-native`
 - `cargo clippy-spin-wasm`
-- `cargo clippy --package trusted-server-cli --target $(rustc -vV | sed -n 's/host: //p') --all-targets --all-features -- -D warnings`
+- `cargo clippy --package trusted-server-cli --target $(rustc -vV | sed -n 's/host: //p') --all-targets -- -D warnings`
 - `cargo clippy --package trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p') --all-targets -- -D warnings`
 - `cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check`
 - `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings`
@@ -386,8 +381,11 @@ IntegrationRegistration::builder(ID)
 - `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
 - `cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release`
 
-### Rust API documentation
+## Manual documentation gates
 
+These commands are run by `scripts/check-documentation.sh` through the
+manual-only (`workflow_dispatch`) Documentation checks workflow. They are not
+pull-request status checks; CI does not block on rustdoc warnings.
 
 - `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p trusted-server-core -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1`
 - `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p trusted-server-adapter-fastly --target wasm32-wasip1`

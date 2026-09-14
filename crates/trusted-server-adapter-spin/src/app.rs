@@ -507,10 +507,7 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 }
 
 fn startup_error_diagnostic(error: &Report<TrustedServerError>) -> String {
-    format!(
-        "Spin startup failed, serving error fallback: {}",
-        error.current_context()
-    )
+    format!("Spin startup failed, serving error fallback: {error:?}")
 }
 
 // ---------------------------------------------------------------------------

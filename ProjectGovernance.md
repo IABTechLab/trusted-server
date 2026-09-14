@@ -1,43 +1,25 @@
-# Trusted Server project governance
+# Project Governance for The Trusted Server
 
-Trusted Server is an IAB Tech Lab open-source project. The governance model
-separates product direction from implementation and release execution.
+The Trusted Server project will be governed as an open-source initiative, in accordance with the established guidelines of the IAB Tech Lab Open Source initiative. However, certain key distinctions apply:
 
-## Trusted Server Task Force
+* The Trusted Server Task Force shall be responsible for the definition of requirements and the project roadmap.
+* The Task Force shall adhere to the working group rules and procedures of the Tech Lab.
+* The Trusted Server Development Team shall oversee engineering development and releases.
 
-The Task Force owns requirements, roadmap priorities, and review of material
-community proposals. It operates under applicable IAB Tech Lab working-group
-rules and procedures. Public-comment release periods are not required for
-ordinary software changes.
+## The Trusted Server Task Force
 
-The repository does not currently publish Task Force meeting minutes. Public
-requirements and implementation decisions must therefore be grounded in the
-repository's issues, pull requests, specifications, and accepted documentation;
-this document does not claim a separate minutes archive.
+A dedicated Task Force has been constituted by the Tech Lab to oversee the requirements and roadmap for the Trusted Server initiative. The core mandate of the Task Force is to review, approve, and prioritize proposals, issues, and pull requests submitted by the community for the Trusted Server.
 
-## Trusted Server Development Team
+The Task Force shall adhere to the working group rules and procedures of the Tech Lab for decision-making and management of the Trusted Server roadmap, with one exception: in recognition of the project's open-source nature, a formal public comment release period will not be instituted. Software releases will be conducted on a continuous basis.
 
-The Development Team evaluates technical feasibility, defines the system
-architecture, implements approved work, and executes releases. Repository
-evidence does not support a claim that releases occur continuously; release
-timing follows the team's reviewed release process.
+The Task Force will convene biweekly, and detailed meeting minutes will be meticulously maintained within the Trusted Server GitHub repository.
 
-The project uses these responsibility classes without naming current
-incumbents:
+## The Trusted Server Development Team
 
-- A project release manager is accountable for release coordination and has
-  repository write access.
-- A committer has repository write access and integrates reviewed changes.
-- A developer contributes code or documentation and may take on additional
-  project responsibilities.
+The Development Team shall be responsible for the evaluation of technical feasibility of requirements, the definition of system architecture, and the construction of the Trusted Server in alignment with the roadmap established by the Task Force. The team composition is as follows:
 
-Maintainer identity and ownership assignments are managed through current IAB
-Tech Lab project channels. This document does not create a `CODEOWNERS` policy
-or assign a person to an unverified role.
+* **Project Release Manager:** This individual holds ultimate responsibility for project development and possesses 'write' access to the repository.
+* **Committer:** This developer possesses 'write' access to the repository and is responsible for implementing final changes.
+* **Developer:** This contributor contributes to the project through code or documentation and may assume further project management responsibilities.
 
-## Contribution and decisions
-
-Contributors should use [CONTRIBUTING.md](CONTRIBUTING.md). Material technical
-decisions should remain reviewable in an issue, pull request, or checked design
-record. Merging a change records implementation acceptance; deployment and
-release evidence must be recorded separately when those operations occur.
+The Development Team shall be responsible for the development and release of the Trusted Server and will establish its own sprint and meeting schedule.

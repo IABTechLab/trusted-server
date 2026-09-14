@@ -7,8 +7,6 @@ description = "EdgePubs - Trusted Server"
 language = "rust"
 manifest_version = 3
 name = "trusted-server-adapter-fastly"
-# Temporary service-ID exception: owner `aram356`; expires
-# 2026-09-30T00:00:00Z. See the documentation-refresh decision record.
 service_id = "dysUw6h73VzeomD61eal85"
 
 [scripts]

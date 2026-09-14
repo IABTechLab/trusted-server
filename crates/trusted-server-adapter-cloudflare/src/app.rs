@@ -360,10 +360,7 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 
 #[cfg(any(test, target_arch = "wasm32"))]
 fn startup_error_diagnostic(error: &Report<TrustedServerError>) -> String {
-    format!(
-        "Cloudflare startup failed, serving error fallback: {}",
-        error.current_context()
-    )
+    format!("Cloudflare startup failed, serving error fallback: {error:?}")
 }
 
 // ---------------------------------------------------------------------------
