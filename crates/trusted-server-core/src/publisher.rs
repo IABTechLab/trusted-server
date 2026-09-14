@@ -3178,6 +3178,13 @@ struct BrowserAuctionDiagnostics {
     auction_wait_placement: Option<&'static str>,
 }
 
+const fn auction_wait_placement_wire(placement: AuctionWaitPlacement) -> &'static str {
+    match placement {
+        AuctionWaitPlacement::PreHeader => "pre_header",
+        AuctionWaitPlacement::InStream => "in_stream",
+    }
+}
+
 impl BrowserAuctionDiagnostics {
     fn from_request_timings(timings: &RequestTimings) -> Option<Self> {
         let snapshot = timings.snapshot();
@@ -3187,18 +3194,11 @@ impl BrowserAuctionDiagnostics {
             auction_resolved_ms: snapshot.auction_resolved_ms,
             auction_committed_ms: snapshot.auction_committed_ms,
             auction_wait_ms: snapshot.auction_wait_ms,
-            auction_wait_placement: snapshot.auction_wait_placement.map(
-                |placement| match placement {
-                    AuctionWaitPlacement::PreHeader => "pre_header",
-                    AuctionWaitPlacement::InStream => "in_stream",
-                },
-            ),
+            auction_wait_placement: snapshot
+                .auction_wait_placement
+                .map(auction_wait_placement_wire),
         })
     }
-}
-
-fn elapsed_millis(started: &web_time::Instant) -> u32 {
-    started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
 }
 
 #[derive(Clone, Default)]
@@ -3255,6 +3255,10 @@ impl AdBidsState {
         *self.bids.lock().expect("should lock bid map") = bid_map;
     }
 
+    /// Attach server auction facts to the rendered bid script.
+    ///
+    /// This rebuilds the script cell, so callers must run it before
+    /// [`Self::prepend_to_script`] to preserve an existing debug prefix.
     fn set_auction_diagnostics(&self, timings: &RequestTimings) {
         if !self.diagnostics_active {
             return;
@@ -6930,10 +6934,10 @@ pub async fn handle_page_bids(
                             auction_wait_ms: timing_snapshot
                                 .auction_resolved_ms
                                 .zip(timing_snapshot.auction_dispatched_ms)
-                                .map(|(resolved, dispatched)| {
-                                    resolved.saturating_sub(dispatched)
-                                }),
-                            auction_wait_placement: Some("pre_header"),
+                                .map(|(resolved, dispatched)| resolved.saturating_sub(dispatched)),
+                            auction_wait_placement: Some(auction_wait_placement_wire(
+                                AuctionWaitPlacement::PreHeader,
+                            )),
                         });
                     }
                     let winning_bids = result.winning_bids.clone();
@@ -20439,7 +20443,7 @@ mod tests {
         #[test]
         fn active_diagnostics_hands_auction_timing_to_the_generation_guarded_scheduler() {
             let timings = RequestTimings::new();
-            timings.mark_auction_dispatched("auction-test".to_string());
+            timings.mark_auction_dispatched();
             timings.record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(12));
             timings.mark_auction_resolved();
             timings.mark_auction_committed();
@@ -20465,7 +20469,7 @@ mod tests {
         #[test]
         fn inactive_diagnostics_omits_auction_timing_from_the_bid_script() {
             let timings = RequestTimings::new();
-            timings.mark_auction_dispatched("auction-test".to_string());
+            timings.mark_auction_dispatched();
             timings.mark_auction_resolved();
             timings.mark_auction_committed();
             let state = AdBidsState::default();
@@ -21147,20 +21151,25 @@ mod tests {
             let auction_diagnostics = winning_body["auctionDiagnostics"]
                 .as_object()
                 .expect("an active session should expose page-bids auction diagnostics");
-            for field in [
-                "auctionDispatchedMs",
-                "auctionResolvedMs",
-                "auctionCommittedMs",
-                "auctionWaitMs",
-            ] {
-                assert!(
-                    auction_diagnostics
-                        .get(field)
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some(),
-                    "page-bids diagnostics should include {field}"
-                );
-            }
+            let timing = |field| {
+                auction_diagnostics
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| panic!("page-bids diagnostics should include {field}"))
+            };
+            let dispatched_ms = timing("auctionDispatchedMs");
+            let resolved_ms = timing("auctionResolvedMs");
+            let committed_ms = timing("auctionCommittedMs");
+            let wait_ms = timing("auctionWaitMs");
+            assert!(
+                dispatched_ms <= resolved_ms && resolved_ms <= committed_ms,
+                "page-bids auction milestones should be monotonic"
+            );
+            assert_eq!(
+                wait_ms,
+                resolved_ms.saturating_sub(dispatched_ms),
+                "auction wait should exclude page-bids pre-dispatch work"
+            );
             assert_eq!(auction_diagnostics["auctionWaitPlacement"], "pre_header");
             assert!(
                 winning_auction_id.starts_with("ts-auc-"),
@@ -21184,7 +21193,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 make_page_bids_request("/2024/01/my-article/"),
             )
             .await
