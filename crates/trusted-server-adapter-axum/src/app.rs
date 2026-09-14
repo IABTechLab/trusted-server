@@ -710,8 +710,11 @@ mod tests {
     fn state_with_uninjected_provider() -> AppState {
         let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
             .expect("should parse settings selecting an uninjected provider");
-        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
+        let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)
+            .expect("should build orchestrator");
+        let registry =
+            IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");
         AppState {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
