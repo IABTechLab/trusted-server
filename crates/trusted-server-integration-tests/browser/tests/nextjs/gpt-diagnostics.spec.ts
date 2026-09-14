@@ -24,6 +24,32 @@ async function waitForApi(page: Page): Promise<void> {
     );
 }
 
+async function captureClosedShadowRoots(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+        const roots = new WeakMap<Element, ShadowRoot>();
+        const attachShadow = Element.prototype.attachShadow;
+        Object.defineProperty(Element.prototype, "attachShadow", {
+            configurable: true,
+            value(this: Element, init: ShadowRootInit): ShadowRoot {
+                const root = attachShadow.call(this, init);
+                roots.set(this, root);
+                return root;
+            },
+        });
+        (window as any).__gptDiagnosticsClosedRoots = roots;
+    });
+}
+
+async function diagnosticsText(page: Page): Promise<string> {
+    return page.evaluate((hostId) => {
+        const host = document.getElementById(hostId);
+        const roots = (window as any).__gptDiagnosticsClosedRoots as
+            | WeakMap<Element, ShadowRoot>
+            | undefined;
+        return host && roots ? (roots.get(host)?.textContent ?? "") : "";
+    }, HOST_ID);
+}
+
 async function emit(
     page: Page,
     name: string,
@@ -188,6 +214,7 @@ test.describe("GPT runtime diagnostics", () => {
     }, testInfo) => {
         const pageErrors: string[] = [];
         const diagnosticNetworkRequests: string[] = [];
+        await captureClosedShadowRoots(page);
         page.on("pageerror", (error) => pageErrors.push(error.message));
         page.on("request", (request) => {
             if (
@@ -220,10 +247,13 @@ test.describe("GPT runtime diagnostics", () => {
         );
         await emit(page, "slotRenderEnded", "gpt-diagnostics-slot-primary", {
             isEmpty: false,
-            size: [1, 1],
+            size: [300, 250],
             isBackfill: true,
             slotContentChanged: true,
         });
+        await expect
+            .poll(() => diagnosticsText(page))
+            .toContain("Fill 300×250");
         await emit(page, "slotOnload", "gpt-diagnostics-slot-primary");
         await emit(page, "impressionViewable", "gpt-diagnostics-slot-primary");
         await emit(
@@ -279,7 +309,7 @@ test.describe("GPT runtime diagnostics", () => {
         ).toEqual([1, 2, 3]);
         expect(primary.requests[0]).toMatchObject({
             isEmpty: false,
-            size: [1, 1],
+            size: [300, 250],
             isBackfill: true,
             slotContentChanged: true,
         });
@@ -334,17 +364,38 @@ test.describe("GPT runtime diagnostics", () => {
         await page.evaluate(() => (window as any).tsjs.gptDiagnostics.hide());
         await expect(page.locator(`#${HOST_ID}`)).toHaveCount(0);
         await emit(page, "slotRequested", "gpt-diagnostics-slot-secondary");
+        await emit(
+            page,
+            "slotResponseReceived",
+            "gpt-diagnostics-slot-secondary",
+        );
+        await emit(page, "slotRenderEnded", "gpt-diagnostics-slot-secondary", {
+            isEmpty: false,
+            size: [1, 1],
+        });
         await page.evaluate(() => (window as any).tsjs.gptDiagnostics.show());
         await expect(page.locator(`#${HOST_ID}`)).toHaveCount(1);
         const hiddenPeriodSnapshot = await page.evaluate(() =>
             (window as any).tsjs.gptDiagnostics.snapshot(),
         );
-        expect(
-            hiddenPeriodSnapshot.slots.find(
-                (slot: any) =>
-                    slot.slotElementId === "gpt-diagnostics-slot-secondary",
-            ).requests,
-        ).toHaveLength(2);
+        const secondaryRequests = hiddenPeriodSnapshot.slots.find(
+            (slot: any) =>
+                slot.slotElementId === "gpt-diagnostics-slot-secondary",
+        ).requests;
+        expect(secondaryRequests).toHaveLength(2);
+        expect(secondaryRequests[1]).toMatchObject({
+            isEmpty: false,
+            size: [1, 1],
+        });
+        await page.evaluate(
+            () =>
+                new Promise<void>((resolve) =>
+                    requestAnimationFrame(() =>
+                        requestAnimationFrame(() => resolve()),
+                    ),
+                ),
+        );
+        expect(await diagnosticsText(page)).not.toContain("1×1");
 
         const downloadPromise = page.waitForEvent("download");
         await page.evaluate(() => (window as any).tsjs.gptDiagnostics.export());
@@ -358,6 +409,16 @@ test.describe("GPT runtime diagnostics", () => {
         const exported = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         expect(exported.version).toBe(1);
         expect(exported.slots).toHaveLength(hiddenPeriodSnapshot.slots.length);
+        const exportedPrimary = exported.slots.find(
+            (slot: any) =>
+                slot.slotElementId === "gpt-diagnostics-slot-primary",
+        );
+        const exportedSecondary = exported.slots.find(
+            (slot: any) =>
+                slot.slotElementId === "gpt-diagnostics-slot-secondary",
+        );
+        expect(exportedPrimary.requests[0].size).toEqual([300, 250]);
+        expect(exportedSecondary.requests[1].size).toEqual([1, 1]);
         expect(exported.callbackIssues).toHaveLength(
             hiddenPeriodSnapshot.callbackIssues.length,
         );

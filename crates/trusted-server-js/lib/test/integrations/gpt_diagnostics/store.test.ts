@@ -662,7 +662,9 @@ describe('GptDiagnosticsStore', () => {
       const slot = fakeSlot('path-slot');
 
       if (direct !== undefined) {
-        store.recordTrustedServerOpportunity(slot, 'auction-slot', direct);
+        store.recordTrustedServerOpportunity(slot, 'auction-slot', direct, undefined, undefined, {
+          auctionType: 'ssat',
+        });
       }
       if (prebid) store.recordPrebidRefresh([slot]);
       if (publisher) store.recordPublisherRefresh([slot]);
@@ -761,7 +763,7 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRequested(slot);
 
     const cycle = store.snapshot().slots[0].requests[0];
-    expect(cycle.auctionType).toBe('ssat');
+    expect(cycle.auctionType).toBeUndefined();
     expect(cycle.auctionWinner).toBeUndefined();
     expect(cycle.serverAuctionTimings).toBeUndefined();
   });

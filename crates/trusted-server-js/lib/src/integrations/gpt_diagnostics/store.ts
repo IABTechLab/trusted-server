@@ -1126,7 +1126,7 @@ export class GptDiagnosticsStore {
     const hasClientSideAuction = intent?.sources.has('prebid_refresh') === true;
     if (hasTrustedServerAuction && hasClientSideAuction) return 'competing';
     if (hasClientSideAuction) return 'client_side';
-    if (hasTrustedServerAuction) return trustedServerEvidence?.auctionType ?? 'ssat';
+    if (hasTrustedServerAuction) return trustedServerEvidence?.auctionType;
     return undefined;
   }
 

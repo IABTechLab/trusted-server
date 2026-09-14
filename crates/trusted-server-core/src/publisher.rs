@@ -3129,6 +3129,13 @@ struct BrowserAuctionDiagnostics {
     auction_wait_placement: Option<&'static str>,
 }
 
+const fn auction_wait_placement_wire(placement: AuctionWaitPlacement) -> &'static str {
+    match placement {
+        AuctionWaitPlacement::PreHeader => "pre_header",
+        AuctionWaitPlacement::InStream => "in_stream",
+    }
+}
+
 impl BrowserAuctionDiagnostics {
     fn from_request_timings(timings: &RequestTimings) -> Option<Self> {
         let snapshot = timings.snapshot();
@@ -3138,12 +3145,9 @@ impl BrowserAuctionDiagnostics {
             auction_resolved_ms: snapshot.auction_resolved_ms,
             auction_committed_ms: snapshot.auction_committed_ms,
             auction_wait_ms: snapshot.auction_wait_ms,
-            auction_wait_placement: snapshot.auction_wait_placement.map(
-                |placement| match placement {
-                    AuctionWaitPlacement::PreHeader => "pre_header",
-                    AuctionWaitPlacement::InStream => "in_stream",
-                },
-            ),
+            auction_wait_placement: snapshot
+                .auction_wait_placement
+                .map(auction_wait_placement_wire),
         })
     }
 }
@@ -3206,6 +3210,10 @@ impl AdBidsState {
         *self.bids.lock().expect("should lock bid map") = bid_map;
     }
 
+    /// Attach server auction facts to the rendered bid script.
+    ///
+    /// This rebuilds the script cell, so callers must run it before
+    /// [`Self::prepend_to_script`] to preserve an existing debug prefix.
     fn set_auction_diagnostics(&self, timings: &RequestTimings) {
         if !self.diagnostics_active {
             return;
@@ -6545,6 +6553,10 @@ pub async fn handle_page_bids(
     ec_context: &EcContext,
     mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    // SPA offsets use this handler boundary so pre-dispatch work and the
+    // auction wait remain distinct on every adapter.
+    let timing_started = web_time::Instant::now();
+
     // Adapter fallbacks prepare this before routing. Keep this idempotent call as
     // a direct-handler safety net and retain the session decision after the
     // private activation cookie is stripped.
@@ -6744,7 +6756,6 @@ pub async fn handle_page_bids(
                 provider_responses: None,
                 services,
             };
-            let timing_started = web_time::Instant::now();
             let auction_dispatched_ms = elapsed_millis(&timing_started);
             let result = auction
                 .orchestrator
@@ -6764,7 +6775,9 @@ pub async fn handle_page_bids(
                             auction_wait_ms: Some(
                                 auction_resolved_ms.saturating_sub(auction_dispatched_ms),
                             ),
-                            auction_wait_placement: Some("pre_header"),
+                            auction_wait_placement: Some(auction_wait_placement_wire(
+                                AuctionWaitPlacement::PreHeader,
+                            )),
                         });
                     }
                     let winning_bids = result.winning_bids.clone();
@@ -20230,20 +20243,25 @@ mod tests {
             let auction_diagnostics = winning_body["auctionDiagnostics"]
                 .as_object()
                 .expect("an active session should expose page-bids auction diagnostics");
-            for field in [
-                "auctionDispatchedMs",
-                "auctionResolvedMs",
-                "auctionCommittedMs",
-                "auctionWaitMs",
-            ] {
-                assert!(
-                    auction_diagnostics
-                        .get(field)
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some(),
-                    "page-bids diagnostics should include {field}"
-                );
-            }
+            let timing = |field| {
+                auction_diagnostics
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| panic!("page-bids diagnostics should include {field}"))
+            };
+            let dispatched_ms = timing("auctionDispatchedMs");
+            let resolved_ms = timing("auctionResolvedMs");
+            let committed_ms = timing("auctionCommittedMs");
+            let wait_ms = timing("auctionWaitMs");
+            assert!(
+                dispatched_ms <= resolved_ms && resolved_ms <= committed_ms,
+                "page-bids auction milestones should be monotonic"
+            );
+            assert_eq!(
+                wait_ms,
+                resolved_ms.saturating_sub(dispatched_ms),
+                "auction wait should exclude page-bids pre-dispatch work"
+            );
             assert_eq!(auction_diagnostics["auctionWaitPlacement"], "pre_header");
             assert!(
                 winning_auction_id.starts_with("ts-auc-"),
