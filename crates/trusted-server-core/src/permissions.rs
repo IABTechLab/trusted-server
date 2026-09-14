@@ -475,9 +475,12 @@ pub struct PermissionMaps {
 }
 
 /// The default permission rules, compiled into the build from the repository's
-/// vanilla sample in `config/permissions`. A deployer chooses or replaces the
-/// compiled-in file to set the default policy; it is not read at runtime.
-const DEFAULT_PERMISSION_RULES: &str = include_str!("../../../config/permissions/vanilla.yaml");
+/// sample in `config/permissions`.
+///
+/// That sample is for testing and evaluation only and is not a production
+/// policy. A deployer chooses or replaces the compiled-in file to set the
+/// default policy, which is not read at runtime.
+const DEFAULT_PERMISSION_RULES: &str = include_str!("../../../config/permissions/sample.yaml");
 
 /// Builds the upper-cased `COUNTRY:REGION` key for [`PermissionMaps::by_region`].
 fn region_key(country: &str, region: &str) -> String {
