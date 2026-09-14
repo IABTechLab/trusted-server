@@ -35,7 +35,7 @@ Closes #
 
 ## Checklist
 
-- [ ] Changes follow [CLAUDE.md](/CLAUDE.md) conventions
+- [ ] Changes follow [AGENTS.md](/AGENTS.md) conventions
 - [ ] No `unwrap()` in production code — use `expect("should ...")`
 - [ ] Uses `tracing` macros (not `println!`)
 - [ ] New code has tests
