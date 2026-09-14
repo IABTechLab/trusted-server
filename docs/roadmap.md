@@ -32,8 +32,8 @@ The repository currently tracks follow-up work for these verified gaps:
 - decide whether standard-profile `imp_ext` needs reserved-member protection;
 - remove or implement dead adapter configuration surfaces;
 - make Fastly staging deployments select the staging config blob; and
-- retire the deprecated `POST /__ts/page-bids` alias after measured traffic has
-  moved to `POST /_ts/page-bids`.
+- retire the deprecated `GET /__ts/page-bids` alias after measured traffic has
+  moved to `GET /_ts/page-bids`.
 
 ## Deferred or unshipped
 

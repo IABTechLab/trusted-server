@@ -3,7 +3,7 @@
 - Status: executed on `spec-docs-refresh`
 - PR: https://github.com/IABTechLab/trusted-server/pull/1049
 - Base: `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`
-- Revised: 2026-09-11 after reviewer scope correction
+- Revised: 2026-09-14 after reviewer scope and onboarding corrections
 
 ## Goal
 
@@ -29,6 +29,7 @@ Files:
 
 - `docs/.vitepress/config.mts`
 - `docs/guide/index.md`
+- `docs/guide/onboarding.md`
 - `docs/internal/onboarding.md`
 - `docs/business-use-cases.md`
 - `docs/superpowers/archive/FAQ_POC.md`
@@ -37,6 +38,7 @@ Files:
 Work:
 
 - [x] Retain product getting-started material on the public site.
+- [x] Publish onboarding without maintainer-only details.
 - [x] Move maintainer onboarding to the internal source tree.
 - [x] Exclude internal, archived, and unverified business-use-case material
       from VitePress inputs.

@@ -89,6 +89,10 @@ export default withMermaid(
               link: '/guide/what-is-trusted-server',
             },
             { text: 'Getting Started', link: '/guide/getting-started' },
+            {
+              text: 'Onboarding',
+              link: '/guide/onboarding',
+            },
           ],
         },
         {

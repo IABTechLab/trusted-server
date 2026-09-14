@@ -75,6 +75,9 @@ function normalizeId(raw: string): string {
  * This does not sanitize content: it rejects non-string and empty values but
  * never removes markup. Origin isolation comes from the iframe sandbox without
  * `allow-same-origin`; server-side sanitization remains independently optional.
+ * `sanitizedLength` equals `originalLength` and `removedCount` is always zero;
+ * those fields preserve the shared result shape and carry no sanitization signal
+ * in this function.
  */
 export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
   if (typeof creativeHtml !== 'string') {

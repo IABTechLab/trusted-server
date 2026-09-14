@@ -2,7 +2,7 @@
 
 - Status: approved and implemented on PR #1049
 - Design date: 2026-08-19
-- Last revised: 2026-09-11
+- Last revised: 2026-09-14
 - Target branch: `rc/202608`
 - Audited base: `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`
 
@@ -76,7 +76,9 @@ The public site must answer, in order:
 6. how to test and diagnose the deployment.
 
 The public landing and getting-started material retain that journey. Onboarding
-was not deleted: repository-team onboarding moved to
+has two explicit homes: `docs/guide/onboarding.md` preserves the URL for public
+onboarding covering the request path, project vocabulary, code layout, and
+first development steps, while repository-team onboarding lives in
 `docs/internal/onboarding.md` because it contains maintainer workflow details
 rather than product installation instructions.
 
@@ -258,7 +260,8 @@ on a separate documentation proposal.
 The refresh is complete when:
 
 - the public site builds with no dead internal links;
-- getting-started and internal onboarding both have clear, separate homes;
+- getting-started, public onboarding, and internal maintainer onboarding have
+  clear, separate homes;
 - configuration, API, adapters, integrations, auction, JavaScript, CLI,
   telemetry, and testing are covered;
 - every crate has an accurate README and API documentation gates pass;

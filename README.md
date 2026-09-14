@@ -14,6 +14,7 @@ reader-facing source of truth. Start with:
 | Guide                                                                                                 | Purpose                                                            |
 | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | [Getting Started](https://iabtechlab.github.io/trusted-server/guide/getting-started)                  | Install prerequisites and create a working configuration.          |
+| [Onboarding](https://iabtechlab.github.io/trusted-server/guide/onboarding)                            | Learn the request path, vocabulary, and codebase layout.           |
 | [Configuration](https://iabtechlab.github.io/trusted-server/guide/configuration)                      | Exact settings, defaults, validation, and secret handling.         |
 | [CLI](https://iabtechlab.github.io/trusted-server/guide/cli)                                          | Host installation and the generated Linux/macOS command inventory. |
 | [Deployment](https://iabtechlab.github.io/trusted-server/guide/integrations-overview#adapter-support) | Adapter support and first-success journeys.                        |

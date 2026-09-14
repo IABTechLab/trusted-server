@@ -1,7 +1,7 @@
 # Documentation Refresh Decisions
 
 - Decision date: 2026-08-31
-- Last revised: 2026-09-11
+- Last revised: 2026-09-14
 - Approver: `aram356`
 - Delivery: PR #1049 to `rc/202608`
 - Audited base: `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`
@@ -31,10 +31,13 @@ records.
 
 ### Repository-team onboarding
 
-Move maintainer onboarding from `docs/guide/onboarding.md` to
-`docs/internal/onboarding.md` and exclude it from the public build. Preserve the
-public installation and setup journey in the landing, getting-started,
-configuration, and adapter guides.
+Move maintainer-specific onboarding from `docs/guide/onboarding.md` to
+`docs/internal/onboarding.md` and exclude it from the public build. Reuse the
+established `/guide/onboarding` URL for public onboarding that explains the
+request path, repository vocabulary, code layout, and first development steps
+without maintainer contacts or meeting details. Preserve the public
+installation and setup journey in the landing, getting-started, configuration,
+and adapter guides.
 
 ### CNAME
 
