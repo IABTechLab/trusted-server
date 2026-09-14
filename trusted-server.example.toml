@@ -112,7 +112,7 @@ pull_sync_concurrency = 3
 # passphrase = "ec_passphrase"
 
 # Built-in host-signal provider block. Creates the identifier from the host's TLS
-# JA4 and HTTP/2 signals instead of the client IP, so it needs a host that
+# JA4 and HTTP/2 signals together with the client IP, so it needs a host that
 # supplies those signals (Fastly does). Uncomment it together with
 # `provider = "host-signals"` above, and give it its own secret on the same
 # terms as the hmac block.
