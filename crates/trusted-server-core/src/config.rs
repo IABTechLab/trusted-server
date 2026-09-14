@@ -144,7 +144,25 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 
         vec![
             field(vec![object("publisher"), object("proxy_secret")], false),
-            field(vec![object("ec"), object("passphrase")], false),
+            field(vec![object("ec"), object("passphrase")], true),
+            field(
+                vec![
+                    object("ec"),
+                    optional_object("providers"),
+                    optional_object("hmac"),
+                    object("passphrase"),
+                ],
+                true,
+            ),
+            field(
+                vec![
+                    object("ec"),
+                    optional_object("providers"),
+                    optional_object("host-signals"),
+                    object("passphrase"),
+                ],
+                true,
+            ),
             field(
                 vec![
                     object("ec"),
@@ -390,7 +408,18 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         "publisher.proxy_secret",
         settings.publisher.proxy_secret.expose(),
     )?;
-    validate_secret_key_reference("ec.passphrase", settings.ec.passphrase.expose())?;
+    if let Some(passphrase) = &settings.ec.passphrase {
+        validate_secret_key_reference("ec.passphrase", passphrase.expose())?;
+    }
+    if let Some(hmac) = &settings.ec.providers.hmac {
+        validate_secret_key_reference("ec.providers.hmac.passphrase", hmac.passphrase.expose())?;
+    }
+    if let Some(host_signals) = &settings.ec.providers.host_signals {
+        validate_secret_key_reference(
+            "ec.providers.host-signals.passphrase",
+            host_signals.passphrase.expose(),
+        )?;
+    }
 
     for (index, partner) in settings.ec.partners.iter().enumerate() {
         if let Some(token) = &partner.api_token {
@@ -735,7 +764,13 @@ formats = [{ width = 300, height = 250 }]
     fn push_validation_accepts_secret_key_names() {
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
-        settings.ec.passphrase = Redacted::new("ec_key".to_owned());
+        settings
+            .ec
+            .providers
+            .hmac
+            .as_mut()
+            .expect("should configure the hmac provider")
+            .passphrase = Redacted::new("ec_key".to_owned());
         settings.handlers[0].password = Redacted::new("handler_password".to_owned());
         settings.handlers[1].password = Redacted::new("admin_password".to_owned());
         let app_config = TrustedServerAppConfig::new(settings)
@@ -745,6 +780,28 @@ formats = [{ width = 300, height = 250 }]
             serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
         assert!(serialized.contains("publisher_proxy"));
         assert!(!serialized.contains("unit-test-proxy-secret"));
+    }
+
+    #[test]
+    fn push_validation_accepts_a_host_signals_passphrase_key_name() {
+        // The block is named `host-signals` in the configuration and in the
+        // registered secret path, so push validation has to skip the passphrase
+        // check under that name.
+        let mut settings = valid_settings();
+        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
+            "host-signals",
+        ));
+        settings.ec.providers.hmac = None;
+        settings.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
+            passphrase: Redacted::new("host_signals_key".to_owned()),
+        });
+
+        let app_config = TrustedServerAppConfig::new(settings)
+            .expect("should validate the host-signals passphrase as a key name");
+
+        let serialized =
+            serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
+        assert!(serialized.contains("host_signals_key"));
     }
 
     #[test]
@@ -759,7 +816,9 @@ formats = [{ width = 300, height = 250 }]
             paths,
             vec![
                 ("publisher.proxy_secret".to_owned(), false),
-                ("ec.passphrase".to_owned(), false),
+                ("ec.passphrase".to_owned(), true),
+                ("ec.providers.hmac.passphrase".to_owned(), true),
+                ("ec.providers.host-signals.passphrase".to_owned(), true),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
@@ -1040,6 +1099,9 @@ origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "production-secret-key-32-bytes-min"
 
 [[handlers]]
