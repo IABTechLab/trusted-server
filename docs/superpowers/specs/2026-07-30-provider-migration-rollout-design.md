@@ -324,7 +324,8 @@ the sharing/targeted GPP fields (row 3e), the grant-signal class (row 3a,
 now stricter instead), and the batch-sync provenance gate (row 11c).
 
 Policy now lives in a permissions YAML document (the repository sample is
-`config/permissions/vanilla.yaml`), compiled into the build. There is
+`config/permissions/sample.yaml`, for testing and evaluation only),
+compiled into the build. There is
 no `[permissions]` block in `trusted-server.toml`, so the draft's
 partial-policy trap (a TOML table containing only a permissive default)
 cannot be written at all. A deployer edits the yaml and rebuilds, which

@@ -138,7 +138,8 @@ spelling.)
 ### 3.1 Location: `permissions.yaml`, compiled into the build
 
 Policy lives in a human-editable permissions YAML document (the repository
-sample is `config/permissions/vanilla.yaml`),
+sample is `config/permissions/sample.yaml`, for testing and evaluation
+only),
 compiled into the binary with `include_str!` and parsed once per instance
 (cached behind a `OnceLock` in `PermissionMaps::standard`). A deployer edits
 or replaces the file and rebuilds to change policy. The file is not read at
@@ -615,7 +616,7 @@ Implemented sources, as declared in the shipped `signals` section:
 | Absent / unknown / reserved values | Nothing                                 |
 
 An opt-out revokes the Data Uses the policy's `revokes` value names. The
-sample policy, `config/permissions/vanilla.yaml`, lists device storage, sale,
+sample, `config/permissions/sample.yaml`, lists device storage, sale,
 sharing, third-party sale, first- and third-party targeted advertising, and
 profiling, so an opted-out visitor gets no Edge Cookie written and no
 identifier shared while contextual advertising and measurement continue. That
