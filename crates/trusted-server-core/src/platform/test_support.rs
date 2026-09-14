@@ -12,7 +12,8 @@ use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerOptions,
     PlatformImageOptimizerParams, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformSelectResult, RawProxyPolicyV1, RawProxyResponseV1, RuntimeServices, StoreId,
+    StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
@@ -254,6 +255,8 @@ pub(crate) struct StubHttpClient {
     request_uris: Mutex<Vec<String>>,
     // Outgoing request bodies captured per send call, collected to bytes.
     request_bodies: Mutex<Vec<Vec<u8>>>,
+    raw_proxy_responses: Mutex<VecDeque<RawProxyResponseV1>>,
+    raw_proxy_policies: Mutex<Vec<RawProxyPolicyV1>>,
 }
 
 struct StubHttpResponse {
@@ -281,6 +284,8 @@ impl StubHttpClient {
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
             request_bodies: Mutex::new(Vec::new()),
+            raw_proxy_responses: Mutex::new(VecDeque::new()),
+            raw_proxy_policies: Mutex::new(Vec::new()),
         }
     }
 
@@ -326,6 +331,22 @@ impl StubHttpClient {
                 body,
                 headers,
             });
+    }
+
+    /// Queue one response for the dedicated raw-proxy transport boundary.
+    pub fn push_raw_proxy_response(&self, response: RawProxyResponseV1) {
+        self.raw_proxy_responses
+            .lock()
+            .expect("should lock raw proxy responses")
+            .push_back(response);
+    }
+
+    /// Return raw-proxy policies captured per dedicated send.
+    pub fn recorded_raw_proxy_policies(&self) -> Vec<RawProxyPolicyV1> {
+        self.raw_proxy_policies
+            .lock()
+            .expect("should lock raw proxy policies")
+            .clone()
     }
 
     /// Inject a `select()` error: the next call to `select()` will return
@@ -551,6 +572,77 @@ impl PlatformHttpClient for StubHttpClient {
         Ok(PlatformResponse::new(edge_response))
     }
 
+    async fn send_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        if request.image_optimizer.is_some() || request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("unsupported option on StubHttpClient raw proxy request"));
+        }
+
+        self.calls
+            .lock()
+            .expect("should lock calls")
+            .push(request.backend_name.clone());
+        self.raw_proxy_policies
+            .lock()
+            .expect("should lock raw proxy policies")
+            .push(policy);
+        self.cache_bypass_flags
+            .lock()
+            .expect("should lock cache bypass flags")
+            .push(request.bypass_cache);
+        self.request_methods
+            .lock()
+            .expect("should lock request methods")
+            .push(request.request.method().to_string());
+        self.request_uris
+            .lock()
+            .expect("should lock request URIs")
+            .push(request.request.uri().to_string());
+        self.request_headers
+            .lock()
+            .expect("should lock request headers")
+            .push(
+                request
+                    .request
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect(),
+            );
+
+        let (_, body) = request.request.into_parts();
+        let body = body
+            .into_bytes_bounded(MAX_RECORDED_BODY_BYTES)
+            .await
+            .change_context(PlatformError::HttpClient)?
+            .to_vec();
+        self.request_bodies
+            .lock()
+            .expect("should lock request bodies")
+            .push(body);
+
+        let response = self
+            .raw_proxy_responses
+            .lock()
+            .expect("should lock raw proxy responses")
+            .pop_front()
+            .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
+        if response.body.len() > policy.max_response_bytes {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("stub raw proxy body exceeds configured cap"));
+        }
+        Ok(response)
+    }
+
     async fn send_async(
         &self,
         request: PlatformHttpRequest,
@@ -752,25 +844,6 @@ pub(crate) fn build_services_with_config_and_secret(
         .build()
 }
 
-pub(crate) fn build_services_with_config_and_secret_and_client_ip(
-    config_store: impl PlatformConfigStore + 'static,
-    secret_store: impl PlatformSecretStore + 'static,
-    client_ip: IpAddr,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(config_store))
-        .secret_store(Arc::new(secret_store))
-        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: Some(client_ip),
-            ..ClientInfo::default()
-        })
-        .build()
-}
-
 pub(crate) fn build_request_signing_services() -> RuntimeServices {
     let signing_key = SigningKey::generate(&mut OsRng);
     let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
@@ -802,6 +875,27 @@ pub(crate) fn build_services_with_config(
         .http_client(Arc::new(NoopHttpClient))
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo::default())
+        .build()
+}
+
+/// Build test services with caller-supplied configuration and secrets plus an
+/// attested client IP.
+pub(crate) fn build_services_with_config_and_secret_and_client_ip(
+    config_store: impl PlatformConfigStore + 'static,
+    secret_store: impl PlatformSecretStore + 'static,
+    client_ip: IpAddr,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(config_store))
+        .secret_store(Arc::new(secret_store))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some(client_ip),
+            ..ClientInfo::default()
+        })
         .build()
 }
 

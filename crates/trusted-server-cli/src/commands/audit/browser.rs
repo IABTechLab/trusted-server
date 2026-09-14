@@ -875,7 +875,6 @@ fn decode_ad_evidence_envelope(
                     // page owns that store, so re-cap after decode.
                     evidence.dom_ids.truncate(MAX_EVIDENCE_ENTRIES);
                     evidence.gpt_slots.truncate(MAX_EVIDENCE_ENTRIES);
-                    evidence.aps_calls.truncate(MAX_EVIDENCE_ENTRIES);
                     evidence.warnings.truncate(MAX_EVIDENCE_ENTRIES);
                     Some(evidence)
                 }

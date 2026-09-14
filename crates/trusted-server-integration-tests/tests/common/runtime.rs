@@ -97,6 +97,21 @@ pub trait RuntimeEnvironment: Send + Sync {
     /// Returns [`TestError::RuntimeNotReady`] if the health check times out.
     fn spawn(&self, wasm_path: &Path) -> TestResult<RuntimeProcess>;
 
+    /// Spawn the dedicated APS runner-proxy integration artifact.
+    ///
+    /// `fixture_url` is selected by the private test controller, never an
+    /// incoming browser request. Implementations must pass it only through
+    /// their feature-gated transport seam.
+    #[cfg(feature = "aps-runner-proxy")]
+    fn spawn_aps_runner_proxy(
+        &self,
+        _wasm_path: &Path,
+        _fixture_url: &str,
+    ) -> TestResult<RuntimeProcess> {
+        Err(Report::new(TestError::RuntimeSpawn)
+            .attach("runtime does not implement the APS runner proxy test artifact"))
+    }
+
     /// Health check endpoint (may differ by platform)
     fn health_check_path(&self) -> &str {
         "/health"

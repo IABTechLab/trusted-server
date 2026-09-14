@@ -78,3 +78,26 @@ export const TRUSTED_BASE_URL: string = (() => {
   }
   return '';
 })();
+
+// Exact first-party origin for protocol messages and root-owned endpoints.
+// `TRUSTED_BASE_URL` may be a full inherited base URI in the final fallback,
+// so normalize it to its origin while retaining the same HTTP(S)-only and
+// credential-free trust boundary.
+export function trustedHttpOrigin(baseUrl: string = TRUSTED_BASE_URL): string {
+  if (!baseUrl) return '';
+  try {
+    const parsed = new URL(baseUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    if (parsed.username !== '' || parsed.password !== '') return '';
+    return parsed.origin;
+  } catch {
+    return '';
+  }
+}
+
+export function trustedDocumentHttpOrigin(
+  documentOrigin: string,
+  trustedBaseUrl: string = TRUSTED_BASE_URL
+): string {
+  return trustedHttpOrigin(documentOrigin === 'null' ? trustedBaseUrl : documentOrigin);
+}

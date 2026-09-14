@@ -32,7 +32,7 @@ pub struct ExpectedSlot {
     pub gam_unit_path: Option<String>,
     /// Configured ad formats.
     pub formats: Vec<ExpectedFormat>,
-    /// Configured provider names, in `aps`, `prebid` order.
+    /// Configured slot-level provider names.
     pub providers: Vec<String>,
     /// Glob patterns configured for this slot.
     pub page_patterns: Vec<String>,
@@ -97,9 +97,6 @@ fn provider_names(
     slot: &trusted_server_core::creative_opportunities::CreativeOpportunitySlot,
 ) -> Vec<String> {
     let mut providers = Vec::new();
-    if slot.providers.aps.is_some() {
-        providers.push("aps".to_string());
-    }
     if slot.providers.prebid.is_some() {
         providers.push("prebid".to_string());
     }
@@ -152,7 +149,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         let toml = format!(
-            "gam_network_id = \"123\"\n\
+            "enabled = true\n\
+             gam_network_id = \"123\"\n\
              \n\
              [[slot]]\n\
              id = \"atf\"\n\
@@ -202,7 +200,8 @@ mod tests {
 
     #[test]
     fn expected_slots_default_resolution_without_overrides() {
-        let toml = "gam_network_id = \"42\"\n\
+        let toml = "enabled = true\n\
+             gam_network_id = \"42\"\n\
              \n\
              [[slot]]\n\
              id = \"footer\"\n\
@@ -223,7 +222,8 @@ mod tests {
 
     #[test]
     fn expected_slots_render_section_templates_per_path() {
-        let toml = "gam_network_id = \"99999\"\n\
+        let toml = "enabled = true\n\
+             gam_network_id = \"99999\"\n\
              section_root = \"homepage\"\n\
              \n\
              [[slot]]\n\
@@ -256,9 +256,10 @@ mod tests {
     #[test]
     fn expected_slots_omit_dynamic_template_the_runtime_cannot_render() {
         // A `{section}` template that renders past GAM's 100-byte unit-path
-        // limit. The runtime omits this slot for the request path, so diagnostics
-        // must not match it against a truncated or otherwise different path.
-        let toml = "gam_network_id = \"99999\"\n\
+        // limit. `validate_runtime` rejects this config, so the verifier reports
+        // the slot as unconfirmable rather than matching a truncated path.
+        let toml = "enabled = true\n\
+             gam_network_id = \"99999\"\n\
              section_root = \"homepage\"\n\
              \n\
              [[slot]]\n\

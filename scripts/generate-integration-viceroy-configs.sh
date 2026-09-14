@@ -16,11 +16,20 @@ APP_CONFIG_PATH="crates/trusted-server-integration-tests/fixtures/configs/truste
 INTEGRATION_TARGET_DIR="crates/trusted-server-integration-tests/target"
 ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+ENABLE_AUCTION="${INTEGRATION_ENABLE_AUCTION:-false}"
 
 if [ -z "$HOST_TARGET" ]; then
     echo "Failed to detect host target from rustc -vV" >&2
     exit 1
 fi
+
+case "$ENABLE_AUCTION" in
+    true|false) ;;
+    *)
+        echo "INTEGRATION_ENABLE_AUCTION must be true or false" >&2
+        exit 1
+        ;;
+esac
 
 mkdir -p "$CONFIG_DIR"
 
@@ -36,8 +45,14 @@ if [ ! -x "$GENERATOR_BIN" ]; then
     exit 1
 fi
 
-"$GENERATOR_BIN" \
-    --template "$TEMPLATE_PATH" \
-    --app-config "$APP_CONFIG_PATH" \
-    --output "$CONFIG_DIR/viceroy.toml" \
+GENERATOR_ARGS=(
+    --template "$TEMPLATE_PATH"
+    --app-config "$APP_CONFIG_PATH"
+    --output "$CONFIG_DIR/viceroy.toml"
     --origin-url "$ORIGIN_URL"
+)
+if [ "$ENABLE_AUCTION" = true ]; then
+    GENERATOR_ARGS+=(--enable-auction)
+fi
+
+"$GENERATOR_BIN" "${GENERATOR_ARGS[@]}"

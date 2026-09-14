@@ -8,14 +8,46 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  ARTIFACT_RELEASE_SENTINEL,
+  assertNoLegacyRuntimeFlags,
+  assertPurePrebidArtifact,
   deriveBundleMetadata,
   main,
   parseArgs,
   readAdapterBidderCodes,
+  readAdapterMetadata,
   renderIncludedUserIdModulesExport,
 } from '../build-prebid-external.mjs';
 
 describe('build-prebid-external metadata', () => {
+  it('rejects any legacy TSJS runtime flag before publishing an artifact', () => {
+    expect(() => assertNoLegacyRuntimeFlags('window.' + '__' + 'tsjs_prebid = {};')).toThrow(
+      /legacy TSJS runtime flag/
+    );
+    expect(() => assertNoLegacyRuntimeFlags('window.pbjs = { que: [] };')).not.toThrow();
+  });
+
+  it('rejects Trusted Server auction, render, and PUC behavior in the external Prebid artifact', () => {
+    for (const marker of [
+      'TS APS Top Mount Started',
+      'TS ADM Start',
+      'TS Render Owner Register',
+      '/_ts/auction',
+      'rendererReservationId',
+      'lifecycleTicket',
+      'tsjs.requestAds',
+    ]) {
+      expect(() => assertPurePrebidArtifact(`/* prebid */ ${marker}`)).toThrow(
+        /TS-owned auction or render behavior/
+      );
+    }
+    expect(() =>
+      assertPurePrebidArtifact(
+        'window.pbjs={que:[],cmd:[]};window.__prebidProtocol="Prebid Request";Object.defineProperty(window.pbjs,"__trustedServerArtifactV1",{});'
+      )
+    ).not.toThrow();
+  });
+
   it('derives filename, sha256, and SRI from exact bundle bytes', () => {
     const bundleBytes = Buffer.from('console.log("trusted prebid");\n', 'utf8');
     const sha256 = crypto.createHash('sha256').update(bundleBytes).digest('hex');
@@ -37,6 +69,10 @@ describe('build-prebid-external metadata', () => {
   it('derives registered bidder codes including aliases from prebid metadata', () => {
     // adfBidAdapter.js registers adf plus the adform/adformOpenRTB aliases.
     expect(readAdapterBidderCodes(['adf'])).toEqual(['adf', 'adform', 'adformOpenRTB']);
+    expect(readAdapterMetadata(['adf']).bidderAliases).toEqual([
+      { code: 'adform', moduleStem: 'adf' },
+      { code: 'adformOpenRTB', moduleStem: 'adf' },
+    ]);
   });
 
   it('maps a module file stem to its registered bidder code', () => {
@@ -70,10 +106,41 @@ describe('build-prebid-external metadata', () => {
       );
       const bundle = fs.readFileSync(path.join(outputDirectory, manifest.filename), 'utf8');
 
-      expect(manifest.userIdModules).toEqual(['pairIdSystem', 'lockrAIMIdSystem']);
+      expect(manifest).toMatchObject({
+        abi: 1,
+        prebidVersion: '10.26.0',
+        moduleStems: ['lockrAIMIdSystem', 'pairIdSystem', 'rubicon'],
+        bidderCodes: ['rubicon'],
+        bidderAliases: [],
+        userIdModules: [
+          {
+            moduleName: 'lockrAIMIdSystem',
+            configNames: ['lockrAIMId'],
+            eidSources: [],
+          },
+          {
+            moduleName: 'pairIdSystem',
+            configNames: ['pairId'],
+            eidSources: ['google.com'],
+          },
+        ],
+      });
+      expect(manifest.artifactReleaseId).toMatch(/^[0-9a-f]{64}$/);
+      expect(manifest.filename).toMatch(/^trusted-prebid-[0-9a-f]{64}\.js$/);
+      expect(manifest.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(manifest.sri).toMatch(/^sha384-/);
+      expect(bundle).toContain('__trustedServerArtifactV1');
+      expect(bundle).toContain('getBidResponsesForAdUnitCode');
+      expect(bundle).toContain(manifest.artifactReleaseId);
+      expect(bundle).not.toContain(ARTIFACT_RELEASE_SENTINEL);
+      expect(bundle).not.toContain('__' + 'tsjs_');
       expect(manifest.bidderCodes).toEqual(['rubicon']);
-      expect(bundle).toContain('"pairIdSystem"');
-      expect(bundle).toContain('"lockrAIMIdSystem"');
+      expect(bundle.split(manifest.artifactReleaseId)).toHaveLength(2);
+      const normalized = bundle.replace(manifest.artifactReleaseId, ARTIFACT_RELEASE_SENTINEL);
+      expect(crypto.createHash('sha256').update(normalized).digest('hex')).toBe(
+        manifest.artifactReleaseId
+      );
+      expect(crypto.createHash('sha256').update(bundle).digest('hex')).toBe(manifest.sha256);
     } finally {
       fs.rmSync(outputDirectory, { recursive: true, force: true });
     }
@@ -83,5 +150,10 @@ describe('build-prebid-external metadata', () => {
     const parsed = parseArgs(['--adapters', 'rubicon', '--out', 'dist/prebid']);
 
     expect(parsed.outDir).toBe(path.resolve(process.cwd(), 'dist/prebid'));
+  });
+
+  it('canonicalizes module order and rejects duplicate module names', () => {
+    expect(parseArgs(['--adapters', 'rubicon,adf']).adapters).toEqual(['adf', 'rubicon']);
+    expect(() => parseArgs(['--adapters', 'rubicon,rubicon'])).toThrow(/duplicates/);
   });
 });

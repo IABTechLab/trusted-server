@@ -1,9 +1,13 @@
+#[cfg(feature = "aps-runner-proxy")]
+use crate::common::config::aps_runner_proxy_app_config_envelope;
 use crate::common::config::integration_app_config_envelope;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
 use error_stack::ResultExt as _;
 use std::io::{BufRead as _, BufReader};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -53,18 +57,49 @@ impl RuntimeEnvironment for AxumDevServer {
     }
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
+        self.spawn_inner(None)
+    }
+
+    #[cfg(feature = "aps-runner-proxy")]
+    fn spawn_aps_runner_proxy(
+        &self,
+        _wasm_path: &Path,
+        fixture_url: &str,
+    ) -> TestResult<RuntimeProcess> {
+        self.spawn_inner(Some(fixture_url))
+    }
+
+    fn health_check_path(&self) -> &str {
+        "/health"
+    }
+}
+
+impl AxumDevServer {
+    fn spawn_inner(&self, aps_runner_fixture_url: Option<&str>) -> TestResult<RuntimeProcess> {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
+        #[cfg(feature = "aps-runner-proxy")]
+        let app_config = if aps_runner_fixture_url.is_some() {
+            aps_runner_proxy_app_config_envelope(origin_port())?
+        } else {
+            integration_app_config_envelope(origin_port())?
+        };
+        #[cfg(not(feature = "aps-runner-proxy"))]
         let app_config = integration_app_config_envelope(origin_port())?;
 
-        let mut child = Command::new(&binary)
-            .env("PORT", port.to_string())
-            .env(
-                "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
-                app_config,
-            )
-            .envs(INTEGRATION_SECRET_ENV.iter().copied())
+        let mut command = Command::new(&binary);
+        command.env("PORT", port.to_string()).env(
+            "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
+            app_config,
+        );
+        command.envs(INTEGRATION_SECRET_ENV.iter().copied());
+        if let Some(fixture_url) = aps_runner_fixture_url {
+            command.env("TS_APS_RUNNER_PROXY_TEST_ENDPOINT", fixture_url);
+        }
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -73,6 +108,7 @@ impl RuntimeEnvironment for AxumDevServer {
                 "Failed to spawn trusted-server-axum binary at {}",
                 binary.display()
             ))?;
+        super::register_process_group(&mut child)?;
 
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
@@ -97,13 +133,6 @@ impl RuntimeEnvironment for AxumDevServer {
             base_url,
         })
     }
-
-    fn health_check_path(&self) -> &str {
-        "/health"
-    }
-}
-
-impl AxumDevServer {
     /// Resolve the path to the compiled `trusted-server-axum` binary.
     ///
     /// Respects the `AXUM_BINARY_PATH` environment variable for CI overrides.
@@ -149,6 +178,11 @@ impl RuntimeProcessHandle for AxumHandle {}
 
 impl Drop for AxumHandle {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(not(unix))]
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

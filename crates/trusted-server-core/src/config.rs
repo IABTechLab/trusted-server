@@ -16,7 +16,7 @@ use validator::{Validate, ValidationError, ValidationErrors};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
+    adserver_mock::AdServerMockConfig, aps, datadome::DataDomeConfig,
     didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
     gpt_diagnostics::GptDiagnosticsConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
     osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
@@ -263,7 +263,7 @@ fn validate_enabled_integrations(
     resolved_secrets: bool,
 ) -> Result<(), Report<TrustedServerError>> {
     validate_prebid(settings, plan)?;
-    validate_integration::<ApsConfig>(settings, "aps")?;
+    aps::reject_retired_integration_table(settings)?;
     validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
@@ -440,19 +440,6 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
 
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    #[allow(dead_code)]
-    struct LegacyCreativeOpportunitiesConfig {
-        gam_network_id: String,
-        #[serde(default)]
-        auction_timeout_ms: Option<u32>,
-        #[serde(default)]
-        price_granularity: serde_json::Value,
-        #[serde(default)]
-        slot: Vec<serde_json::Value>,
-    }
-
     fn app_config_with_creative_opportunities(
         gam_unit_path: Option<&str>,
     ) -> TrustedServerAppConfig {
@@ -461,6 +448,7 @@ mod tests {
             r#"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "99999"
 
 [[creative_opportunities.slot]]
@@ -812,49 +800,6 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn static_gam_unit_template_is_accepted_by_legacy_schema() {
-        let creative_opportunities = serialized_creative_opportunities(Some("/99999/example/home"));
-
-        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-            .expect("should accept static GAM unit template");
-    }
-
-    #[test]
-    fn absent_gam_unit_template_is_accepted_by_legacy_schema() {
-        let creative_opportunities = serialized_creative_opportunities(None);
-
-        assert!(
-            creative_opportunities.get("enabled").is_none(),
-            "default template switch should be omitted for legacy binaries"
-        );
-        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-            .expect("should accept absent GAM unit template");
-    }
-
-    #[test]
-    fn disabled_creative_opportunities_flag_is_rejected_by_legacy_schema() {
-        let mut toml = crate_test_settings_str();
-        toml.push_str(
-            r#"
-
-[creative_opportunities]
-enabled = false
-gam_network_id = "99999"
-"#,
-        );
-        let app_config: TrustedServerAppConfig =
-            toml::from_str(&toml).expect("should deserialize app config wrapper");
-        let creative_opportunities = serde_json::to_value(app_config)
-            .expect("should serialize app config wrapper")
-            .get("creative_opportunities")
-            .cloned()
-            .expect("should contain creative opportunities");
-
-        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-            .expect_err("legacy binaries should reject an explicit disabled switch");
-    }
-
-    #[test]
     fn app_config_new_rejects_empty_secret_key_reference() {
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new(String::new());
@@ -910,6 +855,24 @@ password = "production-admin-password-32-bytes"
             err.to_string().contains("Insecure default"),
             "error should mention insecure default"
         );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_retired_aps_table_for_both_toggle_values() {
+        for enabled in [true, false] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("aps", &serde_json::json!({ "enabled": enabled }))
+                .expect("should insert retired APS integration table");
+
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("deploy validation should reject retired APS integration table");
+            assert!(
+                error.to_string().contains("[integrations.aps]"),
+                "should identify the retired APS table: {error}"
+            );
+        }
     }
 
     #[test]

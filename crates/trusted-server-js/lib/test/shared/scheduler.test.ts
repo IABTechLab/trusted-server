@@ -42,4 +42,18 @@ describe('shared/scheduler', () => {
     await Promise.resolve();
     expect(perform).toHaveBeenCalledTimes(2);
   });
+
+  it('cancels queued and future work after disposal', async () => {
+    const perform = vi.fn();
+    const schedule = createMutationScheduler(perform);
+    const el = document.createElement('div');
+
+    schedule(el);
+    schedule.dispose();
+    await Promise.resolve();
+    schedule(el);
+    await Promise.resolve();
+
+    expect(perform).not.toHaveBeenCalled();
+  });
 });

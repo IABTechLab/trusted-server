@@ -76,6 +76,49 @@ pub fn assert_unique_script_tag(html: &str) -> TestResult<()> {
     Ok(())
 }
 
+/// Return the exact content-addressed TSJS URL injected into publisher HTML.
+///
+/// The hard cutover intentionally has no unversioned transport alias, so the
+/// integration corpus must discover and validate the release URL produced by
+/// the server instead of constructing a stale filename itself.
+///
+/// # Errors
+///
+/// Returns an error when the script is missing, duplicated, or does not use
+/// the canonical relative unified path plus one lowercase SHA-256 query value.
+pub fn trustedserver_script_src(html: &str) -> TestResult<String> {
+    const PREFIX: &str = "/static/tsjs=tsjs-unified.min.js?v=";
+
+    let document = Html::parse_document(html);
+    let selector = parse_selector("script#trustedserver-js")?;
+    let scripts = document.select(&selector).collect::<Vec<_>>();
+    let [script] = scripts.as_slice() else {
+        return Err(if scripts.is_empty() {
+            Report::new(TestError::ScriptTagNotFound)
+        } else {
+            Report::new(TestError::DuplicateScriptTag)
+        });
+    };
+    let src = script
+        .value()
+        .attr("src")
+        .ok_or_else(|| Report::new(TestError::ScriptTagNotFound))?;
+    let hash = src.strip_prefix(PREFIX).ok_or_else(|| {
+        Report::new(TestError::UnexpectedContent)
+            .attach("trustedserver-js must use the content-addressed unified route")
+    })?;
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Report::new(TestError::UnexpectedContent)
+            .attach("trustedserver-js release hash must be lowercase SHA-256"));
+    }
+
+    Ok(src.to_owned())
+}
+
 /// Assert that origin host URLs in `href`/`src` attributes have been rewritten.
 ///
 /// Checks that the proxied HTML no longer contains the origin host in `href`
@@ -315,6 +358,29 @@ mod tests {
         "#;
 
         assert_script_tag_present(html).expect("should find trustedserver-js script tag");
+    }
+
+    #[test]
+    fn content_addressed_script_src_returns_the_injected_release_url() {
+        let hash = "a".repeat(64);
+        let html = format!(
+            r#"<!DOCTYPE html><script src="/static/tsjs=tsjs-unified.min.js?v={hash}" id="trustedserver-js"></script>"#
+        );
+
+        assert_eq!(
+            trustedserver_script_src(&html).expect("should read the canonical injected URL"),
+            format!("/static/tsjs=tsjs-unified.min.js?v={hash}")
+        );
+    }
+
+    #[test]
+    fn content_addressed_script_src_rejects_the_removed_unversioned_alias() {
+        let html = r#"<!DOCTYPE html><script src="/static/tsjs=tsjs-unified.min.js" id="trustedserver-js"></script>"#;
+
+        assert!(
+            trustedserver_script_src(html).is_err(),
+            "the integration corpus must not resurrect the removed unversioned route"
+        );
     }
 
     #[test]

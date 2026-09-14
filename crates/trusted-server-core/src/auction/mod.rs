@@ -228,6 +228,6 @@ mod plan_sharing_tests {
         let registry = IntegrationRegistry::with_plan(&settings, plan)
             .expect("should build APS renderer registry");
 
-        assert!(registry.has_route(&http::Method::GET, "/integrations/aps/renderer"));
+        assert!(registry.has_reserved_path("/integrations/aps/renderer/v2"));
     }
 }

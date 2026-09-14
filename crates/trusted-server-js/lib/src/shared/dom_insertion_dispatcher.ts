@@ -42,11 +42,11 @@ interface RegisteredDomInsertionHandler extends DomInsertionHandler {
 }
 
 interface DomInsertionDispatcherState {
-  appendChildWrapper?: AppendChildMethod;
-  baselineAppendChild?: AppendChildMethod;
-  baselineInsertBefore?: InsertBeforeMethod;
+  appendChildWrapper?: AppendChildMethod | undefined;
+  baselineAppendChild?: AppendChildMethod | undefined;
+  baselineInsertBefore?: InsertBeforeMethod | undefined;
   handlers: Map<number, RegisteredDomInsertionHandler>;
-  insertBeforeWrapper?: InsertBeforeMethod;
+  insertBeforeWrapper?: InsertBeforeMethod | undefined;
   nextSequence: number;
   orderedHandlers: RegisteredDomInsertionHandler[];
   version: number;

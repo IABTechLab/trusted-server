@@ -1,6 +1,12 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { FIRST_PARTY_CLICK, MUTATED_CLICK, PROXY_RESPONSE, importCreativeModule } from './helpers';
+import {
+  FIRST_PARTY_CLICK,
+  MUTATED_CLICK,
+  PROXY_RESPONSE,
+  activateCreativeRuntime,
+  disposeImportedCreativeModule,
+} from './helpers';
 
 const ORIGINAL_FETCH = global.fetch;
 
@@ -11,13 +17,45 @@ const REBUILD_PREFIX = absolute('/first-party/proxy-rebuild?');
 
 describe('creative/click.ts', () => {
   beforeEach(() => {
+    disposeImportedCreativeModule();
     vi.resetModules();
     document.body.innerHTML = '';
   });
 
   afterEach(() => {
+    disposeImportedCreativeModule();
     global.fetch = ORIGINAL_FETCH;
     vi.useRealTimers();
+  });
+
+  it('owns click listeners and defers the baseline scan until requested', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ href: PROXY_RESPONSE }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+    anchor.setAttribute('href', MUTATED_CLICK);
+    document.body.appendChild(anchor);
+    const removeEventListener = vi.spyOn(document, 'removeEventListener');
+    const { installClickGuard } = await import('../../../src/integrations/creative/click');
+
+    const handle = installClickGuard(false);
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    handle.scan();
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    handle.dispose();
+    handle.dispose();
+    expect(removeEventListener.mock.calls.filter(([type]) => type === 'click')).toHaveLength(1);
+    expect(removeEventListener.mock.calls.filter(([type]) => type === 'auxclick')).toHaveLength(1);
   });
 
   it('repairs anchors via proxy rebuild fallback when fetch is unavailable', async () => {
@@ -29,7 +67,7 @@ describe('creative/click.ts', () => {
     anchor.setAttribute('href', FIRST_PARTY_CLICK);
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
+    await activateCreativeRuntime();
 
     anchor.setAttribute('href', MUTATED_CLICK);
 
@@ -56,7 +94,7 @@ describe('creative/click.ts', () => {
     anchor.setAttribute('href', FIRST_PARTY_CLICK);
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
+    await activateCreativeRuntime();
 
     anchor.setAttribute('href', MUTATED_CLICK);
 
@@ -64,7 +102,7 @@ describe('creative/click.ts', () => {
     await vi.runAllTimersAsync();
 
     expect(fetchMock).toHaveBeenCalled();
-    const call = fetchMock.mock.calls[0];
+    const call = fetchMock.mock.calls[0]!;
     expect(call[0]).toBe('/first-party/proxy-rebuild');
     const payload = JSON.parse(call[1]?.body as string);
     expect(payload).toEqual({
@@ -74,37 +112,27 @@ describe('creative/click.ts', () => {
     });
 
     expect(anchor.getAttribute('href')).toBe(absolute(PROXY_RESPONSE));
-    // data-tsclick keeps the server's root-relative shape: it is echoed back as
-    // the rebuild payload's `tsclick`, which the server parses as a click path.
     expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
   });
 
   it('sends a root-relative tsclick on a second rebuild after a successful one', async () => {
-    // Regression: persisting an absolute canonical click made the next rebuild
-    // POST a value the server rejects as an invalid click path, so the second
-    // mutation was silently lost on non-opaque consumers.
     vi.useFakeTimers();
-
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ href: PROXY_RESPONSE }),
     });
     global.fetch = fetchMock as unknown as typeof fetch;
-
     const anchor = document.createElement('a');
     anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
     anchor.setAttribute('href', FIRST_PARTY_CLICK);
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
-
+    await activateCreativeRuntime();
     anchor.setAttribute('href', MUTATED_CLICK);
     await Promise.resolve();
     await vi.runAllTimersAsync();
-
     expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
 
-    // A second mutation now diffs against the rebuilt canonical click.
     anchor.setAttribute('href', 'https://example.com/landing?baz=3');
     await Promise.resolve();
     await vi.runAllTimersAsync();
@@ -113,11 +141,9 @@ describe('creative/click.ts', () => {
     const payloads = fetchMock.mock.calls.map(
       (call) => JSON.parse(call[1]?.body as string) as { tsclick: string }
     );
-    // Every payload must carry the server's root-relative click form: an
-    // absolute one is rejected as an invalid click path.
-    for (const payload of payloads) {
-      expect(payload.tsclick.startsWith('/first-party/click?')).toBe(true);
-    }
+    expect(payloads.every((payload) => payload.tsclick.startsWith('/first-party/click?'))).toBe(
+      true
+    );
     expect(payloads.some((payload) => payload.tsclick === PROXY_RESPONSE)).toBe(true);
   });
 
@@ -142,7 +168,7 @@ describe('creative/click.ts', () => {
       anchor.setAttribute('href', FIRST_PARTY_CLICK);
       document.body.appendChild(anchor);
 
-      await importCreativeModule();
+      await activateCreativeRuntime();
 
       anchor.setAttribute('href', MUTATED_CLICK);
 
@@ -182,7 +208,7 @@ describe('creative/click.ts', () => {
       anchor.setAttribute('href', FIRST_PARTY_CLICK);
       document.body.appendChild(anchor);
 
-      await importCreativeModule();
+      await activateCreativeRuntime();
 
       anchor.setAttribute('href', MUTATED_CLICK);
       await Promise.resolve();
@@ -231,7 +257,7 @@ describe('creative/click.ts', () => {
       anchor.setAttribute('target', '_blank');
       document.body.appendChild(anchor);
 
-      await importCreativeModule();
+      await activateCreativeRuntime();
 
       // Wave 1: creative mutates the link, observer repairs it.
       anchor.setAttribute('href', MUTATED_CLICK);
@@ -247,7 +273,7 @@ describe('creative/click.ts', () => {
       await vi.runAllTimersAsync();
 
       expect(openMock).toHaveBeenCalled();
-      const navigated = String(openMock.mock.calls[0][0]);
+      const navigated = String(openMock.mock.calls[0]![0]);
       expect(navigated.startsWith(REBUILD_PREFIX)).toBe(true);
       expect(navigated).toContain('add=%7B%22bar%22%3A%222%22%7D');
       expect(navigated).not.toBe(absolute(FIRST_PARTY_CLICK));
@@ -261,17 +287,62 @@ describe('creative/click.ts', () => {
     }
   });
 
-  it('navigates an over-long rebuild through a form POST instead of a GET URL', async () => {
-    // Fastly rejects request URLs over 8192 bytes before the handler runs, and
-    // a signed click with many tracking params exceeds that once nested in
-    // another query string. A form body has no such bound, and a submission is
-    // a navigation — so it is not blocked by CORS from the opaque origin.
+  it('does not reuse an opaque rebuild from a disposed guard generation', async () => {
     vi.useFakeTimers();
-
+    const nextClick =
+      '/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Fnext&wave=2&tstoken=nexttoken';
     const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
     Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
     global.fetch = undefined as unknown as typeof fetch;
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+    let firstGeneration: { dispose(): void; scan(): void } | undefined;
+    let secondGeneration: { dispose(): void; scan(): void } | undefined;
 
+    try {
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', MUTATED_CLICK);
+      anchor.setAttribute('target', '_blank');
+      document.body.appendChild(anchor);
+      const { installClickGuard } = await import('../../../src/integrations/creative/click');
+
+      firstGeneration = installClickGuard(false);
+      firstGeneration.scan();
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+      const firstFallback = anchor.getAttribute('href') ?? '';
+      expect(firstFallback.startsWith(REBUILD_PREFIX)).toBe(true);
+
+      firstGeneration.dispose();
+      anchor.setAttribute('data-tsclick', nextClick);
+      expect(anchor.getAttribute('href')).toBe(firstFallback);
+
+      secondGeneration = installClickGuard(false);
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(openMock).toHaveBeenCalledWith(absolute(nextClick), '_blank', 'noopener,noreferrer');
+      expect(openMock).not.toHaveBeenCalledWith(firstFallback, '_blank', 'noopener,noreferrer');
+    } finally {
+      secondGeneration?.dispose();
+      firstGeneration?.dispose();
+      window.open = originalOpen;
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
+  });
+
+  it('navigates an over-long opaque-origin rebuild through a form POST', async () => {
+    vi.useFakeTimers();
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+    global.fetch = undefined as unknown as typeof fetch;
     const submits: HTMLFormElement[] = [];
     const originalSubmit = HTMLFormElement.prototype.submit;
     HTMLFormElement.prototype.submit = function patched(this: HTMLFormElement) {
@@ -279,7 +350,6 @@ describe('creative/click.ts', () => {
     };
 
     try {
-      // A signed click long enough that the nested rebuild URL crosses the cap.
       const filler = 'a'.repeat(6800);
       const longClick = `/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&pad=${filler}&tstoken=token123`;
       const anchor = document.createElement('a');
@@ -287,24 +357,21 @@ describe('creative/click.ts', () => {
       anchor.setAttribute('href', longClick);
       document.body.appendChild(anchor);
 
-      await importCreativeModule();
-
+      await activateCreativeRuntime();
       anchor.setAttribute('href', `https://example.com/landing?pad=${filler}&bar=2`);
       await Promise.resolve();
       await vi.runAllTimersAsync();
-
       anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       await Promise.resolve();
       await vi.runAllTimersAsync();
 
       expect(submits.length).toBeGreaterThan(0);
       const form = submits[0];
-      expect(form.method.toLowerCase()).toBe('post');
-      expect(form.action).toContain('/first-party/proxy-rebuild');
-      const tsclick = form.querySelector('input[name="tsclick"]') as HTMLInputElement | null;
-      expect(tsclick?.value).toBe(longClick);
-      const add = form.querySelector('input[name="add"]') as HTMLInputElement | null;
-      expect(add?.value).toContain('bar');
+      expect(form?.method.toLowerCase()).toBe('post');
+      expect(form?.action).toContain('/first-party/proxy-rebuild');
+      expect(form?.rel).toBe('noopener noreferrer');
+      expect(form?.querySelector<HTMLInputElement>('input[name="tsclick"]')?.value).toBe(longClick);
+      expect(form?.querySelector<HTMLInputElement>('input[name="add"]')?.value).toContain('bar');
     } finally {
       HTMLFormElement.prototype.submit = originalSubmit;
       if (originDescriptor) {
@@ -312,6 +379,38 @@ describe('creative/click.ts', () => {
       } else {
         delete (window as { origin?: string }).origin;
       }
+    }
+  });
+
+  it('does not form-submit a long non-rebuild URL containing the rebuild path', async () => {
+    vi.useFakeTimers();
+    const submits: HTMLFormElement[] = [];
+    const originalSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function patched(this: HTMLFormElement) {
+      submits.push(this);
+    };
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+
+    try {
+      const targetUrl = `/first-party/landing?next=/first-party/proxy-rebuild&tsclick=fictional&pad=${'a'.repeat(7000)}`;
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', targetUrl);
+      anchor.setAttribute('href', targetUrl);
+      anchor.setAttribute('target', '_blank');
+      document.body.appendChild(anchor);
+
+      await activateCreativeRuntime();
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(submits).toHaveLength(0);
+      expect(openMock).toHaveBeenCalledWith(absolute(targetUrl), '_blank', 'noopener,noreferrer');
+    } finally {
+      HTMLFormElement.prototype.submit = originalSubmit;
+      window.open = originalOpen;
     }
   });
 
@@ -326,7 +425,7 @@ describe('creative/click.ts', () => {
     anchor.setAttribute('href', 'javascript:evil()');
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
+    await activateCreativeRuntime();
 
     anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
     await Promise.resolve();
@@ -337,4 +436,96 @@ describe('creative/click.ts', () => {
     // unhandled navigation error is the assertion that location.href was
     // never assigned the javascript: URL.
   });
+
+  it.each([
+    'https://user@example.com/landing',
+    'https://:password@example.com/landing',
+    'https://%75ser:%70assword@example.com/landing',
+  ])('refuses a credential-bearing navigation URL: %s', async (targetUrl) => {
+    vi.useFakeTimers();
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', targetUrl);
+    anchor.setAttribute('href', targetUrl);
+    anchor.setAttribute('target', '_blank');
+    document.body.appendChild(anchor);
+
+    try {
+      await activateCreativeRuntime();
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(openMock).not.toHaveBeenCalled();
+      expect(anchor.getAttribute('href')).toBe(targetUrl);
+    } finally {
+      window.open = originalOpen;
+    }
+  });
+
+  it.each([
+    ['absolute', 'https://example.com/landing?campaign=fictional'],
+    ['root-relative', '/first-party/landing?campaign=fictional'],
+  ])('preserves valid %s HTTP(S) navigation', async (_caseName, targetUrl) => {
+    vi.useFakeTimers();
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', targetUrl);
+    anchor.setAttribute('href', targetUrl);
+    anchor.setAttribute('target', '_blank');
+    document.body.appendChild(anchor);
+
+    try {
+      await activateCreativeRuntime();
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(openMock).toHaveBeenCalledWith(absolute(targetUrl), '_blank', 'noopener,noreferrer');
+    } finally {
+      window.open = originalOpen;
+    }
+  });
+
+  it.each(['success', 'error'] as const)(
+    'does not persist a late proxy-rebuild %s after disposal',
+    async (outcome) => {
+      let resolveFetch: ((response: Response) => void) | undefined;
+      let rejectFetch: ((reason: unknown) => void) | undefined;
+      global.fetch = vi.fn(
+        () =>
+          new Promise<Response>((resolve, reject) => {
+            resolveFetch = resolve;
+            rejectFetch = reject;
+          })
+      );
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', MUTATED_CLICK);
+      document.body.appendChild(anchor);
+      const { installClickGuard } = await import('../../../src/integrations/creative/click');
+      const handle = installClickGuard(false);
+
+      handle.scan();
+      await vi.waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
+      handle.dispose();
+      if (outcome === 'success') {
+        resolveFetch?.({
+          ok: true,
+          json: async () => ({ href: PROXY_RESPONSE }),
+        } as Response);
+      } else {
+        rejectFetch?.(new Error('fictional late proxy failure'));
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(anchor.getAttribute('href')).toBe(MUTATED_CLICK);
+      expect(anchor.getAttribute('data-tsclick')).toBe(FIRST_PARTY_CLICK);
+    }
+  );
 });

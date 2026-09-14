@@ -1,9 +1,13 @@
 pub mod axum;
 pub mod cloudflare;
 pub mod fastly;
+#[cfg(feature = "aps-runner-proxy")]
+pub mod spin;
 
 use crate::common::runtime::{RuntimeEnvironment, TestError, TestResult};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
+use std::io::Write as _;
+use std::process::Child;
 use std::time::Duration;
 
 /// Runtime factory function type — avoids trait object static initialization issues.
@@ -25,6 +29,48 @@ pub static RUNTIME_ENVIRONMENTS: &[RuntimeFactory] = &[
     || Box::new(axum::AxumDevServer),
     || Box::new(cloudflare::CloudflareWorkers),
 ];
+
+/// Record an isolated runtime process group for the task-level shell trap.
+///
+/// The APS corpus launcher supplies a freshly-created file. Recording happens
+/// immediately after spawn so an interrupted Cargo process cannot leave the
+/// adapter's separately-isolated process tree behind.
+#[cfg(unix)]
+pub(crate) fn register_process_group(child: &mut Child) -> TestResult<()> {
+    let Some(path) = std::env::var_os("APS_RUNNER_PROXY_PROCESS_GROUP_FILE") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    let result = (|| {
+        if !path.is_absolute() {
+            return Err(Report::new(TestError::RuntimeSpawn)
+                .attach("APS process-group registry path must be absolute"));
+        }
+        let mut registry = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .change_context(TestError::RuntimeSpawn)
+            .attach(format!(
+                "failed to open APS process-group registry {}",
+                path.display()
+            ))?;
+        writeln!(registry, "{}", child.id())
+            .change_context(TestError::RuntimeSpawn)
+            .attach("failed to register APS runtime process group")
+    })();
+    if result.is_err() {
+        unsafe {
+            libc::killpg(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = child.wait();
+    }
+    result
+}
+
+#[cfg(not(unix))]
+pub(crate) fn register_process_group(_child: &mut Child) -> TestResult<()> {
+    Ok(())
+}
 
 /// Readiness polling configuration for runtimes and frontend containers.
 pub(crate) struct ReadyCheckOptions {

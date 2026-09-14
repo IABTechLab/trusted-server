@@ -45,7 +45,9 @@ pub fn register(
     };
 
     Ok(Some(
-        IntegrationRegistration::builder(OSANO_INTEGRATION_ID).build(),
+        IntegrationRegistration::builder(OSANO_INTEGRATION_ID)
+            .with_empty_browser_config_v1()?
+            .build(),
     ))
 }
 

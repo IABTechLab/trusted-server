@@ -574,8 +574,8 @@ fn process_auction_creative_with_rewriter(
 /// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - Injects the `tsjs-creative` script once at the top of `<body>` to safeguard click URLs inside creatives
-///   (served from `/static/tsjs=tsjs-creative.min.js`).
+/// - Injects one exact creative boot controller and content-addressed runtime
+///   artifact at the top of `<body>` to safeguard click URLs inside creatives.
 ///
 /// The proxy/click URLs are emitted **root-relative** (`/first-party/…`), which
 /// resolves only when the creative's document base URL is the first-party origin.
@@ -671,6 +671,18 @@ fn rewrite_creative_html_impl(
     if markup.is_empty() {
         return String::new();
     }
+    let creative_tsjs = if inject_tsjs {
+        match tsjs::creative_tsjs_bootstrap_v1(settings) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                log::warn!("rewrite_creative_html: invalid TSJS creative bootstrap: {error}");
+                return String::new();
+            }
+        }
+    } else {
+        None
+    };
+    let creative_tsjs = std::rc::Rc::new(creative_tsjs);
     // No size parsing needed now; all absolute/protocol-relative URLs are proxied uniformly.
     let mut out = Vec::with_capacity(markup.len() + 64);
     // Shared with the `body` handler through an `Rc` so the outcome is readable
@@ -698,13 +710,15 @@ fn rewrite_creative_html_impl(
                     el.remove();
                     Ok(())
                 }),
-                // Inject unified tsjs bundle at the top of body once
+                // Inject the exact document-local creative bootstrap at the top of body once.
                 element!("body", {
                     let injected = std::rc::Rc::clone(&injected_ts_creative);
+                    let creative_tsjs = std::rc::Rc::clone(&creative_tsjs);
                     move |el| {
-                        if inject_tsjs && !injected.get() {
-                            let script_tag = tsjs::tsjs_unified_script_tag();
-                            el.prepend(&script_tag, ContentType::Html);
+                        if let Some(bootstrap) = creative_tsjs.as_deref()
+                            && !injected.get()
+                        {
+                            el.prepend(bootstrap, ContentType::Html);
                             injected.set(true);
                         }
                         Ok(())
@@ -922,8 +936,11 @@ fn rewrite_creative_html_impl(
     // Empty output is never injected into: the markup was rejected upstream or
     // rewrote to nothing, and a script-only result would read as an accepted
     // creative that renders blank.
-    if inject_tsjs && !injected_ts_creative.get() && !rewritten.is_empty() {
-        rewritten.insert_str(0, &tsjs::tsjs_unified_script_tag());
+    if let Some(bootstrap) = creative_tsjs.as_deref()
+        && !injected_ts_creative.get()
+        && !rewritten.is_empty()
+    {
+        rewritten.insert_str(0, bootstrap);
         if rewritten.len() > max_output_size {
             log::warn!(
                 "rewrite_creative_html: output exceeds {} byte cap after runtime injection; rejecting",
@@ -1032,6 +1049,7 @@ mod tests {
         process_auction_creative, rewrite_creative_html, rewrite_inline_creative_html,
         rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
     };
+    use crate::test_support::tests::bootstrap_transport;
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
         let settings = crate::test_support::tests::create_test_settings();
@@ -1103,8 +1121,25 @@ mod tests {
             out.contains("/static/tsjs=tsjs-unified.min.js"),
             "expected unified tsjs injection: {out}"
         );
-        // Inject only once
-        assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
+        assert!(out.contains("__TSJS_SERVER_BOOT_TRANSPORT_V1__"));
+        let transport = bootstrap_transport(&out);
+        assert_eq!(
+            transport["boot"]["manifest"]["integrations"],
+            serde_json::json!([
+                {"id":"render_runtime","phase":"takeover"},
+                {"id":"creative","phase":"takeover"}
+            ]),
+            "expected exact creative runtime membership: {out}"
+        );
+        assert!(
+            transport["boot"]["manifest"]["integrations"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["id"] != "gpt")),
+            "must not ship GPT into a creative: {out}"
+        );
+        // The source appears in both the authenticated manifest and the tag;
+        // the executable tag itself is still emitted exactly once.
+        assert_eq!(out.matches("id=\"trustedserver-js\"").count(), 1);
     }
 
     #[test]
@@ -1112,7 +1147,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let html = "<html><body>one</body><body>two</body></html>";
         let out = rewrite_creative_html(&settings, html);
-        assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
+        assert_eq!(out.matches("id=\"trustedserver-js\"").count(), 1);
     }
 
     #[test]
@@ -1789,11 +1824,7 @@ mod tests {
             out.contains("/static/tsjs=tsjs-unified.min.js"),
             "should inject the creative runtime without a body token: {out}"
         );
-        assert_eq!(
-            out.matches("/static/tsjs=tsjs-unified.min.js").count(),
-            1,
-            "should inject exactly once: {out}"
-        );
+        assert_eq!(out.matches("id=\"trustedserver-js\"").count(), 1, "{out}");
         assert!(
             out.contains("/first-party/click?tsurl="),
             "should still rewrite click URLs: {out}"

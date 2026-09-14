@@ -55,7 +55,6 @@ Add GPT configuration to `trusted-server.toml`:
 enabled = true
 gam_attribution_enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
-cache_ttl_seconds = 3600
 rewrite_script = true
 ```
 
@@ -66,7 +65,6 @@ rewrite_script = true
 | `enabled`                 | boolean | No       | `true`                                                 | Enable/disable the integration                                    |
 | `gam_attribution_enabled` | boolean | No       | `false`                                                | Add fixed page-level `ts=true` targeting for GAM cohort reporting |
 | `script_url`              | string  | No       | `https://securepubads.g.doubleclick.net/tag/js/gpt.js` | URL for the GPT bootstrap script                                  |
-| `cache_ttl_seconds`       | integer | No       | `3600`                                                 | Cache TTL for proxied scripts (60--86400s)                        |
 | `rewrite_script`          | boolean | No       | `true`                                                 | Whether to rewrite GPT script URLs in HTML                        |
 
 The environment override

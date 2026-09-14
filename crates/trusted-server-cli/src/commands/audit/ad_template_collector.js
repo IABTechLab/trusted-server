@@ -12,7 +12,6 @@ const __ts_prefixes = Array.isArray(__ts_config.div_prefixes) ? __ts_config.div_
 const __ts_ev = (window.__tsAdTemplateEvidence = window.__tsAdTemplateEvidence || {
   dom_ids: [],
   gpt_slots: [],
-  aps_calls: [],
   warnings: []
 })
 

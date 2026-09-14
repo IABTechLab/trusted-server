@@ -45,10 +45,12 @@ and non-storeable.
 
 ### Auction correlation token
 
-Enabling the integration has one further server-side effect, beyond module
-availability, that does not depend on browser activation. For each server-side auction
-that produced winning bids, Trusted Server mints a fresh correlation token and publishes
-it as `hb_auction_id` on each winning bid in `window.tsjs.bids`:
+Enabling the integration has one server-side effect that does not depend on browser
+activation. For each server-side auction that produced winning bids, Trusted Server
+mints a fresh correlation token and publishes it as `hb_auction_id` on each winning
+bid targeting record in the initial immutable `tsjs.boot.auctionProjection`. A later
+SPA page-bids response keeps its replacement projection internal to that navigation
+session:
 
 ```text
 ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d
@@ -385,12 +387,12 @@ have elapsed. GPT callback capture and integration evidence can begin earlier.
 ## Browser API
 
 When active, the integration exposes a read-only operator API. It has exactly the
-five methods below; the evidence writers Trusted Server's own integration modules
-use live on a separate internal channel (`window.tsjs.gptDiagnosticsRecorder`) that
-is not part of this contract and is not supported for operator use.
+five methods below. Trusted Server's own integration modules write evidence through
+a closure-private recorder capability passed directly between TSJS owners. That
+capability is never published on `window` and is not part of the operator contract.
 
 ```js
-const diagnostics = window.tsjs.gptDiagnostics
+const diagnostics = window.tsjs.diagnostics.gpt
 
 diagnostics.snapshot()
 diagnostics.export()

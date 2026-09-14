@@ -119,7 +119,17 @@ impl TestScenario {
             }
 
             Self::ScriptServing => {
-                let url = format!("{base_url}/static/tsjs=tsjs-unified.min.js");
+                let html = reqwest::blocking::get(base_url)
+                    .change_context(TestError::HttpRequest)
+                    .attach(format!(
+                        "scenario: ScriptServing discovery, framework: {framework_id}"
+                    ))?
+                    .text()
+                    .change_context(TestError::ResponseParse)
+                    .attach(format!("framework: {framework_id}"))?;
+                let script_src = assertions::trustedserver_script_src(&html)
+                    .attach(format!("framework: {framework_id}"))?;
+                let url = format!("{base_url}{script_src}");
 
                 let resp = reqwest::blocking::get(&url)
                     .change_context(TestError::HttpRequest)

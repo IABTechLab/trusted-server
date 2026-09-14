@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::auction::types::{BidRenderer, OrchestratorExt};
+use crate::auction::types::{BidRenderSourceV1, OrchestratorExt};
 
 pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
@@ -180,7 +180,7 @@ impl ToExt for BidExt<'_> {}
 
 #[derive(Debug, Serialize)]
 pub struct BidTrustedServerExt<'a> {
-    pub renderer: &'a BidRenderer,
+    pub renderer: &'a BidRenderSourceV1,
 }
 
 #[derive(Debug, Serialize)]

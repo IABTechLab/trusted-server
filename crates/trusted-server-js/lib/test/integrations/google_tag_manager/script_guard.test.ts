@@ -372,10 +372,10 @@ describe('GTM Beacon Guard', () => {
     originalFetch = window.fetch;
 
     sendBeaconSpy = vi.fn(() => true);
-    navigator.sendBeacon = sendBeaconSpy;
+    navigator.sendBeacon = sendBeaconSpy as typeof navigator.sendBeacon;
 
     fetchSpy = vi.fn(() => Promise.resolve(new Response('', { status: 200 })));
-    window.fetch = fetchSpy;
+    window.fetch = fetchSpy as typeof window.fetch;
 
     resetBeaconGuardState();
   });
@@ -397,7 +397,7 @@ describe('GTM Beacon Guard', () => {
 
     navigator.sendBeacon('https://www.google-analytics.com/g/collect?v=2&tid=G-JGPCNWGVHC', '');
 
-    const calledUrl = sendBeaconSpy.mock.calls[0][0];
+    const calledUrl = sendBeaconSpy.mock.calls[0]![0];
     expect(calledUrl).toContain('/integrations/google_tag_manager/g/collect');
     expect(calledUrl).not.toContain('google-analytics.com');
   });
@@ -407,7 +407,7 @@ describe('GTM Beacon Guard', () => {
 
     navigator.sendBeacon('https://analytics.google.com/g/collect?v=2&tid=G-DQMZGMPHXN', '');
 
-    const calledUrl = sendBeaconSpy.mock.calls[0][0];
+    const calledUrl = sendBeaconSpy.mock.calls[0]![0];
     expect(calledUrl).toContain('/integrations/google_tag_manager/g/collect');
     expect(calledUrl).not.toContain('analytics.google.com');
   });
@@ -417,7 +417,7 @@ describe('GTM Beacon Guard', () => {
 
     await window.fetch('https://www.google-analytics.com/g/collect?v=2&tid=G-TEST');
 
-    const calledUrl = fetchSpy.mock.calls[0][0];
+    const calledUrl = fetchSpy.mock.calls[0]![0];
     expect(calledUrl).toContain('/integrations/google_tag_manager/g/collect');
     expect(calledUrl).not.toContain('google-analytics.com');
   });
@@ -435,7 +435,7 @@ describe('GTM Beacon Guard', () => {
 
     navigator.sendBeacon('https://www.google-analytics.com/g/collect?v=2&tid=G-TEST&cid=123', '');
 
-    const calledUrl = sendBeaconSpy.mock.calls[0][0];
+    const calledUrl = sendBeaconSpy.mock.calls[0]![0];
     expect(calledUrl).toContain('v=2&tid=G-TEST&cid=123');
   });
 });
