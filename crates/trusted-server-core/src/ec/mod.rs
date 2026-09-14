@@ -734,12 +734,12 @@ mod tests {
             }
             self.inner.insert(key, write)
         }
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
