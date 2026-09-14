@@ -21891,78 +21891,94 @@ mod tests {
             // navigation preload that follows read under the identifier as
             // issued, found nothing there, and replaced that snapshot with a
             // miss, so EC finalization skipped the cookie for the identifier
-            // this request had just created.
-            let settings = settings_with_capturing_provider();
-            let captured = Arc::new(Mutex::new(None));
-            let orchestrator = orchestrator_capturing_request(&settings, &captured);
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
-            let services = services_with(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-                Arc::new(RecordingTelemetrySink::default()),
-            );
-            let graph = KvIdentityGraph::in_memory("navigation-new-identifier-store");
-            let consent = crate::consent::ConsentContext {
-                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
-                ..Default::default()
-            };
-            let mut ec_context = EcContext::new_for_test(None, consent)
-                .with_provider_for_test(Arc::new(CanonicalizingProvider));
-            ec_context
-                .generate_if_needed(&settings, Some(&graph))
-                .expect("should create the identifier through the provider");
-            assert_eq!(
-                ec_context.ec_value(),
-                Some(CANONICAL_COOKIE_VALUE),
-                "test precondition: the provider should create its identifier"
-            );
-            let req = HttpRequest::builder()
-                .method(Method::GET)
-                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
-                .header(header::HOST, EDGE_HOST)
-                .header("sec-fetch-dest", "document")
-                .body(EdgeBody::empty())
-                .expect("should build test request");
+            // this request had just created. The second store's first point
+            // read misses the row generation just wrote, as an eventually
+            // consistent store can right after a write. The preload keeps
+            // generation's snapshot in that case only when it compares both
+            // snapshots under the canonical key.
+            let stores = [
+                (
+                    "a consistent store",
+                    KvIdentityGraph::in_memory("navigation-new-identifier-store"),
+                ),
+                (
+                    "a store whose first point read misses",
+                    KvIdentityGraph::stale_lookup("navigation-stale-read-store", 1),
+                ),
+            ];
+            for (store, graph) in stores {
+                let settings = settings_with_capturing_provider();
+                let captured = Arc::new(Mutex::new(None));
+                let orchestrator = orchestrator_capturing_request(&settings, &captured);
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+                let services = services_with(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let consent = crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..Default::default()
+                };
+                let mut ec_context = EcContext::new_for_test(None, consent)
+                    .with_provider_for_test(Arc::new(CanonicalizingProvider));
+                ec_context
+                    .generate_if_needed(&settings, Some(&graph))
+                    .expect("should create the identifier through the provider");
+                assert_eq!(
+                    ec_context.ec_value(),
+                    Some(CANONICAL_COOKIE_VALUE),
+                    "test precondition: the provider should create its identifier"
+                );
+                let req = HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                    .header(header::HOST, EDGE_HOST)
+                    .header("sec-fetch-dest", "document")
+                    .body(EdgeBody::empty())
+                    .expect("should build test request");
 
-            let _ = handle_publisher_request(
-                &settings,
-                &services,
-                Some(&graph),
-                &mut ec_context,
-                AuctionDispatch {
-                    orchestrator: &orchestrator,
-                    slots: &[],
-                    registry: None,
-                },
-                req,
-                EdgeCacheHeader::SMaxageFallback,
-            )
-            .await
-            .expect("should proxy publisher request");
+                let _ = handle_publisher_request(
+                    &settings,
+                    &services,
+                    Some(&graph),
+                    &mut ec_context,
+                    AuctionDispatch {
+                        orchestrator: &orchestrator,
+                        slots: &[],
+                        registry: None,
+                    },
+                    req,
+                    EdgeCacheHeader::SMaxageFallback,
+                )
+                .await
+                .expect("should proxy publisher request");
 
-            let mut response = Response::new(EdgeBody::empty());
-            crate::ec::finalize::ec_finalize_response(
-                &settings,
-                &mut ec_context,
-                Some(&graph),
-                &PartnerRegistry::empty(),
-                None,
-                None,
-                &mut response,
-            );
+                let mut response = Response::new(EdgeBody::empty());
+                crate::ec::finalize::ec_finalize_response(
+                    &settings,
+                    &mut ec_context,
+                    Some(&graph),
+                    &PartnerRegistry::empty(),
+                    None,
+                    None,
+                    &mut response,
+                );
 
-            let cookies: Vec<&str> = response
-                .headers()
-                .get_all(header::SET_COOKIE)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect();
-            assert!(
-                cookies
+                let cookies: Vec<&str> = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
                     .iter()
-                    .any(|cookie| cookie.starts_with("ts-ec=") && !cookie.contains("Max-Age=0")),
-                "the identifier this request created should reach the browser, got {cookies:?}"
-            );
+                    .filter_map(|value| value.to_str().ok())
+                    .collect();
+                assert!(
+                    cookies
+                        .iter()
+                        .any(|cookie| cookie.starts_with("ts-ec=") && !cookie.contains("Max-Age=0")),
+                    "the identifier this request created should reach the browser with {store}, \
+                     got {cookies:?}"
+                );
+            }
         }
 
         #[tokio::test]

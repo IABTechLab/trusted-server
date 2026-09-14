@@ -482,10 +482,9 @@ impl EcContext {
         // validation and identity-graph row generation enforces. A rejection
         // returns an error, as the identifier-bounds rejection below does.
         // Because the check runs before the headers are captured, nothing from
-        // a rejected provider response is kept, and the caller serves the
-        // response without a new Edge Cookie. Checked before the identifier is
-        // read, because a provider can return headers with no identifier at
-        // all.
+        // a rejected provider response is kept, and the response is served
+        // without a new Edge Cookie. Checked before the identifier is read,
+        // because a provider can return headers with no identifier at all.
         for (name, value) in &generated.response_headers {
             if let Some(effect) = provider::reserved_response_effect(name, value) {
                 return Err(Report::new(TrustedServerError::EdgeCookie {
@@ -649,13 +648,14 @@ impl EcContext {
     /// at creation.
     ///
     /// Identify, EC finalization and pull sync read and write this
-    /// identifier's row under this key, and so do the snapshot reads and EID
-    /// resolution of the publisher navigation, `/auction` and `/_ts/page-bids`
-    /// paths. Each reaches the key through this or through
-    /// [`ec_kv_key`](Self::ec_kv_key), which wraps it. Batch sync and the admin
-    /// lookup have no EC context, so they call
-    /// [`AcceptedProviders::canonical_kv_key`](provider::AcceptedProviders::canonical_kv_key)
-    /// directly, which this wraps.
+    /// identifier's row under this key. The publisher navigation, `/auction`
+    /// and `/_ts/page-bids` paths load their request snapshot under this key,
+    /// and EID resolution looks the entry up in that snapshot under this key.
+    /// Each of these reaches the key through this function or through
+    /// [`ec_kv_key`](Self::ec_kv_key), which wraps this function. Batch sync
+    /// and the admin lookup have no EC context, so they call
+    /// [`AcceptedProviders::canonical_kv_key`](provider::AcceptedProviders::canonical_kv_key),
+    /// the function this one wraps, directly.
     ///
     /// `None` when no provider this deployment reads owns `value`, in which
     /// case there is no row to read or write.
@@ -1722,12 +1722,12 @@ pub(crate) mod tests {
 
     #[test]
     fn a_rejected_provider_effect_never_reaches_the_finalized_response() {
-        // Returning the error is half of the rule. The caller logs the error
-        // and still serves the response, and EC finalization runs on that
-        // response with this same context, so a rejected header kept anywhere
-        // on the context would reach the browser anyway. The provider also
-        // returns an identifier here, to show that nothing from the rejected
-        // provider response is kept.
+        // Returning the error is half of the rule. The publisher and
+        // integration proxies log the error and still serve the response, and
+        // EC finalization applies the response headers this same context
+        // holds, so a rejected header kept among them would reach the browser
+        // anyway. The provider also returns an identifier here, to show that
+        // nothing from the rejected provider response is kept.
         for (name, value) in [
             ("set-cookie", "ts-ec=forged-value; Path=/"),
             ("x-ts-ec", "forged"),

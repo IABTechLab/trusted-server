@@ -199,8 +199,8 @@ pub fn deny_admin_diagnostic_fallback(req: &Request<EdgeBody>) -> Option<Respons
 struct AdminEcLookupResponse {
     /// The EC ID as requested, from the path or the `ts-ec` cookie.
     ec_id: String,
-    /// The identity-graph key the entry was read from, the owning provider's
-    /// canonical form of `ec_id`.
+    /// The identity-graph key the entry was read from, being the canonical form
+    /// of `ec_id` that [`AcceptedProviders::canonical_kv_key`] returns.
     kv_key: String,
     /// Platform KV store name the entry was read from.
     store: String,
@@ -293,8 +293,9 @@ pub fn handle_admin_ec_lookup(
 
     // Read the row under the owning provider's canonical form of the
     // identifier, the key the row is stored under, rather than under the
-    // identifier as requested. The two differ for a provider whose canonical
-    // form is not the cookie value.
+    // identifier as requested. The two differ whenever the canonical form is
+    // not the requested string itself, for example for a built-in HMAC
+    // identifier requested with its hash in uppercase.
     let Some(lookup) = kv.lookup_raw(&requested.kv_key)? else {
         log::info!(
             "Admin EC lookup: no entry for '{}'",
@@ -360,7 +361,9 @@ fn cookie_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeBody
 struct RequestedEcId {
     /// The EC ID as requested, from the path or the `ts-ec` cookie.
     ec_id: String,
-    /// The owning provider's canonical form of `ec_id`.
+    /// The canonical form of `ec_id` that
+    /// [`AcceptedProviders::canonical_kv_key`] returns, which the row is stored
+    /// under.
     kv_key: String,
 }
 
@@ -370,8 +373,9 @@ struct RequestedEcId {
 /// The identifier is validated in two parts: the global cookie bounds, then
 /// the provider that owns its `{code}~` prefix, so an operator can look up an
 /// identifier created by whichever provider this deployment reads rather than
-/// only a built-in HMAC one. That provider also supplies the key, its canonical
-/// form of the identifier.
+/// only a built-in HMAC one. The same check supplies the key, the canonical
+/// form of the identifier that [`AcceptedProviders::canonical_kv_key`]
+/// returns.
 ///
 /// Returns the (boxed) error response to send directly when no valid ID is
 /// available.

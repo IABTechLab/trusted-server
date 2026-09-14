@@ -99,8 +99,8 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
 /// The request snapshot lookup, the revalidation read and the write-back all
 /// use the context's identity-graph key, the owning provider's canonical form
 /// of the EC ID, because that is the key the row is stored under. Partners
-/// still receive the EC ID as issued, and the per-partner rate limit is keyed
-/// by that EC ID's hash.
+/// still receive the EC ID as issued, and the per-partner rate limit key uses
+/// `ec_hash` of that EC ID.
 ///
 /// # Consent revalidation
 ///

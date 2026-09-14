@@ -553,7 +553,7 @@ This lookup is implemented only by the Fastly adapter because the identity graph
 
 **Response fields:**
 
-- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from, which is the owning provider's canonical form of `ec_id` and the same string for an identifier the built-in HMAC provider issued. `store` and `generation` identify the raw KV lookup.
+- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC provider issued. `store` and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.

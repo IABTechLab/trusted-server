@@ -513,12 +513,13 @@ pub fn provider_kv_key(provider: &dyn EdgeCookieProvider, full: &str) -> String 
 /// second provider's identifiers can never be adopted or written under this
 /// deployment's keys.
 ///
-/// All three read and write rows under the key
+/// All three look rows up under the key
 /// [`canonical_kv_key`](Self::canonical_kv_key) returns rather than under the
-/// identifier as given, so a provider whose canonical form differs from the
-/// cookie value still reaches the row it created. Batch sync and the admin
-/// lookup call it directly. Pull sync reaches it through `EcContext::kv_key_for`
-/// and still sends partners the identifier as issued.
+/// identifier as given, and pull sync and batch sync also write under that
+/// key, so a provider whose canonical form differs from the cookie value still
+/// reaches the row it created. Batch sync and the admin lookup call
+/// `canonical_kv_key` directly. Pull sync calls `canonical_kv_key` through
+/// `EcContext::kv_key_for` and still sends partners the identifier as issued.
 ///
 /// The set holds the deployment's active provider. The design's
 /// `legacy_providers` reader list, the providers that never create but must still
