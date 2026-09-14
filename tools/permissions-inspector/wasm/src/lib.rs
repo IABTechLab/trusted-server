@@ -3,13 +3,28 @@
 //! functions the server runs: `build_context_from_signals` decodes the raw
 //! consent signals and `assemble_permissions` resolves the policy.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde_json::json;
 use trusted_server_core::consent::build_context_from_signals;
 use trusted_server_core::consent::types::RawConsentSignals;
 use trusted_server_core::ec::consent::{GeoStatus, assemble_permissions};
+use trusted_server_core::evidence::OwnedRequestInfo;
+use trusted_server_core::permission_signal::PermissionSignalProvider;
 use trusted_server_core::permissions::{Permission, PermissionMaps};
 use trusted_server_core::platform::GeoInfo;
+
+/// The signal providers the inspector asks, in the order every adapter offers
+/// them when `[permission_signal] sources` names none.
+fn providers() -> Vec<Arc<dyn PermissionSignalProvider>> {
+    vec![
+        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+    ]
+}
 
 /// The inspector's evaluation request.
 #[derive(Deserialize)]
@@ -38,14 +53,20 @@ fn eval_json(input: &str) -> String {
         gpc: input.gpc,
     };
     let ctx = build_context_from_signals(&signals);
+    // The page carries no request, only the consent signals above, and each of
+    // the four providers answers from the consent record rather than from
+    // request evidence, so empty evidence changes none of their answers. A
+    // provider that read a header or a cookie would need real evidence here.
+    let evidence = OwnedRequestInfo::default();
+    let providers = providers();
     let maps = PermissionMaps::standard();
     let (state, jurisdiction) = match input.geo.as_str() {
         "failed" => {
-            let state = assemble_permissions(&ctx, GeoStatus::Failed);
+            let state = assemble_permissions(&ctx, &evidence, GeoStatus::Failed, &providers);
             (state, "unknown".to_string())
         }
         "none" => {
-            let state = assemble_permissions(&ctx, GeoStatus::NoLocation);
+            let state = assemble_permissions(&ctx, &evidence, GeoStatus::NoLocation, &providers);
             (state, jurisdiction_name(maps.default_jurisdiction()))
         }
         _ => {
@@ -59,7 +80,8 @@ fn eval_json(input: &str) -> String {
                 region: input.region.clone().filter(|r| !r.is_empty()),
                 asn: None,
             };
-            let state = assemble_permissions(&ctx, GeoStatus::Located(&info));
+            let state =
+                assemble_permissions(&ctx, &evidence, GeoStatus::Located(&info), &providers);
             let jurisdiction = jurisdiction_name(
                 maps.jurisdiction_for(input.country.as_deref(), input.region.as_deref()),
             );
@@ -83,7 +105,8 @@ fn eval_json(input: &str) -> String {
 fn jurisdiction_name(j: trusted_server_core::consent::jurisdiction::Jurisdiction) -> String {
     let name = format!("{j:?}").to_lowercase();
     let name = name.split('(').next().unwrap_or(&name).to_string();
-    name.replace("usstate", "us-state").replace("nonregulated", "non-regulated")
+    name.replace("usstate", "us-state")
+        .replace("nonregulated", "non-regulated")
 }
 
 fn validate_json(yaml: &str) -> String {

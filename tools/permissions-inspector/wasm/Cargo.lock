@@ -538,7 +538,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.7#5c9886e51d17e6969531356bacdf27f144ac8a2e"
+source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -569,7 +569,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.7#5c9886e51d17e6969531356bacdf27f144ac8a2e"
+source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
 dependencies = [
  "log",
  "proc-macro2",
@@ -1322,6 +1322,10 @@ dependencies = [
  "serde",
  "serde_json",
  "trusted-server-core",
+ "trusted-server-permission-signal-gpc",
+ "trusted-server-permission-signal-gpp",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
 ]
 
 [[package]]
@@ -2038,6 +2042,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "cookie",
+ "cssparser",
  "derive_more",
  "ed25519-dalek",
  "edgezero-core",
@@ -2090,6 +2095,34 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-gpc"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-gpp"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-tcf"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-us-privacy"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
 ]
 
 [[package]]

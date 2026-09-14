@@ -30,8 +30,17 @@ fn workspace_version() -> String {
 
 fn main() {
     println!("cargo:rustc-env=TS_CORE_VERSION={}", workspace_version());
-    println!("cargo:rustc-env=TS_CORE_COMMIT={}", git(&["rev-parse", "--short=9", "HEAD"]));
-    println!("cargo:rustc-env=TS_CORE_DATE={}", git(&["show", "-s", "--format=%cs", "HEAD"]));
-    println!("cargo:rustc-env=TS_CORE_BRANCH={}", git(&["rev-parse", "--abbrev-ref", "HEAD"]));
+    println!(
+        "cargo:rustc-env=TS_CORE_COMMIT={}",
+        git(&["rev-parse", "--short=9", "HEAD"])
+    );
+    println!(
+        "cargo:rustc-env=TS_CORE_DATE={}",
+        git(&["show", "-s", "--format=%cs", "HEAD"])
+    );
+    println!(
+        "cargo:rustc-env=TS_CORE_BRANCH={}",
+        git(&["rev-parse", "--abbrev-ref", "HEAD"])
+    );
     println!("cargo:rerun-if-changed=../../../Cargo.toml");
 }
