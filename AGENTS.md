@@ -156,7 +156,7 @@ cargo install viceroy --version 0.17.0 --locked --force
 
 The Rust adapter tests run natively on Windows through the cargo aliases
 (`cargo test-fastly` via Viceroy, `cargo test-axum`, `cargo test-cloudflare`),
-and CI runs these on both `ubuntu-latest` and `windows-latest`.
+and CI runs them on `ubuntu-latest`.
 
 The Docker-based integration suite (`scripts/integration-tests.sh`) and the
 Cloudflare worker build (`crates/trusted-server-adapter-cloudflare/build.sh`,
@@ -165,6 +165,10 @@ inside WSL (Ubuntu) with Docker Desktop's WSL integration enabled. Provision the
 WSL distro with the same toolchain as `.tool-versions` (rustup + the
 `wasm32-wasip1` / `wasm32-unknown-unknown` targets, Node, Viceroy, wrangler), then
 run the scripts from a clone on the WSL native filesystem for fast builds.
+The CLI crate (`trusted-server-cli`) does not build on a Windows host either,
+because its dependency `edgezero-adapter-fastly` uses a standard library
+feature that is unstable on Windows, so run its tests and the template cache
+harness (`scripts/template-cache-local-test.sh`), which builds it, in WSL too.
 
 ---
 
