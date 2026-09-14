@@ -250,6 +250,18 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
+# The permission baseline and consent handling come from the permissions.yaml
+# rules tree compiled into the binary. The Viceroy geolocation block appended
+# to the harness fastly.toml below maps the loopback client to US/CA, and the
+# platform geo provider is selected here, so the auction runs under the US
+# state opt-out rules with no consent signal, which is what the retired
+# default_country lever used to arrange.
+s = replace_once(
+    s,
+    chr(10) + '# provider = "platform"' + chr(10),
+    chr(10) + 'provider = "platform"' + chr(10),
+    "platform geo provider",
+)
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
@@ -319,6 +331,33 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
+# Give Viceroy a geolocation answer for the loopback client, so the platform
+# geo provider selected in the app config resolves US/CA.
+cat >> "$WORK/fastly.toml" <<'GEOEOF'
+
+[local_server.geolocation]
+format = "inline-toml"
+
+[local_server.geolocation.addresses."127.0.0.1"]
+as_name = "Local Harness"
+as_number = 64496
+area_code = 0
+city = "Test City"
+conn_speed = "broadband"
+conn_type = "wired"
+continent = "NA"
+country_code = "US"
+country_code3 = "USA"
+country_name = "United States"
+latitude = 0.0
+longitude = 0.0
+metro_code = 0
+postal_code = "00000"
+proxy_description = "?"
+proxy_type = "?"
+region = "CA"
+utc_offset = -800
+GEOEOF
 
 # The application registers provider backends dynamically. Pre-register the exact
 # deterministic name so Viceroy reuses a local backend that trusts the temporary CA.
