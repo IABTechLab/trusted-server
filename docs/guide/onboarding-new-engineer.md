@@ -1,32 +1,87 @@
 # New Engineer Onboarding
 
 This page orients a new engineer on the Trusted Server codebase. It answers the
-questions the reference guides assume you already know: what the system does,
-how one request flows through it, what the ad-tech vocabulary means here, and
-what to do in your first week.
+questions the reference guides assume you already know: what problem the system
+solves, how one request flows through it, what the ad-tech vocabulary means
+here, and what to do in your first week.
 
 Read [What is Trusted Server?](/guide/what-is-trusted-server) for the product
 framing and [Getting Started](/guide/getting-started) for setup. This page is
 the bridge between them and the rest of the documentation.
 
-## What the system does
+## Project overview
 
-A publisher puts Trusted Server in front of their site at the CDN edge. Every
-page request passes through it before reaching the publisher's origin. That
-position lets Trusted Server do three things a page script cannot:
+Trusted Server is an open-source edge computing framework from IAB Tech Lab
+that moves advertising operations out of third-party browser JavaScript and
+into WebAssembly running on edge platforms.
 
-1. **Serve advertising infrastructure as first-party.** Third-party ad and
-   identity scripts are proxied through the publisher's own domain, so they are
-   not blocked as cross-site requests and do not depend on third-party cookies.
-2. **Generate and hold identity at the edge.** The Edge Cookie (EC) ID is
-   derived server-side rather than written by browser JavaScript.
-3. **Run the ad auction before the page is sent.** Bids can be collected while
-   the origin response is still being fetched, so the auction does not have to
-   wait for the browser to parse the page.
+### The problem it solves
 
-The rest of the system exists to make those three things safe: consent
-enforcement, creative sanitization, request signing, and per-integration
-rewriting of the publisher's HTML.
+- **Privacy restrictions.** Third-party cookie deprecation and tracking
+  prevention limit traditional advertising.
+- **Third-party dependency.** Publishers have little control over the
+  third-party scripts running on their pages.
+- **Performance.** Multiple third-party scripts slow page load.
+- **Data control.** Publishers need control over how and with whom data is
+  shared.
+
+### What edge position buys
+
+- **First-party context.** Ads and assets are served from the publisher's own
+  domain.
+- **Consent enforcement.** Consent is read and enforced before any demand call
+  is made.
+- **Better performance.** Server-side processing reduces client-side
+  JavaScript.
+- **Identity at the edge.** The Edge Cookie (EC) ID is derived server-side
+  rather than written by page JavaScript.
+
+## Architecture at a glance
+
+```
+                        User's browser
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────┐
+│           Edge runtime (adapter + core)                  │
+│                                                          │
+│  Adapter (Fastly / Cloudflare / Spin / Axum)             │
+│  • Entry point, routing, platform bindings               │
+│  • Client IP, TLS signals, EC request state              │
+│                          │                               │
+│         ┌────────────────┼────────────────┐              │
+│         ▼                ▼                ▼              │
+│  ┌───────────┐   ┌──────────────┐   ┌──────────────┐     │
+│  │  Proxy    │   │  Publisher   │   │ Integrations │     │
+│  │           │   │              │   │              │     │
+│  │ /first-   │   │ Origin fetch │   │ Prebid, GPT, │     │
+│  │ party/*   │   │ Ad-stack gate│   │ APS, consent │     │
+│  │ Creative  │   │ Auction      │   │ vendors, ... │     │
+│  │ rewriting │   │ HTML rewrite │   │              │     │
+│  └───────────┘   └──────────────┘   └──────────────┘     │
+│                                                          │
+│  Storage layer                                           │
+│  • KV stores    • Config stores    • Secret stores       │
+└──────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+      Publisher origin                 Demand partners
+```
+
+The core crate is runtime-agnostic; anything platform-specific lives in an
+adapter. A test enforces that core never imports the Fastly SDK.
+
+### Technology stack
+
+| Layer          | Technology                               |
+| -------------- | ---------------------------------------- |
+| Language       | Rust {{RUST_VERSION}}                    |
+| Runtime        | WebAssembly (`wasm32-wasip1` for Fastly) |
+| Edge platforms | Fastly Compute, Cloudflare Workers, Spin |
+| Dev server     | Axum (native)                            |
+| Client library | TypeScript (tsjs)                        |
+| Build tools    | Cargo, esbuild                           |
 
 ## The request path
 
@@ -56,69 +111,93 @@ Two details in that list surprise people:
 See [Architecture](/guide/architecture) for the component view and
 [Auction Orchestration](/guide/auction-orchestration) for the auction itself.
 
+## Key concepts
+
+### First-party proxying
+
+Instead of loading ad creatives and vendor scripts directly from third-party
+domains, Trusted Server proxies them through first-party endpoints:
+
+```
+Before:  Browser → ad-server.example/creative.html
+After:   Browser → publisher.example/first-party/proxy?tsurl=...
+```
+
+Everything stays under the publisher's domain, which avoids third-party cookie
+restrictions and tracking prevention. Proxy URLs are signed, so the endpoint
+cannot be used as an open relay. See
+[First-Party Proxy](/guide/first-party-proxy).
+
+### Edge Cookie identity
+
+The EC ID is a privacy-preserving identifier derived at the edge with
+HMAC-SHA256 rather than written by page JavaScript. It is deterministic for the
+same inputs, non-reversible, and publisher-controlled. Rotating the passphrase
+resets the identity graph. See [Edge Cookies](/guide/edge-cookies).
+
+### Integration modules
+
+Each vendor lives in its own module under
+`crates/trusted-server-core/src/integrations/` and registers the hooks it
+needs — proxying, request filtering, attribute rewriting, script rewriting,
+HTML post-processing, or head injection. Browser-side counterparts live in
+`crates/trusted-server-js/lib/src/integrations/`. See the
+[Integration Guide](/guide/integration-guide) before adding one.
+
+### Request signing
+
+Ed25519 signing authenticates outbound API requests. Public keys are published
+at `/.well-known/trusted-server.json`, and rotation is supported with a grace
+period. See [Request Signing](/guide/request-signing) and
+[Key Rotation](/guide/key-rotation).
+
+## Where the code lives
+
+| Path                                           | What it is                                                              |
+| ---------------------------------------------- | ----------------------------------------------------------------------- |
+| `crates/trusted-server-core/`                  | Nearly all the logic. Start here.                                       |
+| `crates/trusted-server-core/src/publisher.rs`  | The main request path. Large — navigate by function, not top to bottom. |
+| `crates/trusted-server-core/src/auction/`      | Auction orchestration, providers, and bidders.                          |
+| `crates/trusted-server-core/src/ec/`           | Edge Cookie identity.                                                   |
+| `crates/trusted-server-core/src/consent/`      | Consent parsing and enforcement.                                        |
+| `crates/trusted-server-core/src/integrations/` | One module per vendor integration.                                      |
+| `crates/trusted-server-js/lib/src/`            | The browser-side TypeScript that ships to the page.                     |
+| `crates/trusted-server-adapter-*/`             | Per-runtime entry points. The Fastly adapter is production.             |
+| `crates/trusted-server-cli/`                   | The `ts` operator CLI.                                                  |
+
 ## Vocabulary
 
 The reference guides use these terms without defining them. Here is what each
 one means _in this codebase_.
 
-| Term                        | Meaning here                                                                                                                                                          |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Impression**              | One opportunity to show one ad in one slot on one page view.                                                                                                          |
-| **Ad slot** / **placement** | A region of the page that can hold an ad. Identified by a DOM element ID.                                                                                             |
-| **Creative**                | The actual ad markup that gets rendered — HTML, an image, or a script. Arrives from a bidder and is rendered inside a sandboxed iframe.                               |
-| **Bid**                     | An offer to buy one impression at a price.                                                                                                                            |
-| **Auction**                 | Collecting bids for the page's slots and choosing winners.                                                                                                            |
-| **Header bidding**          | Running an auction among several demand sources before calling the ad server, so they compete rather than being asked in a fixed order.                               |
-| **SSP**                     | Supply-side platform — sells the publisher's inventory. A demand source from our perspective.                                                                         |
-| **DSP**                     | Demand-side platform — buys on behalf of advertisers, usually via an SSP.                                                                                             |
-| **CPM**                     | Cost per thousand impressions, the usual unit of a bid price.                                                                                                         |
-| **OpenRTB**                 | The IAB-standard JSON format for bid requests and responses. Our types live in the `trusted-server-openrtb` crate.                                                    |
-| **Prebid**                  | The open-source header-bidding framework. We ship a browser shim plus an optional first-party bundle.                                                                 |
-| **GPT**                     | Google Publisher Tag, the browser library that requests ads from Google Ad Manager.                                                                                   |
-| **GAM**                     | Google Ad Manager, the ad server that decides what finally renders.                                                                                                   |
-| **EC ID**                   | Edge Cookie ID. A privacy-preserving identifier derived at the edge with HMAC-SHA256 rather than written by page JavaScript. See [Edge Cookies](/guide/edge-cookies). |
-| **Consent string**          | An encoded record of what a user agreed to. TCF covers GDPR, GPP is the newer multi-jurisdiction container, GPC is a browser-level opt-out signal.                    |
-| **CMP**                     | Consent management platform — the vendor that shows the consent banner and produces the consent string.                                                               |
-| **First-party proxy**       | Serving a third-party asset through the publisher's own domain. See [First-Party Proxy](/guide/first-party-proxy).                                                    |
-
-## Where the code lives
-
-| Path                                           | What it is                                                                         |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `crates/trusted-server-core/`                  | Nearly all the logic. Start here.                                                  |
-| `crates/trusted-server-core/src/publisher.rs`  | The main request path. Large — navigate by function, not by reading top to bottom. |
-| `crates/trusted-server-core/src/auction/`      | Auction orchestration, providers, and bidders.                                     |
-| `crates/trusted-server-core/src/ec/`           | Edge Cookie identity.                                                              |
-| `crates/trusted-server-core/src/consent/`      | Consent parsing and enforcement.                                                   |
-| `crates/trusted-server-core/src/integrations/` | One module per vendor integration.                                                 |
-| `crates/trusted-server-js/lib/src/`            | The browser-side TypeScript that ships to the page.                                |
-| `crates/trusted-server-adapter-*/`             | Per-runtime entry points. The Fastly adapter is production.                        |
-| `crates/trusted-server-cli/`                   | The `ts` operator CLI.                                                             |
-
-The core crate is runtime-agnostic; anything Fastly-specific belongs in the
-adapter. A test enforces that core never imports the Fastly SDK.
+| Term                        | Meaning here                                                                                                                                       |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Impression**              | One opportunity to show one ad in one slot on one page view.                                                                                       |
+| **Ad slot** / **placement** | A region of the page that can hold an ad. Identified by a DOM element ID.                                                                          |
+| **Creative**                | The actual ad markup that gets rendered — HTML, an image, or a script. Arrives from a bidder and renders inside a sandboxed iframe.                |
+| **Bid**                     | An offer to buy one impression at a price.                                                                                                         |
+| **Auction**                 | Collecting bids for the page's slots and choosing winners.                                                                                         |
+| **Header bidding**          | Running an auction among several demand sources before calling the ad server, so they compete rather than being asked in a fixed order.            |
+| **SSP**                     | Supply-side platform — sells the publisher's inventory. A demand source from our perspective.                                                      |
+| **DSP**                     | Demand-side platform — buys on behalf of advertisers, usually via an SSP.                                                                          |
+| **CPM**                     | Cost per thousand impressions, the usual unit of a bid price.                                                                                      |
+| **OpenRTB**                 | The IAB-standard JSON format for bid requests and responses. Our types live in the `trusted-server-openrtb` crate.                                 |
+| **Prebid**                  | The open-source header-bidding framework. We ship a browser shim plus an optional first-party bundle.                                              |
+| **GPT**                     | Google Publisher Tag, the browser library that requests ads from Google Ad Manager.                                                                |
+| **GAM**                     | Google Ad Manager, the ad server that decides what finally renders.                                                                                |
+| **EC ID**                   | Edge Cookie ID. See [Edge Cookies](/guide/edge-cookies).                                                                                           |
+| **Consent string**          | An encoded record of what a user agreed to. TCF covers GDPR, GPP is the newer multi-jurisdiction container, GPC is a browser-level opt-out signal. |
+| **CMP**                     | Consent management platform — the vendor that shows the consent banner and produces the consent string.                                            |
 
 ## Your first week
 
 **Get it running.** Follow [Getting Started](/guide/getting-started). The Axum
 dev server is the fastest path and needs no cloud account.
 
-Three things that are easy to trip over:
+**Read one request end to end.** Follow the request-path table above through the
+source with the files open. That single exercise explains more than any other.
 
-- Bare `cargo build` and `cargo test` fail at the workspace root, because the
-  adapters target different architectures. Use the aliases in
-  `.cargo/config.toml` — `cargo test-axum`, `cargo test-fastly`, and so on. A
-  bare `cargo test` fails while linking with missing `fastly` symbols.
-- `ts` is built from this repository. After pulling changes that touch
-  configuration types, reinstall it with `cargo install-cli`, or
-  `ts config validate` will reject a valid `trusted-server.toml`.
-- The Rust build runs the JavaScript build, so Node from `.tool-versions` is
-  required even if you are only touching Rust.
-
-**Read one request end to end.** Follow the table above through the source with
-the file open. That single exercise explains more than any other.
-
-**Make a small change.** Pick something with a test next to it, change it, and
+**Make a small change.** Pick something with a test beside it, change it, and
 watch the test fail. `cargo test-axum` is the quickest loop.
 
 **Learn the tooling you will need later.**
@@ -127,19 +206,47 @@ local build, which is the only practical way to reproduce most production
 issues. [GPT Diagnostics](/guide/integrations/gpt-diagnostics) explains
 `?ts_console=1`, the first thing to reach for when ads do not render.
 
+### Local origin stub
+
+To exercise the first-party proxy against a fully local origin, point the
+publisher origin at a local server and sign an asset URL:
+
+```bash
+# Terminal 1: serve a file from a local origin
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=http://localhost:9090
+mkdir -p /tmp/ts-origin
+printf 'hello from origin\n' > /tmp/ts-origin/hello.txt
+python3 -m http.server 9090 --directory /tmp/ts-origin
+```
+
+```bash
+# Terminal 2: with the server running, sign the URL and fetch it
+curl -s "http://127.0.0.1:7676/first-party/sign?url=http://localhost:9090/hello.txt"
+```
+
+Request the signed path that comes back; the response body should be
+`hello from origin`.
+
+## Common issues
+
+| Issue                                       | Solution                                                                                                                                |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Bare `cargo build` / `cargo test` fails     | The adapters target different architectures. Use the aliases in `.cargo/config.toml`, such as `cargo test-axum` or `cargo test-fastly`. |
+| `ts config validate` rejects a valid config | `ts` is built from this repository. Reinstall it with `cargo install-cli` after pulling changes to configuration types.                 |
+| Rust build fails in the JS step             | The Rust build runs the JavaScript build, so Node from `.tool-versions` is required even for Rust-only work.                            |
+| `cargo test-fastly` fails on Viceroy        | Install the pinned version: `cargo install viceroy --version {{VICEROY_VERSION}} --locked --force`.                                     |
+| Tests pass locally but fail in CI           | Run `cargo fmt --all -- --check` and the target-matched clippy aliases; CI denies warnings.                                             |
+| No bids and no ads                          | Check consent state and the ad-stack gate before suspecting demand.                                                                     |
+
 ## When something does not work
 
-| Symptom                          | Look at                                                                                            |
-| -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Build or config error            | [Error Reference](/guide/error-reference)                                                          |
-| Tests fail or will not run       | [Testing](/guide/testing) — check you used the right alias                                         |
-| Ads not rendering                | `?ts_console=1` via [GPT Diagnostics](/guide/integrations/gpt-diagnostics); then the ad-stack gate |
-| Behaviour differs on a real site | [Dev Proxy](/guide/ts-dev-proxy)                                                                   |
-| Config rejected on push          | [Configuration](/guide/configuration) and [CLI](/guide/cli)                                        |
-
-Consent is worth calling out: if the consent gate closes, there are no bids and
-no ads, and the symptom looks like a broken auction rather than a consent
-decision. Check consent state before debugging demand.
+| Symptom                          | Look at                                                                                   |
+| -------------------------------- | ----------------------------------------------------------------------------------------- |
+| Build or config error            | [Error Reference](/guide/error-reference)                                                 |
+| Tests fail or will not run       | [Testing](/guide/testing) — check you used the right alias                                |
+| Ads not rendering                | `?ts_console=1` via [GPT Diagnostics](/guide/integrations/gpt-diagnostics), then the gate |
+| Behaviour differs on a real site | [Dev Proxy](/guide/ts-dev-proxy)                                                          |
+| Config rejected on push          | [Configuration](/guide/configuration) and [CLI](/guide/cli)                               |
 
 ## Contributing
 
