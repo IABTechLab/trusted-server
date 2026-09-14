@@ -219,8 +219,11 @@ npm ci
 npm run dev
 ```
 
-The site is served at `http://localhost:5173`. Pages reload as you save, so you
-can keep it open while you read. Stop it with `Ctrl+C`.
+The site is served at `http://localhost:5173/trusted-server/`. The
+`/trusted-server/` suffix matters: the site sets a `base` path for GitHub
+Pages, so the bare `http://localhost:5173` redirects rather than serving the
+home page. VitePress prints the correct URL when it starts. Pages reload as you
+save, so you can keep it open while you read. Stop it with `Ctrl+C`.
 
 Each page maps to one Markdown file under `docs/guide/`, so the fastest way to
 find the source of something you are reading is to search the repository for a
