@@ -19,7 +19,11 @@ import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, TsjsApi } from '../../core/types';
 
-import { PREBID_USER_ID_MODULE_REGISTRY, userIdConfigNameAliases } from './user_id_modules';
+import {
+  PREBID_USER_ID_MODULE_REGISTRY,
+  userIdConfigNameAliases,
+  userIdSubmoduleKey,
+} from './user_id_modules';
 
 /**
  * Prebid.js public API surface (type-only; erased at build time).
@@ -281,6 +285,39 @@ function managedUserIdEntry(managed: InjectedManagedUserId): PrebidUserIdConfigE
     entry.storage = cloneInjectedJson(managed.storage);
   }
   return entry;
+}
+
+/**
+ * Drops managed User ID entries that address a submodule an earlier entry
+ * already claimed.
+ *
+ * `ts prebid bundle` rejects such a pair, but an operator running a prebuilt
+ * external bundle never invokes it, and core's duplicate check compares names
+ * rather than the submodules they resolve to. Prebid registers one submodule
+ * for a module's name and each of its aliases and reads only the first matching
+ * entry, so appending both would silently discard one operator configuration.
+ * Dropping the later entry keeps the configuration Prebid sees equal to the one
+ * that takes effect, and names the loss in the log.
+ */
+function dedupeManagedUserIdsBySubmodule(
+  managedUserIds: InjectedManagedUserId[]
+): InjectedManagedUserId[] {
+  const claimedBy = new Map<string, string>();
+  const kept: InjectedManagedUserId[] = [];
+  for (const managed of managedUserIds) {
+    const submodule = userIdSubmoduleKey(managed.name);
+    const owner = claimedBy.get(submodule);
+    if (owner !== undefined) {
+      log.error(
+        `[tsjs-prebid] managed User ID "${managed.name}" addresses the same Prebid submodule as ` +
+          `"${owner}"; dropping it because Prebid would read only the first entry`
+      );
+      continue;
+    }
+    claimedBy.set(submodule, managed.name);
+    kept.push(managed);
+  }
+  return kept;
 }
 
 function withManagedUserIds(
@@ -609,6 +646,16 @@ function isTerminalTcfResult(result: unknown): boolean {
   );
 }
 
+/** Handle over one outstanding terminal-consent subscription. */
+interface TerminalTcfConsentWatch {
+  /** The `__tcfapi` function this subscription was actually made against. */
+  tcfApi: unknown;
+  /** Whether the CMP has answered this subscription at least once. */
+  hasAnswered: () => boolean;
+  /** Removes the subscription. */
+  retire: () => void;
+}
+
 /**
  * Waits for the CMP to settle GDPR applicability and consent, then reports once.
  *
@@ -621,21 +668,22 @@ function isTerminalTcfResult(result: unknown): boolean {
  * closed here and managed seeding waits for a terminal result. A publisher's
  * own GDPR configuration keeps Prebid's timeout semantics untouched.
  *
- * Returns a function that removes the subscription, or `undefined` when no
- * subscription could be made. Retiring before the CMP has answered cannot send
- * the removal yet — the listener id arrives only with a callback — so the
- * subscription is removed on the CMP's first event instead.
+ * Returns a handle over the subscription, or `undefined` when no subscription
+ * could be made. Retiring before the CMP has answered cannot send the removal
+ * yet — the listener id arrives only with a callback — so the subscription is
+ * removed on the CMP's first event instead.
  */
 function awaitTerminalTcfConsent(
   onSettled: () => void,
   onRefused: () => void
-): (() => void) | undefined {
+): TerminalTcfConsentWatch | undefined {
   if (typeof window === 'undefined') return undefined;
   const tcfApi = (window as { __tcfapi?: unknown }).__tcfapi;
   if (typeof tcfApi !== 'function') return undefined;
 
   let settled = false;
   let retired = false;
+  let answered = false;
   let listenerId: unknown;
 
   const removeListener = () => {
@@ -643,18 +691,20 @@ function awaitTerminalTcfConsent(
     const pendingId = listenerId;
     listenerId = undefined;
     try {
-      // CMP bootstrap stubs are commonly replaced before callbacks drain.
-      // Prefer the current live API so removal does not enter a stale queue.
-      const currentTcfApi = (window as { __tcfapi?: unknown }).__tcfapi;
-      const removalTcfApi =
-        typeof currentTcfApi === 'function' ? (currentTcfApi as TcfApi) : (tcfApi as TcfApi);
-      removalTcfApi.call(window, 'removeEventListener', 2, () => {}, pendingId);
+      // Listener ids belong to the API that accepted the subscription. A
+      // replacement may use the same id for an unrelated consumer. Keep using
+      // the original API, including when a retired listener answers late;
+      // bootstrap stubs must forward cleanup to their own backing CMP.
+      (tcfApi as TcfApi).call(window, 'removeEventListener', 2, () => {}, pendingId);
     } catch (error) {
       log.error('[tsjs-prebid] terminal TCF consent listener could not be removed', error);
     }
   };
 
   const onCmpEvent = (result: unknown, success: boolean) => {
+    // Any callback at all, terminal or not, proves this CMP is reachable and
+    // still answering on this subscription.
+    answered = true;
     // Capture the id before any early return. It only ever arrives with a
     // callback, and without it the subscription can never be removed — so a
     // retirement that happened before the CMP first answered has to wait for
@@ -685,10 +735,14 @@ function awaitTerminalTcfConsent(
     return undefined;
   }
 
-  return () => {
-    retired = true;
-    settled = true;
-    removeListener();
+  return {
+    tcfApi,
+    hasAnswered: () => answered,
+    retire: () => {
+      retired = true;
+      settled = true;
+      removeListener();
+    },
   };
 }
 
@@ -746,12 +800,9 @@ function activateManagedUserIdTcfConsent(
         try {
           const listenerId = isRecord(result) ? result.listenerId : undefined;
           if (listenerId !== undefined && listenerId !== null) {
-            // CMP bootstrap stubs are commonly replaced before callbacks drain.
-            // Prefer the current live API so removal does not enter a stale queue.
-            const currentTcfApi = (window as { __tcfapi?: unknown }).__tcfapi;
-            const removalTcfApi =
-              typeof currentTcfApi === 'function' ? (currentTcfApi as TcfApi) : originalTcfApi;
-            removalTcfApi.call(window, 'removeEventListener', version, () => {}, listenerId);
+            // Cleanup belongs to the API that accepted this subscription,
+            // even if another CMP now occupies the global with its own ids.
+            originalTcfApi.call(window, 'removeEventListener', version, () => {}, listenerId);
           }
         } catch (error) {
           log.error(
@@ -1626,13 +1677,16 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
-  const managedUserIds = injected?.managedUserIds;
+  const injectedManagedUserIds = injected?.managedUserIds;
   let trySeedManagedUserIds: (() => void) | undefined;
   if (
-    managedUserIds &&
-    managedUserIds.length > 0 &&
+    injectedManagedUserIds &&
+    injectedManagedUserIds.length > 0 &&
     managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] !== true
   ) {
+    // Resolve submodule ownership once, before any consumer reads the list, so
+    // a dropped entry is reported a single time rather than on every seed.
+    const managedUserIds = dedupeManagedUserIdsBySubmodule(injectedManagedUserIds);
     const originalSetConfig = pbjs.setConfig.bind(pbjs);
     const prebidConfigApi = pbjs as typeof pbjs & {
       mergeConfig?: typeof pbjs.setConfig;
@@ -1649,7 +1703,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     let retireLateTcfWatch: (() => void) | undefined;
     let awaitingTerminalTcfConsent = false;
     let terminalTcfConsentSettled = false;
-    let retireTerminalTcfWatch: (() => void) | undefined;
+    let terminalTcfWatch: TerminalTcfConsentWatch | undefined;
 
     const retireAutomaticTcfConsent = (
       publisherConfig: PbjsConfig,
@@ -1790,8 +1844,8 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       // `trySeedManagedUserIds` that now returns on the flag above.
       retireLateTcfWatch?.();
       retireLateTcfWatch = undefined;
-      retireTerminalTcfWatch?.();
-      retireTerminalTcfWatch = undefined;
+      terminalTcfWatch?.retire();
+      terminalTcfWatch = undefined;
       automaticTcfConsentActivation = activateManagedUserIdTcfConsent(
         managedUserIds,
         originalSetConfig,
@@ -1859,13 +1913,28 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       }
       // Automatic TCF activation is ours, so it fails closed: subscribe once
       // and wait for a settled CMP result rather than for a callable API.
-      if (awaitingTerminalTcfConsent) return;
-      // A previous attempt the CMP refused leaves its subscription behind.
-      // Retire it before subscribing again so only one is ever outstanding.
-      retireTerminalTcfWatch?.();
-      retireTerminalTcfWatch = undefined;
+      if (awaitingTerminalTcfConsent) {
+        const outstanding = terminalTcfWatch;
+        // A CMP that has answered may still have its dialog open. Keep its
+        // subscription when the global changes so its eventual decision is
+        // not swallowed. A discarded CMP that answered once stays fail-closed.
+        if (!outstanding || outstanding.hasAnswered()) return;
+        const currentTcfApi =
+          typeof window === 'undefined' ? undefined : (window as { __tcfapi?: unknown }).__tcfapi;
+        // A silent, replaced API may be a stub that never replays its queue.
+        // Ask the replacement rather than defer IDs for the page lifetime.
+        // An unchanged API is the same wait, so do not pile up listeners.
+        if (currentTcfApi === outstanding.tcfApi) return;
+        awaitingTerminalTcfConsent = false;
+      }
+      // A previous attempt the CMP refused, or one stranded on a stub since
+      // replaced, leaves its subscription behind. Retire it before subscribing
+      // again so only one can settle the wait. The retired callback may still
+      // arrive later; it ignores consent and cleans up through its own API.
+      terminalTcfWatch?.retire();
+      terminalTcfWatch = undefined;
       awaitingTerminalTcfConsent = true;
-      const retire = awaitTerminalTcfConsent(
+      const watch = awaitTerminalTcfConsent(
         () => {
           terminalTcfConsentSettled = true;
           trySeedManagedUserIds?.();
@@ -1878,17 +1947,17 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           awaitingTerminalTcfConsent = false;
         }
       );
-      if (!retire) {
+      if (!watch) {
         // No CMP to subscribe to yet; a later call retries once one appears.
         awaitingTerminalTcfConsent = false;
         return;
       }
       if (managedUserIdsDeferred) {
-        retireTerminalTcfWatch = retire;
+        terminalTcfWatch = watch;
       } else {
         // A synchronous terminal result already seeded; retire the subscription
         // the seeding path could not yet see.
-        retire();
+        watch.retire();
       }
     };
     trySeedManagedUserIds();

@@ -97,6 +97,7 @@ function pendingCmp() {
         listeners.set(nextListenerId++, callback);
       } else if (command === 'removeEventListener') {
         removed.push(parameter);
+        listeners.delete(parameter as number);
         callback?.(true, true);
       }
     }
@@ -1061,6 +1062,203 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
     testWindow.__tcfapi = terminalCmp();
     expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it('re-subscribes for consent when a silent CMP stub is replaced', () => {
+    // A non-compliant stub accepts the subscription and never replays it to the
+    // CMP that replaces it, so the outstanding wait can never settle.
+    const stub = pendingCmp();
+    testWindow.__tcfapi = stub.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    expect(stub.listenerCount()).toBe(1);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    // The same stub is still installed, so the wait stays open without churn.
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(stub.listenerCount()).toBe(1);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    const cmp = terminalCmp();
+    testWindow.__tcfapi = cmp;
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(cmp).toHaveBeenCalledWith('addEventListener', 2, expect.any(Function));
+    expect(stub.listenerCount()).toBe(1);
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([EXPECTED_MANAGED_USER_ID]);
+  });
+
+  it('keeps waiting on a CMP that has answered once when the global is shadowed', () => {
+    // A CMP that reports its UI is up is alive and still owns the wait. Another
+    // script shadowing `window.__tcfapi` must not make the shim abandon it: the
+    // real consent decision still arrives on that subscription, and its
+    // listener id belongs to its own id space.
+    const cmp = pendingCmp();
+    testWindow.__tcfapi = cmp.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+    cmp.answer({ eventStatus: 'cmpuishown' });
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    const shadow = pendingCmp();
+    testWindow.__tcfapi = shadow.api;
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(shadow.listenerCount()).toBe(0);
+    expect(shadow.removed).toEqual([]);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    // The user answers the CMP that was there all along.
+    cmp.answer();
+    expect(cmp.removed).toEqual([1]);
+    expect(shadow.removed).toEqual([]);
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([EXPECTED_MANAGED_USER_ID]);
+  });
+
+  it('removes a delayed retired listener through its own CMP after replacement', () => {
+    const oldCmp = pendingCmp();
+    testWindow.__tcfapi = oldCmp.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+
+    const replacement = pendingCmp();
+    const otherConsumer = vi.fn();
+    // Each CMP assigns listener 1 independently. The replacement already has
+    // another consumer before the shim subscribes to it.
+    replacement.api('addEventListener', 2, otherConsumer);
+    testWindow.__tcfapi = replacement.api;
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(replacement.listenerCount()).toBe(2);
+
+    oldCmp.answer();
+
+    expect(oldCmp.removed).toEqual([1]);
+    expect(oldCmp.listenerCount()).toBe(0);
+    expect(replacement.removed).toEqual([]);
+    expect(replacement.listenerCount()).toBe(2);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    replacement.answer();
+    expect(otherConsumer).toHaveBeenCalledOnce();
+    expect(replacement.removed).toEqual([2]);
+    expect(replacement.listenerCount()).toBe(1);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it('cleans up replayed subscriptions through a forwarding bootstrap stub', () => {
+    const cmp = pendingCmp();
+    const queued: Parameters<typeof cmp.api>[] = [];
+    let forwarding = false;
+    const stub = vi.fn((...args: Parameters<typeof cmp.api>) => {
+      if (forwarding) cmp.api(...args);
+      else queued.push(args);
+    });
+    testWindow.__tcfapi = stub;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    expect(queued).toHaveLength(1);
+
+    forwarding = true;
+    testWindow.__tcfapi = cmp.api;
+    for (const args of queued) cmp.api(...args);
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(cmp.listenerCount()).toBe(2);
+    cmp.answer();
+
+    expect(stub).toHaveBeenCalledWith('removeEventListener', 2, expect.any(Function), 1);
+    expect(cmp.removed).toEqual([1, 2]);
+    expect(cmp.listenerCount()).toBe(0);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it('refuses a shim installed over a CMP that is still asking the user', () => {
+    // `gdprApplies: false` is the cheapest possible claim of no jurisdiction.
+    // A script that installs it over a live CMP whose dialog is still on screen
+    // must not be able to settle the wait and release the identity vendor.
+    const cmp = pendingCmp();
+    testWindow.__tcfapi = cmp.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+    cmp.answer({ eventStatus: 'cmpuishown' });
+
+    const outOfScopeShim = vi.fn(
+      (
+        command: string,
+        _version?: number,
+        callback?: (result: unknown, success: boolean) => void
+      ) => {
+        if (command === 'addEventListener') {
+          callback?.({ gdprApplies: false, listenerId: 1 }, true);
+        }
+      }
+    );
+    testWindow.__tcfapi = outOfScopeShim;
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(outOfScopeShim).not.toHaveBeenCalled();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+  });
+
+  it('drops a managed User ID addressing a submodule an earlier entry claimed', () => {
+    // `sharedIdSystem` answers to both names, so Prebid would register one
+    // submodule and read only the first entry.
+    const managedSharedId = { ...MANAGED_USER_ID, name: 'sharedId' };
+    const managedPubCommonId = { ...MANAGED_USER_ID, name: 'pubCommonId' };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [managedSharedId, managedPubCommonId] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([
+      { ...EXPECTED_MANAGED_USER_ID, name: 'sharedId' },
+    ]);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] managed User ID "pubCommonId" addresses the same Prebid submodule as ' +
+        '"sharedId"; dropping it because Prebid would read only the first entry'
+    );
+  });
+
+  it('keeps managed User IDs that address different submodules', () => {
+    const managedSharedId = { ...MANAGED_USER_ID, name: 'sharedId' };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID, managedSharedId] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([
+      EXPECTED_MANAGED_USER_ID,
+      { ...EXPECTED_MANAGED_USER_ID, name: 'sharedId' },
+    ]);
   });
 
   it.each(['setConfig', 'mergeConfig'] as const)(

@@ -144,6 +144,7 @@ async function runGdprPage(
     lateCmp = false,
     queueAuction = true,
     replaceTcfApiBeforeLateEvent = false,
+    replaceStalledCmp = false,
     tcDataOverrides,
     lateTcDataOverrides,
     waitPastConsentTimeoutMs = 0,
@@ -181,6 +182,9 @@ async function runGdprPage(
 
   const consentListeners = new Map();
   let nextListenerId = 1;
+  // A stalled CMP registers subscriptions and never answers them. Kept mutable
+  // so a replacement CMP can start answering the ones it accepts.
+  let cmpStalled = deferInitialCmpResponse;
   let registeredConsentListenerCount = 0;
   let removedConsentListenerCount = 0;
   let replacementApiRemoveCount = 0;
@@ -194,7 +198,7 @@ async function runGdprPage(
       // The shim's own consent gate subscribes before it activates automatic
       // IAB consent, so Prebid's subscription is always a later one.
       const isShimConsentGate = registeredConsentListenerCount === 1;
-      const deferred = deferInitialCmpResponse || (deferPrebidCmpResponse && !isShimConsentGate);
+      const deferred = cmpStalled || (deferPrebidCmpResponse && !isShimConsentGate);
       if (!deferred) {
         callback(event(listenerId), true);
       }
@@ -261,6 +265,15 @@ async function runGdprPage(
       }
     };
   }
+  if (replaceStalledCmp) {
+    // A non-compliant bootstrap stub accepted the subscription and never
+    // replayed it to the CMP that replaces it. The replacement answers, and
+    // arrives under its own function identity — the only signal available to
+    // tell it apart from the stub that is still holding a dead subscription.
+    cmpStalled = false;
+    pageWindow.__tcfapi = (...args) => cmp(...args);
+  }
+
   if (cmpEventAfterLateConfig !== undefined) {
     for (const [listenerId, callback] of consentListeners) {
       callback(
@@ -406,6 +419,21 @@ describe('external bundle TCF enforcement', () => {
     expect(userIdNames).not.toContain('identityLink');
   }, 60_000);
 
+  it('resolves managed IDs when a silent CMP stub gives way to a real CMP', async () => {
+    // The recovery half of the stalled-CMP reproduction above: a stub that
+    // accepts the subscription and never replays it would otherwise hold
+    // managed IDs deferred for the page lifetime, with no later call able to
+    // re-subscribe.
+    const { requestedUrls, cookies, userIdNames, consentManagement } = await runGdprPage(
+      {},
+      { deferInitialCmpResponse: true, replaceStalledCmp: true }
+    );
+    expect(userIdNames).toContain('identityLink');
+    expect(envelopeRequests(requestedUrls)).toHaveLength(1);
+    expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);
+    expect(consentManagement.gdpr.cmpApi).toBe('iab');
+  });
+
   it('never seeds a managed module while the CMP UI still awaits the user', async () => {
     const { userIdNames, consentManagement } = await runGdprPage(
       {},
@@ -520,7 +548,13 @@ describe('external bundle TCF enforcement', () => {
       },
     };
 
-    const { requestedUrls, cookies, replacementApiRemoveCount } = await runGdprPage(
+    const {
+      requestedUrls,
+      cookies,
+      replacementApiRemoveCount,
+      removedConsentListenerCount,
+      remainingConsentListenerCount,
+    } = await runGdprPage(
       {},
       {
         latePublisherConsentManagement: deniedStaticConsent,
@@ -530,7 +564,9 @@ describe('external bundle TCF enforcement', () => {
       }
     );
 
-    expect(replacementApiRemoveCount).toBe(1);
+    expect(replacementApiRemoveCount).toBe(0);
+    expect(removedConsentListenerCount).toBe(2);
+    expect(remainingConsentListenerCount).toBe(0);
     expect(envelopeRequests(requestedUrls)).toEqual([]);
     expect(cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
     expect(cookies).not.toContain('_lr_retry_request');
