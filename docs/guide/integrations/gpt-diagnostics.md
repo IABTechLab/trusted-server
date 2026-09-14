@@ -148,7 +148,7 @@ Auction labels describe the path observed for that GPT request cycle:
 
 Publisher refresh evidence does not by itself establish another auction. It remains
 visible in the request-path classification but does not turn an SSAT, TS auction, or
-client-side auction label into “Competing auctions.” Publisher-only refreshes and
+client-side auction label into `Multiple auction paths observed`. Publisher-only refreshes and
 unattributed requests have no auction label because the available evidence does not
 establish an auction implementation.
 
@@ -265,15 +265,15 @@ that acknowledgement is outside the zero-publisher-change design.
 
 The derived `delivery` value uses these evidence-safe meanings:
 
-| Delivery state                 | Panel wording                                                                                                                                               |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `trusted_server_response_sent` | Creative markup sent; execution not confirmed                                                                                                               |
-| `trusted_server_selected`      | Server bid selected by the creative bridge; response not confirmed                                                                                          |
-| `candidate_unconfirmed`        | Server bid available; selection not confirmed                                                                                                               |
-| `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                                                                         |
-| `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed                                                                        |
-| `pending`                      | Waiting for Trusted Server creative evidence                                                                                                                |
-| `not_applicable`               | No delivery conclusion is displayed before render or for an explicitly empty result, provided no Trusted Server creative evidence was stamped on the cycle. |
+| Delivery state                 | Panel wording                                                      |
+| ------------------------------ | ------------------------------------------------------------------ |
+| `trusted_server_response_sent` | Creative markup sent; execution not confirmed                      |
+| `trusted_server_selected`      | Server bid selected by the creative bridge; response not confirmed |
+| `candidate_unconfirmed`        | Server bid available; selection not confirmed                      |
+| `no_candidate`                 | No direct Trusted Server candidate                                 |
+| `unknown`                      | Delivery status unknown — required evidence was not observed       |
+| `pending`                      | Waiting for Trusted Server creative evidence                       |
+| `not_applicable`               | Delivery evidence: Not applicable                                  |
 
 For an explicit non-empty candidate, diagnostics wait five seconds from
 `slotRenderEnded` for positive creative evidence. If no matched PUC request arrives,
@@ -433,14 +433,17 @@ content or altering the APS sandbox, so this field cannot prove the inner creati
 pixels.
 
 Badges and the panel live in a closed Shadow DOM. Diagnostics do not add attributes,
-classes, or inline styles to publisher slot elements.
+classes, or inline styles to publisher slot elements. Each badge is an interactive button
+positioned over the slot's top-left area. While diagnostics are active, the badge intercepts
+pointer input within its own bounds instead of passing that input to the creative.
 
 ## Presentation Lifecycle
 
 - **Collapse** reduces the panel while preserving capture.
 - **Close** dismisses the presentation for the current document.
 - External removal by hydration or DOM reconciliation triggers a debounced remount.
-- Live re-renders preserve open request-history disclosures and panel scroll position.
+- Live re-renders preserve open request-history, help, and technical disclosures plus panel scroll position.
+- Selecting an earlier request from a badge opens its history once. A later user collapse remains closed across live updates.
 - Explicit Close or `hide()` prevents remount until `show()` is called.
 - Capture continues while the panel is hidden.
 

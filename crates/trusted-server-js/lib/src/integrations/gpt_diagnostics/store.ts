@@ -23,6 +23,8 @@ import type {
   Size,
 } from '../../core/types';
 
+import { clonePrebidAuctionEvidence } from './evidence';
+
 export const MAX_DIAGNOSTIC_SLOTS = 64;
 export const MAX_REQUEST_CYCLES_PER_SLOT = 10;
 export const MAX_CALLBACK_ISSUES = 128;
@@ -369,15 +371,7 @@ function copyCycle(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsReq
       : undefined,
     ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
     ...(cycle.prebidAuction
-      ? {
-          prebidAuction: {
-            ...cycle.prebidAuction,
-            ...(cycle.prebidAuction.targetingCandidate
-              ? { targetingCandidate: { ...cycle.prebidAuction.targetingCandidate } }
-              : {}),
-            ...(cycle.prebidAuction.win ? { win: { ...cycle.prebidAuction.win } } : {}),
-          },
-        }
+      ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
       : {}),
     ...(cycle.serverAuctionTimings
       ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
