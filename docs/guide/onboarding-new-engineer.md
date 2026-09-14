@@ -10,6 +10,23 @@ map. [Getting Started](/guide/getting-started) covers prerequisites and running
 an adapter. This page is the practical companion to both and does not repeat
 them.
 
+## Request access
+
+Ask your manager or onboarding contact for these on your first day. Some take
+time to be granted, so request them before you need them. Nothing else on this
+page requires them, so you can start reading and building while you wait.
+
+| Access                   | What it is for                                                                                    | Where                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **Google account**       | Calendar invitations for team meetings, and shared documents                                      | Ask your manager or onboarding contact                                        |
+| **GitHub account**       | Read and write access to the repository, so you can push branches and open pull requests          | [IABTechLab/trusted-server](https://github.com/IABTechLab/trusted-server)     |
+| **GitHub project board** | The team's planned and in-flight work, and where you find a first task                            | [Trusted Server project board](https://github.com/orgs/IABTechLab/projects/3) |
+| **Fastly account**       | The production edge platform. You need an account and an API token to deploy or inspect a service | [manage.fastly.com](https://manage.fastly.com)                                |
+
+A Fastly account is only needed for deploying and inspecting real services.
+Local development on the Axum adapter needs no edge account at all, so it is
+the right place to start on day one.
+
 ## Reading these docs locally
 
 This documentation is a [VitePress](https://vitepress.dev) site in `docs/`.
