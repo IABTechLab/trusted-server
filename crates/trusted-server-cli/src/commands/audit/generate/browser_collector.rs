@@ -616,7 +616,7 @@ async fn collect_open_page(
         )),
     }
 
-    // Settle phases share one clock, with a quiet-window floor for GPT polling.
+    // Settle phases share one clock, with a minimum allowance for GPT's dwell.
     // Navigation has its own timeout; scrolling consumes the settle budget.
     // Read GPT before metadata so extraction cannot starve its polling. DOM and
     // network evidence consequently reflect the page after the GPT wait.
@@ -661,13 +661,13 @@ async fn collect_open_page(
     // `getSlots()` snapshot instead and can observe a half-registered registry.
     // `ts audit page` also takes a snapshot, but reports what it saw rather
     // than generating config from it.
-    // Initial settling and scrolling can exhaust the shared budget. Allow at
-    // least one quiet window of GPT polling to capture later batches, while
-    // retaining the partial-evidence warning if a full dwell cannot finish.
-    let gpt_budget = settings
-        .settle_max
-        .saturating_sub(settle_start.elapsed())
-        .max(settings.settle_quiet);
+    // Initial settling and scrolling can exhaust the shared budget. Leave
+    // enough time for an already-stable registry to establish and finish a
+    // dwell; later changes can still exhaust this bounded allowance.
+    let gpt_budget = gpt_polling_budget(
+        settings.settle_max.saturating_sub(settle_start.elapsed()),
+        settings.settle_quiet,
+    );
     let gpt_slots =
         collect_stable_gpt_slots(page, settings.settle_quiet, gpt_budget, &mut warnings).await;
 
@@ -1015,6 +1015,15 @@ fn gpt_registry_reading(
     }
 }
 
+/// Allocates time to establish a repeated reading and complete its dwell.
+///
+/// The first repeat starts the dwell after one poll interval. A second interval
+/// leaves slack before the deadline, which is checked before reading again.
+/// Slow browser reads or later registry changes can still exhaust this budget.
+fn gpt_polling_budget(remaining: Duration, dwell_target: Duration) -> Duration {
+    remaining.max(dwell_target.saturating_add(2 * SETTLE_POLL_INTERVAL))
+}
+
 /// Reads GPT until a non-empty registry holds still for `dwell_target`, or
 /// until `budget` expires.
 ///
@@ -1023,7 +1032,8 @@ fn gpt_registry_reading(
 /// can both observe the same burst and miss the next. Requiring the reading to
 /// repeat for a dwell window mirrors [`wait_for_page_settle`], and taking both
 /// the dwell from the operator's quiet flag and the budget from the remaining
-/// shared allowance, floored at that quiet window, bounds this phase. An
+/// shared allowance, floored at the quiet window plus two poll intervals,
+/// bounds this phase. An
 /// in-flight read may overrun the budget by its own bound. Even an exhausted
 /// budget takes one snapshot; two consecutive empty polls end the wait early.
 ///
@@ -1689,6 +1699,80 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_allows_an_unchanging_registry_to_finish_its_dwell() {
+        for quiet_ms in [0, 100, 250, 600, 1000, 3000] {
+            let dwell = Duration::from_millis(quiet_ms);
+            let budget = gpt_polling_budget(Duration::ZERO, dwell);
+            let expected = vec![gpt_slot("/123/header", "ad-header")];
+            let mut warnings = Vec::new();
+            let mut reads = 0;
+            let start = tokio::time::Instant::now();
+
+            let slots = poll_gpt_registry(
+                || {
+                    reads += 1;
+                    std::future::ready(Ok(expected.clone()))
+                },
+                dwell,
+                budget,
+                &mut warnings,
+            )
+            .await;
+
+            assert_eq!(slots, expected, "should retain the stable registry");
+            assert!(
+                warnings.is_empty(),
+                "should finish a stable dwell at quiet={quiet_ms}: {warnings:?}"
+            );
+            assert!(reads >= 2, "should confirm stability with another read");
+            assert!(
+                start.elapsed() < budget,
+                "should complete before the polling deadline"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_still_warns_when_a_later_batch_cannot_finish_its_dwell() {
+        let first = vec![gpt_slot("/123/first", "ad-first")];
+        let mut latest = first.clone();
+        latest.push(gpt_slot("/123/second", "ad-second"));
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let dwell = Duration::from_millis(600);
+        let budget = gpt_polling_budget(Duration::ZERO, dwell);
+        let start = tokio::time::Instant::now();
+
+        let slots = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(if reads == 1 {
+                    first.clone()
+                } else {
+                    latest.clone()
+                }))
+            },
+            dwell,
+            budget,
+            &mut warnings,
+        )
+        .await;
+
+        assert_eq!(slots, latest, "should retain the latest batch");
+        assert_eq!(
+            start.elapsed(),
+            budget,
+            "should stop at the polling deadline"
+        );
+        assert_eq!(reads, 5, "should continue polling through the floor");
+        assert_eq!(warnings.len(), 1, "should warn about the incomplete dwell");
+        assert!(
+            warnings[0].contains("within the 1100ms budget"),
+            "should report the actual allowance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn registry_poll_stops_after_two_empty_readings() {
         let mut reads = 0;
         let mut warnings = Vec::new();
@@ -2164,8 +2248,8 @@ mod tests {
         for scroll in [false, true] {
             let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
             let mut url = fixture.url().clone();
-            // A second read exposes the second batch without racing the
-            // browser's 400ms timer against the 600ms budget on busy runners.
+            // A second read exposes the second batch without racing a browser
+            // timer against the polling deadline on busy runners.
             url.set_fragment(Some("poll-driven"));
             // A quiet window equal to the maximum cannot finish inside that
             // maximum, so the initial settle spends the entire shared budget.
@@ -2190,13 +2274,13 @@ mod tests {
                         sizes: vec![(728, 90)],
                     },
                 ],
-                "should collect the later batch within the quiet-window floor (scroll={scroll})"
+                "should collect the later batch within the minimum polling allowance (scroll={scroll})"
             );
             assert!(
                 collected
                     .warnings
                     .iter()
-                    .any(|warning| warning.contains("within the 600ms budget")),
+                    .any(|warning| warning.contains("within the 1100ms budget")),
                 "should report partial evidence when the later batch cannot finish its dwell (scroll={scroll})"
             );
             assert_eq!(

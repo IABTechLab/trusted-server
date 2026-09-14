@@ -23,6 +23,7 @@ export TS_AUDIT_BROWSER_TESTS=1
 AUDIT_BROWSER_TEST_FILTERS=(
   "commands::audit::browser::tests::"
   "commands::audit::generate::browser_collector::tests::"
+  "generate_deploy_validation_"
 )
 for AUDIT_BROWSER_TEST_FILTER in "${AUDIT_BROWSER_TEST_FILTERS[@]}"; do
   AUDIT_BROWSER_TEST_COUNT="$({

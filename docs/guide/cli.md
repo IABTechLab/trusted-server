@@ -577,12 +577,14 @@ not exceed the maximum.
 Generation shares one `--settle-max-ms` budget across the initial settle,
 optional post-scroll settle, and GPT registry wait. The clock starts after
 navigation, immediately before the initial settle; scrolling also consumes the
-remaining budget. GPT polling receives the remaining budget or
-`--settle-quiet-ms`, whichever is greater, so exhausting the shared budget still
-allows one quiet window of polling. This floor can capture later slot batches,
-but does not guarantee a full stable dwell; a non-empty registry that does not
-stabilize is returned with a partial-evidence warning. The floor adds at most
-one quiet window to the shared settle allowance.
+remaining budget. GPT polling receives the remaining budget or a minimum of
+`--settle-quiet-ms` plus two 250ms poll intervals, whichever is greater. One
+interval lets an already-stable registry establish a repeated reading; the
+other leaves time to confirm the completed dwell before the deadline. Later
+slot batches or slow browser reads can still prevent a full dwell, in which
+case generation returns the latest non-empty registry with a partial-evidence
+warning. The minimum allowance adds at most the quiet window plus 500ms to the
+shared settle allowance.
 
 GPT polling precedes metadata extraction, so those reads cannot consume its
 budget. DOM and network evidence reflect the page after the GPT wait. If the
@@ -593,8 +595,8 @@ finish after the settle budget, so this is not a total page deadline. Two
 consecutive empty GPT polls end the wait early regardless of the budget; slots
 registered later may be missed. Increasing `--settle-max-ms` can help when a
 non-empty registry does not stabilize, but on continuously busy pages initial
-settling can still consume the entire shared budget, leaving GPT only its quiet
-window floor.
+settling can still consume the entire shared budget, leaving GPT only its
+minimum polling allowance.
 
 Verification applies `--settle-max-ms` separately to its initial and optional
 post-scroll settle phases. It performs no GPT wait: its evidence collector is
