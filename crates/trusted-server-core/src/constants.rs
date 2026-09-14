@@ -12,6 +12,8 @@ pub const HEADER_X_TS_EC: HeaderName = HeaderName::from_static("x-ts-ec");
 pub const HEADER_X_TS_EIDS: HeaderName = HeaderName::from_static("x-ts-eids");
 pub const HEADER_X_TS_EC_CONSENT: HeaderName = HeaderName::from_static("x-ts-ec-consent");
 pub const HEADER_X_TS_EIDS_TRUNCATED: HeaderName = HeaderName::from_static("x-ts-eids-truncated");
+pub const HEADER_X_TS_ERROR: HeaderName = HeaderName::from_static("x-ts-error");
+pub const HEADER_X_TS_JS_ASSET_PROXY: HeaderName = HeaderName::from_static("x-ts-js-asset-proxy");
 pub const HEADER_X_CONSENT_ADVERTISING: HeaderName =
     HeaderName::from_static("x-consent-advertising");
 pub const HEADER_X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
