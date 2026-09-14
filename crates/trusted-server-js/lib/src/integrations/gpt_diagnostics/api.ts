@@ -10,6 +10,7 @@ import type {
 } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { clonePrebidAuctionEvidence } from './evidence';
 import type { GptDiagnosticsStoreSnapshot } from './store';
 
 interface ApiStore {
@@ -82,15 +83,7 @@ function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsEx
         observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
         ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
         ...(cycle.prebidAuction
-          ? {
-              prebidAuction: {
-                ...cycle.prebidAuction,
-                ...(cycle.prebidAuction.targetingCandidate
-                  ? { targetingCandidate: { ...cycle.prebidAuction.targetingCandidate } }
-                  : {}),
-                ...(cycle.prebidAuction.win ? { win: { ...cycle.prebidAuction.win } } : {}),
-              },
-            }
+          ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
           : {}),
         ...(cycle.serverAuctionTimings
           ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
@@ -236,15 +229,7 @@ export class GptDiagnosticsApiController {
           observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
           ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
           ...(cycle.prebidAuction
-            ? {
-                prebidAuction: {
-                  ...cycle.prebidAuction,
-                  ...(cycle.prebidAuction.targetingCandidate
-                    ? { targetingCandidate: { ...cycle.prebidAuction.targetingCandidate } }
-                    : {}),
-                  ...(cycle.prebidAuction.win ? { win: { ...cycle.prebidAuction.win } } : {}),
-                },
-              }
+            ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
             : {}),
           ...(cycle.serverAuctionTimings
             ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }

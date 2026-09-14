@@ -200,7 +200,13 @@ export class GptDiagnosticsBadgeManager {
   update(): void {
     if (this.destroyed || !this.layer?.isConnected) return;
     const observedElements: HTMLElement[] = [];
-    const badges: HTMLElement[] = [];
+    const existingBadges = new Map(
+      Array.from(this.layer.querySelectorAll<HTMLButtonElement>('.tsgd-badge')).map((badge) => [
+        badge.dataset.runtimeSlot,
+        badge,
+      ])
+    );
+    const badges = new Set<HTMLButtonElement>();
 
     for (const slot of this.slots) {
       const cycle = latestCycle(slot);
@@ -213,18 +219,29 @@ export class GptDiagnosticsBadgeManager {
       if (!intersectsViewport(rectangle, this.window)) continue;
       observedElements.push(element);
 
-      const badge = this.document.createElement('button');
-      badge.type = 'button';
-      badge.className = 'tsgd-badge';
-      badge.dataset.runtimeSlot = String(slot.runtimeSlotNumber);
+      const runtimeSlot = String(slot.runtimeSlotNumber);
+      let badge = existingBadges.get(runtimeSlot);
+      if (!badge) {
+        const createdBadge = this.document.createElement('button');
+        createdBadge.type = 'button';
+        createdBadge.className = 'tsgd-badge';
+        createdBadge.addEventListener('click', () => {
+          const runtimeSlotNumber = Number(createdBadge.dataset.runtimeSlot);
+          const requestNumber = Number(createdBadge.dataset.requestNumber);
+          if (!Number.isSafeInteger(runtimeSlotNumber) || !Number.isSafeInteger(requestNumber)) {
+            return;
+          }
+          this.onActivate(runtimeSlotNumber, requestNumber);
+        });
+        badge = createdBadge;
+      }
+      const text = badgeText(cycle);
+      badge.dataset.runtimeSlot = runtimeSlot;
       badge.dataset.requestNumber = String(cycle.requestNumber);
-      badge.textContent = `Ad #${slot.runtimeSlotNumber} · Request #${cycle.requestNumber} · ${badgeText(cycle)}`;
+      badge.textContent = `Ad #${slot.runtimeSlotNumber} · Request #${cycle.requestNumber} · ${text}`;
       badge.setAttribute(
         'aria-label',
-        `Open diagnostics for Ad #${slot.runtimeSlotNumber}, Request #${cycle.requestNumber}`
-      );
-      badge.addEventListener('click', () =>
-        this.onActivate(slot.runtimeSlotNumber, cycle.requestNumber)
+        `Open diagnostics for Ad #${slot.runtimeSlotNumber}, Request #${cycle.requestNumber}: ${text}`
       );
       badge.style.maxWidth = `${BADGE_MAX_WIDTH_PX}px`;
       badge.style.left = `${Math.max(
@@ -239,12 +256,17 @@ export class GptDiagnosticsBadgeManager {
           BADGE_EDGE_GUTTER_PX,
           rectangle.top + BADGE_EDGE_GUTTER_PX
         )}px`;
+        badge.style.transform = '';
       }
-      badges.push(badge);
+      badges.add(badge);
     }
 
-    for (const badge of this.layer.querySelectorAll('.tsgd-badge')) badge.remove();
-    this.layer.append(...badges);
+    for (const badge of Array.from(this.layer.querySelectorAll<HTMLButtonElement>('.tsgd-badge'))) {
+      if (!badges.has(badge)) badge.remove();
+    }
+    for (const badge of badges) {
+      if (!badge.isConnected) this.layer.append(badge);
+    }
     this.resizeObserver?.disconnect();
     for (const element of observedElements) this.resizeObserver?.observe(element);
   }

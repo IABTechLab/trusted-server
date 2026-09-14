@@ -462,14 +462,7 @@ function targetingCandidate(slot: RefreshGptSlot): GptDiagnosticsAuctionWinner |
   const bidder = boundedTargetingValue(slot, 'hb_bidder', 128);
   const priceBucket = boundedTargetingValue(slot, 'hb_pb', 64);
   if (!bidder || !priceBucket || !/^\d+(?:\.\d+)?$/.test(priceBucket)) return undefined;
-  const suppliedCurrency = boundedTargetingValue(slot, 'hb_cur', 3)?.toUpperCase();
-  return {
-    bidder,
-    priceBucket,
-    ...(suppliedCurrency && /^[A-Z]{3}$/.test(suppliedCurrency)
-      ? { currency: suppliedCurrency }
-      : {}),
-  };
+  return { bidder, priceBucket };
 }
 
 function recordCompletedPrebidAuction(

@@ -161,7 +161,7 @@ function deliveryFact(cycle: GptDiagnosticsRequestCycle): string {
     case undefined:
       return 'Delivery evidence: Not observed';
     default:
-      return unhandledCase(cycle.delivery);
+      return unhandledCase(cycle.delivery) ?? 'Delivery evidence: Not observed';
   }
 }
 
@@ -248,6 +248,10 @@ function responseClassFact(cycle: GptDiagnosticsRequestCycle): string | undefine
   }
 }
 
+function priceBucket(value: { priceBucket: string; currency?: string }): string {
+  return `${value.priceBucket}${value.currency ? ` ${value.currency}` : ''}`;
+}
+
 function auctionFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   const facts = [
     requestPathFact(cycle),
@@ -255,23 +259,17 @@ function auctionFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   ];
   if (cycle.auctionWinner) {
     facts.push(`Server auction winner: ${cycle.auctionWinner.bidder}`);
-    facts.push(
-      `Server bid price bucket: ${cycle.auctionWinner.priceBucket} ${cycle.auctionWinner.currency ?? '(currency not supplied)'}`
-    );
+    facts.push(`Server bid price bucket: ${priceBucket(cycle.auctionWinner)}`);
   }
   if (cycle.prebidAuction?.targetingCandidate) {
     const candidate = cycle.prebidAuction.targetingCandidate;
     facts.push(`Prebid targeting candidate: ${candidate.bidder}`);
-    facts.push(
-      `Prebid candidate price bucket: ${candidate.priceBucket} ${candidate.currency ?? '(currency not supplied)'}`
-    );
+    facts.push(`Prebid candidate price bucket: ${priceBucket(candidate)}`);
   }
   if (cycle.prebidAuction?.win) {
     const win = cycle.prebidAuction.win;
     facts.push(`Prebid bidWon observation: ${win.bidder}`);
-    facts.push(
-      `Prebid win price bucket: ${win.priceBucket} ${win.currency ?? '(currency not supplied)'}`
-    );
+    facts.push(`Prebid win price bucket: ${priceBucket(win)}`);
   }
   const servedBidder = servedBidderFact(cycle);
   if (servedBidder) facts.push(servedBidder);
@@ -481,6 +479,7 @@ export class GptDiagnosticsOverlay {
   private destroyed = false;
   private filter: GptDiagnosticsFilter = 'all';
   private selectedRequest?: { runtimeSlotNumber: number; requestNumber: number };
+  private historySlotToOpenOnce?: number;
   private selectedRequestHasFocus = false;
 
   constructor(store: OverlayStore, bindings: OverlayBindings, options: OverlayOptions = {}) {
@@ -516,6 +515,7 @@ export class GptDiagnosticsOverlay {
   selectRequest(runtimeSlotNumber: number, requestNumber: number): void {
     if (this.destroyed) return;
     this.selectedRequest = { runtimeSlotNumber, requestNumber };
+    this.historySlotToOpenOnce = runtimeSlotNumber;
     this.filter = 'all';
     this.collapsed = false;
     this.show();
@@ -652,11 +652,19 @@ export class GptDiagnosticsOverlay {
     const previousContent = panel.querySelector<HTMLElement>('.tsgd-content');
     const previousScrollTop = previousContent?.scrollTop ?? 0;
     const selectedRequestWasFocused = this.selectedRequestHasFocus;
+    const helpOpen = panel.querySelector<HTMLDetailsElement>('.tsgd-help')?.open ?? false;
     const openHistorySlots = new Set(
       Array.from(panel.querySelectorAll<HTMLDetailsElement>('.tsgd-history[open]'))
         .map((details) => details.closest<HTMLElement>('.tsgd-slot')?.dataset.runtimeSlot)
         .filter((runtimeSlot): runtimeSlot is string => runtimeSlot !== undefined)
     );
+    const openTechnicalSlots = new Set(
+      Array.from(panel.querySelectorAll<HTMLDetailsElement>('.tsgd-technical[open]'))
+        .map((details) => details.closest<HTMLElement>('.tsgd-slot')?.dataset.runtimeSlot)
+        .filter((runtimeSlot): runtimeSlot is string => runtimeSlot !== undefined)
+    );
+    const historySlotToOpenOnce = this.historySlotToOpenOnce;
+    this.historySlotToOpenOnce = undefined;
     panel.replaceChildren();
 
     const header = this.document.createElement('header');
@@ -717,6 +725,7 @@ export class GptDiagnosticsOverlay {
 
     const help = this.document.createElement('details');
     help.className = 'tsgd-help';
+    help.open = helpOpen;
     const helpSummary = this.document.createElement('summary');
     helpSummary.textContent = 'How to read this evidence';
     const helpText = this.document.createElement('p');
@@ -767,13 +776,12 @@ export class GptDiagnosticsOverlay {
       content.append(empty);
     } else {
       for (const slot of filteredSlots) {
-        const selectedPreviousRequest =
-          this.selectedRequest?.runtimeSlotNumber === slot.runtimeSlotNumber &&
-          this.selectedRequest.requestNumber !== latestCycle(slot)?.requestNumber;
+        const runtimeSlot = String(slot.runtimeSlotNumber);
         content.append(
           this.renderSlot(
             slot,
-            openHistorySlots.has(String(slot.runtimeSlotNumber)) || selectedPreviousRequest
+            openHistorySlots.has(runtimeSlot) || historySlotToOpenOnce === slot.runtimeSlotNumber,
+            openTechnicalSlots.has(runtimeSlot)
           )
         );
       }
@@ -785,7 +793,11 @@ export class GptDiagnosticsOverlay {
     }
   }
 
-  private renderSlot(slot: GptDiagnosticsStoreSlotSnapshot, historyOpen: boolean): HTMLElement {
+  private renderSlot(
+    slot: GptDiagnosticsStoreSlotSnapshot,
+    historyOpen: boolean,
+    technicalOpen: boolean
+  ): HTMLElement {
     const container = this.document.createElement('article');
     container.className = 'tsgd-slot';
     const latest = latestCycle(slot);
@@ -872,16 +884,22 @@ export class GptDiagnosticsOverlay {
     }
 
     const technical = this.document.createElement('details');
+    technical.className = 'tsgd-technical';
+    technical.open = technicalOpen;
     const technicalSummary = this.document.createElement('summary');
     technicalSummary.textContent = 'Technical details';
     technical.append(technicalSummary);
     appendFacts(this.document, technical, [
       slot.adUnitPath ? `Ad unit ${slot.adUnitPath}` : 'Ad unit: Unavailable',
-      binding.binding.status === 'bound'
-        ? `Bound · ${binding.visible ? 'Visible' : 'Outside viewport'}`
-        : binding.binding.status === 'ambiguous'
-          ? `Ambiguous binding · ${binding.binding.reason ?? 'reason unavailable'}`
-          : `Unbound · ${binding.binding.reason ?? 'reason unavailable'}`,
+      ...(latest
+        ? []
+        : [
+            binding.binding.status === 'bound'
+              ? `Bound · ${binding.visible ? 'Visible' : 'Outside viewport'}`
+              : binding.binding.status === 'ambiguous'
+                ? `Ambiguous binding · ${binding.binding.reason ?? 'reason unavailable'}`
+                : `Unbound · ${binding.binding.reason ?? 'reason unavailable'}`,
+          ]),
       ...(latest ? technicalCycleFacts(latest) : []),
     ]);
     container.append(technical);
