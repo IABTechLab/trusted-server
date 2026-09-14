@@ -22,6 +22,30 @@ case "$MODE" in
     ;;
 esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VICEROY_VERSION="$(
+  awk '
+    $1 == "viceroy" {
+      if (seen || NF != 2 || $2 !~ /^[0-9]+[.][0-9]+[.][0-9]+$/) {
+        malformed = 1
+        next
+      }
+      version = $2
+      seen = 1
+    }
+    END {
+      if (seen && !malformed) {
+        print version
+      }
+    }
+  ' "$REPO_ROOT/.tool-versions"
+)" || {
+  echo "Unable to read Viceroy pin from $REPO_ROOT/.tool-versions." >&2
+  exit 1
+}
+if [ -z "$VICEROY_VERSION" ]; then
+  echo "Viceroy pin is missing or malformed in $REPO_ROOT/.tool-versions; expected: viceroy <major.minor.patch>." >&2
+  exit 1
+fi
 WORK="$(mktemp -d)"
 ORIGIN_PORT="${ORIGIN_PORT:-9099}"
 BID_PORT="${BID_PORT:-9100}"
@@ -63,7 +87,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 command -v viceroy >/dev/null || {
-  echo "viceroy not found. Install: cargo install viceroy --version 0.17.0 --locked" >&2
+  echo "viceroy not found. Install: cargo install viceroy --version $VICEROY_VERSION --locked" >&2
   exit 1
 }
 command -v node >/dev/null || {

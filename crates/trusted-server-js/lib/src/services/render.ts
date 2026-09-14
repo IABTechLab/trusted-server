@@ -1720,9 +1720,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
         return false;
       }
       let promoted: boolean;
-      let promotionAttempted = false;
       try {
-        promotionAttempted = true;
         promoted = Reflect.apply(promoteArtifactMethod, artifacts, [
           candidate,
           () =>
@@ -1746,12 +1744,10 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
         promoted = false;
       }
       if (!promoted) {
-        if (promotionAttempted) {
-          try {
-            Reflect.apply(releaseArtifactMethod, artifacts, [candidate]);
-          } catch {
-            // The branded store contains release failure; attempt cleanup remains exact-once.
-          }
+        try {
+          Reflect.apply(releaseArtifactMethod, artifacts, [candidate]);
+        } catch {
+          // The branded store contains release failure; attempt cleanup remains exact-once.
         }
         fail('internal_error');
         return false;

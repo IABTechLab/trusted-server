@@ -26,7 +26,6 @@ pub(super) struct RenderSlot {
     formats: Vec<(u32, u32, Option<&'static str>)>,
     floor_price: Option<f64>,
     targeting: BTreeMap<String, String>,
-    aps_slot_id: Option<String>,
     /// `Some` when the slot runs Prebid; the map is per-bidder params (often empty).
     prebid_bidders: Option<BTreeMap<String, serde_json::Value>>,
 }
@@ -44,10 +43,7 @@ impl RenderSlot {
 
     /// Whether this configured slot carries fields that discovery cannot infer.
     fn has_tuned_fields(&self) -> bool {
-        self.floor_price.is_some()
-            || !self.targeting.is_empty()
-            || self.aps_slot_id.is_some()
-            || self.prebid_bidders.is_some()
+        self.floor_price.is_some() || !self.targeting.is_empty() || self.prebid_bidders.is_some()
     }
 
     /// Builds a slot from one page's discovery.
@@ -68,7 +64,6 @@ impl RenderSlot {
                 .collect(),
             floor_price: None,
             targeting: BTreeMap::new(),
-            aps_slot_id: None,
             prebid_bidders: slot.has_prebid.then(BTreeMap::new),
         }
     }
@@ -97,7 +92,6 @@ impl RenderSlot {
                 .collect(),
             floor_price: None,
             targeting: BTreeMap::new(),
-            aps_slot_id: None,
             prebid_bidders: has_prebid.then(BTreeMap::new),
         }
     }
@@ -125,7 +119,6 @@ impl RenderSlot {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
-            aps_slot_id: slot.providers.aps.as_ref().map(|aps| aps.slot_id.clone()),
             prebid_bidders: slot.providers.prebid.as_ref().map(|prebid| {
                 prebid
                     .bidders
@@ -490,10 +483,6 @@ pub(super) fn render_slots(slots: &[RenderSlot]) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("targeting = {{ {pairs} }}\n"));
-        }
-        if let Some(slot_id) = &slot.aps_slot_id {
-            out.push_str("[creative_opportunities.slot.providers.aps]\n");
-            out.push_str(&format!("slot_id = {}\n", toml_string(slot_id)));
         }
         if let Some(bidders) = &slot.prebid_bidders {
             out.push_str("[creative_opportunities.slot.providers.prebid]\n");
@@ -923,7 +912,7 @@ mod tests {
         render_slots(&merged)
     }
 
-    fn two_provider_slots_rendered() -> &'static str {
+    fn provider_slots_rendered() -> &'static str {
         r#"
 # Slots managed by `ts audit ad-templates generate`.
 # Review page_patterns and formats before validating/pushing.
@@ -943,8 +932,6 @@ div_id = "sidebar"
 gam_unit_path = "/222/{section}/sidebar"
 page_patterns = ["/"]
 formats = [{ width = 300, height = 250 }]
-[creative_opportunities.slot.providers.aps]
-slot_id = "sidebar"
 "#
     }
 
@@ -1060,12 +1047,9 @@ slot_id = "sidebar"
             [creative_opportunities]\ngam_network_id = \"111\"\n\n\
             [debug]\nauction_html_comment = true\n";
 
-        let updated = splice_creative_slots(
-            existing,
-            &network_keys("222"),
-            two_provider_slots_rendered(),
-        )
-        .expect("should splice slots");
+        let updated =
+            splice_creative_slots(existing, &network_keys("222"), provider_slots_rendered())
+                .expect("should splice slots");
 
         assert_eq!(
             table_headers(&updated),
@@ -1076,7 +1060,6 @@ slot_id = "sidebar"
                 "[[creative_opportunities.slot]]",
                 "[creative_opportunities.slot.providers.prebid]",
                 "[[creative_opportunities.slot]]",
-                "[creative_opportunities.slot.providers.aps]",
                 "[debug]",
             ]
         );
@@ -1088,12 +1071,9 @@ slot_id = "sidebar"
             [debug]\nauction_html_comment = true\n\n\
             [auction]\nenabled = true\n";
 
-        let updated = splice_creative_slots(
-            existing,
-            &network_keys("222"),
-            two_provider_slots_rendered(),
-        )
-        .expect("should create creative section and splice slots");
+        let updated =
+            splice_creative_slots(existing, &network_keys("222"), provider_slots_rendered())
+                .expect("should create creative section and splice slots");
 
         assert_eq!(
             table_headers(&updated),
@@ -1105,7 +1085,6 @@ slot_id = "sidebar"
                 "[[creative_opportunities.slot]]",
                 "[creative_opportunities.slot.providers.prebid]",
                 "[[creative_opportunities.slot]]",
-                "[creative_opportunities.slot.providers.aps]",
             ]
         );
     }
@@ -1436,7 +1415,6 @@ slot_id = "sidebar"
             formats: vec![(728, 90, None)],
             floor_price: Some(f64::NAN),
             targeting: BTreeMap::new(),
-            aps_slot_id: None,
             prebid_bidders: None,
         };
 
@@ -1459,7 +1437,6 @@ slot_id = "sidebar"
             formats: vec![(728, 90, None), (970, 250, None), (300, 250, None)],
             floor_price: None,
             targeting: BTreeMap::new(),
-            aps_slot_id: None,
             prebid_bidders: None,
         };
 

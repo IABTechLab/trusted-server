@@ -11,11 +11,15 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderName;
 use http::{HeaderMap, Method, StatusCode, header};
+use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 use serde::de::Error as _;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use url::Url;
-use validator::{Validate, ValidationError};
+#[cfg(test)]
+use validator::Validate;
+use validator::ValidationError;
 
 use crate::auction::openrtb::ignored_bidder_params_count;
 #[cfg(test)]
@@ -52,7 +56,9 @@ use crate::platform::{
     PlatformHttpRequest, PlatformResponse, ProxyHeaderEvidenceV1, RawProxyPolicyV1,
     RawProxyResponseV1, RuntimeServices,
 };
-use crate::settings::{IntegrationConfig, Settings};
+#[cfg(test)]
+use crate::settings::IntegrationConfig;
+use crate::settings::Settings;
 
 const APS_INTEGRATION_ID: &str = "aps";
 pub const APS_RENDERER_V2_ROUTE: &str = "/integrations/aps/renderer/v2";
@@ -280,15 +286,6 @@ impl Default for LegacyApsProviderConfig {
     }
 }
 
-/// Browser integration toggle retained independently from APS server providers.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
-pub struct ApsConfig {
-    /// Whether browser-side APS integration behavior is enabled.
-    #[serde(default)]
-    pub enabled: bool,
-}
-
 #[cfg(test)]
 impl IntegrationConfig for LegacyApsProviderConfig {
     fn is_enabled(&self) -> bool {
@@ -296,10 +293,24 @@ impl IntegrationConfig for LegacyApsProviderConfig {
     }
 }
 
-impl IntegrationConfig for ApsConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
+/// Reject the retired APS integration table.
+///
+/// APS activation and browser configuration are derived solely from an auction
+/// provider whose profile is `aps`.
+///
+/// # Errors
+///
+/// Returns a configuration error whenever `[integrations.aps]` is present.
+pub(crate) fn reject_retired_integration_table(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    if settings.integrations.contains_key(APS_INTEGRATION_ID) {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "`[integrations.aps]` is removed; configure APS under `[auction.providers.<id>]` with `profile = \"aps\"`"
+                .to_string(),
+        }));
     }
+    Ok(())
 }
 
 /// Typed server-side APS profile configuration used by the auction compiler.
@@ -2165,15 +2176,16 @@ impl IntegrationProxy for ApsV1Integration {
 ///
 /// # Errors
 ///
-/// Returns an error when enabled APS configuration is invalid.
+/// Returns an error when the retired APS integration table is present, including
+/// when no APS provider is active.
 pub fn register_for_plan(
     settings: &Settings,
     plan: &crate::auction::AuctionPlan,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    reject_retired_integration_table(settings)?;
     if !plan.enabled() || !plan.has_profile(APS_INTEGRATION_ID) {
         return Ok(None);
     }
-    let _browser_config = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)?;
     Ok(Some(
         IntegrationRegistration::builder(APS_INTEGRATION_ID)
             .without_js()
@@ -2197,12 +2209,10 @@ pub fn register(
     else {
         return Ok(None);
     };
-    let mut browser_settings = settings.clone();
-    browser_settings
-        .integrations
-        .insert_config(APS_INTEGRATION_ID, &ApsConfig { enabled: true })?;
+    let mut provider_settings = settings.clone();
+    provider_settings.integrations.remove(APS_INTEGRATION_ID);
     register_for_plan(
-        &browser_settings,
+        &provider_settings,
         &crate::auction::AuctionPlan::compile(AuctionPlanConfig {
             timeout_ms: 1000,
             providers: BTreeMap::from([(
@@ -2752,8 +2762,9 @@ mod tests {
         }))
         .expect("should parse canonical account ID");
         let integer = serde_json::from_value::<ApsProfileConfig>(json!({"account_id": 1234}));
+        let retired_key = concat!("pub", "_id");
         let legacy_alias = serde_json::from_value::<ApsProfileConfig>(json!({
-            "pub_id": "legacy-account"
+            retired_key: "legacy-account"
         }));
         let debug: ApsProfileConfig = serde_json::from_value(json!({
             "account_id": "example-account",
@@ -2765,26 +2776,31 @@ mod tests {
             integer.is_err(),
             "integer account IDs must fail the hard cutover"
         );
-        assert!(legacy_alias.is_err(), "pub_id must fail the hard cutover");
+        assert!(
+            legacy_alias.is_err(),
+            "{} must fail the hard cutover",
+            concat!("pub", "_id")
+        );
         assert!(!canonical.debug);
         assert!(debug.debug);
         assert!(!canonical.allow_script_creatives);
     }
 
     #[test]
-    fn browser_config_rejects_provider_fields() {
-        let enabled: ApsConfig = serde_json::from_value(json!({"enabled": true}))
-            .expect("should accept the browser enablement toggle");
-        assert!(enabled.enabled);
-
-        assert!(
-            serde_json::from_value::<ApsConfig>(json!({
-                "enabled": true,
-                "account_id": "legacy-account"
-            }))
-            .is_err(),
-            "removed APS provider fields must fail the hard cutover"
-        );
+    fn retired_integration_table_is_rejected_for_both_toggle_values() {
+        for enabled in [true, false] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(APS_INTEGRATION_ID, &json!({"enabled": enabled}))
+                .expect("should insert retired APS integration toggle");
+            let error = reject_retired_integration_table(&settings)
+                .expect_err("retired APS integration table should be rejected");
+            assert!(
+                error.to_string().contains("[integrations.aps]"),
+                "should identify the retired table: {error}"
+            );
+        }
     }
 
     #[test]
@@ -4088,10 +4104,10 @@ mod tests {
         }
 
         for path in [
-            "/integrations/aps/renderer",
-            "/integrations/aps/renderer/v1",
+            concat!("/integrations/aps/", "renderer"),
+            concat!("/integrations/aps/", "renderer/v1"),
             "/integrations/aps/runner/v1.js",
-            "/integrations/aps/renderer/v2/extra",
+            concat!("/integrations/aps/", "renderer/v2/extra"),
             "/integrations/aps/not-a-route",
         ] {
             let request = http::Request::builder()

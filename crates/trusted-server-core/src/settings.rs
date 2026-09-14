@@ -2534,7 +2534,7 @@ pub struct DebugConfig {
     pub auction_html_comment_options: AuctionDebugCommentOptions,
 
     /// Enable the testing-only direct GAM-replace path and the verbose per-bid
-    /// `debug_bid` blob in `window.tsjs.bids`.
+    /// `debug_bid` blob in the browser runtime.
     ///
     /// Note: the sanitized winning `adm` is now injected **unconditionally** for
     /// production inline rendering through the pbRender bridge (see
@@ -6070,34 +6070,26 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn disabled_removed_prebid_and_aps_fields_are_rejected() {
-        for (integration_id, removed_field) in [("prebid", "server_url"), ("aps", "account_id")] {
-            let mut settings = create_test_settings();
-            settings
-                .integrations
-                .insert_config(
-                    integration_id,
-                    &json!({
-                        "enabled": false,
-                        (removed_field): "removed-value",
-                    }),
-                )
-                .expect("should insert removed integration config field");
+    fn disabled_removed_prebid_fields_are_rejected() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": false,
+                    "server_url": "removed-value",
+                }),
+            )
+            .expect("should insert removed Prebid integration field");
 
-            let error = match integration_id {
-                "prebid" => settings
-                    .integration_config::<PrebidIntegrationConfig>(integration_id)
-                    .expect_err("should reject removed disabled Prebid field"),
-                "aps" => settings
-                    .integration_config::<crate::integrations::aps::ApsConfig>(integration_id)
-                    .expect_err("should reject removed disabled APS field"),
-                _ => unreachable!("test integration ID should be known"),
-            };
-            assert!(
-                format!("{error:?}").contains(removed_field),
-                "should identify removed field `{removed_field}`: {error:?}"
-            );
-        }
+        let error = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect_err("should reject removed disabled Prebid field");
+        assert!(
+            format!("{error:?}").contains("server_url"),
+            "should identify removed Prebid field: {error:?}"
+        );
     }
 
     #[test]

@@ -1043,6 +1043,47 @@ function largestMask(masks, sizeName) {
   );
 }
 
+/** Derive remaining bytes for each exact first-display transport ceiling. */
+export function deriveFirstDisplayHeadroomBytes(measurement) {
+  return Object.fromEntries(
+    SIZE_NAMES.map((sizeName) => {
+      const measuredBytes = measurement?.[sizeName];
+      const ceilingBytes = FIRST_DISPLAY_AGENT_SIZE_CEILING[sizeName];
+      if (
+        !Number.isSafeInteger(measuredBytes) ||
+        measuredBytes < 0 ||
+        measuredBytes > ceilingBytes
+      ) {
+        fail(`first-display ${sizeName} must be a permitted integer measurement`);
+      }
+      return [sizeName, ceilingBytes - measuredBytes];
+    })
+  );
+}
+
+/** List first-display size dimensions with one percent or less remaining headroom. */
+export function findFirstDisplayHeadroomWarnings(headroomBytes) {
+  return SIZE_NAMES.flatMap((sizeName) => {
+    const remainingBytes = headroomBytes?.[sizeName];
+    const ceilingBytes = FIRST_DISPLAY_AGENT_SIZE_CEILING[sizeName];
+    if (
+      !Number.isSafeInteger(remainingBytes) ||
+      remainingBytes < 0 ||
+      remainingBytes > ceilingBytes
+    ) {
+      fail(`first-display ${sizeName} headroom must be a non-negative integer`);
+    }
+    if (remainingBytes > ceilingBytes / 100) return [];
+    return [
+      {
+        dimension: `firstDisplayAgent.${sizeName}`,
+        ceilingBytes,
+        headroomBytes: remainingBytes,
+      },
+    ];
+  });
+}
+
 function namedFirstDisplayMask(masks, ids, name) {
   const key = JSON.stringify(ids);
   const matches = masks.filter((mask) => JSON.stringify(mask.ids) === key);
@@ -1095,16 +1136,18 @@ export function buildCandidateArchitectureSizeReport({
   for (const name of ['minimal', 'reference', 'aps']) {
     if (!named[name].permitted) fail(`required first-display ${name} mask exceeds its ceiling`);
   }
+  const firstDisplayAgent = {
+    rawBytes: largestRaw.rawBytes,
+    gzipBytes: largestGzip.gzipBytes,
+    brotliBytes: largestBrotli.brotliBytes,
+  };
+  const headroomBytes = deriveFirstDisplayHeadroomBytes(firstDisplayAgent);
   return {
     ceilings: CANDIDATE_ARCHITECTURE_SIZE_CEILINGS,
     bootstrap: Object.fromEntries(
       SIZE_NAMES.map((sizeName) => [sizeName, metrics.bootstrap[sizeName]])
     ),
-    firstDisplayAgent: {
-      rawBytes: largestRaw.rawBytes,
-      gzipBytes: largestGzip.gzipBytes,
-      brotliBytes: largestBrotli.brotliBytes,
-    },
+    firstDisplayAgent: { ...firstDisplayAgent, headroomBytes },
     referencePersistent: Object.fromEntries(
       SIZE_NAMES.map((sizeName) => [sizeName, metrics.sets.reference[sizeName]])
     ),
@@ -1112,6 +1155,7 @@ export function buildCandidateArchitectureSizeReport({
       SIZE_NAMES.map((sizeName) => [sizeName, maximalTotal[sizeName]])
     ),
     firstDisplay: { masks, permittedMasks, named },
+    headroomWarnings: findFirstDisplayHeadroomWarnings(headroomBytes),
   };
 }
 
@@ -1624,6 +1668,7 @@ export function checkBundleBudgets({ baselinePath = defaultBaselinePath } = {}) 
     historicalDeltas,
     frozenTransferReports: roleCorrect.captureReports,
     candidateArchitecture,
+    headroomWarnings: candidateArchitecture.headroomWarnings,
     productionGraphReport: buildProductionGraphReport(metrics, release),
     sets: metrics.sets,
   };

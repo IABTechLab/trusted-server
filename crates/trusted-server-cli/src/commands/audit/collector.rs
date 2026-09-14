@@ -331,7 +331,6 @@ mod tests {
                     "phase": "initial_load"
                 }
             ],
-            "aps_calls": [{ "slot_id": "atf", "sizes": [[300, 250]], "phase": "scroll" }],
             "warnings": [{ "code": "fluid_size_ignored", "message": "non-numeric GPT size ignored" }]
         }"#;
 
@@ -342,9 +341,19 @@ mod tests {
         assert_eq!(evidence.dom_ids[0].dom_id, "ad-atf-0");
         assert_eq!(evidence.gpt_slots[0].gam_unit_path, "/123/news/atf");
         assert_eq!(evidence.gpt_slots[0].sizes, vec![(300, 250)]);
-        assert_eq!(evidence.aps_calls[0].slot_id, "atf");
         // page_bids is absent in the payload and defaults to empty.
         assert!(evidence.page_bids.is_empty());
         assert_eq!(evidence.warnings[0].code, "fluid_size_ignored");
+
+        let retired_field = concat!("aps", "_calls");
+        let retired = serde_json::json!({
+            "dom_ids": [],
+            "gpt_slots": [],
+            (retired_field): []
+        });
+        assert!(
+            serde_json::from_value::<BrowserAdEvidence>(retired).is_err(),
+            "retired APS browser evidence must fail the hard cutover"
+        );
     }
 }

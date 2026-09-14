@@ -54,6 +54,8 @@ Trusted Server renderer owner required by revision 44. The refresh also retains 
 config-first auction-provider contract, strict first-party proxy allowlist
 enforcement, edge-validated Basic-auth template eligibility, and the latest
 first-impression arbitration behavior behind the revision-44 owners.
+A final fetch on 2026-09-14 confirmed that the release-branch tip had not advanced,
+so no additional merge or overlap reclassification was required.
 
 `origin/rc/202608` is the behavior, API, dependency, CI, and performance baseline.
 Do not merge `main` separately. Before final verification, fetch the release branch;
@@ -487,11 +489,13 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::aps::tests
   ```
 
-- [ ] **Step 4: Update the single renderer generator and generated contract.** Keep
-      the schema's `x-*` semantic markers documentary; generator code remains the
-      enforcement authority. Generate deterministic ES5-compatible v2 bootstrap
-      bytes, reuse the shared corpus across Rust, TypeScript, and Node tests, delete
-      the v1 body, and serve v1 as an unknown local `404` with no compatibility path.
+- [ ] **Step 4: Update the single renderer generator and generated contract.** Treat
+      `x-utf8MaxBytes`, `x-decodedMaxBytes`, and `x-envelope` as authoritative
+      generator inputs. The remaining `x-*` markers document checks emitted directly
+      by the generator and do not change enforcement on their own. Generate
+      deterministic ES5-compatible v2 bootstrap bytes, reuse the shared corpus across
+      Rust, TypeScript, and Node tests, delete the v1 body, and serve v1 as an unknown
+      local `404` with no compatibility path.
 
 - [ ] **Step 5: Preserve the live runner proxy exactly.** Keep its fixed target,
       credential/referrer stripping, duplicate-header evidence, identity encoding,
@@ -1070,6 +1074,13 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       independent `48,000/16,000/14,000` ceiling and require both GPT and APS
       candidate first-action p90 to be at most the exact rc base × 1.10 so the paired
       timing measurement covers controller and agent transfer/parse end to end.
+
+      Report remaining raw/gzip/Brotli headroom for the largest permitted mask in
+      each encoding as its exact ceiling minus its measured bytes. Emit deterministic,
+      advisory warning evidence for each dimension at or below the inclusive one
+      percent threshold. This observability does not change exact mask admission or
+      any ceiling: permitted masks remain served, and unpermitted masks intentionally
+      use direct persistent boot.
 
       Pin the APS absolute table: bids-script→first GPT action p90 ≤900 ms; first
       action→accepted completion p90 ≤1,500 ms; accepted completion→paint p90 ≤250
@@ -1722,7 +1733,11 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 **Files:** no intended production changes; fix failures test-first in the owning task
 and rerun this task from the start.
 
-- [ ] **Step 1: Verify formatting and repository integrity.**
+Execution tracking below records current-state proof only. Historical RED/GREEN and
+per-task commit checkboxes above remain intentionally unfilled rather than being
+backfilled without contemporaneous evidence.
+
+- [x] **Step 1: Verify formatting and repository integrity.**
 
   ```bash
   cargo fmt --all -- --check
@@ -1731,7 +1746,7 @@ and rerun this task from the start.
   git diff --check
   ```
 
-- [ ] **Step 2: Verify TypeScript build, types, lint, contracts, and bundles.**
+- [x] **Step 2: Verify TypeScript build, types, lint, contracts, and bundles.**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib ci
@@ -1748,7 +1763,7 @@ and rerun this task from the start.
   npm --prefix crates/trusted-server-js/lib run test:release
   ```
 
-- [ ] **Step 3: Verify Rust and every runtime adapter.**
+- [x] **Step 3: Verify Rust and every runtime adapter.**
 
   ```bash
   cargo test-fastly
@@ -1759,7 +1774,7 @@ and rerun this task from the start.
   ./scripts/test-cli.sh
   ```
 
-- [ ] **Step 4: Verify all target-matched clippy gates.**
+- [x] **Step 4: Verify all target-matched clippy gates.**
 
   ```bash
   cargo clippy-fastly
@@ -1770,7 +1785,7 @@ and rerun this task from the start.
   cargo clippy-spin-wasm
   ```
 
-- [ ] **Step 5: Verify APS proxy transport parity.**
+- [x] **Step 5: Verify APS proxy transport parity.**
 
   ```bash
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime axum
@@ -1779,7 +1794,7 @@ and rerun this task from the start.
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime spin
   ```
 
-- [ ] **Step 6: Verify the hermetic browser matrix in all three engines.**
+- [x] **Step 6: Verify the hermetic browser matrix in all three engines.**
 
   ```bash
   bash scripts/ci/aps-tsjs-cutover.sh install-browsers
@@ -1788,6 +1803,14 @@ and rerun this task from the start.
 
   The checked-in browser command includes `tests/shared/tsjs-policy.spec.ts`; no
   multiline policy/server implementation is embedded in workflow YAML.
+
+  Final local evidence on 2026-09-14: all four actual-adapter APS proxy corpora
+  passed; the Chromium, Firefox, and WebKit matrix passed 89 tests with 10
+  capability-based Trusted Types skips; 2,180 Vitest assertions, 101 release
+  contracts, every Rust adapter suite, cross-adapter parity, the CLI suite, all six
+  target-matched clippy gates, formatting, bundle, architecture, concept-audit,
+  APS-contract, and hard-cutover gates passed. Remote-only paired performance and
+  protected real-GAM evidence remain Steps 8 and 9.
 
 - [ ] **Step 7: Push the exact locally verified candidate before remote gates.**
       Require a clean worktree, confirm `origin/rc/202608` is the audited base, push
@@ -1882,41 +1905,42 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
 
 ## Completion checklist
 
-- [ ] Design revision 44 and this one plan agree on `rc/202608` authority.
-- [ ] All 23 concept rows have fresh final rc-baseline classifications.
-- [ ] No backward-compatibility path or second runtime remains.
-- [ ] No APS runner, GPT, or PUC bytes are vendored, pinned, cached, or stored.
-- [ ] The live runner proxy remains fixed-target, bounded, five-second, and
+- [x] Design revision 44 and this one plan agree on `rc/202608` authority.
+- [x] All 23 concept rows have fresh final rc-baseline classifications.
+- [x] No backward-compatibility path or second runtime remains.
+- [x] No APS runner, GPT, or PUC bytes are vendored, pinned, cached, or stored.
+- [x] The live runner proxy remains fixed-target, bounded, five-second, and
       equivalent across all four adapters.
-- [ ] `TsjsBootV1` contains one exact frozen ordered integration-config carrier;
+- [x] `TsjsBootV1` contains one exact frozen ordered integration-config carrier;
       modules receive attenuated values only.
-- [ ] Production boot uses one server-sealed canonical JSON lexical transport;
+- [x] Production boot uses one server-sealed canonical JSON lexical transport;
       bootstrap does not bundle the full object-form projection/config validators.
-- [ ] Bootstrap seals one authenticated runtime admission through the selected
+- [x] Bootstrap seals one authenticated runtime admission through the selected
       script's `_claimRuntimeV1`; no retired two-claim harness or mutable namespace
       admission remains.
-- [ ] One response-header CSP nonce, when uniquely admitted, covers every
+- [x] One response-header CSP nonce, when uniquely admitted, covers every
       Trusted Server executable tag and is copied only through the authenticated
       runtime chain; the named Trusted Types policy is created at most once per path.
-- [ ] `ServerBootIntegrityV1` is always present; direct runtime and takeover both
+- [x] `ServerBootIntegrityV1` is always present; direct runtime and takeover both
       recompute projection/config digests before effects, and takeover requires exact
       integrity/outline/handoff equality.
-- [ ] No-agent preparation/activation/commit is synchronous and parser-blocking.
-- [ ] ADM and APS reservations select one `render_owner_initial` slice with the
+- [x] No-agent preparation/activation/commit is synchronous and parser-blocking.
+- [x] ADM and APS reservations select one `render_owner_initial` slice with the
       source-neutral journal and compact self-contained PUC owner; `aps_initial`
       owns only APS-specific descriptor/nonce/mount behavior.
-- [ ] APS uses top mount -> bootstrap -> outer data -> inner data -> creative with
+- [x] APS uses top mount -> bootstrap -> outer data -> inner data -> creative with
       independent `b1_`/`n1_` nonces and exact conditional CSP.
-- [ ] PUC protocol v4 owns registration/Promise settlement only, not APS DOM.
-- [ ] Committed overlays retire exactly once on every required lifecycle boundary.
-- [ ] `creative_opportunities.enabled` is required and preserves direct auction plus
+- [x] PUC protocol v4 owns registration/Promise settlement only, not APS DOM.
+- [x] Committed overlays retire exactly once on every required lifecycle boundary.
+- [x] `creative_opportunities.enabled` is required and preserves direct auction plus
       the exact inactive HTML policy.
-- [ ] GPT diagnostics keep requested, GPT-fill, and observed sizes distinct.
-- [ ] GAM attribution has one typed parser-time GPT owner and no raw global path.
-- [ ] Rc C2/ESI, DataDome, PBS Cache, GPT, Prebid, creative, and remaining
+- [x] GPT diagnostics keep requested, GPT-fill, and observed sizes distinct.
+- [x] GAM attribution has one typed parser-time GPT owner and no raw global path.
+- [x] Rc C2/ESI, DataDome, PBS Cache, GPT, Prebid, creative, and remaining
       integrations pass unchanged-behavior contracts.
-- [ ] Package, TypeScript, Prebid isolation, architecture, bundle, and hard-cutover
+- [x] Package, TypeScript, Prebid isolation, architecture, bundle, and hard-cutover
       gates pass.
-- [ ] Hermetic three-browser, four-adapter proxy, paired rc performance, and
-      protected real-GAM gates pass.
+- [x] Hermetic three-browser and four-adapter proxy gates pass.
+- [ ] Paired rc performance and protected real-GAM gates pass on the exact pushed
+      candidate.
 - [ ] Branch is clean, pushed, reviewed, and the PR targets `rc/202608`.

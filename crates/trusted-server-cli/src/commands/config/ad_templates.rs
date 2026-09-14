@@ -498,9 +498,6 @@ fn format_format(format: &CreativeOpportunityFormat) -> String {
 
 fn format_providers(slot: &CreativeOpportunitySlot) -> String {
     let mut providers = Vec::new();
-    if slot.providers.aps.is_some() {
-        providers.push("aps");
-    }
     if slot.providers.prebid.is_some() {
         providers.push("prebid");
     }

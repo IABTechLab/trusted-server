@@ -326,6 +326,12 @@ test('generated bootstrap source graph excludes APS integration implementation',
   );
 });
 
+test('render promotion failure cleanup has no promotion-attempt flag', async () => {
+  const source = await readFile(path.join(packageRoot, 'src/services/render.ts'), 'utf8');
+
+  assert.doesNotMatch(source, /\bpromotionAttempted\b/u);
+});
+
 test('every current integration directory participates in cross-integration isolation', async () => {
   const entries = await readdir(path.join(packageRoot, 'src/integrations'), {
     withFileTypes: true,

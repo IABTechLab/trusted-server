@@ -68,6 +68,9 @@ jobs:
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
+      - name: Test template cache harness contract
+        run: node --test scripts/template-cache-local-test.test.mjs
+
       - name: Run tests
         run: cargo test-fastly
 

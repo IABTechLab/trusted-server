@@ -60,6 +60,7 @@ export function generatedTsjsArtifactFiles(root = packageRoot) {
 
 const generatedTsjsFiles = generatedTsjsArtifactFiles();
 const currentGuideFiles = collect(path.join(repositoryRoot, 'docs/guide'));
+const currentReleaseNoteFiles = [path.join(repositoryRoot, 'CHANGELOG.md')];
 const browserTestFiles = collect(
   path.join(repositoryRoot, 'crates/trusted-server-integration-tests/browser')
 );
@@ -69,6 +70,7 @@ const productionRustFiles = [
   'crates/trusted-server-adapter-axum/src',
   'crates/trusted-server-adapter-cloudflare/src',
   'crates/trusted-server-adapter-spin/src',
+  'crates/trusted-server-cli/src',
 ].flatMap((directory) => collect(path.join(repositoryRoot, directory)));
 const thisScript = path.resolve(import.meta.filename);
 const auxiliaryFiles = [
@@ -77,7 +79,12 @@ const auxiliaryFiles = [
   ...collect(path.join(repositoryRoot, 'scripts')),
   ...collect(path.join(repositoryRoot, '.github/workflows')),
 ].filter((file) => path.resolve(file) !== thisScript);
-const legacySurfaceFiles = [...shippedTsjsFiles, ...generatedTsjsFiles, ...currentGuideFiles];
+const legacySurfaceFiles = [
+  ...shippedTsjsFiles,
+  ...generatedTsjsFiles,
+  ...currentGuideFiles,
+  ...currentReleaseNoteFiles,
+];
 const uniqueFiles = (files) => [...new Set(files)];
 const violations = [];
 
@@ -128,6 +135,11 @@ const retiredCutoverExpressions = [
   ],
   ['retired TSJS public version', /\btsjs(?:\.|\?\.)version\s*=\s*['"]0\.1\.0['"]/gu],
   ['retired creative global', /\b(?:tscreative|tsCreativeConfig)\b/gu],
+  [
+    'retired APS creative-opportunity slot configuration',
+    /\bcreative_opportunities(?:\.slot)?\.providers\.aps\b|\bslot\.providers\.aps\b|\bApsSlotParams\b/gu,
+  ],
+  ['retired APS browser audit evidence', /\b(?:aps_calls|ApsFetchBidsEvidence)\b/gu],
 ];
 
 export function findCutoverTextViolations(file, source) {
@@ -141,6 +153,11 @@ export function findCutoverTextViolations(file, source) {
     if (expression.test(source)) found.push(label);
   }
   return found;
+}
+
+/** Returns cutover violations in the complete source, including Rust tests. */
+export function findProductionCutoverTextViolations(file, source) {
+  return findCutoverTextViolations(file, source);
 }
 
 const forbiddenVendorBasename =
@@ -166,17 +183,38 @@ export function findVendorBoundaryViolations(file, source) {
   return found;
 }
 
-for (const file of uniqueFiles([
-  ...productionTsjsFiles,
-  ...generatedTsjsFiles,
-  ...currentGuideFiles,
-  ...productionRustFiles,
-])) {
+/** Returns retired APS route and configuration violations in complete APS Rust source. */
+export function findApsLegacySurfaceViolations(source) {
+  const found = [];
+  for (const [label, expression] of [
+    [
+      'non-canonical APS renderer route',
+      /\/integrations\/aps\/renderer(?!\/v2(?![A-Za-z0-9_./-]))/g,
+    ],
+    ['APS pub_id compatibility alias', /\bpub_id\b/g],
+  ]) {
+    expression.lastIndex = 0;
+    for (let match = expression.exec(source); match; match = expression.exec(source)) {
+      found.push({ label, offset: match.index });
+      if (match[0].length === 0) expression.lastIndex += 1;
+    }
+  }
+  return found;
+}
+
+export function productionCutoverFiles() {
+  return uniqueFiles([
+    ...productionTsjsFiles,
+    ...generatedTsjsFiles,
+    ...currentGuideFiles,
+    ...currentReleaseNoteFiles,
+    ...productionRustFiles,
+  ]);
+}
+
+for (const file of productionCutoverFiles()) {
   const source = fs.readFileSync(file, 'utf8');
-  const productionSource = file.endsWith('.rs')
-    ? (source.split('\n#[cfg(test)]')[0] ?? source)
-    : source;
-  for (const label of findCutoverTextViolations(relative(file), productionSource)) {
+  for (const label of findProductionCutoverTextViolations(relative(file), source)) {
     violations.push(`${relative(file)}:1: ${label}`);
   }
 }
@@ -201,10 +239,7 @@ const vendorBoundaryFiles = [
 ];
 for (const file of uniqueFiles(vendorBoundaryFiles)) {
   const source = fs.readFileSync(file, 'utf8');
-  const productionSource = file.endsWith('.rs')
-    ? (source.split('\n#[cfg(test)]')[0] ?? source)
-    : source;
-  for (const label of findVendorBoundaryViolations(relative(file), productionSource)) {
+  for (const label of findVendorBoundaryViolations(relative(file), source)) {
     violations.push(`${relative(file)}:1: ${label}`);
   }
 }
@@ -295,7 +330,7 @@ forbid(
   /\/\/\/.*window\.__tsjs_.*/g
 );
 
-const routeAndConfigFiles = [...shippedTsjsFiles, ...currentGuideFiles];
+const routeAndConfigFiles = [...shippedTsjsFiles, ...currentGuideFiles, ...currentReleaseNoteFiles];
 forbid(routeAndConfigFiles, 'deprecated page-bids route', /\/__ts\/page-bids/g);
 forbid(
   routeAndConfigFiles,
@@ -307,12 +342,11 @@ const apsIntegrationFile = path.join(
   'crates/trusted-server-core/src/integrations/aps.rs'
 );
 const apsIntegrationSource = fs.readFileSync(apsIntegrationFile, 'utf8');
-forbidSource(
-  apsIntegrationFile,
-  apsIntegrationSource.split('\n#[cfg(test)]')[0] ?? apsIntegrationSource,
-  'non-canonical APS renderer route',
-  /\/integrations\/aps\/renderer(?!\/v2(?![A-Za-z0-9_./-]))/g
-);
+for (const { label, offset } of findApsLegacySurfaceViolations(apsIntegrationSource)) {
+  violations.push(
+    `${relative(apsIntegrationFile)}:${lineNumber(apsIntegrationSource, offset)}: ${label}`
+  );
+}
 if (
   !apsIntegrationSource.includes(
     'pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";'
@@ -325,10 +359,8 @@ if (
 ) {
   violations.push(`${relative(apsIntegrationFile)}:1: versioned APS runner route is served`);
 }
-forbid(currentGuideFiles, 'APS pub_id compatibility alias', /\bpub_id\b/g);
-forbidSource(
-  apsIntegrationFile,
-  apsIntegrationSource.split('\n#[cfg(test)]')[0] ?? apsIntegrationSource,
+forbid(
+  [...currentGuideFiles, ...currentReleaseNoteFiles],
   'APS pub_id compatibility alias',
   /\bpub_id\b/g
 );

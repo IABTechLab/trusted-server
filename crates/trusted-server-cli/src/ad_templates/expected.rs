@@ -32,7 +32,7 @@ pub struct ExpectedSlot {
     pub gam_unit_path: Option<String>,
     /// Configured ad formats.
     pub formats: Vec<ExpectedFormat>,
-    /// Configured provider names, in `aps`, `prebid` order.
+    /// Configured slot-level provider names.
     pub providers: Vec<String>,
     /// Glob patterns configured for this slot.
     pub page_patterns: Vec<String>,
@@ -97,9 +97,6 @@ fn provider_names(
     slot: &trusted_server_core::creative_opportunities::CreativeOpportunitySlot,
 ) -> Vec<String> {
     let mut providers = Vec::new();
-    if slot.providers.aps.is_some() {
-        providers.push("aps".to_string());
-    }
     if slot.providers.prebid.is_some() {
         providers.push("prebid".to_string());
     }

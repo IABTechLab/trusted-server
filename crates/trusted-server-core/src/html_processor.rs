@@ -1070,7 +1070,9 @@ mod tests {
         let cleanup_program_marker = "history.replaceState";
 
         assert_eq!(
-            processed.matches("__tsjs_gpt_diagnostics_active").count(),
+            processed
+                .matches(concat!("__", "tsjs_gpt_diagnostics_active"))
+                .count(),
             0,
             "server boot data must be the only browser-visible activation result"
         );

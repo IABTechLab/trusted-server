@@ -161,9 +161,9 @@ Edit `trusted-server.toml` to configure:
 - stable key names for `trusted_server_secrets`
 
 Do not put a Prebid Server URL or server bidder list under
-`[integrations.prebid]`, and do not put APS account, endpoint, or timeout fields
-under `[integrations.aps]`. Those server values belong to auction provider
-common fields and `profile_config`.
+`[integrations.prebid]`. The retired `[integrations.aps]` table is rejected in
+its entirety. APS account, endpoint, timeout, and policy values belong to auction
+provider common fields and `profile_config`.
 
 Provision the physical store mapped from logical `trusted_server_secrets` with
 the existing credential values before pushing a migrated config. On Fastly,

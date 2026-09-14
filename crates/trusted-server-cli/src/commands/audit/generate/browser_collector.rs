@@ -944,9 +944,6 @@ const GPT_DIAGNOSTIC_SCRIPT: &str = r#"() => {
         slots: count,
         tcfapi: typeof window.__tcfapi,
         scripts: document.scripts.length,
-        ts_ad_slots: (() => {
-            try { return (window.tsjs && window.tsjs.adSlots || []).length } catch (error) { return -1 }
-        })(),
     };
 }"#;
 

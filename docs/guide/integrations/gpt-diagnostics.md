@@ -387,9 +387,9 @@ have elapsed. GPT callback capture and integration evidence can begin earlier.
 ## Browser API
 
 When active, the integration exposes a read-only operator API. It has exactly the
-five methods below; the evidence writers Trusted Server's own integration modules
-use live on a separate internal channel (`window.tsjs.gptDiagnosticsRecorder`) that
-is not part of this contract and is not supported for operator use.
+five methods below. Trusted Server's own integration modules write evidence through
+a closure-private recorder capability passed directly between TSJS owners. That
+capability is never published on `window` and is not part of the operator contract.
 
 ```js
 const diagnostics = window.tsjs.diagnostics.gpt

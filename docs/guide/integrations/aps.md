@@ -37,15 +37,16 @@ enabled = true
 timeout_ms = 2000
 ```
 
-`account_id` is required. It accepts a non-empty string or integer account identifier; no alternate field name is supported.
+`account_id` is required and accepts only a non-empty string. Integer values,
+alternate field names, mixed legacy shapes, and unknown APS keys are rejected.
 
-This is a hard config cutover. Before deploying the new binary, rename the former
-APS account field to the canonical `account_id`, quote any numeric
-identifier so it is a TOML string, and remove legacy or unknown APS keys. Run
-`ts config validate`, then push the canonical configuration while the old binary
-that accepts `account_id` is still serving. Deploy the new binary only after that
-push succeeds. The new binary has no legacy field alias, numeric-ID coercion, or
-compatibility parser.
+This is a hard config cutover with no mixed-version-safe deployment order: old
+binaries reject the provider maps and the new binary rejects the retired shape.
+Prepare the canonical configuration, quote any numeric account identifier so it
+is a TOML string, remove legacy or unknown APS keys, and run `ts config validate`.
+Activate the new binary and canonical config blob together. A rollback must restore
+the prior binary and its old-schema blob together. The new binary has no legacy
+field alias, numeric-ID coercion, or compatibility parser.
 
 `debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
 
@@ -130,9 +131,9 @@ provider = "aps-main"
 The optional mediator stays separate under `[auction].mediator`; never declare
 it under `[auction.providers]` or `[auction.bidders]`.
 
-APS uses ordinary auction slot IDs and banner formats. Legacy creative-
-opportunity APS `slot_id` values are ignored, and `bidders.aps.slotID` is not
-required.
+APS uses ordinary auction slot IDs and banner formats. The retired APS-specific
+creative-opportunity slot block is rejected, and `bidders.aps.slotID` is neither
+required nor accepted as APS provider configuration.
 
 ## OpenRTB request
 
@@ -295,10 +296,13 @@ This release is a direct configuration and protocol cutover:
 
 1. In the operator configuration, rename the former APS account field
    to `account_id`, quote numeric identifiers, and remove legacy or unknown APS keys.
-2. Run `ts config validate`, then push that canonical configuration while the old
-   binary that accepts `account_id` is still serving.
-3. Deploy the new binary. It rejects the former field, numeric IDs, aliases, mixed
-   legacy shapes, and unknown APS keys; there is no compatibility parser.
+2. Run `ts config validate`, then stage the canonical config blob and new binary for
+   one atomic activation. Do not publish the new shape to an old binary or the old
+   shape to the new binary.
+3. Activate the new binary and canonical config blob together. It rejects the former
+   field, numeric IDs, aliases, mixed legacy shapes, and unknown APS keys; there is no
+   compatibility parser. Roll back only by restoring the prior binary and old-schema
+   blob together.
 4. Replace the legacy `/e/dtb/bid` endpoint with `/e/pb/bid`.
 5. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path.
 6. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.

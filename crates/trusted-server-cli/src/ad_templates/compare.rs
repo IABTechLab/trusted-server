@@ -45,27 +45,7 @@ pub struct GptSlotEvidence {
     pub phase: EvidencePhase,
 }
 
-/// An `apstag.fetchBids` call the page made, if any were recorded.
-///
-/// The collector no longer hooks `apstag`: server-side APS configuration is
-/// metadata rather than a client assertion, so a missing client call is not a
-/// finding. The field and this shape stay for the evidence payload's schema, and
-/// the list arrives empty.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(
-    dead_code,
-    reason = "decoded for schema stability; the collector records no APS calls"
-)]
-pub struct ApsFetchBidsEvidence {
-    /// The APS slot ID requested.
-    pub slot_id: String,
-    /// Sizes requested for the slot.
-    pub sizes: Vec<(u32, u32)>,
-    /// The phase it was observed in.
-    pub phase: EvidencePhase,
-}
-
-/// A `/__ts/page-bids` observation for SPA routes (spec §5.2).
+/// A `/_ts/page-bids` observation for SPA routes (spec §5.2).
 ///
 /// DEFERRED in Phase 1: kept as forward scaffolding so the decoded evidence shape
 /// stays forward-compatible. Not populated by the collector or surfaced in JSON.
@@ -83,14 +63,13 @@ pub struct PageBidsEvidence {
 
 /// All read-only ad evidence decoded from a single browser page.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserAdEvidence {
     /// DOM element IDs matching configured prefixes.
     pub dom_ids: Vec<DomEvidence>,
     /// GPT slots observed via `defineSlot` and `getSlots()`.
     pub gpt_slots: Vec<GptSlotEvidence>,
-    /// `apstag.fetchBids` calls observed.
-    pub aps_calls: Vec<ApsFetchBidsEvidence>,
-    /// `/__ts/page-bids` observations (deferred; default empty).
+    /// `/_ts/page-bids` observations (deferred; default empty).
     #[serde(default)]
     #[allow(dead_code, reason = "reserved for the optional bids phase")]
     pub page_bids: Vec<PageBidsEvidence>,
@@ -438,23 +417,10 @@ mod tests {
         }
     }
 
-    fn aps(slot_id: &str, sizes: &[(u32, u32)]) -> ApsFetchBidsEvidence {
-        ApsFetchBidsEvidence {
-            slot_id: slot_id.to_string(),
-            sizes: sizes.to_vec(),
-            phase: EvidencePhase::InitialLoad,
-        }
-    }
-
-    fn evidence(
-        doms: Vec<DomEvidence>,
-        gpts: Vec<GptSlotEvidence>,
-        aps: Vec<ApsFetchBidsEvidence>,
-    ) -> BrowserAdEvidence {
+    fn evidence(doms: Vec<DomEvidence>, gpts: Vec<GptSlotEvidence>) -> BrowserAdEvidence {
         BrowserAdEvidence {
             dom_ids: doms,
             gpt_slots: gpts,
-            aps_calls: aps,
             page_bids: Vec::new(),
             warnings: Vec::new(),
         }
@@ -505,7 +471,6 @@ mod tests {
         let evidence = evidence(
             vec![dom("ad-atf-0")],
             vec![gpt_slot("/123/news/atf", "ad-atf-0", &[(300, 250)])],
-            Vec::new(),
         );
 
         let result = compare_page_evidence(
@@ -528,7 +493,6 @@ mod tests {
         let evidence = evidence(
             vec![dom("ad-atf-0")],
             vec![gpt_slot("/123/news/atf", "ad-atf-0", &[(300, 250)])],
-            Vec::new(),
         );
 
         let result = compare_page_evidence(
@@ -554,7 +518,7 @@ mod tests {
     #[test]
     fn dom_only_is_partial() {
         let expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &[]);
-        let evidence = evidence(vec![dom("ad-atf-0")], Vec::new(), Vec::new());
+        let evidence = evidence(vec![dom("ad-atf-0")], Vec::new());
 
         let result = compare_page_evidence(
             &[expected],
@@ -574,7 +538,7 @@ mod tests {
     #[test]
     fn no_dom_or_gpt_is_missing() {
         let expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &[]);
-        let evidence = evidence(Vec::new(), Vec::new(), Vec::new());
+        let evidence = evidence(Vec::new(), Vec::new());
 
         let result = compare_page_evidence(
             &[expected],
@@ -596,7 +560,6 @@ mod tests {
         );
         let evidence = evidence(
             vec![dom("ad-header-0--container"), dom("ad-header-0-_R_abc123")],
-            Vec::new(),
             Vec::new(),
         );
 
@@ -627,7 +590,6 @@ mod tests {
                     &[(300, 250)],
                 ),
             ],
-            Vec::new(),
         );
 
         let result = compare_page_evidence(
@@ -648,7 +610,7 @@ mod tests {
     #[test]
     fn auction_disabled_skips_strict_missing_failure() {
         let expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &[]);
-        let evidence = evidence(Vec::new(), Vec::new(), Vec::new());
+        let evidence = evidence(Vec::new(), Vec::new());
 
         let result = compare_page_evidence(
             &[expected],
@@ -670,7 +632,6 @@ mod tests {
         let evidence = evidence(
             vec![dom("ad-atf-0")],
             vec![gpt_slot("/123/news/atf", "ad-atf-0", &[(728, 90)])],
-            Vec::new(),
         );
 
         let result = compare_page_evidence(
@@ -694,7 +655,6 @@ mod tests {
         let evidence = evidence(
             vec![dom("ad-video-0")],
             vec![gpt_slot("/123/news/video", "ad-video-0", &[(640, 480)])],
-            Vec::new(),
         );
 
         let result = compare_page_evidence(
@@ -726,7 +686,6 @@ mod tests {
                 "ad-atf-0-container",
                 &[(300, 250)],
             )],
-            Vec::new(),
         );
 
         let result = compare_page_evidence(
@@ -754,7 +713,6 @@ mod tests {
         let evidence = evidence(
             vec![dom("ad-oop-0")],
             vec![gpt_slot("/123/news/oop", "ad-oop-0", &[])],
-            Vec::new(),
         );
 
         let result = compare_page_evidence(
@@ -773,58 +731,6 @@ mod tests {
         assert!(
             result.strict_failed(),
             "a live sizeless slot drifting from configured banner sizes must fail strict"
-        );
-    }
-
-    #[test]
-    fn aps_match_adds_no_warning() {
-        let expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &["aps"]);
-        let evidence = evidence(
-            vec![dom("ad-atf-0")],
-            vec![gpt_slot("/123/news/atf", "ad-atf-0", &[(300, 250)])],
-            vec![aps("atf", &[(300, 250)])],
-        );
-
-        let result = compare_page_evidence(
-            &[expected],
-            &evidence,
-            RuntimeGateSummary::unknown_allowed(),
-        );
-
-        assert_eq!(result.slots[0].status, SlotStatus::Confirmed);
-        assert!(
-            !result.slots[0]
-                .warnings
-                .iter()
-                .any(|w| w.code.starts_with("aps_")),
-            "matching APS should not warn"
-        );
-    }
-
-    #[test]
-    fn server_side_aps_config_does_not_require_client_fetch_bids_evidence() {
-        let expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &["aps"]);
-        let evidence = evidence(
-            vec![dom("ad-atf-0")],
-            vec![gpt_slot("/123/news/atf", "ad-atf-0", &[(300, 250)])],
-            Vec::new(),
-        );
-
-        let result = compare_page_evidence(
-            &[expected],
-            &evidence,
-            RuntimeGateSummary::unknown_allowed(),
-        );
-
-        assert_eq!(
-            result.slots[0].status,
-            SlotStatus::Confirmed,
-            "missing APS does not flip status"
-        );
-        assert!(result.slots[0].warnings.is_empty());
-        assert!(
-            !result.strict_failed(),
-            "provider warning alone must not fail strict"
         );
     }
 }

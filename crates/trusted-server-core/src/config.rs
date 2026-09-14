@@ -16,7 +16,7 @@ use validator::{Validate, ValidationError, ValidationErrors};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
+    adserver_mock::AdServerMockConfig, aps, datadome::DataDomeConfig,
     didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
     gpt_diagnostics::GptDiagnosticsConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
     osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
@@ -263,7 +263,7 @@ fn validate_enabled_integrations(
     resolved_secrets: bool,
 ) -> Result<(), Report<TrustedServerError>> {
     validate_prebid(settings, plan)?;
-    validate_integration::<ApsConfig>(settings, "aps")?;
+    aps::reject_retired_integration_table(settings)?;
     validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
@@ -855,6 +855,24 @@ password = "production-admin-password-32-bytes"
             err.to_string().contains("Insecure default"),
             "error should mention insecure default"
         );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_retired_aps_table_for_both_toggle_values() {
+        for enabled in [true, false] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("aps", &serde_json::json!({ "enabled": enabled }))
+                .expect("should insert retired APS integration table");
+
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("deploy validation should reject retired APS integration table");
+            assert!(
+                error.to_string().contains("[integrations.aps]"),
+                "should identify the retired APS table: {error}"
+            );
+        }
     }
 
     #[test]

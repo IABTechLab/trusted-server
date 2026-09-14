@@ -1644,10 +1644,10 @@ a missing leaf is silently ignored.
 ### Provider map
 
 ::: danger Breaking migration from the provider list
-The former `[auction].providers = ["prebid", ...]` list and server-owned fields
-under `[integrations.prebid]` and `[integrations.aps]` are no longer accepted,
-even when an integration is disabled. Replace them with provider instances and
-bidder routes before deployment.
+The former `[auction].providers = ["prebid", ...]` list, server-owned fields
+under `[integrations.prebid]`, and the entire retired `[integrations.aps]` table
+are no longer accepted, even when set to disabled. Replace them with provider
+instances and bidder routes before deployment.
 
 For Prebid Server, move `server_url` to provider `endpoint`, server timeout to
 provider `timeout_ms`, request controls and bidder-parameter overrides to the

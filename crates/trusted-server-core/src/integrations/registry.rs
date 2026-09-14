@@ -2130,13 +2130,34 @@ mod tests {
     }
 
     #[test]
+    fn registry_rejects_retired_aps_integration_toggle_without_an_aps_profile() {
+        for enabled in [true, false] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "aps",
+                    &serde_json::json!({
+                        "enabled": enabled
+                    }),
+                )
+                .expect("should insert retired APS integration config");
+
+            let error = IntegrationRegistry::new(&settings)
+                .err()
+                .expect("retired APS integration toggle should fail registry startup");
+            assert!(
+                error.to_string().contains("[integrations.aps]"),
+                "should identify the retired APS integration table: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn aps_profile_alone_registers_and_activates_reserved_routes() {
         let settings = create_test_settings();
         assert!(
-            settings
-                .integration_config::<crate::integrations::aps::ApsConfig>("aps")
-                .expect("APS browser config lookup should succeed")
-                .is_none(),
+            !settings.integrations.contains_key("aps"),
             "the activation proof must not depend on integrations.aps"
         );
         let plan = crate::auction::AuctionPlan::compile(crate::auction::plan::AuctionPlanConfig {
@@ -3136,12 +3157,6 @@ mod tests {
     fn registry_projects_every_enabled_product_once_without_private_server_fields() {
         let mut settings = crate::test_support::tests::create_test_settings();
         for (id, config) in [
-            (
-                "aps",
-                serde_json::json!({
-                    "enabled": true
-                }),
-            ),
             (
                 "datadome",
                 serde_json::json!({

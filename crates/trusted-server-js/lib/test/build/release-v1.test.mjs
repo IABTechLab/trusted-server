@@ -21,9 +21,12 @@ import {
 import * as bundleBudgets from '../../scripts/check-bundle-budgets.mjs';
 import * as bundleMetrics from '../../scripts/bundle-metrics.mjs';
 import {
+  findApsLegacySurfaceViolations,
   findCutoverTextViolations,
+  findProductionCutoverTextViolations,
   findVendorBoundaryViolations,
   generatedTsjsArtifactFiles,
+  productionCutoverFiles,
 } from '../../scripts/check-hard-cutover-absence.mjs';
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -544,6 +547,38 @@ test('generated APS bootstrap configuration preserves its public wire keys', () 
   );
 });
 
+test('APS renderer schema identifies authoritative and documentation-only markers', () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(libDirectory, 'test/fixtures/aps-renderer-v1.schema.json'), 'utf8')
+  );
+  const generator = fs.readFileSync(
+    path.join(repositoryRoot, 'scripts/generate-aps-renderer-contract.mjs'),
+    'utf8'
+  );
+
+  for (const marker of ['x-utf8MaxBytes', 'x-decodedMaxBytes', 'x-envelope']) {
+    assert.ok(
+      schema.$comment.includes(marker),
+      `schema comment must identify authoritative marker ${marker}`
+    );
+    assert.ok(generator.includes(marker), `generator must consume authoritative marker ${marker}`);
+  }
+  for (const marker of [
+    'x-forbidNulAndAsciiControl',
+    'x-canonicalStandardBase64',
+    'x-requiredScheme',
+    'x-forbidCredentials',
+    'x-forbidPublisherOrigin',
+  ]) {
+    assert.ok(schema.$comment.includes('remaining x-* markers'));
+    assert.equal(
+      generator.includes(marker),
+      false,
+      `generator must not imply documentation-only marker ${marker} is authoritative`
+    );
+  }
+});
+
 test('co-bundled render_runtime and independent GPT start one branded display flow', async () => {
   const release = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
@@ -947,6 +982,81 @@ test('candidate architecture obeys every independent absolute transfer ceiling',
     gzipBytes: maximalNonBootstrap.gzipBytes,
     brotliBytes: maximalNonBootstrap.brotliBytes,
   });
+});
+
+test('first-display headroom subtracts each largest permitted measurement from its exact ceiling', () => {
+  assert.deepEqual(
+    bundleBudgets.deriveFirstDisplayHeadroomBytes({
+      rawBytes: 89_999,
+      gzipBytes: 29_700,
+      brotliBytes: 25_740,
+    }),
+    {
+      rawBytes: 1,
+      gzipBytes: 300,
+      brotliBytes: 260,
+    }
+  );
+});
+
+test('first-display headroom warnings include the one-percent boundary and exclude one byte above it', () => {
+  const warnings = bundleBudgets.findFirstDisplayHeadroomWarnings({
+    rawBytes: 900,
+    gzipBytes: 301,
+    brotliBytes: 260,
+  });
+
+  assert.deepEqual(warnings, [
+    {
+      dimension: 'firstDisplayAgent.rawBytes',
+      ceilingBytes: 90_000,
+      headroomBytes: 900,
+    },
+    {
+      dimension: 'firstDisplayAgent.brotliBytes',
+      ceilingBytes: 26_000,
+      headroomBytes: 260,
+    },
+  ]);
+});
+
+test('candidate architecture derives first-display headroom and warnings from current permitted masks', () => {
+  const { metrics, release, catalog } = readBuildEvidence();
+  const currentArtifactContents = new Map(
+    release.artifacts.map(({ file }) => [
+      file,
+      fs.readFileSync(path.resolve(libDirectory, '../dist', file)),
+    ])
+  );
+  const report = bundleBudgets.buildCandidateArchitectureSizeReport({
+    metrics,
+    release,
+    catalog,
+    currentArtifactContents,
+  });
+  const permittedMasks = metrics.firstDisplay.masks.filter(({ permitted }) => permitted);
+  const expectedHeadroomBytes = Object.fromEntries(
+    bundleMetrics.BUNDLE_SIZE_NAMES.map((sizeName) => [
+      sizeName,
+      bundleMetrics.FIRST_DISPLAY_AGENT_SIZE_CEILING[sizeName] -
+        Math.max(...permittedMasks.map((mask) => mask[sizeName])),
+    ])
+  );
+  const expectedWarnings = bundleMetrics.BUNDLE_SIZE_NAMES.flatMap((sizeName) => {
+    const ceilingBytes = bundleMetrics.FIRST_DISPLAY_AGENT_SIZE_CEILING[sizeName];
+    const headroomBytes = expectedHeadroomBytes[sizeName];
+    if (headroomBytes > ceilingBytes / 100) return [];
+    return [
+      {
+        dimension: `firstDisplayAgent.${sizeName}`,
+        ceilingBytes,
+        headroomBytes,
+      },
+    ];
+  });
+
+  assert.deepEqual(report.firstDisplayAgent.headroomBytes, expectedHeadroomBytes);
+  assert.deepEqual(report.headroomWarnings, expectedWarnings);
 });
 
 test('absolute transfer ceilings reject independent one-byte regressions', () => {
@@ -1933,6 +2043,11 @@ test('bundle check authenticates frozen captures and reports both without enforc
     result.candidateArchitecture.firstDisplay.permittedMasks.length
   );
   assert.equal(Object.hasOwn(commandReport.candidateArchitecture.firstDisplay, 'masks'), false);
+  assert.deepEqual(
+    commandReport.candidateArchitecture.firstDisplayAgent.headroomBytes,
+    result.candidateArchitecture.firstDisplayAgent.headroomBytes
+  );
+  assert.deepEqual(commandReport.headroomWarnings, result.candidateArchitecture.headroomWarnings);
 });
 
 test('takeover render trace source is data-only and guarded against presentation regression', () => {
@@ -2010,6 +2125,8 @@ test('hard-cutover policy rejects every retired wire, runtime, and public surfac
     ['src/legacy.ts', 'const diagnostics = tsjs.gptDiagnostics'],
     ['src/legacy.ts', 'tsjs.version = "0.1.0"'],
     ['src/legacy.ts', 'window.dispatchEvent(new Event("tsjs:adRendered"))'],
+    ['src/legacy.ts', 'const apsSlot = slot.providers.aps'],
+    ['src/legacy.ts', 'const legacyEvidence = { aps_calls: [] }'],
     ['src/composition/browser.ts', 'export function createBrowserRuntime() {}'],
   ];
   for (const [file, source] of retired) {
@@ -2085,6 +2202,82 @@ test('hard-cutover scan traverses the complete generated release inventory', () 
     true,
     'hard-cutover scan must traverse its generated release manifest'
   );
+});
+
+test('hard-cutover scan covers current release notes and retired TSJS members there', () => {
+  const scanned = new Set(productionCutoverFiles().map((file) => path.resolve(file)));
+  assert.equal(
+    scanned.has(path.join(repositoryRoot, 'CHANGELOG.md')),
+    true,
+    'hard-cutover scan must include current release notes'
+  );
+  assert.deepEqual(
+    findProductionCutoverTextViolations(
+      'CHANGELOG.md',
+      'A stale release note publishes window.tsjs.adSlots.'
+    ),
+    ['retired TSJS namespace member']
+  );
+});
+
+test('hard-cutover absence scanner rejects retired Rust surfaces in cfg(test) items', () => {
+  const apsIntegrationFile = path.join(
+    repositoryRoot,
+    'crates/trusted-server-core/src/integrations/aps.rs'
+  );
+  const route = findProductionCutoverTextViolations(
+    'crates/trusted-server-core/src/hard_cutover_absence_cfg_test_fixture.rs',
+    `
+#[cfg(test)]
+use std::sync::Arc;
+const RETIRED_ROUTE: &str = "/integrations/aps/renderer";
+`
+  );
+  assert.deepEqual(route, ['non-canonical APS renderer route']);
+
+  const testOnlyRoute = findProductionCutoverTextViolations(
+    'crates/trusted-server-core/src/hard_cutover_absence_cfg_test_fixture.rs',
+    `
+#[cfg(test)]
+fn fixture() {
+    let route = "/integrations/aps/renderer";
+    assert!(!route.is_empty());
+}
+`
+  );
+  assert.deepEqual(testOnlyRoute, ['non-canonical APS renderer route']);
+
+  const vendor = findVendorBoundaryViolations(
+    'crates/trusted-server-core/src/hard_cutover_absence_cfg_test_fixture.rs',
+    `
+#[cfg(test)]
+use std::sync::Arc;
+const VENDORED_GPT: &str = "/*! @license Google Publisher Tag */";
+`
+  );
+  assert.deepEqual(vendor, ['stored vendor body, checksum, or version metadata']);
+
+  const apsSource = fs
+    .readFileSync(apsIntegrationFile, 'utf8')
+    .replace(
+      'pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";',
+      'pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";\nconst LEGACY_ROUTE: &str = "/integrations/aps/renderer";\nconst LEGACY_PUB_ID: &str = "pub_id";'
+    );
+  assert.deepEqual(
+    findApsLegacySurfaceViolations(apsSource).map(({ label }) => label),
+    ['non-canonical APS renderer route', 'APS pub_id compatibility alias']
+  );
+
+  const fixture = findVendorBoundaryViolations(
+    'crates/trusted-server-core/src/hard_cutover_absence_cfg_test_fixture.rs',
+    `
+#[cfg(test)]
+mod fixtures {
+    const VENDORED_GPT: &str = "/*! @license Google Publisher Tag */";
+}
+`
+  );
+  assert.deepEqual(fixture, ['stored vendor body, checksum, or version metadata']);
 });
 
 test('registered integration dispatch selects post-switch evidence without changing the instrument', () => {

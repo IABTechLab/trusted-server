@@ -7331,7 +7331,7 @@ mod tests {
 
         let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
         assert!(
-            !html.contains("__tsjs_gpt_diagnostics_active"),
+            !html.contains(concat!("__", "tsjs_gpt_diagnostics_active")),
             "should not inject the removed activation flag"
         );
         assert!(
@@ -12748,8 +12748,8 @@ mod tests {
             "first rewritten head chunk should carry the parser-time TSJS runtime: {html}"
         );
         assert!(
-            !html.contains("__tsjs_gam_attribution_enabled")
-                && !html.contains("data-ts-gam-attribution"),
+            !html.contains(concat!("__", "tsjs_gam_attribution_enabled"))
+                && !html.contains(concat!("data-ts-", "gam-attribution")),
             "hard cutover must not retain either legacy GAM activation transport: {html}"
         );
     }

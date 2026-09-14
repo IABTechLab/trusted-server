@@ -477,12 +477,6 @@ impl CreativeOpportunitiesConfig {
                     slot.id
                 ));
             }
-            if slot.providers.aps.is_some() {
-                log::warn!(
-                    "creative opportunity slot '{}': providers.aps is retained only for configuration compatibility and is ignored by APS OpenRTB",
-                    slot.id
-                );
-            }
         }
 
         Ok(())
@@ -888,25 +882,12 @@ impl CreativeOpportunityFormat {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlotProviders {
-    /// Legacy APS slot parameters, retained only for configuration compatibility.
-    ///
-    /// APS `OpenRTB` uses the canonical creative-opportunity slot ID and does not
-    /// forward this value to APS or Prebid Server.
-    pub aps: Option<ApsSlotParams>,
     /// Prebid Server inline bidder parameters.
     ///
     /// When present, these are forwarded directly as `ext.prebid.bidder.*`
     /// in the `OpenRTB` request, bypassing PBS stored request lookup for this slot.
     /// Useful in development environments where stored requests are not available.
     pub prebid: Option<PrebidSlotParams>,
-}
-
-/// Legacy APS-specific parameters retained for configuration compatibility.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApsSlotParams {
-    /// Deprecated legacy slot ID. APS `OpenRTB` ignores this value.
-    pub slot_id: String,
 }
 
 /// Inline Prebid Server bidder parameters for a slot.
@@ -2151,15 +2132,15 @@ mod tests {
     }
 
     #[test]
-    fn to_ad_slot_ignores_legacy_aps_params() {
-        let mut slot = make_slot("atf", vec!["/"]);
-        slot.providers.aps = Some(ApsSlotParams {
-            slot_id: "legacy-aps-slot-atf".to_string(),
+    fn slot_providers_reject_retired_aps_params() {
+        let retired = serde_json::json!({
+            "aps": {
+                "slot_id": "retired-aps-slot-atf"
+            }
         });
-        let ad_slot = slot.to_ad_slot();
         assert!(
-            !ad_slot.bidders.contains_key("aps"),
-            "legacy APS params must not enable APS through Prebid Server"
+            serde_json::from_value::<SlotProviders>(retired).is_err(),
+            "retired APS slot parameters must fail the hard cutover"
         );
     }
 
@@ -2349,13 +2330,6 @@ mod tests {
         assert!(
             serde_json::from_value::<SlotProviders>(providers_typo).is_err(),
             "unknown provider key should be rejected"
-        );
-
-        // APS typo: `slotId` instead of `slot_id`.
-        let aps_typo = serde_json::json!({ "slotId": "x" });
-        assert!(
-            serde_json::from_value::<ApsSlotParams>(aps_typo).is_err(),
-            "unknown APS key should be rejected"
         );
     }
 

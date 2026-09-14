@@ -131,7 +131,7 @@ test("run selection rejects stale, ambiguous, and wrong-head evidence", () => {
 });
 
 test("performance dispatch binds the remote head, exact base, artifact, and validator", async () => {
-  const ref = "feature/aps-tsjs-resilience-rc202608";
+  const ref = "spec/aps-tsjs-resilience-design";
   const evidenceId =
     "aps-tsjs-performance-postswitch-aaaaaaaaaaaa-20260820T120000Z-0123abcd";
   const run = {
@@ -149,7 +149,7 @@ test("performance dispatch binds the remote head, exact base, artifact, and vali
         `${HEAD}\trefs/heads/${ref}\n`,
       ],
       [
-        "gh run list --workflow .github/workflows/tsjs-performance-gate.yml --branch feature/aps-tsjs-resilience-rc202608 --event workflow_dispatch --limit 100 --json databaseId,displayTitle,headSha,createdAt",
+        "gh run list --workflow .github/workflows/tsjs-performance-gate.yml --branch spec/aps-tsjs-resilience-design --event workflow_dispatch --limit 100 --json databaseId,displayTitle,headSha,createdAt",
         JSON.stringify([run]),
       ],
     ]),
@@ -198,7 +198,7 @@ test("performance dispatch binds the remote head, exact base, artifact, and vali
 });
 
 test("remote-head mismatch fails before any workflow dispatch", async () => {
-  const ref = "feature/aps-tsjs-resilience-rc202608";
+  const ref = "spec/aps-tsjs-resilience-design";
   const runner = fakeRunner(
     new Map([
       ["git status --porcelain=v1 --untracked-files=all", ""],
@@ -229,7 +229,7 @@ test("remote-head mismatch fails before any workflow dispatch", async () => {
 });
 
 test("zero matching workflow runs are rejected after bounded polling", async () => {
-  const ref = "feature/aps-tsjs-resilience-rc202608";
+  const ref = "spec/aps-tsjs-resilience-design";
   const runner = fakeRunner(
     new Map([
       ["git status --porcelain=v1 --untracked-files=all", ""],
@@ -239,7 +239,7 @@ test("zero matching workflow runs are rejected after bounded polling", async () 
         `${HEAD}\trefs/heads/${ref}\n`,
       ],
       [
-        "gh run list --workflow .github/workflows/tsjs-performance-gate.yml --branch feature/aps-tsjs-resilience-rc202608 --event workflow_dispatch --limit 100 --json databaseId,displayTitle,headSha,createdAt",
+        "gh run list --workflow .github/workflows/tsjs-performance-gate.yml --branch spec/aps-tsjs-resilience-design --event workflow_dispatch --limit 100 --json databaseId,displayTitle,headSha,createdAt",
         "[]",
       ],
     ]),
@@ -273,7 +273,7 @@ test("zero matching workflow runs are rejected after bounded polling", async () 
 });
 
 test("real-GAM dispatch derives release id and validates the exact run artifact", async () => {
-  const ref = "feature/aps-tsjs-resilience-rc202608";
+  const ref = "spec/aps-tsjs-resilience-design";
   const releaseId = "c".repeat(64);
   const previousArtifactId = "rollback-artifact-123";
   const evidenceId =
@@ -291,7 +291,7 @@ test("real-GAM dispatch derives release id and validates the exact run artifact"
         `${releaseId}\n`,
       ],
       [
-        "gh run list --workflow .github/workflows/aps-real-gam.yml --branch feature/aps-tsjs-resilience-rc202608 --event workflow_dispatch --limit 100 --json databaseId,displayTitle,headSha,createdAt",
+        "gh run list --workflow .github/workflows/aps-real-gam.yml --branch spec/aps-tsjs-resilience-design --event workflow_dispatch --limit 100 --json databaseId,displayTitle,headSha,createdAt",
         JSON.stringify([
           {
             databaseId: 77,

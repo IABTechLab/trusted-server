@@ -15,6 +15,7 @@
   `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` on 2026-08-28. The final overlap
   audit and performance comparison use that exact tip. It already contains the
   `main` ancestry selected by the release branch, so `main` is not merged separately.
+  A final fetch on 2026-09-14 confirmed that the release-branch tip had not advanced.
   The refresh includes the config-first auction-provider contract, strict
   first-party proxy allowlist enforcement, edge-validated Basic-auth template
   eligibility, and the latest first-impression arbitration repairs. Their behavior
@@ -1372,8 +1373,10 @@ fields. If a bid also carries standard `adm`, it is permitted only for an ADM so
 and must equal `render_source.adm` byte-for-byte; an `adm` on APS/cache or a mismatch
 is invalid. `/_ts/page-bids` returns `BrowserAuctionProjectionV1`, and initial HTML
 stores that same value at `tsjs.boot.auctionProjection`. They do not carry a second
-legacy `{slots,bids}` interpretation. The deprecated `/__ts/page-bids` endpoint and
-its JS fallback are deleted at cutover.
+legacy `{slots,bids}` interpretation. The deprecated double-underscore route has no
+functional alias and the client has no retry. Every adapter retains only an explicit
+local `404 no-store` tombstone, with negative tests, so the retired path can never
+fall through to a publisher origin.
 
 ### 3.3 APS response admission
 
@@ -1396,11 +1399,12 @@ entry points. This is not a new external telemetry contract.
 APS configuration accepts only canonical `account_id`; the `pub_id` deserialization
 alias and its integer coercion are deleted at the hard cutover.
 
-Deployment is ordered so the old serving binary receives the canonical configuration
-first: replace `pub_id` with quoted string `account_id`, quote numeric identifiers,
-remove legacy and unknown APS keys, run `ts config validate`, and push while the old
-binary that accepts `account_id` is still active. Only then deploy the new binary.
-No alias or coercion is added to make an out-of-order deployment succeed.
+There is no mixed-version-safe deployment order. Prepare the canonical provider map,
+replace the former account field with quoted string `account_id`, remove legacy and
+unknown APS keys, and run `ts config validate`. Activate the new binary and canonical
+config blob atomically; never serve either schema to the opposite binary. Rollback
+likewise restores the prior binary and old-schema blob together. No alias or coercion
+is added to make a mixed deployment succeed.
 
 ### 3.4 Mediation provenance
 
@@ -5228,6 +5232,14 @@ making total release growth unbounded. They are not substitutes for the rc-basel
 selected-agent comparison or paired end-to-end timing gates. Changing any ceiling
 requires a reviewed design rather than recapturing candidate history.
 
+Near-ceiling optional masks retain this exact admission behavior: a closed
+configuration whose measured mask is permitted serves its selected first-display
+artifact, while an unpermitted mask intentionally selects direct persistent boot.
+The candidate budget report derives per-encoding headroom from the largest permitted
+mask and emits advisory, deterministic warning evidence when remaining headroom is
+at or below one percent of its exact ceiling. That warning exposes fragile permitted
+membership without changing admission, any ceiling, or the direct-persistent fallback.
+
 The build emits one canonical release inventory with each production bundle's id,
 role, phase, trigger, inputs, outputs, bytes, and hash. Budget membership is derived
 from that catalog rather than an obsolete exact filename list. Candidate evidence
@@ -5923,10 +5935,12 @@ over once through the existing APS/TSJS release mechanism. No runtime flag,
 old/new selector, compatibility branch, or dual protocol is introduced in any
 deployable artifact.
 
-Operator configuration moves before the binary cutover. The rc baseline already
-accepts canonical APS `account_id` and `[creative_opportunities].enabled`, so both
-are validated and pushed as release prerequisites. The new binary requires the
-boolean and exposes no legacy alias or omitted-field compatibility path.
+There is no mixed-version-safe configuration phase. Prepare and validate the
+canonical APS provider map and required `[creative_opportunities].enabled` value,
+then activate that config blob and the new binary atomically. Never expose the new
+schema to the prior binary or the retired schema to the new binary. Rollback restores
+the prior binary and its old-schema blob together; no legacy alias, omitted-field
+compatibility path, or staged config-first bridge exists.
 
 1. **Integrate the release base:** fetch and integrate current `origin/rc/202608`, record its
    exact SHA, run the unchanged affected Rust/TS/browser suites, and start every
@@ -6108,9 +6122,12 @@ The design is complete when all of the following are true:
 7. The runtime has one slot registry, one bridge listener, one adapter instance per
    external library, and one explicit owner for every timer/listener/port/iframe.
 8. Legacy expandos, duplicate bridge branches, old globals, old `requestAds`, and
-   duplicated bootstrap logic are absent from the final bundle. The `pub_id` config
-   alias, `/__ts/page-bids`, its JS retry, and the unversioned APS renderer path are
-   absent from server routes, tests, and documentation. Every bootstrap failure
+   duplicated bootstrap logic are absent from the final bundle. The retired APS
+   account alias, functional double-underscore page-bids route, its JS retry, and the
+   unversioned APS renderer path are absent from production behavior and operator
+   documentation. Every adapter instead reserves the retired page-bids path solely
+   as a tested local `404 no-store` tombstone so it cannot reach publisher fallback.
+   Every bootstrap failure
    checkpoint commits the terminal non-rendering shell, drains work exactly once,
    and cannot construct or admit a second runtime.
 9. APS bootstrap and runner-proxy routing, security headers, bounded relay, and failure

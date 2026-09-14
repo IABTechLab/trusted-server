@@ -348,7 +348,6 @@ fn empty_evidence() -> BrowserAdEvidence {
     BrowserAdEvidence {
         dom_ids: Vec::new(),
         gpt_slots: Vec::new(),
-        aps_calls: Vec::new(),
         page_bids: Vec::new(),
         warnings: Vec::new(),
     }
@@ -659,7 +658,6 @@ mod tests {
                 sizes: vec![(300, 250)],
                 phase: EvidencePhase::InitialLoad,
             }],
-            aps_calls: Vec::new(),
             page_bids: Vec::new(),
             warnings: Vec::new(),
         }

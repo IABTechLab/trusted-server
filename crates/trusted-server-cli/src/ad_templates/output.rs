@@ -258,7 +258,7 @@ pub struct GptEvidenceJson {
 /// Live ad-slot evidence with no matching configured slot.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExtraEvidenceJson {
-    /// Evidence kind: `dom`, `gpt`, or `aps`.
+    /// Evidence kind; currently only `gpt` is produced.
     pub kind: String,
     /// The phase the evidence was observed in.
     pub phase: EvidencePhaseJson,
@@ -308,7 +308,7 @@ impl VerificationReport {
                             height: 250,
                             media_type: "banner".to_string(),
                         }],
-                        providers: vec!["aps".to_string()],
+                        providers: vec!["prebid".to_string()],
                     },
                     evidence: SlotEvidenceJson {
                         dom_id: Some("ad-atf-0".to_string()),

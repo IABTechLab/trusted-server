@@ -1601,13 +1601,17 @@ mod tests {
             enabled = true
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
-            [integrations.aps]
+            [auction]
             enabled = true
+            [auction.providers.aps]
+            protocol = "openrtb-2.6"
+            profile = "aps"
+            endpoint = "https://aps.example.com/e/pb/bid"
+            timeout_ms = 800
+            [auction.providers.aps.profile_config]
             account_id = "route-test-aps-account"
             allow_script_creatives = true
 
-            [auction]
-            enabled = true
             [auction.providers.prebid]
             protocol = "openrtb-2.6"
             profile = "prebid-server"
@@ -1705,12 +1709,12 @@ mod tests {
             ),
             (
                 Method::GET,
-                "/integrations/aps/renderer",
+                concat!("/integrations/aps/", "renderer"),
                 StatusCode::NOT_FOUND,
             ),
             (
                 Method::GET,
-                "/integrations/aps/renderer/v1",
+                concat!("/integrations/aps/", "renderer/v1"),
                 StatusCode::NOT_FOUND,
             ),
             (

@@ -345,7 +345,7 @@ pub struct LegacyPrebidServerConfig {
     /// - `both` — consent in both cookies and body (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
-    /// Strip `nurl` and `burl` from PBS bids before they reach `window.tsjs.bids`.
+    /// Strip `nurl` and `burl` from PBS bids before they reach browser bid collection.
     ///
     /// Set to `true` when the PBS deployment is configured to fire win/billing
     /// notifications server-side (e.g. `ext.prebid.events.enabled`), so the
@@ -353,7 +353,7 @@ pub struct LegacyPrebidServerConfig {
     #[serde(default)]
     pub suppress_nurl: bool,
     /// Bidder seats whose `nurl` and `burl` should be stripped before they reach
-    /// `window.tsjs.bids`.
+    /// browser bid collection.
     ///
     /// Use this when only specific PBS seats fire win/billing notifications
     /// internally. The global [`suppress_nurl`](Self::suppress_nurl) switch still
@@ -486,7 +486,7 @@ fn remove_aps_bidders(config: &mut LegacyPrebidServerConfig) {
         bidders.retain(|bidder| !bidder.eq_ignore_ascii_case("aps"));
         if bidders.len() != original_len {
             log::warn!(
-                "prebid: ignoring APS in integrations.prebid.{field}; configure APS under [integrations.aps]"
+                "prebid: ignoring APS in integrations.prebid.{field}; configure an [auction.providers.<id>] entry with profile = \"aps\""
             );
         }
     }
