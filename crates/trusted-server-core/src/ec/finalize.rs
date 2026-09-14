@@ -53,7 +53,7 @@ pub fn ec_finalize_response(
     // generation (for example to request more client evidence). This is empty
     // unless a provider produced headers, so it is safe on every path. Each
     // one was checked against core's reserved response surface at capture
-    // time in `EcContext::generate_with_provider`, so nothing here can set a
+    // time in `EcContext::candidate_id`, so nothing here can set a
     // managed `ts-` cookie, an `x-ts-` header, or a framing or hop-by-hop
     // header. They accumulate with whatever the origin returned rather than
     // replacing it, for the reasons on
@@ -444,6 +444,7 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
@@ -512,16 +513,6 @@ mod tests {
             ec_allowed,
         )
     }
-
-    /// The identifier [`CanonicalizingProvider`] creates, as the browser carries
-    /// it in the `ts-ec` cookie.
-    const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
-
-    /// The identity-graph key generation writes that identifier's row under.
-    /// Pinned to the creation path by
-    /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
-    /// `ec` module tests.
-    const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
 
     fn canonicalizing_context(
         ec_was_present: bool,
