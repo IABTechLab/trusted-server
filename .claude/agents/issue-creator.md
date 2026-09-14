@@ -82,7 +82,7 @@ Output the issue URL and type.
   - Core (Edge Cookies, GDPR)
   - Integrations (prebid, lockr, permutive, etc.)
   - HTML processing / JS injection
-  - Ad serving (Equativ)
+  - Ad serving / auctions
   - Fastly runtime
   - JS build pipeline
   - Documentation

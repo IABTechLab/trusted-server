@@ -21,22 +21,15 @@ Closes #
 
 ## Test plan
 
-<!-- How did you verify this works? Check all that apply -->
+<!-- Follow the canonical gates; do not copy their command list here. -->
 
-- [ ] `cargo test-fastly && cargo test-axum`
-- [ ] `cargo clippy-fastly && cargo clippy-axum`
-- [ ] `cargo fmt --all -- --check`
-- [ ] JS tests: `cd crates/trusted-server-js/lib && npx vitest run`
-- [ ] JS format: `cd crates/trusted-server-js/lib && npm run format`
-- [ ] Docs format: `cd docs && npm run format`
-- [ ] WASM build: `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
-- [ ] Manual testing via `fastly compute serve`
-- [ ] Other: <!-- describe -->
+- [ ] Completed the [canonical CI gate list](/CLAUDE.md#ci-gates)
+- Evidence: <!-- Record exact results and any scoped additional checks. -->
 
 ## Checklist
 
 - [ ] Changes follow [CLAUDE.md](/CLAUDE.md) conventions
 - [ ] No `unwrap()` in production code — use `expect("should ...")`
-- [ ] Uses `tracing` macros (not `println!`)
+- [ ] Uses `log` macros (not `println!`)
 - [ ] New code has tests
 - [ ] No secrets or credentials committed

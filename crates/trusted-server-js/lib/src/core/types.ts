@@ -1,19 +1,25 @@
-// Shared TypeScript types for the tsjs core API and extensions.
+/** @file Public and cross-bundle types for the TSJS browser runtime. */
+
+/** Immutable creative width and height in CSS pixels. */
 export type Size = readonly [number, number];
 
+/** Banner media-type configuration accepted by the lightweight ad-unit registry. */
 export interface Banner {
   sizes: ReadonlyArray<Size>;
 }
 
+/** Media-type subset currently consumed by the core browser bundle. */
 export interface MediaTypes {
   banner?: Banner;
 }
 
+/** One bidder and its opaque integration-specific parameters. */
 export interface Bid {
   bidder: string;
   params?: Record<string, unknown>;
 }
 
+/** Browser ad-unit definition keyed by publisher slot code. */
 export interface AdUnit {
   code: string;
   mediaTypes?: MediaTypes;
@@ -50,6 +56,7 @@ export interface AuctionDebugBidData {
   metadata?: Record<string, unknown>;
 }
 
+/** Markup carrier used by an APS renderer response. */
 export type ApsTagType = 'iframe' | 'script';
 
 /** Version 1 Trusted Server APS renderer descriptor. */
@@ -66,6 +73,7 @@ export interface ApsRendererV1 {
   height: number;
 }
 
+/** Closed renderer capability attached to a winning auction bid. */
 export type AuctionBidRenderer = ApsRendererV1;
 
 /** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
@@ -108,6 +116,7 @@ export interface AuctionBidData {
   debug_bid?: AuctionDebugBidData;
 }
 
+/** GPT lifecycle callbacks retained by diagnostics. */
 export type GptDiagnosticsCallbackKind =
   | 'slotRequested'
   | 'slotResponseReceived'
@@ -116,8 +125,10 @@ export type GptDiagnosticsCallbackKind =
   | 'impressionViewable'
   | 'slotVisibilityChanged';
 
+/** Whether a GPT callback maps to one request cycle. */
 export type GptDiagnosticsCallbackDisposition = 'matched' | 'unmatched' | 'ambiguous';
 
+/** Safe reason a GPT slot could not be bound to one DOM element. */
 export type GptDiagnosticsBindingReason =
   | 'missing_slot_element_id'
   | 'missing_element'
@@ -125,11 +136,13 @@ export type GptDiagnosticsBindingReason =
   | 'dom_uniqueness_unverifiable'
   | 'duplicate_gpt_slot_id';
 
+/** Result of binding a GPT slot object to a physical element. */
 export interface GptDiagnosticsBinding {
   status: 'bound' | 'unbound' | 'ambiguous';
   reason?: GptDiagnosticsBindingReason;
 }
 
+/** Derived durations between observed GPT lifecycle callbacks. */
 export interface GptDiagnosticsDurations {
   requestToResponseMs?: number;
   responseToRenderMs?: number;
@@ -198,6 +211,7 @@ export type GptDiagnosticsDelivery =
   | 'pending'
   | 'not_applicable';
 
+/** Bounded evidence for one numbered GPT request cycle. */
 export interface GptDiagnosticsRequestCycle {
   requestNumber: number;
   requestedAtMs?: number;
@@ -238,6 +252,7 @@ export interface GptDiagnosticsRequestCycle {
   delivery?: GptDiagnosticsDelivery;
 }
 
+/** Operator-safe diagnostics snapshot for one runtime GPT slot. */
 export interface GptDiagnosticsSlotExport {
   runtimeSlotNumber: number;
   slotElementId?: string;
@@ -248,6 +263,7 @@ export interface GptDiagnosticsSlotExport {
   requests: GptDiagnosticsRequestCycle[];
 }
 
+/** GPT callback that could not be associated with exactly one request cycle. */
 export interface GptDiagnosticsCallbackIssue {
   kind: GptDiagnosticsCallbackKind;
   runtimeSlotNumber: number;
@@ -276,6 +292,7 @@ export interface GptDiagnosticsAttributionIssue {
   slotElementId?: string;
 }
 
+/** Aggregate callback attribution counts for one callback kind. */
 export interface GptDiagnosticsCoverageCounters {
   observed: number;
   matched: number;
@@ -283,6 +300,7 @@ export interface GptDiagnosticsCoverageCounters {
   ambiguous: number;
 }
 
+/** Versioned, bounded, and operator-safe GPT diagnostics export. */
 export interface GptDiagnosticsExportV1 {
   version: 1;
   capturedAt: string;
@@ -365,7 +383,9 @@ export interface GptSlotHandoff {
   suppressPublisherRefresh: boolean;
 }
 
+/** Runtime that currently owns a slot's first impression. */
 export type FirstImpressionOwner = 'publisher' | 'trusted_server';
+/** Current first-impression auction or delivery phase. */
 export type FirstImpressionPhase = 'auctioning' | 'delivery_pending' | 'requested' | 'rendered';
 
 /** One publisher auction participating in the current navigation's first impression. */
@@ -400,6 +420,7 @@ export interface FirstImpressionState {
   fallbackSlots: Record<string, HTMLElement>;
 }
 
+/** Shared `window.tsjs` API and bounded cross-bundle coordination state. */
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;

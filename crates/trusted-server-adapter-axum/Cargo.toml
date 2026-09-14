@@ -1,6 +1,7 @@
 [package]
 name = "trusted-server-adapter-axum"
 description = "Axum entry point for Trusted Server — native dev server."
+readme = "README.md"
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

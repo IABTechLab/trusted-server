@@ -2,7 +2,8 @@
 //!
 //! Core owns the cache-safety ordering and the portable byte-seam fallback. An adapter
 //! may provide a richer assembler for the cold response after the reader-neutral
-//! template has been stored.
+//! template has been stored. Unsupported adapters return a typed error rather
+//! than serving unresolved ESI instructions.
 
 use core::fmt;
 

@@ -37,7 +37,7 @@ use super::types::{
 ///
 /// `adUnits` lists the placements to bid on. `config` carries optional
 /// context values (e.g. audience segments) filtered through
-/// [`auction.allowed_context_keys`][`crate::settings::AuctionConfig::allowed_context_keys`].
+/// [`auction.allowed_context_keys`][`crate::auction_config_types::AuctionConfig::allowed_context_keys`].
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {

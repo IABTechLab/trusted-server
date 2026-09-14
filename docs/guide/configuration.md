@@ -68,6 +68,49 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
+Two accepted secret-shaped fields are deliberately different:
+
+- `trusted_client_ip.shared_secret` is an inline value in the app-config blob;
+  it is redacted by debug formatting but is not resolved from a secret store.
+- `tinybird.access_token_secret` is deprecated input. It is accepted for
+  migration, then discarded and omitted from serialized config; use
+  `tinybird.auction_token_secret` as the store key name instead.
+
+The four deprecated `secret_store` selectors under Tinybird, DataDome, its
+protection-test bypass, and S3 route authentication are also accepted and
+discarded. Store selection comes from the adapter's EdgeZero mapping.
+
+::: warning CLI output and inline secrets
+`ts config diff`, `ts config push --dry-run`, and the interactive push preview
+can print deliberately inline values. Use `ts config push --no-diff` when that
+output is not safe for the current terminal or CI log. The flag suppresses the
+diff; it does not move inline values to a secret store.
+:::
+
+The following table records the independent lifecycle, key-identity,
+serialization, runtime, and secret axes for every exceptional field:
+
+| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
+| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
+| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only | none                     |
+| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away      | accepted, then discarded |
+| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | deliberately inline      |
+
 Migrate an existing deployment in this order:
 
 1. Populate the physical store mapped from `trusted_server_secrets` with the
@@ -142,18 +185,25 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section               | Purpose                                      |
-| --------------------- | -------------------------------------------- |
-| `[publisher]`         | Domain, origin, proxy settings               |
-| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
-| `[ec]`                | Edge Cookie (EC) ID generation               |
-| `[tester_cookie]`     | Optional tester-cookie endpoint              |
-| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
-| `[cache]`             | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
-| `[request_signing]`   | Ed25519 request signing                      |
-| `[auction]`           | Auction orchestration                        |
-| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
+| Section                    | Purpose                                                                 |
+| -------------------------- | ----------------------------------------------------------------------- |
+| `[auction]`                | Auction orchestration, provider instances, bidder routes, and mediation |
+| `[cache]`                  | Static and rehosted asset cache policy                                  |
+| `[consent]`                | Consent interpretation, forwarding, and conflict resolution             |
+| `[creative_opportunities]` | Server-side page ad opportunities and templates                         |
+| `[debug]`                  | Explicit non-production diagnostics                                     |
+| `[ec]`                     | Edge Cookie identity, persistence, and partner sync                     |
+| `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
+| `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
+| `[integrations.*]`         | Typed partner and browser integration settings                          |
+| `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
+| `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
+| `[request_signing]`        | Outbound Ed25519 request signing and management-store IDs               |
+| `[response_headers]`       | Headers added to Trusted Server responses                               |
+| `[rewrite]`                | First-party URL rewrite exclusions                                      |
+| `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
+| `[tinybird]`               | Direct Tinybird auction telemetry                                       |
+| `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
 
 ## Example: Production Setup
 
@@ -292,7 +342,7 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 # Optional: connect to origin_url but send this outbound Host header.
 # origin_host_header_override = "www.publisher.com"
-proxy_secret = "publisher_proxy_secret"},{
+proxy_secret = "publisher_proxy_secret"
 ```
 
 **Environment Override**:
@@ -650,6 +700,43 @@ TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 
 - Empty string
 
+## Consent Configuration
+
+`[consent]` controls request-local interpretation and forwarding of privacy
+signals. It does not create a second consent database. Set `consent_store` to a
+KV store name only when consent should persist with the EC identity graph.
+
+### `[consent]`
+
+| Field                                          | Type           | Default                     | Contract                                                    |
+| ---------------------------------------------- | -------------- | --------------------------- | ----------------------------------------------------------- |
+| `mode`                                         | String         | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
+| `check_expiration`                             | Boolean        | `true`                      | Check TCF timestamps                                        |
+| `max_consent_age_days`                         | Integer        | `395`                       | Clamped to `1..=3650`                                       |
+| `consent_store`                                | String or null | `null`                      | Optional KV store for EC-linked consent persistence         |
+| `gdpr.applies_in`                              | Array[String]  | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
+| `us_states.privacy_states`                     | Array[String]  | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
+| `us_privacy_defaults.notice_given`             | Boolean        | `true`                      | Publisher policy used for GPC-only requests                 |
+| `us_privacy_defaults.lspa_covered`             | Boolean        | `false`                     | Publisher LSPA posture                                      |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
+| `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
+| `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+
+```toml
+[consent]
+mode = "interpreter"
+check_expiration = true
+max_consent_age_days = 395
+
+[consent.conflict_resolution]
+mode = "restrictive"
+freshness_threshold_days = 30
+```
+
+`applies_in` and `privacy_states` are policy inputs. Review them against the
+publisher's operating jurisdictions instead of assuming the built-in lists are
+legal advice.
+
 ## Response Headers
 
 Custom headers added to all responses.
@@ -781,18 +868,18 @@ Path-based HTTP Basic Authentication.
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "admin_password"},{
+password = "admin_password"
 
 # Multiple handlers
 [[handlers]]
 path = "^/secure"
 username = "user1"
-password = "secure_handler_password"},{
+password = "secure_handler_password"
 
 [[handlers]]
 path = "^/api/private"
 username = "api-user"
-password = "api_handler_password"},{
+password = "api_handler_password"
 ```
 
 **Environment Override**:
@@ -1235,6 +1322,32 @@ when_missing = "smart"
 
 See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
 
+## Tinybird Configuration
+
+`[tinybird]` sends auction events directly to the Tinybird Events API. The
+emitter is active only when `enabled = true`; access-log emission is not wired.
+
+### `[tinybird]`
+
+| Field                  | Type           | Default                | Contract                                                           |
+| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------ |
+| `enabled`              | Boolean        | `false`                | Enable auction telemetry                                           |
+| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path |
+| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                |
+| `auction_token_secret` | String or null | `null`                 | Store key required when enabled; resolved value must be nonempty   |
+| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired         |
+| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                                   |
+| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled            |
+| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                              |
+
+`secret_store` and `access_token_secret` are deprecated compatibility inputs.
+Both are removed during normalization; neither reaches runtime or serialized
+output. New configurations use only `auction_token_secret`, whose value is
+resolved through `trusted_server_secrets`.
+
+The complete enabled example appears in
+[Tinybird auction telemetry](#tinybird-auction-telemetry).
+
 ## Cache Configuration
 
 Static and rehosted asset cache upgrades are operator-controlled. By default,
@@ -1356,8 +1469,26 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Integration Configurations
 
-Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
-integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
+Every deploy-validated integration ID is listed here. A section is optional
+unless its integration is enabled or a CLI workflow retains an explicit
+disabled stub.
+
+| Section                             | Reference                                                    |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `[integrations.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)          |
+| `[integrations.aps]`                | [APS](/guide/integrations/aps)                               |
+| `[integrations.datadome]`           | [DataDome](/guide/integrations/datadome)                     |
+| `[integrations.didomi]`             | [Didomi](/guide/integrations/didomi)                         |
+| `[integrations.google_tag_manager]` | [Google Tag Manager](/guide/integrations/google_tag_manager) |
+| `[integrations.gpt]`                | [GPT](/guide/integrations/gpt)                               |
+| `[integrations.gpt_diagnostics]`    | [GPT diagnostics](/guide/integrations/gpt-diagnostics)       |
+| `[integrations.lockr]`              | [lockr](/guide/integrations/lockr)                           |
+| `[integrations.nextjs]`             | [Next.js](/guide/integrations/nextjs)                        |
+| `[integrations.osano]`              | [Osano](/guide/integrations/osano)                           |
+| `[integrations.permutive]`          | [Permutive](/guide/integrations/permutive)                   |
+| `[integrations.prebid]`             | [Prebid](/guide/integrations/prebid)                         |
+| `[integrations.sourcepoint]`        | [Sourcepoint](/guide/integrations/sourcepoint)               |
+| `[integrations.testlight]`          | [Testlight](/guide/integrations/testlight)                   |
 
 ### Common Fields
 
@@ -1368,24 +1499,168 @@ apply when the integration section exists in `trusted-server.toml`.
 | --------- | ------- | ------------------------------ |
 | `enabled` | Boolean | Enable/disable the integration |
 
+### Ad Server Mock Integration
+
+**Section**: `[integrations.adserver_mock]`
+
+This integration is the optional auction mediator selected by
+`auction.mediator = "adserver_mock"`; it is not an OpenRTB provider.
+
+| Field                  | Type           | Default  | Contract                                          |
+| ---------------------- | -------------- | -------- | ------------------------------------------------- |
+| `enabled`              | Boolean        | `false`  | Enable mediator registration                      |
+| `endpoint`             | URL            | Required | Mediation service URL                             |
+| `timeout_ms`           | Integer        | `500`    | `1..=60000` milliseconds                          |
+| `price_floor`          | Number or null | `null`   | Optional minimum accepted CPM                     |
+| `context_query_params` | Object         | `{}`     | Maps admitted auction-context keys to query names |
+
+### APS Browser Integration
+
+**Section**: `[integrations.aps]`
+
+| Field            | Type    | Default            | Contract                               |
+| ---------------- | ------- | ------------------ | -------------------------------------- |
+| `enabled`        | Boolean | `false`            | Enable browser-side APS behavior       |
+| `rendering_mode` | String  | `"trusted_server"` | `trusted_server` or `publisher_native` |
+
+Server endpoint, timeout, account, inventory, and debug settings belong to an
+`aps` provider and its `profile_config`, not this browser section. See
+[APS](/guide/integrations/aps).
+
+### DataDome Integration
+
+**Section**: `[integrations.datadome]`
+
+The [DataDome guide](/guide/integrations/datadome) explains request behavior
+and exclusion-rule syntax. This table covers every canonical top-level field:
+
+| Field                                  | Type           | Default                          | Contract                                                        |
+| -------------------------------------- | -------------- | -------------------------------- | --------------------------------------------------------------- |
+| `enabled`                              | Boolean        | `false`                          | Enable DataDome registration                                    |
+| `sdk_origin`                           | URL            | `https://js.datadome.co`         | Browser SDK origin                                              |
+| `api_origin`                           | URL            | `https://api-js.datadome.co`     | Browser signal API origin                                       |
+| `cache_ttl_seconds`                    | Integer        | `3600`                           | `60..=86400` seconds                                            |
+| `rewrite_sdk`                          | Boolean        | `true`                           | Rewrite matching SDK URLs                                       |
+| `enable_protection`                    | Boolean        | `false`                          | Call the Protection API before route matching                   |
+| `server_side_key_secret_name`          | String or null | `null`                           | Secret-store key required when protection is enabled            |
+| `protection_api_origin`                | URL            | `https://api-fastly.datadome.co` | Protection API origin                                           |
+| `timeout_ms`                           | Integer        | `1500`                           | `1..=10000` milliseconds                                        |
+| `protection_excluded_methods`          | Array[String]  | `["OPTIONS"]`                    | Methods that bypass protection                                  |
+| `protection_excluded_asns`             | Array[Integer] | `[]`                             | Client ASNs that bypass protection                              |
+| `protection_excluded_ip_cidrs`         | Array[String]  | `[]`                             | Inline client-IP CIDRs that bypass protection                   |
+| `protection_excluded_ip_cidr_sources`  | Array[Object]  | `[]`                             | Config-store sources of client-IP CIDRs that bypass protection  |
+| `protection_ip_list_cache_ttl_seconds` | Integer        | `300`                            | `1..=86400` seconds                                             |
+| `protection_exclusion_rules`           | Array[Object]  | Static-asset path-regex rule     | Ordered typed exclusion rules                                   |
+| `protection_test_bypass`               | Object or null | `null`                           | Access-controlled test bypass; disabled when present by default |
+| `enable_graphql_support`               | Boolean        | `false`                          | Reserved; `true` is accepted but ignored in v1                  |
+| `client_side_key`                      | String         | `""`                             | Key used for browser-tag injection                              |
+| `inject_client_side_tag`               | Boolean        | `true`                           | Inject only when `client_side_key` is nonempty                  |
+| `client_side_tag_url`                  | String         | `/integrations/datadome/tags.js` | Root-relative or HTTPS injection URL                            |
+| `client_side_configuration`            | JSON value     | `{ "ajaxListenerPath": true }`   | Value assigned to `window.ddoptions`                            |
+
+Each `protection_excluded_ip_cidr_sources` item requires `key` and defaults
+`config_store` to `datadome-ip-bypass`. Each
+`protection_exclusion_rules` item requires `id` (legacy alias `name`), defaults
+`enabled` to `true`, defaults `methods` to every method, and selects one typed
+matcher: `path_exact`, `path_prefix`, `path_regex`,
+`query_param_non_empty`, `asn`, `ip_cidr`, or `ip_cidr_source`.
+
+When `protection_test_bypass` is present, its `enabled` field defaults to
+`false`; `credential_secret_name` identifies the secret-store key and becomes
+required only when the bypass is enabled. The resolved credential must contain
+at least 32 bytes.
+
+The deprecated `server_side_key_secret_store` and nested
+`credential_secret_store` inputs are accepted and discarded. Do not add them
+to new configurations.
+
+### Didomi Integration
+
+**Section**: `[integrations.didomi]`
+
+| Field        | Type           | Default                          | Contract                                                            |
+| ------------ | -------------- | -------------------------------- | ------------------------------------------------------------------- |
+| `enabled`    | Boolean        | `true`                           | Enable the reverse proxy when the section exists                    |
+| `proxy_path` | String or null | `/integrations/didomi/consent`   | No trailing slash, repeated slash, dot segment, or unsafe character |
+| `sdk_origin` | URL            | `https://sdk.privacy-center.org` | SDK upstream                                                        |
+| `api_origin` | URL            | `https://api.privacy-center.org` | API upstream                                                        |
+
+See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
+
+### Google Tag Manager Integration
+
+**Section**: `[integrations.google_tag_manager]`
+
+| Field                  | Type    | Default                            | Contract                                            |
+| ---------------------- | ------- | ---------------------------------- | --------------------------------------------------- |
+| `enabled`              | Boolean | `false`                            | Enable tag-gateway routes and rewriting             |
+| `container_id`         | String  | Required                           | `GTM-` followed by 4–20 uppercase letters or digits |
+| `upstream_url`         | URL     | `https://www.googletagmanager.com` | Script upstream                                     |
+| `cache_max_age`        | Integer | `900`                              | `60..=86400` seconds                                |
+| `max_beacon_body_size` | Integer | `65536`                            | `1024..=1048576` bytes                              |
+
+See [Google Tag Manager](/guide/integrations/google_tag_manager).
+
+### GPT Integration
+
+**Section**: `[integrations.gpt]`
+
+| Field                     | Type           | Default                 | Contract                                               |
+| ------------------------- | -------------- | ----------------------- | ------------------------------------------------------ |
+| `enabled`                 | Boolean        | `true`                  | Enable GPT when the section exists                     |
+| `gam_attribution_enabled` | Boolean        | `false`                 | Add page-level `ts=true` targeting                     |
+| `script_url`              | URL            | Google's secure GPT URL | Bootstrap source                                       |
+| `cache_ttl_seconds`       | Integer        | `3600`                  | `60..=86400` seconds                                   |
+| `rewrite_script`          | Boolean        | `true`                  | Rewrite matching GPT script URLs                       |
+| `slim_prebid_url`         | String or null | `null`                  | Optional tsjs-prebid bundle loaded after `window.load` |
+
+See [GPT](/guide/integrations/gpt).
+
+### GPT Diagnostics Integration
+
+**Section**: `[integrations.gpt_diagnostics]`
+
+The only field is `enabled`, a Boolean that defaults to `false`. When enabled,
+the standalone diagnostics tag is available, but individual browser sessions
+still require the activation flow in [GPT diagnostics](/guide/integrations/gpt-diagnostics).
+
+### lockr Integration
+
+**Section**: `[integrations.lockr]`
+
+| Field               | Type            | Default                                             | Contract                             |
+| ------------------- | --------------- | --------------------------------------------------- | ------------------------------------ |
+| `enabled`           | Boolean         | `true`                                              | Enable lockr when the section exists |
+| `app_id`            | String          | Required                                            | Nonempty lockr application ID        |
+| `api_endpoint`      | URL             | `https://identity.loc.kr`                           | API origin                           |
+| `sdk_url`           | URL             | `https://aim.loc.kr/identity-lockr-trust-server.js` | SDK source                           |
+| `cache_ttl_seconds` | Integer         | `3600`                                              | `60..=86400` seconds                 |
+| `rewrite_sdk`       | Boolean         | `true`                                              | Rewrite matching lockr SDK URLs      |
+| `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated compatibility input       |
+| `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override  |
+
+See [lockr](/guide/integrations/lockr).
+
 ### Prebid Integration
 
 `[integrations.prebid]` owns browser behavior only. Server endpoint, provider
 timeout, routing, profile debug/test controls, consent forwarding, bidder-param
 overrides, and notification suppression belong under `[auction]`.
 
-| Browser field                         | Type          | Default                                                                | Description                                                                    |
-| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `enabled`                             | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
-| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
-| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
-| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
-| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
-| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
-| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
-| `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
-| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                              |
+| Browser field                        | Type                  | Default                                                                | Contract                                                                       |
+| ------------------------------------ | --------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `enabled`                            | Boolean               | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
+| `account_id`                         | String or null        | `null`                                                                 | Optional account value injected into browser Prebid configuration              |
+| `timeout_ms`                         | Integer               | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
+| `debug`                              | Boolean               | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
+| `script_patterns`                    | Array[String]         | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
+| `external_bundle_url`                | String or null        | `null`                                                                 | Required when enabled; absolute HTTPS URL with an allowlisted proxy host       |
+| `external_bundle_sha256`             | String or null        | `null`                                                                 | Optional 64-character hexadecimal SHA-256                                      |
+| `external_bundle_sri`                | String or null        | `null`                                                                 | Optional space-separated `sha256`, `sha384`, or `sha512` integrity tokens      |
+| `client_side_bidders`                | Array[String]         | `[]`                                                                   | Bidders kept on native browser adapters                                        |
+| `excluded_gam_ad_unit_path_suffixes` | Array[String]         | `[]`                                                                   | Trimmed, non-root, slash-prefixed GAM path suffixes                            |
+| `bundle.adapters`                    | Array[String]         | `[]`                                                                   | Prebid.js bidder adapters used only by `ts prebid bundle`                      |
+| `bundle.user_id_modules`             | Array[String] or null | `null`                                                                 | Optional user-ID modules used only by `ts prebid bundle`                       |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
@@ -1474,11 +1749,11 @@ win on conflicts.
 
 **Section**: `[integrations.nextjs]`
 
-| Field                        | Type          | Default                 | Description                   |
-| ---------------------------- | ------------- | ----------------------- | ----------------------------- |
-| `enabled`                    | Boolean       | `false`                 | Enable Next.js integration    |
-| `rewrite_attributes`         | Array[String] | `["href","link","url"]` | Attributes to rewrite         |
-| `max_combined_payload_bytes` | Integer       | `10485760`              | Max combined RSC payload size |
+| Field                        | Type          | Default                   | Contract                                           |
+| ---------------------------- | ------------- | ------------------------- | -------------------------------------------------- |
+| `enabled`                    | Boolean       | `false`                   | Enable Next.js integration                         |
+| `rewrite_attributes`         | Array[String] | `["href", "link", "url"]` | Nonempty set of structured payload keys to rewrite |
+| `max_combined_payload_bytes` | Integer       | `10485760`                | Maximum combined RSC payload size in bytes         |
 
 **Example**:
 
@@ -1524,16 +1799,16 @@ The Osano mirror runs in the browser, so consent cookies it writes are available
 
 **Section**: `[integrations.permutive]`
 
-| Field                     | Type    | Default                                | Description                      |
-| ------------------------- | ------- | -------------------------------------- | -------------------------------- |
-| `enabled`                 | Boolean | `true`                                 | Enable Permutive integration     |
-| `organization_id`         | String  | Required                               | Permutive organization ID        |
-| `workspace_id`            | String  | Required                               | Permutive workspace ID           |
-| `project_id`              | String  | `""`                                   | Permutive project ID             |
-| `api_endpoint`            | String  | `https://api.permutive.com`            | Permutive API URL                |
-| `secure_signals_endpoint` | String  | `https://secure-signals.permutive.app` | Secure signals URL               |
-| `cache_ttl_seconds`       | Integer | `3600`                                 | Cache TTL in seconds             |
-| `rewrite_sdk`             | Boolean | `true`                                 | Rewrite Permutive SDK references |
+| Field                     | Type    | Default                                | Contract                                     |
+| ------------------------- | ------- | -------------------------------------- | -------------------------------------------- |
+| `enabled`                 | Boolean | `true`                                 | Enable Permutive integration                 |
+| `organization_id`         | String  | Required                               | Nonempty Permutive organization ID           |
+| `workspace_id`            | String  | Required                               | Nonempty Permutive workspace ID              |
+| `project_id`              | String  | `""`                                   | Optional project ID; reserved for future use |
+| `api_endpoint`            | URL     | `https://api.permutive.com`            | Permutive API URL                            |
+| `secure_signals_endpoint` | URL     | `https://secure-signals.permutive.app` | Secure Signals URL                           |
+| `cache_ttl_seconds`       | Integer | `3600`                                 | `60..=86400` seconds                         |
+| `rewrite_sdk`             | Boolean | `true`                                 | Rewrite Permutive SDK references             |
 
 **Example**:
 
@@ -1549,17 +1824,31 @@ cache_ttl_seconds = 7200
 rewrite_sdk = true
 ```
 
+### Sourcepoint Integration
+
+**Section**: `[integrations.sourcepoint]`
+
+| Field               | Type           | Default                        | Contract                                                          |
+| ------------------- | -------------- | ------------------------------ | ----------------------------------------------------------------- |
+| `enabled`           | Boolean        | `false`                        | Enable Sourcepoint proxying and rewriting                         |
+| `rewrite_sdk`       | Boolean        | `true`                         | Rewrite matching Sourcepoint URLs                                 |
+| `cdn_origin`        | URL            | `https://cdn.privacy-mgmt.com` | HTTP(S) URL whose host is exactly `cdn.privacy-mgmt.com`          |
+| `auth_cookie_name`  | String or null | `null`                         | 1–64 letters, digits, `_`, or `-`; built-in cookies need no entry |
+| `cache_ttl_seconds` | Integer        | `3600`                         | `60..=86400` seconds                                              |
+
+See [Sourcepoint](/guide/integrations/sourcepoint).
+
 ### Testlight Integration
 
 **Section**: `[integrations.testlight]`
 
-| Field             | Type    | Default                                     | Description                         |
-| ----------------- | ------- | ------------------------------------------- | ----------------------------------- |
-| `enabled`         | Boolean | `true`                                      | Enable Testlight integration        |
-| `endpoint`        | String  | Required                                    | Testlight auction endpoint          |
-| `timeout_ms`      | Integer | `1000`                                      | Request timeout in milliseconds     |
-| `shim_src`        | String  | `/static/tsjs=tsjs-unified.min.js?v=<hash>` | Script source for testlight shim    |
-| `rewrite_scripts` | Boolean | `false`                                     | Rewrite Testlight script references |
+| Field             | Type    | Default                            | Contract                            |
+| ----------------- | ------- | ---------------------------------- | ----------------------------------- |
+| `enabled`         | Boolean | `false`                            | Enable Testlight integration        |
+| `endpoint`        | URL     | Required                           | Testlight auction endpoint          |
+| `timeout_ms`      | Integer | `1000`                             | `10..=60000` milliseconds           |
+| `shim_src`        | String  | `/static/tsjs=tsjs-unified.min.js` | Nonempty script source for the shim |
+| `rewrite_scripts` | Boolean | `false`                            | Rewrite Testlight script references |
 
 **Example**:
 
@@ -1726,6 +2015,28 @@ timeout_ms = 500
 | `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
 | `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
 
+### Profile configuration
+
+The table reflects the typed profile schemas. `Required` refers to the selected
+profile's `profile_config` object, not to the provider wrapper.
+
+| Profile         | Field                      | Required | Default | Provider timeout default | Constraints                                                                                                      |
+| --------------- | -------------------------- | -------- | ------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `aps`           | `account_id`               | Yes      | —       | `800 ms`                 | String or integer; trimmed, nonempty, at most 1024 bytes                                                         |
+| `aps`           | `allow_script_creatives`   | No       | `false` | `800 ms`                 | Script creatives are ineligible unless enabled                                                                   |
+| `aps`           | `debug`                    | No       | `false` | `800 ms`                 | May expose unredacted request and response data                                                                  |
+| `aps`           | `inventory_domain`         | No       | `None`  | `800 ms`                 | DNS name, at most 253 bytes; configure with inventory_page_origin                                                |
+| `aps`           | `inventory_page_origin`    | No       | `None`  | `800 ms`                 | HTTPS origin without credentials, port, path, query, or fragment; host must equal or be beneath inventory_domain |
+| `prebid-server` | `bid_param_override_rules` | No       | `[]`    | `1000 ms`                | Ordered exact-match rules; at least one matcher and a nonempty set object                                        |
+| `prebid-server` | `bid_param_overrides`      | No       | `{}`    | `1000 ms`                | Per-bidder nonempty shallow-merge objects                                                                        |
+| `prebid-server` | `bid_param_zone_overrides` | No       | `{}`    | `1000 ms`                | Per-bidder, per-zone nonempty shallow-merge objects                                                              |
+| `prebid-server` | `consent_forwarding`       | No       | `both`  | `1000 ms`                | `openrtb_only`, `cookies_only`, or `both`                                                                        |
+| `prebid-server` | `debug`                    | No       | `false` | `1000 ms`                | Includes upstream exchange diagnostics                                                                           |
+| `prebid-server` | `debug_query_params`       | No       | `None`  | `1000 ms`                | Optional legacy page-URL query fragment                                                                          |
+| `prebid-server` | `test_mode`                | No       | `false` | `1000 ms`                | Sets OpenRTB `test = 1`                                                                                          |
+| `standard`      | `imp_ext`                  | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object                                               |
+| `standard`      | `request_ext`              | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object; `trusted_server` is reserved                 |
+
 Timeout defaults are 1000 ms for `prebid-server`, 800 ms for `aps`, and the
 auction timeout for `standard`. An explicit provider timeout overrides the
 profile default. Runtime uses `min(provider timeout, auction time remaining)`
@@ -1747,8 +2058,9 @@ exact ID `trustedServer`. Browser `trustedServer.bidderParams` accepts at most
 
 For the `standard` profile, `profile_config.request_ext` and `imp_ext` must be
 JSON objects. Each object is limited to 16 KiB serialized, eight container
-levels, and 256 keys at any one object level. Reserved driver, profile, and
-signing fields cannot be overwritten.
+levels, and 256 keys at any one object level. Within `request_ext`, the
+`trusted_server` member is reserved and cannot be overwritten. `imp_ext` has no
+reserved-member guard in the current implementation.
 
 Common notification suppression uses exact returned OpenRTB seat values, not
 bidder route IDs:
@@ -2116,6 +2428,38 @@ no slot at all, so no template is rendered for it.
 Startup validation rejects a malformed template: an unknown placeholder (e.g.
 `{oops}`), an unmatched or nested `{`, a stray `}`, or an empty `gam_unit_path`.
 
+## Debug Configuration
+
+Every debug switch defaults to `false`. These controls expose request,
+auction, TLS, or creative data and are for controlled non-production use only.
+
+### `[debug]`
+
+| Field                                                     | Type          | Default                                | Contract                                                         |
+| --------------------------------------------------------- | ------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| `ja4_endpoint_enabled`                                    | Boolean       | `false`                                | Expose `GET /_ts/debug/ja4` on Fastly                            |
+| `auction_html_comment`                                    | Boolean       | `false`                                | Insert an auction diagnostic comment before `</body>`            |
+| `inject_adm_for_testing`                                  | Boolean       | `false`                                | Enable the direct GAM-replace test path and raw `debug_bid` data |
+| `auction_html_comment_options.include_provider_responses` | Boolean       | `true`                                 | Include provider response summaries                              |
+| `auction_html_comment_options.include_mediator_response`  | Boolean       | `true`                                 | Include mediator response summaries                              |
+| `auction_html_comment_options.include_bids`               | Boolean       | `true`                                 | Include provider bid arrays                                      |
+| `auction_html_comment_options.metadata_keys`              | Array[String] | `error_type`, `http_status`, `message` | Must be a subset of this fixed allowlist                         |
+| `auction_html_comment_options.verbosity`                  | String        | `"redacted"`                           | `redacted`, `upstream`, or `full`                                |
+| `auction_html_comment_options.format`                     | String        | `"compact"`                            | `compact` or `pretty`                                            |
+
+The default options table is omitted from serialized config for rollback
+compatibility. A non-default table is serialized and therefore requires every
+running binary to understand it. `upstream` and `full` can expose
+identity-bearing provider data; `inject_adm_for_testing` carries raw creative
+markup. Do not enable them in production.
+
+```toml
+[debug]
+ja4_endpoint_enabled = false
+auction_html_comment = false
+inject_adm_for_testing = false
+```
+
 ## Fastly Runtime Config Store
 
 After the EdgeZero cutover, the Fastly adapter always dispatches through the
@@ -2293,16 +2637,12 @@ trusted-server.dev.toml      # Development overrides
 - Rerun `ts config push` after changing a deploy-time override
 - Try explicit string: `VARIABLE='value'` not `VARIABLE=value`
 
-### Debug Configuration
+### Inspect Configuration Inputs
 
-**Print Loaded Config** (test only):
-
-```rust
-use trusted_server_core::settings_data::get_settings;
-
-let settings = get_settings()?;
-println!("{:#?}", settings);
-```
+Runtime adapters load the app-config envelope with
+`get_settings_from_config_store` from the `trusted_server_core::settings_data`
+module. For a source file or local fixture, use `Settings::from_toml`; there is
+no process-global settings accessor.
 
 **Check Environment**:
 

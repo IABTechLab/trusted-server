@@ -1,3 +1,8 @@
+//! Top-level `ts` argument model and command dispatch.
+//!
+//! Each branch delegates to `edgezero-cli` or a Trusted Server command module;
+//! this layer normalizes success, help, and failure outcomes for the binary.
+
 use std::process;
 
 use clap::{Parser, Subcommand};

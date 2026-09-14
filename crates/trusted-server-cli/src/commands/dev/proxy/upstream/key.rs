@@ -1,3 +1,8 @@
+//! Strong keys for upstream transport, addressing, and certificate identity.
+//!
+//! Keeping connection address separate from reference identity prevents pinned
+//! development routes from disabling hostname verification accidentally.
+
 use std::net::IpAddr;
 use std::sync::Arc;
 

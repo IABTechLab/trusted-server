@@ -1,3 +1,8 @@
+//! Cache-busted Trusted Server JavaScript URLs and script tags.
+//!
+//! Hashes come from the embedded bundle crate so emitted URLs change exactly
+//! when the selected module bytes change.
+
 use trusted_server_js::{concatenated_hash, single_module_hash};
 
 /// `/static` URL for the tsjs bundle with cache-busting hash based on

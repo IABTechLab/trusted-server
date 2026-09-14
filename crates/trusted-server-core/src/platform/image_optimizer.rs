@@ -7,7 +7,8 @@
 //! `fastly::image_optimizer::ImageOptimizerOptions`.
 //!
 //! Unsupported adapters should reject requests carrying this metadata rather
-//! than silently dropping transformations.
+//! than silently dropping transformations. The closed enums keep invalid
+//! provider-specific options out of the shared request path.
 
 /// Platform-neutral Image Optimizer processing region.
 ///

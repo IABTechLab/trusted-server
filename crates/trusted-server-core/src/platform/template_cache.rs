@@ -1,7 +1,6 @@
-//! The shared transformed-template cache for the #1009 ESI validation spike.
+//! Shared cache for transformed, reader-neutral publisher templates.
 //!
-//! Three caches are in play and conflating them is what produced the original wrong
-//! conclusion in the design doc, so this module names which one it is:
+//! Three cache layers are intentionally distinct:
 //!
 //! | Cache | Contents                          | Owner                          |
 //! | ----- | --------------------------------- | ------------------------------ |
@@ -9,13 +8,11 @@
 //! | Template cache | post-`lol_html`, pre-assembly     | **This module.**       |
 //! | Final response | final per-user assembled response | **Must never exist.** |
 //!
-//! The template cache holds a *shared template*: no per-user bytes, and no decisions that depend on
-//! the request. What may and may not live in it is
+//! The template cache holds no per-user bytes or request-dependent decisions.
+//! Its safety contract is
 //! [§6.7 of the design doc](../../../../docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md),
 //! and the invariant is enforced by the rendered-document byte-identity tests in
 //! `publisher`.
-//!
-//! Spike-only. Remove with the spike.
 
 use core::fmt;
 use std::collections::HashSet;

@@ -5,10 +5,10 @@
 
 ## Project Overview
 
-Rust-based edge computing application targeting **Fastly Compute**. Handles
-Edge Cookie (EC) ID generation, ad serving with consent signal extraction
-and enforcement, real-time bidding integration, and publisher-side
-JavaScript injection.
+Rust-based publisher edge application with a portable core and adapters for
+Fastly Compute, Cloudflare Workers, Fermyon Spin, and native Axum development.
+It handles Edge Cookie (EC) ID generation, consent-aware ad serving, auction
+orchestration, first-party proxying, and publisher-side JavaScript injection.
 
 ## Workspace Layout
 
@@ -22,6 +22,9 @@ crates/
   trusted-server-cli/                   # Host-target `ts` operator CLI
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
+  trusted-server-integration-tests/     # Native parity, end-to-end, and documentation tests
+  trusted-server-openrtb/               # Checked-in OpenRTB JSON model
+  trusted-server-openrtb-codegen/       # Host-only manual OpenRTB generator
 ```
 
 Supporting files: `edgezero.toml`, `fastly.toml`,
@@ -99,7 +102,7 @@ cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
 
-# Run host-target CLI tests (workspace default target is wasm32-wasip1)
+# Run host-target CLI tests (the workspace has no global target)
 # Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
 # or aarch64-apple-darwin on Apple Silicon macOS.
 # Use the local helper (recommended):
@@ -253,7 +256,8 @@ impl core::error::Error for MyError {}
 - Always use intra-doc links (`[`Item`]`) for referenced types.
 - Document errors with `# Errors` section for all fallible functions.
 - Document panics with `# Panics` section.
-- Add `# Examples` sections for public API functions.
+- Add `# Examples` sections when an example proves behavior or prevents a
+  likely misuse; do not add ceremonial examples that restate the signature.
 - Add `# Performance` sections for performance-critical functions.
 - Skip documentation for standard trait implementations unless behavior is unique.
 - Use `cargo doc --no-deps --all-features` to verify.
@@ -303,9 +307,16 @@ IntegrationRegistration::builder(ID)
     .build()
 ```
 
-- Integration IDs match JS directory names: `prebid` (deferred), `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
-- `creative` is JS-only (no Rust registration); `nextjs`, `aps`, `adserver_mock` are Rust-only.
-- Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
+- The checked integration inventory contains 14 deployment IDs. Registration
+  can come from a settings builder, auction plan, or auction mediator; a deploy
+  ID does not imply that all three exist.
+- Twelve browser integration entries produce bundles alongside `core`.
+  `creative` is browser-only; `nextjs` and `adserver_mock` have no browser
+  module; APS rendering uses a dedicated asset rather than an integration
+  bundle.
+- Immediate modules are concatenated into the unified bundle. Prebid opts into
+  deferred loading through `.with_deferred_js()`. `gpt_diagnostics` is excluded
+  from both registry lists and uses a request-gated standalone tag.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
 
 ## JS Build Pipeline
@@ -320,28 +331,70 @@ IntegrationRegistration::builder(ID)
 
 ## Configuration Files
 
-| File                  | Purpose                                                    |
-| --------------------- | ---------------------------------------------------------- |
-| `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
-| `fastly.toml`                   | Fastly service configuration and build settings                 |
-| `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
-| `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
-| `.env.dev`                      | Local development environment variables                         |
+| File                          | Purpose                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                 |
+| `fastly.toml`                 | Fastly service configuration and build settings                                                   |
+| `trusted-server.example.toml` | Source-controlled Trusted Server app-config template                                              |
+| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
+| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                       |
+| `.env.dev`                    | Local development environment variables                                                           |
 
 ---
 
 ## CI Gates
 
-Every PR must pass:
+Every pull request must pass the gates in this section.
 
-1. `cargo fmt --all -- --check`
-2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm`
-3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
-4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
-5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
-6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
-7. Docs format (`cd docs && npm run format`)
+### JavaScript and documentation site
+
+
+- `cd crates/trusted-server-js/lib && npm ci && npm run lint && npx vitest run && npm run format && npm run build`
+- `cd docs && npm ci && npm run lint && npm run format && npm run build`
+
+### Rust formatting and linting
+
+
+- `cargo fmt --all -- --check`
+- `cargo clippy-fastly`
+- `cargo clippy-axum`
+- `cargo clippy-cloudflare`
+- `cargo clippy-cloudflare-wasm`
+- `cargo clippy-spin-native`
+- `cargo clippy-spin-wasm`
+- `cargo clippy --package trusted-server-cli --target $(rustc -vV | sed -n 's/host: //p') --all-targets -- -D warnings`
+- `cargo clippy --package trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p') --all-targets -- -D warnings`
+- `cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check`
+- `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings`
+
+### Rust tests and release builds
+
+
+- `cargo test-fastly`
+- `cargo test-axum`
+- `cargo test-cloudflare`
+- `cargo test-spin`
+- `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
+- `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test documentation_snippets`
+- `./scripts/test-cli.sh`
+- `cargo test --package trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p')`
+- `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
+- `cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release`
+
+## Manual documentation gates
+
+These commands are run by `scripts/check-documentation.sh` through the
+manual-only (`workflow_dispatch`) Documentation checks workflow. They are not
+pull-request status checks; CI does not block on rustdoc warnings.
+
+- `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p trusted-server-core -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p trusted-server-adapter-fastly --target wasm32-wasip1`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p trusted-server-adapter-axum`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p trusted-server-cli -p trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p')`
+- `cargo test --doc -p trusted-server-core`
+
 
 ---
 
@@ -430,18 +483,18 @@ both runtime behavior and build/tooling changes.
 
 ## Key Files
 
-| File                                         | Purpose                                           |
-| -------------------------------------------- | ------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
-| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
-| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
-| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
+| File                                                      | Purpose                                              |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`               |
+| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs                |
+| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start                 |
+| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules        |
 | `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
-| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
-| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
-| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
-| `crates/trusted-server-js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
-| `crates/trusted-server-js/src/bundle.rs`                    | Module map, concatenation, hashing                |
+| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                      |
+| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management                  |
+| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities              |
+| `crates/trusted-server-js/build.rs`                       | Discovers dist files, generates `tsjs_modules.rs`    |
+| `crates/trusted-server-js/src/bundle.rs`                  | Module map, concatenation, hashing                   |
 
 ---
 

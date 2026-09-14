@@ -1,3 +1,8 @@
+//! Streaming placeholders for complete Next.js RSC push payloads.
+//!
+//! Payloads are removed during element rewriting and restored by the final HTML
+//! post-processor so cross-script rewriting can operate on a coherent stream.
+
 use std::sync::{Arc, Mutex};
 
 use crate::integrations::{

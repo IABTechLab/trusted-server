@@ -1,4 +1,4 @@
-// Entry point for the creative runtime: wires up click + image + iframe guards globally.
+/** @file Installs and configures the global creative protection runtime. */
 import { log } from '../../core/log';
 import type { TsCreativeConfig, CreativeWindow, TsCreativeApi } from '../../shared/globals';
 import { creativeGlobal, resolveWindow } from '../../shared/globals';
@@ -7,7 +7,9 @@ import { installClickGuard } from './click';
 import { installDynamicImageProxy } from './image';
 import { installDynamicIframeProxy } from './iframe';
 
+/** Re-export the image source guard for explicit installation. */
 export { installDynamicImageProxy } from './image';
+/** Re-export the iframe source guard for explicit installation. */
 export { installDynamicIframeProxy } from './iframe';
 
 const DEFAULT_CONFIG: Required<TsCreativeConfig> = {
@@ -41,6 +43,7 @@ function mergeConfig(cfg: TsCreativeConfig): void {
   creativeGlobal.tsCreativeConfig = { ...currentConfig };
 }
 
+/** Merge creative guard configuration and activate newly enabled guards. */
 export function setCreativeConfig(cfg: TsCreativeConfig): void {
   mergeConfig(cfg);
   if (guardsInstallTriggered) {
@@ -48,11 +51,12 @@ export function setCreativeConfig(cfg: TsCreativeConfig): void {
   }
 }
 
+/** Return a copy of the effective creative guard configuration. */
 export function getCreativeConfig(): TsCreativeConfig {
   return { ...currentConfig };
 }
 
-// Public entry for creative runtime: install click + image protections once per page.
+/** Install the enabled click and dynamic-render guards at most once per page. */
 export function installGuards(): void {
   if (!guardsInstallTriggered) {
     guardsInstallTriggered = true;
@@ -60,6 +64,7 @@ export function installGuards(): void {
   applyConfig();
 }
 
+/** Public creative guard API exposed as `globalThis.tscreative`. */
 export const tsCreative: TsCreativeApi = {
   installGuards,
   setConfig: setCreativeConfig,
@@ -72,6 +77,7 @@ try {
   log.debug('tsjs-creative: failed to expose global tscreative', err);
 }
 
+/** Default creative-runtime API export. */
 export default tsCreative;
 
 (function auto() {

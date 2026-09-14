@@ -1,3 +1,9 @@
+//! macOS production-hostname development proxy.
+//!
+//! The proxy manages a local CA, system proxy settings, request rewriting, and
+//! bounded upstream connection reuse. Cleanup restores host configuration on
+//! normal shutdown and leaves recovery state when restoration fails.
+
 pub mod browser;
 pub mod ca;
 pub mod config;

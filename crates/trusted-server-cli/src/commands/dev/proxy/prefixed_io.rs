@@ -1,3 +1,5 @@
+//! Async stream adapter that replays parser over-read bytes before socket data.
+
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};

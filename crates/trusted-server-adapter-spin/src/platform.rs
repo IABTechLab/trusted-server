@@ -1,3 +1,9 @@
+//! Fermyon Spin implementations of Trusted Server platform services.
+//!
+//! Outbound HTTP and secret variables use Spin component APIs. Config and KV
+//! handle adapters cannot be reached at request time until this adapter wires
+//! an `EdgeZero` store registry through `Hooks::stores()`.
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -459,7 +465,7 @@ struct SpinPendingResponse {
 ///
 /// **No configurable outbound timeout.** `spin_sdk::http::send` does not
 /// expose per-request timeout control, and [`PlatformBackendSpec::first_byte_timeout`]
-/// is ignored by [`NoopBackend`]. A slow or hung origin will block the Spin
+/// is ignored by the private `NoopBackend`. A slow or hung origin will block the Spin
 /// invocation for whatever default the Spin runtime imposes. Operators requiring
 /// deterministic timeout behaviour should use the Fastly adapter.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -704,9 +710,14 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Spin request.
 ///
-/// Config and KV are sourced from the `EdgeZero` handles that `run_app` injects
-/// before routing. Secrets are read synchronously from Spin component
-/// variables because Trusted Server's platform secret trait is sync.
+/// Config and KV handles are currently absent because the Spin application does
+/// not implement `Hooks::stores()`. The corresponding services therefore fail
+/// closed even though the checked deployment maps the CLI-written store to the
+/// `default` label. Wiring or retiring that manifest is tracked by the
+/// documentation-refresh `Hooks::stores()` follow-up.
+///
+/// Secrets are read synchronously from Spin component variables because
+/// Trusted Server's platform secret trait is synchronous.
 #[must_use]
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
@@ -716,11 +727,13 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
+    // These handles remain absent until this adapter implements Hooks::stores().
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()
         .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
+    // Keep the typed adapters ready for that wiring; fall back closed today.
     let kv_store: Arc<dyn PlatformKvStore> = ctx
         .kv_store_default()
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)

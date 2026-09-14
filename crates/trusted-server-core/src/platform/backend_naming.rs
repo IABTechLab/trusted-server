@@ -2,7 +2,9 @@
 //!
 //! These policies contain no platform SDK calls. Startup validation, CLI
 //! validation, and runtime adapters can therefore predict the same backend
-//! names before any backend registration occurs.
+//! names before any backend registration occurs. The Fastly policy also keeps
+//! the readable prefix, digest suffix, timeout quantization, and backend-count
+//! budget in one deterministic contract.
 
 use core::fmt::Write as _;
 

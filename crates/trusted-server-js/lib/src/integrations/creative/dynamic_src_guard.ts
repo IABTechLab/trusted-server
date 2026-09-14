@@ -1,3 +1,7 @@
+/**
+ * @file Generic dynamic `src` guard used by creative image and iframe modules.
+ */
+
 import { log } from '../../core/log';
 import { createMutationScheduler } from '../../shared/scheduler';
 
@@ -16,6 +20,7 @@ type FactoryFunction<E extends ElementWithSrc> = {
   new (...args: unknown[]): E;
 } & ((...args: unknown[]) => E);
 
+/** DOM hooks and policy callbacks for one guarded element type. */
 export interface DynamicSrcProxyOptions<E extends ElementWithSrc> {
   elementConstructor: ElementCtor<E> | undefined;
   selector: string;
@@ -28,6 +33,13 @@ export interface DynamicSrcProxyOptions<E extends ElementWithSrc> {
   signProxy(raw: string, element: E): Promise<ProxySignOutcome>;
 }
 
+/**
+ * Build an idempotent installer that signs dynamic sources before assignment.
+ *
+ * The guard covers property writes, attribute writes, added nodes, and optional
+ * element factories. Stale asynchronous signing results are discarded by a
+ * per-element request sequence.
+ */
 export function createDynamicSrcProxy<E extends ElementWithSrc>(
   options: DynamicSrcProxyOptions<E>
 ): () => void {

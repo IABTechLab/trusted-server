@@ -136,7 +136,8 @@ pub struct SiteInfo {
 /// client state from `context.request`** — the placeholder has none of the
 /// real headers. If a future mediator needs that data, snapshot it into a new
 /// field on this struct at dispatch time and stash it on the
-/// [`DispatchedAuction`] token so collect can attach it to the mediator's
+/// [`DispatchedAuction`](crate::auction::orchestrator::DispatchedAuction) token
+/// so collect can attach it to the mediator's
 /// context. See <https://github.com/IABTechLab/trusted-server/issues/680>
 /// (P2-1) for the open follow-up.
 ///

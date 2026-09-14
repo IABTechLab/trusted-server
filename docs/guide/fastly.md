@@ -2,6 +2,17 @@
 
 This guide covers setting up your Fastly account and Compute service for Trusted Server.
 
+## Support status
+
+| Adapter  | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization |
+| -------- | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | --------------------- |
+| `fastly` | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                  |
+
+The row above summarizes the
+[adapter-support contract](./api-reference#adapter-and-startup-support). A healthy
+response does not prove that configuration loaded: Fastly serves `/health`
+before it constructs the application.
+
 ## Create a Fastly Account
 
 1. Go to [manage.fastly.com](https://manage.fastly.com) and create an account if you don't have one
@@ -340,9 +351,41 @@ fastly resource-link list --service-id <service-id> --version <active-version>
 
 If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version. Legacy partner/consent KV bindings can be removed once no deployment-specific tooling depends on them.
 
+## Verify the complete local handoff
+
+Run the repository smoke from a clean shell:
+
+```bash
+./scripts/smoke-fastly.sh
+```
+
+The script creates an isolated application config, applies its publisher-origin
+overrides, and runs strict validation. It then executes `ts config push
+--adapter fastly --local`, adds all three required entries to
+`[local_server.secret_stores.ts_secrets]`, and starts `fastly compute serve`
+through Viceroy. The required keys are `handler_password`,
+`publisher_proxy_secret`, and `ec_passphrase`.
+
+The check deliberately proves both halves of startup. With no config entry, it
+requires `/health` to return 200 while the publisher route returns 500 with the
+missing `trusted_server_config` diagnostic. It then removes each required
+secret independently and requires the corresponding setting path to fail.
+Finally, the publisher request must return 200, retain the stub-origin
+sentinel, rewrite an origin URL to the Fastly listener, and omit the original
+URL. A green health response cannot satisfy that final assertion.
+
+The script copies `edgezero.toml` and `fastly.toml` into a per-run temporary
+project before pushing local configuration or adding synthetic secrets. The
+tracked manifests remain untouched, including when smoke runs overlap. Its trap
+stops Viceroy and the stub origin and removes the temporary project. For a
+deployed service, provision and link the stores described above and write the
+three secrets through Fastly's secret-store interface.
+
 ## Next Steps
 
 - Return to [Getting Started](/guide/getting-started) to continue setup
 - See [Configuration](/guide/configuration) for detailed configuration options
 - See [EC Setup Guide](/guide/ec-setup-guide) for end-to-end EC verification
 - See [Request Signing](/guide/request-signing) for setting up cryptographic signing
+- Compare the [Cloudflare](./cloudflare), [Spin](./spin), and [Axum](./axum-dev)
+  adapter journeys

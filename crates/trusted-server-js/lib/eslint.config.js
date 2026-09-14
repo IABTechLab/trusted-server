@@ -57,4 +57,52 @@ export default [
       globals: globals.nodeBuiltin,
     },
   },
+  // Public browser-runtime sources and the external-Prebid builder form the
+  // maintained JSDoc surface. Generated bundles, vendor code, and tests remain
+  // outside this scope.
+  {
+    files: [
+      'build-prebid-external.mjs',
+      'src/core/registry.ts',
+      'src/core/render.ts',
+      'src/core/types.ts',
+      'src/shared/globals.ts',
+      'src/integrations/creative/**/*.ts',
+    ],
+    plugins: {
+      jsdoc,
+    },
+    settings: {
+      jsdoc: {
+        mode: 'typescript',
+      },
+    },
+    rules: {
+      'jsdoc/check-alignment': 'error',
+      'jsdoc/check-types': 'error',
+      'jsdoc/require-file-overview': 'error',
+      'jsdoc/require-jsdoc': [
+        'error',
+        {
+          require: {
+            ArrowFunctionExpression: false,
+            ClassDeclaration: false,
+            ClassExpression: false,
+            FunctionDeclaration: false,
+            FunctionExpression: false,
+            MethodDefinition: false,
+          },
+          contexts: [
+            'ExportNamedDeclaration > FunctionDeclaration',
+            'ExportNamedDeclaration > ClassDeclaration',
+            'ExportNamedDeclaration > TSInterfaceDeclaration',
+            'ExportNamedDeclaration > TSTypeAliasDeclaration',
+            'ExportNamedDeclaration[declaration.type="VariableDeclaration"]',
+            'ExportDefaultDeclaration',
+            'ExportNamedDeclaration[source]',
+          ],
+        },
+      ],
+    },
+  },
 ];

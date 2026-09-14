@@ -1,3 +1,8 @@
+//! Shared runtime service container and request metadata.
+//!
+//! [`RuntimeServices`] is assembled once by an adapter and passed through core
+//! handlers; its builder supplies typed unavailable services for omitted ports.
+
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;

@@ -261,7 +261,7 @@ struct SkippedPartnerId {
 /// Resolves the EC ID from the path when present, falling back to the
 /// request's `ts-ec` cookie for the bare route. Responds:
 ///
-/// - `200 OK` with an [`AdminEcLookupResponse`] JSON body when the key
+/// - `200 OK` with an `AdminEcLookupResponse` JSON body when the key
 ///   exists (including corrupt entries, which are reported with
 ///   `entry_error` and `raw_body` instead of failing closed);
 /// - `400 Bad Request` when the resolved ID is not a valid EC ID;

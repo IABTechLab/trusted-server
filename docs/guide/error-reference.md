@@ -8,7 +8,7 @@ Common errors, their causes, and solutions when working with Trusted Server.
 - [Runtime Errors](#runtime-errors)
 - [Integration Errors](#integration-errors)
 - [Request Signing Errors](#request-signing-errors)
-- [Build & Deployment Errors](#build--deployment-errors)
+- [Build & Deployment Errors](#build-deployment-errors)
 
 ---
 
@@ -608,10 +608,10 @@ npm ci
 npm run build
 ```
 
-3. Check for TypeScript errors:
+3. Run the TypeScript-aware ESLint checks:
 
 ```bash
-npm run type-check
+npm run lint
 ```
 
 4. Skip TSJS build temporarily:

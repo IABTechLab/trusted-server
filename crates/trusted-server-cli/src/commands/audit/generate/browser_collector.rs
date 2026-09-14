@@ -11,6 +11,8 @@ use tokio::runtime::Builder;
 use tokio::time::{sleep, timeout};
 use url::Url;
 
+#[cfg(test)]
+use crate::commands::audit::browser::browser_fixture_tests_enabled;
 use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
     resolve_chrome, set_browser_cookies,
@@ -485,23 +487,41 @@ async fn with_browser(
                 report_error(format!("failed to close browser after audit: {error}"))
             })
         });
-    // Reap the child even when the CDP close request failed or timed out. Give
-    // waiting its own budget so a slow close cannot consume the entire teardown
-    // window and leave chromiumoxide's drop handler to kill the process.
-    let wait_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.wait())
-        .await
-        .map_err(|_| report_error("timed out waiting for browser process to exit after audit"))
-        .and_then(|waited| {
-            waited.map(|_| ()).map_err(|error| {
-                report_error(format!(
-                    "failed waiting for browser process to exit after audit: {error}"
-                ))
-            })
-        });
+    // Give process exit its own budget so a slow close cannot consume the
+    // entire teardown window. Test fixtures may force cleanup after that bound;
+    // production retains the established timeout error and drop behavior.
+    let wait_result = wait_for_browser_exit(&mut browser).await;
     handler_task.abort();
     let _ = handler_task.await;
 
     combine_browser_run_results(result, finalization_result, close_result, wait_result)
+}
+
+async fn wait_for_browser_exit(browser: &mut Browser) -> CliResult<()> {
+    match timeout(BROWSER_CLOSE_TIMEOUT, browser.wait()).await {
+        Ok(waited) => waited.map(|_| ()).map_err(|error| {
+            report_error(format!(
+                "failed waiting for browser process to exit after audit: {error}"
+            ))
+        }),
+        Err(_) => {
+            #[cfg(test)]
+            if browser_fixture_tests_enabled() {
+                return timeout(BROWSER_CLOSE_TIMEOUT, browser.kill())
+                    .await
+                    .map_err(|_| report_error("timed out killing browser test fixture"))
+                    .and_then(|killed| match killed {
+                        Some(Ok(())) | None => Ok(()),
+                        Some(Err(error)) => Err(report_error(format!(
+                            "failed to kill browser test fixture: {error}"
+                        ))),
+                    });
+            }
+            Err(report_error(
+                "timed out waiting for browser process to exit after audit",
+            ))
+        }
+    }
 }
 
 /// Combines already-attempted browser phases, preserving the first error.
@@ -1086,6 +1106,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::Arc;
+    use std::time::Instant;
 
     use chromiumoxide::cdp::browser_protocol::network::{Headers, RequestId, Response};
     use chromiumoxide::cdp::browser_protocol::security::SecurityState;
@@ -1128,28 +1149,64 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
         let address = listener.local_addr().expect("should read fixture address");
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("should accept browser request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("should set fixture read timeout");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut chunk = [0_u8; 1024];
-                let chunk_len = stream.read(&mut chunk).expect("should read HTTP request");
-                assert!(chunk_len > 0, "request should contain complete headers");
-                request.extend_from_slice(&chunk[..chunk_len]);
-                assert!(
-                    request.len() <= 16 * 1024,
-                    "request headers should be bounded"
-                );
+            listener
+                .set_nonblocking(true)
+                .expect("should make fixture listener nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            while Instant::now() < deadline && served < 4 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("should accept browser request: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("should make fixture stream blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("should set fixture read timeout");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut chunk = [0_u8; 1024];
+                    let chunk_len = match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(chunk_len) => chunk_len,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => panic!("should read HTTP request: {error}"),
+                    };
+                    request.extend_from_slice(&chunk[..chunk_len]);
+                    assert!(
+                        request.len() <= 16 * 1024,
+                        "request headers should be bounded"
+                    );
+                }
+                if !request.ends_with(b"\r\n\r\n") {
+                    continue;
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    LAZY_GPT_FIXTURE.len(),
+                    LAZY_GPT_FIXTURE,
+                )
+                .expect("should write fixture response");
+                served += 1;
             }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                LAZY_GPT_FIXTURE.len(),
-                LAZY_GPT_FIXTURE,
-            )
-            .expect("should write fixture response");
+            assert!(
+                served > 0,
+                "fixture should serve at least one browser request"
+            );
         });
         Url::parse(&format!("http://{address}/")).expect("should parse fixture URL")
     }

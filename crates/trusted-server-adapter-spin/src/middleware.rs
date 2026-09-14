@@ -128,7 +128,7 @@ impl Middleware for AuthMiddleware {
 
 /// Request-normalization chokepoint.
 ///
-/// Runs [`crate::app::normalize_spin_request`] on every routed request before
+/// Runs the internal `normalize_spin_request` helper on every routed request before
 /// the handler executes, so the de-spoofing invariant — strip client-spoofable
 /// `Forwarded` / `X-Forwarded-*` headers, derive the trusted Host, scheme, and
 /// client IP from Spin's synthetic runtime headers — holds for *every* route

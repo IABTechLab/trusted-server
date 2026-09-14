@@ -589,7 +589,7 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// Rewrite an HTML document proxied through `/first-party/proxy`.
 ///
 /// Same rewrite pass as [`rewrite_creative_html`], but bounded by the proxy's
-/// own [`MAX_REWRITABLE_BODY_SIZE`] rather than the per-creative auction cap:
+/// own `MAX_REWRITABLE_BODY_SIZE` rather than the per-creative auction cap:
 /// a proxied document is a whole page, not an `adm`, and legitimately exceeds
 /// 1 MiB. The creative runtime is still injected so click mediation survives.
 #[must_use]

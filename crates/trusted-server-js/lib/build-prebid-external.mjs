@@ -1,5 +1,5 @@
 /**
- * Build a publisher-specific external Prebid bundle.
+ * @file Build a publisher-specific external Prebid bundle.
  *
  * Unlike build-all.mjs, this script is intended to run outside the Cargo build.
  * It produces an immutable bundle and manifest that can be hosted on an asset
@@ -35,6 +35,7 @@ const PREBID_LIVE_INTENT_STANDARD = path.join(
 const PREBID_GLOBAL_MODULE = path.join(PREBID_PACKAGE_DIR, 'dist', 'src', 'src', 'prebidGlobal.js');
 const LIVE_INTENT_SHIM = path.join(prebidDir, 'prebid_modules', 'liveIntentIdSystem.ts');
 
+/** Parse strict `--name value` or `--name=value` build arguments. */
 export function parseArgs(argv) {
   const options = new Map();
   for (let i = 0; i < argv.length; i += 1) {
@@ -122,6 +123,7 @@ function writeGeneratedModule(filePath, title, moduleNames, imports, exports = [
   fs.writeFileSync(filePath, content);
 }
 
+/** Render the generated module's immutable User ID module-name export. */
 export function renderIncludedUserIdModulesExport(moduleNames) {
   return `export const INCLUDED_PREBID_USER_ID_MODULES = ${JSON.stringify(moduleNames)};`;
 }
@@ -277,6 +279,7 @@ function generateExternalEntry(entryFile, adapters, bidderCodes) {
   fs.writeFileSync(entryFile, content);
 }
 
+/** Derive the content-addressed filename, SHA-256 digest, and SRI value. */
 export function deriveBundleMetadata(bundleBytes) {
   const sha256 = crypto.createHash('sha256').update(bundleBytes).digest('hex');
   const sri = `sha384-${crypto.createHash('sha384').update(bundleBytes).digest('base64')}`;
@@ -362,6 +365,7 @@ async function buildExternalBundle(outDir, generatedModules) {
   }
 }
 
+/** Build one immutable external bundle and manifest, then remove temporary modules. */
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const generatedModules = createTemporaryModulePaths();

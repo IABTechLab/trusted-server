@@ -1,3 +1,8 @@
+//! `ts config init` example-config creation.
+//!
+//! Creation refuses to replace an existing target unless `--force` is set and
+//! writes the repository's canonical example bytes.
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;

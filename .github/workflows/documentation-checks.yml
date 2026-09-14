@@ -1,0 +1,37 @@
+name: Documentation checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  documentation:
+    name: Site, snippets, and API docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Read tool versions
+        id: tool-versions
+        run: ./scripts/read-tool-versions.sh
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
+        with:
+          toolchain: ${{ steps.tool-versions.outputs.rust }}
+          target: wasm32-wasip1,wasm32-unknown-unknown
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ steps.tool-versions.outputs.node }}
+          cache: "npm"
+          cache-dependency-path: |
+            docs/package-lock.json
+            crates/trusted-server-js/lib/package-lock.json
+
+      - name: Run documentation checks
+        run: ./scripts/check-documentation.sh

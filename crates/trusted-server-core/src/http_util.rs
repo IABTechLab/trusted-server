@@ -1,3 +1,8 @@
+//! Shared HTTP policy and cryptographic request helpers.
+//!
+//! This module centralizes internal-header filtering, request classification,
+//! bounded body handling, client-IP trust, and encrypted token operations.
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit as _};
 use edgezero_core::body::Body as EdgeBody;

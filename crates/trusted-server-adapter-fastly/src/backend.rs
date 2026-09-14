@@ -200,7 +200,7 @@ impl<'a> BackendConfig<'a> {
     /// Return the deterministic backend name without registering anything.
     ///
     /// Convenience wrapper over `Self::predict_backend` that discards the
-    /// resolved port, used by [`crate::platform::PlatformBackend`]
+    /// resolved port, used by [`crate::platform::FastlyPlatformBackend`]
     /// implementations that only need the name for correlation.
     ///
     /// # Errors

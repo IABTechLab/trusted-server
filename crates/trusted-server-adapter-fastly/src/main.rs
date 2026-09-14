@@ -1,3 +1,10 @@
+//! Fastly Compute entry point for Trusted Server.
+//!
+//! The adapter opens runtime stores, assembles [`RuntimeServices`], normalizes
+//! trusted Fastly connection metadata, and dispatches through the shared
+//! `EdgeZero` application. Response finalization runs exactly once after route
+//! handling, including error responses.
+
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;

@@ -1,4 +1,4 @@
-// Dynamic iframe proxy guard: routes iframe src assignments through the first-party proxy.
+/** @file Routes dynamic creative iframe sources through the first-party proxy. */
 import { createDynamicSrcProxy } from './dynamic_src_guard';
 import { shouldProxyExternalUrl, signProxyUrl } from './proxy_sign';
 
@@ -12,6 +12,7 @@ const installProxy = createDynamicSrcProxy<HTMLIFrameElement>({
   signProxy: (raw) => signProxyUrl(raw),
 });
 
+/** Install the idempotent dynamic-iframe source guard. */
 export function installDynamicIframeProxy(): void {
   installProxy();
 }

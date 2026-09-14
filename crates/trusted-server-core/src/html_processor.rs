@@ -1,6 +1,8 @@
-//! Simplified HTML processor that combines URL replacement and integration injection
+//! Streaming HTML transformation and integration injection.
 //!
-//! This module provides a `StreamProcessor` implementation for HTML content.
+//! The processor combines core URL rewriting with the enabled integration
+//! registry. It streams when no final post-processor is registered and buffers
+//! only when an integration explicitly requires whole-document context.
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;

@@ -1,3 +1,8 @@
+//! Actor-owned bounded upstream connection pool.
+//!
+//! The manager serializes reservations, waiters, idle reuse, timeout expiry,
+//! and driver completion so capacity accounting has one owner.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};

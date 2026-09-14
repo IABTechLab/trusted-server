@@ -1448,7 +1448,7 @@ pub enum PublisherResponse {
         response: Response<EdgeBody>,
         /// Origin body to be piped through the streaming pipeline.
         body: EdgeBody,
-        /// Parameters for [`process_response_streaming`].
+        /// Parameters for the internal streaming-response processor.
         params: Box<OwnedProcessResponseParams>,
     },
     /// A shared template read from template cache, to be assembled on the way out.
@@ -1573,7 +1573,7 @@ fn apply_publisher_asset_cache_policy(
     Ok(())
 }
 
-/// Owned version of [`ProcessResponseParams`] for returning from
+/// Owned version of the internal borrowed response parameters for returning from
 /// [`handle_publisher_request`] without lifetime issues.
 pub struct OwnedProcessResponseParams {
     /// Where to store the transformed template, or [`None`] to store nothing.
@@ -6227,10 +6227,10 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
 
 /// Builds the `403 Forbidden` returned when the side-effecting
 /// `/_ts/page-bids` endpoint refuses a request — both the CORS preflight
-/// (`OPTIONS`) and the GET cross-site gate ([`page_bids_request_allowed`])
+/// (`OPTIONS`) and the GET cross-site gate (`page_bids_request_allowed`)
 /// return this single denial shape.
 ///
-/// The GET handler's [`page_bids_request_allowed`] gate trusts the
+/// The GET handler's `page_bids_request_allowed` gate trusts the
 /// `X-TSJS-Page-Bids` header precisely because this endpoint never grants a
 /// preflight; letting `OPTIONS` fall through to the publisher origin (which may
 /// return permissive CORS) would defeat that, allowing a cross-site page to

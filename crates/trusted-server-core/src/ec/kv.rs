@@ -299,7 +299,7 @@ impl KvIdentityGraph {
     /// - **No existing key** — creates the entry (same as [`create`](Self::create)).
     /// - **Existing live entry** (`consent.ok = true`) — no-op, returns `Ok(())`.
     /// - **Existing tombstone** (`consent.ok = false`) — CAS overwrite with
-    ///   the new entry. Retries up to [`MAX_CAS_RETRIES`] on conflict.
+    ///   the new entry. Retries up to `MAX_CAS_RETRIES` on conflict.
     ///
     /// Called by `generate_if_needed()` instead of `create()` so that a
     /// user who re-consents within the 24-hour tombstone window recovers
@@ -467,7 +467,7 @@ impl KvIdentityGraph {
     /// Atomically merges a partner ID into the existing entry.
     ///
     /// Uses CAS (generation markers) to avoid clobbering concurrent writes
-    /// from other partners. Retries up to [`MAX_CAS_RETRIES`] on conflict.
+    /// from other partners. Retries up to `MAX_CAS_RETRIES` on conflict.
     ///
     /// If the root entry does not exist, returns an error. This method
     /// intentionally fails closed to prevent phantom identity entries.
@@ -475,7 +475,7 @@ impl KvIdentityGraph {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store error or CAS
-    /// exhaustion after [`MAX_CAS_RETRIES`] attempts.
+    /// exhaustion after `MAX_CAS_RETRIES` attempts.
     pub fn upsert_partner_id(
         &self,
         ec_id: &str,
@@ -660,7 +660,7 @@ impl KvIdentityGraph {
     /// Counts the number of keys sharing the same EC hash prefix.
     ///
     /// Uses the platform KV list API with a prefix filter, limited to
-    /// [`CLUSTER_LIST_LIMIT`] keys. If the limit is reached, the count
+    /// `CLUSTER_LIST_LIMIT` keys. If the limit is reached, the count
     /// is capped — the exact number beyond the limit is not meaningful
     /// for disambiguation.
     ///

@@ -1,3 +1,8 @@
+//! Streaming URL rewriting for React Server Component Flight payloads.
+//!
+//! The parser preserves row framing and recomputes byte lengths for rewritten
+//! length-delimited chunks without buffering an entire response.
+
 use std::io;
 
 use crate::host_rewrite::rewrite_bare_host_at_boundaries;

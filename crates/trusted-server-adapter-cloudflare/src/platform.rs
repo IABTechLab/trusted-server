@@ -1,3 +1,10 @@
+//! Cloudflare implementations of Trusted Server platform services.
+//!
+//! Outbound HTTP, secrets, client IP, and geo data use Workers APIs. Config and
+//! KV handle adapters are retained for the future store-registry wiring but are
+//! currently unavailable at request time because this adapter does not
+//! implement `Hooks::stores()`.
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -578,10 +585,14 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Cloudflare Workers request.
 ///
-/// Config and KV are sourced from the edgezero handles that `run_app` injects
-/// before routing — via the `TRUSTED_SERVER_CONFIG` env-var binding and the
-/// `TRUSTED_SERVER_KV` KV namespace declared in `cloudflare.toml`. No
-/// platform-specific `#[cfg]` is required for these two stores.
+/// Config and KV handles are currently absent: the Cloudflare application does
+/// not implement `Hooks::stores()`, so `run_app` cannot inject either registry.
+/// The declared `TRUSTED_SERVER_KV` binding is therefore not opened here and
+/// these services fail closed through their unavailable implementations.
+/// Startup configuration instead comes from the nested
+/// `TRUSTED_SERVER_CONFIG` variable read by the crate entry point. Wiring or
+/// retiring these manifests is tracked by the documentation-refresh
+/// `Hooks::stores()` follow-up.
 ///
 /// Secrets still require direct `worker::Env` access because
 /// `SecretHandle::get_bytes` is async while `PlatformSecretStore::get_bytes`
@@ -598,13 +609,13 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     #[cfg(not(target_arch = "wasm32"))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
-    // Config: use the ConfigStoreHandle injected by run_app — no #[cfg] needed.
+    // These handles remain absent until this adapter implements Hooks::stores().
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()
         .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
-    // KV: use the KvHandle injected by run_app — no #[cfg] needed.
+    // Keep the typed adapters ready for that wiring; fall back closed today.
     let kv_store: Arc<dyn PlatformKvStore> = ctx
         .kv_store_default()
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)

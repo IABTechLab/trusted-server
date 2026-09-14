@@ -1,3 +1,8 @@
+//! Streaming browser-upload and pooled upstream-response body adapters.
+//!
+//! Completion and failure transitions notify the pool exactly once so a
+//! connection is reused only after its response body drains successfully.
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};

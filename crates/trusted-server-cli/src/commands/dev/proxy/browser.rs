@@ -72,7 +72,7 @@ fn login_keychain() -> String {
 /// Adds the CA certificate to the macOS login keychain (spec §7.3).
 ///
 /// On non-macOS systems, or if the `security` command fails, prints manual
-/// instructions via [`crate::output`]. Never panics.
+/// instructions through the CLI output layer. Never panics.
 pub fn ca_install(cert_path: &Path) {
     #[cfg(target_os = "macos")]
     {
@@ -183,7 +183,7 @@ pub fn launch(
 ///
 /// On non-macOS systems or when no restore file is present, this is a no-op.
 /// The restore file is **kept** when the restore commands fail so a later run
-/// (or the manual command printed via [`crate::output::warn`]) can still fix the
+/// (or the manual command printed by the CLI warning helper) can still fix the
 /// system proxy; it is deleted only after a successful restore or when the file
 /// is malformed (so a bad file cannot loop forever). Never panics.
 pub fn restore_system_proxy_if_pending(ca_dir: &Path, interactive: bool) {
