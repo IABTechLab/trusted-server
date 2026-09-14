@@ -120,19 +120,16 @@ type TestWindow = Omit<Window, 'tsjs'> & {
 };
 
 async function runGptBootstrapWithGoogleTag(googletag: object): Promise<void> {
-  const bootstrapUrl = new URL(
-    '../../../../../trusted-server-core/src/integrations/gpt_bootstrap.js',
-    import.meta.url
+  // Resolved from the vitest root (the lib directory, per vitest.config.ts)
+  // rather than from `import.meta.url`, which the jsdom environment rewrites
+  // to a non-file scheme. This is the same approach gpt_bootstrap.test.ts
+  // takes for the same file, and it makes no assumption about the platform:
+  // a URL pathname is not a filesystem path, and on Windows it carries a
+  // leading slash before the drive letter.
+  const bootstrapPath = path.resolve(
+    process.cwd(),
+    '../../trusted-server-core/src/integrations/gpt_bootstrap.js'
   );
-  const urlPath = decodeURIComponent(bootstrapUrl.pathname);
-  let bootstrapPath: string;
-  if (urlPath.startsWith('/@fs/')) {
-    bootstrapPath = urlPath.slice('/@fs'.length);
-  } else if (bootstrapUrl.protocol === 'file:') {
-    bootstrapPath = urlPath;
-  } else {
-    bootstrapPath = path.resolve(process.cwd(), `.${urlPath}`);
-  }
   const bootstrap = await readFile(bootstrapPath, 'utf8');
   const runBootstrap = new Function('window', 'googletag', bootstrap) as (
     window: Window,
