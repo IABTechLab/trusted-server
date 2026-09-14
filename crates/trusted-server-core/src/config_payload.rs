@@ -195,6 +195,7 @@ mod tests {
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
+                "host-signals-passphrase-key" => "resolved-host-signals-passphrase-32-bytes-ok",
                 _ => key,
             };
             Ok(value.as_bytes().to_vec())
@@ -828,6 +829,59 @@ mod tests {
         assert!(
             err.to_string().contains("short_passphrase") || err.to_string().contains("validation"),
             "error should indicate runtime validation: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("short_key"),
+            "error should not expose the secret value"
+        );
+    }
+
+    #[test]
+    fn resolves_the_host_signals_passphrase_from_the_mapped_store() {
+        let mut original = test_settings();
+        original.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
+            "host-signals",
+        ));
+        original.ec.providers.hmac = None;
+        original.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
+            passphrase: Redacted::new("host-signals-passphrase-key".to_string()),
+        });
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the host-signals passphrase from the mapped store");
+
+        assert_eq!(
+            reconstructed
+                .ec
+                .providers
+                .host_signals
+                .as_ref()
+                .map(|config| config.passphrase.expose().as_str()),
+            Some("resolved-host-signals-passphrase-32-bytes-ok")
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_short_resolved_host_signals_passphrase() {
+        let mut settings = test_settings();
+        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
+            "host-signals",
+        ));
+        settings.ec.providers.hmac = None;
+        settings.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
+            passphrase: Redacted::new("short_key".to_owned()),
+        });
+
+        let err = load_settings(&envelope_json(&settings))
+            .expect_err("should reject a short resolved host-signals passphrase");
+
+        assert!(
+            err.to_string().contains("short_passphrase"),
+            "error should name the passphrase check: {err:?}"
         );
         assert!(
             !err.to_string().contains("short_key"),

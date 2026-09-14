@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use subtle::ConstantTimeEq as _;
 use url::Url;
-use validator::{Validate, ValidationError};
+use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
@@ -811,18 +811,16 @@ impl Ec {
 /// The active provider is chosen by the [`Ec::provider`] selector, and the one
 /// block present must be the one it names (see
 /// [`Ec::validate_provider_selection`]).
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct EcProviders {
     /// The built-in HMAC-over-client-IP provider, keyed `hmac`.
     #[serde(default)]
-    #[validate(nested)]
     pub hmac: Option<HmacProviderConfig>,
 
     /// The built-in host-signal provider, keyed `host-signals`. Creates the Edge
     /// Cookie from the host's TLS and HTTP/2 signals plus the client IP, so it
     /// requires a host that supplies those signals.
     #[serde(default, rename = "host-signals")]
-    #[validate(nested)]
     pub host_signals: Option<HostSignalsProviderConfig>,
 
     /// Configuration blocks for vendor or host providers that live in their own
@@ -833,6 +831,33 @@ pub struct EcProviders {
     /// adds nothing here.
     #[serde(flatten)]
     vendor: HashMap<String, JsonValue>,
+}
+
+/// Validates each built-in provider block under the key the configuration
+/// uses for it.
+///
+/// The derived implementation would key a nested error by the Rust field name,
+/// `host_signals`, while the configuration, the secret-store resolution and the
+/// secret paths `TrustedServerAppConfig::secret_fields` registers all use
+/// `host-signals`. `edgezero_core::app_config::validate_excluding_secrets`
+/// matches those paths against the error keys verbatim, so a derived key would
+/// leave the passphrase checked as a value when it holds a key name at push
+/// time. Vendor blocks are validated by the adapter that builds the provider.
+impl Validate for EcProviders {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = ValidationErrors::new();
+        if let Some(hmac) = &self.hmac {
+            errors.merge_self("hmac", hmac.validate());
+        }
+        if let Some(host_signals) = &self.host_signals {
+            errors.merge_self("host-signals", host_signals.validate());
+        }
+        if errors.errors().is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl EcProviders {
