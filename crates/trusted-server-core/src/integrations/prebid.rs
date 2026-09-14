@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-#[cfg(test)]
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 #[cfg(test)]
@@ -222,6 +221,118 @@ fn extract_prebid_error_message(
 #[cfg(test)]
 const GPC_US_PRIVACY: &str = "1YYN";
 
+/// Rejects a Prebid User ID identifier that Prebid.js could not address.
+///
+/// Applies only the constraints Prebid itself imposes on a `userSync.userIds`
+/// entry name and on a storage key: a non-empty ASCII token with no
+/// surrounding whitespace. Anything narrower would encode one vendor's rules
+/// into core.
+fn validate_prebid_user_id_token(value: &str) -> Result<(), ValidationError> {
+    let is_valid = !value.is_empty()
+        && value.trim() == value
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if is_valid {
+        return Ok(());
+    }
+
+    let mut error = ValidationError::new("invalid_prebid_user_id_token");
+    error.message = Some(
+        "must be a non-empty ASCII token of letters, digits, `_`, `-`, or `.` without surrounding whitespace"
+            .into(),
+    );
+    Err(error)
+}
+
+/// Browser storage mechanism for an operator-managed Prebid User ID module.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrebidUserIdStorageType {
+    /// Store the module's value in a browser cookie.
+    #[default]
+    Cookie,
+    /// Store the module's value in browser local storage.
+    Html5,
+}
+
+/// Browser storage settings forwarded verbatim to a Prebid User ID module.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PrebidManagedUserIdStorage {
+    /// Browser storage mechanism.
+    #[serde(default, rename = "type")]
+    pub storage_type: PrebidUserIdStorageType,
+    /// Cookie or local-storage key the module reads and writes.
+    #[validate(custom(function = "validate_prebid_user_id_token"))]
+    pub name: String,
+    /// Number of days the browser retains the stored value.
+    ///
+    /// Omitted leaves Prebid's own default in place. Core applies no upper
+    /// bound: the ceiling is a property of the selected module, not of Trusted
+    /// Server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub expires: Option<u16>,
+    /// Number of seconds before the module may refresh the stored value.
+    ///
+    /// Omitted leaves Prebid's own default in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub refresh_in_seconds: Option<u32>,
+}
+
+/// Rejects a managed User ID list whose names address one module twice.
+///
+/// Prebid matches `userSync.userIds` entry names to submodules
+/// case-insensitively and takes the first matching entry, so two entries whose
+/// names differ only by case give one submodule two conflicting configurations
+/// with no defined winner.
+fn validate_unique_managed_user_id_names(
+    entries: &[PrebidManagedUserIdConfig],
+) -> Result<(), ValidationError> {
+    let mut seen = HashSet::with_capacity(entries.len());
+    let Some(duplicate) = entries
+        .iter()
+        .find(|entry| !seen.insert(entry.name.to_ascii_lowercase()))
+    else {
+        return Ok(());
+    };
+
+    let mut error = ValidationError::new("duplicate_managed_user_id_name");
+    // Name the matching rule: for a collision that differs only by case, the
+    // printed name alone does not look repeated in the operator's config.
+    error.message = Some(
+        format!(
+            "managed Prebid User ID module `{}` is configured more than once (names are matched case-insensitively)",
+            duplicate.name
+        )
+        .into(),
+    );
+    Err(error)
+}
+
+/// Operator-owned Prebid User ID module entry that Trusted Server manages.
+///
+/// Core treats every entry as opaque: it validates only what Prebid.js needs to
+/// address the module, then forwards the entry to the browser unchanged. Which
+/// identity vendor an entry selects is an operator configuration choice, not a
+/// property of core.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PrebidManagedUserIdConfig {
+    /// Prebid `userSync.userIds` entry name, for example `sharedId`.
+    #[validate(custom(function = "validate_prebid_user_id_token"))]
+    pub name: String,
+    /// Module-specific parameters, forwarded to Prebid without inspection.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub params: serde_json::Map<String, Json>,
+    /// Optional browser storage settings for the module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub storage: Option<PrebidManagedUserIdStorage>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct LegacyPrebidServerConfig {
@@ -234,6 +345,13 @@ pub struct LegacyPrebidServerConfig {
     /// it in JavaScript.
     #[serde(default)]
     pub account_id: Option<String>,
+    /// Prebid User ID modules that Trusted Server installs and keeps installed.
+    ///
+    /// Each entry is forwarded to Prebid.js verbatim; publisher-configured
+    /// entries with other names are preserved. Names must be unique.
+    #[serde(default)]
+    #[validate(nested, custom(function = "validate_unique_managed_user_id_names"))]
+    pub managed_user_ids: Vec<PrebidManagedUserIdConfig>,
     #[serde(default = "default_timeout_ms")]
     #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
@@ -419,6 +537,14 @@ pub struct PrebidIntegrationConfig {
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
     pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
+    /// Prebid User ID modules that Trusted Server installs and keeps installed.
+    ///
+    /// Each entry is forwarded to Prebid.js verbatim; publisher-configured
+    /// entries with other names are preserved. Names must be unique, and no two
+    /// names may resolve to the same Prebid User ID submodule.
+    #[serde(default)]
+    #[validate(nested, custom(function = "validate_unique_managed_user_id_names"))]
+    pub managed_user_ids: Vec<PrebidManagedUserIdConfig>,
     /// CLI-only external bundle build inputs; runtime registration ignores these fields.
     #[serde(default)]
     pub bundle: PrebidBundleBuildConfig,
@@ -437,6 +563,7 @@ impl Default for PrebidIntegrationConfig {
             external_bundle_sri: None,
             client_side_bidders: Vec::new(),
             excluded_gam_ad_unit_path_suffixes: Vec::new(),
+            managed_user_ids: Vec::new(),
             bundle: PrebidBundleBuildConfig::default(),
         }
     }
@@ -462,6 +589,7 @@ impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
             external_bundle_sri: config.external_bundle_sri.clone(),
             client_side_bidders: config.client_side_bidders.clone(),
             excluded_gam_ad_unit_path_suffixes: config.excluded_gam_ad_unit_path_suffixes.clone(),
+            managed_user_ids: config.managed_user_ids.clone(),
             bundle: PrebidBundleBuildConfig::default(),
         }
     }
@@ -974,30 +1102,13 @@ impl PrebidIntegration {
         browser_config: &PrebidIntegrationConfig,
         plan: &AuctionPlan,
     ) -> Vec<String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct InjectedBrowserConfig<'a> {
-            account_id: &'a str,
-            timeout: u32,
-            debug: bool,
-            server_side_bidders: Vec<&'a str>,
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            client_side_bidders: &'a [String],
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            excluded_gam_ad_unit_path_suffixes: &'a [String],
-        }
-
-        let payload = InjectedBrowserConfig {
-            account_id: browser_config.account_id.as_deref().unwrap_or_default(),
-            timeout: browser_config.timeout_ms,
-            debug: browser_config.debug,
-            server_side_bidders: if plan.enabled() {
+        let payload = InjectedPrebidClientConfig {
+            server_side_bidders: Some(if plan.enabled() {
                 plan.browser_bidder_codes().collect()
             } else {
                 Vec::new()
-            },
-            client_side_bidders: &browser_config.client_side_bidders,
-            excluded_gam_ad_unit_path_suffixes: &browser_config.excluded_gam_ad_unit_path_suffixes,
+            }),
+            ..InjectedPrebidClientConfig::from(browser_config)
         };
         let config_json = serialize_injected_prebid_config(&payload);
 
@@ -1369,24 +1480,8 @@ impl IntegrationHeadInjector for PrebidIntegration {
         if let Some(inserts) = &self.planned_head_inserts {
             return inserts.clone();
         }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct InjectedPrebidClientConfig<'a> {
-            account_id: &'a str,
-            timeout: u32,
-            debug: bool,
-            bidders: &'a [String],
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            client_side_bidders: &'a [String],
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            excluded_gam_ad_unit_path_suffixes: &'a [String],
-        }
-
         let payload = InjectedPrebidClientConfig {
-            account_id: self.config.account_id.as_deref().unwrap_or_default(),
-            timeout: self.config.timeout_ms,
-            debug: self.config.debug,
-            bidders: {
+            bidders: Some({
                 #[cfg(test)]
                 {
                     self.legacy_config
@@ -1397,9 +1492,8 @@ impl IntegrationHeadInjector for PrebidIntegration {
                 {
                     &[]
                 }
-            },
-            client_side_bidders: &self.config.client_side_bidders,
-            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
+            }),
+            ..InjectedPrebidClientConfig::from(&self.config)
         };
 
         let config_json = serialize_injected_prebid_config(&payload);
@@ -1408,6 +1502,89 @@ impl IntegrationHeadInjector for PrebidIntegration {
         inserts.push(self.external_bundle_script_tag());
 
         inserts
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectedManagedUserIdStorage<'a> {
+    #[serde(rename = "type")]
+    storage_type: PrebidUserIdStorageType,
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_in_seconds: Option<u32>,
+}
+
+impl<'a> From<&'a PrebidManagedUserIdStorage> for InjectedManagedUserIdStorage<'a> {
+    fn from(storage: &'a PrebidManagedUserIdStorage) -> Self {
+        Self {
+            storage_type: storage.storage_type,
+            name: &storage.name,
+            expires: storage.expires,
+            refresh_in_seconds: storage.refresh_in_seconds,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectedManagedUserId<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    params: &'a serde_json::Map<String, Json>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage: Option<InjectedManagedUserIdStorage<'a>>,
+}
+
+impl<'a> From<&'a PrebidManagedUserIdConfig> for InjectedManagedUserId<'a> {
+    fn from(config: &'a PrebidManagedUserIdConfig) -> Self {
+        Self {
+            name: &config.name,
+            params: &config.params,
+            storage: config
+                .storage
+                .as_ref()
+                .map(InjectedManagedUserIdStorage::from),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectedPrebidClientConfig<'a> {
+    account_id: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    managed_user_ids: Vec<InjectedManagedUserId<'a>>,
+    timeout: u32,
+    debug: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bidders: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_side_bidders: Option<Vec<&'a str>>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    client_side_bidders: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    excluded_gam_ad_unit_path_suffixes: &'a [String],
+}
+
+impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
+    fn from(config: &'a PrebidIntegrationConfig) -> Self {
+        Self {
+            account_id: config.account_id.as_deref().unwrap_or_default(),
+            managed_user_ids: config
+                .managed_user_ids
+                .iter()
+                .map(InjectedManagedUserId::from)
+                .collect(),
+            timeout: config.timeout_ms,
+            debug: config.debug,
+            bidders: None,
+            server_side_bidders: None,
+            client_side_bidders: &config.client_side_bidders,
+            excluded_gam_ad_unit_path_suffixes: &config.excluded_gam_ad_unit_path_suffixes,
+        }
     }
 }
 
@@ -3487,6 +3664,7 @@ mod tests {
             enabled: true,
             server_url: "https://prebid.example".to_string(),
             account_id: Some("test-account".to_string()),
+            managed_user_ids: Vec::new(),
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
             debug: false,
@@ -3506,6 +3684,19 @@ mod tests {
             consent_forwarding: ConsentForwardingMode::Both,
             suppress_nurl: false,
             suppress_nurl_bidders: Vec::new(),
+        }
+    }
+
+    fn valid_managed_user_id() -> PrebidManagedUserIdConfig {
+        PrebidManagedUserIdConfig {
+            name: "exampleId".to_string(),
+            params: serde_json::Map::from_iter([("pid".to_string(), json!("999"))]),
+            storage: Some(PrebidManagedUserIdStorage {
+                storage_type: PrebidUserIdStorageType::Cookie,
+                name: "example_env".to_string(),
+                expires: Some(15),
+                refresh_in_seconds: Some(1800),
+            }),
         }
     }
 
@@ -3878,6 +4069,243 @@ server_url = "https://prebid.example/openrtb2/auction"
             "should inject the canonical suffix list: {config_insert}"
         );
     }
+    #[test]
+    fn managed_user_ids_parse_with_opaque_params() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+params = { pid = "999", notUse3P = false, nested = { depth = 2 } }
+
+[integrations.prebid.managed_user_ids.storage]
+type = "html5"
+name = "example_env"
+expires = 30
+refresh_in_seconds = 3600
+"#,
+        );
+
+        let [entry] = config.managed_user_ids.as_slice() else {
+            panic!("should parse exactly one managed User ID entry");
+        };
+        assert_eq!(entry.name, "exampleId", "should preserve the module name");
+        assert_eq!(
+            Json::Object(entry.params.clone()),
+            json!({"pid": "999", "notUse3P": false, "nested": {"depth": 2}}),
+            "should carry module parameters through without inspecting them"
+        );
+
+        let storage = entry.storage.as_ref().expect("should parse storage");
+        assert_eq!(
+            storage.storage_type,
+            PrebidUserIdStorageType::Html5,
+            "should preserve the configured storage mechanism"
+        );
+        assert_eq!(storage.name, "example_env", "should preserve storage key");
+        assert_eq!(storage.expires, Some(30), "should preserve expiry");
+        assert_eq!(
+            storage.refresh_in_seconds,
+            Some(3600),
+            "should preserve refresh interval"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_leave_prebid_defaults_in_place_when_unset() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+
+[integrations.prebid.managed_user_ids.storage]
+name = "example_env"
+"#,
+        );
+
+        let [entry] = config.managed_user_ids.as_slice() else {
+            panic!("should parse exactly one managed User ID entry");
+        };
+        assert!(
+            entry.params.is_empty(),
+            "should treat parameters as optional"
+        );
+
+        let storage = entry.storage.as_ref().expect("should parse storage");
+        assert_eq!(
+            storage.storage_type,
+            PrebidUserIdStorageType::Cookie,
+            "should default to cookie storage"
+        );
+        assert_eq!(
+            storage.expires, None,
+            "should leave Prebid's own expiry default in place"
+        );
+        assert_eq!(
+            storage.refresh_in_seconds, None,
+            "should leave Prebid's own refresh default in place"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_allow_an_entry_without_storage() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+"#,
+        );
+
+        let [entry] = config.managed_user_ids.as_slice() else {
+            panic!("should parse exactly one managed User ID entry");
+        };
+        assert!(
+            entry.storage.is_none(),
+            "should treat storage as optional for modules that need none"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_reject_invalid_values() {
+        for (name, entry_section) in [
+            ("missing name", "params = { pid = \"999\" }"),
+            ("empty name", "name = \"\""),
+            ("padded name", "name = \" exampleId \""),
+            ("name with a space", "name = \"example id\""),
+            (
+                "unknown entry field",
+                "name = \"exampleId\"\nunsupported = true",
+            ),
+            (
+                "empty storage name",
+                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"\"",
+            ),
+            (
+                "missing storage name",
+                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\ntype = \"cookie\"",
+            ),
+            (
+                "zero expiry",
+                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\nexpires = 0",
+            ),
+            (
+                "zero refresh",
+                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\nrefresh_in_seconds = 0",
+            ),
+            (
+                "unknown storage mechanism",
+                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\ntype = \"session\"",
+            ),
+            (
+                "unknown storage field",
+                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\nunsupported = true",
+            ),
+        ] {
+            let result = parse_prebid_toml_result(&format!(
+                r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+{entry_section}
+"#
+            ));
+
+            assert!(result.is_err(), "should reject {name}");
+        }
+    }
+
+    #[test]
+    fn managed_user_ids_reject_a_repeated_module_name() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+params = { pid = "1" }
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+params = { pid = "2" }
+"#,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject the same module configured twice"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_reject_a_case_variant_module_name() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+params = { pid = "1" }
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleid"
+params = { pid = "2" }
+"#,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject two names that address the same submodule under Prebid's case-insensitive match"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_accept_distinct_module_names() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+
+[[integrations.prebid.managed_user_ids]]
+name = "otherExampleId"
+"#,
+        );
+
+        assert_eq!(
+            config.managed_user_ids.len(),
+            2,
+            "should keep every distinctly named module"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_default_to_none_configured() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+"#,
+        );
+
+        assert!(
+            config.managed_user_ids.is_empty(),
+            "should manage no User ID modules by default"
+        );
+    }
+
     #[test]
     fn excluded_gam_ad_unit_path_suffixes_reject_invalid_values() {
         for (suffix, expected_message) in [
@@ -4813,6 +5241,140 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn planned_registration_injects_managed_user_ids() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "managed_user_ids": [{
+                        "name": "exampleId",
+                        "params": {"nested": {"value": "</script>"}},
+                        "storage": {"name": "example_env", "refresh_in_seconds": 3600}
+                    }, {"name": "anotherId"}]
+                }),
+            )
+            .expect("should configure prebid");
+        let plan =
+            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan");
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+        for enabled in [true, false] {
+            let registration = register_for_plan(&settings, &plan.clone().with_enabled(enabled))
+                .expect("should register prebid")
+                .expect("should enable prebid");
+            let inserts = registration.head_injectors[0].head_inserts(&ctx);
+            let script = &inserts[0];
+            assert!(
+                script.contains(r#""managedUserIds":[{"name":"exampleId""#),
+                "should inject managed IDs: {script}"
+            );
+            assert!(
+                script.contains(r#""refreshInSeconds":3600"#),
+                "should use browser storage keys: {script}"
+            );
+            assert!(
+                script.contains(r#"{"name":"anotherId"}"#),
+                "should omit unset fields: {script}"
+            );
+            assert!(
+                !script.contains("</script>\""),
+                "should escape script breakout: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_injector_includes_managed_user_ids() {
+        let mut config = base_config();
+        config.managed_user_ids = vec![PrebidManagedUserIdConfig {
+            name: "exampleId".to_string(),
+            params: serde_json::Map::from_iter([
+                ("pid".to_string(), json!("999")),
+                ("notUse3P".to_string(), json!(true)),
+            ]),
+            storage: Some(PrebidManagedUserIdStorage {
+                storage_type: PrebidUserIdStorageType::Html5,
+                name: "example_env".to_string(),
+                expires: Some(30),
+                refresh_in_seconds: Some(3600),
+            }),
+        }];
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+
+        assert!(
+            script.contains(
+                r#""managedUserIds":[{"name":"exampleId","params":{"notUse3P":true,"pid":"999"},"storage":{"type":"html5","name":"example_env","expires":30,"refreshInSeconds":3600}}]"#
+            ),
+            "should inject the managed User ID entry verbatim: {script}"
+        );
+    }
+
+    #[test]
+    fn head_injector_omits_optional_managed_user_id_fields_when_unset() {
+        let mut config = base_config();
+        config.managed_user_ids = vec![PrebidManagedUserIdConfig {
+            name: "exampleId".to_string(),
+            params: serde_json::Map::new(),
+            storage: None,
+        }];
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+
+        assert!(
+            script.contains(r#""managedUserIds":[{"name":"exampleId"}]"#),
+            "should omit empty parameters and absent storage: {script}"
+        );
+    }
+
+    #[test]
+    fn head_injector_omits_managed_user_ids_when_none_configured() {
+        let integration = PrebidIntegration::new(base_config());
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+
+        assert!(
+            !script.contains("managedUserIds"),
+            "should omit managed User IDs when none are configured: {script}"
+        );
+    }
+
+    #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn prepared_browser_injection_uses_only_plan_routes_and_browser_timeout_debug() {
         let integration = PrebidIntegration::new(base_config());
@@ -4888,6 +5450,39 @@ external_bundle_sri = "sha384-AAAA"
             disabled_inserts[0].contains(r#""serverSideBidders":[]"#),
             "auction kill switch should suppress browser server-side bidders: {}",
             disabled_inserts[0]
+        );
+    }
+
+    #[test]
+    fn head_injector_escapes_script_breakout_in_managed_user_ids() {
+        let mut config = base_config();
+        config.managed_user_ids = vec![PrebidManagedUserIdConfig {
+            params: serde_json::Map::from_iter([(
+                "pid".to_string(),
+                json!("1</script><script>alert(1)</script>"),
+            )]),
+            ..valid_managed_user_id()
+        }];
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+
+        assert!(
+            script.contains(r#""pid":"1\u003c/script>\u003cscript>alert(1)\u003c/script>""#),
+            "should retain the escaped module parameter: {script}"
+        );
+        assert_eq!(
+            script.matches("</script>").count(),
+            1,
+            "should contain only the legitimate outer closing script tag"
         );
     }
 
