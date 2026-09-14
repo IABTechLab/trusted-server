@@ -315,3 +315,59 @@ fn generate_deploy_validation_refusal_preserves_config_and_safe_output() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+fn generate_unavailable_proxy_reports_navigation_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("should reserve a proxy port");
+    let address = listener.local_addr().expect("should read proxy address");
+    drop(listener);
+    let directory = tempfile::tempdir().expect("should create config directory");
+    let path = directory.path().join("app.toml");
+    let source = baseline();
+    fs::write(&path, &source).expect("should write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args([
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://example.com/",
+            "--app-config",
+        ])
+        .arg(&path)
+        .args([
+            "--no-env",
+            "--browser-proxy",
+            &address.to_string(),
+            "--max-pages",
+            "1",
+            "--settle-quiet-ms",
+            "10",
+            "--settle-max-ms",
+            "100",
+            "--dry-run",
+        ])
+        .output()
+        .expect("should run audit with unavailable proxy");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should refuse failed navigation"
+    );
+    assert!(
+        stderr.contains("browser navigation did not produce an HTTP(S) page"),
+        "should identify failed navigation: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cross-origin root redirect"),
+        "should not invent a redirect: {stderr}"
+    );
+    assert!(output.stdout.is_empty(), "should not generate config");
+    assert_eq!(
+        fs::read_to_string(path).expect("should read config"),
+        source,
+        "should preserve config after navigation failure"
+    );
+}

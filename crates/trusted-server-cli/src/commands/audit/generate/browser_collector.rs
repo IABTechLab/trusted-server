@@ -686,6 +686,17 @@ async fn collect_open_page(
         .map_err(|_| "timed out reading final page URL".to_string())?
         .map_err(|error| format!("failed to read final page URL: {error}"))?
         .ok_or("browser page URL was empty after navigation")?;
+    // Browser error pages and about:blank have opaque origins. They are failed
+    // collections, not evidence of a cross-origin HTTP redirect. Keep the URL
+    // out of the diagnostic because it may contain operator credentials.
+    let parsed_final_url = Url::parse(&final_url)
+        .map_err(|_| "browser returned an invalid final page URL".to_string())?;
+    if !matches!(parsed_final_url.scheme(), "http" | "https") {
+        return Err(
+            "browser navigation did not produce an HTTP(S) page; check the browser proxy, network connectivity, and TLS settings"
+                .to_string(),
+        );
+    }
     let page_title = timeout(CDP_OPERATION_TIMEOUT, page.get_title())
         .await
         .map_err(|_| "timed out reading page title".to_string())?

@@ -937,6 +937,12 @@ pub(crate) fn run_update_slots(
                         }
                     }
                     Err(error) => {
+                        // Root collection failure prevents planning. Preserve its
+                        // cause instead of replacing it with a missing-root error.
+                        if url == &target_url {
+                            fold_error = Some(error);
+                            return Ok(collector::ControlFlow::Stop);
+                        }
                         // Path only, like the progress lines: a planned target
                         // still carries the origin and any userinfo.
                         notes.push(format!(
