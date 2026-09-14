@@ -7,6 +7,17 @@ function isSnapshot(value: unknown): value is PermissionsSnapshot {
   return typeof value === 'object' && value !== null;
 }
 
+// Page code reads `set` and `tdls` without checking either exists, so both are
+// arrays whatever arrived. The edge always sends both, and a page assigning a
+// snapshot by hand, or an older edge, may not.
+function normalize(snapshot: PermissionsSnapshot): PermissionsSnapshot {
+  return {
+    ...snapshot,
+    set: Array.isArray(snapshot.set) ? snapshot.set : [],
+    tdls: Array.isArray(snapshot.tdls) ? snapshot.tdls : [],
+  };
+}
+
 /**
  * Install the `permissions` accessor and `whenPermissions()` on the API object.
  *
@@ -20,7 +31,9 @@ export function installPermissions(api: TsjsApi): void {
   // A value already on the API object came from the head-open injection, so it
   // is the current value; otherwise page code must still read a defined value.
   const injected = api.permissions;
-  let current: PermissionsSnapshot = isSnapshot(injected) ? injected : { set: [] };
+  let current: PermissionsSnapshot = isSnapshot(injected)
+    ? normalize(injected)
+    : { set: [], tdls: [] };
   let settled = false;
   let resolvePending: (snapshot: PermissionsSnapshot) => void = () => {};
   const pending = new Promise<PermissionsSnapshot>((resolve) => {
@@ -38,9 +51,9 @@ export function installPermissions(api: TsjsApi): void {
       return current;
     },
     set(value: PermissionsSnapshot) {
-      current = value;
-      log.debug('permissions: received', value);
-      settle(value);
+      current = isSnapshot(value) ? normalize(value) : { set: [], tdls: [] };
+      log.debug('permissions: received', current);
+      settle(current);
     },
     enumerable: true,
     configurable: true,

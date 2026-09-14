@@ -2,17 +2,26 @@
 //!
 //! The Edge Cookie provider advertises the [`Permission`]s its data use
 //! requires. [`assemble_permissions`] resolves which permissions are set for a
-//! request, from its session signals and the country it maps to, and the
-//! context construction gates the provider on that state. The EC permission
-//! decision lives here, in the EC subsystem, and nowhere else, so callers
-//! route every EC permission check through this module rather than
+//! request, from the country it maps to and what the signal providers say,
+//! and the context construction gates the provider on that state. The EC
+//! permission decision lives here, in the EC subsystem, and nowhere else, so
+//! callers route every EC permission check through this module rather than
 //! re-deriving one.
+//!
+//! No scheme is decoded here. Which signals count, and what each says about
+//! a permission, is answered by the [`PermissionSignalProvider`]s the adapter
+//! hands in, every one of which is a crate outside core. This module asks
+//! them in order and applies the country and region rules to what they
+//! settle on.
+
+use std::sync::Arc;
 
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
+use crate::evidence::RequestInfo;
+use crate::permission_signal::{self, PermissionSignalProvider};
 use crate::permissions::{
-    Acquisition, ConsentSignal, OptOutSource, Permission, PermissionMaps, PermissionState,
-    SignalPolicy,
+    Acquisition, ConsentSignal, Permission, PermissionMaps, PermissionState, SignalPolicy,
 };
 use crate::platform::GeoInfo;
 
@@ -73,20 +82,36 @@ pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
 }
 
 /// Assembles the permission state for a request: the place baseline from the
-/// tree in `permissions.yaml`, augmented by the session's signals.
+/// tree in `permissions.yaml`, amended by what the signal providers say.
 ///
-/// Permissions exist without a consent model. With no signal present the result
-/// is simply the baseline for the request's country and region. When the geo
-/// provider resolves no location, or a country/region that has no rule, the
-/// policy's top node applies, and the top node's `group` is required so one is
-/// always available. A failed lookup ([`GeoStatus::Failed`]) instead resolves
-/// every permission to the requires-signal floor, so an outage is handled
-/// protectively rather than as the policy's declared default.
+/// Permissions exist without a consent model. With no provider having an
+/// opinion the result is simply the baseline for the request's country and
+/// region. When the geo provider resolves no location, or a country/region
+/// that has no rule, the policy's top node applies, and the top node's `group`
+/// is required so one is always available. A failed lookup
+/// ([`GeoStatus::Failed`]) instead resolves every permission to the
+/// requires-signal floor, so an outage is handled protectively rather than as
+/// the policy's declared default.
+///
+/// `providers` are the signal providers the adapter selected, in the order
+/// they run. A scheme missing from the list does not run, so a publisher
+/// removes one by leaving it out rather than by configuring it off, and an
+/// empty slice runs none of them, which leaves every permission at its
+/// country and region baseline. The same providers answer whether storage
+/// was explicitly withdrawn, recorded on the state and read through
+/// [`PermissionState::storage_withdrawn`], and declare the terms documents the
+/// request's data is available under, read through
+/// [`PermissionState::tdls`].
 #[must_use]
-pub fn assemble_permissions(consent: &ConsentContext, geo: GeoStatus<'_>) -> PermissionState {
+pub fn assemble_permissions(
+    consent: &ConsentContext,
+    evidence: &dyn RequestInfo,
+    geo: GeoStatus<'_>,
+    providers: &[Arc<dyn PermissionSignalProvider>],
+) -> PermissionState {
     let maps = PermissionMaps::standard();
-    let signal = permission_signal(consent, maps.signals());
-    match geo {
+    let signal = permission_signal(consent, evidence, maps.signals(), providers);
+    let state = match geo {
         GeoStatus::Failed => PermissionMaps::floor_with(signal),
         GeoStatus::Located(_) | GeoStatus::NoLocation => {
             let info = geo.info();
@@ -96,7 +121,18 @@ pub fn assemble_permissions(consent: &ConsentContext, geo: GeoStatus<'_>) -> Per
                 signal,
             )
         }
-    }
+    };
+    let withdrawn = permission_signal::withdrawn(
+        providers,
+        Permission::StoreOnDevice,
+        consent,
+        evidence,
+        maps.signals(),
+        storage_acquisition(geo),
+    );
+    state
+        .with_storage_withdrawn(withdrawn)
+        .with_tdls(permission_signal::tdls(providers, consent, evidence))
 }
 
 /// The acquisition rule for Edge Cookie storage in the request's resolved
@@ -124,154 +160,114 @@ pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
     }
 }
 
-/// Maps a consent context to a [`ConsentSignal`] for each permission, applying
-/// the [`SignalPolicy`] the permission model parsed from `permissions.yaml`.
+/// Maps a request to a [`ConsentSignal`] for each permission, applying the
+/// [`SignalPolicy`] the permission model parsed from `permissions.yaml`.
 ///
-/// This is the only place the EC subsystem reads consent signals. The policy,
-/// not this function, decides which sources are authoritative, which TCF purpose
-/// maps to which Data Use, and what a US-style opt-out revokes. This function
-/// only decodes the request and applies that policy, so no signal-to-permission
-/// policy lives in the code.
+/// This is the only place the EC subsystem consults the signal providers. The
+/// policy, not this function, decides which schemes are authoritative and what
+/// a US-style opt-out revokes, and each provider decides what its own scheme
+/// says. This function only hands each provider the request, in order, so no
+/// signal-to-permission rule lives in core.
 ///
-/// It considers every source the policy names: a TCF record (a standalone TC
-/// string or the EU TCF section of a GPP string), and the US-style opt-out
-/// signals (GPC, a GPP sale opt-out, or a US Privacy opt-out). Precedence is
-/// most-restrictive-first and is fixed in code, not policy:
+/// Each provider amends what the ones before it settled on. The order is the
+/// policy, and [`combine`] documents why.
 ///
-/// 1. A US-style opt-out revokes the Data Uses the policy lists, even when a
-///    TCF record consents. An opt-out is an explicit user signal, so no other
-///    signal may override it.
-/// 2. A consent record that is present but cannot be decoded revokes
-///    everything, so an unreadable expression of preference fails closed
-///    instead of degrading to the no-signal baseline.
-/// 3. When the policy marks TCF authoritative, a present TCF record then
-///    decides the mapped Data Uses: granted where the record consents to the
-///    mapped purpose, revoked where it does not, and neutral where no purpose
-///    is mapped. The `authoritative` flag governs only whether TCF grants and
-///    revokes apply, never whether an opt-out may be overridden.
+/// Whether an amendment changes anything is then decided by the country/region
+/// map, which drops a `granted` baseline on a `Revoke` and has nothing to drop
+/// where the permission is `requires_signal` or `denied`.
 ///
-/// Whether a `Revoke` changes anything is decided by the country/region map,
-/// which drops a `granted` baseline and has nothing to drop where the
-/// permission is `requires_signal` or `denied`.
+/// [`combine`]: crate::permission_signal::combine
 fn permission_signal<'a>(
     consent: &'a ConsentContext,
+    evidence: &'a dyn RequestInfo,
     signals: &'a SignalPolicy,
-) -> impl Fn(Permission) -> ConsentSignal + 'a {
-    move |permission| {
-        if opt_out_present(consent, signals.opt_out_sources())
-            && signals.opt_out_revokes(permission)
-        {
-            return ConsentSignal::Revoke;
-        }
+    providers: &'a [Arc<dyn PermissionSignalProvider>],
+) -> impl Fn(Permission, Acquisition) -> ConsentSignal + 'a {
+    move |permission, baseline| {
+        // A record that arrived and could not be read fails closed, ahead of
+        // every configured provider and regardless of which are configured.
+        //
+        // This is not a signaling scheme and is deliberately not in the
+        // configured list. A publisher chooses which signals to act on, but
+        // not what happens when one of those signals arrives unreadable. An
+        // unreadable record is a preference someone expressed that cannot be
+        // read, which is different from no record at all, so it must not
+        // degrade to the no-signal baseline.
+        //
+        // It overrides rather than taking a place in the order because the
+        // ordered rule would otherwise let a readable record from one scheme
+        // overwrite the refusal caused by an unreadable one from another.
         if consent.has_malformed_record() {
             return ConsentSignal::Revoke;
         }
-        if signals.tcf_authoritative()
-            && let Some(tcf) = crate::consent::effective_tcf(consent)
-        {
-            return match signals.tcf_purpose(permission) {
-                Some(purpose) => {
-                    if tcf.has_purpose_consent(usize::from(purpose)) {
-                        ConsentSignal::Grant
-                    } else {
-                        ConsentSignal::Revoke
-                    }
-                }
-                None => ConsentSignal::Neutral,
-            };
-        }
-        ConsentSignal::Neutral
+        permission_signal::combine(providers, permission, consent, evidence, signals, baseline)
     }
-}
-
-/// Whether the request carries any of the `sources` a US-style opt-out is
-/// declared to use. Decoding only, so the policy (not this function) decides
-/// which sources count and what the opt-out revokes.
-fn opt_out_present(consent: &ConsentContext, sources: &[OptOutSource]) -> bool {
-    sources.iter().any(|source| match source {
-        OptOutSource::Gpc => consent.gpc,
-        OptOutSource::GppSaleOptOut => {
-            consent.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true)
-        }
-        OptOutSource::UsPrivacyOptOut => consent
-            .us_privacy
-            .as_ref()
-            .is_some_and(|usp| usp.opt_out_sale == crate::consent::PrivacyFlag::Yes),
-    })
-}
-
-/// Reports whether the request carries an explicit signal withdrawing Edge
-/// Cookie storage, rather than merely lacking the permission.
-///
-/// This separates an affirmative withdrawal (which expires the browser cookie
-/// and writes the authoritative identity-graph tombstone) from suppression,
-/// where the permission is simply not set for this request (which strips EC
-/// response headers but must not destroy an already-issued identifier, or a
-/// returning user would be permanently withdrawn before they ever get to
-/// consent).
-///
-/// Only a TCF record refusing storage (Purpose 1) withdraws, and only where
-/// the jurisdiction's storage baseline is not `granted`: under a
-/// `requires_signal` baseline the refusal is the visitor declining the very
-/// signal storage depends on, while under a `granted` baseline storage never
-/// depended on the record, so the refusal suppresses use without destroying
-/// the identifier. US-style opt-outs (GPC, a GPP sale opt-out, or a US
-/// Privacy opt-out) suppress the permissions the policy revokes but are
-/// never destructive, and no signal at all is not a withdrawal.
-#[must_use]
-pub fn ec_storage_withdrawn(consent: &ConsentContext, storage_baseline: Acquisition) -> bool {
-    if let Some(tcf) = crate::consent::effective_tcf(consent) {
-        return !tcf.has_storage_consent() && !matches!(storage_baseline, Acquisition::Granted);
-    }
-    false
 }
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderMap;
+
     use super::*;
-    use crate::consent::TcfConsent;
+    use crate::evidence::OwnedRequestInfo;
+    use crate::permission_signal::SignalInput;
     use crate::test_support::tests::create_test_settings;
 
-    /// Builds a minimal decoded TCF record consenting to the given 1-indexed
-    /// purposes, with everything else refused.
-    fn tcf_with_purposes(consented: &[usize]) -> TcfConsent {
-        let mut purpose_consents = vec![false; 24];
-        for &purpose in consented {
-            purpose_consents[purpose - 1] = true;
+    /// A provider that grants every permission, standing in for a scheme that
+    /// answered a prompt, so the assembly rules can be exercised without any
+    /// real scheme in core.
+    struct Granting;
+
+    impl PermissionSignalProvider for Granting {
+        fn id(&self) -> &'static str {
+            "granting"
         }
-        TcfConsent {
-            version: 2,
-            cmp_id: 0,
-            cmp_version: 0,
-            consent_screen: 0,
-            consent_language: "EN".to_owned(),
-            vendor_list_version: 0,
-            tcf_policy_version: 2,
-            created_ds: 0,
-            last_updated_ds: 0,
-            purpose_consents,
-            purpose_legitimate_interests: vec![false; 24],
-            vendor_consents: Vec::new(),
-            vendor_legitimate_interests: Vec::new(),
-            special_feature_opt_ins: vec![false; 12],
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Grant
         }
     }
 
-    #[test]
-    fn hmac_provider_is_blocked_without_a_storage_signal() {
-        let settings = create_test_settings();
-        // The test settings select the HMAC provider, which requires
-        // necessary.operations.storage. The policy's top node resolves storage
-        // as requires-signal, so with no signal the permission is not set and
-        // the provider's requirement is not met.
-        let provider = crate::ec::provider::build_provider(&settings.ec, None, None)
-            .expect("should build the configured provider")
-            .expect("should select the hmac provider");
-        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::NoLocation);
-        assert!(
-            !state.all_set(provider.required_permissions()),
-            "the requires-signal default should not satisfy the HMAC provider without a signal"
-        );
+    /// A provider that declares a terms document, standing in for a terms
+    /// scheme such as Model Terms for Marketing, which is the next provider
+    /// and is not one of the four that ship here.
+    struct DeclaringTerms;
+
+    impl PermissionSignalProvider for DeclaringTerms {
+        fn id(&self) -> &'static str {
+            "declaring-terms"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn tdls(
+            &self,
+            _consent: &ConsentContext,
+            _evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Vec<crate::tdl::Tdl> {
+            vec![
+                crate::tdl::Tdl::new("https://terms.example.com/marketing/2.txt")
+                    .expect("should accept the test locator"),
+            ]
+        }
+    }
+
+    fn no_evidence() -> OwnedRequestInfo {
+        OwnedRequestInfo::new(String::new(), HeaderMap::new())
+    }
+
+    fn granting() -> Vec<Arc<dyn PermissionSignalProvider>> {
+        vec![Arc::new(Granting)]
+    }
+
+    fn assembled(
+        consent: &ConsentContext,
+        geo: GeoStatus<'_>,
+        providers: &[Arc<dyn PermissionSignalProvider>],
+    ) -> PermissionState {
+        assemble_permissions(consent, &no_evidence(), geo, providers)
     }
 
     fn us_ca_geo() -> GeoInfo {
@@ -288,11 +284,53 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_declaring_terms_reaches_the_assembled_state() {
+        let consent = ConsentContext::default();
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(DeclaringTerms)];
+        let state =
+            assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &providers);
+        let addresses: Vec<&str> = state.tdls().iter().map(crate::tdl::Tdl::as_str).collect();
+        assert_eq!(
+            addresses,
+            vec!["https://terms.example.com/marketing/2.txt"],
+            "should carry the terms the provider declared through to whatever reads the state"
+        );
+    }
+
+    #[test]
+    fn a_state_assembled_from_the_shipped_kind_of_provider_declares_no_terms() {
+        let consent = ConsentContext::default();
+        let state =
+            assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &granting());
+        assert!(
+            state.tdls().is_empty(),
+            "should declare nothing, because a scheme carrying no terms says nothing about them"
+        );
+    }
+
+    #[test]
+    fn hmac_provider_is_blocked_without_a_storage_signal() {
+        let settings = create_test_settings();
+        // The test settings select the HMAC provider, which requires
+        // necessary.operations.storage. The policy's top node resolves storage
+        // as requires-signal, so with no provider granting it the permission is
+        // not set and the provider's requirement is not met.
+        let provider = crate::ec::provider::build_provider(&settings.ec, None, None)
+            .expect("should build the configured provider")
+            .expect("should select the hmac provider");
+        let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);
+        assert!(
+            !state.all_set(provider.required_permissions()),
+            "the requires-signal default should not satisfy the HMAC provider without a signal"
+        );
+    }
+
+    #[test]
     fn no_signal_uses_the_us_opt_out_baseline() {
         // US/CA maps to the us-opt-out group, where every purpose is granted
         // without a signal, so EC identity and bidstream EIDs are both permitted.
         let geo = us_ca_geo();
-        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::Located(&geo));
+        let state = assembled(&ConsentContext::default(), GeoStatus::Located(&geo), &[]);
         assert!(
             state.is_set(Permission::StoreOnDevice)
                 && state.is_set(Permission::SelectPersonalisedAds),
@@ -301,227 +339,73 @@ mod tests {
     }
 
     #[test]
-    fn gpc_revokes_the_granted_baseline_in_a_us_opt_out_state() {
-        // A US-style opt-out drops a granted baseline with no jurisdiction match:
-        // the map granted these purposes, and GPC revokes them.
-        let consent = ConsentContext {
-            gpc: true,
-            ..ConsentContext::default()
-        };
-        let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
+    fn a_grant_sets_a_requires_signal_permission() {
+        // The top node requires a signal for storage, and a provider granting
+        // it is what a signal arriving looks like from here.
+        let state = assembled(
+            &ConsentContext::default(),
+            GeoStatus::NoLocation,
+            &granting(),
+        );
         assert!(
-            !state.is_set(Permission::StoreOnDevice)
-                && !state.is_set(Permission::SelectPersonalisedAds),
-            "GPC should revoke the granted necessary.operations.storage and advertising_marketing.first_party.targeted baseline"
+            state.is_set(Permission::StoreOnDevice),
+            "a provider granting storage should set it under a requires-signal baseline"
+        );
+        assert!(
+            !state.storage_withdrawn(),
+            "and a grant is the opposite of a withdrawal"
         );
     }
 
     // ------------------------------------------------------------------
-    // Opt-out precedence pinning tests. These reinstate the behavior the
-    // consent module enforced before the permission model: an explicit
-    // opt-out signal suppresses storage and sharing even when a TCF record
-    // consents. The permission model must never let a CMP-written record
-    // override the visitor's own opt-out.
+    // An unreadable record. Not a scheme a publisher lists, so it applies
+    // whatever they configured, and it is not subject to the ordering.
     // ------------------------------------------------------------------
 
     #[test]
-    fn gpc_suppresses_storage_even_with_a_consenting_tcf_record() {
+    fn an_unreadable_record_revokes_even_with_no_providers_configured() {
         let consent = ConsentContext {
-            tcf: Some(tcf_with_purposes(&[1, 4])),
-            gpc: true,
+            raw_tc_string: Some("this is not a TC string".to_owned()),
             ..ConsentContext::default()
         };
-        let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
-            !state.is_set(Permission::StoreOnDevice)
-                && !state.is_set(Permission::SelectPersonalisedAds),
-            "GPC should suppress storage and sharing even when the TCF record consents"
+            consent.has_malformed_record(),
+            "the fixture has to actually be unreadable for this to test anything"
         );
-    }
-
-    #[test]
-    fn us_privacy_opt_out_suppresses_storage_even_with_a_consenting_tcf_record() {
-        let consent = ConsentContext {
-            tcf: Some(tcf_with_purposes(&[1, 4])),
-            us_privacy: Some(crate::consent::types::UsPrivacy {
-                version: 1,
-                notice_given: crate::consent::PrivacyFlag::Yes,
-                opt_out_sale: crate::consent::PrivacyFlag::Yes,
-                lspa_covered: crate::consent::PrivacyFlag::NotApplicable,
-            }),
-            ..ConsentContext::default()
-        };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
-        assert!(
-            !state.is_set(Permission::StoreOnDevice)
-                && !state.is_set(Permission::SelectPersonalisedAds),
-            "a US Privacy opt-out should suppress storage and sharing even when the TCF record consents"
-        );
-    }
-
-    #[test]
-    fn gpp_sale_opt_out_suppresses_storage_even_with_a_consenting_tcf_record() {
-        let consent = ConsentContext {
-            tcf: Some(tcf_with_purposes(&[1, 4])),
-            gpp: Some(crate::consent::types::GppConsent {
-                version: 1,
-                section_ids: vec![7],
-                eu_tcf: None,
-                us_sale_opt_out: Some(true),
-            }),
-            ..ConsentContext::default()
-        };
-        let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
-        assert!(
-            !state.is_set(Permission::StoreOnDevice)
-                && !state.is_set(Permission::SelectPersonalisedAds),
-            "a GPP sale opt-out should suppress storage and sharing even when the TCF record consents"
-        );
-    }
-
-    #[test]
-    fn gpc_suppresses_storage_even_when_us_privacy_reports_no_opt_out() {
-        let consent = ConsentContext {
-            gpc: true,
-            us_privacy: Some(crate::consent::types::UsPrivacy {
-                version: 1,
-                notice_given: crate::consent::PrivacyFlag::Yes,
-                opt_out_sale: crate::consent::PrivacyFlag::No,
-                lspa_covered: crate::consent::PrivacyFlag::NotApplicable,
-            }),
-            ..ConsentContext::default()
-        };
-        let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
+        let state = assembled(&consent, GeoStatus::Located(&geo), &[]);
         assert!(
             !state.is_set(Permission::StoreOnDevice),
-            "any one opt-out source should suppress, whatever the others say"
+            "a preference someone expressed that cannot be read must not degrade to the \
+             no-signal baseline, and a publisher cannot configure that away"
         );
     }
 
-    // ------------------------------------------------------------------
-    // Withdrawal scoping: only a TCF storage refusal withdraws, and only
-    // where the baseline did not grant storage outright. Opt-outs suppress
-    // use but never destroy an already-issued identifier.
-    // ------------------------------------------------------------------
-
     #[test]
-    fn tcf_storage_refusal_withdraws_under_a_requires_signal_baseline() {
+    fn a_readable_record_does_not_overwrite_an_unreadable_one() {
+        // The regression the override exists to prevent: under the ordered
+        // rule alone, a provider that grants would be asked after the
+        // unreadable GPP string and would overwrite the refusal it caused.
         let consent = ConsentContext {
-            tcf: Some(tcf_with_purposes(&[4])),
+            raw_gpp_string: Some("this is not a GPP string".to_owned()),
             ..ConsentContext::default()
         };
         assert!(
-            ec_storage_withdrawn(&consent, Acquisition::RequiresSignal),
-            "refusing the signal storage depends on should withdraw"
+            consent.has_malformed_record(),
+            "the fixture has to actually be unreadable for this to test anything"
         );
-    }
-
-    #[test]
-    fn tcf_storage_refusal_does_not_withdraw_under_a_granted_baseline() {
-        let consent = ConsentContext {
-            tcf: Some(tcf_with_purposes(&[4])),
-            ..ConsentContext::default()
-        };
-        assert!(
-            !ec_storage_withdrawn(&consent, Acquisition::Granted),
-            "storage never depended on the record here, so refusal suppresses without destroying"
-        );
-    }
-
-    #[test]
-    fn tcf_storage_consent_is_not_a_withdrawal() {
-        let consent = ConsentContext {
-            tcf: Some(tcf_with_purposes(&[1])),
-            ..ConsentContext::default()
-        };
-        assert!(
-            !ec_storage_withdrawn(&consent, Acquisition::RequiresSignal),
-            "a consenting record is not a withdrawal"
-        );
-    }
-
-    #[test]
-    fn gpc_alone_never_withdraws() {
-        let consent = ConsentContext {
-            gpc: true,
-            ..ConsentContext::default()
-        };
-        assert!(
-            !ec_storage_withdrawn(&consent, Acquisition::Granted)
-                && !ec_storage_withdrawn(&consent, Acquisition::RequiresSignal),
-            "GPC suppresses use for the request but never destroys the identifier"
-        );
-    }
-
-    #[test]
-    fn us_style_opt_outs_never_withdraw() {
-        let consent = ConsentContext {
-            us_privacy: Some(crate::consent::types::UsPrivacy {
-                version: 1,
-                notice_given: crate::consent::PrivacyFlag::Yes,
-                opt_out_sale: crate::consent::PrivacyFlag::Yes,
-                lspa_covered: crate::consent::PrivacyFlag::NotApplicable,
-            }),
-            gpp: Some(crate::consent::types::GppConsent {
-                version: 1,
-                section_ids: vec![7],
-                eu_tcf: None,
-                us_sale_opt_out: Some(true),
-            }),
-            ..ConsentContext::default()
-        };
-        assert!(
-            !ec_storage_withdrawn(&consent, Acquisition::RequiresSignal),
-            "sale opt-outs suppress use but never destroy the identifier"
-        );
-    }
-
-    #[test]
-    fn no_signal_is_not_a_withdrawal() {
-        assert!(
-            !ec_storage_withdrawn(&ConsentContext::default(), Acquisition::RequiresSignal),
-            "absence of a signal must never destroy an identifier"
-        );
-    }
-
-    #[test]
-    fn a_malformed_record_is_not_a_withdrawal() {
-        let consent = ConsentContext {
-            raw_tc_string: Some("not-a-tc-string".to_owned()),
-            ..ConsentContext::default()
-        };
-        assert!(
-            !ec_storage_withdrawn(&consent, Acquisition::RequiresSignal),
-            "an unreadable record fails closed (suppression), not destructively"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Malformed-but-present records block baseline grants (fail closed)
-    // instead of degrading to the no-signal baseline.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn a_malformed_tcf_record_blocks_baseline_grants() {
-        let consent = ConsentContext {
-            raw_tc_string: Some("not-a-tc-string".to_owned()),
-            ..ConsentContext::default()
-        };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
+        let state = assembled(&consent, GeoStatus::Located(&geo), &granting());
         assert!(
             !state.is_set(Permission::StoreOnDevice),
-            "an unreadable record should block the granted baseline, not vanish"
+            "one scheme arriving unreadable is not cured by another scheme granting"
         );
     }
 
     #[test]
     fn a_malformed_gpp_or_us_privacy_record_is_detected() {
+        // Each undecodable record form has to be detected, or the override
+        // above would not fire for it.
         let gpp = ConsentContext {
             raw_gpp_string: Some("not-a-gpp-string".to_owned()),
             ..ConsentContext::default()
@@ -534,21 +418,37 @@ mod tests {
             gpp.has_malformed_record() && usp.has_malformed_record(),
             "each undecodable record form should be detected"
         );
+        let geo = us_ca_geo();
+        assert!(
+            !assembled(&usp, GeoStatus::Located(&geo), &granting())
+                .is_set(Permission::StoreOnDevice),
+            "an unreadable US Privacy string blocks the granted baseline like any other record"
+        );
     }
 
     #[test]
-    fn an_expired_tcf_record_is_not_treated_as_malformed() {
+    fn an_unreadable_record_is_not_a_withdrawal() {
         let consent = ConsentContext {
-            raw_tc_string: Some("CPc-old-string".to_owned()),
-            expired: true,
+            raw_tc_string: Some("not-a-tc-string".to_owned()),
             ..ConsentContext::default()
         };
+        let state = assembled(&consent, GeoStatus::NoLocation, &granting());
+        assert!(
+            !state.storage_withdrawn(),
+            "an unreadable record fails closed by suppression, never destructively"
+        );
+    }
+
+    #[test]
+    fn running_no_providers_leaves_the_place_baseline() {
         let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
+        let state = assembled(&ConsentContext::default(), GeoStatus::Located(&geo), &[]);
         assert!(
             state.is_set(Permission::StoreOnDevice),
-            "expiry is its own explicit state, deliberately distinct from malformed"
+            "an empty list is a publisher acting on no signal at all, so only the country \
+             and region rules apply"
         );
+        assert!(!state.storage_withdrawn(), "and nothing can have withdrawn");
     }
 
     // ------------------------------------------------------------------
@@ -564,11 +464,11 @@ mod tests {
         // other, so nothing is set without a signal.
         let geo = us_ca_geo();
         assert!(
-            assemble_permissions(&ConsentContext::default(), GeoStatus::Located(&geo))
+            assembled(&ConsentContext::default(), GeoStatus::Located(&geo), &[])
                 .is_set(Permission::StoreOnDevice),
             "the located baseline must grant storage, or this test proves nothing"
         );
-        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::Failed);
+        let state = assembled(&ConsentContext::default(), GeoStatus::Failed, &[]);
         assert!(
             !state.is_set(Permission::StoreOnDevice),
             "a lookup failure must not fall back to any node of the policy tree"
@@ -585,7 +485,7 @@ mod tests {
         // The shipped policy's top node is the gdpr-eu group, which requires a
         // signal for storage, so an unplaced visitor gets no identifier until
         // one arrives.
-        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::NoLocation);
+        let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);
         assert!(
             !state.is_set(Permission::StoreOnDevice),
             "the top node requires a signal for storage"
@@ -608,38 +508,6 @@ mod tests {
             default_jurisdiction(GeoStatus::Failed),
             Jurisdiction::Unknown,
             "a failed lookup must not adopt the policy's declared jurisdiction"
-        );
-    }
-
-    #[test]
-    fn tcf_resolves_every_mapped_purpose_not_just_storage_and_ads() {
-        // A TCF record now grants or revokes every one of the eleven mapped
-        // purposes, not only Purpose 1 and Purpose 4. Consent to all purposes
-        // except Purpose 7 (measure ad performance), in a US opt-out state where
-        // the baseline granted them all, so a revoke is observable as a drop.
-        let consented: Vec<usize> = (1..=11).filter(|&p| p != 7).collect();
-        let consent = ConsentContext {
-            tcf: Some(tcf_with_purposes(&consented)),
-            ..ConsentContext::default()
-        };
-        let geo = us_ca_geo();
-        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
-
-        // Purpose 2 is now resolved (it was neutral before), so consent sets it.
-        assert!(
-            state.is_set(Permission::SelectBasicAds),
-            "Purpose 2 consent should set advertising_marketing.first_party.contextual"
-        );
-        // Purpose 7 was refused, so the granted baseline is revoked.
-        assert!(
-            !state.is_set(Permission::MeasureAdPerformance),
-            "Purpose 7 refusal should revoke analytics.ad_reporting.measure_ad_performance"
-        );
-        // The originally wired purposes still behave.
-        assert!(
-            state.is_set(Permission::StoreOnDevice)
-                && state.is_set(Permission::SelectPersonalisedAds),
-            "Purposes 1 and 4 remain resolved from the TCF record"
         );
     }
 }

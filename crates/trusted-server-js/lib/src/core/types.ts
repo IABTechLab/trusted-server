@@ -370,9 +370,17 @@ export interface GptSlotHandoff {
  *
  * The names in `set` are IAB Privacy Taxonomy Data Use keys, as resolved by the
  * server for this request.
+ *
+ * `tdls` are the terms documents the data for this request is available under,
+ * as declared by the permission signal providers the deployment runs, in the
+ * order they were asked. Each entry addresses a published document a person can
+ * read. An empty list says no terms were declared, which is not the same as
+ * terms that permit anything, so page code that needs a basis and finds none
+ * has none.
  */
 export interface PermissionsSnapshot {
   set: string[];
+  tdls: string[];
 }
 
 export interface TsjsApi {

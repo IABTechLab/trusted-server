@@ -221,6 +221,45 @@ pull_sync_concurrency = 3
 # mode = "restrictive"            # "restrictive" | "newest" | "permissive"
 # freshness_threshold_days = 30
 
+# Which permission signal providers run, and in what order.
+#
+# Signals compose rather than select. A request can carry a TCF string and a
+# Global Privacy Control header at once, and both have something to say, so
+# this is a list, whereas [ec], [geo] and [device] each name one provider. The
+# order is the policy, because the last provider with an opinion decides.
+#
+# Listed below is every provider the shipped adapters link, which is also
+# exactly what runs when this section is absent. Each is a crate under
+# crates/permission-signal, outside the core. Remove the ones this publisher
+# does not want to act on. A provider that is not on the list does not run,
+# and there is no separate switch to turn one off. An unknown or repeated name
+# is refused at startup rather than quietly ignored.
+#
+# [permission_signal]
+# sources = [
+#   "gpc",              # the Sec-GPC request header, Global Privacy Control
+#   "gpp-sale-opt-out", # a GPP US sale opt-out
+#   "us-privacy",       # a US Privacy string sale opt-out
+#   "tcf",              # TCF v2, with its purpose mapping in the crate
+# ]
+#
+# The three opt-outs are separate entries so that a publisher who does not act
+# on Global Privacy Control can remove "gpc" and keep the GPP and US Privacy
+# opt-outs working.
+#
+# A consent record that arrives and cannot be read revokes, whichever providers
+# are configured. That is error handling rather than a provider to choose, so
+# it is not in this list and cannot be removed.
+#
+# The default order asks Global Privacy Control first, being a browser setting
+# with no interface of its own, and the three that carry a choice someone made
+# through an interface after, so an answer given at a prompt amends the header
+# the visitor arrived with. Reorder the list to change that.
+#
+# The layering, what a provider may consult, and how to add a scheme are
+# documented in crates/trusted-server-core/src/permission_signal/README.md
+# and in the Permission Signals guide.
+
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
 # Verify TLS certs when proxying to HTTPS origins (default true; false only for

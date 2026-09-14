@@ -24,6 +24,7 @@ crates/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device provider)
   edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC provider is in core)
   geo/                                  # vendor geo provider crates (host geo is injected by the adapter)
+  permission-signal/                    # permission signal provider crates, one per scheme (gpc, gpp, tcf, us-privacy); core links none
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -357,6 +358,7 @@ deployment selects an implementation and the core stays neutral:
 | Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
 | Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
 | Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
+| Permission signals    | `PermissionSignalProvider` (`permission_signal/mod.rs`) | `[permission_signal] sources` (an ordered list) | None, and with no provider every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
 
 Principles for adding or changing a provider:
 
@@ -415,7 +417,7 @@ IntegrationRegistration::builder(ID)
 | --------------------- | ---------------------------------------------------------- |
 | `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
 | `fastly.toml`                   | Fastly service configuration and build settings                 |
-| `trusted-server.example.toml`   | Source-controlled app-config template (includes the `[ec]` / `[geo]` / `[device]` provider selectors) |
+| `trusted-server.example.toml`   | Source-controlled app-config template (includes the `[ec]` / `[geo]` / `[device]` provider selectors and the `[permission_signal] sources` list) |
 | `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
 | `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
 | `.env.dev`                      | Local development environment variables                         |
