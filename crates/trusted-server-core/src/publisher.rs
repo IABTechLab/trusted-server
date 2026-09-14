@@ -4141,6 +4141,11 @@ pub async fn handle_publisher_request(
     // ID, keeping the withdrawal CAS off the post-origin latency path.
     let active_ec_id_owned = ec_context.ec_value().map(str::to_owned);
     let active_ec_id = active_ec_id_owned.as_deref();
+    // The identity-graph key for the active EC ID, the owning provider's
+    // canonical form of it. The snapshot preload reads and compares the row
+    // under this key, the key the row was written under, rather than under the
+    // identifier as issued.
+    let active_kv_key = ec_context.ec_kv_key();
     let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
     let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
@@ -4424,16 +4429,17 @@ pub async fn handle_publisher_request(
                 })?,
         );
     }
-    if should_preload_ec && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
-        let refreshed = graph.load_snapshot(active_ec_id);
+    if should_preload_ec && let (Some(graph), Some(active_kv_key)) = (kv, active_kv_key.as_deref())
+    {
+        let refreshed = graph.load_snapshot(active_kv_key);
         // Never downgrade an in-request Add-confirmed Present snapshot: a
         // freshly created row can read back Missing/Failed on an
         // eventually-consistent store, and rotating or suppressing that
         // just-generated identity would fragment it. Adopt the refresh only
         // when it keeps or upgrades to a Present row (the intended
         // generation-refresh) — otherwise retain the confirmed entry.
-        let keep_present = ec_context.kv_snapshot().entry_for(active_ec_id).is_some()
-            && refreshed.entry_for(active_ec_id).is_none();
+        let keep_present = ec_context.kv_snapshot().entry_for(active_kv_key).is_some()
+            && refreshed.entry_for(active_kv_key).is_none();
         if !keep_present {
             ec_context.set_kv_snapshot(refreshed);
         }
@@ -6611,9 +6617,16 @@ pub async fn handle_page_bids(
             // actually running (enabled, consent-granted, slots matched, not a
             // bot/prefetch) and a partner registry exists to consume server-side
             // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
-            // never reach here, so they incur no billable KV read.
+            // never reach here, so they incur no billable KV read. The row is
+            // read under the owning provider's canonical form of the
+            // identifier, the key it is stored under, rather than under the
+            // identifier as issued.
             let page_bids_kv_snapshot = match (kv, ec_id.as_deref(), auction.registry) {
-                (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+                (Some(graph), Some(_), Some(_)) => ec_context
+                    .ec_kv_key()
+                    .map_or(crate::ec::EcKvSnapshot::NotRead, |kv_key| {
+                        graph.load_snapshot(&kv_key)
+                    }),
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
             // Hand the loaded row to the request context so response
@@ -21330,6 +21343,11 @@ mod tests {
     /// tests drive the real handlers with a divergent edge host and assert on
     /// the auction request the orchestrator dispatched and on the telemetry rows
     /// the handler emitted.
+    ///
+    /// The same capturing setup also covers how both paths key the identity
+    /// graph. A provider whose canonical form differs from the cookie value has
+    /// its row read under the canonical key, so the partner ID stored there
+    /// reaches the dispatched auction request.
     mod navigation_publisher_domain_tests {
         use super::*;
         use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
@@ -21337,6 +21355,7 @@ mod tests {
         use crate::auction::types::AuctionRequest;
         use crate::auction::{AuctionContext, AuctionOrchestrator};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+        use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
@@ -21738,6 +21757,256 @@ mod tests {
             .expect("should return ok response");
 
             assert_only_renderable_slot_was_auctioned(&captured);
+        }
+
+        /// The bidstream partner whose stored ID the canonical row carries.
+        const CANONICAL_ROW_PARTNER: &str = "ssp.example.com";
+
+        /// The partner ID the canonical row stores for [`CANONICAL_ROW_PARTNER`].
+        const CANONICAL_ROW_UID: &str = "partner-uid-123";
+
+        /// An identity graph holding one live row under [`CANONICAL_KV_KEY`],
+        /// and a registry that forwards that row's partner ID as an EID.
+        fn canonical_row_graph_and_registry() -> (KvIdentityGraph, PartnerRegistry) {
+            let graph = KvIdentityGraph::in_memory("navigation-canonical-store");
+            graph
+                .create(
+                    CANONICAL_KV_KEY,
+                    &crate::ec::kv_types::KvEntry::minimal(
+                        CANONICAL_ROW_PARTNER,
+                        CANONICAL_ROW_UID,
+                        1_741_824_000,
+                    ),
+                )
+                .expect("should seed the row under the canonical key");
+            let registry = PartnerRegistry::from_config(&[crate::settings::EcPartner {
+                name: "Canonical row partner".to_owned(),
+                source_domain: CANONICAL_ROW_PARTNER.to_owned(),
+                openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+                bidstream_enabled: true,
+                api_token: Some(crate::redacted::Redacted::new(
+                    "canonical-row-partner-token-32-bytes".to_owned(),
+                )),
+                batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+                pull_sync_enabled: false,
+                pull_sync_url: None,
+                pull_sync_allowed_domains: vec![],
+                pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+                pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+                ts_pull_token: None,
+            }])
+            .expect("should build a registry with one bidstream partner");
+            (graph, registry)
+        }
+
+        /// A returning visitor carrying the identifier [`CanonicalizingProvider`]
+        /// creates, with consent that permits the server-side auction.
+        fn canonicalizing_returning_visitor() -> EcContext {
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            EcContext::new_for_test(Some(CANONICAL_COOKIE_VALUE.to_owned()), consent)
+                .with_provider_for_test(Arc::new(CanonicalizingProvider))
+        }
+
+        /// Asserts the dispatched auction request carried the partner ID the
+        /// canonical row stores, and the request snapshot is bound to the
+        /// canonical key.
+        fn assert_auction_used_the_canonical_row(
+            captured: &Arc<Mutex<Option<AuctionRequest>>>,
+            ec_context: &EcContext,
+        ) {
+            let request = captured
+                .lock()
+                .expect("should lock captured request")
+                .clone()
+                .expect("should dispatch an auction request");
+            let eids = request
+                .user
+                .eids
+                .expect("the auction should carry server-side EIDs from the identity graph");
+            assert!(
+                eids.iter().any(|eid| eid.source == CANONICAL_ROW_PARTNER
+                    && eid.uids.iter().any(|uid| uid.id == CANONICAL_ROW_UID)),
+                "the auction should carry the partner ID stored under the canonical key, got {eids:?}"
+            );
+            assert!(
+                ec_context
+                    .kv_snapshot()
+                    .entry_for(CANONICAL_KV_KEY)
+                    .is_some(),
+                "the request snapshot should be bound to the canonical key"
+            );
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_reads_the_identity_row_under_the_canonical_key() {
+            // The identity graph stores a row under the owning provider's
+            // canonical form of the identifier. Preloaded and resolved under
+            // the identifier as issued, a provider whose canonical form differs
+            // from the cookie value found no row, so the auction carried no
+            // server-side EIDs.
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let (graph, registry) = canonical_row_graph_and_registry();
+            let mut ec_context = canonicalizing_returning_visitor();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let _ = handle_publisher_request(
+                &settings,
+                &services,
+                Some(&graph),
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: Some(&registry),
+                },
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            assert_auction_used_the_canonical_row(&captured, &ec_context);
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_keeps_a_new_identifiers_cookie() {
+            // Generation binds the request snapshot to the canonical key. The
+            // navigation preload that follows read under the identifier as
+            // issued, found nothing there, and replaced that snapshot with a
+            // miss, so EC finalization skipped the cookie for the identifier
+            // this request had just created.
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let graph = KvIdentityGraph::in_memory("navigation-new-identifier-store");
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent)
+                .with_provider_for_test(Arc::new(CanonicalizingProvider));
+            ec_context
+                .generate_if_needed(&settings, Some(&graph))
+                .expect("should create the identifier through the provider");
+            assert_eq!(
+                ec_context.ec_value(),
+                Some(CANONICAL_COOKIE_VALUE),
+                "test precondition: the provider should create its identifier"
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let _ = handle_publisher_request(
+                &settings,
+                &services,
+                Some(&graph),
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            let mut response = Response::new(EdgeBody::empty());
+            crate::ec::finalize::ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &PartnerRegistry::empty(),
+                None,
+                None,
+                &mut response,
+            );
+
+            let cookies: Vec<&str> = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect();
+            assert!(
+                cookies
+                    .iter()
+                    .any(|cookie| cookie.starts_with("ts-ec=") && !cookie.contains("Max-Age=0")),
+                "the identifier this request created should reach the browser, got {cookies:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_reads_the_identity_row_under_the_canonical_key() {
+            // The same keying for the SPA re-auction endpoint, which loads the
+            // row itself only once a live auction will run.
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let (graph, registry) = canonical_row_graph_and_registry();
+            let mut ec_context = canonicalizing_returning_visitor();
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                Some(&graph),
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: Some(&registry),
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            assert_auction_used_the_canonical_row(&captured, &ec_context);
         }
     }
 }

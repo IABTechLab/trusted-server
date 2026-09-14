@@ -638,38 +638,24 @@ impl EcContext {
         provider::AcceptedProviders::active(self.selected_provider.as_deref())
     }
 
-    /// Returns whether `value` is a well-formed identifier for the selected
-    /// provider.
-    ///
-    /// Lets core validate a cookie or active identifier (for example before
-    /// withdrawing it) through the provider that issued it, rather than assuming
-    /// the built-in shape. The global cookie bounds are checked first, then the
-    /// provider-specific part is dispatched by the identifier's code. Falls back
-    /// to the built-in shape when no provider is configured.
-    #[must_use]
-    pub(crate) fn accepts_id(&self, value: &str) -> bool {
-        self.accepted_providers().accepts(value)
-    }
-
     /// The identity-graph key for `value` under the providers this deployment
     /// reads.
     ///
-    /// The canonical route from an identifier to a row key. The organic
-    /// generate, identify and finalize paths turn an identifier into a row key
-    /// through this (or through [`ec_kv_key`](Self::ec_kv_key), which wraps it),
-    /// so a provider whose canonical form differs from the cookie value still
-    /// finds the row it created. The owning provider is picked by the
-    /// identifier's `{code}~` prefix and supplies the canonical form of its own
-    /// value part, matching what
-    /// [`generate_if_needed`](Self::generate_if_needed) wrote at creation.
+    /// The canonical route from a request's identifier to a row key, so a
+    /// provider whose canonical form differs from the cookie value still finds
+    /// the row it created. The owning provider is picked by the identifier's
+    /// `{code}~` prefix and supplies the canonical form of its own value part,
+    /// matching the key [`generate_if_needed`](Self::generate_if_needed) wrote
+    /// at creation.
     ///
-    /// Known gap: pull sync (`ec::pull_sync`) and the admin lookup
-    /// (`ec::admin`) still key rows by the raw active identifier rather than
-    /// this canonical form, so for a provider whose canonical form differs from
-    /// the cookie value they can read or write under the wrong key. The three
-    /// organic paths were routed through the canonical form (commit
-    /// `343ac3e`); these two were left keying raw and are tracked as a known
-    /// issue for a later change.
+    /// Identify, EC finalization and pull sync read and write this
+    /// identifier's row under this key, and so do the snapshot reads and EID
+    /// resolution of the publisher navigation, `/auction` and `/_ts/page-bids`
+    /// paths. Each reaches the key through this or through
+    /// [`ec_kv_key`](Self::ec_kv_key), which wraps it. Batch sync and the admin
+    /// lookup have no EC context, so they call
+    /// [`AcceptedProviders::canonical_kv_key`](provider::AcceptedProviders::canonical_kv_key)
+    /// directly, which this wraps.
     ///
     /// `None` when no provider this deployment reads owns `value`, in which
     /// case there is no row to read or write.
@@ -984,7 +970,7 @@ pub(crate) fn current_timestamp() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
@@ -1860,8 +1846,9 @@ mod tests {
     /// A provider whose identifier normalizes to a distinct canonical form, to
     /// prove the identity graph is keyed by the canonical form.
     ///
-    /// Shared with the identify and finalization tests, which need a provider
-    /// whose canonical key is not the value the browser carries.
+    /// Shared with the identify, finalization, pull sync, admin lookup, auction
+    /// and publisher tests, which need a provider whose canonical key is not the
+    /// value the browser carries.
     #[derive(Debug)]
     pub(crate) struct CanonicalizingProvider;
 
@@ -1894,6 +1881,17 @@ mod tests {
         }
     }
 
+    /// The identifier [`CanonicalizingProvider`] creates, as the browser
+    /// carries it in the `ts-ec` cookie.
+    pub(crate) const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
+
+    /// The identity-graph key generation writes that identifier's row under.
+    /// Pinned to the creation path by
+    /// `generate_keys_the_identity_graph_by_the_normalized_identifier`, which
+    /// asserts both the key generation writes and the key
+    /// [`EcContext::ec_kv_key`] derives.
+    pub(crate) const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
+
     /// The built-in HMAC provider, as an HMAC deployment selects it.
     ///
     /// Creating or rotating an identifier needs a selected provider, so the
@@ -1922,12 +1920,12 @@ mod tests {
 
         assert_eq!(
             ec.ec_value(),
-            Some("t0ca~MiXeD.CaseId"),
+            Some(CANONICAL_COOKIE_VALUE),
             "the cookie value keeps the provider's exact identifier under its code"
         );
         assert!(
             graph
-                .get("t0ca~mixed.caseid")
+                .get(CANONICAL_KV_KEY)
                 .expect("should read the graph")
                 .is_some(),
             "the graph row should be keyed by the code plus the canonical form"
@@ -1937,7 +1935,7 @@ mod tests {
         // row through `ec_kv_key`, so the two must never drift apart.
         assert_eq!(
             ec.ec_kv_key().as_deref(),
-            Some("t0ca~mixed.caseid"),
+            Some(CANONICAL_KV_KEY),
             "the read-side key should be the key generation wrote"
         );
     }

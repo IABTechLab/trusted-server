@@ -444,6 +444,7 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
@@ -512,16 +513,6 @@ mod tests {
             ec_allowed,
         )
     }
-
-    /// The identifier [`CanonicalizingProvider`] creates, as the browser carries
-    /// it in the `ts-ec` cookie.
-    const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
-
-    /// The identity-graph key generation writes that identifier's row under.
-    /// Pinned to the creation path by
-    /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
-    /// `ec` module tests.
-    const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
 
     fn canonicalizing_context(
         ec_was_present: bool,

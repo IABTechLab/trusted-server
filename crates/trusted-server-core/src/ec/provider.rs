@@ -513,12 +513,12 @@ pub fn provider_kv_key(provider: &dyn EdgeCookieProvider, full: &str) -> String 
 /// second provider's identifiers can never be adopted or written under this
 /// deployment's keys.
 ///
-/// Batch sync keys its rows through [`canonical_kv_key`](Self::canonical_kv_key)
-/// here. Pull sync and the admin lookup still read and write rows by the raw
-/// active identifier rather than the canonical form, so for a provider whose
-/// canonical form differs from the cookie value they can key the wrong row.
-/// That gap is recorded on `EcContext::kv_key_for` and tracked as a known
-/// issue for a later change.
+/// All three read and write rows under the key
+/// [`canonical_kv_key`](Self::canonical_kv_key) returns rather than under the
+/// identifier as given, so a provider whose canonical form differs from the
+/// cookie value still reaches the row it created. Batch sync and the admin
+/// lookup call it directly. Pull sync reaches it through `EcContext::kv_key_for`
+/// and still sends partners the identifier as issued.
 ///
 /// The set holds the deployment's active provider. The design's
 /// `legacy_providers` reader list, the providers that never create but must still
@@ -581,8 +581,7 @@ impl<'a> AcceptedProviders<'a> {
                 provider_owns_id(owner, &key).then_some(key)
             }
             // No provider is selected, so there is no code to dispatch on and
-            // the built-in HMAC grammar is the fallback, the same fallback
-            // `EcContext::accepts_id` has always used for a stateless
+            // the built-in HMAC grammar is the fallback for a stateless
             // deployment.
             None if self.readers.is_empty() => {
                 let key = generation::normalize_ec_id_for_kv(full);
