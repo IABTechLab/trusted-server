@@ -743,7 +743,9 @@ mod tests {
         let mut original = test_settings();
         original.publisher.proxy_secret =
             Redacted::new("12345678901234567890123456789012".to_string());
-        original.ec.passphrase = Redacted::new("12345678901234567890123456789012".to_string());
+        original.ec.providers.hmac = Some(crate::settings::HmacProviderConfig {
+            passphrase: Redacted::new("12345678901234567890123456789012".to_string()),
+        });
         original.handlers[0].password = Redacted::new("true".to_string());
 
         let reconstructed =
@@ -755,8 +757,22 @@ mod tests {
             "numeric-looking proxy secret should remain a string"
         );
         assert_eq!(
-            reconstructed.ec.passphrase.expose(),
-            original.ec.passphrase.expose(),
+            reconstructed
+                .ec
+                .providers
+                .hmac
+                .as_ref()
+                .expect("should reconstruct the hmac provider")
+                .passphrase
+                .expose(),
+            original
+                .ec
+                .providers
+                .hmac
+                .as_ref()
+                .expect("should keep the hmac provider")
+                .passphrase
+                .expose(),
             "numeric-looking passphrase should remain a string"
         );
         assert_eq!(
@@ -798,7 +814,13 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
-        settings.ec.passphrase = Redacted::new("short_key".to_owned());
+        settings
+            .ec
+            .providers
+            .hmac
+            .as_mut()
+            .expect("should configure the hmac provider")
+            .passphrase = Redacted::new("short_key".to_owned());
 
         let err = load_settings(&envelope_json(&settings))
             .expect_err("should reject a short resolved passphrase");

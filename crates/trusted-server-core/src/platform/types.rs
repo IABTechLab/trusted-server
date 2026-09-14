@@ -9,6 +9,7 @@ use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::ec::provider::EdgeCookieProvider;
 
 /// Geographic information extracted from a request.
 ///
@@ -18,7 +19,7 @@ use super::{
 pub struct GeoInfo {
     /// City name.
     pub city: String,
-    /// Two-letter country code.
+    /// ISO 3166-1 alpha-2 country code, for example `US` or `GB`.
     pub country: String,
     /// Continent name.
     pub continent: String,
@@ -28,7 +29,8 @@ pub struct GeoInfo {
     pub longitude: f64,
     /// DMA (Designated Market Area) / metro code.
     pub metro_code: i64,
-    /// Region code.
+    /// ISO 3166-2 subdivision code without the country prefix, for example `CA`
+    /// for California, or `None` when no region resolves.
     pub region: Option<String>,
     /// Autonomous System Number (e.g. `7922` = Comcast).
     /// Used to distinguish home ISP vs. corporate VPN.
@@ -188,6 +190,13 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// The Edge Cookie provider this deployment already resolved from
+    /// `[ec] provider` while it built application state.
+    ///
+    /// `None` when the adapter resolved nothing here, in which case the request
+    /// path resolves the selection itself, which is what a deployment that
+    /// selects no provider, the Axum adapter, and the core tests all do.
+    pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 impl RuntimeServices {
@@ -275,6 +284,21 @@ impl RuntimeServices {
         &self.client_info
     }
 
+    /// Returns the Edge Cookie provider the composition root already resolved,
+    /// when the adapter threaded one through.
+    ///
+    /// Resolving `[ec] provider` reads no request data, so the answer is the
+    /// same for every request and an adapter that resolves it once while it
+    /// builds application state can hand the result here instead of the
+    /// request path resolving the same settings again. `None` means nothing was
+    /// threaded, so the request path resolves for itself. Read this through
+    /// [`request_provider`](crate::ec::provider::request_provider) rather than
+    /// directly, so both answers are handled in one place.
+    #[must_use]
+    pub fn resolved_ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
+        self.resolved_ec_provider.clone()
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -291,6 +315,25 @@ impl RuntimeServices {
     pub fn with_kv_store(self, store: Arc<dyn PlatformKvStore>) -> Self {
         Self {
             kv_store: store,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the resolved Edge Cookie provider
+    /// replaced.
+    ///
+    /// Adapters that build their per-request services through a shared helper
+    /// with no application state in hand use this to thread the provider the
+    /// composition root resolved. `None` leaves the request path to resolve
+    /// `[ec] provider` for itself, which is what the Axum adapter and a
+    /// deployment selecting no provider both do.
+    #[must_use]
+    pub fn with_resolved_ec_provider(
+        self,
+        resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    ) -> Self {
+        Self {
+            resolved_ec_provider,
             ..self
         }
     }
@@ -342,6 +385,7 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -357,6 +401,7 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            resolved_ec_provider: None,
         }
     }
 
@@ -436,6 +481,18 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the Edge Cookie provider the composition root already resolved.
+    ///
+    /// Optional. This is the provider the selector actually chose, so setting
+    /// it keeps the request path from resolving the same settings a second
+    /// time. It is the single seam through which a vendor or host Edge Cookie
+    /// provider reaches the request path.
+    #[must_use]
+    pub fn resolved_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
+        self.resolved_ec_provider = Some(provider);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -476,6 +533,7 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
+            resolved_ec_provider: self.resolved_ec_provider,
         }
     }
 }

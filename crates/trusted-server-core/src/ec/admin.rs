@@ -32,7 +32,6 @@ use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
 use super::eids::{resolve_partner_ids, to_eids};
-use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
@@ -40,6 +39,7 @@ use super::log_id;
 use super::prebid_eids::{
     analyze_prebid_eids_cookie, collect_sharedid_update, dedupe_partner_updates, is_valid_eid_uid,
 };
+use super::provider::{AcceptedProviders, EdgeCookieProvider};
 use super::registry::PartnerRegistry;
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
@@ -197,8 +197,11 @@ pub fn deny_admin_diagnostic_fallback(req: &Request<EdgeBody>) -> Option<Respons
 /// Successful admin EC lookup payload.
 #[derive(Debug, Serialize)]
 struct AdminEcLookupResponse {
-    /// The EC ID that was looked up.
+    /// The EC ID as requested, from the path or the `ts-ec` cookie.
     ec_id: String,
+    /// The identity-graph key the entry was read from, being the canonical form
+    /// of `ec_id` that [`AcceptedProviders::canonical_kv_key`] returns.
+    kv_key: String,
     /// Platform KV store name the entry was read from.
     store: String,
     /// Store generation marker for the entry.
@@ -276,19 +279,28 @@ struct SkippedPartnerId {
 pub fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
+    provider: Option<&dyn EdgeCookieProvider>,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let Some(kv) = kv else {
         return Ok(admin_ec_lookup_not_supported());
     };
 
-    let ec_id = match requested_ec_id(req) {
-        Ok(ec_id) => ec_id,
+    let requested = match requested_ec_id(req, &AcceptedProviders::active(provider)) {
+        Ok(requested) => requested,
         Err(response) => return Ok(*response),
     };
 
-    let Some(lookup) = kv.lookup_raw(&ec_id)? else {
-        log::info!("Admin EC lookup: no entry for '{}'", log_id(&ec_id));
+    // Read the row under the owning provider's canonical form of the
+    // identifier, the key the row is stored under, rather than under the
+    // identifier as requested. The two differ whenever the canonical form is
+    // not the requested string itself, for example for a built-in HMAC
+    // identifier requested with its hash in uppercase.
+    let Some(lookup) = kv.lookup_raw(&requested.kv_key)? else {
+        log::info!(
+            "Admin EC lookup: no entry for '{}'",
+            log_id(&requested.ec_id)
+        );
         return Ok(json_error(
             StatusCode::NOT_FOUND,
             "EC entry not found (KV reads are eventually consistent; a very \
@@ -296,8 +308,11 @@ pub fn handle_admin_ec_lookup(
         ));
     };
 
-    log::info!("Admin EC lookup: returning entry for '{}'", log_id(&ec_id));
-    let payload = build_lookup_response(registry, kv.store_name(), ec_id, &lookup);
+    log::info!(
+        "Admin EC lookup: returning entry for '{}'",
+        log_id(&requested.ec_id)
+    );
+    let payload = build_lookup_response(registry, kv.store_name(), requested, &lookup);
     let body =
         serde_json::to_string(&payload).change_context(TrustedServerError::Configuration {
             message: "failed to serialize admin EC lookup response".to_owned(),
@@ -340,11 +355,34 @@ fn cookie_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeBody
     })
 }
 
-/// Resolves the EC ID to look up from the path or the `ts-ec` cookie.
+/// An EC ID resolved for lookup, with the identity-graph key its row is stored
+/// under.
+#[derive(Debug)]
+struct RequestedEcId {
+    /// The EC ID as requested, from the path or the `ts-ec` cookie.
+    ec_id: String,
+    /// The canonical form of `ec_id` that
+    /// [`AcceptedProviders::canonical_kv_key`] returns, which the row is stored
+    /// under.
+    kv_key: String,
+}
+
+/// Resolves the EC ID to look up from the path or the `ts-ec` cookie, with the
+/// identity-graph key its row is stored under.
+///
+/// The identifier is validated in two parts: the global cookie bounds, then
+/// the provider that owns its `{code}~` prefix, so an operator can look up an
+/// identifier created by whichever provider this deployment reads rather than
+/// only a built-in HMAC one. The same check supplies the key, the canonical
+/// form of the identifier that [`AcceptedProviders::canonical_kv_key`]
+/// returns.
 ///
 /// Returns the (boxed) error response to send directly when no valid ID is
 /// available.
-fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeBody>>> {
+fn requested_ec_id(
+    req: &Request<EdgeBody>,
+    accepted_providers: &AcceptedProviders<'_>,
+) -> Result<RequestedEcId, Box<Response<EdgeBody>>> {
     let remainder = req
         .uri()
         .path()
@@ -358,14 +396,16 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
         remainder.to_owned()
     };
 
-    if !is_valid_ec_id(&ec_id) {
+    let Some(kv_key) = accepted_providers.canonical_kv_key(&ec_id) else {
         return Err(Box::new(json_error(
             StatusCode::BAD_REQUEST,
-            "invalid EC ID format (expected {64hex}.{6alnum})",
+            "invalid EC ID: not an identifier any provider this deployment reads \
+             issued (the built-in HMAC provider issues hmac~{64hex}.{6alnum} and \
+             still reads the bare legacy form)",
         )));
-    }
+    };
 
-    Ok(ec_id)
+    Ok(RequestedEcId { ec_id, kv_key })
 }
 
 /// Builds the success payload from a raw KV lookup.
@@ -375,11 +415,12 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
 fn build_lookup_response(
     registry: &PartnerRegistry,
     store_name: &str,
-    ec_id: String,
+    requested: RequestedEcId,
     lookup: &EcKvLookup,
 ) -> AdminEcLookupResponse {
     let mut payload = AdminEcLookupResponse {
-        ec_id,
+        ec_id: requested.ec_id,
+        kv_key: requested.kv_key,
         store: store_name.to_owned(),
         generation: lookup.generation,
         tombstone: None,
@@ -683,6 +724,7 @@ mod tests {
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
     use crate::ec::kv_types::KvPartnerId;
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -975,7 +1017,7 @@ mod tests {
         let kv = kv_with_entry(&ec_id, &sample_entry());
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1071,7 +1113,7 @@ mod tests {
         let kv = kv_with_raw_body_and_metadata(&ec_id, &body, &metadata);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1098,7 +1140,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, &body);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1130,7 +1172,7 @@ mod tests {
         );
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1150,7 +1192,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1161,7 +1203,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec/not-a-valid-id");
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1173,7 +1215,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, "not json at all");
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(
@@ -1214,7 +1256,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, &body);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1239,7 +1281,7 @@ mod tests {
         let kv = kv_with_entry(&ec_id, &sample_entry());
         let req = get_request_with_cookie("/_ts/admin/ec", &format!("other=1; ts-ec={ec_id}; x=2"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1264,7 +1306,7 @@ mod tests {
             &format!("ts-ec={stale_ec_id}; ts-ec={live_ec_id}"),
         );
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1281,7 +1323,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec");
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1299,8 +1341,8 @@ mod tests {
     fn missing_identity_graph_returns_501() {
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let response =
-            handle_admin_ec_lookup(None, &test_registry(), &req).expect("should handle lookup");
+        let response = handle_admin_ec_lookup(None, &test_registry(), None, &req)
+            .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
@@ -1334,7 +1376,7 @@ mod tests {
         let kv = KvIdentityGraph::failing("broken-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req);
+        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req);
 
         assert!(result.is_err(), "should propagate KV read failures");
     }
@@ -1530,5 +1572,153 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
+    }
+
+    /// A non-HMAC provider whose identifiers are opaque, modeling the
+    /// host-signal provider PR #1044 adds.
+    #[derive(Debug)]
+    struct OpaqueProvider;
+
+    impl EdgeCookieProvider for OpaqueProvider {
+        fn id(&self) -> &'static str {
+            "opaque"
+        }
+
+        fn code(&self) -> super::super::provider::ProviderCode {
+            crate::provider_code!("t0op")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &super::super::provider::IdentityInput<'_>,
+        ) -> Result<super::super::provider::GeneratedEdgeCookie, Report<TrustedServerError>>
+        {
+            Ok(super::super::provider::GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+    }
+
+    #[test]
+    fn requested_ec_id_accepts_the_hmac_envelope() {
+        let coded = format!("hmac~{}", test_ec_id());
+        let request = request_with_method(http::Method::GET, &format!("/_ts/admin/ec/{coded}"));
+
+        let requested = requested_ec_id(&request, &AcceptedProviders::active(None))
+            .unwrap_or_else(|_| panic!("should accept a coded HMAC identifier in the path"));
+
+        assert_eq!(
+            requested.ec_id, coded,
+            "should report the identifier as given"
+        );
+        assert_eq!(
+            requested.kv_key, coded,
+            "a lowercase HMAC identifier should be its own identity-graph key"
+        );
+    }
+
+    #[test]
+    fn requested_ec_id_accepts_the_active_non_hmac_provider_and_rejects_others() {
+        // The diagnostic must be usable on a deployment whose provider is not
+        // the built-in HMAC one. Before the dispatch every non-`hmac` code was
+        // a 400, so an operator could not look up the identifier in the very
+        // cookie the browser was carrying.
+        let accepted = AcceptedProviders::active(Some(&OpaqueProvider));
+
+        let opaque = "t0op~Opaque_Value_MixedCase";
+        let request = request_with_method(http::Method::GET, &format!("/_ts/admin/ec/{opaque}"));
+        let requested = requested_ec_id(&request, &accepted)
+            .unwrap_or_else(|_| panic!("should accept the active provider's identifier"));
+        assert_eq!(
+            requested.ec_id, opaque,
+            "should report the identifier as given"
+        );
+
+        // A code no configured provider reads stays a 400, even in the built-in
+        // HMAC shape, so one deployment cannot inspect another's identifiers.
+        let foreign = format!("t0zz~{}", test_ec_id());
+        let request = request_with_method(http::Method::GET, &format!("/_ts/admin/ec/{foreign}"));
+        let response = requested_ec_id(&request, &accepted)
+            .expect_err("an unread provider code should be rejected");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an unread provider code should be a 400"
+        );
+    }
+
+    #[test]
+    fn ec_lookup_reads_the_row_under_the_canonical_key() {
+        // The identity graph stores a row under the owning provider's
+        // canonical form of the identifier. Read under the identifier as
+        // requested, the lookup answered 404 for a row that exists whenever a
+        // provider's canonical form differs from the cookie value.
+        let kv = kv_with_entry(CANONICAL_KV_KEY, &sample_entry());
+        let req =
+            get_request_with_cookie("/_ts/admin/ec", &format!("ts-ec={CANONICAL_COOKIE_VALUE}"));
+
+        let response = handle_admin_ec_lookup(
+            Some(&kv),
+            &test_registry(),
+            Some(&CanonicalizingProvider),
+            &req,
+        )
+        .expect("should handle lookup");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the cookie value should find the row stored under the canonical key"
+        );
+        let json = response_json(response);
+        assert_eq!(
+            json["ec_id"], CANONICAL_COOKIE_VALUE,
+            "should report the identifier as requested"
+        );
+        assert_eq!(
+            json["kv_key"], CANONICAL_KV_KEY,
+            "should report the key the entry was read from"
+        );
+        assert_eq!(
+            json["entry"]["ids"]["bidstream.example"]["uid"], "uid-live",
+            "should return the entry stored under the canonical key"
+        );
+    }
+
+    #[test]
+    fn ec_lookup_given_an_uppercase_hmac_hash_reads_the_lowercase_row() {
+        // The built-in HMAC provider issues lowercase hex, and its canonical
+        // form lowercases the hash, so its row key is the identifier it issued.
+        // An operator who pastes that identifier with the hash in uppercase is
+        // still asking for the same row.
+        let ec_id = format!("hmac~{}", test_ec_id());
+        let kv = kv_with_entry(&ec_id, &sample_entry());
+        let uppercase = format!("hmac~{}.abc123", "A".repeat(64));
+        let provider = crate::ec::tests::hmac_provider();
+        let req = get_request(&format!("/_ts/admin/ec/{uppercase}"));
+
+        let response =
+            handle_admin_ec_lookup(Some(&kv), &test_registry(), Some(provider.as_ref()), &req)
+                .expect("should handle lookup");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an uppercase hash should find the row stored under the lowercase key"
+        );
+        let json = response_json(response);
+        assert_eq!(
+            json["ec_id"],
+            uppercase.as_str(),
+            "should report the identifier as requested"
+        );
+        assert_eq!(
+            json["kv_key"],
+            ec_id.as_str(),
+            "should report the lowercase key the entry was read from"
+        );
     }
 }
