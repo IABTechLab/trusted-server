@@ -811,6 +811,9 @@ mod tests {
 
                 [ec]
                 passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse startup test settings");
@@ -859,6 +862,9 @@ mod tests {
 
                 [ec]
                 passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse startup test settings");
@@ -903,6 +909,9 @@ mod tests {
 
                 [ec]
                 passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse startup test settings");

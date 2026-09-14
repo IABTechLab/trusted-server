@@ -596,12 +596,14 @@ impl EcContext {
         // Check every response header the provider asked for against core's
         // reserved surface before any of them are kept. A provider may set its
         // own cookies and headers, but not a managed `ts-` cookie, a header in
-        // the `x-ts-` namespace, or a framing or hop-by-hop header. Rejection
-        // fails the request, matching the identifier-bounds rejection below:
-        // without it a provider could write `ts-ec` itself and bypass the
-        // identifier validation and identity-graph row generation enforces.
-        // Checked before the identifier is read, because a provider can return
-        // headers with no identifier at all.
+        // the `x-ts-` namespace, or a framing or hop-by-hop header. Without the
+        // check a provider could write `ts-ec` itself and bypass the identifier
+        // validation and identity-graph row generation enforces. A rejection
+        // returns an error, as the identifier-bounds rejection below does.
+        // Because the check runs before the headers are captured, nothing from
+        // a rejected provider response is kept, and the response is served
+        // without a new Edge Cookie. Checked before the identifier is read,
+        // because a provider can return headers with no identifier at all.
         for (name, value) in &generated.response_headers {
             if let Some(effect) = provider::reserved_response_effect(name, value) {
                 return Err(Report::new(TrustedServerError::EdgeCookie {
@@ -612,14 +614,14 @@ impl EcContext {
                 }));
             }
         }
-        // Capture any response headers the provider asked for, even when it
-        // produced no identifier (for example while it still needs more client
-        // evidence). EC finalization applies them to the response.
-        self.response_headers = generated.response_headers;
         let generated_id = generated
             .id
             .map(|value| crate::ec::provider::apply_provider_code(ec_provider, &value));
         let Some(ec_id) = generated_id else {
+            // Keep the response headers the provider asked for even though it
+            // produced no identifier (for example while it still needs more
+            // client evidence). EC finalization applies them to the response.
+            self.response_headers = generated.response_headers;
             log::info!(
                 "EC generation produced no identifier (provider={}); proceeding without an EC",
                 ec_provider.id(),
@@ -641,6 +643,11 @@ impl EcContext {
                 ),
             }));
         }
+        // Keep the provider's response headers only now that its identifier
+        // has passed the bounds check, so a provider response whose identifier
+        // is rejected keeps none of them. EC finalization applies them to the
+        // response.
+        self.response_headers = generated.response_headers;
         log::info!(
             "Generated new EC ID (provider={}): {}",
             ec_provider.id(),
@@ -661,6 +668,12 @@ impl EcContext {
     /// canonical form of the identifier, and the request snapshot is bound to
     /// that key. The skip guards (existing EC, permission gate) stay in
     /// [`generate_if_needed`](Self::generate_if_needed).
+    ///
+    /// The response headers a provider response asks for stay on the context
+    /// only when its identifier is committed or it produced no identifier at
+    /// all. A colliding candidate's headers are dropped before the next attempt
+    /// and nothing is kept when persisting fails, so EC finalization never
+    /// applies a header from a candidate this request discarded.
     ///
     /// # Errors
     ///
@@ -707,6 +720,10 @@ impl EcContext {
                         };
                     }
                     Ok(CreateIfAbsentOutcome::AlreadyExists) => {
+                        // The colliding candidate is discarded, and the
+                        // response headers its provider response asked for
+                        // are discarded with it.
+                        self.response_headers.clear();
                         log::warn!(
                             "Generated EC ID collision on attempt {}/{MAX_CREATE_ATTEMPTS}",
                             attempt + 1
@@ -714,6 +731,9 @@ impl EcContext {
                         continue;
                     }
                     Err(err) => {
+                        // Nothing is committed, so none of the provider's
+                        // response headers are kept either.
+                        self.response_headers.clear();
                         log::error!(
                             "Failed to create EC entry for id '{}' after generation: {err:?}",
                             log_id(&ec_id),
@@ -754,38 +774,25 @@ impl EcContext {
         provider::AcceptedProviders::active(self.selected_provider.as_deref())
     }
 
-    /// Returns whether `value` is a well-formed identifier for the selected
-    /// provider.
-    ///
-    /// Lets core validate a cookie or active identifier (for example before
-    /// withdrawing it) through the provider that issued it, rather than assuming
-    /// the built-in shape. The global cookie bounds are checked first, then the
-    /// provider-specific part is dispatched by the identifier's code. Falls back
-    /// to the built-in shape when no provider is configured.
-    #[must_use]
-    pub(crate) fn accepts_id(&self, value: &str) -> bool {
-        self.accepted_providers().accepts(value)
-    }
-
     /// The identity-graph key for `value` under the providers this deployment
     /// reads.
     ///
-    /// The canonical route from an identifier to a row key. The organic
-    /// generate, identify and finalize paths turn an identifier into a row key
-    /// through this (or through [`ec_kv_key`](Self::ec_kv_key), which wraps it),
-    /// so a provider whose canonical form differs from the cookie value still
-    /// finds the row it created. The owning provider is picked by the
-    /// identifier's `{code}~` prefix and supplies the canonical form of its own
-    /// value part, matching what
-    /// [`generate_if_needed`](Self::generate_if_needed) wrote at creation.
+    /// The canonical route from a request's identifier to a row key, so a
+    /// provider whose canonical form differs from the cookie value still finds
+    /// the row it created. The owning provider is picked by the identifier's
+    /// `{code}~` prefix and supplies the canonical form of its own value part,
+    /// matching the key [`generate_if_needed`](Self::generate_if_needed) wrote
+    /// at creation.
     ///
-    /// Known gap: pull sync (`ec::pull_sync`) and the admin lookup
-    /// (`ec::admin`) still key rows by the raw active identifier rather than
-    /// this canonical form, so for a provider whose canonical form differs from
-    /// the cookie value they can read or write under the wrong key. The three
-    /// organic paths were routed through the canonical form (commit
-    /// `343ac3e`); these two were left keying raw and are tracked as a known
-    /// issue for a later change.
+    /// Identify, EC finalization and pull sync read and write this
+    /// identifier's row under this key. The publisher navigation, `/auction`
+    /// and `/_ts/page-bids` paths load their request snapshot under this key,
+    /// and EID resolution looks the entry up in that snapshot under this key.
+    /// Each of these reaches the key through this function or through
+    /// [`ec_kv_key`](Self::ec_kv_key), which wraps this function. Batch sync
+    /// and the admin lookup have no EC context, so they call
+    /// [`AcceptedProviders::canonical_kv_key`](provider::AcceptedProviders::canonical_kv_key),
+    /// the function this one wraps, directly.
     ///
     /// `None` when no provider this deployment reads owns `value`, in which
     /// case there is no row to read or write.
@@ -1188,7 +1195,7 @@ pub(crate) fn current_timestamp() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
@@ -1835,14 +1842,14 @@ mod tests {
         );
     }
 
-    /// A provider that returns a caller-chosen response header and no
-    /// identifier, so a test can drive one provider response effect at a time
-    /// through the organic generate path.
+    /// A provider that returns a caller-chosen response header, and `id` as its
+    /// identifier when one is given, so a test can drive one provider response
+    /// effect at a time through the organic generate path.
     #[derive(Debug)]
     struct HeaderSettingProvider {
         name: &'static str,
         value: &'static str,
-        mint: bool,
+        id: Option<&'static str>,
     }
 
     impl EdgeCookieProvider for HeaderSettingProvider {
@@ -1860,7 +1867,7 @@ mod tests {
             _input: &IdentityInput<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
-                id: self.mint.then(|| "provider-value".to_owned()),
+                id: self.id.map(str::to_owned),
                 response_headers: vec![(
                     http::HeaderName::from_bytes(self.name.as_bytes())
                         .expect("should parse header name"),
@@ -1878,10 +1885,13 @@ mod tests {
         }
     }
 
+    /// Runs generation through `provider` and hands back the context whether or
+    /// not generation succeeded, so a test can finalize a response on a context
+    /// whose generation returned an error.
     fn generate_with_header_setting_provider(
         provider: HeaderSettingProvider,
         graph: Option<&KvIdentityGraph>,
-    ) -> (Settings, Result<EcContext, Report<TrustedServerError>>) {
+    ) -> (Settings, EcContext, Result<(), Report<TrustedServerError>>) {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let mut settings = create_test_settings();
@@ -1890,27 +1900,32 @@ mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
-        let outcome = ec.generate_if_needed(&settings, graph).map(|()| ec);
-        (settings, outcome)
+        let outcome = ec.generate_if_needed(&settings, graph);
+        (settings, ec, outcome)
     }
 
     #[test]
     fn generate_rejects_a_provider_effect_inside_the_reserved_response_surface() {
         // A provider that sets the managed `ts-ec` cookie would bypass core's
-        // identifier validation and its identity-graph row entirely, so the
-        // request fails rather than the effect being quietly dropped. The
+        // identifier validation and its identity-graph row entirely, so
+        // generation returns an error rather than quietly dropping the effect.
+        // The publisher and integration proxies log that error and serve the
+        // response without an Edge Cookie, and
+        // `a_rejected_provider_effect_never_reaches_the_finalized_response`
+        // checks that the rejected header stays off that response. The
         // provider creates no identifier here, which is exactly the case the
         // cookie write would otherwise slip through.
-        let (_settings, outcome) = generate_with_header_setting_provider(
+        let (_settings, _ec, outcome) = generate_with_header_setting_provider(
             HeaderSettingProvider {
                 name: "set-cookie",
                 value: "ts-ec=forged-value; Path=/",
-                mint: false,
+                id: None,
             },
             None,
         );
 
-        let err = outcome.expect_err("a managed cookie effect should fail the request");
+        let err =
+            outcome.expect_err("a managed cookie effect should make generation return an error");
         assert!(
             err.to_string().contains("header-setting"),
             "the error should name the provider, got: {err}"
@@ -1918,17 +1933,87 @@ mod tests {
 
         // The same for the reserved header namespace and for message framing.
         for (name, value) in [("x-ts-ec", "forged"), ("transfer-encoding", "chunked")] {
-            let (_settings, outcome) = generate_with_header_setting_provider(
+            let (_settings, _ec, outcome) = generate_with_header_setting_provider(
                 HeaderSettingProvider {
                     name,
                     value,
-                    mint: false,
+                    id: None,
                 },
                 None,
             );
             assert!(
                 outcome.is_err(),
-                "`{name}` is reserved and should fail the request"
+                "`{name}` is reserved, so generation should return an error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_provider_effect_never_reaches_the_finalized_response() {
+        // Returning the error is half of the rule. The publisher and
+        // integration proxies log the error and still serve the response, and
+        // EC finalization applies the response headers this same context
+        // holds, so a rejected header kept among them would reach the browser
+        // anyway. The provider also returns an identifier here, to show that
+        // nothing from the rejected provider response is kept.
+        for (name, value) in [
+            ("set-cookie", "ts-ec=forged-value; Path=/"),
+            ("x-ts-ec", "forged"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            let graph = KvIdentityGraph::in_memory("test-ec-store");
+            let (settings, mut ec, outcome) = generate_with_header_setting_provider(
+                HeaderSettingProvider {
+                    name,
+                    value,
+                    id: Some("provider-value"),
+                },
+                Some(&graph),
+            );
+            assert!(
+                outcome.is_err(),
+                "`{name}` is reserved, so generation should return an error"
+            );
+            assert_eq!(
+                ec.ec_value(),
+                None,
+                "no identifier should be committed after `{name}` is rejected"
+            );
+
+            let mut response = http::Response::builder()
+                .status(200)
+                .body(EdgeBody::empty())
+                .expect("should build test response");
+            finalize::ec_finalize_response(
+                &settings,
+                &mut ec,
+                Some(&graph),
+                &registry::PartnerRegistry::empty(),
+                None,
+                None,
+                &mut response,
+            );
+
+            let cookies: Vec<&str> = response
+                .headers()
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|cookie| cookie.to_str().ok())
+                .collect();
+            assert!(
+                !cookies.iter().any(|cookie| cookie.contains("ts-ec=forged")),
+                "the rejected `{name}` effect should not set `ts-ec`, got: {cookies:?}"
+            );
+            assert!(
+                response.headers().get("x-ts-ec").is_none(),
+                "the rejected `{name}` effect should not set `x-ts-ec`"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(http::header::TRANSFER_ENCODING)
+                    .is_none(),
+                "the rejected `{name}` effect should not set `transfer-encoding`"
             );
         }
     }
@@ -1939,15 +2024,15 @@ mod tests {
         // it survives generation and reaches the browser response unchanged,
         // alongside the managed `ts-ec` cookie core writes itself.
         let graph = KvIdentityGraph::in_memory("test-ec-store");
-        let (settings, outcome) = generate_with_header_setting_provider(
+        let (settings, mut ec, outcome) = generate_with_header_setting_provider(
             HeaderSettingProvider {
                 name: "set-cookie",
                 value: "acme-evidence=abc123; Path=/; Secure",
-                mint: true,
+                id: Some("provider-value"),
             },
             Some(&graph),
         );
-        let mut ec = outcome.expect("a provider-owned cookie should not fail the request");
+        outcome.expect("generation should accept a provider-owned cookie");
         assert_eq!(
             ec.ec_value(),
             Some("t0hs~provider-value"),
@@ -1986,11 +2071,133 @@ mod tests {
         );
     }
 
+    /// A cookie a provider may set for itself, used to check which provider
+    /// responses keep their headers.
+    const PROVIDER_EVIDENCE_COOKIE: &str = "acme-evidence=abc123; Path=/; Secure";
+
+    /// Runs EC finalization on `ec` for an empty response and returns the
+    /// `Set-Cookie` values the response carries.
+    fn finalized_set_cookies(
+        settings: &Settings,
+        ec: &mut EcContext,
+        graph: &KvIdentityGraph,
+    ) -> Vec<String> {
+        let mut response = http::Response::builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build test response");
+        finalize::ec_finalize_response(
+            settings,
+            ec,
+            Some(graph),
+            &registry::PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|cookie| cookie.to_str().ok())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_rejected_identifier_keeps_none_of_its_provider_response_headers() {
+        // The provider's own cookie is permitted, but the identifier in the
+        // same provider response is outside the cookie-safe alphabet, so
+        // generation returns an error and nothing from that response may reach
+        // the browser.
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+        let (settings, mut ec, outcome) = generate_with_header_setting_provider(
+            HeaderSettingProvider {
+                name: "set-cookie",
+                value: PROVIDER_EVIDENCE_COOKIE,
+                id: Some("bad;value with spaces"),
+            },
+            Some(&graph),
+        );
+
+        assert!(
+            outcome.is_err(),
+            "an identifier outside the cookie-safe alphabet should make generation return an error"
+        );
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph);
+        assert!(
+            !cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("acme-evidence=")),
+            "the rejected provider response's cookie should not reach the response, got: {cookies:?}"
+        );
+    }
+
+    #[test]
+    fn a_colliding_candidates_provider_headers_never_reach_the_response() {
+        // Every candidate collides with a row the graph already holds, so each
+        // one is discarded and generation returns an error once the retries
+        // run out. The cookie each provider response asked for belongs to a
+        // discarded candidate and must not reach the browser.
+        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
+        let (settings, mut ec, outcome) = generate_with_header_setting_provider(
+            HeaderSettingProvider {
+                name: "set-cookie",
+                value: PROVIDER_EVIDENCE_COOKIE,
+                id: Some("provider-value"),
+            },
+            Some(&graph),
+        );
+
+        assert!(
+            outcome.is_err(),
+            "exhausting the collision retries should make generation return an error"
+        );
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph);
+        assert!(
+            !cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("acme-evidence=")),
+            "a colliding candidate's cookie should not reach the response, got: {cookies:?}"
+        );
+    }
+
+    #[test]
+    fn an_unpersisted_candidate_keeps_none_of_its_provider_response_headers() {
+        // The identity graph cannot store the candidate's row, so no
+        // identifier is committed and the cookie its provider response asked
+        // for must not reach the browser either.
+        let graph = KvIdentityGraph::new(crate::ec::kv_backend::test_support::FailingEcKv::new(
+            "failing-ec-store",
+        ));
+        let (settings, mut ec, outcome) = generate_with_header_setting_provider(
+            HeaderSettingProvider {
+                name: "set-cookie",
+                value: PROVIDER_EVIDENCE_COOKIE,
+                id: Some("provider-value"),
+            },
+            Some(&graph),
+        );
+
+        assert!(
+            outcome.is_err(),
+            "a failed identity-graph write should make generation return an error"
+        );
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph);
+        assert!(
+            !cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("acme-evidence=")),
+            "an unpersisted candidate's cookie should not reach the response, got: {cookies:?}"
+        );
+    }
+
     /// A provider whose identifier normalizes to a distinct canonical form, to
     /// prove the identity graph is keyed by the canonical form.
     ///
-    /// Shared with the identify and finalization tests, which need a provider
-    /// whose canonical key is not the value the browser carries.
+    /// Shared with the identify, finalization, pull sync, admin lookup, auction
+    /// and publisher tests, which need a provider whose canonical key is not the
+    /// value the browser carries.
     #[derive(Debug)]
     pub(crate) struct CanonicalizingProvider;
 
@@ -2023,6 +2230,17 @@ mod tests {
         }
     }
 
+    /// The identifier [`CanonicalizingProvider`] creates, as the browser
+    /// carries it in the `ts-ec` cookie.
+    pub(crate) const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
+
+    /// The identity-graph key generation writes that identifier's row under.
+    /// Pinned to the creation path by
+    /// `generate_keys_the_identity_graph_by_the_normalized_identifier`, which
+    /// asserts both the key generation writes and the key
+    /// [`EcContext::ec_kv_key`] derives.
+    pub(crate) const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
+
     /// The built-in HMAC provider, as an HMAC deployment selects it.
     ///
     /// Creating or rotating an identifier needs a selected provider, so the
@@ -2050,12 +2268,12 @@ mod tests {
 
         assert_eq!(
             ec.ec_value(),
-            Some("t0ca~MiXeD.CaseId"),
+            Some(CANONICAL_COOKIE_VALUE),
             "the cookie value keeps the provider's exact identifier under its code"
         );
         assert!(
             graph
-                .get("t0ca~mixed.caseid")
+                .get(CANONICAL_KV_KEY)
                 .expect("should read the graph")
                 .is_some(),
             "the graph row should be keyed by the code plus the canonical form"
@@ -2065,7 +2283,7 @@ mod tests {
         // row through `ec_kv_key`, so the two must never drift apart.
         assert_eq!(
             ec.ec_kv_key().as_deref(),
-            Some("t0ca~mixed.caseid"),
+            Some(CANONICAL_KV_KEY),
             "the read-side key should be the key generation wrote"
         );
     }
