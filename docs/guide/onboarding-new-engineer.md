@@ -206,6 +206,46 @@ local build, which is the only practical way to reproduce most production
 issues. [GPT Diagnostics](/guide/integrations/gpt-diagnostics) explains
 `?ts_console=1`, the first thing to reach for when ads do not render.
 
+### Reading these docs locally
+
+This documentation is a [VitePress](https://vitepress.dev) site that lives in
+`docs/`. You are probably reading the published version, but running it locally
+gives you full-text search over every guide and lets you preview any change you
+make before opening a pull request.
+
+```bash
+cd docs
+npm ci
+npm run dev
+```
+
+The site is served at `http://localhost:5173`. Pages reload as you save, so you
+can keep it open while you read. Stop it with `Ctrl+C`.
+
+Each page maps to one Markdown file under `docs/guide/`, so the fastest way to
+find the source of something you are reading is to search the repository for a
+phrase from the page.
+
+If you edit a page, run these before opening a pull request:
+
+```bash
+npm run format:write   # apply Prettier formatting
+npm run lint           # ESLint
+npm run build          # production build; fails on broken internal links
+```
+
+`npm run build` is the one that matters most: it fails the build on a dead
+internal link, so it catches a mistyped `/guide/...` path that would otherwise
+ship. `npm run preview` serves the built output if you want to check the
+production result.
+
+Version numbers such as the Rust and Viceroy versions on this page are not
+written literally in the Markdown. Each entry in `.tool-versions` gets a
+double-brace placeholder named after the tool in upper case followed by
+`_VERSION`, and `docs/.vitepress/config.mts` substitutes it at build time. So
+tool versions in the docs cannot drift from the pinned toolchain. If you need
+to cite one in a page, use the placeholder rather than typing the number.
+
 ### Local origin stub
 
 To exercise the first-party proxy against a fully local origin, point the
