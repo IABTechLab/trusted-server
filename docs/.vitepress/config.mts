@@ -93,6 +93,10 @@ export default withMermaid(
               text: 'Onboarding',
               link: '/guide/onboarding',
             },
+            {
+              text: 'New Engineer Setup',
+              link: '/guide/onboarding-new-engineer',
+            },
           ],
         },
         {
