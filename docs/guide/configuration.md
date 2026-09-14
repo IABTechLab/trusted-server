@@ -26,6 +26,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "ec_passphrase"
 ```
 
@@ -41,7 +44,8 @@ export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 # Secret overrides, when needed, are key names—not secret values.
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
-export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+export TRUSTED_SERVER__EC__PROVIDER=hmac
+export TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=ec_passphrase
 
 # Replace the rejected placeholder values in trusted-server.toml, then validate.
 ts config validate
@@ -136,6 +140,7 @@ fail and the service will return its startup-error response.
 | File                  | Purpose                         |
 | --------------------- | ------------------------------- |
 | `trusted-server.toml` | Main application configuration  |
+| `permissions.yaml`    | Country/region permission rules |
 | `fastly.toml`         | Fastly Compute service settings |
 | `.env.dev`            | Local development overrides     |
 
@@ -147,6 +152,8 @@ fail and the service will return its startup-error response.
 | `[trusted_client_ip]` | Authenticated client-IP forwarding           |
 | `[ec]`                | Edge Cookie (EC) ID generation               |
 | `[tester_cookie]`     | Optional tester-cookie endpoint              |
+| `[device]`            | Device classification provider selection     |
+| `[geo]`               | Geolocation provider selection               |
 | `[proxy]`             | Proxy SSRF allowlist and asset routes        |
 | `[cache]`             | Static/rehosted asset cache policy rules     |
 | `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
@@ -167,6 +174,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "ec_passphrase"
 
 [request_signing]
@@ -571,17 +581,27 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 
 ### `[ec]`
 
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                    |
+| ------------------------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`                | String or null | No       | Key of the active Edge Cookie provider: `"hmac"` (built-in), `"host-signals"` (opt-in), or `"none"` (explicitly stateless). Omit to run statelessly with no Edge Cookie. The `"client-fixed"` demo needs the `client-fixed-demo` build feature |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                     |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                            |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                                                                                                                                        |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                |
+
+The selected `provider` must have a matching `[ec.providers.<key>]` block. Selecting a provider with no configured block, or an unknown key, fails at startup.
+
+### `[ec.providers.hmac]`
+
+The built-in HMAC-over-client-IP provider, keyed `hmac`.
+
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+| Field        | Type   | Required                    | Description                                                |
+| ------------ | ------ | --------------------------- | ---------------------------------------------------------- |
+| `passphrase` | String | Yes when `hmac` is selected | Secret-store key name whose resolved value is the HMAC key |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -596,8 +616,11 @@ outbound pull sync, but cannot authenticate to those inbound APIs.
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
+provider = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.providers.hmac]
+passphrase = "ec_passphrase"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -610,15 +633,24 @@ bidstream_enabled = true
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__PROVIDER=hmac
+TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
+These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environment values into the published configuration (for example test harnesses building an app-config blob). The running server reads its settings from the platform config store, so provider selection changes take effect when a new configuration is pushed, not per request.
+
 ### Field Details
 
-#### `passphrase`
+#### `provider`
 
-**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation.
+**Purpose**: Names the active Edge Cookie provider by its key. Omit to run statelessly with no Edge Cookie.
+
+**Validation**: Application startup fails if the selected key has no matching `[ec.providers.<key>]` block, or is unknown.
+
+#### `providers.hmac.passphrase`
+
+**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation, read when `provider = "hmac"`.
 
 **Security**:
 
@@ -629,6 +661,66 @@ TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 **Validation**: Application startup fails if:
 
 - Empty string
+- Shorter than 32 characters
+
+## Device Configuration
+
+Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie provider selection. These signals serve identifier gating and bot detection, not bid enrichment.
+
+### `[device]`
+
+| Field      | Type           | Required | Description                                                                                                                                                                         |
+| ---------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider` | String or null | No       | Key of the device-detection provider. Defaults to `builtin` (User-Agent only, no host-specific call). Set `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers |
+
+The default `builtin` provider classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Selecting an unknown provider key fails at startup.
+
+**Example**:
+
+```toml
+[device]
+provider = "builtin" # or "fastly" to add TLS and HTTP/2 evidence
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__DEVICE__PROVIDER=builtin
+```
+
+## Geo Configuration
+
+Selects how a client IP is resolved into geolocation (country, region, coordinates), mirroring the Edge Cookie provider selection. The resolved country also feeds the [permission model](/guide/permission-model).
+
+### `[geo]`
+
+| Field                        | Type           | Required        | Description                                                                                                                                                                                                      |
+| ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`                   | String or null | No              | Key of the geo provider. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                 |
+| `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie provider without a geo provider acknowledges that by setting this to `true`. |
+
+No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
+
+**Example**:
+
+```toml
+[geo]
+provider = "platform"
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__GEO__PROVIDER=platform
+```
+
+## Provider Permissions
+
+A provider advertises the technical permissions its data use requires, and Trusted Server runs the provider only when every required permission is set. This separates legal policy from the core, so the deployer brings the policy that decides how permissions are established. See the [Permission Model](/guide/permission-model) for the concept, the permission vocabulary, and how a request resolves.
+
+### Country and region rules (`permissions.yaml`)
+
+The country and region permission rules are defined in a human-editable permissions YAML document, compiled into the build (not loaded at runtime). The repository sample is `config/permissions/sample.yaml`, which is for testing and evaluation only and is neither a production policy nor legal advice. Edit or replace the compiled-in file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
 
 ## Response Headers
 
@@ -821,7 +913,7 @@ Startup fails when no handler covers an admin route. The dynamic
 `/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
 Basic Auth runs on the raw path before routing, so coverage cannot be inferred
 from ID-shaped samples: a pattern such as
-`^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
+`^/_ts/admin/ec/hmac~[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
 matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
 patterns).
 
@@ -2132,7 +2224,8 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- The `passphrase` key name is non-empty at push time
+- `provider`, when set, names a provider with a matching `[ec.providers.<key>]` block; an unknown or unconfigured selection fails at startup
+- The `providers.hmac.passphrase` key name is non-empty at push time
 - The resolved passphrase is at least 32 bytes at runtime
 - Known placeholder values are rejected after resolution
 

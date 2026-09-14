@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -171,10 +171,11 @@ pub async fn handle_auction(
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
-    // Only forward the EC ID to auction partners when consent allows it.
-    // Owned so the identity-graph snapshot can be stored back on `ec_context`
-    // below without holding a borrow of it across the mutation.
-    let ec_id = if ec_context.ec_allowed() {
+    // Forward the EC ID to auction partners only when sharing is permitted,
+    // being storage plus personalized-ad selection, the same pair that gates
+    // EIDs. Owned so the identity-graph snapshot can be stored back on
+    // `ec_context` below without holding a borrow of it across the mutation.
+    let ec_id = if ec_context.ec_sharing_allowed() {
         ec_context.ec_value().map(str::to_owned)
     } else {
         None
@@ -282,8 +283,9 @@ pub async fn handle_auction(
     // `ts-eids` cookie so later requests can still forward the browser's
     // full OpenRTB-style EID structure.
     //
-    // Gate this on the same identity-consent condition as the EC ID
-    // (`ec_id.is_some()`, which is already filtered by `ec_context.ec_allowed()`).
+    // Gate this on the same identity condition as the EC ID
+    // (`ec_id.is_some()`, which is already filtered by the sharing pair via
+    // `ec_context.ec_sharing_allowed()`).
     // Otherwise a US/GPC or US-Privacy opt-out context — where EC identity use is
     // denied but a non-personalized auction may still run — could forward
     // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
@@ -303,8 +305,13 @@ pub async fn handle_auction(
     // EC and both KV and partner stores are available. Gate the read on a
     // present registry: without one, `resolve_auction_eids` yields no
     // server-side EIDs, so the snapshot would be an unused billable KV read.
+    // The row is read under the owning provider's canonical form of the
+    // identifier, the key it is stored under, rather than under the identifier
+    // as issued.
     let auction_kv_snapshot = match (kv, ec_id.as_deref(), registry) {
-        (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+        (Some(graph), Some(_), Some(_)) => ec_context
+            .ec_kv_key()
+            .map_or(EcKvSnapshot::NotRead, |kv_key| graph.load_snapshot(&kv_key)),
         _ => EcKvSnapshot::NotRead,
     };
     // Hand the loaded row to the request context so response finalization —
@@ -340,10 +347,9 @@ pub async fn handle_auction(
     // consent gating before attaching them to the auction request.
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-    auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+    auction_request.user.eids = gate_eids_by_permissions(merged_eids, ec_context.permissions());
     if had_eids && auction_request.user.eids.is_none() {
-        log::warn!("Auction EIDs stripped by TCF consent gating");
+        log::warn!("Auction EIDs stripped: bidstream permissions not set");
     }
 
     // Create auction context
@@ -451,7 +457,13 @@ pub(crate) fn resolve_auction_eids(
 
     let ec_id = ec_context.ec_value()?;
 
-    let Some(entry) = snapshot.entry_for(ec_id) else {
+    // Callers read the snapshot under the identity-graph key, the owning
+    // provider's canonical form of the identifier, so the entry is looked up
+    // under that key rather than under the identifier as issued.
+    let Some(entry) = ec_context
+        .kv_key_for(ec_id)
+        .and_then(|kv_key| snapshot.entry_for(&kv_key))
+    else {
         return Some(Vec::new());
     };
 
@@ -624,6 +636,7 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
@@ -671,13 +684,25 @@ mod tests {
             .build()
     }
 
-    fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
-        EcContext::new_for_test(
+    fn make_ec_context(ec_allowed: bool, ec_value: Option<&str>) -> EcContext {
+        EcContext::new_for_test_gated(
+            ec_value.map(str::to_owned),
+            ConsentContext::default(),
+            ec_allowed,
+        )
+    }
+
+    /// A context in a non-regulated jurisdiction with the permission gate open,
+    /// for tests whose subject is dispatch or identity reuse rather than the
+    /// jurisdiction gate.
+    fn make_non_regulated_ec_context(ec_value: Option<&str>) -> EcContext {
+        EcContext::new_for_test_gated(
             ec_value.map(str::to_owned),
             ConsentContext {
-                jurisdiction,
+                jurisdiction: Jurisdiction::NonRegulated,
                 ..ConsentContext::default()
             },
+            true,
         )
     }
 
@@ -729,7 +754,7 @@ mod tests {
         graph.create(&ec_id, &live).expect("should seed live row");
         lookups.store(0, std::sync::atomic::Ordering::Relaxed);
 
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut ec_context = make_non_regulated_ec_context(Some(&ec_id));
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
@@ -793,6 +818,84 @@ mod tests {
             stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
             Some("shared-cookie-id"),
             "the sharedId update must still be ingested from the shared snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_endpoint_loads_the_row_under_the_canonical_key() {
+        // The identity graph stores a row under the owning provider's
+        // canonical form of the identifier. Loaded and resolved under the
+        // identifier as issued, a provider whose canonical form differs from
+        // the cookie value found no row, so the auction carried no server-side
+        // EIDs and the context kept a snapshot bound to the wrong key.
+        let settings = create_test_settings();
+        let had_eids = Arc::new(std::sync::Mutex::new(None));
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            had_eids: Arc::clone(&had_eids),
+        }));
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("ssp.example.com")])
+            .expect("should build partner registry");
+        let graph = KvIdentityGraph::in_memory("canonical-auction-store");
+        graph
+            .create(
+                CANONICAL_KV_KEY,
+                &crate::ec::kv_types::KvEntry::minimal(
+                    "ssp.example.com",
+                    "partner-uid-123",
+                    1_741_824_000,
+                ),
+            )
+            .expect("should seed the row under the canonical key");
+        let mut ec_context = make_non_regulated_ec_context(Some(CANONICAL_COOKIE_VALUE))
+            .with_provider_for_test(Arc::new(CanonicalizingProvider));
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // The capturing provider records whether the request carried EIDs and
+        // then fails its launch, which is all this test needs. The request
+        // carries no client EIDs, so any EID it records came from the graph.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        assert!(
+            ec_context
+                .kv_snapshot()
+                .entry_for(CANONICAL_KV_KEY)
+                .is_some(),
+            "the endpoint should load the row stored under the canonical key"
+        );
+        assert_eq!(
+            *had_eids.lock().expect("should lock captured eids"),
+            Some(true),
+            "the auction should carry the canonical row's partner ID as an EID"
         );
     }
 
@@ -914,7 +1017,11 @@ mod tests {
             .geo(Arc::new(NoopGeo))
             .client_info(ClientInfo::default())
             .build();
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let mut ec_context = EcContext::new_for_test_gated(None, consent, true);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -963,7 +1070,7 @@ mod tests {
         orchestrator.register_provider(Arc::new(PanicOnBidProvider));
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let mut ec_context = make_non_regulated_ec_context(None);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -1026,7 +1133,7 @@ mod tests {
         let orchestrator = AuctionOrchestrator::from_plan(plan, None);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let mut ec_context = make_non_regulated_ec_context(None);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -1088,7 +1195,9 @@ mod tests {
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mut ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+        // The default consent context keeps the jurisdiction unknown, so the
+        // server-side auction gate fails closed; the EC gate is off to match.
+        let mut ec_context = make_ec_context(false, Some(&ec_id));
 
         let body = json!({
             "adUnits": [
@@ -1285,7 +1394,7 @@ mod tests {
     fn resolve_auction_eids_returns_empty_without_snapshot() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
@@ -1297,7 +1406,7 @@ mod tests {
     #[test]
     fn resolve_auction_eids_returns_none_without_registry() {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context);
         assert!(
@@ -1310,7 +1419,7 @@ mod tests {
     fn resolve_auction_eids_returns_none_when_consent_denied() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+        let ec_context = make_ec_context(false, Some(&ec_id));
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
@@ -1322,7 +1431,11 @@ mod tests {
     #[test]
     fn resolve_auction_eids_returns_none_when_no_ec() {
         let registry = PartnerRegistry::empty();
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let ec_context = EcContext::new_for_test_gated(None, consent, true);
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
@@ -1335,7 +1448,7 @@ mod tests {
     fn resolve_auction_eids_returns_empty_on_kv_miss() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let snapshot = EcKvSnapshot::Failed {
             ec_id: ec_id.clone(),

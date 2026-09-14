@@ -75,7 +75,7 @@ TOML file.
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `ec.passphrase`
+- `ec.providers.hmac.passphrase` (when `ec.provider = "hmac"`)
 
 ---
 
@@ -149,10 +149,13 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `passphrase` names a secret-store entry in `trusted-server.toml`:
+1. Ensure the `hmac` provider is selected and its `passphrase` names a secret-store entry in `trusted-server.toml`:
 
 ```toml
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "ec_passphrase"
 ```
 
@@ -160,7 +163,8 @@ passphrase = "ec_passphrase"
    passphrase value:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__PROVIDER=hmac
+TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=ec_passphrase
 ```
 
 3. Provision a high-entropy value of at least 32 characters under

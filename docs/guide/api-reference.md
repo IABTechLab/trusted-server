@@ -194,6 +194,18 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 
 ---
 
+### POST /\_ts/api/v1/ec/resolve
+
+Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client-fixed` demo). Server-side providers such as HMAC do not use it.
+
+**Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
+
+**Request Body:** the provider's value, opaque to the core. For the `client-fixed` demo this is the fixed known word sent as `text/plain`.
+
+**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side provider is configured, no identity graph is available, or the provider produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
+
+---
+
 ### GET /first-party/proxy
 
 Unified proxy for resources referenced by creatives (images, scripts, CSS, etc.).
@@ -547,13 +559,13 @@ The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec/`{id}`
 
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the provider this deployment selects, such as the built-in HMAC provider's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC provider also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no provider selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
 
 This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
 
 **Response fields:**
 
-- `ec_id`, `store`, and `generation` identify the raw KV lookup.
+- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC provider issued. `store` and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
