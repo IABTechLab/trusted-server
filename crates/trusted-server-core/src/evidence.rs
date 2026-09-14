@@ -297,7 +297,11 @@ mod cookie_tests {
             Some("1"),
             "spaces around the name and value are not part of either"
         );
-        assert_eq!(info.cookie("b"), Some("2"));
+        assert_eq!(
+            info.cookie("b"),
+            Some("2"),
+            "and so are the spaces around a later pair"
+        );
     }
 
     #[test]
