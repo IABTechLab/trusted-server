@@ -3,26 +3,36 @@
 **Status:** Proposed. PR #1045 carries the implementation and is not yet
 merged to main. Revised against that implementation, 2026-08-25. Revised again
 on 2026-09-01 for the `rules:` tree, which replaces the flat rule keys and
-retires `[geo] default_country` (§3.2, §5.4, and the §12 record).
+retires `[geo] default_country` (§3.2, §5.4, and the §12 record). Revised again
+on 2026-09-14 for permission signal providers, which replace the fixed signal
+precedence with a configured order (§4, and the §13 record).
 **Author:** Engineering
 **Issue references:** #779
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`
-**Last updated:** 2026-09-01
+**Last updated:** 2026-09-14
 
 > **Context.** PR #838 proposed a permission model whose review surfaced two
-> classes of defect this spec exists to prevent: (1) silent behavioral
-> inversions of consent-signal precedence, most seriously a present TCF string
-> short-circuiting GPC/GPP/US-Privacy opt-outs, and (2) fail-open jurisdiction
-> resolution when geolocation is disabled. Both defect classes are closed in
-> the implementation. The precedence rules (§4) and the failure-mode matrix
-> (§6) are normative and are now backed by pinning tests in
-> `crates/trusted-server-core/src/ec/consent.rs`. One structural position of
-> the 2026-07-31 draft was not adopted: policy remains a build-time-embedded
+> classes of defect this spec exists to prevent. The first was silent
+> inversion of consent-signal precedence, most seriously a present TCF string
+> short-circuiting GPC/GPP/US-Privacy opt-outs through a rule fixed in code.
+> The second was fail-open jurisdiction resolution when geolocation is
+> disabled. Precedence is now explicit rather than silent, being the order a
+> deployment configures, validated and logged at startup. The default order
+> lets an answer given through a consent interface amend an opt-out the
+> browser sent, and a deployment reverses that by listing the opt-out last
+> (§4). The fail-open resolution is closed. The precedence rules (§4) and the
+> failure-mode matrix (§6) are normative and are backed by tests in
+> `crates/trusted-server-core/src/permission_signal/mod.rs`,
+> `crates/trusted-server-core/src/ec/consent.rs` and
+> `crates/trusted-server-adapter-axum/tests/permission_signals.rs`. One
+> structural position of the 2026-07-31 draft was not adopted: policy remains
+> a build-time-embedded
 > `permissions.yaml`, not a `[permissions]` section of `trusted-server.toml`,
 > because the runtime config push and activation apparatus the draft assumed
 > does not exist yet (§3.1). Every other draft position that was narrowed,
-> simplified, or deferred is recorded in §11.
+> simplified, or deferred is recorded in §11, and the move to configured
+> precedence in §13.
 
 ---
 
@@ -41,17 +51,19 @@ The set is resolved from three inputs:
    (§5).
 2. **Policy**, a declarative map from jurisdiction to a baseline acquisition
    rule per permission, plus a declared signal policy (§3).
-3. **Signals**, the request's privacy signals, being TCF, GPP, GPC, and US
-   Privacy (§4).
+3. **Signals**, answered by the permission signal providers a deployment
+   configures, in the order it configures (§4). Four providers ship, one per
+   scheme, being GPC, the GPP US sale opt-out, US Privacy, and TCF, each a
+   crate under `crates/permission-signal/`.
 
-These are the initial sources. Issues #777 and #779 also envision publisher
-interaction and external services as permission sources. That source interface
-remains **explicitly deferred**, not silently dropped. §10 records the
-divergence, and the documentation (`docs/guide/permission-model.md`) already
-frames consent as one source among many so a later source plugs into the
-same mechanism. Core code resolves permissions through a per-permission
-`ConsentSignal` closure (`Grant`, `Revoke`, `Neutral`), so a new source is a
-new producer of that signal, not a new resolution algorithm.
+Issues #777 and #779 also envision publisher interaction and external services
+as permission sources. The provider seam is that source interface. A provider
+is a crate implementing `PermissionSignalProvider`
+(`crates/trusted-server-core/src/permission_signal/mod.rs`) that answers
+`Grant`, `Revoke` or `Neutral` for each permission, so a new source is a new
+provider rather than a new resolution algorithm. Core links none of the four
+shipped providers itself, and the adapters link them. §10 and §13 record the
+change.
 
 Scope. The model governs decisions Trusted Server makes. A downstream protocol
 receives the full regulatory context only where that protocol defines fields
@@ -218,10 +230,6 @@ rules:
 signals:
   tcf:
     authoritative: true
-    purposes:
-      1: necessary.operations.storage
-      4: advertising_marketing.first_party.targeted
-      # ... purposes 2, 3, 5..11 likewise
   us_opt_out:
     sources: [gpc, gpp_sale_opt_out, us_privacy_opt_out]
     revokes: all
@@ -260,13 +268,16 @@ Format rules, as implemented:
   baseline for exactly that Data Use. This adopts the draft's requirement that
   overrides name explicit target states. The earlier `+`/`-` sigil scheme,
   which could not express `requires_signal`, is gone.
-- The **signals** section is new relative to the draft. The TCF purpose to
-  Data Use mapping, the opt-out source list, and the opt-out revoke set are
-  data in the file, so no signal-to-permission policy lives in the code. The
+- The **signals** section is new relative to the draft. The opt-out source
+  list and the opt-out revoke set are data in the file, and the
   `signals.tcf.authoritative` flag governs only whether a present TCF
-  record's own grants and revokes apply. It never lets a TCF record override
-  an opt-out (§4). The `us_opt_out.revokes` value is `all` or an explicit
-  list of Data Uses, so a deployer bounds what an opt-out drops.
+  record's own grants and revokes apply. The TCF purpose to Data Use mapping
+  is not in the file. It lives in the TCF provider crate
+  (`crates/permission-signal/tcf/src/mapping.rs`), so a deployment that runs
+  no TCF carries no table of another scheme's numbers. Nor is the order the
+  signals are asked in, which is `[permission_signal] sources` in
+  `trusted-server.toml` (§4). The `us_opt_out.revokes` value is `all` or an
+  explicit list of Data Uses, so a deployer bounds what an opt-out drops.
 
 The canonical shape of the tree, as written for policy owners in
 `docs/guide/permission-model.md`:
@@ -306,7 +317,7 @@ Validation runs where the policy actually enters the system:
 - **At parse**, meaning the unit tests and any `PermissionMaps::from_yaml`
   caller, the file is rejected for: malformed YAML, a rule referencing an
   undefined group, an unknown Data Use identifier anywhere (group flag,
-  detailed-rule entry, signals purpose map, or revoke list), an acquisition
+  detailed-rule entry, or revoke list), an acquisition
   value outside `granted | requires_signal | denied`, a group without
   `default` that does not list every permission, duplicate rule keys under
   case-insensitive comparison (`us` and `US`), unknown fields on a detailed
@@ -316,7 +327,9 @@ Validation runs where the policy actually enters the system:
   acknowledgment must be present where required (§5.3). A file whose top node
   is missing either key is rejected exactly as a missing
   `[geo] default_country` was rejected before. Both are settings-construction
-  failures, never per-request failures.
+  failures, never per-request failures. A name in `[permission_signal] sources`
+  that no linked provider carries, or a name given twice, fails when the
+  adapter builds its state at startup, also never per request (§4).
 
 Not implemented from the draft's list, and recorded as future hardening
 (§11): checking rule-key country parts against the assigned ISO 3166-1 list,
@@ -362,49 +375,83 @@ else opt-in), and the US and Australia to
 
 ## 4. Signal precedence (normative, implemented)
 
-Precedence is **fixed in code**
-(`permission_signal` in `crates/trusted-server-core/src/ec/consent.rs`), not
-in policy, and runs most restrictive first. The policy file decides which
-sources count and what they revoke or grant. The code decides only the order.
+Precedence is the **order a deployment configures**, not a rule in code. The
+policy file decides what the shipped schemes mean for the deployment (§3.2),
+each permission signal provider decides what its own scheme says, and
+`[permission_signal] sources` in `trusted-server.toml` decides the order the
+providers are asked in. Each permission resolves in these steps.
 
 1. **Policy `denied`** is never set, regardless of any signal. (Enforced in
    the resolver, `PermissionMaps::resolve_with`.)
-2. **A US-style opt-out always suppresses the Data Uses the policy revokes**,
-   regardless of any consent record present. The opt-out sources are the
-   `Sec-GPC` header, a GPP US sale opt-out, and a US Privacy sale opt-out,
-   as declared in `signals.us_opt_out.sources`. A GPC header suppresses the
-   revoked Data Uses even when an accompanying TCF string consents to them.
-   An explicit opt-out is never overridden by another signal, and the
-   `signals.tcf.authoritative` flag cannot change that. (This is the rule
-   PR #838 inverted. Three pinning tests now hold it in place, one per
-   opt-out source against a consenting TCF record.)
-3. **A consent record present but undecodable revokes everything.** A
+2. **A consent record present but undecodable revokes everything**, ahead of
+   every configured provider and whichever of them are configured
+   (`permission_signal` in `crates/trusted-server-core/src/ec/consent.rs`). A
    malformed record is a preference that could not be read, so it fails
    closed rather than degrading to the no-signal baseline, which under a
-   `granted` baseline would turn garbage into a grant. It never withdraws
-   (§4.2). An **expired** TCF record is deliberately a distinct state, not
-   malformed. The decoded record is cleared, the raw string is kept for
-   proxy forwarding, and acquisition proceeds as if the record were absent,
-   so the baseline applies.
-4. **Only then does a present TCF record decide the mapped Data Uses**, when
-   `signals.tcf.authoritative` is true: granted where the record consents to
-   the mapped purpose, revoked where it does not, neutral where no purpose
-   maps. The effective record is the standalone TC string or the EU TCF
-   section of a GPP string (`effective_tcf`). A TCF refusal of a mapped
-   purpose is a revoke at this step, which drops a `granted` baseline and
-   leaves a `requires_signal` baseline unset.
-5. **No signal leaves the baseline standing**: `granted` sets the
-   permission, `requires_signal` leaves it unset.
+   `granted` baseline would turn garbage into a grant. It is error handling
+   rather than a signaling scheme, so it takes no place in the order and
+   cannot be removed, which also stops a readable record from one scheme
+   overwriting the refusal an unreadable record from another caused. It never
+   withdraws (§4.2). An **expired** TCF record is deliberately a distinct
+   state, not malformed. The decoded record is cleared, the raw string is kept
+   for proxy forwarding, and acquisition proceeds as if the record were
+   absent, so the baseline applies.
+3. **The configured providers are asked in order** (`combine` in
+   `crates/trusted-server-core/src/permission_signal/mod.rs`). Each sees the
+   baseline and what the providers before it settled on, and answers `Grant`,
+   `Revoke` or `Neutral` for the permission. A `Neutral` answer leaves the
+   prior value standing and any other answer replaces it, so **the last
+   provider with an opinion decides**. Every provider is asked, because a
+   later one may amend what an earlier one settled.
+4. **No provider with an opinion leaves the baseline standing**, so `granted`
+   sets the permission and `requires_signal` leaves it unset. A `Revoke` drops
+   a `granted` baseline, and only a `Grant` sets a `requires_signal` one.
+
+The order is set by `[permission_signal] sources`, a list of provider
+identifiers.
+
+- **Omitted**, every provider the adapter links runs, in the order the adapter
+  offers them, so a signal is never ignored because nobody listed it.
+- **An empty list** runs no provider, and every permission stays at its
+  country and region baseline.
+- **A name no linked provider carries, or a name given twice**, fails startup
+  with a message naming the providers that are available.
+- The providers acted on, and any the list leaves out, are written to the log
+  once at startup.
+
+Every adapter offers the four shipped providers in the same default order,
+being `gpc`, `gpp-sale-opt-out`, `us-privacy` and `tcf`. Global Privacy
+Control is a browser setting with no interface of its own, so it is asked
+first, and the three schemes that carry an answer a person gave through an
+interface are asked after it. Under that default a TCF record consenting to a
+mapped purpose sets a permission that a GPC header, a GPP sale opt-out or a US
+Privacy opt-out revoked, and a deployment that wants the opt-out to stand
+lists it after `tcf`. Which scheme wins is a question about a jurisdiction and
+a publisher, so the deployment decides it. The `signals.tcf.authoritative`
+flag governs only TCF's own effect, and with it false the TCF provider has no
+opinion.
+
+A provider is also given the whole ordered list and its own place in it, and
+may ask a named peer what that peer makes of a permission. That makes a rule
+such as "this answer supersedes a refusal only when Global Privacy Control
+made it" expressible inside the provider that wants it. A consultation goes
+one level deep, so two providers asking each other cannot loop.
+
+Removing `gpc` from the list stops the GPC provider running, but the consent
+pipeline can still synthesize a US Privacy opt-out from the same header for a
+US privacy state (§4.4), which the `us-privacy` provider then acts on. A
+deployment that wants the header to have no effect also turns that synthesis
+off.
 
 Two simplifications against the draft's taxonomy, both recorded in §11:
 
-- **TCF is the only grant-class signal.** The draft's grant class also
-  admitted explicit GPP/USP non-opt-out values, regime-scoped, so a US rule
-  could be `requires_signal` yet grant on signal-carrying traffic.
-  The implementation instead expresses the US posture as a `granted`
-  baseline that opt-outs revoke, so no-signal US traffic is allowed rather
-  than blocked pending a signal. Explicit non-opt-out GPP/USP values grant
-  nothing on their own.
+- **Of the shipped providers, TCF is the only grant-class signal.** The
+  draft's grant class also admitted explicit GPP/USP non-opt-out values,
+  regime-scoped, so a US rule could be `requires_signal` yet grant on
+  signal-carrying traffic. The implementation instead expresses the US posture
+  as a `granted` baseline that opt-outs revoke, so no-signal US traffic is
+  allowed rather than blocked pending a signal. Explicit non-opt-out GPP/USP
+  values grant nothing on their own.
 - **Malformed-present blocks everything, not per family.** Any present but
   undecodable record (TCF, GPP, or US Privacy) revokes every Data Use for
   the request, rather than blocking only the permissions mapped to the
@@ -413,18 +460,21 @@ Two simplifications against the draft's taxonomy, both recorded in §11:
 
 ### 4.1 Decision matrix
 
-For each permission, with baseline _B_ from the resolved rule:
+For each permission, with baseline _B_ from the resolved rule, under the
+default order:
 
-| Signal state (per §4 order)                 | B = granted | B = requires_signal | B = denied |
-| ------------------------------------------- | ----------- | ------------------- | ---------- |
-| Opt-out present, Data Use in the revoke set | unset       | unset               | unset      |
-| Any record present but undecodable          | unset       | unset               | unset      |
-| TCF present, consents to the mapped purpose | set         | set                 | unset      |
-| TCF present, refuses the mapped purpose     | unset       | unset               | unset      |
-| No signal (or neutral for this Data Use)    | set         | unset               | unset      |
+| Signal state                                                            | B = granted | B = requires_signal | B = denied |
+| ----------------------------------------------------------------------- | ----------- | ------------------- | ---------- |
+| Any record present but undecodable                                      | unset       | unset               | unset      |
+| TCF present, consents to the mapped purpose, with or without an opt-out | set         | set                 | unset      |
+| TCF present, refuses the mapped purpose                                 | unset       | unset               | unset      |
+| Opt-out present, Data Use in the revoke set, no TCF answer              | unset       | unset               | unset      |
+| No signal (or neutral for this Data Use)                                | set         | unset               | unset      |
 
-An expired TCF record resolves as the "no signal" row. Whether an unset
-outcome is also a **withdrawal** is a separate, narrower question (§4.2).
+With an opt-out listed after `tcf`, a request carrying both resolves unset
+under every baseline for the Data Uses that opt-out revokes. An expired TCF
+record resolves as the "no signal" row. Whether an unset outcome is also a
+**withdrawal** is a separate, narrower question (§4.2).
 
 ### 4.2 Withdrawal vs. absence
 
@@ -453,7 +503,7 @@ The implemented trigger, exhaustively (nothing else withdraws):
    restrictions, which suppress the permissions the policy revokes (EC
    headers stripped, nothing egressed) but never trigger destruction, so
    lifting the opt-out restores the identity.
-3. **A malformed record never withdraws.** It suppresses only (§4, step 3).
+3. **A malformed record never withdraws.** It suppresses only (§4, step 2).
    Destruction requires an affirmative, decodable signal.
 4. **Absence of signal never destroys identity.** A visitor who has not yet
    made a choice is never stripped of an existing identity.
@@ -467,11 +517,16 @@ authenticated deletion request honored in every jurisdiction, has no
 implemented carrier, as no such endpoint exists. It is recorded as deferred
 (§11), and when it arrives it joins this list as a global trigger.
 
-`ec_storage_withdrawn` (in `ec/consent.rs`, surfaced as
-`EcContext::storage_withdrawn`) has direct unit coverage for every arm
-above: refusal under `requires_signal` withdraws, refusal under `granted`
-does not, consent does not, GPC alone does not, sale opt-outs do not, no
-signal does not, malformed does not.
+A provider answers withdrawal separately from its signal, through
+`withdraws` on `PermissionSignalProvider`, and core scopes any answer to the
+baseline (`withdrawn` in `permission_signal/mod.rs`), carrying the result as
+`PermissionState::storage_withdrawn`. Of the shipped providers only TCF
+answers it. Every arm above has direct coverage in
+`crates/trusted-server-adapter-axum/tests/permission_signals.rs`, with the
+real providers assembled. Refusal under `requires_signal` withdraws, refusal
+under `granted` does not, consent does not, GPC alone does not, sale opt-outs
+do not, and no signal does not. A malformed record does not (`ec/consent.rs`),
+and a deployment whose list leaves out `tcf` cannot withdraw at all.
 
 ### 4.3 Withdrawal durability (largely deferred)
 
@@ -499,13 +554,14 @@ commit, and revocation durability is bounded by the KV store's behavior.
 ### 4.4 Signal normalization
 
 The consent subsystem (`consent/mod.rs`) remains the decoder and
-normalizer. The permission layer consumes its output only through the
-per-permission `ConsentSignal` closure. The implemented pipeline:
+normalizer. A provider reads its output as the decoded consent record on
+`SignalInput`, and a provider for a scheme the pipeline does not decode reads
+the request evidence instead. The implemented pipeline:
 
 1. Extract raw signals from cookies and headers, and decode TCF v2, GPP,
    and US Privacy. A decode failure keeps the raw string and leaves the
    decoded field empty, which the permission layer reads as
-   malformed-present (§4, step 3).
+   malformed-present (§4, step 2).
 2. Resolve standalone-TCF vs GPP-embedded-TCF conflicts per the configured
    mode (`restrictive`, `permissive`, `newest`), preserving the pre-epic
    selection algorithm.
@@ -537,7 +593,7 @@ storage cannot itself require storage.
 draft's minimal opt-out extraction was not implemented, but the fail-open
 consequence the draft feared does not arise under the permission model. A
 present record in proxy mode is present-but-undecoded, which blocks every
-baseline grant (§4, step 3), and the GPC header needs no decoding, so the
+baseline grant (§4, step 2), and the GPC header needs no decoding, so the
 GPC opt-out is honored directly. No grants are ever derived in proxy mode.
 The net posture is equal to or more restrictive than the draft's row.
 Absent records resolve to the baseline.
@@ -556,11 +612,17 @@ Implemented sources, as declared in the shipped `signals` section:
 | Absent / unknown / reserved values | Nothing                                 |
 
 An opt-out revokes the Data Uses the policy's `revokes` value names. The
-shipped file says `revokes: all`, so an opt-out drops **every** granted
-Data Use, including storage. That is deliberately broader than the draft's
-mapping, which scoped sale opt-outs to personalized-ad selection only, and
-a deployer narrows it by listing specific Data Uses instead. No
-sale-family opt-out is destructive (§4.2).
+sample policy, `config/permissions/vanilla.yaml`, lists device storage, sale,
+sharing, third-party sale, first- and third-party targeted advertising, and
+profiling, so an opted-out visitor gets no Edge Cookie written and no
+identifier shared while contextual advertising and measurement continue. That
+is broader than the draft's mapping, which scoped sale opt-outs to
+personalized-ad selection only, and a deployer changes it by editing the list
+or writing `revokes: all`. Each source is read by its own provider (`gpc`,
+`gpp-sale-opt-out`, `us-privacy`), which runs only when
+`[permission_signal] sources` includes it or is omitted, and whether an
+opt-out stands over a TCF answer is the order (§4). No sale-family opt-out is
+destructive (§4.2).
 
 The remainder of the draft's §4.5 is **not implemented** and is recorded
 as deferred: `SharingOptOut` and `TargetedAdvertisingOptOut` as distinct
@@ -709,7 +771,7 @@ requires a live user signal (§4.2), never a policy change.
 | Malformed `permissions.yaml`                      | Parse error at settings load, once per instance, because the embedded file is a build-time constant, never per-request                                                                                                             |
 | Undecodable record present (TCF, GPP, or USP)     | Revokes every Data Use (fail-closed acquisition), never withdraws, and still honors opt-outs                                                                                                                                       |
 | Expired TCF record                                | Distinct state, not malformed, and treated as absent, so the baseline applies                                                                                                                                                      |
-| Signals contradict (opt-out plus consent)         | Opt-out wins (§4)                                                                                                                                                                                                                  |
+| Signals contradict (opt-out plus consent)         | The later provider in the configured order decides, so under the default order a TCF consent amends an earlier opt-out (§4)                                                                                                        |
 | No EC provider selected                           | Identity fails closed, with nothing created and an incoming cookie value never used or egressed (§7)                                                                                                                               |
 
 The posture is fail-closed. Every ambiguous state resolves to the
@@ -804,14 +866,18 @@ work.
 
 ## 8. Testing strategy
 
-Implemented, in `permissions.rs`, `ec/consent.rs`, `ec/mod.rs`,
-`ec/finalize.rs`, and `consent/mod.rs`:
+Implemented, in `permissions.rs`, `permission_signal/mod.rs`,
+`ec/consent.rs`, `ec/mod.rs`, `ec/finalize.rs`, `consent/mod.rs`, the four
+provider crates, and `crates/trusted-server-adapter-axum/tests/permission_signals.rs`:
 
-- **Signal precedence pinning.** Three opt-out-beats-TCF tests, one per
-  opt-out source against a consenting TCF record
-  (`gpc_suppresses_storage_even_with_a_consenting_tcf_record` and
-  companions). These reinstate the
-  behavior PR #838 inverted.
+- **Signal order.** The last provider with an opinion decides, silence
+  leaves an earlier answer standing, and silence from every provider is not
+  a refusal. One test per opt-out source shows a TCF answer applied over it
+  under the default order (`a_prompt_answer_applies_over_a_gpc_signal` and
+  companions), and `the_opt_out_wins_when_a_deployment_puts_it_last` shows
+  the reverse. An omitted `sources` runs every provider in the offered order,
+  a configured list is the order they run in, an empty list is accepted, and
+  an unknown or repeated name is refused.
 - **Withdrawal scoping.** One test per §4.2 arm: refusal under
   `requires_signal` withdraws, refusal under `granted` suppresses without
   destroying, consent is not a withdrawal, GPC alone never withdraws, sale
@@ -864,12 +930,12 @@ their deferred features.
 This spec supersedes #779 on the following points, so there is one
 acceptance contract, not two:
 
-| #779 says                                                                                    | This spec says                                                                                                                                                                                  | Why                                                                                                                         |
-| -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Unmatched countries fall to `default_country`                                                | Adopted, with a changed mechanism since 2026-09-01. Unmatched and unresolved requests both fall to the required top node of the `rules:` tree, and a **failed** lookup floors instead (§5, §12) | The failure state is the one that must never reach a permissive default, and the draft's `rules.default` split was not kept |
-| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended. All eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)                                                               | The joint taxonomy work made whole-taxonomy declaration the goal, and `denied` defaults keep undeclared uses inert          |
-| Policy is an embedded file                                                                   | Adopted. `permissions.yaml` is compiled into the build (§3.1), and runtime configuration is deferred follow-up                                                                                  | The runtime push and activation pipeline does not exist, and version control is the audit trail meanwhile                   |
-| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Sources are jurisdiction, policy, and the §4 signals. Further sources are deferred, and the `ConsentSignal` closure is their seam (§1)                                                          | Shipping an interface with no second source repeats the inert-surface mistake, and the extension seam is defined            |
+| #779 says                                                                                    | This spec says                                                                                                                                                                                  | Why                                                                                                                                                                          |
+| -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unmatched countries fall to `default_country`                                                | Adopted, with a changed mechanism since 2026-09-01. Unmatched and unresolved requests both fall to the required top node of the `rules:` tree, and a **failed** lookup floors instead (§5, §12) | The failure state is the one that must never reach a permissive default, and the draft's `rules.default` split was not kept                                                  |
+| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended. All eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)                                                               | The joint taxonomy work made whole-taxonomy declaration the goal, and `denied` defaults keep undeclared uses inert                                                           |
+| Policy is an embedded file                                                                   | Adopted. `permissions.yaml` is compiled into the build (§3.1), and runtime configuration is deferred follow-up                                                                                  | The runtime push and activation pipeline does not exist, and version control is the audit trail meanwhile                                                                    |
+| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Adopted as a seam. A source is a permission signal provider, a crate implementing `PermissionSignalProvider`, asked in the order a deployment configures (§1, §4)                               | The four shipped schemes already use it from outside core, so the interface has real consumers, and publisher interaction or an external service arrives as another provider |
 
 ## 11. Revision record vs the 2026-07-31 draft
 
@@ -885,7 +951,7 @@ PR #1045).
 | Overrides name explicit acquisition rules, replacing the `+`/`-` sigils (§3.2)                                                                            | Adopted. A detailed rule's `permissions` map assigns `granted`, `requires_signal`, or `denied` per Data Use                                                                                                                                                                           | The draft's requirement, expressed in the YAML schema. `requires_signal` is now expressible per rule                                                                                          |
 | Two fallbacks: policy `rules.default` for unmatched countries, `default_country` only for the static no-geo mode (§5.4)                                   | One required fallback covers unmatched and unresolved requests in every mode, startup-validated, and a failed lookup floors separately. It was `[geo] default_country` until 2026-09-01 and is now the top node of the `rules:` tree (§12)                                            | One deployer knob is simpler, and the safety-critical separation kept is failure vs absence, carried by `GeoStatus`                                                                           |
 | Validation checks assigned ISO 3166-1 codes, assigned subdivisions, and a group identifier grammar (§3.3)                                                 | Validation covers unknown groups, permissions, acquisitions, revoke rules, incomplete groups, case-duplicate rule keys, and unknown fields on detailed rules                                                                                                                          | Smaller surface shipped first, and the EU/EEA coverage test guards the shipped table against the typo class. ISO-assignment checks are future hardening                                       |
-| Three-class signal taxonomy with regime-scoped grant acceptance, where the US posture is `requires_signal` with GPP/USP non-opt-out values as grants (§4) | TCF is the only grant source, the US posture is a `granted` baseline that opt-outs revoke, and explicit non-opt-out values grant nothing                                                                                                                                              | A simpler two-signal model without regimes. The cost, no-signal US traffic is allowed by baseline rather than blocked pending a signal, is a deliberate policy choice in the shipped file     |
+| Three-class signal taxonomy with regime-scoped grant acceptance, where the US posture is `requires_signal` with GPP/USP non-opt-out values as grants (§4) | Of the shipped providers TCF is the only grant source, the US posture is a `granted` baseline that opt-outs revoke, and explicit non-opt-out values grant nothing                                                                                                                     | A simpler two-signal model without regimes. The cost, no-signal US traffic is allowed by baseline rather than blocked pending a signal, is a deliberate policy choice in the shipped file     |
 | Malformed-present blocks grants per record family and mapped section (§4.4, §4.5)                                                                         | Any present-but-undecodable record revokes every Data Use for the request                                                                                                                                                                                                             | Strictly more restrictive simplification, and per-family scoping needs the full §4.5 decoder work                                                                                             |
 | Normalization runs expiry before conflict resolution, a declared change (§4.4)                                                                            | Conflict resolution still runs before the expiry check                                                                                                                                                                                                                                | The reordering was not implemented, though the expired state itself (distinct from malformed, absent for acquisition) was adopted                                                             |
 | Persisted-KV consent flows through the full normalization pipeline with an explicit TTL comparison (§4.4)                                                 | The loaded record substitutes directly when the request carries no signals, jurisdiction re-derived, and staleness is enforced by the store TTL (`max_consent_age_days`)                                                                                                              | The store-level TTL delivers the staleness bound without a second normalization pass                                                                                                          |
@@ -897,7 +963,7 @@ PR #1045).
 | §3.4 single jurisdiction truth, and §7 dispatch gated on the policy regime with a contextual projection                                                   | Half adopted. Since 2026-09-01 the `rules:` tree carries regime applicability and the two `[consent]` lists retire into it (§3.4), while auction dispatch still keeps the consent-subsystem gate (effective TCF Purpose 1 for GDPR or unknown jurisdictions), with no contextual view | Dispatch migration is follow-up. The legacy-list drift risk the draft named still stands and is recorded rather than resolved                                                                 |
 | Every raw-EC egress path is pair-gated, with per-row tests and a denylist check (§7)                                                                      | Pair gating is centralized in `ec_sharing_allowed` (auction endpoint `user.id`, publisher navigation and page-bids `user.id`, identify, pull sync) and `gate_eids_by_permissions` (EIDs everywhere). Batch sync checks row state only                                                 | Partial adoption. Aligning the remaining paths, the S2S stored-provenance authority, and the inventory tests is recorded follow-up                                                            |
 | Identity rows never store raw consent strings, only normalized provenance and a digest (§1)                                                               | The identity-graph entry stores the raw TCF and GPP strings with the row                                                                                                                                                                                                              | The normalized provenance schema belongs to the providers-spec storage work, and until then rows carry the raw strings                                                                        |
-| No signals block in policy, and the signal mapping is fixed in the spec                                                                                   | New. A `signals` section in `permissions.yaml` declares the TCF purpose map, opt-out sources, and revoke set, with `tcf.authoritative` governing only TCF's own effect                                                                                                                | Moves signal policy from code into deployer-editable data, and the flag can never let a TCF record override an opt-out, preserving §4 precedence                                              |
+| No signals block in policy, and the signal mapping is fixed in the spec                                                                                   | New. A `signals` section in `permissions.yaml` declares the opt-out sources and revoke set, with `tcf.authoritative` governing only TCF's own effect. The TCF purpose map has since moved into the TCF provider crate (§13)                                                           | Moves signal policy from code into deployer-editable data, while what a scheme's own signal means stays with that scheme's provider                                                           |
 | The §5.3 no-geo guard covers every jurisdiction consumer                                                                                                  | The guard fires when an Edge Cookie provider is configured with no geo provider                                                                                                                                                                                                       | The EC provider is the only policy-gated consumer today, and the trigger list grows when dispatch and further egress paths join the model                                                     |
 | `default_country` is required only in the acknowledged static no-geo mode (§5.4)                                                                          | Required always and startup-validated. Since 2026-09-01 the requirement sits on the `rules:` tree's top node, which must carry a `group` and a `jurisdiction` (§12)                                                                                                                   | It is the baseline for unmatched requests in every mode, so it must always exist                                                                                                              |
 
@@ -925,3 +991,20 @@ precedence of §4, and the requires-signal floor for a failed geo lookup, which
 stays distinct from having no location. Trusted Server still encodes no
 jurisdiction's law, as the deployer states the policy and the software carries
 it out.
+
+## 13. Revision record: permission signal providers (2026-09-14)
+
+Signal precedence moves from a fixed rule in code to the order a deployment
+configures, and the four shipped schemes move out of core into provider
+crates. One row per change.
+
+| Before                                                                                                                 | After                                                                                                                                                                                                                                                                                    | Why                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Precedence fixed in code, most restrictive first, so an opt-out always beat a consenting TCF record                    | The order in `[permission_signal] sources`, where the last provider with an opinion decides, validated and logged at startup (§4)                                                                                                                                                        | Which scheme wins is a question about a jurisdiction and a publisher, and a fixed rule answers it in code for every deployment                                                                                         |
+| A GPC header suppressed a Data Use that a TCF record consented to                                                      | The default order is `gpc`, `gpp-sale-opt-out`, `us-privacy`, `tcf`, so a TCF answer amends an earlier opt-out, and listing the opt-out after `tcf` restores the previous outcome                                                                                                        | Global Privacy Control is a browser setting with no interface of its own, and the other three carry an answer a person gave through an interface, so by default that answer amends the header the visitor arrived with |
+| Signals resolved inside core through a per-permission `ConsentSignal` closure, with further sources deferred (§1, §10) | A `PermissionSignalProvider` trait in core, with GPC, the GPP sale opt-out, US Privacy and TCF each a crate under `crates/permission-signal/` that core does not link                                                                                                                    | A scheme core has never heard of plugs in without a change to core, and none of the four is privileged by being built in                                                                                               |
+| The TCF purpose to Data Use map in the `signals` section of `permissions.yaml` (§3.2)                                  | The map in the TCF provider crate, `crates/permission-signal/tcf/src/mapping.rs`                                                                                                                                                                                                         | A deployment that runs no TCF carries no table of another scheme's numbers                                                                                                                                             |
+| Malformed-present as step 3 of the fixed order                                                                         | Ahead of every provider and not configurable (§4, step 2)                                                                                                                                                                                                                                | It is error handling rather than a signaling scheme, and a place in the order would let a readable record from one scheme overwrite the refusal an unreadable record from another caused                               |
+| Withdrawal decided in core from the TCF record                                                                         | A `withdraws` answer on the provider trait, scoped by core to the storage baseline, and given today only by TCF (§4.2)                                                                                                                                                                   | Revoking and withdrawing stay different questions, and a new scheme can carry its own withdrawal                                                                                                                       |
+| The permission state carries the resolved set only                                                                     | It also carries `tdls`, the terms documents the configured providers declare, in provider order with duplicates removed, and the page receives `{"set":[],"tdls":[]}`. Each entry must address a document never edited once published, which the `Tdl` type documents and cannot enforce | A recipient needs the exact terms the data is available under, and an empty list says no terms were declared rather than that anything is permitted                                                                    |
+| Opt-out-beats-TCF pinning tests                                                                                        | Order tests in both directions, per-source tests, and selection tests (§8)                                                                                                                                                                                                               | The tests pin the configured behavior rather than the retired rule                                                                                                                                                     |
