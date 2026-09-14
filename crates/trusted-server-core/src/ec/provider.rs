@@ -270,10 +270,15 @@ fn set_cookie_name(value: &[u8]) -> &[u8] {
 /// later request, for example), so the rule reserves core's namespace rather
 /// than banning `Set-Cookie` outright.
 ///
-/// A rejected effect fails the request rather than being dropped, because a
+/// A rejected effect is not simply dropped while the rest of the provider
+/// response goes ahead. Generation returns an error instead, as it does for a
+/// provider creating an identifier outside the cookie-safe alphabet, because a
 /// provider reaching into the reserved surface has broken its contract in the
-/// same way as one creating an identifier outside the cookie-safe alphabet, and
-/// that already fails the request. Serving the response instead would let a
+/// same way. The check runs before anything from that provider response is
+/// kept, so neither its identifier nor any of its headers is kept. The
+/// publisher proxy and integration proxy log the error and serve the response
+/// without an Edge Cookie, and orphan recovery in EC finalization leaves the
+/// visitor's existing cookie in place. Applying the header instead would let a
 /// provider set `ts-ec` directly, bypassing core's identifier validation and
 /// its requirement that a created identifier have an identity-graph row.
 #[must_use]
@@ -320,10 +325,11 @@ pub fn reserved_response_effect(
 ///   `Vary: Accept-Encoding` with the provider's own would break the cache
 ///   correctness the origin asked for.
 /// - The single-valued headers where replacing would be the right answer are
-///   exactly the ones a provider must not author at all, and
-///   [`reserved_response_effect`] already fails the request for them: core's
-///   `x-ts-` namespace, the `ts-` managed cookies, and the framing and
-///   hop-by-hop set.
+///   exactly the ones a provider must not author at all, being core's `x-ts-`
+///   namespace, the `ts-` managed cookies, and the framing and hop-by-hop set.
+///   [`reserved_response_effect`] rejects those before anything from the
+///   provider response is kept, so generation returns an error and none of
+///   them reaches the response.
 ///
 /// So nothing a provider is permitted to set here needs to replace, and
 /// accumulating is the direction that cannot silently destroy someone else's
@@ -464,16 +470,17 @@ pub fn split_provider_code(full: &str) -> (Option<&str>, &str) {
 /// visitor's bare cookie is never rewritten into the coded form, and its
 /// `COOKIE_MAX_AGE` lifetime in [`cookies`](super::cookies) (one year, not
 /// operator-configurable) runs from the moment it was written. The
-/// identity-graph row is not fixed the same way: an ordinary page view that
-/// ingests `ts-eids` or `sharedId` cookies runs `ingest_eid_cookies` in
-/// `ec_finalize_response` (see [`finalize`](super::finalize)), which rewrites
-/// the bare-keyed row with a fresh `ENTRY_TTL` in [`kv`](super::kv) (also one
-/// year), so the row's clock restarts on each such view. The earliest safe
-/// retirement is therefore one year after the last write that could still
-/// leave a bare-keyed row, which is the later of the last release that could
-/// still create a bare identifier stopping everywhere and the last page view
-/// that refreshed such a row, plus however long a deployment's own rollout
-/// takes to reach every point of presence.
+/// identity-graph row is not fixed the same way. When the `ts-eids` or
+/// `sharedId` cookies on an ordinary page view add or change a partner ID in
+/// the row, `ec_finalize_response` (see [`finalize`](super::finalize)) writes
+/// the bare-keyed row back through `upsert_partner_ids_from_snapshot` with a
+/// fresh `ENTRY_TTL` in [`kv`](super::kv) (also one year), so the row's clock
+/// restarts on each such view. The earliest safe retirement is therefore one
+/// year after the last write that could still leave a bare-keyed row, which
+/// is the later of the last release that could still create a bare
+/// identifier stopping everywhere and the last page view that refreshed such
+/// a row, plus however long a deployment's own rollout takes to reach every
+/// point of presence.
 ///
 /// The other half of that condition, evidence that bare identifiers really
 /// have stopped arriving, cannot be checked today. Nothing counts or logs a
@@ -525,12 +532,13 @@ pub fn provider_kv_key(provider: &dyn EdgeCookieProvider, full: &str) -> String 
 /// second provider's identifiers can never be adopted or written under this
 /// deployment's keys.
 ///
-/// Batch sync keys its rows through [`canonical_kv_key`](Self::canonical_kv_key)
-/// here. Pull sync and the admin lookup still read and write rows by the raw
-/// active identifier rather than the canonical form, so for a provider whose
-/// canonical form differs from the cookie value they can key the wrong row.
-/// That gap is recorded on `EcContext::kv_key_for` and tracked as a known
-/// issue for a later change.
+/// All three look rows up under the key
+/// [`canonical_kv_key`](Self::canonical_kv_key) returns rather than under the
+/// identifier as given, and pull sync and batch sync also write under that
+/// key, so a provider whose canonical form differs from the cookie value still
+/// reaches the row it created. Batch sync and the admin lookup call
+/// `canonical_kv_key` directly. Pull sync calls `canonical_kv_key` through
+/// `EcContext::kv_key_for` and still sends partners the identifier as issued.
 ///
 /// The set holds the deployment's active provider. The design's
 /// `legacy_providers` reader list, the providers that never create but must still
@@ -593,8 +601,7 @@ impl<'a> AcceptedProviders<'a> {
                 provider_owns_id(owner, &key).then_some(key)
             }
             // No provider is selected, so there is no code to dispatch on and
-            // the built-in HMAC grammar is the fallback, the same fallback
-            // `EcContext::accepts_id` has always used for a stateless
+            // the built-in HMAC grammar is the fallback for a stateless
             // deployment.
             None if self.readers.is_empty() => {
                 let key = generation::normalize_ec_id_for_kv(full);
