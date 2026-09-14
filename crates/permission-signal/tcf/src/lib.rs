@@ -156,7 +156,11 @@ mod tests {
 
     #[test]
     fn answers_to_its_identifier() {
-        assert_eq!(TcfProvider::new().id(), ID);
+        assert_eq!(
+            TcfProvider::new().id(),
+            ID,
+            "the provider answers to the identifier configuration names"
+        );
     }
 
     #[test]
