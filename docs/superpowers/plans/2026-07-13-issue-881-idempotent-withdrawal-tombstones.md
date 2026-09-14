@@ -11,11 +11,13 @@
 Make explicit EC withdrawal idempotent across repeated and concurrent requests
 without weakening the existing-key-only privacy invariant introduced by PR
 #885. The first successful withdrawal of a live row writes a CAS-protected
-24-hour tombstone and a same-TTL completion marker. A request that already has
-authoritative tombstone state returns without reading or writing KV. When an
-eventually consistent point read instead misses the existing tombstone, the
-strongly read completion marker prevents an unconditional replacement write,
-so neither path refreshes the tombstone's entry timestamp or TTL.
+24-hour tombstone and a completion marker whose key records the tombstone's
+absolute validity bound. A request that already has authoritative tombstone
+state returns without reading or writing KV. When an eventually consistent
+point read instead misses the existing tombstone, a strongly listed marker
+prevents an unconditional replacement write only while the original tombstone
+should still exist. An expired marker cannot suppress withdrawal of a recreated
+live row.
 
 Browser-cookie deletion remains synchronous and best-effort KV failure must
 never block the response.
@@ -40,7 +42,8 @@ never block the response.
   performs no second root write. A completion-marker insert is attempted only
   after the first successful tombstone write.
 - A repeated stale point-read miss uses the strongly consistent completion
-  marker to avoid another unconditional root write.
+  marker to avoid another unconditional root write. The marker key records
+  `consent.updated + TOMBSTONE_TTL` and is ignored at or after that bound.
 - Completion-marker failure never suppresses the privacy write. Explicit
   same-key CAS revival and hard deletion clear the marker before replacing or
   removing the tombstoned generation.
@@ -119,12 +122,15 @@ A successful tombstone remains `consent.ok = false`, has empty partner IDs, and
 uses `TOMBSTONE_TTL`.
 
 Each successful root tombstone also creates an add-only completion marker in the
-same EC store with `TOMBSTONE_TTL`. The marker namespace cannot collide with EC
-IDs and is excluded from hash-prefix cluster counts. If a later point read
-misses but the exact, strongly read marker exists, withdrawal returns without a
-second strong root-existence check or root rewrite. Marker read or write
+same EC store with `TOMBSTONE_TTL`. Its key includes the original tombstone's
+absolute validity bound. The marker namespace cannot collide with EC IDs and is
+excluded from hash-prefix cluster counts. If a later point read misses and a
+strong prefix list returns a correctly shaped marker whose bound is still in
+the future, withdrawal returns without a second strong root-existence check or
+root rewrite. Expired or malformed markers are ignored. Marker read or write
 failures fall back to the root privacy write. Explicit same-key CAS revival and
-hard deletion remove the marker. Fresh-ID creation does not read marker state.
+hard deletion remove markers for that EC ID. Fresh-ID creation does not read
+marker state.
 
 ### 2. Contain the unconditional fallback
 
@@ -154,6 +160,8 @@ each write's mode and TTL. Tests must show:
 - two consecutive stale point-read misses cause one unconditional root write;
   the second request observes the strong completion marker and leaves the root
   generation and `consent.updated` unchanged;
+- an expired root recreated under the same key is tombstoned when the point
+  read misses, because the older marker's absolute bound is no longer valid;
 - two stale live snapshots model parallel requests: the first writes the
   tombstone; the second conflicts, rereads the tombstone, and performs no
   replacement write;
@@ -243,9 +251,10 @@ is expected. The EC store gains an internal completion-marker key namespace.
       serialization, or write.
 - [x] Keep live/missing/failed/mismatched/CAS behavior unchanged.
 - [x] Record completion after successful tombstone writes.
-- [x] Check the exact completion marker before strong root existence so a
-      repeated stale miss performs one strong read.
-- [x] Suppress repeated stale-miss overwrites when the completion marker exists.
+- [x] Strongly list and validate completion markers before checking root
+      existence so a repeated stale miss performs one strong read.
+- [x] Suppress repeated stale-miss overwrites only while a marker's encoded
+      tombstone-validity bound is still in the future.
 - [x] Clear completion state on explicit same-key CAS revival and hard deletion.
 - [x] Keep fresh-ID creation independent of marker availability.
 - [x] Run focused KV tests until green.
@@ -349,11 +358,15 @@ git diff --check
   subsequent insert attempt at the wrapper boundary; stable root
   generation/timestamp alone is not sufficient evidence.
 - **Stale-miss completion:** Write the marker only after the root tombstone
-  succeeds. Marker failures must fall back to the privacy write. Explicit
-  same-key CAS revival and hard deletion must remove stale completion state.
-- **Fallback containment:** Check the exact completion marker first. Keep
-  unconditional overwrite behind strong root existence when no marker exists
-  so no other path can refresh a completed tombstone.
+  succeeds. Encode the original tombstone's absolute validity bound in the key
+  and ignore the marker after that bound. Marker failures must fall back to the
+  privacy write. Explicit same-key CAS revival and hard deletion must remove
+  stale completion state. Revival and hard deletion fail closed before changing
+  the root when a bounded marker list is full, rather than making partial
+  cleanup progress that could leave a future live row next to an unseen marker.
+- **Fallback containment:** Strongly list and validate completion markers first.
+  Keep unconditional overwrite behind strong root existence when no valid
+  marker exists so no other path can refresh a completed tombstone.
 - **Conflict-test realism:** Inject actual generation changes and persisted
   state, not endless synthetic precondition failures.
 - **Stack dependency:** Reconcile changes if PR #885 or draft PR #900 modifies
