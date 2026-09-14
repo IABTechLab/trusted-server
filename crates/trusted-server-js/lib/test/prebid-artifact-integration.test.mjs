@@ -84,9 +84,12 @@ describe('tsjs-prebid shim artifact', () => {
     expect(shimCode).not.toContain('_pbjsGlobals');
 
     // A value-import of Prebid or a private rendering helper would multiply
-    // the shim size; retain a margin above the normal compact shim output.
+    // the shim size. The bound sits just above the normal compact shim output,
+    // which is roughly 42 KB on this release candidate: material growth must be
+    // noticed and re-justified here, and far enough below a multiplication
+    // that one still fails loudly. The bundle beside it is 200 KB and up.
     expect(bundleCode.length).toBeGreaterThan(200_000);
-    expect(shimCode.length).toBeLessThan(40_000);
+    expect(shimCode.length).toBeLessThan(43_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 });
