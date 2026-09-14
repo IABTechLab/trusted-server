@@ -452,16 +452,17 @@ pub fn split_provider_code(full: &str) -> (Option<&str>, &str) {
 /// visitor's bare cookie is never rewritten into the coded form, and its
 /// `COOKIE_MAX_AGE` lifetime in [`cookies`](super::cookies) (one year, not
 /// operator-configurable) runs from the moment it was written. The
-/// identity-graph row is not fixed the same way: an ordinary page view that
-/// ingests `ts-eids` or `sharedId` cookies runs `ingest_eid_cookies` in
-/// `ec_finalize_response` (see [`finalize`](super::finalize)), which rewrites
-/// the bare-keyed row with a fresh `ENTRY_TTL` in [`kv`](super::kv) (also one
-/// year), so the row's clock restarts on each such view. The earliest safe
-/// retirement is therefore one year after the last write that could still
-/// leave a bare-keyed row, which is the later of the last release that could
-/// still create a bare identifier stopping everywhere and the last page view
-/// that refreshed such a row, plus however long a deployment's own rollout
-/// takes to reach every point of presence.
+/// identity-graph row is not fixed the same way. When the `ts-eids` or
+/// `sharedId` cookies on an ordinary page view add or change a partner ID in
+/// the row, `ec_finalize_response` (see [`finalize`](super::finalize)) writes
+/// the bare-keyed row back through `upsert_partner_ids_from_snapshot` with a
+/// fresh `ENTRY_TTL` in [`kv`](super::kv) (also one year), so the row's clock
+/// restarts on each such view. The earliest safe retirement is therefore one
+/// year after the last write that could still leave a bare-keyed row, which
+/// is the later of the last release that could still create a bare
+/// identifier stopping everywhere and the last page view that refreshed such
+/// a row, plus however long a deployment's own rollout takes to reach every
+/// point of presence.
 ///
 /// The other half of that condition, evidence that bare identifiers really
 /// have stopped arriving, cannot be checked today. Nothing counts or logs a

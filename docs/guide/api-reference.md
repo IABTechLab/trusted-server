@@ -547,7 +547,7 @@ The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec/`{id}`
 
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the provider this deployment selects, such as the built-in HMAC provider's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC provider also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no provider selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
 
 This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
 
