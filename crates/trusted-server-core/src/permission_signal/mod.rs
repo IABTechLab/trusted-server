@@ -609,7 +609,11 @@ mod tests {
 
     #[test]
     fn no_providers_leaves_the_place_baseline_alone() {
-        assert_eq!(combined_signals(&[]), ConsentSignal::Neutral);
+        assert_eq!(
+            combined_signals(&[]),
+            ConsentSignal::Neutral,
+            "with no provider configured nothing amends the place baseline"
+        );
     }
 
     #[test]
@@ -634,11 +638,13 @@ mod tests {
         // uses undo the one that was working.
         assert_eq!(
             combined_signals(&[ConsentSignal::Grant, ConsentSignal::Neutral]),
-            ConsentSignal::Grant
+            ConsentSignal::Grant,
+            "a later provider with no opinion leaves an earlier grant standing"
         );
         assert_eq!(
             combined_signals(&[ConsentSignal::Revoke, ConsentSignal::Neutral]),
-            ConsentSignal::Revoke
+            ConsentSignal::Revoke,
+            "and a later silence leaves an earlier refusal standing too"
         );
     }
 
@@ -649,7 +655,8 @@ mod tests {
         // not carry that scheme, which is most of them.
         assert_eq!(
             combined_signals(&[ConsentSignal::Neutral, ConsentSignal::Neutral]),
-            ConsentSignal::Neutral
+            ConsentSignal::Neutral,
+            "no provider having an opinion is not a refusal"
         );
     }
 
@@ -681,7 +688,11 @@ mod tests {
 
         let providers: Vec<Arc<dyn PermissionSignalProvider>> =
             vec![fixed("opt-out", ConsentSignal::Revoke), Arc::new(Recording)];
-        assert_eq!(combined(&providers), ConsentSignal::Revoke);
+        assert_eq!(
+            combined(&providers),
+            ConsentSignal::Revoke,
+            "the recording provider has no opinion, so the opt-out stands"
+        );
     }
 
     #[test]
@@ -695,7 +706,11 @@ mod tests {
                 peer: "gpc",
             }),
         ];
-        assert_eq!(combined(&providers), ConsentSignal::Grant);
+        assert_eq!(
+            combined(&providers),
+            ConsentSignal::Grant,
+            "a later provider overrides a refusal made by the peer it consulted"
+        );
 
         // The same provider leaves the refusal alone when it came from a peer
         // it was not told to override.
@@ -706,7 +721,11 @@ mod tests {
                 peer: "gpc",
             }),
         ];
-        assert_eq!(combined(&providers), ConsentSignal::Revoke);
+        assert_eq!(
+            combined(&providers),
+            ConsentSignal::Revoke,
+            "and leaves a refusal from any other peer standing"
+        );
     }
 
     #[test]
@@ -741,14 +760,21 @@ mod tests {
                     input.ask("not-configured", permission).is_none(),
                     "a provider must be able to tell a missing peer from a silent one"
                 );
-                assert!(!input.has("not-configured"));
+                assert!(
+                    !input.has("not-configured"),
+                    "and sees that the peer is not in the list"
+                );
                 assert!(input.has("absent"), "and can see itself in the list");
                 ConsentSignal::Neutral
             }
         }
 
         let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(Absent)];
-        assert_eq!(combined(&providers), ConsentSignal::Neutral);
+        assert_eq!(
+            combined(&providers),
+            ConsentSignal::Neutral,
+            "a provider that finds its peer missing leaves the permission unsettled"
+        );
     }
 
     #[test]
@@ -762,13 +788,20 @@ mod tests {
 
             fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
                 // Without the guard this recurses until the stack is gone.
-                assert!(input.ask("self-asking", permission).is_none());
+                assert!(
+                    input.ask("self-asking", permission).is_none(),
+                    "a provider asking itself gets no answer"
+                );
                 ConsentSignal::Grant
             }
         }
 
         let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(SelfAsking)];
-        assert_eq!(combined(&providers), ConsentSignal::Grant);
+        assert_eq!(
+            combined(&providers),
+            ConsentSignal::Grant,
+            "a provider refused its own consultation still answers for itself"
+        );
     }
 
     #[test]
@@ -786,7 +819,11 @@ mod tests {
                 peer: "first",
             }),
         ];
-        assert_eq!(combined(&providers), ConsentSignal::Neutral);
+        assert_eq!(
+            combined(&providers),
+            ConsentSignal::Neutral,
+            "two providers consulting each other settle instead of looping"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -817,12 +854,18 @@ mod tests {
         // and must never destroy an identifier.
         let providers: Vec<Arc<dyn PermissionSignalProvider>> =
             vec![fixed("opt-out", ConsentSignal::Revoke)];
-        assert!(!withdrawn_under(&providers, Acquisition::RequiresSignal));
+        assert!(
+            !withdrawn_under(&providers, Acquisition::RequiresSignal),
+            "a provider that only revokes never withdraws"
+        );
     }
 
     #[test]
     fn no_providers_never_withdraw() {
-        assert!(!withdrawn_under(&[], Acquisition::RequiresSignal));
+        assert!(
+            !withdrawn_under(&[], Acquisition::RequiresSignal),
+            "with no provider configured nothing can withdraw"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -863,7 +906,7 @@ mod tests {
     #[test]
     fn an_empty_list_is_acting_on_no_signal_and_is_accepted() {
         let selected = select(&four(), Some(&[])).expect("should accept an empty list");
-        assert!(selected.is_empty());
+        assert!(selected.is_empty(), "an empty list selects no provider");
         assert_eq!(
             omitted(&four(), Some(&[])).len(),
             4,
@@ -901,7 +944,8 @@ mod tests {
         let configured = names(&["gpc", "tcf"]);
         assert_eq!(
             omitted(&four(), Some(&configured)),
-            vec!["gpp-sale-opt-out", "us-privacy"]
+            vec!["gpp-sale-opt-out", "us-privacy"],
+            "the providers the list leaves out are reported in the offered order"
         );
         assert!(
             omitted(&four(), None).is_empty(),
