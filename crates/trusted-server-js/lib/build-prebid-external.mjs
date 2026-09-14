@@ -304,8 +304,7 @@ function resolveSpecifierFromInstalledPackage(specifier) {
 function resolveOneModule(stem, definition, context) {
   const metadataFilename = `${stem}.json`;
   const metadataPath = path.join(context.metadataDir, metadataFilename);
-  const metadataEntries = fs.readdirSync(context.metadataDir);
-  if (!metadataEntries.includes(metadataFilename)) {
+  if (!context.metadataEntries.has(metadataFilename)) {
     throw unsupportedModuleError(definition, stem, context.prebidVersion);
   }
 
@@ -448,6 +447,7 @@ export function resolveBundleModules(
     );
   }
 
+  const metadataEntries = new Set(fs.readdirSync(canonicalMetadataDir));
   const userIdModules = new Set(registry.modules.map((entry) => entry.moduleName));
   const resolved = { bidder: [], userId: [], analytics: [] };
 
@@ -462,6 +462,7 @@ export function resolveBundleModules(
         resolveOneModule(stem, definition, {
           prebidVersion,
           metadataDir: canonicalMetadataDir,
+          metadataEntries,
           resolveSpecifier,
           canonicalPackageDir,
         })

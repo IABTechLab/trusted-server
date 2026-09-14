@@ -77,6 +77,7 @@ provider = "pbs-main"
 ```
 
 ### Browser configuration options
+
 | Field                                | Default                                                                | Ownership and behavior                                                              |
 | ------------------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `enabled`                            | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider |
@@ -141,7 +142,6 @@ Browser `timeout_ms`/`debug` never inherit a server provider timeout or profile
 debug value. Enabling the browser integration does not create a server provider,
 and a `prebid-server` provider can exist independently from browser injection.
 
-
 ## External Bundle Generation
 
 Use `ts prebid bundle` to build the publisher-specific browser bundle from
@@ -185,6 +185,25 @@ adapter on the same `window.pbjs` object and processes the publisher queue. A
 bundle generated before the shim split still carries a baked-in shim, so upgrade
 that bundle with the server and push its new hash and SRI. The sentinel
 `window.__tsjsPrebidShimInstalled` prevents duplicate shim installation.
+
+### Upgrading from `bundle.adapters` and `bundle.user_id_modules`
+
+Before deploying this server version, move the old bundle fields under
+`[integrations.prebid.bundle.modules]` and expand short bidder names to exact
+upstream stems. For example, `adapters = ["rubicon"]` becomes
+`bidder = ["rubiconBidAdapter"]`; `client_side_bidders` continues to use the
+runtime code `rubicon`.
+
+`ts prebid bundle` rejects the removed `adapters`, `user_id_modules`, and
+`analytics_adapters` fields with the replacement path. Runtime config
+validation, `ts config push`, and server startup also reject the old bundle
+fields.
+
+Bundles with the old flat manifest shape are treated as unstamped. When relevant
+User ID or `client_side_bidders` configuration is present, the shim reports that
+it cannot verify those configured modules or adapters. Regenerate and deploy the
+external bundle to stamp the supported schema. Auction routing does not depend
+on these diagnostics.
 
 ## Debug Mode
 
@@ -537,8 +556,8 @@ table.
 
 ## Analytics adapters
 
-Add analytics modules by exact stem. For the pinned Prebid.js 10.26.0 package,
-ATS uses this build selection:
+Add analytics modules by exact stem. When the pinned Prebid.js package includes
+ATS, use this build selection:
 
 ```toml
 [integrations.prebid.bundle.modules]
@@ -561,9 +580,10 @@ pbjs.que.push(() => {
 runtime provider. Trusted Server imports the module but does not call
 `pbjs.enableAnalytics`.
 
-Only analytics modules shipped by the pinned Prebid package can be selected.
-Prebid.js 10.26.0 does not include `mavenDistributionAnalyticsAdapter`. Custom
-files, local paths, URLs, and automatic downloads are not supported.
+Only analytics modules shipped by the pinned Prebid package can be selected. If
+a configured stem is unavailable, the generator reports the installed pinned
+version and missing module path. Custom files, local paths, URLs, and automatic
+downloads are not supported.
 
 ## Identity Forwarding
 

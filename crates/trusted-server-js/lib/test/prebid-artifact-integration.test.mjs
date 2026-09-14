@@ -13,10 +13,11 @@ import { fileURLToPath } from 'node:url';
 import { JSDOM, requestInterceptor } from 'jsdom';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { main } from '../build-prebid-external.mjs';
+import { main, verifyPrebidPackageVersion } from '../build-prebid-external.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const libDir = path.resolve(__dirname, '..');
+const prebidVersion = verifyPrebidPackageVersion();
 
 let outputDirectory;
 let analyticsArtifact;
@@ -198,6 +199,12 @@ function installNetworkAndConsoleStubs(pageWindow) {
 function expectNoUnexpectedNetworkActivity(stubs) {
   expect(stubs.unexpectedTransports).toEqual([]);
   expect(stubs.blockedResourceRequests).toEqual([]);
+  expect(
+    stubs.requests
+      .map((entry) => new URL(requestUrl(entry.url ?? entry.resource), 'https://pub.example.com'))
+      .filter((url) => url.origin !== 'https://pub.example.com')
+      .map(String)
+  ).toEqual([]);
 }
 
 function installServerState(pageWindow, { analytics = false } = {}) {
@@ -276,7 +283,7 @@ async function runAuction(pageWindow, fetchSpy) {
 function expectManifest(manifest, analytics) {
   expect(manifest).toMatchObject({
     schemaVersion: 1,
-    prebidVersion: '10.26.0',
+    prebidVersion,
     modules: {
       bidder: ['rubiconBidAdapter'],
       userId: ['sharedIdSystem'],
@@ -414,7 +421,7 @@ describe('tsjs-prebid production artifacts', () => {
     }
   });
 
-  it('records hashes and SRI for the no-analytics artifact', () => {
+  it('records both manifests and validates the no-analytics artifact hash and SRI', () => {
     expectManifest(analyticsArtifact.manifest, true);
     expectManifest(noAnalyticsArtifact.manifest, false);
 

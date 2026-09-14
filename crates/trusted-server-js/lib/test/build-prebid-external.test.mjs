@@ -27,6 +27,7 @@ const require = createRequire(import.meta.url);
 const libDir = path.resolve(__dirname, '..');
 const prebidPackageDir = path.join(libDir, 'node_modules', 'prebid.js');
 const prebidMetadataDir = path.join(prebidPackageDir, 'metadata', 'modules');
+const prebidVersion = verifyPrebidPackageVersion();
 const registry = JSON.parse(
   fs.readFileSync(
     path.join(libDir, 'src', 'integrations', 'prebid', 'user_id_modules.json'),
@@ -49,7 +50,7 @@ function parseRequest(value) {
 
 function actualResolveOptions(overrides = {}) {
   return {
-    prebidVersion: '10.26.0',
+    prebidVersion,
     registry,
     metadataDir: prebidMetadataDir,
     packageDir: prebidPackageDir,
@@ -668,7 +669,7 @@ describe('build-prebid-external rendering and orchestration', () => {
       expect(error).toContain(
         'integrations.prebid.bundle.modules.analytics requested "mavenDistributionAnalyticsAdapter"'
       );
-      expect(error).toContain('prebid.js 10.26.0');
+      expect(error).toContain(`prebid.js ${prebidVersion}`);
       expect(error).toContain('modules/mavenDistributionAnalyticsAdapter.js');
       expect(error).toContain('Choose an analytics module shipped by the pinned prebid.js package');
       expect(createGeneratedPaths).not.toHaveBeenCalled();
@@ -736,7 +737,7 @@ describe('build-prebid-external rendering and orchestration', () => {
 
       expect(manifest).toMatchObject({
         schemaVersion: 1,
-        prebidVersion: '10.26.0',
+        prebidVersion,
         modules: {
           bidder: ['rubiconBidAdapter'],
           userId: ['pairIdSystem', 'sharedIdSystem'],
