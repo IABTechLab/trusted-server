@@ -10,15 +10,12 @@ answer anyone gave to a question, and a jurisdiction rule is neither. Consent
 is one kind of signal, so the seam takes the wider name and the consent
 subsystem keeps the narrower one.
 
-## Why the providers are not in core
+## What core holds
 
-Privacy is a non-price factor of competition. Publishers, browsers and
-standards bodies compete on it, and schemes come and go. Compiling a closed
-list of schemes into core would settle that competition in code, because
-the schemes built in would be the only ones a deployment could act on, and
-the core maintainers would be deciding which privacy schemes exist.
+The reasons the schemes live outside core are on the docs page,
+docs/guide/permission-signals.md.
 
-So core holds the trait, the ordering, the country baseline, and the policy
+Core holds the trait, the ordering, the country baseline, and the policy
 vocabulary for what a deployment decides about the shipped schemes, being
 whether a TCF record answers, which signals count as a US-style opt-out and
 what an opt-out takes away. It holds no scheme's wire format and no scheme's
