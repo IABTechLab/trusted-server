@@ -77,7 +77,7 @@ function diagnosticsAuctionFacts(
     isNonEmptyString(bid.hb_bidder) && isNonEmptyString(bid.hb_pb)
       ? { bidder: bid.hb_bidder, priceBucket: bid.hb_pb }
       : undefined;
-  if (!isSpaAuction && !winner && auctionDiagnostics === undefined) return undefined;
+  if (!winner && auctionDiagnostics === undefined) return undefined;
 
   return {
     auctionType: isSpaAuction ? 'trusted_server' : 'ssat',
