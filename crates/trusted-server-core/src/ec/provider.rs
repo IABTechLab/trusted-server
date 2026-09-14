@@ -252,10 +252,15 @@ fn set_cookie_name(value: &[u8]) -> &[u8] {
 /// later request, for example), so the rule reserves core's namespace rather
 /// than banning `Set-Cookie` outright.
 ///
-/// A rejected effect fails the request rather than being dropped, because a
+/// A rejected effect is not simply dropped while the rest of the provider
+/// response goes ahead. Generation returns an error instead, as it does for a
+/// provider creating an identifier outside the cookie-safe alphabet, because a
 /// provider reaching into the reserved surface has broken its contract in the
-/// same way as one creating an identifier outside the cookie-safe alphabet, and
-/// that already fails the request. Serving the response instead would let a
+/// same way. The check runs before anything from that provider response is
+/// kept, so neither its identifier nor any of its headers is kept. The
+/// publisher proxy and integration proxy log the error and serve the response
+/// without an Edge Cookie, and orphan recovery in EC finalization leaves the
+/// visitor's existing cookie in place. Applying the header instead would let a
 /// provider set `ts-ec` directly, bypassing core's identifier validation and
 /// its requirement that a created identifier have an identity-graph row.
 #[must_use]
@@ -302,10 +307,11 @@ pub fn reserved_response_effect(
 ///   `Vary: Accept-Encoding` with the provider's own would break the cache
 ///   correctness the origin asked for.
 /// - The single-valued headers where replacing would be the right answer are
-///   exactly the ones a provider must not author at all, and
-///   [`reserved_response_effect`] already fails the request for them: core's
-///   `x-ts-` namespace, the `ts-` managed cookies, and the framing and
-///   hop-by-hop set.
+///   exactly the ones a provider must not author at all, being core's `x-ts-`
+///   namespace, the `ts-` managed cookies, and the framing and hop-by-hop set.
+///   [`reserved_response_effect`] rejects those before anything from the
+///   provider response is kept, so generation returns an error and none of
+///   them reaches the response.
 ///
 /// So nothing a provider is permitted to set here needs to replace, and
 /// accumulating is the direction that cannot silently destroy someone else's

@@ -477,12 +477,15 @@ impl EcContext {
         // Check every response header the provider asked for against core's
         // reserved surface before any of them are kept. A provider may set its
         // own cookies and headers, but not a managed `ts-` cookie, a header in
-        // the `x-ts-` namespace, or a framing or hop-by-hop header. Rejection
-        // fails the request, matching the identifier-bounds rejection below:
-        // without it a provider could write `ts-ec` itself and bypass the
-        // identifier validation and identity-graph row generation enforces.
-        // Checked before the identifier is read, because a provider can return
-        // headers with no identifier at all.
+        // the `x-ts-` namespace, or a framing or hop-by-hop header. Without the
+        // check a provider could write `ts-ec` itself and bypass the identifier
+        // validation and identity-graph row generation enforces. A rejection
+        // returns an error, as the identifier-bounds rejection below does.
+        // Because the check runs before the headers are captured, nothing from
+        // a rejected provider response is kept, and the caller serves the
+        // response without a new Edge Cookie. Checked before the identifier is
+        // read, because a provider can return headers with no identifier at
+        // all.
         for (name, value) in &generated.response_headers {
             if let Some(effect) = provider::reserved_response_effect(name, value) {
                 return Err(Report::new(TrustedServerError::EdgeCookie {
@@ -1667,10 +1670,13 @@ mod tests {
         }
     }
 
+    /// Runs generation through `provider` and hands back the context whether or
+    /// not generation succeeded, so a test can finalize a response on a context
+    /// whose generation returned an error.
     fn generate_with_header_setting_provider(
         provider: HeaderSettingProvider,
         graph: Option<&KvIdentityGraph>,
-    ) -> (Settings, Result<EcContext, Report<TrustedServerError>>) {
+    ) -> (Settings, EcContext, Result<(), Report<TrustedServerError>>) {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let mut settings = create_test_settings();
@@ -1680,18 +1686,22 @@ mod tests {
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
-        let outcome = ec.generate_if_needed(&settings, graph).map(|()| ec);
-        (settings, outcome)
+        let outcome = ec.generate_if_needed(&settings, graph);
+        (settings, ec, outcome)
     }
 
     #[test]
     fn generate_rejects_a_provider_effect_inside_the_reserved_response_surface() {
         // A provider that sets the managed `ts-ec` cookie would bypass core's
-        // identifier validation and its identity-graph row entirely, so the
-        // request fails rather than the effect being quietly dropped. The
+        // identifier validation and its identity-graph row entirely, so
+        // generation returns an error rather than quietly dropping the effect.
+        // The publisher and integration proxies log that error and serve the
+        // response without an Edge Cookie, and
+        // `a_rejected_provider_effect_never_reaches_the_finalized_response`
+        // checks that the rejected header stays off that response. The
         // provider creates no identifier here, which is exactly the case the
         // cookie write would otherwise slip through.
-        let (_settings, outcome) = generate_with_header_setting_provider(
+        let (_settings, _ec, outcome) = generate_with_header_setting_provider(
             HeaderSettingProvider {
                 name: "set-cookie",
                 value: "ts-ec=forged-value; Path=/",
@@ -1700,7 +1710,8 @@ mod tests {
             None,
         );
 
-        let err = outcome.expect_err("a managed cookie effect should fail the request");
+        let err =
+            outcome.expect_err("a managed cookie effect should make generation return an error");
         assert!(
             err.to_string().contains("header-setting"),
             "the error should name the provider, got: {err}"
@@ -1708,7 +1719,7 @@ mod tests {
 
         // The same for the reserved header namespace and for message framing.
         for (name, value) in [("x-ts-ec", "forged"), ("transfer-encoding", "chunked")] {
-            let (_settings, outcome) = generate_with_header_setting_provider(
+            let (_settings, _ec, outcome) = generate_with_header_setting_provider(
                 HeaderSettingProvider {
                     name,
                     value,
@@ -1718,7 +1729,77 @@ mod tests {
             );
             assert!(
                 outcome.is_err(),
-                "`{name}` is reserved and should fail the request"
+                "`{name}` is reserved, so generation should return an error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_provider_effect_never_reaches_the_finalized_response() {
+        // Returning the error is half of the rule. The caller logs the error
+        // and still serves the response, and EC finalization runs on that
+        // response with this same context, so a rejected header kept anywhere
+        // on the context would reach the browser anyway. The provider also
+        // returns an identifier here, to show that nothing from the rejected
+        // provider response is kept.
+        for (name, value) in [
+            ("set-cookie", "ts-ec=forged-value; Path=/"),
+            ("x-ts-ec", "forged"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            let graph = KvIdentityGraph::in_memory("test-ec-store");
+            let (settings, mut ec, outcome) = generate_with_header_setting_provider(
+                HeaderSettingProvider {
+                    name,
+                    value,
+                    mint: true,
+                },
+                Some(&graph),
+            );
+            assert!(
+                outcome.is_err(),
+                "`{name}` is reserved, so generation should return an error"
+            );
+            assert_eq!(
+                ec.ec_value(),
+                None,
+                "no identifier should be committed after `{name}` is rejected"
+            );
+
+            let mut response = http::Response::builder()
+                .status(200)
+                .body(EdgeBody::empty())
+                .expect("should build test response");
+            finalize::ec_finalize_response(
+                &settings,
+                &mut ec,
+                Some(&graph),
+                &registry::PartnerRegistry::empty(),
+                None,
+                None,
+                &mut response,
+            );
+
+            let cookies: Vec<&str> = response
+                .headers()
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|cookie| cookie.to_str().ok())
+                .collect();
+            assert!(
+                !cookies.iter().any(|cookie| cookie.contains("ts-ec=forged")),
+                "the rejected `{name}` effect should not set `ts-ec`, got: {cookies:?}"
+            );
+            assert!(
+                response.headers().get("x-ts-ec").is_none(),
+                "the rejected `{name}` effect should not set `x-ts-ec`"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(http::header::TRANSFER_ENCODING)
+                    .is_none(),
+                "the rejected `{name}` effect should not set `transfer-encoding`"
             );
         }
     }
@@ -1729,7 +1810,7 @@ mod tests {
         // it survives generation and reaches the browser response unchanged,
         // alongside the managed `ts-ec` cookie core writes itself.
         let graph = KvIdentityGraph::in_memory("test-ec-store");
-        let (settings, outcome) = generate_with_header_setting_provider(
+        let (settings, mut ec, outcome) = generate_with_header_setting_provider(
             HeaderSettingProvider {
                 name: "set-cookie",
                 value: "acme-evidence=abc123; Path=/; Secure",
@@ -1737,7 +1818,7 @@ mod tests {
             },
             Some(&graph),
         );
-        let mut ec = outcome.expect("a provider-owned cookie should not fail the request");
+        outcome.expect("generation should accept a provider-owned cookie");
         assert_eq!(
             ec.ec_value(),
             Some("t0hs~provider-value"),
