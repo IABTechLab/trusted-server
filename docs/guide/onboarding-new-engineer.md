@@ -38,36 +38,40 @@ into WebAssembly running on edge platforms.
 
 ## Architecture at a glance
 
+```mermaid
+flowchart TD
+  browser["Browser"]
+  origin["Publisher origin"]
+  demand["Demand partners"]
+
+  subgraph edge["Edge runtime"]
+    direction TB
+    adapter["Adapter"]
+    proxy["Proxy"]
+    publisher["Publisher"]
+    integrations["Integrations"]
+    storage["Storage"]
+
+    adapter --> proxy
+    adapter --> publisher
+    adapter --> integrations
+    proxy --> storage
+    publisher --> storage
+    integrations --> storage
+  end
+
+  browser --> adapter
+  publisher --> origin
+  publisher --> demand
 ```
-                        User's browser
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────┐
-│           Edge runtime (adapter + core)                  │
-│                                                          │
-│  Adapter (Fastly / Cloudflare / Spin / Axum)             │
-│  • Entry point, routing, platform bindings               │
-│  • Client IP, TLS signals, EC request state              │
-│                          │                               │
-│         ┌────────────────┼────────────────┐              │
-│         ▼                ▼                ▼              │
-│  ┌───────────┐   ┌──────────────┐   ┌──────────────┐     │
-│  │  Proxy    │   │  Publisher   │   │ Integrations │     │
-│  │           │   │              │   │              │     │
-│  │ /first-   │   │ Origin fetch │   │ Prebid, GPT, │     │
-│  │ party/*   │   │ Ad-stack gate│   │ APS, consent │     │
-│  │ Creative  │   │ Auction      │   │ vendors, ... │     │
-│  │ rewriting │   │ HTML rewrite │   │              │     │
-│  └───────────┘   └──────────────┘   └──────────────┘     │
-│                                                          │
-│  Storage layer                                           │
-│  • KV stores    • Config stores    • Secret stores       │
-└──────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-      Publisher origin                 Demand partners
-```
+
+| Component        | Responsibility                                                                                                             |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **Adapter**      | Entry point for Fastly, Cloudflare, Spin, or Axum: routing, platform bindings, client IP and TLS signals, EC request state |
+| **Proxy**        | `/first-party/*` endpoints and creative rewriting                                                                          |
+| **Publisher**    | Origin fetch, ad-stack gate, auction dispatch, HTML rewriting                                                              |
+| **Integrations** | Prebid, GPT, APS, and consent vendors                                                                                      |
+| **Storage**      | KV, config, and secret stores                                                                                              |
 
 The core crate is runtime-agnostic; anything platform-specific lives in an
 adapter. A test enforces that core never imports the Fastly SDK.
