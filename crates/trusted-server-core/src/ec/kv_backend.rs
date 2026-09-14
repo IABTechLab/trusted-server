@@ -7,7 +7,7 @@
 //! `trusted-server-adapter-fastly`).
 //!
 //! This trait is intentionally narrow: lookup with a generation marker,
-//! conditional insert, prefix counting, and delete. Conditional writes are
+//! conditional insert, strong prefix listing, and delete. Conditional writes are
 //! expressed through [`EcKvWriteMode`] so compare-and-swap loops stay in
 //! core while the platform supplies the actual precondition mechanics.
 
@@ -123,6 +123,20 @@ pub trait EcKvStore {
         write: EcKvWrite<'_>,
     ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>>;
 
+    /// Lists keys sharing the given prefix from strongly consistent state.
+    ///
+    /// Returns at most `limit` keys. Callers that use key contents for a
+    /// correctness decision must validate the complete key shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store open or list failure.
+    fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>>;
+
     /// Counts keys sharing the given prefix, up to `limit`.
     ///
     /// # Errors
@@ -132,7 +146,11 @@ pub trait EcKvStore {
         &self,
         prefix: &str,
         limit: u32,
-    ) -> Result<u32, Report<TrustedServerError>>;
+    ) -> Result<u32, Report<TrustedServerError>> {
+        let count = self.list_keys_with_prefix(prefix, limit)?.len();
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(count as u32)
+    }
 
     /// Hard-deletes a key.
     ///
@@ -191,12 +209,12 @@ pub(crate) mod test_support {
             self.inner.insert(key, write)
         }
 
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
 
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
@@ -207,7 +225,7 @@ pub(crate) mod test_support {
     /// [`EcKvStore`] wrapper that models an eventually-consistent point read.
     ///
     /// The first `stale_lookups` calls to [`EcKvStore::lookup`] report the key
-    /// absent while [`EcKvStore::count_keys_with_prefix`] — the list API, which
+    /// absent while [`EcKvStore::list_keys_with_prefix`] — the list API, which
     /// reads the primary data source — still sees it. Writes reach the inner
     /// store, so a test can assert what actually persisted.
     ///
@@ -264,18 +282,18 @@ pub(crate) mod test_support {
             self.inner.insert(key, write)
         }
 
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
             if self.list_fails {
                 return Err(Report::new(TrustedServerError::KvStore {
                     store_name: self.inner.store_name().to_owned(),
                     message: "list unavailable".to_owned(),
                 }));
             }
-            self.inner.count_keys_with_prefix(prefix, limit)
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
 
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
@@ -356,19 +374,18 @@ pub(crate) mod test_support {
             Ok(EcKvWriteOutcome::Written)
         }
 
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
             let entries = self.entries.lock().expect("should lock in-memory store");
-            let count = entries
+            Ok(entries
                 .keys()
                 .filter(|key| key.starts_with(prefix))
                 .take(limit as usize)
-                .count();
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(count as u32)
+                .cloned()
+                .collect())
         }
 
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
@@ -419,11 +436,11 @@ pub(crate) mod test_support {
             Err(self.error("insert"))
         }
 
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             _prefix: &str,
             _limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
             Err(self.error("list"))
         }
 

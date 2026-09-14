@@ -98,6 +98,9 @@ pub enum EcKvSnapshot {
     /// The store authoritatively reported that this EC ID does not exist.
     Missing { ec_id: String },
     /// Persisted entry data, optionally with a generation usable for CAS.
+    ///
+    /// A generation never authorizes a write by itself. Callers must first
+    /// enforce entry policy such as rejecting a withdrawal tombstone.
     Present {
         ec_id: String,
         entry: Box<KvEntry>,
@@ -731,12 +734,12 @@ mod tests {
             }
             self.inner.insert(key, write)
         }
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
