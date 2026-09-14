@@ -497,59 +497,43 @@ rules:
       group: us-opt-out
       jurisdiction: us-state
 
-# How each session signal maps onto Data Uses. The permission engine reads this,
-# so no signal-to-permission policy lives in the code. For each Data Use a signal
-# produces a grant or a revoke, which the resolver then applies against the group
-# baseline above (a grant sets a `requires_signal` Data Use, a revoke drops a
-# `granted` one, and `denied` always wins so no signal can set it).
+# What each session signal is allowed to do to the Data Uses, for the
+# decisions that are a deployment's policy rather than a scheme's own meaning.
+# For each Data Use a signal produces a grant or a revoke, which the resolver
+# then applies against the group baseline above (a grant sets a
+# `requires_signal` Data Use, a revoke drops a `granted` one, and `denied`
+# always wins so no signal can set it).
+#
+# What a scheme's own signal means is not here. Which TCF purpose grants which
+# Data Use is the TCF scheme's knowledge and lives in the TCF permission signal
+# provider crate, crates/permission-signal/tcf, so a deployment that runs no
+# TCF carries no table of another scheme's numbers. Which schemes run at all,
+# and in what order, is [permission_signal] sources in trusted-server.toml.
 signals:
   # A present TCF v2 record (a standalone TC string, or the EU TCF section of a
-  # GPP string). With authoritative true, each listed TCF purpose grants the
-  # Data Use it maps to when the record consents to that purpose, and revokes it
-  # otherwise; with authoritative false the record is ignored. The flag governs
-  # only the TCF record's own grants and revokes: an opt-out signal below always
-  # suppresses the Data Uses it revokes, even alongside a consenting TCF record,
-  # because an explicit opt-out is never overridden by another signal. This is
-  # the interim home for the purpose to Data Use mapping, and a purpose may
-  # grant one Data Use or a list of them. Once the IAB Privacy Taxonomy tcf
-  # column is finalized (fideslang) that becomes the single source and this
-  # block is dropped.
+  # GPP string). With authoritative true, the record's consent to a purpose
+  # grants the Data Uses the TCF provider maps to that purpose, and its refusal
+  # revokes them, whereas with authoritative false the record is ignored.
+  # The flag governs only whether the record answers. Whether its answer
+  # stands over an opt-out signal below, or the opt-out over it, is the order
+  # the providers are asked in, [permission_signal] sources in
+  # trusted-server.toml, where the last provider with an opinion decides. The
+  # default order asks Global Privacy Control first, being a browser setting
+  # with no interface of its own, and the schemes carrying a choice someone
+  # made through an interface after.
   tcf:
     authoritative: true
-    purposes:
-      1: necessary.operations.storage
-      2:
-        - advertising_marketing.first_party.contextual
-        - advertising_marketing.frequency_capping
-        - advertising_marketing.negative_targeting
-      3: advertising_marketing.profiling
-      4:
-        - advertising_marketing.first_party.targeted
-        - advertising_marketing.third_party.targeted
-      5: advertising_marketing.personalize.profiling
-      6:
-        - advertising_marketing.personalize.content
-        - advertising_marketing.personalize.system
-        - functional.personalization
-      7:
-        - analytics.ad_reporting.measure_ad_performance
-        - analytics.ad_reporting.ad_delivery_and_targeting
-        - analytics.ad_reporting.ad_viewability
-      8: analytics.ad_reporting.content_performance
-      9:
-        - analytics.ad_reporting.market_research
-        - analytics.ad_reporting.campaign_insights
-      10: necessary.operations.improve
-      11: select-basic-content
   # US-style opt-out of sale or sharing. It applies when any listed source is
-  # set, and it suppresses the Data Uses it revokes even when a TCF record
-  # consents to them. The list below models the US state opt-out scope, being
-  # sale, sharing, targeted advertising, and device storage as the
-  # conservative reading, so an opted-out visitor gets no Edge Cookie
-  # written and no identifier shared, whilst contextual advertising and
-  # measurement continue after an opt-out. A deployer can widen the list, or write `revokes: all` to drop
-  # every granted Data Use. An opt-out suppresses use for the request; it is
-  # never a destructive withdrawal of an already-issued identifier.
+  # set, and its provider revokes the Data Uses listed here. Whether that
+  # revoke stands when a TCF record consents to the same Data Use depends on
+  # the provider order, see above. The list below models the US state opt-out
+  # scope, being sale, sharing, targeted advertising, and device storage as
+  # the conservative reading, so an opted-out visitor gets no Edge Cookie
+  # written and no identifier shared, while contextual advertising and
+  # measurement continue after an opt-out. A deployer can widen the list, or
+  # write `revokes: all` to drop every granted Data Use. An opt-out suppresses
+  # use for the request and is never a destructive withdrawal of an
+  # already-issued identifier.
   us_opt_out:
     sources: [gpc, gpp_sale_opt_out, us_privacy_opt_out]
     revokes:

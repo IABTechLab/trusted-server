@@ -77,7 +77,7 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::evidence::{BorrowedRequestInfo, HostSignals};
 use crate::geo::GeoInfo;
-use crate::permissions::{Acquisition, Permission, PermissionState};
+use crate::permissions::{Permission, PermissionState};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
@@ -150,11 +150,6 @@ pub struct EcContext {
     /// augmented by the session's signals. Assembled once at construction and
     /// read via [`permissions`](Self::permissions).
     permissions: PermissionState,
-    /// The jurisdiction's acquisition rule for Edge Cookie storage, resolved
-    /// once at construction and used by
-    /// [`storage_withdrawn`](Self::storage_withdrawn) to scope destructive
-    /// withdrawal. Defaults to the requires-signal floor.
-    storage_acquisition: Acquisition,
     /// The normalized client IP, captured early before the request body
     /// is consumed. `None` when the platform cannot determine client IP.
     client_ip: Option<String>,
@@ -368,12 +363,24 @@ impl EcContext {
         });
 
         // Assemble the permission state once, here, through the permission
-        // model, building the country/region baseline augmented by the session's
-        // signals. Downstream consumers read the stored result via
+        // model, building the country/region baseline amended by what the
+        // signal providers the adapter selected say about the request.
+        // Downstream consumers read the stored result via
         // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
-        // re-deriving it.
-        let permissions = consent::assemble_permissions(&consent, geo_status);
-        let storage_acquisition = consent::storage_acquisition(geo_status);
+        // re-deriving it. The providers see the request as evidence, the same
+        // abstraction the Edge Cookie and device providers read, so a scheme
+        // core has never heard of can read its own signal from it.
+        let evidence = crate::evidence::BorrowedRequestInfo::new(
+            client_ip.as_deref().unwrap_or_default(),
+            Some(req.headers()),
+        )
+        .with_request_target(req.uri().path(), req.uri().query().unwrap_or_default());
+        let permissions = consent::assemble_permissions(
+            &consent,
+            &evidence,
+            geo_status,
+            services.permission_signal_providers(),
+        );
         // With no provider selected nothing may create or use an identifier, so
         // the gate is closed rather than open by default.
         let ec_allowed = selected_provider
@@ -396,7 +403,6 @@ impl EcContext {
             consent,
             ec_allowed,
             permissions,
-            storage_acquisition,
             client_ip,
             geo_info: geo_info.cloned(),
             device_signals: None,
@@ -792,13 +798,15 @@ impl EcContext {
     /// Whether the request carries an explicit signal withdrawing Edge Cookie
     /// storage, scoped to the jurisdiction's storage baseline.
     ///
-    /// See [`consent::ec_storage_withdrawn`]: only a TCF record refusing
-    /// storage withdraws, and only where the storage baseline is not
-    /// `granted`. Suppression (the permission merely not set) is reported by
+    /// Answered by the signal providers at construction and recorded on the
+    /// permission state, see [`PermissionState::storage_withdrawn`]. Of the
+    /// schemes that ship, only a TCF record refusing storage withdraws, and
+    /// only where the storage baseline is not `granted`. Suppression (the
+    /// permission merely not set) is reported by
     /// [`ec_allowed`](Self::ec_allowed) being `false` instead.
     #[must_use]
     pub fn storage_withdrawn(&self) -> bool {
-        consent::ec_storage_withdrawn(&self.consent, self.storage_acquisition)
+        self.permissions.storage_withdrawn()
     }
 
     /// Whether the Edge Cookie identifier may be shared beyond the edge for
@@ -899,7 +907,6 @@ impl EcContext {
             consent,
             ec_allowed,
             permissions,
-            storage_acquisition: Acquisition::default(),
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -928,7 +935,6 @@ impl EcContext {
             ec_generated: false,
             consent,
             ec_allowed: true,
-            storage_acquisition: Acquisition::default(),
             permissions: PermissionState::default(),
             client_ip,
             geo_info: None,
@@ -963,7 +969,6 @@ impl EcContext {
             consent,
             ec_allowed,
             permissions: PermissionState::default(),
-            storage_acquisition: Acquisition::default(),
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -975,6 +980,21 @@ impl EcContext {
             request_query: String::new(),
             response_headers: Vec::new(),
         }
+    }
+
+    /// The same context, recording that the request explicitly withdrew
+    /// storage, as assembly records it when a signal provider answers so.
+    ///
+    /// Core links no provider, so a core test cannot derive the withdrawal
+    /// from a consent record the way a deployment does through the TCF
+    /// provider. It states the answer instead and tests what finalization does
+    /// with it. That a TCF refusal produces this answer is proved where the
+    /// providers are linked, in the Axum adapter's `permission_signals` test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_storage_withdrawn_for_test(mut self, withdrawn: bool) -> Self {
+        self.permissions = self.permissions.with_storage_withdrawn(withdrawn);
+        self
     }
 }
 

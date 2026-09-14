@@ -68,6 +68,23 @@ pub trait RequestInfo: Send + Sync + core::fmt::Debug {
         url::form_urlencoded::parse(self.query().as_bytes())
             .find_map(|(key, value)| (&*key == name).then(|| value.into_owned()))
     }
+
+    /// The value of request cookie `name`, or `None` when the request does not
+    /// carry it.
+    ///
+    /// Defaulted, parsing the `Cookie` header, so a provider that needs a
+    /// cookie does not write its own splitting and trimming and get it subtly
+    /// different from the next one. An implementation holding a parsed jar may
+    /// override it. Core keeps no list of which cookies belong to which
+    /// scheme, which is what lets a permission signal provider for a scheme
+    /// core has never heard of read its own signal.
+    fn cookie(&self, name: &str) -> Option<&str> {
+        let header = self.header("cookie")?;
+        header.split(';').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key.trim() == name).then(|| value.trim())
+        })
+    }
 }
 
 /// An owned [`RequestInfo`] built from a request snapshot.
@@ -248,6 +265,65 @@ pub trait HostSignals: Send + Sync + core::fmt::Debug {
 
     /// The raw HTTP/2 SETTINGS signal, or `None` when unavailable.
     fn h2(&self) -> Option<&str>;
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use http::HeaderMap;
+
+    use super::*;
+
+    fn with_cookie_header(value: &'static str) -> OwnedRequestInfo {
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", http::HeaderValue::from_static(value));
+        OwnedRequestInfo::new(String::new(), headers)
+    }
+
+    #[test]
+    fn reads_a_cookie_by_name_from_among_several() {
+        let info = with_cookie_header("a=1; euconsent-v2=CP-abc; b=2");
+        assert_eq!(
+            info.cookie("euconsent-v2"),
+            Some("CP-abc"),
+            "the named cookie is found wherever it sits in the header"
+        );
+    }
+
+    #[test]
+    fn trims_the_spaces_browsers_put_around_pairs() {
+        let info = with_cookie_header("  a = 1 ;  b=2 ");
+        assert_eq!(
+            info.cookie("a"),
+            Some("1"),
+            "spaces around the name and value are not part of either"
+        );
+        assert_eq!(info.cookie("b"), Some("2"));
+    }
+
+    #[test]
+    fn answers_nothing_for_a_cookie_that_is_absent() {
+        let info = with_cookie_header("a=1");
+        assert_eq!(
+            info.cookie("b"),
+            None,
+            "an absent cookie is None, not an empty value"
+        );
+        assert_eq!(
+            OwnedRequestInfo::default().cookie("a"),
+            None,
+            "and so is a request with no Cookie header at all"
+        );
+    }
+
+    #[test]
+    fn matches_the_whole_name_and_not_a_prefix() {
+        let info = with_cookie_header("session_id=abc; id=xyz");
+        assert_eq!(
+            info.cookie("id"),
+            Some("xyz"),
+            "`id` must not match `session_id`"
+        );
+    }
 }
 
 #[cfg(test)]

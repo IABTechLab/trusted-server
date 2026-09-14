@@ -21,14 +21,17 @@ describe('core/permissions', () => {
   });
 
   it('keeps permissions injected before the bundle loads and resolves with them', async () => {
-    const injected: PermissionsSnapshot = { set: ['necessary.operations'] };
+    const injected: PermissionsSnapshot = {
+      set: ['necessary.operations'],
+      tdls: ['https://terms.example.com/marketing/2.txt'],
+    };
     window.tsjs = { permissions: injected } as TsjsApi;
 
     await import('../../src/core/index');
     const api = window.tsjs as TsjsApi;
 
-    expect(api.permissions).toEqual({ set: ['necessary.operations'] });
-    await expect(api.whenPermissions!()).resolves.toEqual({ set: ['necessary.operations'] });
+    expect(api.permissions).toEqual(injected);
+    await expect(api.whenPermissions!()).resolves.toEqual(injected);
   });
 
   it('resolves on the body seam assignment and reads the value back', async () => {
@@ -36,10 +39,16 @@ describe('core/permissions', () => {
     const api = window.tsjs as TsjsApi;
 
     const settled = api.whenPermissions!();
-    api.permissions = { set: ['marketing.advertising.serving'] };
+    api.permissions = { set: ['marketing.advertising.serving'], tdls: [] };
 
-    await expect(settled).resolves.toEqual({ set: ['marketing.advertising.serving'] });
-    expect(api.permissions).toEqual({ set: ['marketing.advertising.serving'] });
+    await expect(settled).resolves.toEqual({
+      set: ['marketing.advertising.serving'],
+      tdls: [],
+    });
+    expect(api.permissions).toEqual({
+      set: ['marketing.advertising.serving'],
+      tdls: [],
+    });
   });
 
   it('falls back to the empty default when no assignment arrives before DOMContentLoaded', async () => {
@@ -49,7 +58,7 @@ describe('core/permissions', () => {
     const settled = api.whenPermissions!();
     document.dispatchEvent(new Event('DOMContentLoaded'));
 
-    await expect(settled).resolves.toEqual({ set: [] });
+    await expect(settled).resolves.toEqual({ set: [], tdls: [] });
   });
 
   it('resolves at once when the document has already been parsed', async () => {
@@ -59,18 +68,45 @@ describe('core/permissions', () => {
     await import('../../src/core/index');
     const api = window.tsjs as TsjsApi;
 
-    await expect(api.whenPermissions!()).resolves.toEqual({ set: [] });
+    await expect(api.whenPermissions!()).resolves.toEqual({ set: [], tdls: [] });
   });
 
   it('returns the same resolved value from every later call', async () => {
     await import('../../src/core/index');
     const api = window.tsjs as TsjsApi;
 
-    api.permissions = { set: ['analytics.reporting'] };
+    api.permissions = { set: ['analytics.reporting'], tdls: [] };
     const first = await api.whenPermissions!();
     const second = await api.whenPermissions!();
 
     expect(second).toBe(first);
-    expect(second).toEqual({ set: ['analytics.reporting'] });
+    expect(second).toEqual({ set: ['analytics.reporting'], tdls: [] });
+  });
+
+  it('gives page code both lists when the edge sent only the permissions', async () => {
+    // An older edge, or a page assigning a snapshot by hand, sends no terms.
+    // Page code still reads `tdls` without checking it exists.
+    await import('../../src/core/index');
+    const api = window.tsjs as TsjsApi;
+
+    api.permissions = { set: ['analytics.reporting'] } as PermissionsSnapshot;
+
+    expect(api.permissions.tdls).toEqual([]);
+    await expect(api.whenPermissions!()).resolves.toEqual({
+      set: ['analytics.reporting'],
+      tdls: [],
+    });
+  });
+
+  it('carries the terms the edge declared for the request', async () => {
+    await import('../../src/core/index');
+    const api = window.tsjs as TsjsApi;
+
+    api.permissions = {
+      set: ['necessary.operations.storage'],
+      tdls: ['https://terms.example.com/marketing/2.txt'],
+    };
+
+    expect(api.permissions.tdls).toEqual(['https://terms.example.com/marketing/2.txt']);
   });
 });

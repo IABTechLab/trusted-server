@@ -177,6 +177,12 @@ pub(crate) struct AppState {
     /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
     /// `None` for a deployment that selects no provider.
     pub(crate) ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// The permission signal providers `[permission_signal] sources` selects
+    /// from the scheme crates this adapter links, in the order they run.
+    /// Selected once here so a name no crate answers to fails startup rather
+    /// than the first request, and handed to every request's services.
+    pub(crate) permission_signal_providers:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -230,6 +236,11 @@ pub(crate) fn build_state_from_settings(
 
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
+    let permission_signal_providers =
+        trusted_server_core::permission_signal::build_permission_signal_providers(
+            &settings,
+            &shipped_signal_providers(),
+        )?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -241,7 +252,27 @@ pub(crate) fn build_state_from_settings(
         default_kv_store,
         auction_telemetry_sink,
         ec_provider,
+        permission_signal_providers,
     }))
+}
+
+/// The permission signal providers this adapter links, in the order they run
+/// when configuration names none. Global Privacy Control is first because it
+/// is a browser setting with no interface of its own, and the three that
+/// carry a choice someone made through an interface follow, so an answer
+/// given at a prompt amends the header the visitor arrived with.
+///
+/// Core supplies no provider of its own, so this is where a deployment's
+/// schemes are decided. A scheme is added by linking its crate here, and a
+/// scheme core has never heard of plugs in the same way.
+fn shipped_signal_providers()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+    vec![
+        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+    ]
 }
 
 fn warn_if_certificate_check_disabled(settings: &Settings) {
@@ -342,6 +373,10 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         ))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
+        // The signal providers were selected once at startup from the scheme
+        // crates this adapter links, so every request asks exactly the ones
+        // configuration named, in that order.
+        .permission_signal_providers(Arc::clone(&state.permission_signal_providers))
         .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
 
     // Hand every request the provider resolved at the composition root, so the
@@ -1659,6 +1694,9 @@ mod tests {
             registry: Arc::new(registry),
             default_kv_store,
             ec_provider,
+            // These tests exercise routing, and a request with no signal
+            // provider resolves at the place baseline.
+            permission_signal_providers: Arc::default(),
         });
         TrustedServerApp::routes_for_state(&state)
     }

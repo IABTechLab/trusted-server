@@ -1519,10 +1519,10 @@ mod tests {
         /// The permission state observed by the last invocation, or `None` when
         /// the filter has not run.
         fn seen(&self) -> Option<Option<crate::permissions::PermissionState>> {
-            *self
-                .seen
+            self.seen
                 .lock()
                 .expect("should lock the recorded permission state")
+                .clone()
         }
     }
 
@@ -1540,7 +1540,7 @@ mod tests {
                 .seen
                 .lock()
                 .expect("should lock the recorded permission state") =
-                Some(input.permissions.copied());
+                Some(input.permissions.cloned());
             Ok(RequestFilterDecision::Continue(
                 RequestFilterEffects::default(),
             ))
