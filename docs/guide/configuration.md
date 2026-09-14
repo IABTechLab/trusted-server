@@ -699,7 +699,7 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 | `provider`                   | String or null | No              | Key of the geo provider. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                 |
 | `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie provider without a geo provider acknowledges that by setting this to `true`. |
 
-No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup. A failed geo lookup at request time does not fall back to `default_country`; it resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
+No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
 **Example**:
 
