@@ -3034,6 +3034,13 @@ describe('installTsRenderBridge', () => {
     return iframe.contentWindow!;
   }
 
+  // The APS capability path runs on publisher Prebid ad units, so diagnostics
+  // resolve the GPT slot by element ID rather than through TS slot mapping.
+  function stubGoogletagSlot(elementId: string): void {
+    const slot = { getSlotElementId: () => elementId };
+    vi.stubGlobal('googletag', { pubads: () => ({ getSlots: () => [slot] }) });
+  }
+
   async function captureBridgeListener(): Promise<(e: MessageEvent) => unknown> {
     let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
     const origAdd = window.addEventListener.bind(window);
@@ -3339,6 +3346,7 @@ describe('installTsRenderBridge', () => {
     const marker = enablePublisherNativeMode();
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const portMessages: string[] = [];
@@ -3378,6 +3386,7 @@ describe('installTsRenderBridge', () => {
     const marker = enablePublisherNativeMode();
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const portMessages: string[] = [];
@@ -3457,6 +3466,96 @@ describe('installTsRenderBridge', () => {
     foreignIframe.remove();
   });
 
+  it('records a creative attempt for a registered APS renderer so delivery is attributable', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-diagnostics-ad-id';
+    const recordTrustedServerOpportunity = vi.fn();
+    const recordTrustedServerCreativeRequest = vi.fn(() => 7);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity,
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      stubGoogletagSlot('div-header');
+      const bridgeListener = await captureBridgeListener();
+      const portMessages: string[] = [];
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source: createTrustedSlotIframe(),
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(portMessages).toHaveLength(1);
+      expect(recordTrustedServerOpportunity.mock.calls[0]?.slice(1, 3)).toEqual([
+        'div-header',
+        'renderable_candidate',
+      ]);
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('div-header');
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(7);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
+  it('records the tombstone reason when a consumed APS ad ID is replayed', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-replayed-ad-id';
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity: vi.fn(),
+      recordTrustedServerCreativeRequest: vi.fn(() => 11),
+      recordTrustedServerCreativeResponse: vi.fn(),
+      recordTrustedServerCreativeFailure,
+    } as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      stubGoogletagSlot('div-header');
+      const bridgeListener = await captureBridgeListener();
+      const request = (): MessageEvent =>
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: () => {} }],
+          source: createTrustedSlotIframe(),
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent;
+
+      bridgeListener(request());
+      recordTrustedServerCreativeFailure.mockClear();
+      bridgeListener(request());
+
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(11, 'aps_consumed_tombstone');
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
   it('contract test: fails a registered APS runner without a Universal Creative response or markUsed', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'native-prebid-decline-ad-id';
@@ -3473,6 +3572,7 @@ describe('installTsRenderBridge', () => {
     const marker = enablePublisherNativeMode();
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const portMessages: string[] = [];
@@ -3515,6 +3615,7 @@ describe('installTsRenderBridge', () => {
     const marker = enablePublisherNativeMode();
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const portMessages: string[] = [];
@@ -4033,6 +4134,7 @@ describe('installTsRenderBridge', () => {
     });
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const postMessage = vi.fn();
