@@ -11,7 +11,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
-    AuctionOrchestrator, AuctionProviderBuilder, build_orchestrator_with_providers,
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
@@ -44,7 +44,7 @@ use trusted_server_core::settings_data::{
 use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
+use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -95,8 +95,13 @@ fn shipped_signal_providers()
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
-    let settings =
-        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
+    let settings = get_settings_from_config_store(
+        &AxumPlatformConfigStore,
+        &AxumPlatformSecretStore,
+        &store_name,
+        &config_key,
+        &trusted_server_core::settings_data::default_secret_store_name(),
+    )?;
     build_state_with_settings(settings)
 }
 
@@ -110,27 +115,27 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_with_registrations(settings, &[], &[])
+    build_state_with_registrations(settings, &[])
 }
 
 /// Build the application state from explicit settings, composing the built-in
-/// integrations and auction providers with the externally supplied builders in
-/// `integrations` and `auction_providers`.
+/// integrations with the externally supplied builders in `integrations`.
 ///
 /// A deployment that ships a vendor crate calls this to add that crate's
-/// integration and auction provider builders without the adapter naming the
-/// vendor.
+/// integration builder without the adapter naming the vendor. Auction
+/// providers come from the compiled auction plan, as they do without any
+/// external builders.
 ///
 /// # Errors
 ///
 /// Returns an error when the selected Edge Cookie provider cannot be built for
-/// this adapter, or when the auction orchestrator or the integration registry
-/// fail to initialize, which includes two builders claiming the same
-/// integration id or auction provider name.
+/// this adapter, when the auction plan does not compile or cannot run on this
+/// adapter, or when the auction orchestrator or the integration registry fail
+/// to initialize, which includes two builders claiming the same integration
+/// id.
 pub fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
-    auction_providers: &[AuctionProviderBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     // Composition root: reject a provider selection this adapter can never
     // supply, once, before any request is served. The Axum dev server injects
@@ -146,8 +151,10 @@ pub fn build_state_with_registrations(
     // provider that reads no request data. It supplies no host signals either,
     // so the host-signals argument is `None`.
     ensure_provider_available(&settings.ec, None, None)?;
-    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
-    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
     let permission_signal_providers =
         trusted_server_core::permission_signal::build_permission_signal_providers(
             &settings,
@@ -576,13 +583,13 @@ fn named_route_handler(
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
                         // fails it closed for consented users.
-                        let ec_context = build_ec_context(&state, &services, &req).await?;
+                        let mut ec_context = build_ec_context(&state, &services, &req).await?;
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
                             None,
                             None,
-                            &ec_context,
+                            &mut ec_context,
                             &services,
                             req,
                         )
@@ -595,7 +602,7 @@ fn named_route_handler(
                         if req.method() == Method::OPTIONS {
                             Ok(page_bids_preflight_denied())
                         } else {
-                            let ec_context = build_ec_context(&state, &services, &req).await?;
+                            let mut ec_context = build_ec_context(&state, &services, &req).await?;
                             let auction = AuctionDispatch {
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),
@@ -606,7 +613,7 @@ fn named_route_handler(
                                 &services,
                                 None,
                                 auction,
-                                &ec_context,
+                                &mut ec_context,
                                 req,
                             )
                             .await
@@ -718,8 +725,8 @@ impl TrustedServerApp {
     }
 
     /// Build the full application router from explicit settings, composing the
-    /// built-in integrations and auction providers with the externally supplied
-    /// builders in `integrations` and `auction_providers`.
+    /// built-in integrations with the externally supplied builders in
+    /// `integrations`.
     ///
     /// The route table is the one [`TrustedServerApp::routes_with_settings`]
     /// builds, so a composed deployment routes exactly as the plain one does.
@@ -727,15 +734,15 @@ impl TrustedServerApp {
     /// # Errors
     ///
     /// Returns an error when the selected Edge Cookie provider cannot be built
-    /// for this adapter, or when the auction orchestrator or the integration
+    /// for this adapter, when the auction plan does not compile or cannot run
+    /// on this adapter, or when the auction orchestrator or the integration
     /// registry fail to initialize, which includes two builders claiming the
-    /// same integration id or auction provider name.
+    /// same integration id.
     pub fn routes_with_registrations(
         settings: Settings,
         integrations: &[IntegrationBuilder],
-        auction_providers: &[AuctionProviderBuilder],
     ) -> Result<RouterService, Report<TrustedServerError>> {
-        let state = build_state_with_registrations(settings, integrations, auction_providers)?;
+        let state = build_state_with_registrations(settings, integrations)?;
         Ok(build_router(&state))
     }
 }
@@ -825,9 +832,11 @@ mod tests {
     fn state_with_uninjected_provider() -> AppState {
         let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
             .expect("should parse settings selecting an uninjected provider");
-        let orchestrator =
-            build_orchestrator_with_providers(&settings, &[]).expect("should build orchestrator");
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
+        let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)
+            .expect("should build orchestrator");
+        let registry =
+            IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");
         AppState {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),

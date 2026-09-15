@@ -9,13 +9,18 @@
 # vocabulary this project invented, so a reader can check it against the
 # taxonomy rather than against us.
 #
+# This file is a sample for testing and evaluation only. It is not a
+# production policy, it is not legal advice, and no deployment should run it
+# as it stands. Read it, change it, or replace it, and have whoever is
+# accountable for the deployment decide what it should say.
+#
 # No policy ever ships with Trusted Server. The builder of a deployment
 # chooses the permissions.yaml compiled into their image, an operator overlay
 # is the recorded follow-on, and the visitor's signals decide the rest at
-# runtime. This copy is the repository's plain vanilla sample, compiled into
-# test and demo builds so the rules stay visible and reviewable in version
-# control. The samples live in config/permissions, and choosing one is always
-# an explicit choice by whoever builds, configures, or inspects.
+# runtime. This copy is compiled into test and demo builds so the rules stay
+# visible and reviewable in version control. The samples live in
+# config/permissions, and choosing one is always an explicit choice by whoever
+# builds, configures, or inspects.
 #
 # There are three parts:
 #   groups   named permission baselines, defined once and referenced by rules
@@ -106,7 +111,7 @@
 # Named baselines. Each group lists every Data Use and its flag, so a group's
 # meaning is explicit. (A `default: <flag>` shorthand is also accepted for any
 # Data Use a group omits.)
-name: Vanilla
+name: Sample (testing and evaluation only)
 
 groups:
   # European Union and EEA, where the model is opt-in, so every modeled ad-tech

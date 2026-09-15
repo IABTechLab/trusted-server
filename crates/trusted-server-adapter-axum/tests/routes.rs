@@ -71,6 +71,42 @@ fn assert_route_registered(method: &str, path: &str) {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aps_profile_serves_renderer_through_adapter_fallback() {
+    let mut settings = test_settings();
+    settings.auction.providers.insert(
+        "aps-main".parse().expect("should parse APS provider ID"),
+        trusted_server_core::auction::ProviderConfig {
+            protocol: "openrtb-2.6".to_string(),
+            profile: "aps".to_string(),
+            endpoint: "https://aps.example/e/pb/bid".to_string(),
+            timeout_ms: None,
+            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+            notifications: trusted_server_core::auction::NotificationConfig::default(),
+            profile_config: "{\"account_id\":\"example-account\"}"
+                .parse()
+                .expect("should parse APS profile config"),
+        },
+    );
+    let router = TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router with APS profile");
+    let mut service = EdgeZeroAxumService::new(router);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/integrations/aps/renderer")
+        .body(AxumBody::empty())
+        .expect("should build APS renderer request");
+
+    let response = service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should serve APS renderer");
+    assert_eq!(response.status().as_u16(), 200);
+}
+
 /// Verify that every expected explicit route is registered in the route table.
 ///
 /// Uses [`RouterService::routes()`] for introspection rather than checking
@@ -923,7 +959,7 @@ fn routes_with_registrations_rejects_a_duplicate_integration_id_naming_both_sour
         validate_nothing,
     )];
 
-    let error = TrustedServerApp::routes_with_registrations(test_settings(), &extra, &[])
+    let error = TrustedServerApp::routes_with_registrations(test_settings(), &extra)
         .err()
         .expect("should reject a duplicate integration id supplied through the adapter");
 

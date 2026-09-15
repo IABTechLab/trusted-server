@@ -3,10 +3,9 @@
 //!
 //! One registration carries a browser module, a proxy route, a geo provider,
 //! an Edge Cookie identity provider and a device provider, alongside its own
-//! configuration block. The builder adds a request preparer, and the crate
-//! also supplies an auction provider builder. The round-trip tests in
-//! `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each of
-//! those through a real adapter, so the seam is proven by a caller that core
+//! configuration block, and the builder adds a request preparer. The round-trip
+//! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each
+//! of those through a real adapter, so the seam is proven by a caller that core
 //! does not know about.
 //!
 //! This crate is a test fixture and must never ship in a deployment. It
@@ -26,9 +25,6 @@ use http::header::{self, HeaderValue};
 use http::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
-use trusted_server_core::auction::AuctionProviderBuilder;
-use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
 use trusted_server_core::ec::device::{DeviceProvider, DeviceSignals};
 use trusted_server_core::ec::provider::{
     EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput, ProviderCode,
@@ -39,9 +35,7 @@ use trusted_server_core::integrations::{
     CarriedJsModule, IntegrationBuilder, IntegrationEndpoint, IntegrationProxy,
     IntegrationRegistration,
 };
-use trusted_server_core::platform::{
-    GeoInfo, PlatformError, PlatformGeo, PlatformResponse, RuntimeServices,
-};
+use trusted_server_core::platform::{GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
 
@@ -50,13 +44,8 @@ use validator::Validate;
 /// select the probe's geo provider.
 pub const SEAM_PROBE_ID: &str = "seam_probe";
 
-/// Source label the registry and the orchestrator use in duplicate-id and
-/// duplicate-name errors.
+/// Source label the registry uses in duplicate-id errors.
 pub const SEAM_PROBE_SOURCE: &str = "trusted-server-integration-seam-probe";
-
-/// Auction provider name this crate declares, which `[auction] providers` may
-/// name.
-pub const SEAM_PROBE_AUCTION_PROVIDER: &str = "seam_probe";
 
 /// Path of the proxy route that reports what the seam delivered.
 ///
@@ -79,10 +68,6 @@ pub const PROBE_JS: &str = include_str!("../js/probe.js");
 /// `carried_module_hash_literal_matches_its_source` keeps this honest.
 pub const PROBE_JS_SHA256: &str =
     "4711826cac0ce3df585c4a2b30f6ad5d565900a81e89f0ee00148efff2342079";
-
-/// Timeout the probe's auction provider reports. It answers immediately, so
-/// no test turns on the value.
-const SEAM_PROBE_AUCTION_TIMEOUT_MS: u32 = 2000;
 
 /// Message the probe's own deploy rule rejects a bad country with, so a test
 /// can prove deploy validation reached a vendor's rules rather than stopping
@@ -339,46 +324,6 @@ impl IntegrationProxy for SeamProbeProxy {
     }
 }
 
-/// Auction provider the probe contributes, which answers every bid request
-/// immediately with no bids.
-///
-/// It exists so a name declared outside core can satisfy
-/// `[auction] providers`, not to bid.
-pub struct SeamProbeAuctionProvider;
-
-#[async_trait(?Send)]
-impl AuctionProvider for SeamProbeAuctionProvider {
-    fn provider_name(&self) -> &'static str {
-        SEAM_PROBE_AUCTION_PROVIDER
-    }
-
-    async fn request_bids(
-        &self,
-        _request: &AuctionRequest,
-        _context: &AuctionContext<'_>,
-    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-        Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
-            SEAM_PROBE_AUCTION_PROVIDER,
-            0,
-        )))
-    }
-
-    async fn parse_response(
-        &self,
-        _response: PlatformResponse,
-        response_time_ms: u64,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        Ok(AuctionResponse::no_bid(
-            SEAM_PROBE_AUCTION_PROVIDER,
-            response_time_ms,
-        ))
-    }
-
-    fn timeout_ms(&self) -> u32 {
-        SEAM_PROBE_AUCTION_TIMEOUT_MS
-    }
-}
-
 /// Rejects a country that is not exactly two ASCII letters.
 ///
 /// # Errors
@@ -483,22 +428,6 @@ pub fn prepare_request(
     Ok(())
 }
 
-/// Builds the probe's auction providers, empty when the probe is not enabled.
-///
-/// # Errors
-///
-/// Returns an error when the probe's configuration block cannot be parsed.
-pub fn register_auction_providers(
-    settings: &Settings,
-) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    match read_config(settings)? {
-        Some(_) => Ok(vec![
-            Arc::new(SeamProbeAuctionProvider) as Arc<dyn AuctionProvider>
-        ]),
-        None => Ok(Vec::new()),
-    }
-}
-
 /// The probe's integration builder, for an adapter's
 /// `routes_with_registrations` or `build_state_with_registrations`.
 ///
@@ -515,34 +444,15 @@ pub fn builder() -> IntegrationBuilder {
         .with_request_preparer(prepare_request)
 }
 
-/// The probe's auction provider builder, for an adapter's
-/// `routes_with_registrations` or `build_state_with_registrations`.
-///
-/// # Examples
-///
-/// ```
-/// use trusted_server_integration_seam_probe::{auction_builder, SEAM_PROBE_AUCTION_PROVIDER};
-///
-/// assert_eq!(auction_builder().name(), SEAM_PROBE_AUCTION_PROVIDER);
-/// ```
-#[must_use]
-pub fn auction_builder() -> AuctionProviderBuilder {
-    AuctionProviderBuilder::new(
-        SEAM_PROBE_AUCTION_PROVIDER,
-        SEAM_PROBE_SOURCE,
-        register_auction_providers,
-        validate,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use sha2::{Digest as _, Sha256};
     use trusted_server_core::platform::{
-        ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformSecretStore, StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
+        BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
+        PlatformConfigStore, PlatformSecretStore, StoreId, StoreName, UnavailableHttpClient,
+        UnavailableKvStore,
     };
 
     /// Config store that answers nothing, so a test can build
@@ -605,6 +515,10 @@ mod tests {
     struct StubBackend;
 
     impl PlatformBackend for StubBackend {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            BackendNamingPolicy::Axum
+        }
+
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,

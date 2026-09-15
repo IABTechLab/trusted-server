@@ -6,7 +6,6 @@ use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HeaderMap, HeaderValue, Request as HttpRequest, Response as HttpResponse, header,
@@ -34,7 +33,6 @@ use trusted_server_core::platform::{
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::config_store_name;
 use trusted_server_device_fastly::{FastlyDeviceProvider, FastlyHostSignals};
 
 mod app;
@@ -51,7 +49,7 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, TrustedServerApp, build_finalize_services,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, build_finalize_services,
     load_settings_from_config_store,
 };
 use crate::ec_kv::FastlyEcKvStore;
@@ -64,9 +62,8 @@ use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
-fn open_trusted_server_config_store(env: &EnvConfig) -> Result<ConfigStoreHandle, fastly::Error> {
-    let store_name = config_store_name(env);
-    let store = EdgeZeroFastlyConfigStore::try_open(store_name.as_ref()).map_err(|e| {
+fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandle, fastly::Error> {
+    let store = EdgeZeroFastlyConfigStore::try_open(store_name).map_err(|e| {
         fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
@@ -95,17 +92,19 @@ fn main() {
     }
 
     logging::init_logger();
-    let env = runtime_env_config(TrustedServerApp::stores());
-    edgezero_main(req, &env);
+    edgezero_main(req);
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
+fn edgezero_main(mut req: FastlyRequest) {
+    let runtime_env = runtime_env_config(TrustedServerApp::stores());
+    let runtime_stores = RuntimeStoreConfig::from_env(&runtime_env);
+
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match load_settings_from_config_store(env) {
+        match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
             }
@@ -122,18 +121,19 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
         return;
     }
 
-    let config_store = match open_trusted_server_config_store(env) {
-        Ok(cs) => cs,
-        Err(e) => {
-            log::error!("failed to open config store: {e}");
-            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_body_text_plain("Internal Server Error")
-                .send_to_client();
-            return;
-        }
-    };
+    let config_store =
+        match open_trusted_server_config_store(runtime_stores.config_store_name.as_ref()) {
+            Ok(cs) => cs,
+            Err(e) => {
+                log::error!("failed to open config store: {e}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+                return;
+            }
+        };
 
-    let (app, app_state) = TrustedServerApp::build_app_with_state(env);
+    let (app, app_state) = TrustedServerApp::build_app_with_state(&runtime_stores);
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
     let trusted_client_ip = settings_snapshot
         .as_deref()
@@ -253,7 +253,7 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
                 entry_point_kv_store(&app_state),
             ));
         } else {
-            match load_settings_from_config_store(env) {
+            match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
                     futures::executor::block_on(apply_entry_point_finalize_headers(
                         &settings,
@@ -273,9 +273,13 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
         policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
-    if let Some(ec_state) = ec_state {
+    if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &ec_state, &mut response) {
+            match futures::executor::block_on(apply_edgezero_ec_finalize(
+                settings,
+                &mut ec_state,
+                &mut response,
+            )) {
                 Ok(partner_registry) => {
                     send_edgezero_response(response, request_filter_effects.as_ref());
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
@@ -288,9 +292,13 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
                 }
             }
         } else {
-            match load_settings_from_config_store(env) {
+            match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
+                    match futures::executor::block_on(apply_edgezero_ec_finalize(
+                        &settings,
+                        &mut ec_state,
+                        &mut response,
+                    )) {
                         Ok(partner_registry) => {
                             send_edgezero_response(response, request_filter_effects.as_ref());
                             run_edgezero_pull_sync_after_send(
@@ -376,9 +384,9 @@ async fn apply_entry_point_finalize_headers(
     apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
-fn apply_edgezero_ec_finalize(
+async fn apply_edgezero_ec_finalize(
     settings: &Settings,
-    ec_state: &EcFinalizeState,
+    ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
     let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
@@ -389,13 +397,15 @@ fn apply_edgezero_ec_finalize(
     };
     ec_finalize_response(
         settings,
-        &ec_state.ec_context,
+        &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
-    );
+        &ec_state.services,
+    )
+    .await;
     Ok(partner_registry)
 }
 

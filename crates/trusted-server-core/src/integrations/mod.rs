@@ -19,6 +19,7 @@ pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
+pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
 pub mod osano;
@@ -291,7 +292,8 @@ pub type IntegrationBuilderFn =
 /// whether the integration is enabled.
 ///
 /// Runs for every builder, enabled or not, so a typo in a disabled block is
-/// still caught.
+/// still caught. At deploy time secret fields hold secret-store key names
+/// rather than values, so a validator must not depend on a resolved secret.
 pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedServerError>>;
 
 /// Prepares a request before routing, for every routed request except the
@@ -306,13 +308,16 @@ pub type IntegrationPrepareRequestFn =
 pub const CORE_SOURCE: &str = "trusted-server-core";
 
 /// A named factory for one integration, the unit an adapter or a vendor crate
-/// hands to [`IntegrationRegistry::with_registrations`].
+/// hands to [`IntegrationRegistry::with_plan_and_registrations`].
 ///
 /// # Examples
 ///
 /// ```
 /// use error_stack::Report;
 /// use trusted_server_core::error::TrustedServerError;
+/// use std::sync::Arc;
+///
+/// use trusted_server_core::auction::compile_auction_plan;
 /// use trusted_server_core::integrations::{
 ///     IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
 /// };
@@ -330,7 +335,8 @@ pub const CORE_SOURCE: &str = "trusted-server-core";
 ///
 /// # fn demo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
 /// let builder = IntegrationBuilder::new("example", "example-crate", build, validate);
-/// let registry = IntegrationRegistry::with_registrations(settings, &[builder])?;
+/// let plan = Arc::new(compile_auction_plan(settings)?);
+/// let registry = IntegrationRegistry::with_plan_and_registrations(settings, plan, &[builder])?;
 /// assert!(registry.integration_enabled("example"));
 /// # Ok(())
 /// # }
@@ -415,8 +421,14 @@ impl IntegrationBuilder {
 
 /// The built-in integrations, in hook order.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
-    IntegrationBuilder::new("aps", CORE_SOURCE, aps::register, aps::validate),
-    IntegrationBuilder::new("prebid", CORE_SOURCE, prebid::register, prebid::validate),
+    // This must remain first: attribute rewriters chain replacements and
+    // short-circuit removals.
+    IntegrationBuilder::new(
+        js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
+        CORE_SOURCE,
+        js_asset_proxy::register,
+        js_asset_proxy::validate,
+    ),
     IntegrationBuilder::new(
         "testlight",
         CORE_SOURCE,

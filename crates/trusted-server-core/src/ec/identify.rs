@@ -350,6 +350,7 @@ mod tests {
     use super::*;
     use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::ec::registry::PartnerRegistry;
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
@@ -367,17 +368,6 @@ mod tests {
         );
     }
 
-    /// The identifier [`CanonicalizingProvider`] creates, as the browser
-    /// carries it in the `ts-ec` cookie.
-    const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
-
-    /// The identity-graph key generation writes that identifier's row under.
-    /// Pinned to the creation path by
-    /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
-    /// `ec` module tests, which asserts both the key it writes and the key
-    /// [`EcContext::ec_kv_key`] derives.
-    const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
-
     fn make_ec_context(ec_allowed: bool, ec_value: Option<&str>) -> EcContext {
         let consent = ConsentContext {
             source: ConsentSource::Cookie,
@@ -392,7 +382,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(api_token.to_owned()),
+            api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,

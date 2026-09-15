@@ -16,16 +16,18 @@ use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use error_stack::Report;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
-use trusted_server_core::auction::AuctionProviderBuilder;
+use trusted_server_core::auction::compile_auction_plan;
 use trusted_server_core::config::validate_settings_for_deploy_with;
 use trusted_server_core::ec::provider::IdentityInput;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
-use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::integrations::{
+    IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
+};
 use trusted_server_core::platform::{
-    ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-    PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableHttpClient,
-    UnavailableKvStore,
+    BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    UnavailableHttpClient, UnavailableKvStore,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
@@ -85,15 +87,18 @@ const PROBE_BLOCK: &str = r#"
 "#;
 
 /// Builds a service from the router composed with the supplied builders.
-fn service_with(
-    settings: Settings,
-    integrations: &[IntegrationBuilder],
-    auction_providers: &[AuctionProviderBuilder],
-) -> EdgeZeroAxumService {
-    let router =
-        TrustedServerApp::routes_with_registrations(settings, integrations, auction_providers)
-            .expect("should build a router from the composed builders");
+fn service_with(settings: Settings, integrations: &[IntegrationBuilder]) -> EdgeZeroAxumService {
+    let router = TrustedServerApp::routes_with_registrations(settings, integrations)
+        .expect("should build a router from the composed builders");
     EdgeZeroAxumService::new(router)
+}
+
+/// Builds a registry with the probe registered, over the auction plan the
+/// settings compile to, the way an adapter builds one at startup.
+fn registry_with_probe(settings: &Settings) -> IntegrationRegistry {
+    let plan = Arc::new(compile_auction_plan(settings).expect("should compile the auction plan"));
+    IntegrationRegistry::with_plan_and_registrations(settings, plan, &[seam_probe::builder()])
+        .expect("should build a registry with the probe registered")
 }
 
 /// Sends one GET carrying the probe's counting header and returns the
@@ -167,7 +172,7 @@ fn expected_bundle_parts() -> Vec<JsModulePart> {
 /// request's `?v=` matches that hash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn carried_module_is_served_in_the_unified_bundle_under_its_composed_hash() {
-    let mut service = service_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()], &[]);
+    let mut service = service_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]);
     let source = tsjs_script_src(&expected_bundle_parts());
 
     let response = get(&mut service, &source).await;
@@ -224,7 +229,7 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
             {PROBE_BLOCK}
         "#
     ));
-    let mut service = service_with(settings, &[seam_probe::builder()], &[]);
+    let mut service = service_with(settings, &[seam_probe::builder()]);
 
     let response = get(&mut service, seam_probe::SEAM_PROBE_REPORT_PATH).await;
 
@@ -262,7 +267,7 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_route_prepares_the_request_exactly_once() {
     let settings = settings_with(PROBE_BLOCK);
-    let mut service = service_with(settings, &[seam_probe::builder()], &[]);
+    let mut service = service_with(settings, &[seam_probe::builder()]);
 
     // `/admin/keys/rotate` is a named route (the legacy alias denied locally
     // with a 404), reached through `named_route_handler`, and it is not
@@ -317,7 +322,7 @@ fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
         "#,
     );
 
-    let error = validate_settings_for_deploy_with(&settings, &[seam_probe::builder()], &[])
+    let error = validate_settings_for_deploy_with(&settings, &[seam_probe::builder()])
         .expect_err("should reject the probe's own rule violation");
 
     assert!(
@@ -327,7 +332,7 @@ fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
         "should reject with the module's own message: {error}"
     );
     assert!(
-        validate_settings_for_deploy_with(&settings, &[], &[]).is_ok(),
+        validate_settings_for_deploy_with(&settings, &[]).is_ok(),
         "the same settings should pass without the module's builder, so the rejection is the module's and not core's"
     );
 }
@@ -351,10 +356,9 @@ fn geo_selector_naming_a_module_without_a_provider_fails_at_startup() {
         "#,
     );
 
-    let error =
-        TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()], &[])
-            .err()
-            .expect("should refuse to start when the selected module declares no geo provider");
+    let error = TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()])
+        .err()
+        .expect("should refuse to start when the selected module declares no geo provider");
 
     let message = error.to_string();
     assert!(
@@ -395,10 +399,9 @@ fn duplicate_integration_id_is_rejected_naming_both_sources() {
         ),
     ];
 
-    let error =
-        TrustedServerApp::routes_with_registrations(settings_with(PROBE_BLOCK), &extra, &[])
-            .err()
-            .expect("should reject two builders claiming one integration id");
+    let error = TrustedServerApp::routes_with_registrations(settings_with(PROBE_BLOCK), &extra)
+        .err()
+        .expect("should reject two builders claiming one integration id");
 
     let message = error.to_string();
     assert!(
@@ -406,42 +409,6 @@ fn duplicate_integration_id_is_rejected_naming_both_sources() {
             && message.contains(seam_probe::SEAM_PROBE_SOURCE)
             && message.contains(OTHER_SOURCE),
         "should name the id and both sources: {message}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 6. An outside builder's provider name satisfies `[auction] providers`
-// ---------------------------------------------------------------------------
-
-/// A provider name declared by a builder outside core satisfies
-/// `[auction] providers`, and the same settings are refused when the builder
-/// is not supplied, so the name is genuinely coming from the outside crate.
-#[test]
-fn auction_provider_name_from_an_outside_builder_satisfies_the_configured_list() {
-    let auction_settings = r#"
-            [auction]
-            enabled = true
-            providers = ["seam_probe"]
-        "#;
-    // The two cases differ only in whether the outside builder is supplied,
-    // so the settings are built twice from the same text.
-    let for_the_composed_case = settings_with(&format!("{auction_settings}{PROBE_BLOCK}"));
-    let for_the_bare_case = settings_with(&format!("{auction_settings}{PROBE_BLOCK}"));
-
-    TrustedServerApp::routes_with_registrations(
-        for_the_composed_case,
-        &[],
-        &[seam_probe::auction_builder()],
-    )
-    .expect("the outside builder's provider name should satisfy [auction] providers");
-
-    let error = TrustedServerApp::routes_with_registrations(for_the_bare_case, &[], &[])
-        .err()
-        .expect("should refuse a configured provider name nothing provides");
-
-    assert!(
-        error.to_string().contains("seam_probe"),
-        "should name the provider nothing provides: {error}"
     );
 }
 
@@ -499,11 +466,7 @@ fn ec_selector_naming_a_module_resolves_that_modules_provider() {
         "#,
     );
 
-    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
-        &settings,
-        &[seam_probe::builder()],
-    )
-    .expect("should build a registry with the probe registered");
+    let registry = registry_with_probe(&settings);
 
     let provider = registry
         .ec_provider()
@@ -527,11 +490,7 @@ fn device_selector_naming_a_module_resolves_that_modules_provider() {
         "#,
     );
 
-    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
-        &settings,
-        &[seam_probe::builder()],
-    )
-    .expect("should build a registry with the probe registered");
+    let registry = registry_with_probe(&settings);
 
     let provider = registry
         .device_provider()
@@ -565,11 +524,7 @@ async fn ec_provider_generates_an_identifier_with_the_modules_prefix() {
         "#,
     );
 
-    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
-        &settings,
-        &[seam_probe::builder()],
-    )
-    .expect("should build a registry with the probe registered");
+    let registry = registry_with_probe(&settings);
 
     let provider = registry
         .ec_provider()
@@ -650,6 +605,10 @@ impl PlatformSecretStore for StubSecretStore {
 struct StubBackend;
 
 impl PlatformBackend for StubBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Axum
+    }
+
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }

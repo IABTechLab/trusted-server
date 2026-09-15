@@ -83,37 +83,43 @@ curl -i "https://edge.example.com/_ts/clear-tester"
 
 ## First-Party Endpoints
 
-### GET /first-party/ad
+### POST /auction
 
-Server-side ad rendering endpoint. Returns complete HTML for a single ad slot.
+Browser and programmatic auction endpoint. It accepts the Trusted Server ad-unit
+request shape and returns an OpenRTB response with first-party processed
+creatives. Creative URLs are rewritten by default; set
+`[auction].sanitize_creatives = true` to strip executable markup.
 
-**Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `slot` | string | Yes | Ad slot identifier (matches ad unit code) |
-| `w` | integer | Yes | Ad width in pixels |
-| `h` | integer | Yes | Ad height in pixels |
+Configured provider IDs appear in response metadata and provider responses.
+Consumers that previously matched the literal provider name `prebid` must use
+the configured provider ID, such as `pbs-main`.
 
-**Response:**
+**Request Body:**
 
-- **Content-Type:** `text/html; charset=utf-8`
-- **Body:** Complete HTML creative with first-party proxying applied
+```json
+{
+  "adUnits": [
+    {
+      "code": "header-banner",
+      "mediaTypes": { "banner": { "sizes": [[728, 90]] } },
+      "bids": [
+        {
+          "bidder": "example-server-bidder",
+          "params": { "placement": "example-placement" }
+        }
+      ]
+    }
+  ]
+}
+```
 
 **Example:**
 
 ```bash
-curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
+curl -X POST https://edge.example.com/auction \
+  -H "Content-Type: application/json" \
+  -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
-
-**Response Headers:**
-
-No EC ID response header is emitted. EC identity is maintained with the `ts-ec` cookie.
-
-**Use Cases:**
-
-- Server-side ad rendering
-- Direct iframe embedding
-- First-party ad delivery
 
 ---
 
@@ -140,10 +146,10 @@ Returns EC identity plus the authenticated partner's UID and EID for the current
   "ec": "954d...e0c3.nZ1GxL",
   "consent": "ok",
   "degraded": false,
-  "source_domain": "formally-vital-lion.edgecompute.app",
+  "source_domain": "ssp.example.com",
   "uid": "mock-user-123",
   "eid": {
-    "source": "formally-vital-lion.edgecompute.app",
+    "source": "ssp.example.com",
     "uids": [{ "id": "mock-user-123", "atype": 3 }]
   },
   "cluster_size": 3
@@ -197,63 +203,6 @@ Resolve endpoint for client-side Edge Cookie providers. The page posts a value t
 **Request Body:** the provider's value, opaque to the core. For the `client-fixed` demo this is the fixed known word sent as `text/plain`.
 
 **Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side provider is configured, no identity graph is available, or the provider produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
-
----
-
-### POST /third-party/ad
-
-Client-side auction endpoint for TSJS library.
-
-**Request Body:**
-
-```json
-{
-  "adUnits": [
-    {
-      "code": "header-banner",
-      "mediaTypes": {
-        "banner": {
-          "sizes": [
-            [728, 90],
-            [970, 250]
-          ]
-        }
-      }
-    }
-  ],
-  "config": {
-    "debug": false
-  }
-}
-```
-
-**Response:**
-
-```json
-{
-  "seatbid": [
-    {
-      "bid": [
-        {
-          "impid": "header-banner",
-          "adm": "<html>...</html>",
-          "price": 1.5,
-          "w": 728,
-          "h": 90
-        }
-      ]
-    }
-  ]
-}
-```
-
-**Example:**
-
-```bash
-curl -X POST https://edge.example.com/third-party/ad \
-  -H "Content-Type: application/json" \
-  -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
-```
 
 ---
 
@@ -610,13 +559,13 @@ The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec/`{id}`
 
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format, with or without the `hmac~` provider-code prefix a created identifier carries. The bare route uses the request's `ts-ec` cookie.
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the provider this deployment selects, such as the built-in HMAC provider's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC provider also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no provider selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
 
 This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
 
 **Response fields:**
 
-- `ec_id`, `store`, and `generation` identify the raw KV lookup.
+- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC provider issued. `store` and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
@@ -638,10 +587,10 @@ The auction preview validates the stored record and partner configuration, but c
 | `5xx`  | Unexpected configuration or KV failure (plaintext)          |
 
 ```bash
-curl -u admin:secure-password \
+curl -u 'admin:<resolved-admin-password>' \
   "https://edge.example.com/_ts/admin/ec/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123"
 
-curl -u admin:secure-password \
+curl -u 'admin:<resolved-admin-password>' \
   --cookie "ts-ec=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123" \
   "https://edge.example.com/_ts/admin/ec"
 ```
@@ -672,7 +621,7 @@ After successful authentication this endpoint always returns `200 OK`; missing o
 ```
 
 ```bash
-curl -u admin:secure-password \
+curl -u 'admin:<resolved-admin-password>' \
   --cookie "sharedId=fictional-shared-id" \
   "https://edge.example.com/_ts/admin/eids"
 ```
@@ -723,30 +672,21 @@ All integration modules are built at compile time. At runtime, the server concat
 
 ### Prebid Integration
 
-#### GET /first-party/ad
+#### POST /auction
 
-See [First-Party Endpoints](#get-first-party-ad) above.
+See [First-Party Endpoints](#post-auction) above.
 
-#### POST /third-party/ad
+#### GET /integrations/prebid/bundle.js
 
-See [First-Party Endpoints](#post-third-party-ad) above.
+Proxies the configured external Prebid bundle through the first-party domain.
+The optional `v` query value is the configured SHA-256 cache key.
 
-#### GET /prebid.js (Optional)
+#### GET `<script_patterns>` (Optional)
 
-Returns empty JavaScript to override Prebid.js when `script_handler` is configured.
-
-**Configuration:**
-
-```toml
-[integrations.prebid]
-script_handler = "/prebid.js"
-```
-
-**Response:**
-
-- **Content-Type:** `application/javascript; charset=utf-8`
-- **Body:** `// Prebid.js override by Trusted Server`
-- **Cache:** `immutable, max-age=31536000`
+Each configured Prebid script pattern registers an endpoint that returns empty
+JavaScript, preventing the publisher's original Prebid bundle from loading.
+The defaults include `/prebid.js`, `/prebid.min.js`, `/prebidjs.js`, and
+`/prebidjs.min.js`; set `script_patterns = []` to disable interception.
 
 ---
 
@@ -856,13 +796,16 @@ Endpoints under protected paths require HTTP Basic Authentication:
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "secure-password"
+password = "admin_password"
 ```
+
+`password` is a key in the Trusted Server secret store. Provision the actual
+Basic Authentication password under `admin_password`.
 
 **Usage:**
 
 ```bash
-curl -u admin:secure-password https://edge.example.com/_ts/admin/keys/rotate
+curl -u 'admin:<resolved-admin-password>' https://edge.example.com/_ts/admin/keys/rotate
 ```
 
 **Protected Endpoints:**
