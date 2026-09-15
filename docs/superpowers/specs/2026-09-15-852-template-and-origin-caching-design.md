@@ -590,12 +590,12 @@ The request-side bypass carries no reason value at all. It sets
 `TemplateCacheResponseState::BypassRequest` (`:4386`) and writes free-text `log::debug!` lines
 (`:4360-4369`), and nothing else.
 
-That is a problem for this work specifically, because "cookie-disqualified" — the expected
-default, and the single most important thing an operator needs to see — lives on the
-unreachable side. So the observability work must **derive a structured request-side reason**
-alongside `template_cache_key`, reusing the existing `TemplateCacheBypassReason` variants rather
-than inventing a second vocabulary. That is new code, not a wiring exercise, and the plan must
-budget it.
+That is a problem for whoever instruments this cache, because "cookie-disqualified" — the
+expected default, and the single most important thing an operator needs to see — lives on the
+unreachable side. Doing it means **deriving a structured request-side reason** alongside
+`template_cache_key`, reusing the existing `TemplateCacheBypassReason` variants rather than
+inventing a second vocabulary. That is new code, not a wiring exercise, and **issue B must
+budget it** — it is no longer in this issue's scope.
 
 The `#[cfg(test)]` helper named `template_cache_bypass_reason()` at `:5863` is not the hook for
 either source.
@@ -707,8 +707,8 @@ tooling to observe and reverse it:
 
 1. **Predicate split** — pure refactor, no behavior change. First because everything else
    references the binding it creates.
-2. **Observability** — the three telemetry fields, the request-side bypass-reason derivation, and
-   the Tinybird datasource migration. The migration must reach Tinybird **before the code
+2. **Observability** — the `origin_cache_shareable` telemetry field and the Tinybird datasource
+   migration. (Two further fields were scoped out during implementation: see Observability.) The migration must reach Tinybird **before the code
    deploys**, which in a single PR is a deploy-ordering constraint on the release, not on the
    merge.
 3. **Probe** — the `reqwest` dependency, the loop-accept fixture server, four axes and four
@@ -812,9 +812,9 @@ not rediscovered later.
 **Observability is the largest refactor here and is not in #852.** Turning `AuctionObservationContext`
 from an immutable snapshot into a mutable accumulator, plus a 35-column schema migration with
 quarantine risk, sits close to AGENTS.md's "no large refactors without approval". It needs
-explicit approval before the work starts. If that approval is withheld, the trim is to drop
-`template_cache_state` — it is already on the `x-ts-template-cache` response header — and keep
-`template_cache_bypass_reason` and `origin_cache_shareable`, which carry the triage.
+explicit approval before the work starts. If that approval is withheld, the trim is to keep
+`origin_cache_shareable` alone. (Implementation reached that state anyway: `template_cache_state`
+proved unreachable and `template_cache_bypass_reason` was scoped out to issue B.)
 
 ## What closes #852
 
@@ -823,8 +823,8 @@ All five work items landed, and specifically:
 - The rollback staging verdict recorded, with the runbook matching it.
 - Probe green against the harness fixture origin on all four axes and all four response-header
   verdicts.
-- `template_cache_bypass_reason` and `origin_cache_shareable` confirmed present on Tinybird rows
-  from a staging deploy, with no quarantine.
+- `origin_cache_shareable` confirmed present on Tinybird rows from a staging deploy, with no
+  quarantine.
 - The readthrough gate reviewed as its own commit against the precondition list, not as part of
   the wider diff.
 

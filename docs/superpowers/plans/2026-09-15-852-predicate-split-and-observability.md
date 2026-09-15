@@ -61,7 +61,6 @@ no cache. Task 5 builds the combined one. Do not attempt Tasks 6–9 before it e
 | `crates/trusted-server-core/src/auction/telemetry.rs` | Observation context, row schema, NDJSON                                 | 3 fields on `AuctionObservationContext` (`:99`) and `AuctionEventRow` (`:277`); wire `base()` (`:347`)                                    |
 | `tinybird/datasources/auction_events_raw.datasource`  | ClickHouse columns                                                      | Add 3 nullable columns                                                                                                                    |
 | `tinybird/fixtures/auction_events_raw.ndjson`         | Fixture rows                                                            | Add 3 keys to all 8 rows                                                                                                                  |
-| `AGENTS.md`                                           | CI gate list                                                            | Correct it                                                                                                                                |
 
 ---
 
@@ -439,7 +438,7 @@ Expected: PASS.
 Run: `cargo test-fastly -- auction::telemetry::tests --nocapture 2>&1 | tail -20`
 
 `to_ndjson` (`:424`) uses plain `serde_json::to_string` with no `skip_serializing_if`, so the
-three keys are **always** on the wire including as `null`. That is what makes Task 4 mandatory
+new key is **always** on the wire including as `null`. That is what makes Task 4 mandatory
 and ordered before deploy.
 
 - [ ] **Step 6: Commit**
@@ -466,8 +465,6 @@ In `SCHEMA >`, after `ad_id` and **before** `event_date`:
 
 ```
   `origin_cache_shareable` Nullable(UInt8),
-  `template_cache_state` LowCardinality(Nullable(String)),
-  `template_cache_bypass_reason` LowCardinality(Nullable(String)),
 ```
 
 `LowCardinality` matches how `terminal_status` and `terminal_reason` are declared. The two new
@@ -509,7 +506,7 @@ print(f"ok: {len(rows)} rows match {len(cols)} declared columns")
 PY
 ```
 
-Expected: `ok: 8 rows match 36 declared columns`.
+Expected: `ok: 8 rows match 34 declared columns`.
 
 **The fixture has a pre-existing gap.** Before any change, the datasource declares 33 non-`event_date`
 columns and each fixture row has 32 keys: `user_agent` is declared and absent from every row. The
@@ -787,7 +784,7 @@ discoverable from the Rust doc comments.
      when an auction runs, so a request that bypasses the template cache _because_ the ad stack did
      not run — bot, prefetch, kill-switched, consent-denied — produces no row at all.
   2. **`None` is not a miss.** `AuctionObservationContext` is `Clone` and shared with the
-     `/auction` source, where all three fields are structurally `None`. A dashboard that reads
+     `/auction` source, where the column is structurally `None`. A dashboard that reads
      `None` as "miss" will be wrong for that whole source class. Filter on
      `auction_source = 'initial_navigation'` before computing any rate.
 
@@ -832,8 +829,9 @@ git diff main --stat
 
 Compare against the branch point rather than `main` if later parts have already landed on the
 branch. Expected for this part: only `publisher.rs`, `auction/telemetry.rs`, the two Tinybird
-files, `AGENTS.md`, and the docs touched by Task 11. An adapter file appearing means the telemetry struct is leaking into
-adapter code.
+files, and the docs touched by Task 11. `adapter-fastly/src/tinybird.rs` also appears: that is a
+`mod tests` row literal that must gain the new field, not the telemetry struct leaking into
+adapter code. Any _other_ adapter file appearing would be the leak this check is looking for.
 
 This check confirms _which files changed_, nothing more. Behavior neutrality of the predicate split
 rests on Task 1's `every_shared_input_is_necessary_for_shareability` test and on Task 1 Step 5 —
@@ -843,6 +841,6 @@ any template-cache test changing outcome means the refactor was not neutral.
 
 This is a deploy-ordering constraint, not a commit-ordering one — the PR merges atomically.
 Owner: whoever runs the deploy. Apply the datasource change to Tinybird first, then deploy the
-code, then confirm with a staging request that a summary row carries the three new columns and
+code, then confirm with a staging request that a summary row carries the new column and
 that `tinybird/pipes/quarantine_counts.pipe` shows no new quarantined rows. Record that
 confirmation on the PR; the spec's close-out criteria require it.

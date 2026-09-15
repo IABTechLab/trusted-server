@@ -121,7 +121,11 @@ pub struct AuctionObservationContext {
     pub consent_present: bool,
     /// Requested slot count for this candidate.
     pub slot_count: u16,
-    /// Whether the origin readthrough gate admitted this request.
+    /// Whether this request's origin response *would be* eligible to share.
+    ///
+    /// Records a predicate, not an outcome: no readthrough gate consumes it yet, so today
+    /// every ad-serving request still bypasses the platform cache regardless of this value.
+    /// It exists so the gate's reach is measurable from the deploy that ships it.
     ///
     /// `None` on sources that do not make the decision, which is not the same as
     /// `Some(false)` — a dashboard that reads absence as "not shareable" will be wrong for

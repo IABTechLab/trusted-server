@@ -18,9 +18,14 @@ Adding a field means changing three things together: the struct in
 
 ## Reading `origin_cache_shareable`
 
-Reports whether the origin readthrough gate admitted a request — whether Trusted Server
-allowed the platform cache to serve this page rather than forcing an origin fetch. Two
-caveats, both of which silently produce wrong numbers if a query ignores them.
+Reports whether a request's origin response **would be** eligible to share between readers.
+
+**It is not yet an outcome.** No readthrough gate consumes the predicate — every ad-serving
+request still forces an origin fetch. The column exists so the gate's reach is measurable
+from the deploy that ships it, and until then it answers "how much traffic would the gate
+admit", not "how much did it admit".
+
+Three caveats, each of which silently produces wrong numbers if a query ignores it.
 
 ### The denominator is ad-serving pageviews, not all requests
 
