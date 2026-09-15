@@ -97,6 +97,37 @@ Request the signed path that comes back; the response body should be
 `hello from origin`. If signing fails, the proxy secret is usually missing from
 the environment — see [Getting Started](/guide/getting-started).
 
+## Pick a first issue
+
+These three are scoped deliberately for a first contribution: each is small,
+self-contained, has an existing test nearby to copy, and touches code that only
+one caller depends on. Each issue carries its own reproduction, acceptance
+criteria, and file-and-line pointers, so start by reading the issue in full.
+
+| Issue                                                             | What it is                                                                      | Why it suits a first contribution                                                                                            |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| [#1093](https://github.com/IABTechLab/trusted-server/issues/1093) | Root Markdown escapes the Prettier gate, so several root pages fail `--check`   | Documentation and CI only, no runtime risk. A good way to learn the workflow and the format gates before changing behavior.  |
+| [#1063](https://github.com/IABTechLab/trusted-server/issues/1063) | A bare `ts dev proxy` prints an internal error report instead of help           | One crate, one argument struct, an existing neighboring test. Teaches Clap and this repository's `error-stack` conventions.  |
+| [#1144](https://github.com/IABTechLab/trusted-server/issues/1144) | Partner token placeholders from the config template are not rejected at startup | A single validation function with one production caller, and an adjacent branch to mirror. Teaches configuration validation. |
+
+Take them in that order if you want the gentlest ramp: #1093 exercises the
+review and merge mechanics with nothing at stake, then #1063 and #1144 are real
+behavior changes of a similar small size.
+
+Two notes before you start:
+
+- **#1063 is macOS-only.** `ts dev proxy` has its dependencies scoped to macOS,
+  so the subcommand does not exist on other hosts. It also needs an explicit
+  host target, because the workspace default target is WebAssembly. Pick a
+  different issue if you are not on a Mac.
+- **#1093 edits `AGENTS.md`**, which is high-traffic. Check whether a large
+  documentation pull request is open before you start, and rebase rather than
+  forcing a conflict.
+
+If all three are taken, the project board is the place to look next. Ask in the
+team channel before starting anything unlabelled, since an issue that reads as
+small often is not.
+
 ## Build traps
 
 These are the failures most likely to cost you an afternoon. They are
