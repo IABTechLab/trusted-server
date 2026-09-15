@@ -15,7 +15,7 @@ defers, and why the feature is normative rather than deferred.
 > **Context.** PR #838 shipped, undeclared and unspec'd, a second provider
 > _type_: a "client-cycle" EC provider whose identifier is established by a
 > browser POST to a new public endpoint (`POST /_ts/api/v1/ec/resolve`),
-> plus a demo provider (`client-fixed`) and a JS bundle. Review found the
+> plus a demo provider (`client_fixed`) and a JS bundle. Review found the
 > endpoint accepted cross-origin identity-setting posts with no origin
 > check, created cookies with no identity-graph row (violating an invariant
 > the organic path enforces explicitly), was registered on only one of four
@@ -258,7 +258,7 @@ the bar for the vendor-scheme implementation:
 
 ## 5. Demo providers
 
-Implemented as required. The `client-fixed` demonstration provider (fixed
+Implemented as required. The `client_fixed` demonstration provider (fixed
 identifier, constant-equality verification) is compiled only behind the
 `client-fixed-demo` cargo feature. In a production build the settings
 validator rejects the selection at startup with a direct message, and the

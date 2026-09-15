@@ -66,21 +66,85 @@ Non-goals:
   README describing where vendor EC crates will live.
 - The client-cycle (browser round-trip) provider type has its own spec. The
   trait ships the seam for it (`resolve_from_client`, a no-op by default)
-  and a demonstration provider (`client-fixed`) compiled only into test and
+  and a demonstration provider (`client_fixed`) compiled only into test and
   demonstration builds. Production selection of the demo provider is a
   startup error.
 
 ## 2. Provider taxonomy
 
-| Concern     | Trait                | Built-in default            | Opt-in implementations                                                                                                                        |
-| ----------- | -------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| EC identity | `EdgeCookieProvider` | none (stateless)            | `hmac` (in core, HMAC over client IP, preserves today's identity), `host-signals` (in core, see below), and `client-fixed` (demo builds only) |
-| Device      | `DeviceProvider`     | `builtin` (User-Agent only) | `fastly` (TLS JA4 and HTTP/2 signals through an injected `HostSignals` service)                                                               |
-| Geo         | `PlatformGeo`        | none (no location)          | `platform` (host geo lookup)                                                                                                                  |
+### 2.1 The configuration convention every provider type follows
+
+Every pluggable thing in Trusted Server is a **provider**, meaning a
+component a deployment selects by name in operator configuration rather
+than one core hard-wires. Each provider type is one top-level table, and a
+`provider` key inside that table selects what runs:
+
+```toml
+[<type>]
+provider = "<name>"          # a string where one runs, a list where several run
+
+[<type>.<name>]              # only when that provider has settings
+setting = "value"
+```
+
+The seven types, all singular and snake_case:
+
+| Type                | What it decides                          | `provider` takes           |
+| ------------------- | ---------------------------------------- | -------------------------- |
+| `ec`                | Edge Cookie identity                     | a string, one runs         |
+| `geo`               | location resolution                      | a string, one runs         |
+| `device`            | device classification                    | a string, one runs         |
+| `permission_signal` | which permission signal schemes run      | a list, in the order given |
+| `demand`            | the sources bids are requested from      | a list, all run            |
+| `adserver`          | the ad server that decides what is shown | a string, one runs         |
+| `integration`       | the vendor modules a page loads          | a list, all run            |
+
+The rules, which hold for all seven:
+
+- A `[<type>.<name>]` table exists only where that provider has something to
+  set. A provider with no settings is selected by name alone.
+- The word `providers` appears nowhere in configuration. The type table,
+  and the `provider` key inside it, carry the whole selection.
+- The name is the implementation, unless the table carries
+  `implementation = "<id>"`. That key is optional everywhere, and it is how
+  two Prebid Servers run side by side under different names, each with its
+  own endpoint and its own settings.
+- All names are snake_case.
+- A `[<type>.<name>]` table that its type's `provider` does not select
+  refuses startup, because an unreferenced table is a mistyped selector or a
+  stale block, and accepting one silently invites configuration drift.
+- An implementation this build does not have refuses startup, and the
+  message lists the implementations it does have.
+- A `demand` or `adserver` endpoint must be HTTPS, or HTTP to a loopback
+  host only (`127.0.0.1`, `::1`, `localhost`).
+- Every provider rejects settings it does not know, so a typo fails loudly
+  rather than being quietly ignored.
+- A secret setting holds the **name** of a key in `trusted_server_secrets`,
+  never a value, so no secret is ever written into a configuration file.
+
+`[auction]` is not a provider type. It keeps `enabled`, `timeout_ms`, the
+creative settings, `allowed_context_keys`, and
+`[auction.bidders.<code>] provider = "<demand name>"`, which maps a bidder
+code a page asks for onto one of the declared demand providers.
+
+### 2.2 The three provider types this spec defines
+
+| Concern     | Type     | Trait                | Default                     | Opt-in implementations                                                                                                      |
+| ----------- | -------- | -------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| EC identity | `ec`     | `EdgeCookieProvider` | none (stateless)            | `hmac` (HMAC over client IP, preserves today's identity), `host_signals` (see below), and `client_fixed` (demo builds only) |
+| Device      | `device` | `DeviceProvider`     | `builtin` (User-Agent only) | `fastly` (TLS JA4 and HTTP/2 signals through an injected `HostSignals` service)                                             |
+| Geo         | `geo`    | `PlatformGeo`        | `none` (no location)        | `platform` (host geo lookup)                                                                                                |
 
 The geo trait is the existing `PlatformGeo` in `platform/traits.rs` rather
 than a new `GeoProvider` name. The EC trait lives in `ec/provider.rs` and the
 device trait in `ec/device.rs`.
+
+Core names none of these implementations. Each one is registered by an
+integration builder, which is the same seam a vendor crate uses, and a
+builder that supplies an implementation does not have to be a page
+integration, so a crate can ship an identity, geo or device implementation
+and no browser JavaScript at all. The integration seam spec states that rule
+in full and this spec follows it.
 
 Selection keys are strings in operator configuration
 (`trusted-server.example.toml` carries the commented template):
@@ -89,28 +153,28 @@ Selection keys are strings in operator configuration
 [ec]
 provider = "hmac"
 
-[ec.providers.hmac]
-passphrase = "replace-with-32-plus-byte-random-secret"
+[ec.hmac]
+passphrase_secret = "ec_hmac_passphrase"   # names a trusted_server_secrets key
 
 [device]
 provider = "builtin"   # default. "fastly" opts into TLS/H2 signal evidence
 
 [geo]
-provider = "platform"           # default is none (no location, no host call)
+provider = "platform"           # default is "none" (no location, no host call)
 # The baseline for a request with no resolvable country lives at the top of the
 # rules tree in permissions.yaml, not here.
 # assume_single_jurisdiction = true   # required when EC runs with no geo
 ```
 
-**The `host-signals` EC provider** (identity from HMAC over the host TLS JA4
+**The `host_signals` EC provider** (identity from HMAC over the host TLS JA4
 and HTTP/2 signals plus the client IP) was deliberately dropped from the
-2026-07-31 draft. It has since shipped in PR #1044 as an opt-in built-in
-(`[ec.providers.host-signals]`), implemented against the host-agnostic
+2026-07-31 draft. It has since shipped in PR #1044 as an opt-in
+implementation (`[ec.host_signals]`), implemented against the host-agnostic
 `HostSignals` capability rather than a Fastly API, so any host that supplies
 the signals can run it and a host that supplies none cannot build it.
 When the host supplies no signal at all the provider defers with a
-warning instead of degrading to an IP-only identifier under the host-signals
-name. **An open review question stands on whether this provider should ship
+warning instead of degrading to an IP-only identifier under the
+`host_signals` name. **An open review question stands on whether this provider should ship
 in the series at all**, because its identifier shape shares the built-in
 HMAC grammar and a sign-off row defers host signal processing. The
 question is flagged for the series review and this spec does not present
@@ -342,8 +406,8 @@ structural:
   resolution. The neutral `builtin` classifier reads only the User-Agent
   and makes no host call. The draft went further and made selecting a
   host-signal-reading device provider a startup error pending a separate
-  security design. The implementation instead ships `[device] provider =
-"fastly"` as a selectable opt-in. The Fastly adapter injects a
+  security design. The implementation instead ships
+  `[device] provider = "fastly"` as a selectable opt-in. The Fastly adapter injects a
   `HostSignals` service carrying the TLS JA4 and HTTP/2 signals, and
   the provider uses them to strengthen the browser/bot gate that guards EC
   writes. Identity rows persist the derived classification fields (the JA4
@@ -375,22 +439,22 @@ never a silent behavior change. A selection that only the running host can
 satisfy (an injected vendor provider, or host signals) fails loudly
 when the provider is built, stopping the request rather than degrading.
 
-| Configuration state                                                            | Behavior                                                                                                                                                                                                                                                                                                   |
-| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[ec] provider` set, its `[ec.providers.<key>]` block missing                  | Startup error naming the missing block. There is no closed key list in core for EC, because a vendor key is legitimate when its block is present, so an unknown key with no block fails this same check.                                                                                                   |
-| `[ec.providers.<key>]` block present, `provider` unset                         | **Startup error.** (In PR #838 this silently ran stateless. The half-migrated config becomes a production identity outage detected by revenue drop. Rejecting it is the fix.) An operator who genuinely wants stateless deletes the block.                                                                 |
-| `provider = "none"` (explicit stateless)                                       | Valid, and means exactly what omitting the selector means. Any configured provider block alongside it is a startup error, the same stray-block rule as below.                                                                                                                                              |
-| A configured `[ec.providers.<key>]` block that is not the selected one         | **Startup error** (checked for the `hmac` block and every vendor block). An unreferenced block is almost always a mistyped selector or a stale block, and accepting it silently invites configuration drift.                                                                                               |
-| A selected vendor key whose provider the adapter did not inject                | Loud failure when the provider is built, naming the key, so the deployment never silently runs stateless.                                                                                                                                                                                                  |
-| `provider = "host-signals"` on a host that supplies no signals                 | Loud failure when the provider is built. A host that cannot produce `HostSignals` cannot run the provider.                                                                                                                                                                                                 |
-| `provider = "client-fixed"` in a production build                              | Startup error. The demonstration provider is compiled only behind the `client-fixed-demo` cargo feature.                                                                                                                                                                                                   |
-| No `provider`, no providers block                                              | Valid, the neutral default for that concern.                                                                                                                                                                                                                                                               |
-| Deprecated `[ec] passphrase`                                                   | Migrated to `provider = "hmac"` with the passphrase in `[ec.providers.hmac]`, with a deprecation warning naming the new location. Both forms together are rejected so a half-edited file fails loudly instead of one form silently winning.                                                                |
-| Any unknown key in `[ec]`, `[device]`, `[geo]`, or a built-in provider block   | Startup error. `deny_unknown_fields` is on `Ec`, `DeviceConfig`, `GeoConfig`, and both built-in provider config structs, so a typo like `providr`, or a key from a deferred feature (`legacy_providers`, `rewrite_legacy`, `versions`), fails loudly.                                                      |
-| `[device] provider` names an unknown key                                       | Startup error. Valid keys are `builtin` (default) and `fastly`.                                                                                                                                                                                                                                            |
-| `[geo] provider` names an unknown key                                          | Startup error. Valid states are unset (default, no geolocation), `none` (the same, spelled out), and `platform`.                                                                                                                                                                                           |
-| `permissions.yaml` top node missing `group` or `jurisdiction`                  | **Startup error.** The top node is the permission baseline for a request the geo provider leaves unmatched, so there must always be one, its `group` must name a defined group, and its `jurisdiction` states the consent handling for that request. Nodes below inherit both unless they state their own. |
-| An EC provider configured, no geo provider, `assume_single_jurisdiction` unset | **Startup error.** With geolocation off, every request resolves at the top of the rules tree, so a visitor from any other jurisdiction silently receives that baseline's rules. That is acceptable only as an explicit operator decision.                                                                  |
+| Configuration state                                                                 | Behavior                                                                                                                                                                                                                                                                                                   |
+| ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[ec] provider` names an implementation whose settings table is required and absent | Startup error naming the missing table. A table is required only where the implementation has a setting it cannot default, as `hmac` cannot default its passphrase secret.                                                                                                                                 |
+| `[ec.<name>]` table present, `provider` unset                                       | **Startup error.** (In PR #838 this silently ran stateless. The half-migrated config becomes a production identity outage detected by revenue drop. Rejecting it is the fix.) An operator who genuinely wants stateless deletes the table.                                                                 |
+| `provider = "none"` (explicit stateless)                                            | Valid, and means exactly what omitting the selector means. Any configured provider table alongside it is a startup error, the same stray-table rule as below.                                                                                                                                              |
+| A configured `[ec.<name>]` table that `provider` does not select                    | **Startup error**, the rule §2.1 states for every provider type. An unreferenced table is almost always a mistyped selector or a stale block, and accepting one silently invites configuration drift.                                                                                                      |
+| `[ec] provider` names an implementation this build does not have                    | Startup error listing the implementations the build does have, so the operator sees at once whether the crate is missing or the name is mistyped.                                                                                                                                                          |
+| `provider = "host_signals"` on a host that supplies no signals                      | Loud failure when the provider is built. A host that cannot produce `HostSignals` cannot run the provider.                                                                                                                                                                                                 |
+| `provider = "client_fixed"` in a production build                                   | Startup error. The demonstration provider is compiled only behind the `client-fixed-demo` cargo feature.                                                                                                                                                                                                   |
+| No `provider`, no provider table                                                    | Valid, the neutral default for that concern.                                                                                                                                                                                                                                                               |
+| Deprecated `[ec] passphrase`                                                        | Migrated to `provider = "hmac"` with the passphrase secret named in `[ec.hmac]`, with a deprecation warning naming the new location. Both forms together are rejected so a half-edited file fails loudly instead of one form silently winning.                                                             |
+| Any unknown key in `[ec]`, `[device]`, `[geo]`, or a provider's own table           | Startup error. Every provider rejects settings it does not know (§2.1), so a typo like `providr`, or a key from a deferred feature (`legacy_providers`, `rewrite_legacy`, `versions`), fails loudly.                                                                                                       |
+| `[device] provider` names an implementation the build does not have                 | Startup error listing what the build does have. The implementations in this repository are `builtin` (default) and `fastly`.                                                                                                                                                                               |
+| `[geo] provider` names an implementation the build does not have                    | Startup error listing what the build does have. Valid states are unset (the default, no geolocation), `none` (the same, spelled out), and `platform`.                                                                                                                                                      |
+| `permissions.yaml` top node missing `group` or `jurisdiction`                       | **Startup error.** The top node is the permission baseline for a request the geo provider leaves unmatched, so there must always be one, its `group` must name a defined group, and its `jurisdiction` states the consent handling for that request. Nodes below inherit both unless they state their own. |
+| An EC provider configured, no geo provider, `assume_single_jurisdiction` unset      | **Startup error.** With geolocation off, every request resolves at the top of the rules tree, so a visitor from any other jurisdiction silently receives that baseline's rules. That is acceptable only as an explicit operator decision.                                                                  |
 
 One draft row was not adopted, the startup error for a creating provider
 with no identity-graph store. `[ec] ec_store` remains optional, because the
@@ -400,12 +464,13 @@ could never be withdrawn through the graph), and the organic path persists
 the row whenever the graph is configured. Whether configuration should
 force the pairing is follow-up work with the migration spec.
 
-Vendor provider blocks deserve their own note. Any `[ec.providers.<key>]`
-block whose key is not a built-in is captured in core as raw values (a
-flattened map), and the adapter that injects the vendor provider
-deserializes its own block into the vendor crate's config type. Core never
-names a vendor, so a new provider adds nothing to core. The vendor crate
-applies its own `deny_unknown_fields` when it deserializes.
+Vendor provider tables deserve their own note. Any `[ec.<name>]` table whose
+name core does not itself know is captured as raw values (a flattened map),
+and the crate that registered the implementation deserializes that table into
+its own config type. Core names no vendor, so a new provider adds nothing to
+core. The vendor crate rejects settings it does not know when it
+deserializes, which is the §2.1 rule applied by the party that owns the
+settings.
 
 ### 6.1 Provider switching: what a switch actually does
 
@@ -480,7 +545,7 @@ logged, none silent:
 | `generate` returns an error                                       | No identity this request. The organic caller logs at error level and the request proceeds stateless. No cookie is written.                                          |
 | A provider creates an identifier outside the global bounds        | Rejected at create, never rewritten. The organic path yields no identity. The resolve endpoint returns 400.                                                         |
 | Identity-graph write fails at create                              | The create is undone (no identifier, no cookie), with the error logged. The resolve endpoint returns 503. The next eligible request retries.                        |
-| The host-signals provider finds no TLS/HTTP-2 signals             | Defers with a warning. No identity this request, and no degraded IP-only identifier is created under the host-signals name.                                         |
+| The `host_signals` provider finds no TLS/HTTP-2 signals           | Defers with a warning. No identity this request, and no degraded IP-only identifier is created under the `host_signals` name.                                       |
 | Geo lookup **fails** (the provider errors)                        | Every permission resolves to the requires-signal floor, and the failure is logged at error level. The failure is **not** papered over with the top-node baseline.   |
 | Geo resolves **no location**, or a country or region with no node | The rules tree's top-node baseline applies. This is the configured-default case, deliberately distinct from the failure row above (`GeoStatus` in `ec/consent.rs`). |
 | An incoming cookie value fails the bounds at read-back            | Treated as absent, with a warning naming the source.                                                                                                                |
@@ -532,9 +597,9 @@ request path:
   read-back, the permission gate, and creating, so the per-request
   triple-build observed in PR #838 (cloning the secret into a fresh box up
   to three times per request) is gone.
-- `build_device_provider` (`ec/device.rs`) returns the builtin classifier
-  unless `fastly` is selected, in which case the adapter's closure builds
-  the host-evidence provider.
+- `build_device_provider` (`ec/device.rs`) returns the `builtin` classifier
+  unless `fastly` is selected, in which case the registered implementation
+  builds the host-evidence provider.
 - `build_geo_provider` (`platform/mod.rs`) returns `DisabledGeo` unless
   `platform` is selected, in which case the adapter's host geo
   implementation is used. All four adapters (Fastly, Axum, Cloudflare,
@@ -589,9 +654,9 @@ prominent in release notes:
 
 - **Bot gate.** The pre-provider EC bot gate required JA4 and platform
   class. The default `builtin` classifier is User-Agent only, so the gate
-  is weaker by default. The stronger gate is available as `[device]
-provider = "fastly"` rather than being startup-rejected as the draft
-  specified. Release notes call out the weaker default rather than
+  is weaker by default. The stronger gate is available as
+  `[device] provider = "fastly"` rather than being startup-rejected as the
+  draft specified. Release notes call out the weaker default rather than
   presenting selection alone as authorization.
 - **Geo.** With no geo provider, jurisdiction resolution falls to the
   required top node of the `permissions.yaml` rules tree. The permission model
@@ -645,7 +710,7 @@ As landed:
 2. **PR #1044, device and geo selection.** `DeviceProvider` with the
    builtin default and the opt-in Fastly host-evidence provider,
    `PlatformGeo` selection with the no-geo default, all four adapters
-   routed through the shared builders, and the opt-in host-signals EC
+   routed through the shared builders, and the opt-in `host_signals` EC
    provider (carrying the open review question of section 2).
 3. **PR #1045, the permission model.** The enforcement point for
    `required_permissions`, the fallback-baseline requirement (shipped as
@@ -663,11 +728,11 @@ together in the permission model change.
 This spec supersedes #778 on the following points, so implementation has
 one acceptance contract:
 
-| #778 says                                                    | This spec says                                                                                                                          | Why                                                                                                                                                                                   |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Identifier comparison is a provider operation (`keys_equal`) | Comparison is structural. Read-back acceptance and KV normalization route through the provider, so no comparison method exists (§3, §4) | Satisfies the same requirement with no method to leave uncalled                                                                                                                       |
-| A provider can return response headers                       | Kept, with a production consumer. EC finalization applies them, and the client-cycle path uses them (§4)                                | The caller the minimalism rule demands landed in the same series                                                                                                                      |
-| One built-in provider (HMAC) preserving today's behavior     | HMAC preserved verbatim, plus the opt-in host-signals built-in (open question, §2) and the demo client-cycle provider                   | A switch retires the previous provider's identity population outright (§6.1); carrying identities across a switch (`legacy_providers`) remains follow-up work with the migration spec |
+| #778 says                                                    | This spec says                                                                                                                          | Why                                                                                                                                                                                       |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Identifier comparison is a provider operation (`keys_equal`) | Comparison is structural. Read-back acceptance and KV normalization route through the provider, so no comparison method exists (§3, §4) | Satisfies the same requirement with no method to leave uncalled                                                                                                                           |
+| A provider can return response headers                       | Kept, with a production consumer. EC finalization applies them, and the client-cycle path uses them (§4)                                | The caller the minimalism rule demands landed in the same series                                                                                                                          |
+| One built-in provider (HMAC) preserving today's behavior     | HMAC preserved verbatim, plus the opt-in `host_signals` implementation (open question, §2) and the demo client-cycle provider           | A switch retires the previous provider's identity population outright (§6.1), and carrying identities across a switch (`legacy_providers`) remains follow-up work with the migration spec |
 
 ## 13. Revision record vs the 2026-07-31 draft
 
@@ -684,7 +749,7 @@ this revision describes.
 | Capability mismatch is a startup error at adapter wiring time                                                                       | Configuration coherence fails at startup. A host-capability mismatch (missing `HostSignals`, uninjected vendor) fails loudly when the provider is built, stopping the request.                                                                                                                                                                                                  | The adapter capability declaration that would move the check to startup is deferred with the capability matrix.                                                                                       |
 | A creating provider with no identity-graph store is a startup error                                                                 | Not implemented. `ec_store` stays optional. The resolve endpoint refuses to create without a graph. The organic path persists rows whenever the graph is configured.                                                                                                                                                                                                            | Portability adapters run without platform KV. Whether configuration should force the pairing is follow-up work.                                                                                       |
 | `[device] provider = "fastly"` is startup-rejected pending a separate security design                                               | Shipped as a selectable opt-in. The Fastly adapter injects `HostSignals`, the provider strengthens the browser/bot gate, and rows persist derived classes, not raw signals.                                                                                                                                                                                                     | Selection is an explicit operator opt-in and the neutral default makes no host signal call.                                                                                                           |
-| The `host-signals` EC provider is deliberately dropped and its selection rejected                                                   | Shipped in PR #1044 as an opt-in built-in that defers with a warning when the host supplies no signals. **Open, flagged for the series review**, not settled either way.                                                                                                                                                                                                        | Its identifier shape shares the HMAC grammar, and a sign-off row defers host signal processing, so the review decides whether the provider ships in the series.                                       |
+| The `host_signals` EC provider is deliberately dropped and its selection rejected                                                   | Shipped in PR #1044 as an opt-in implementation that defers with a warning when the host supplies no signals. **Open, flagged for the series review**, not settled either way.                                                                                                                                                                                                  | Its identifier shape shares the HMAC grammar, and a sign-off row defers host signal processing, so the review decides whether the provider ships in the series.                                       |
 | Geo default flip sequenced into the later permission-model step, with an acknowledgment guard                                       | Landed as specified in the same series, with the default of none, a required and validated fallback baseline (`default_country` at the time, the rules tree's top node since 2026-09-01), the `assume_single_jurisdiction` acknowledgment, and a failed lookup resolving to the requires-signal floor with error logging (`GeoStatus`, resolved in core so all adapters agree). | The permission model shipped in PR #1045, so the constraints exist where the draft required them.                                                                                                     |
 | All adapters serve the full EC feature set identically                                                                              | Selector behavior is identical through the shared builders and core constructors. The EC API routes (identify, batch-sync, ec/resolve) are Fastly-only, documented in the Spin route list.                                                                                                                                                                                      | The portability adapters do not yet wire platform KV, and the gap is documented rather than silent.                                                                                                   |
 | Conformance suite, adapter capability matrix, delimiter-free key grammar, `verify`, `legacy_providers`, `versions` / `mint_version` | None of these are in PR #1043 or #1044. All are tracked follow-up work, deferred, not silently dropped.                                                                                                                                                                                                                                                                         | The shipped seam did not need them, and each returns with the feature that gives it a production caller, per the spec's own minimalism rule.                                                          |

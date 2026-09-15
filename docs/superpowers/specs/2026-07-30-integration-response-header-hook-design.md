@@ -699,7 +699,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   §4a.2**, spec-pinned
   today to exactly **`X-DataDome-ClientID`**, admitted only when the
   operator explicitly sets
-  `[integrations.datadome] expose_client_id_to_origin = true` (default
+  `[integration.datadome] expose_client_id_to_origin = true` (default
   `false`); every other `X-DataDome-*`
   field is rejected until a reviewed commit adds it to §4a.2
   ("documented enrichment set, listed one by one" without an actual list
@@ -1018,7 +1018,7 @@ Platform host evidence:
 
 - `TlsProtocol`, capped by TS at 32 bytes
 - `JA4`, capped by TS at 128 bytes, only when the operator explicitly sets
-  `[integrations.datadome] expose_host_fingerprints_to_vendor = true`;
+  `[integration.datadome] expose_host_fingerprints_to_vendor = true`;
   the default is `false`, omission is represented by absence rather than an
   empty field, and startup logs the additional vendor disclosure
 - `TlsCipher` is omitted in v1: DataDome defines it as the ordered list of
@@ -1129,7 +1129,7 @@ and the materialized values below participate in permission §5.5's complete
 effective-config digest.
 
 ```toml
-[integrations.datadome]
+[integration.datadome]
 
 # Existing timeout_ms remains the 1500 ms first-byte bound.
 complete_response_timeout_ms = 3000

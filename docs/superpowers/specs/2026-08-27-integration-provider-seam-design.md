@@ -66,7 +66,7 @@ seventh PR targets, and the five series PRs do not touch these files.
 3. **Startup validation names every vendor.** `validate_enabled_integrations`
    imports and calls each vendor's config type by name
    (`crates/trusted-server-core/src/config.rs:136` to `:166`).
-4. **Auction providers are a second closed table.**
+4. **Demand providers are a second closed table.**
    The list of Prebid, APS and the ad server mock is at
    `crates/trusted-server-core/src/auction/mod.rs:51` to `:53`, inside
    `provider_builders()` at `:49`. `main` has since replaced that table with
@@ -90,6 +90,10 @@ owns nothing behind it. Concretely:
 
 - Core defines the registration contract and the request pipeline. It names
   no vendor.
+- An integration builder is the one way an implementation of any provider
+  type reaches operator configuration. A builder that supplies only an
+  implementation is not a page integration, ships no browser JavaScript,
+  and is never named in `[integration] provider`.
 - A vendor integration ships as its own crate with its Rust, its browser
   JavaScript, its configuration type, its startup validation and its tests.
 - An adapter composes the deployment by injecting the registrations it was
@@ -114,9 +118,11 @@ Make the builder contract public and give the registry a second input.
 - Duplicate integration ids are a startup error, naming both sources, so a
   vendor crate cannot silently shadow a built-in. There is no such check
   today, only a per-route conflict check and a debug-only assertion, so the
-  builder carries a source label and the registry gets the check. Prebid and
-  APS register through the auction plan rather than through a builder, and
-  their ids are reserved by the same check.
+  builder carries a source label and the registry gets the check. Prebid
+  Server and APS are demand implementations rather than integrations,
+  selected by `[demand] provider` and never named in
+  `[integration] provider`, and their names are reserved by the same
+  check so an integration cannot take one.
 
 ### 3.2 Carrying browser JavaScript on the registration
 
@@ -156,22 +162,72 @@ every registered integration is covered by deploy validation
 (`config.rs:688` on `main`) is rewritten against the hook, so the guarantee
 survives in a vendor-neutral form. Two details the map of `main` adds. The
 enumeration the test needs is independent of which integrations a
-configuration enables, so the registry exposes the full set of registrations
-it was built from, not only the enabled ones. And Prebid, APS and
-`adserver_mock` are auction plan providers rather than registrations, so
-validation checks their three configuration blocks by name next to the
-builders' hooks, and a test plants a block each of them must reject.
+configuration selects, so the registry exposes the full set of registrations
+it was built from, not only the ones `[integration] provider` names. And
+Prebid Server, APS and `adserver_mock` are demand and ad server
+implementations rather than integrations, so their `[demand.<name>]` and
+`[adserver.<name>]` tables validate through the same reject-what-you-do-not-
+know rule the registration hook gives every other provider, and a test
+plants a setting each of them must reject.
 
-### 3.4 Auction providers
+### 3.4 Demand and ad server providers
 
-This change does not open the auction to providers from outside core. An
-earlier revision of this section gave `AuctionOrchestrator` a public
+This change does not open the auction to demand implementations from outside
+core. An earlier revision of this section gave `AuctionOrchestrator` a public
 provider-builder type and a second input. `main` has since replaced the
 provider table that revision addressed with a compiled auction plan, in PR
-#1016. Bidders are declared under `[auction.providers]`, each one selects an
-OpenRTB profile, and the orchestrator and the integration registry share the
-one compiled plan. This change follows that design and adds no auction
-provider builder.
+#1016, and the orchestrator and the integration registry share that one
+compiled plan. This change follows that design and adds no auction provider
+builder.
+
+Demand and the ad server are two provider types in their own right, and
+neither is an integration. A demand provider is a source bids are requested
+from, and several run, so `[demand] provider` takes a list. An ad server
+decides what is shown, and one runs, so `[adserver] provider` takes a string.
+Each name is the implementation unless its own table carries
+`implementation = "<id>"`, which is how two Prebid Servers run side by side
+under different names:
+
+```toml
+[demand]
+provider = ["pbs_main", "pbs_eu", "aps"]
+
+[demand.pbs_main]
+implementation = "prebid_server"
+endpoint = "https://pbs.example.com/openrtb2/auction"
+
+[demand.pbs_eu]
+implementation = "prebid_server"
+endpoint = "https://pbs-eu.example.com/openrtb2/auction"
+
+[demand.aps]
+endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+rendering_mode = "aps_sdk"
+
+[adserver]
+provider = "adserver_mock"
+
+[auction]
+enabled = true
+timeout_ms = 1000
+
+[auction.bidders.example_bidder]
+provider = "pbs_main"
+```
+
+The demand implementations in this repository are `openrtb`, `prebid_server`
+and `aps`, and the one ad server implementation is `adserver_mock`. None of
+them is an integration, so none may be named in `[integration] provider`, and
+a configuration that names one there refuses startup. APS in particular
+stopped being an integration, and its `rendering_mode` now sits in its
+`[demand.<name>]` table rather than in a vendor integration table. Every
+demand and ad server endpoint must be HTTPS, or HTTP to a loopback host only
+(`127.0.0.1`, `::1`, `localhost`).
+
+`[auction]` is not a provider type. It keeps `enabled`, `timeout_ms`, the
+creative settings and `allowed_context_keys`, and
+`[auction.bidders.<code>] provider = "<demand name>"` maps a bidder code a
+page asks for onto one of the declared demand providers.
 
 The bid renderer contract is still generalized in this change. Before it,
 `BidRenderer` was an enum with one variant, `Aps(ApsRendererV1)`
@@ -179,30 +235,31 @@ The bid renderer contract is still generalized in this change. Before it,
 OpenRTB response extension under a `type` tag
 (`crates/trusted-server-core/src/auction/formats.rs:377`,
 `crates/trusted-server-core/src/openrtb.rs:183`). It becomes an open
-descriptor, a type tag and a payload the auction provider supplies, with
+descriptor, a type tag and a payload the demand provider supplies, with
 the same serialized form, so the response a page receives does not change
 and the APS renderer type moves out of the shared auction types into
-`crates/trusted-server-core/src/integrations/aps.rs`. The ad server mock
-uses the neutral form.
+`crates/trusted-server-core/src/integrations/aps.rs`, which is where the APS
+demand implementation lives on `main`. The ad server mock uses the neutral
+form.
 
 The plan keeps three things closed, read from `main` at 066ea3c69, and they
 are recorded here rather than solved.
 
-- The profile registry is a fixed list of three in core, being `standard`,
-  `prebid-server` and `aps`
+- The set of demand implementations is fixed in core, being `openrtb`,
+  `prebid_server` and `aps`
   (`crates/trusted-server-core/src/auction/profile.rs:170`), and the
-  compiled profile is a closed enum (`profile.rs:63`) whose Prebid and APS
-  behavior is imported from those integrations (`profile.rs:11` and `:12`).
-  Any number of providers may select one profile
+  compiled form is a closed enum (`profile.rs:63`) whose Prebid and APS
+  behavior is imported from those modules (`profile.rs:11` and `:12`).
+  Any number of demand providers may run the same implementation
   (`compiler_supports_two_instances_of_the_same_profile` in
-  `crates/trusted-server-core/src/auction/plan.rs`), but a vendor cannot add
-  a profile without changing core.
-- The plan compiler treats `prebid-server` and `aps` specially by name
+  `crates/trusted-server-core/src/auction/plan.rs`), which is what
+  `implementation` expresses, but a vendor cannot add an implementation
+  without changing core.
+- The plan compiler treats `prebid_server` and `aps` specially by name
   (`plan.rs:307`, `:585` and `:595`).
-- The only mediator the plan accepts is `adserver_mock` (`plan.rs:20` and
-  `:556`), and the orchestrator builds it by calling that integration
-  directly (`crates/trusted-server-core/src/auction/mod.rs:90`). An ad
-  server is not a provider an operator declares, as a bidder is.
+- The only ad server implementation is `adserver_mock` (`plan.rs:20` and
+  `:556`), and the orchestrator builds it by calling that module directly
+  (`crates/trusted-server-core/src/auction/mod.rs:90`).
 
 Moving an auction-side vendor out of core therefore needs a change to the
 auction plan, which is outside this stack.
@@ -230,7 +287,10 @@ The rule. Things the host supplies are platform services, being the KV store, th
 An identity provider, a geo provider and a device provider are supplied by
 vendors, with or without any host involved, so all three are module
 capabilities, and the same registration carries them alongside the module's
-JavaScript and hooks.
+JavaScript and hooks. A registration does not have to carry JavaScript at
+all, so a crate may supply an implementation and nothing else, which is how
+core ends up naming no vendor while still shipping a default for each
+capability.
 
 - The registration builder gains three optional capabilities, at most one
   of each per registration (names indicative, the shape is normative):
@@ -239,25 +299,30 @@ JavaScript and hooks.
   `.with_device_provider(Arc<dyn DeviceProvider>)`. The traits are the ones
   #1043 and #1044 define, unchanged.
 - Selection keeps the select-exactly-one semantics of #986. `[ec] provider`,
-  `[geo] provider` and `[device] provider` each name either a built-in (the
-  names #986 and #1043/#1044 already define, for example `hmac` and `none`
-  for identity) or the id of a registered module that declares the matching
-  capability. A selector that names a module which is registered but does
-  not declare the capability, or that names nothing registered, is a
-  startup error. A module that declares a capability the selector does not
-  name is inert for that capability and its other hooks still run, and
-  startup logs a warning naming the module and the unused capability, so an
-  operator can see a module shipping script for a provider that is not
-  selected.
+  `[geo] provider` and `[device] provider` each name one implementation, and
+  every implementation reaches those selectors the same way, through an
+  integration builder's registration. Core names none of them. A selector
+  that names a registration which does not declare the matching capability,
+  or a name this build does not carry, is a startup error, and the message
+  lists the implementations the build does carry. A registration that
+  declares a capability no selector names is inert for that capability and
+  its other hooks still run, and startup logs a warning naming the
+  registration and the unused capability, so an operator can see a module
+  shipping script for a provider that is not selected.
 - No provider is built into core. Everything goes through one method, so
   the HMAC identity provider from #1043 and the User-Agent-only device
-  provider from #1044 become Tech Lab-owned modules in their own crates
-  under `crates/integrations/`, configured under `[integrations.<id>]` and
-  validated through §3.3 like any other module, and the adapters register
-  them by default. Core keeps only the seam and the `none` state for each
-  capability (no identity, no location, unknown device signals). A
-  deployment that registers no identity module is stateless, as #986's
-  `provider = "none"` already means.
+  provider from #1044 become Tech Lab-owned crates under
+  `crates/integrations/`, registered by an integration builder, selected by
+  `[ec] provider` and `[device] provider`, and validated through §3.3 like
+  any other registration. Neither ships browser JavaScript and neither is
+  named in `[integration] provider`, because a builder that supplies an
+  implementation does not have to be a page integration. Each takes an
+  `[ec.<name>]` or `[device.<name>]` table only where it has a setting to
+  carry, which `hmac` does and the User-Agent-only classifier does not, and
+  the adapters register both by default. Core keeps only the seam and the
+  `none` state for each capability (no identity, no location, unknown device
+  signals). A deployment that selects no identity implementation is
+  stateless, as #986's `provider = "none"` already means.
 - Composition. The composition root resolves the selected provider for
   each capability from the registry once at startup and places it in the
   per-request services, so the request path is unchanged from #1043 and
@@ -265,8 +330,8 @@ JavaScript and hooks.
   `ec_provider` slot on the runtime services builder and the injected
   closures in `build_device_provider` and `build_geo_provider` go). Host
   defaults are still supplied by the adapter as platform services and are
-  consumed by a built-in or a module through the request evidence and host
-  signal abstractions, exactly as now. A provider that needs a host signal
+  consumed by whichever implementation is selected, through the request
+  evidence and host signal abstractions, exactly as now. A provider that needs a host signal
   the running adapter does not expose is rejected at startup, as #986
   requires.
 - A module that declares all three capabilities may share one backend call
@@ -283,22 +348,25 @@ selection path onto this section, move the HMAC and User-Agent-only
 providers into module crates, and keep everything else. #1045, #1046
 and #1047 are unaffected beyond the rebase.
 
-## 4. Migration of the nine existing integrations
+## 4. Migration of the nine existing vendors
 
 One vendor per PR, after this change lands. Each migration PR gives its vendor crate a visible maintainers declaration, the way Prebid.js requires of every adapter, and per-crate code ownership, so the boundary carries a named owner from its first day. Each moves its Rust, its
 TypeScript, its config type and its tests into
 `crates/integrations/<vendor>`, and the adapter that wants it depends on it.
 
-| Vendor                                                           | What it needs                                                                                                                                                                                                                                                                                  |
-| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                                                                                                    |
-| APS                                                              | Needs the generalized renderer contract in §3.4, which this change delivers. It also needs a change to the auction plan so an auction-side vendor can live outside core (§3.4), and browser-side work, because core TypeScript imports APS directly (§8 item 8). This change delivers neither. |
-| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                                                                                                   |
-| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                                                                                                   |
+| Vendor                                                           | What it needs                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                                                                                                                                                                                                                                                                                   |
+| APS                                                              | A demand provider rather than an integration, so it is configured under `[demand.<name>]`, carries its `rendering_mode` there, and is never named in `[integration] provider`. Needs the generalized renderer contract in §3.4, which this change delivers. It also needs a change to the auction plan so an auction-side vendor can live outside core (§3.4), and browser-side work, because core TypeScript imports APS directly (§8 item 8). This change delivers neither. |
+| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                                                                                                                                                                                                                                                                                  |
+| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                                                                                                                                                                                                                                                                                  |
 
-`[integrations.<vendor>]` configuration tables need no change, because
-`IntegrationSettings` is a flattened map that already accepts unknown vendor
-keys (`crates/trusted-server-core/src/settings.rs:215`).
+A vendor's `[integration.<vendor>]` table needs no change when the vendor
+moves, because `IntegrationSettings` is a flattened map that already accepts
+a name core does not know
+(`crates/trusted-server-core/src/settings.rs:215`). Which vendors run is
+`[integration] provider`, a list, and a table no entry in that list names
+refuses startup like any other stray provider table.
 
 Two more places every move must touch, found by mapping `main`:
 
@@ -330,7 +398,7 @@ Two more places every move must touch, found by mapping `main`:
 ## 5. What does not change
 
 The request pipeline, the hook traits and their order, the served script
-format and its hash, every `[integrations.*]` table, the permission model,
+format and its hash, every `[integration.*]` table, the permission model,
 and the identity lifecycle, envelope and validation contracts from #986 as
 implemented in PRs #1043 to #1046. No integration changes behavior. A
 deployment that lists the same integrations gets the same responses.
@@ -384,7 +452,7 @@ for each vendor to rediscover.
 1. **A vendor's own deploy rules do not run through the operator CLI.**
    `ts config validate` and `ts config push` reach validation through
    `TrustedServerAppConfig`, which supplies no builders, so a vendor's
-   `[integrations.<id>]` rules are skipped on exactly the path an operator
+   `[integration.<id>]` rules are skipped on exactly the path an operator
    uses. The validation hook in §3.3 is only real once that path can carry
    the builders a deployment was composed with. This needs a decision:
    either the CLI is built per deployment with its vendor crates, or the
@@ -494,7 +562,7 @@ defines, and both should land before the first vendor is asked to use it.
 | 5   | The nine existing integrations migrate one PR each, on the schedule in §4                                                                                                                                                                                                                                                                                  | Proposed             |
 | 6   | This change completes the Rust side for integrations, so after it no integration move needs a Rust core change. An auction-side vendor still needs a change to the auction plan (§3.4), and the browser side is not complete, because TSJS core still imports the APS renderer directly (§8 item 8), so an APS move also needs a browser renderer contract | Proposed             |
 | 7   | Identity, geo and device providers are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                                                                                                                          | Proposed             |
-| 8   | No provider is built into core: HMAC and the User-Agent-only device provider are Tech Lab-owned modules configured under `[integrations.<id>]`, and core keeps only `none`                                                                                                                                                                                 | Proposed             |
+| 8   | No provider is built into core: HMAC and the User-Agent-only device provider are Tech Lab-owned crates registered by an integration builder and selected by `[ec] provider` and `[device] provider`, neither being a page integration, and core keeps only `none`                                                                                          | Proposed             |
 | 9   | This spec and its core implementation precede #1043; 51Degrees implements the core seam, the nine vendor moves in §4 stay one PR each                                                                                                                                                                                                                      | Proposed             |
 
 ## Revision record

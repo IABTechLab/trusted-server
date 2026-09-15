@@ -48,8 +48,8 @@ integration provider seam spec on top of the series and changes no code:
    `[A-Za-z0-9._~-]` in `ec/cookies.rs`), rejecting loudly and never
    rewriting, so the cookie value and the graph key cannot silently
    diverge. `[ec] provider = "none"` spells explicit statelessness. A
-   configured `[ec.providers.*]` block with no selector, an unreferenced
-   block, and a selector with no block are each startup errors. The
+   configured `[ec.<name>]` table with no selector, an unreferenced table,
+   and a selector whose required table is absent are each startup errors. The
    deprecated `[ec] passphrase` form still starts for one release cycle,
    mapping to `provider = "hmac"` with a deprecation warning, and a
    configuration carrying both forms is rejected.
@@ -61,7 +61,7 @@ integration provider seam spec on top of the series and changes no code:
    opt-out. All four adapters route geo through the one
    `build_geo_provider` selector. The provider configuration structs carry
    `deny_unknown_fields`, so a mistyped key fails startup. The host-signal
-   Edge Cookie provider (`[ec.providers.host-signals]`) ships opt-in.
+   Edge Cookie provider (`[ec.host_signals]`) ships opt-in.
    Whether the host-signal surface stays is an **open review question**
    (sign-off row 22), not a settled decision.
 3. **PR #1045, the permission model.** Permission names follow the IAB
@@ -95,7 +95,7 @@ integration provider seam spec on top of the series and changes no code:
    the page script a resolve succeeded, fixing the re-post loop the
    HttpOnly Edge Cookie would otherwise cause, and a Rust test pins the
    marker name and the demo's fixed word against the page script source.
-   The client-fixed demonstration provider compiles only under the
+   The `client_fixed` demonstration provider compiles only under the
    `client-fixed-demo` cargo feature and production builds reject
    selecting the demo at startup.
 5. **PR #1047, the documentation set.** Configuration reference for
@@ -204,9 +204,14 @@ New shape:
 [ec]
 provider = "hmac"
 
-[ec.providers.hmac]
-passphrase = "replace-with-32-plus-byte-random-secret"
+[ec.hmac]
+passphrase_secret = "ec_hmac_passphrase"
 ```
+
+The passphrase itself moves with it. A secret setting names a key in
+`trusted_server_secrets` rather than carrying a value, so the migration
+writes the passphrase into the secret store once and the configuration file
+never holds it again.
 
 Requirements, each marked with its implementation state:
 
@@ -260,19 +265,19 @@ Requirements, each marked with its implementation state:
    ships in the series. This work belongs to the durable-suppression and
    provenance follow-up (sign-offs 11, 16, 19, 20, 25).
 6. **Half-migrated fails loud.** Implemented (#1043). An
-   `[ec.providers.hmac]` block with no `provider = "hmac"` selector is a
-   startup error, as is a selector whose block is absent and an
-   unreferenced block alongside a different selection. The exact state
+   `[ec.hmac]` table with no `provider = "hmac"` selector is a startup
+   error, as is a selector whose required table is absent and an
+   unreferenced table alongside a different selection. The exact state
    that validated green and silently created zero ECs in PR #838 now
    refuses to start.
 7. **PR #838-era keys.** **Revised.** The draft required rejecting
-   `provider = "host-signals"` and `provider = "client-fixed"` as unknown
-   keys. The series instead ships both deliberately. `host-signals` is a
+   `provider = "host_signals"` and `provider = "client_fixed"` as unknown
+   names. The series instead ships both deliberately. `host_signals` is a
    supported opt-in selection (#1044) pending the sign-off 22 review, and
-   `client-fixed` exists only under the `client-fixed-demo` cargo feature
-   with production builds rejecting the selection at startup (#1046).
-   Genuinely unknown keys still fail loud through the unknown-selector
-   error and `deny_unknown_fields`.
+   `client_fixed` exists only under the `client-fixed-demo` cargo feature
+   with production builds rejecting the selection at startup (#1046). A
+   name the build does not carry still fails loudly, with the message
+   listing the implementations it does carry.
 8. **Provider switches go through legacy readers.** **Deferred.** No
    `legacy_providers` mechanism exists. Today a provider switch on a
    deployment with live identities strands the outgoing provider's
@@ -339,9 +344,9 @@ of the required rules tree.
 
 The migrated operator configuration is:
 
-- `[ec] provider = "hmac"` with its `[ec.providers.hmac]` block (32-plus
-  character passphrase), carried over verbatim for identity stability
-  (§3);
+- `[ec] provider = "hmac"` with its `[ec.hmac]` table naming the secret
+  that holds the 32-plus character passphrase, carried over verbatim for
+  identity stability (§3);
 - `[device]` left at the `builtin` default, with `fastly` as the opt-in
   documented alongside the open sign-off 22 question;
 - `[geo] provider = "platform"` where the adapter supplies a host lookup
