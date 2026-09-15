@@ -1,7 +1,7 @@
 //! Auction telemetry row construction and sink abstraction.
 //!
-//! Core owns the privacy-preserving auction observation model and pure row
-//! builder. Platform adapters provide the concrete sink implementation.
+//! Core owns the auction observation model and pure row builder. Platform
+//! adapters provide the concrete sink implementation.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -19,6 +19,9 @@ use crate::platform::RuntimeServices;
 
 const MAX_PAGE_PATH_BYTES: usize = 256;
 const DYNAMIC_SEGMENT_REPLACEMENT: &str = ":id";
+#[cfg(test)]
+const TEST_USER_AGENT: &str =
+    "FictionalBrowser/123.4 (FictionalOS 10.2; FictionalDevice) ExampleRenderer/567.8";
 
 /// Source path that initiated an auction candidate.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -91,7 +94,7 @@ impl AbandonedProviderCall {
     }
 }
 
-/// Privacy-preserving context shared by all rows in one auction observation.
+/// Context shared by all rows in one auction observation.
 #[derive(Debug, Clone)]
 pub struct AuctionObservationContext {
     /// Fresh telemetry UUID, independent of EC and internal auction IDs.
@@ -110,6 +113,8 @@ pub struct AuctionObservationContext {
     pub is_mobile: u8,
     /// `0` = bot, `1` = browser, `2` = unknown.
     pub is_known_browser: u8,
+    /// Complete User-Agent supplied by the auction request, when present.
+    pub user_agent: Option<String>,
     /// Whether GDPR applies.
     pub gdpr_applies: bool,
     /// Whether any consent signal was present.
@@ -134,11 +139,16 @@ impl AuctionObservationContext {
             .and_then(|page_url| url::Url::parse(page_url).ok())
             .map(|url| url.path().to_owned())
             .unwrap_or_else(|| "/".to_owned());
+        let user_agent = request
+            .device
+            .as_ref()
+            .and_then(|device| device.user_agent.as_deref());
         Self::from_parts(
             auction_source,
             &request.publisher.domain,
             &raw_path,
             request.slots.len(),
+            user_agent,
             ec_context,
         )
     }
@@ -150,6 +160,7 @@ impl AuctionObservationContext {
         publisher_domain: &str,
         raw_page_path: &str,
         slot_count: usize,
+        user_agent: Option<&str>,
         ec_context: &EcContext,
     ) -> Self {
         let device = ec_context.device_signals();
@@ -172,6 +183,7 @@ impl AuctionObservationContext {
                 Some(false) => 0,
                 None => 2,
             },
+            user_agent: user_agent.map(str::to_owned),
             gdpr_applies: consent.gdpr_applies,
             consent_present: !consent.is_empty(),
             slot_count,
@@ -196,6 +208,7 @@ impl AuctionObservationContext {
             region: Some("CA".to_owned()),
             is_mobile: 0,
             is_known_browser: 1,
+            user_agent: Some(TEST_USER_AGENT.to_owned()),
             gdpr_applies: false,
             consent_present: false,
             slot_count,
@@ -282,6 +295,8 @@ pub struct AuctionEventRow {
     pub is_mobile: u8,
     /// `0` = bot, `1` = browser, `2` = unknown.
     pub is_known_browser: u8,
+    /// Complete User-Agent supplied by the auction request, when present.
+    pub user_agent: Option<String>,
     /// `0` or `1`.
     pub gdpr_applies: u8,
     /// `0` or `1`.
@@ -341,6 +356,7 @@ impl AuctionEventRow {
             region: observation.region.clone(),
             is_mobile: observation.is_mobile,
             is_known_browser: observation.is_known_browser,
+            user_agent: observation.user_agent.clone(),
             gdpr_applies: u8::from(observation.gdpr_applies),
             consent_present: u8::from(observation.consent_present),
             terminal_status: None,
@@ -770,7 +786,11 @@ fn bid_row(
     row.slot_w = Some(u16::try_from(bid.width).unwrap_or(u16::MAX));
     row.slot_h = Some(u16::try_from(bid.height).unwrap_or(u16::MAX));
     row.media_type = media_type_for_slot(request, &bid.slot_id).map(str::to_owned);
-    row.seat = Some(bid.bidder.clone());
+    row.seat = Some(
+        bid.returned_seat
+            .clone()
+            .unwrap_or_else(|| bid.bidder.clone()),
+    );
     row.price_cpm = price;
     row.currency = Some(bid.currency.clone());
     row.is_win = Some(is_win);
@@ -933,7 +953,7 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::auction::types::{AdFormat, AdSlot, PublisherInfo, UserInfo};
+    use crate::auction::types::{AdFormat, AdSlot, DeviceInfo, PublisherInfo, UserInfo};
 
     use super::*;
 
@@ -974,6 +994,7 @@ mod tests {
             creative: None,
             adomain: Some(vec!["advertiser.example".to_owned()]),
             bidder: bidder.to_owned(),
+            returned_seat: None,
             width: 300,
             height: 250,
             nurl: None,
@@ -1002,6 +1023,52 @@ mod tests {
         assert!(
             !builder_called.get(),
             "disabled telemetry sink should not build auction rows"
+        );
+    }
+
+    #[test]
+    fn observation_sources_preserve_complete_user_agent() {
+        let ec_context =
+            EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
+        let mut request = test_request("request-id");
+        request.device = Some(DeviceInfo {
+            user_agent: Some(TEST_USER_AGENT.to_owned()),
+            ip: None,
+            geo: None,
+        });
+
+        let from_request = AuctionObservationContext::from_auction_request(
+            AuctionSource::AuctionApi,
+            &request,
+            &ec_context,
+        );
+        let from_parts = AuctionObservationContext::from_parts(
+            AuctionSource::InitialNavigation,
+            "test-publisher.example",
+            "/article",
+            1,
+            Some(TEST_USER_AGENT),
+            &ec_context,
+        );
+        let without_user_agent = AuctionObservationContext::from_auction_request(
+            AuctionSource::AuctionApi,
+            &test_request("request-without-user-agent"),
+            &ec_context,
+        );
+
+        assert_eq!(
+            from_request.user_agent.as_deref(),
+            Some(TEST_USER_AGENT),
+            "should preserve the complete user agent from an auction request"
+        );
+        assert_eq!(
+            from_parts.user_agent.as_deref(),
+            Some(TEST_USER_AGENT),
+            "should preserve the complete user agent from publisher request parts"
+        );
+        assert_eq!(
+            without_user_agent.user_agent, None,
+            "should omit a missing user agent"
         );
     }
 
@@ -1065,6 +1132,11 @@ mod tests {
         );
 
         let rows = batch.rows();
+        assert!(
+            rows.iter()
+                .all(|row| row.user_agent.as_deref() == Some(TEST_USER_AGENT)),
+            "should copy the complete user agent to every row kind"
+        );
         assert_eq!(
             rows.iter()
                 .filter(|row| row.event_kind == "summary")
@@ -1098,6 +1170,112 @@ mod tests {
             Some("parse_error"),
             "should map provider parse failures"
         );
+    }
+
+    #[test]
+    fn bid_rows_prefer_returned_seat_over_delivery_bidder() {
+        let request = test_request("ts-ec-derived-id");
+        let mut aps_bid = bid("slot-1", "aps", Some("ad-1"), Some(1.25));
+        aps_bid.returned_seat = Some("upstream-seat".to_string());
+        let provider = AuctionResponse::success("aps-primary", vec![aps_bid.clone()], 12);
+        let result = OrchestrationResult {
+            provider_responses: vec![provider],
+            mediator_response: None,
+            winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
+            total_time_ms: 12,
+            metadata: HashMap::new(),
+        };
+        let batch = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: None,
+            },
+        );
+
+        let provider_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "provider_call")
+            .expect("should emit provider row");
+        assert_eq!(provider_row.provider.as_deref(), Some("aps-primary"));
+        let bid_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "bid")
+            .expect("should emit bid row");
+        assert_eq!(bid_row.provider.as_deref(), Some("aps-primary"));
+        assert_eq!(bid_row.seat.as_deref(), Some("upstream-seat"));
+
+        let mut fallback_bid = aps_bid;
+        fallback_bid.returned_seat = None;
+        let fallback = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success(
+                "aps-primary",
+                vec![fallback_bid.clone()],
+                12,
+            )],
+            mediator_response: None,
+            winning_bids: HashMap::from([("slot-1".to_owned(), fallback_bid)]),
+            total_time_ms: 12,
+            metadata: HashMap::new(),
+        };
+        let fallback_batch = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &fallback,
+                delivered_winner_slots: None,
+            },
+        );
+        assert_eq!(
+            fallback_batch
+                .rows()
+                .iter()
+                .find(|row| row.event_kind == "bid")
+                .and_then(|row| row.seat.as_deref()),
+            Some("aps")
+        );
+    }
+
+    #[test]
+    fn mediated_aps_telemetry_retains_provider_upstream_seat_and_delivery_identity() {
+        let request = test_request("ts-ec-derived-id");
+        let mut aps_bid = bid("slot-1", "aps", Some("ad-1"), Some(1.25));
+        aps_bid.returned_seat = Some("upstream-seat".to_string());
+        let provider = AuctionResponse::success("aps-primary", vec![aps_bid.clone()], 12);
+        let mediator = AuctionResponse::success("adserver_mock", vec![aps_bid.clone()], 3);
+        let result = OrchestrationResult {
+            provider_responses: vec![provider],
+            mediator_response: Some(mediator),
+            winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
+            total_time_ms: 15,
+            metadata: HashMap::new(),
+        };
+        let batch = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: None,
+            },
+        );
+
+        let provider_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "provider_call")
+            .expect("should emit provider call");
+        assert_eq!(provider_row.provider.as_deref(), Some("aps-primary"));
+        let bid_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "bid")
+            .expect("should emit provider bid");
+        assert_eq!(bid_row.provider.as_deref(), Some("aps-primary"));
+        assert_eq!(bid_row.seat.as_deref(), Some("upstream-seat"));
+        assert_eq!(aps_bid.bidder, "aps", "delivery identity remains distinct");
     }
 
     #[test]
@@ -1249,6 +1427,10 @@ mod tests {
         .expect("should serialize ndjson");
 
         assert!(body.ends_with('\n'), "should end each row with newline");
+        assert!(
+            body.contains(TEST_USER_AGENT),
+            "should preserve the complete user agent in serialized rows"
+        );
         for line in body.lines() {
             let parsed: serde_json::Value = serde_json::from_str(line).expect("should parse row");
             assert_eq!(parsed["event_kind"], "summary");
