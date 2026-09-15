@@ -13,6 +13,7 @@ fn make_config() -> HtmlProcessorConfig {
         request_scheme: "https".to_string(),
         integrations: IntegrationRegistry::default(),
         ad_slots_script: None,
+        permissions_script: None,
         ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         max_buffered_body_bytes: 16 * 1024 * 1024,
         gpt_diagnostics: None,
