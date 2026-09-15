@@ -558,9 +558,27 @@ positive freshness" is an origin configuration problem, "vary not covered" is a 
 `template_cache_vary` list, "malformed cache policy" is a bug. Without it a zero hit rate is
 uninterpretable.
 
-The production value comes from `template_cache_ttl` (`publisher.rs:6129`), which returns
-`Result<Duration, TemplateCacheBypassReason>`. The similarly named
-`template_cache_bypass_reason()` at `:5863` is `#[cfg(test)]` and is not the hook.
+**The reason has two sources, and only one of them exists today.** `template_cache_ttl`
+(`publisher.rs:6129`) returns `Result<Duration, TemplateCacheBypassReason>`, but it runs inside
+`template_cache_reservation.and_then(...)` (`:4775`), and a reservation exists only when
+`template_cache_key` was built — which is `request_can_use_shared_template.then(...)` (`:4370`).
+So its first three variants, `InlineMode`, `AuthorizedRequest` and `CookieForwarded`, are
+structurally unreachable from it: those requests never get a key in the first place. Only
+response-derived reasons can fire there.
+
+The request-side bypass carries no reason value at all. It sets
+`TemplateCacheResponseState::BypassRequest` (`:4386`) and writes free-text `log::debug!` lines
+(`:4360-4369`), and nothing else.
+
+That is a problem for this work specifically, because "cookie-disqualified" — the expected
+default, and the single most important thing an operator needs to see — lives on the
+unreachable side. So the observability work must **derive a structured request-side reason**
+alongside `template_cache_key`, reusing the existing `TemplateCacheBypassReason` variants rather
+than inventing a second vocabulary. That is new code, not a wiring exercise, and the plan must
+budget it.
+
+The `#[cfg(test)]` helper named `template_cache_bypass_reason()` at `:5863` is not the hook for
+either source.
 
 ### Schema migration — this is not free
 
