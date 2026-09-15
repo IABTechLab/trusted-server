@@ -8,12 +8,13 @@
 //! left off the list not running at all, and withdrawal being TCF's alone
 //! and scoped to the place. This sits in the Axum adapter's tests because
 //! it is the first crate that links all four, and core deliberately links
-//! none.
+//! none. The names a deployment writes in configuration are checked here for
+//! the same reason, against the identifiers the real crates answer to.
 //!
 //! The consent records here are built by hand, so nothing in core's consent
 //! pipeline runs. In a deployment that pipeline also synthesizes a US Privacy
 //! opt-out from a Global Privacy Control header in a US state when the consent
-//! settings say to, and the `us-privacy` provider then acts on it, which is
+//! settings say to, and the `us_privacy` provider then acts on it, which is
 //! why removing `gpc` from the list alone does not make that header inert.
 
 use std::sync::Arc;
@@ -43,14 +44,19 @@ fn all_four() -> Vec<Arc<dyn PermissionSignalProvider>> {
     ]
 }
 
+/// Settings naming these identifiers in `[permission_signal] provider`.
+fn settings_naming(names: &[&str]) -> Settings {
+    let mut settings = Settings::default();
+    settings.permission_signal.provider =
+        Some(names.iter().map(|name| (*name).to_owned()).collect());
+    settings
+}
+
 /// The providers a deployment gets from naming these identifiers in
-/// `[permission_signal] sources`, through the same entry point an adapter's
+/// `[permission_signal] provider`, through the same entry point an adapter's
 /// composition root uses.
 fn configured(names: &[&str]) -> Arc<[Arc<dyn PermissionSignalProvider>]> {
-    let mut settings = Settings::default();
-    settings.permission_signal.sources =
-        Some(names.iter().map(|name| (*name).to_owned()).collect());
-    build_permission_signal_providers(&settings, &all_four())
+    build_permission_signal_providers(&settings_naming(names), &all_four())
         .expect("should select providers this build offers")
 }
 
@@ -138,6 +144,38 @@ fn us_ca_geo() -> GeoInfo {
 // ----------------------------------------------------------------------
 // Which providers run.
 // ----------------------------------------------------------------------
+
+#[test]
+fn the_documented_names_select_every_shipped_provider_in_order() {
+    // The names the guide and the example configuration list, which must be
+    // the identifiers the shipped crates answer to.
+    let documented = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"];
+    let selected: Vec<&str> = configured(&documented)
+        .iter()
+        .map(|provider| provider.id())
+        .collect();
+    assert_eq!(
+        selected, documented,
+        "each documented name selects the shipped provider it names, in the order written"
+    );
+}
+
+#[test]
+fn an_old_hyphenated_name_is_refused_naming_the_names_available() {
+    for old in ["gpp-sale-opt-out", "us-privacy"] {
+        let Err(error) = build_permission_signal_providers(&settings_naming(&[old]), &all_four())
+        else {
+            panic!("should refuse the hyphenated name `{old}`");
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(&format!("`{old}` is not available in this build"))
+                && message
+                    .contains("Available providers are gpc, gpp_sale_opt_out, us_privacy, tcf"),
+            "the refusal names the old name and the names to write instead: {message}"
+        );
+    }
+}
 
 #[test]
 fn gpc_revokes_the_granted_baseline_in_a_us_opt_out_state() {

@@ -211,23 +211,29 @@ pull_sync_concurrency = 3
 #
 # Signals compose rather than select. A request can carry a TCF string and a
 # Global Privacy Control header at once, and both have something to say, so
-# this is a list, whereas [ec], [geo] and [device] each name one provider. The
-# order is the policy, because the last provider with an opinion decides.
+# provider here is a list, whereas in [ec], [geo] and [device] it names one
+# provider. The order is the policy, because the last provider with an opinion
+# decides.
 #
 # Listed below is every provider the shipped adapters link, which is also
-# exactly what runs when this section is absent. Each is a crate under
-# crates/permission-signal, outside the core. Remove the ones this publisher
-# does not want to act on. A provider that is not on the list does not run,
-# and there is no separate switch to turn one off. An unknown or repeated name
-# is refused at startup rather than quietly ignored.
+# exactly what runs when provider is left out. Each is a crate under
+# crates/permission-signal, outside the core. Providers are named in
+# snake_case, lowercase words joined by underscores. Remove the ones this
+# publisher does not want to act on. A provider that is not on the list does
+# not run, and there is no separate switch to turn one off. An unknown or
+# repeated name is refused at startup rather than quietly ignored.
 #
 # [permission_signal]
-# sources = [
+# provider = [
 #   "gpc",              # the Sec-GPC request header, Global Privacy Control
-#   "gpp-sale-opt-out", # a GPP US sale opt-out
-#   "us-privacy",       # a US Privacy string sale opt-out
+#   "gpp_sale_opt_out", # a GPP US sale opt-out
+#   "us_privacy",       # a US Privacy string sale opt-out
 #   "tcf",              # TCF v2, with its purpose mapping in the crate
 # ]
+#
+# A provider that gains settings will take them in a [permission_signal.<name>]
+# block named for it. None of these four has settings, so such a block is
+# refused rather than ignored.
 #
 # The three opt-outs are separate entries so that a publisher who does not act
 # on Global Privacy Control can remove "gpc" and keep the GPP and US Privacy

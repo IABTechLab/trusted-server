@@ -23,7 +23,7 @@ use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInp
 use trusted_server_core::permissions::{ConsentSignal, Permission};
 
 /// The stable identifier this provider answers to in `[permission_signal]`
-/// `sources`, in logs, and when a peer consults it.
+/// `provider`, in logs, and when a peer consults it.
 pub const ID: &str = "tcf";
 
 /// TCF v2, when the policy says TCF answers for this deployment.

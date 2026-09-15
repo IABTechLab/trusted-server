@@ -982,18 +982,23 @@ impl DeviceConfig {
 
 /// Which permission signal providers run, and in what order.
 ///
-/// Mapped from the `[permission_signal]` TOML section. Unlike the `[ec]`,
-/// `[geo]` and `[device]` selectors, which each name one provider, signals
-/// compose: a request can carry a TCF string and a Global Privacy Control
-/// header at once and both have something to say. So this names a list, and
-/// the order is the policy, because the last provider with an opinion decides.
+/// Mapped from the `[permission_signal]` TOML section, where `provider`
+/// selects, as it does in `[ec]`, `[geo]` and `[device]`. Those each name one
+/// provider, whereas signals compose, because a request can carry a TCF string
+/// and a Global Privacy Control header at once and both have something to say.
+/// So here `provider` names a list, and the order is the policy, because the
+/// last provider with an opinion decides.
+///
+/// A provider that gains settings will take them in a
+/// `[permission_signal.<name>]` block named for it. None of the providers that
+/// ship has settings, so `provider` is the only key accepted, and any other key
+/// is refused as an unknown field rather than silently ignored.
 ///
 /// See `crates/trusted-server-core/src/permission_signal/README.md`.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Validate)]
 pub struct PermissionSignalConfig {
     /// The providers to run, in order, named by the identifier each provider
-    /// crate declares, for example `gpc`, `gpp-sale-opt-out`, `us-privacy` and
+    /// crate declares, for example `gpc`, `gpp_sale_opt_out`, `us_privacy` and
     /// `tcf` for the four that ship.
     ///
     /// Absent means every provider the adapter offers, in the order it offers
@@ -1010,8 +1015,41 @@ pub struct PermissionSignalConfig {
     ///
     /// [`build_permission_signal_providers`]:
     ///     crate::permission_signal::build_permission_signal_providers
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sources: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Vec<String>>,
+}
+
+/// Read by hand rather than derived, so that `sources`, the key `provider`
+/// replaced, is refused with a message saying what to write instead. A derived
+/// struct could only refuse it by name by declaring it as a field, and would
+/// then list it among the keys it expects whenever it refused any other.
+impl<'de> Deserialize<'de> for PermissionSignalConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut section = serde_json::Map::<String, JsonValue>::deserialize(deserializer)?;
+        if section.contains_key("sources") {
+            return Err(serde::de::Error::custom(
+                "[permission_signal] sources is no longer accepted. Name the providers \
+                 to run, in order, in [permission_signal] provider instead",
+            ));
+        }
+        if let Some(key) = section.keys().find(|key| key.as_str() != "provider") {
+            return Err(serde::de::Error::custom(format!(
+                "unknown field `{key}` in [permission_signal], expected `provider`. No \
+                 permission signal provider takes settings yet, so a \
+                 [permission_signal.<name>] block is not accepted"
+            )));
+        }
+        // Read as an option, so an explicit JSON null is the same as leaving
+        // the key out.
+        let provider = match section.remove("provider") {
+            Some(value) => serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            None => None,
+        };
+        Ok(Self { provider })
+    }
 }
 
 /// Geo / IP intelligence configuration.
@@ -8758,17 +8796,30 @@ formats = [{{ width = 300, height = 250 }}]
 #[cfg(test)]
 mod permission_signal_config_tests {
     use super::*;
+    use serde_json::json;
+
+    use crate::config::TrustedServerAppConfig;
+    use crate::test_support::tests::crate_test_settings_str;
 
     // Which names are valid is only known where the scheme crates are linked,
     // so the checks that a name matches an available provider, and that none
     // is repeated, live with the seam in `permission_signal::select`. What is
     // tested here is the shape of the section itself.
 
+    /// The test fixture's configuration with `section` written as its
+    /// `[permission_signal]` section.
+    fn settings_toml_with(section: &str) -> String {
+        format!(
+            "{}\n[permission_signal]\n{section}\n",
+            crate_test_settings_str()
+        )
+    }
+
     #[test]
     fn no_section_is_allowed_and_means_every_provider() {
         let config = PermissionSignalConfig::default();
         assert!(
-            config.sources.is_none(),
+            config.provider.is_none(),
             "absent rather than empty, because the two mean opposite things"
         );
     }
@@ -8776,20 +8827,41 @@ mod permission_signal_config_tests {
     #[test]
     fn the_section_round_trips_through_toml() {
         let parsed: PermissionSignalConfig =
-            toml::from_str(r#"sources = ["gpc", "tcf"]"#).expect("should parse the section");
+            toml::from_str(r#"provider = ["gpc", "tcf"]"#).expect("should parse the section");
         assert_eq!(
-            parsed.sources.as_deref(),
+            parsed.provider.as_deref(),
             Some(["gpc".to_owned(), "tcf".to_owned()].as_slice()),
             "the order written is the order read, because the order is the policy"
         );
     }
 
     #[test]
+    fn the_section_round_trips_through_a_config_blob() {
+        // The section is written by derive and read by hand, so what a push
+        // writes into a blob must be what a deployment reads back from it.
+        let written = PermissionSignalConfig {
+            provider: Some(vec!["tcf".to_owned(), "gpc".to_owned()]),
+        };
+        let blob = serde_json::to_value(&written).expect("should write the section");
+        let read: PermissionSignalConfig =
+            serde_json::from_value(blob).expect("should read back what was written");
+        assert_eq!(read, written, "the list and its order survive the blob");
+
+        let null: PermissionSignalConfig = serde_json::from_value(json!({ "provider": null }))
+            .expect("should read an explicit null");
+        assert_eq!(
+            null,
+            PermissionSignalConfig::default(),
+            "an explicit null is the same as leaving the key out"
+        );
+    }
+
+    #[test]
     fn an_empty_list_is_kept_apart_from_no_list() {
         let parsed: PermissionSignalConfig =
-            toml::from_str("sources = []").expect("should parse an empty list");
+            toml::from_str("provider = []").expect("should parse an empty list");
         assert_eq!(
-            parsed.sources.as_deref(),
+            parsed.provider.as_deref(),
             Some(&[][..]),
             "a publisher acting on no signal at all writes an empty list, and it must \
              not read back as having written nothing"
@@ -8798,7 +8870,81 @@ mod permission_signal_config_tests {
 
     #[test]
     fn an_unknown_key_is_refused() {
-        toml::from_str::<PermissionSignalConfig>(r#"source = ["gpc"]"#)
+        let error = toml::from_str::<PermissionSignalConfig>(r#"providers = ["gpc"]"#)
             .expect_err("should refuse a misspelled key rather than silently ignore it");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `providers` in [permission_signal], expected `provider`"),
+            "the refusal names the key it did not recognize and the one it accepts: {error}"
+        );
+    }
+
+    #[test]
+    fn the_removed_sources_key_is_refused_naming_provider() {
+        for written in [
+            r#"sources = ["gpc", "tcf"]"#,
+            "provider = [\"gpc\", \"tcf\"]\nsources = [\"gpc\", \"tcf\"]",
+        ] {
+            let error = toml::from_str::<PermissionSignalConfig>(written)
+                .expect_err("should refuse the removed key, alone or beside its replacement");
+            assert!(
+                error.to_string().contains(
+                    "[permission_signal] sources is no longer accepted. Name the providers \
+                     to run, in order, in [permission_signal] provider instead"
+                ),
+                "the refusal says which key to write instead: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_way_settings_are_read_refuses_the_removed_sources_key() {
+        let written = settings_toml_with(r#"sources = ["gpc", "tcf"]"#);
+
+        let error = Settings::from_toml(&written).expect_err("should refuse the removed key");
+        assert!(
+            format!("{error:?}").contains("[permission_signal] provider"),
+            "reading a TOML file names the key that replaced it: {error:?}"
+        );
+
+        // `ts config push` parses the file into a TOML value before reading the
+        // settings from it.
+        let value: toml::Value = toml::from_str(&written).expect("should parse as TOML");
+        let error = value
+            .try_into::<TrustedServerAppConfig>()
+            .expect_err("should refuse the removed key before a push");
+        assert!(
+            error.to_string().contains("[permission_signal] provider"),
+            "a push names the key that replaced it: {error}"
+        );
+
+        // A deployment reads its settings from a JSON config blob.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut blob = serde_json::to_value(settings).expect("should serialize the fixture");
+        blob["permission_signal"] = json!({ "sources": ["gpc", "tcf"] });
+        let error =
+            Settings::from_json_value(blob).expect_err("should refuse the removed key at startup");
+        assert!(
+            format!("{error:?}").contains("[permission_signal] provider"),
+            "startup names the key that replaced it: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_of_provider_settings_is_refused_as_an_unknown_field() {
+        // No provider takes settings yet, so a block for one is refused rather
+        // than read and then ignored.
+        let written =
+            settings_toml_with("provider = [\"gpc\"]\n\n[permission_signal.gpc]\nenabled = true");
+        let error =
+            Settings::from_toml(&written).expect_err("should refuse settings no provider takes");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("unknown field `gpc` in [permission_signal]")
+                && message.contains("[permission_signal.<name>] block is not accepted"),
+            "the refusal names the block and says why it is refused: {message}"
+        );
     }
 }

@@ -11,8 +11,8 @@ use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInp
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission};
 
 /// The stable identifier this provider answers to in `[permission_signal]`
-/// `sources`, in logs, and when a peer consults it.
-pub const ID: &str = "gpp-sale-opt-out";
+/// `provider`, in logs, and when a peer consults it.
+pub const ID: &str = "gpp_sale_opt_out";
 
 /// A GPP US sale opt-out, read from the `__gpp` string.
 #[derive(Debug, Default, Clone, Copy)]

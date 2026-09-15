@@ -78,7 +78,7 @@ a deployment's to set, not this code's to assume.
 
 ```toml
 [permission_signal]
-sources = ["gpc", "gpp-sale-opt-out", "us-privacy", "tcf"]
+provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
 ```
 
 A provider not on the list does not run, and there is no separate switch. A
@@ -86,12 +86,19 @@ publisher who does not want to act on Global Privacy Control removes `"gpc"`
 from the list, and the provider that reads the header then does not run. One
 caveat: core's consent pipeline can also synthesize a US Privacy opt-out from
 that header for a visitor in a US state, when the consent settings say to,
-which they do by default, and the `us-privacy` provider then acts on the
+which they do by default, and the `us_privacy` provider then acts on the
 record it produced. A publisher who wants the header to have no effect at all
-turns that setting off as well. Leaving the section out entirely runs every
-provider the adapter offers, in the order it offers them, so a signal is never
-quietly ignored because someone forgot to list it. An unknown or repeated name
-is refused at startup, so a typo cannot silently stop a scheme being honored.
+turns that setting off as well. Leaving `provider` out, or the section
+entirely, runs every provider the adapter offers, in the order it offers them,
+so a signal is never quietly ignored because someone forgot to list it. An
+unknown or repeated name is refused at startup, so a typo cannot silently stop
+a scheme being honored.
+
+Providers are named in `snake_case`, lowercase words joined by underscores. A
+provider that gains settings will take them in a `[permission_signal.<name>]`
+block named for it. None of the four here has settings, so `provider` is the
+only key the section accepts, and a block or any other key is refused as an
+unknown field rather than ignored.
 
 The default order asks the signal with no interface of its own first and the
 ones carrying a choice made through an interface after. Global Privacy
@@ -157,7 +164,8 @@ the identifier never depended on the record.
 
 ## Writing a provider
 
-Implement `PermissionSignalProvider` in a crate that depends on core. Answer
+Implement `PermissionSignalProvider` in a crate that depends on core, and give
+it an identifier in `snake_case`, which is the name configuration uses. Answer
 `Neutral` for a permission the provider has no opinion on, including when the
 signal it reads is absent from the request. Returning `Revoke` for an absent
 signal turns silence into refusal and would revoke the permission on every
@@ -188,8 +196,8 @@ configuring nothing gets all four in this order:
 | Identifier         | Crate        | Reads                                             |
 | ------------------ | ------------ | ------------------------------------------------- |
 | `gpc`              | `gpc`        | The `Sec-GPC` header, Global Privacy Control      |
-| `gpp-sale-opt-out` | `gpp`        | The US sale opt-out in a GPP string               |
-| `us-privacy`       | `us-privacy` | The sale opt-out in a US Privacy string           |
+| `gpp_sale_opt_out` | `gpp`        | The US sale opt-out in a GPP string               |
+| `us_privacy`       | `us-privacy` | The sale opt-out in a US Privacy string           |
 | `tcf`              | `tcf`        | A TCF v2 record, with its purpose mapping in code |
 
 The three opt-outs are separate rather than one so that a publisher who does
