@@ -72,24 +72,29 @@ fn assert_route_registered(method: &str, path: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aps_profile_serves_renderer_through_adapter_fallback() {
+async fn an_aps_demand_source_serves_the_renderer_through_adapter_fallback() {
     let mut settings = test_settings();
-    settings.auction.providers.insert(
-        "aps-main".parse().expect("should parse APS provider ID"),
-        trusted_server_core::auction::ProviderConfig {
-            protocol: "openrtb-2.6".to_string(),
-            profile: "aps".to_string(),
-            endpoint: "https://aps.example/e/pb/bid".to_string(),
-            timeout_ms: None,
-            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-            notifications: trusted_server_core::auction::NotificationConfig::default(),
-            profile_config: "{\"account_id\":\"example-account\"}"
-                .parse()
-                .expect("should parse APS profile config"),
-        },
+    let table = serde_json::Map::from_iter([
+        (
+            "implementation".to_string(),
+            serde_json::json!("aps"),
+        ),
+        (
+            "endpoint".to_string(),
+            serde_json::json!("https://aps.example/e/pb/bid"),
+        ),
+        ("routing".to_string(), serde_json::json!("all_eligible")),
+        (
+            "account_id".to_string(),
+            serde_json::json!("example-account"),
+        ),
+    ]);
+    settings.demand = trusted_server_core::provider_table::ProviderList::new(
+        vec!["aps_main".to_string()],
+        std::collections::BTreeMap::from([("aps_main".to_string(), table)]),
     );
     let router = TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router with APS profile");
+        .expect("should build a router with an APS demand source");
     let mut service = EdgeZeroAxumService::new(router);
     let request = Request::builder()
         .method("GET")
