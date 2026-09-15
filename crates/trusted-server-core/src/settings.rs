@@ -27,6 +27,7 @@ use crate::ec::provider::{
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
+use crate::provider_table::{ProviderChoice, ProviderList};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -3139,9 +3140,9 @@ pub struct AuctionDebugCommentOptions {
     #[serde(default = "default_true")]
     pub include_provider_responses: bool,
 
-    /// Include `mediator_response` when a mediator ran.
+    /// Include `ad server_response` when a ad server ran.
     #[serde(default = "default_true")]
-    pub include_mediator_response: bool,
+    pub include_adserver_response: bool,
 
     /// Include each provider's `bids` array (vs. status/metadata only).
     #[serde(default = "default_true")]
@@ -3183,7 +3184,7 @@ impl Default for AuctionDebugCommentOptions {
     fn default() -> Self {
         Self {
             include_provider_responses: true,
-            include_mediator_response: true,
+            include_adserver_response: true,
             include_bids: true,
             metadata_keys: default_auction_debug_metadata_keys(),
             verbosity: AuctionDebugCommentVerbosity::Redacted,
@@ -3407,6 +3408,14 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub auction: AuctionConfig,
+    /// The auction's demand sources. `[demand] provider` selects them and each
+    /// `[demand.<name>]` table holds one source's settings.
+    #[serde(default, skip_serializing_if = "ProviderList::is_unset")]
+    pub demand: ProviderList,
+    /// The ad server that picks the auction winner. `[adserver] provider`
+    /// selects it and `[adserver.<name>]` holds its settings.
+    #[serde(default, skip_serializing_if = "ProviderChoice::is_unset")]
+    pub adserver: ProviderChoice,
     #[serde(default)]
     pub consent: ConsentConfig,
     #[serde(default)]
@@ -4857,8 +4866,8 @@ provider = \"none\"",
             "error should identify the removed field, got {rendered}"
         );
         assert!(
-            rendered.contains("CHANGELOG.md"),
-            "error should direct operators to the migration guidance, got {rendered}"
+            rendered.contains("[demand] provider"),
+            "error should name where the setting moved to, got {rendered}"
         );
     }
 
@@ -4877,8 +4886,8 @@ provider = \"none\"",
             "error should identify the removed field, got {rendered}"
         );
         assert!(
-            rendered.contains("CHANGELOG.md"),
-            "error should direct operators to the migration guidance, got {rendered}"
+            rendered.contains("[demand] provider"),
+            "error should name where the setting moved to, got {rendered}"
         );
     }
 
@@ -4886,7 +4895,7 @@ provider = \"none\"",
     fn auction_debug_comment_options_default_matches_serde_defaults() {
         let opts = AuctionDebugCommentOptions::default();
         assert!(opts.include_provider_responses, "should default to true");
-        assert!(opts.include_mediator_response, "should default to true");
+        assert!(opts.include_adserver_response, "should default to true");
         assert!(opts.include_bids, "should default to true");
         assert_eq!(
             opts.metadata_keys,
@@ -7133,8 +7142,8 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn disabled_removed_prebid_and_aps_fields_are_rejected() {
-        for (integration_id, removed_field) in [("prebid", "server_url"), ("aps", "account_id")] {
+    fn disabled_removed_integration_fields_are_rejected() {
+        for (integration_id, removed_field) in [("prebid", "server_url"), ("datadome", "account_id")] {
             let mut settings = create_test_settings();
             settings
                 .integrations
@@ -7151,9 +7160,11 @@ source_domain = "partner.example.com"
                 "prebid" => settings
                     .integration_config::<PrebidIntegrationConfig>(integration_id)
                     .expect_err("should reject removed disabled Prebid field"),
-                "aps" => settings
-                    .integration_config::<crate::integrations::aps::ApsConfig>(integration_id)
-                    .expect_err("should reject removed disabled APS field"),
+                "datadome" => settings
+                    .integration_config::<crate::integrations::datadome::DataDomeConfig>(
+                        integration_id,
+                    )
+                    .expect_err("should reject removed disabled DataDome field"),
                 _ => unreachable!("test integration ID should be known"),
             };
             assert!(

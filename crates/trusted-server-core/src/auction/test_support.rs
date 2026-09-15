@@ -119,3 +119,88 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
         context: HashMap::new(),
     }
 }
+
+/// One `[demand.<name>]` table naming an implementation, for tests that need a
+/// compiled plan.
+pub(crate) fn demand_table(
+    implementation: &str,
+    endpoint: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut table = serde_json::Map::from_iter([
+        ("implementation".to_string(), json!(implementation)),
+        ("endpoint".to_string(), json!(endpoint)),
+    ]);
+    if implementation == "aps" {
+        table.insert("account_id".to_string(), json!("example-account"));
+    }
+    table
+}
+
+/// An `[demand]` table selecting every name given, in the order given.
+pub(crate) fn demand_selection(
+    tables: Vec<(&str, serde_json::Map<String, serde_json::Value>)>,
+) -> crate::provider_table::ProviderList {
+    let selected = tables
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect::<Vec<_>>();
+    let tables = tables
+        .into_iter()
+        .map(|(name, table)| (name.to_string(), table))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    crate::provider_table::ProviderList::new(selected, tables)
+}
+
+/// A plan configuration selecting the named demand tables, with every
+/// implementation the built-in builders register.
+pub(crate) fn plan_config(
+    tables: Vec<(&str, serde_json::Map<String, serde_json::Value>)>,
+) -> crate::auction::plan::AuctionPlanConfig {
+    let builders = crate::integrations::all_builders(&[]).collect::<Vec<_>>();
+    crate::auction::plan::AuctionPlanConfig {
+        timeout_ms: 1000,
+        demand: demand_selection(tables),
+        demand_implementations: builders
+            .iter()
+            .filter_map(crate::integrations::IntegrationBuilder::demand)
+            .collect(),
+        adserver_implementations: builders
+            .iter()
+            .filter_map(crate::integrations::IntegrationBuilder::adserver)
+            .collect(),
+        ..crate::auction::plan::AuctionPlanConfig::default()
+    }
+}
+
+
+/// A `[demand]` selection of ordinary `OpenRTB` sources under the names given,
+/// each taking every eligible slot.
+pub(crate) fn demand_named(names: &[&str]) -> crate::provider_table::ProviderList {
+    demand_selection(
+        names
+            .iter()
+            .map(|name| {
+                let mut table =
+                    demand_table("openrtb", &format!("https://{name}.example/openrtb2/auction"));
+                table.insert("routing".to_string(), json!("all_eligible"));
+                (*name, table)
+            })
+            .collect(),
+    )
+}
+
+/// The legacy test orchestrator's configuration for these settings, carrying
+/// the demand source names `[demand] provider` selects.
+///
+/// Production compiles its sources from the plan instead, so this exists only
+/// so the parity tests can drive the pre-plan orchestrator.
+pub(crate) fn legacy_auction_config(settings: &Settings) -> crate::auction::AuctionConfig {
+    let mut config = settings.auction.clone();
+    config.provider_names = settings
+        .demand
+        .selected()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    config
+}

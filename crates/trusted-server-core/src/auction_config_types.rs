@@ -1,16 +1,15 @@
 //! Auction configuration types shared by settings and auction planning.
 
-use serde::de::{Error as _, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
+use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::fmt;
 use validator::Validate;
 
-const LEGACY_PROVIDER_LIST_MESSAGE: &str = "Configuration field `auction.providers` uses the removed list schema; migrate to `[auction.providers.<id>]` map entries as described in the CHANGELOG.md breaking migration";
+const MOVED_PROVIDERS_MESSAGE: &str = "`[auction.providers]` has moved. Select demand sources with `[demand] provider = [...]` and give each its settings in `[demand.<name>]`, as the configuration rules describe";
 
-pub use crate::auction::plan::{
-    BidderId, BidderRouteConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
-};
+const MOVED_MEDIATOR_MESSAGE: &str = "`[auction] mediator` has moved. Select the ad server with `[adserver] provider = \"<name>\"` and give it its settings in `[adserver.<name>]`, as the configuration rules describe";
+
+pub use crate::auction::plan::{BidderId, BidderRouteConfig, NotificationConfig, ProviderId, RoutingMode};
 
 /// Auction orchestration configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -49,18 +48,45 @@ pub struct AuctionConfig {
     )]
     pub rewrite_creatives: bool,
 
-    /// Operator-defined bidder-provider instances, keyed by provider ID.
-    #[serde(default, deserialize_with = "deserialize_provider_map")]
-    pub providers: BTreeMap<ProviderId, ProviderConfig>,
+    /// Refuses the removed `providers` table with a message naming its new
+    /// home, so an old configuration fails with the fix rather than as an
+    /// unknown field.
+    #[serde(default, skip_serializing, deserialize_with = "reject_moved_providers")]
+    #[allow(
+        dead_code,
+        reason = "the field exists so deserialization refuses the removed table"
+    )]
+    pub(crate) providers: MovedSetting,
 
-    /// Client-visible bidder routes, keyed by bidder code.
+    /// Client-visible bidder routes, keyed by bidder code, each naming the
+    /// `[demand]` provider the bidder is sent to.
     #[serde(default)]
     pub bidders: BTreeMap<BidderId, BidderRouteConfig>,
 
-    /// Optional separately registered mediator provider name.
-    /// When set, runs parallel mediation strategy (bidders in parallel, then mediator decides)
-    /// When omitted, runs parallel only strategy (bidders in parallel, highest CPM wins)
-    pub mediator: Option<String>,
+    /// The ad server name the legacy test orchestrator runs.
+    ///
+    /// Production selects its ad server in `[adserver]` instead, so this never
+    /// appears in a configuration file.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) adserver_name: Option<String>,
+
+    /// The demand source names the legacy test orchestrator runs.
+    ///
+    /// Production compiles its sources from `[demand]` instead, so this never
+    /// appears in a configuration file.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) provider_names: Vec<String>,
+
+    /// Refuses the removed `mediator` setting with a message naming its new
+    /// home.
+    #[serde(default, skip_serializing, deserialize_with = "reject_moved_mediator")]
+    #[allow(
+        dead_code,
+        reason = "the field exists so deserialization refuses the removed setting"
+    )]
+    pub(crate) mediator: MovedSetting,
 
     /// Timeout in milliseconds
     #[serde(default = "default_timeout")]
@@ -85,9 +111,13 @@ impl Default for AuctionConfig {
             enabled: false,
             sanitize_creatives: default_sanitize_creatives(),
             rewrite_creatives: default_rewrite_creatives(),
-            providers: BTreeMap::new(),
+            providers: MovedSetting,
+            #[cfg(test)]
+            adserver_name: None,
+            #[cfg(test)]
+            provider_names: Vec::new(),
             bidders: BTreeMap::new(),
-            mediator: None,
+            mediator: MovedSetting,
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
             allowed_context_keys: HashSet::new(),
@@ -95,37 +125,32 @@ impl Default for AuctionConfig {
     }
 }
 
-fn deserialize_provider_map<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<ProviderId, ProviderConfig>, D::Error>
+#[cfg(test)]
+impl AuctionConfig {
+    /// Whether the legacy test orchestrator runs an ad server.
+    pub(crate) fn has_adserver(&self) -> bool {
+        self.adserver_name.is_some()
+    }
+}
+
+/// A setting that has moved elsewhere. It deserializes only by failing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MovedSetting;
+
+fn reject_moved_providers<'de, D>(deserializer: D) -> Result<MovedSetting, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct ProviderMapVisitor;
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(MOVED_PROVIDERS_MESSAGE))
+}
 
-    impl<'de> Visitor<'de> for ProviderMapVisitor {
-        type Value = BTreeMap<ProviderId, ProviderConfig>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a map of auction provider IDs to provider configurations")
-        }
-
-        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-        where
-            A: MapAccess<'de>,
-        {
-            Self::Value::deserialize(MapAccessDeserializer::new(map))
-        }
-
-        fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            Err(A::Error::custom(LEGACY_PROVIDER_LIST_MESSAGE))
-        }
-    }
-
-    deserializer.deserialize_any(ProviderMapVisitor)
+fn reject_moved_mediator<'de, D>(deserializer: D) -> Result<MovedSetting, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(MOVED_MEDIATOR_MESSAGE))
 }
 
 fn default_timeout() -> u32 {
@@ -155,36 +180,6 @@ fn default_creative_store() -> String {
 
 fn default_allowed_context_keys() -> HashSet<String> {
     HashSet::new()
-}
-
-impl AuctionConfig {
-    #[cfg(test)]
-    pub(crate) fn legacy_provider_map(names: &[&str]) -> BTreeMap<ProviderId, ProviderConfig> {
-        names
-            .iter()
-            .map(|name| {
-                let id = ProviderId::unchecked_for_legacy_test(name);
-                (
-                    id,
-                    ProviderConfig {
-                        protocol: "openrtb-2.6".to_string(),
-                        profile: "standard".to_string(),
-                        endpoint: format!("https://{name}.example/openrtb2/auction"),
-                        timeout_ms: None,
-                        routing: RoutingMode::AllEligible,
-                        notifications: NotificationConfig::default(),
-                        profile_config: serde_json::json!({}),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// Check if this config has a mediator configured.
-    #[must_use]
-    pub fn has_mediator(&self) -> bool {
-        self.mediator.is_some()
-    }
 }
 
 #[cfg(test)]
@@ -281,35 +276,50 @@ mod tests {
     }
 
     #[test]
-    fn provider_list_shape_is_rejected() {
+    fn moved_providers_fail_naming_the_demand_table() {
+        for providers in [
+            serde_json::json!(["prebid"]),
+            serde_json::json!({ "pbs_main": { "endpoint": "https://prebid.example" } }),
+        ] {
+            let error = serde_json::from_value::<AuctionConfig>(serde_json::json!({
+                "providers": providers
+            }))
+            .expect_err("should refuse the moved providers table");
+
+            assert!(
+                error.to_string().contains("[demand] provider"),
+                "should name the new home: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn moved_mediator_fails_naming_the_adserver_table() {
         let error = serde_json::from_value::<AuctionConfig>(serde_json::json!({
-            "providers": ["prebid"]
+            "mediator": "adserver_mock"
         }))
-        .expect_err("should reject the removed provider-list schema");
+        .expect_err("should refuse the moved mediator setting");
 
         assert!(
-            error.to_string().contains("map") || error.to_string().contains("object"),
-            "should require map-shaped providers: {error}"
+            error.to_string().contains("[adserver] provider"),
+            "should name the new home: {error}"
         );
     }
 
     #[test]
-    fn map_schema_round_trips_provider_and_bidder_routes() {
+    fn bidder_routes_round_trip() {
         let config: AuctionConfig = serde_json::from_value(serde_json::json!({
-            "providers": {
-                "pbs-main": {
-                    "protocol": "openrtb-2.6",
-                    "profile": "prebid-server",
-                    "endpoint": "https://prebid.example/openrtb2/auction"
-                }
-            },
             "bidders": {
-                "example-bidder": { "provider": "pbs-main" }
+                "example-bidder": { "provider": "pbs_main" }
             }
         }))
-        .expect("should parse map-shaped auction config");
+        .expect("should parse bidder routes");
 
-        assert_eq!(config.providers.len(), 1);
         assert_eq!(config.bidders.len(), 1);
+        let serialized = serde_json::to_value(&config).expect("should serialize");
+        assert!(
+            serialized.get("providers").is_none() && serialized.get("mediator").is_none(),
+            "should never write the moved settings back"
+        );
     }
 }

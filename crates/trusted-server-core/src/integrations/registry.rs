@@ -1251,26 +1251,22 @@ impl IntegrationRegistry {
         extra: &[crate::integrations::IntegrationBuilder],
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
-        // Prebid and APS register through the auction plan rather than through
-        // a builder, but their ids are core's all the same. Recording them with
-        // the builders refuses an outside builder that claims one, and lets a
-        // selector naming one that is switched off report it as registered but
-        // not enabled.
-        inner.builder_ids.extend([
-            (
-                crate::integrations::prebid::PREBID_INTEGRATION_ID,
-                crate::integrations::CORE_SOURCE,
-            ),
-            (
-                crate::integrations::aps::APS_INTEGRATION_ID,
-                crate::integrations::CORE_SOURCE,
-            ),
-        ]);
-        // The plan-backed auction providers register first, so opening the
-        // builder table leaves every existing hook order unchanged.
+        // Prebid registers through the auction plan rather than through a
+        // builder, but its id is core's all the same. Recording it with the
+        // builders refuses an outside builder that claims it, and lets a
+        // selector naming it while it is switched off report it as registered
+        // but not enabled.
+        inner.builder_ids.push((
+            crate::integrations::prebid::PREBID_INTEGRATION_ID,
+            crate::integrations::CORE_SOURCE,
+        ));
+        // The plan-backed registrations come first, so opening the builder
+        // table leaves every existing hook order unchanged. The APS renderer
+        // follows the selected demand sources, since APS is an implementation
+        // a deployment selects in `[demand]` and not an integration it names.
         let mut registrations: Vec<IntegrationRegistration> = [
             crate::integrations::prebid::register_for_plan(settings, &plan)?,
-            crate::integrations::aps::register_for_plan(settings, &plan)?,
+            crate::integrations::aps::register_for_plan(&plan)?,
         ]
         .into_iter()
         .flatten()

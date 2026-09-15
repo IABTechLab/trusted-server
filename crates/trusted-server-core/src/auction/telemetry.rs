@@ -76,7 +76,7 @@ impl AuctionTerminalStatus {
 pub struct AbandonedProviderCall {
     /// Provider name.
     pub provider: String,
-    /// Provider role, usually `bidder` or `mediator`.
+    /// Provider role, usually `bidder` or `ad server`.
     pub provider_role: &'static str,
     /// Optional elapsed time for this provider at abandonment.
     pub response_time_ms: Option<u32>,
@@ -313,7 +313,7 @@ pub struct AuctionEventRow {
     pub winning_bid_count: Option<u16>,
     /// Provider name.
     pub provider: Option<String>,
-    /// `bidder` or `mediator`.
+    /// `bidder` or `ad server`.
     pub provider_role: Option<String>,
     /// Provider-call status.
     pub status: Option<String>,
@@ -545,13 +545,13 @@ pub fn build_auction_events(
                 &result.provider_responses,
                 "bidder",
             );
-            if let Some(mediator_response) = &result.mediator_response {
+            if let Some(adserver_response) = &result.adserver_response {
                 push_provider_row(
                     &mut rows,
                     &observation,
                     &event_ts,
-                    mediator_response,
-                    "mediator",
+                    adserver_response,
+                    "adserver",
                 );
             }
             push_bid_rows(
@@ -744,14 +744,14 @@ fn push_bid_rows(
         }
     }
 
-    if let Some(mediator_response) = &result.mediator_response {
+    if let Some(adserver_response) = &result.adserver_response {
         for (slot_id, winning) in &result.winning_bids {
             if delivered_winner_slots.is_some_and(|slots| !slots.contains(slot_id))
                 || matched_wins.contains(slot_id)
             {
                 continue;
             }
-            if mediator_response
+            if adserver_response
                 .bids
                 .iter()
                 .any(|bid| bid_matches_winning_bid(bid, winning))
@@ -760,7 +760,7 @@ fn push_bid_rows(
                     observation,
                     event_ts,
                     request,
-                    &mediator_response.provider,
+                    &adserver_response.provider,
                     winning,
                     1,
                     winning.price,
@@ -1114,7 +1114,7 @@ mod tests {
         let winning = provider_success.bids[0].clone();
         let result = OrchestrationResult {
             provider_responses: vec![provider_success, provider_no_bid, provider_error],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), winning)]),
             total_time_ms: 99,
             metadata: HashMap::new(),
@@ -1180,7 +1180,7 @@ mod tests {
         let provider = AuctionResponse::success("aps-primary", vec![aps_bid.clone()], 12);
         let result = OrchestrationResult {
             provider_responses: vec![provider],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
             total_time_ms: 12,
             metadata: HashMap::new(),
@@ -1216,7 +1216,7 @@ mod tests {
                 vec![fallback_bid.clone()],
                 12,
             )],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), fallback_bid)]),
             total_time_ms: 12,
             metadata: HashMap::new(),
@@ -1240,15 +1240,15 @@ mod tests {
     }
 
     #[test]
-    fn mediated_aps_telemetry_retains_provider_upstream_seat_and_delivery_identity() {
+    fn adserver_aps_telemetry_retains_provider_upstream_seat_and_delivery_identity() {
         let request = test_request("ts-ec-derived-id");
         let mut aps_bid = bid("slot-1", "aps", Some("ad-1"), Some(1.25));
         aps_bid.returned_seat = Some("upstream-seat".to_string());
         let provider = AuctionResponse::success("aps-primary", vec![aps_bid.clone()], 12);
-        let mediator = AuctionResponse::success("adserver_mock", vec![aps_bid.clone()], 3);
+        let adserver = AuctionResponse::success("adserver_mock", vec![aps_bid.clone()], 3);
         let result = OrchestrationResult {
             provider_responses: vec![provider],
-            mediator_response: Some(mediator),
+            adserver_response: Some(adserver),
             winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
             total_time_ms: 15,
             metadata: HashMap::new(),
@@ -1288,7 +1288,7 @@ mod tests {
         );
         let result = OrchestrationResult {
             provider_responses: vec![provider_success.clone()],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), provider_success.bids[0].clone())]),
             total_time_ms: 42,
             metadata: HashMap::new(),
@@ -1329,7 +1329,7 @@ mod tests {
             .with_metadata("status", json!(403));
         let result = OrchestrationResult {
             provider_responses: vec![provider_http_error],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 12,
             metadata: HashMap::new(),
@@ -1358,17 +1358,17 @@ mod tests {
     }
 
     #[test]
-    fn mediated_win_marks_original_bid_once() {
+    fn adserver_win_marks_original_bid_once() {
         let request = test_request("req");
         let original_bid = bid("slot-1", "kargo", Some("ad-1"), None);
         let provider_success = AuctionResponse::success("prebid", vec![original_bid], 42);
-        let mediator_bid = bid("slot-1", "kargo", Some("ad-1"), Some(2.0));
-        let mediator_response =
-            AuctionResponse::success("adserver_mock", vec![mediator_bid.clone()], 15);
+        let adserver_bid = bid("slot-1", "kargo", Some("ad-1"), Some(2.0));
+        let adserver_response =
+            AuctionResponse::success("adserver_mock", vec![adserver_bid.clone()], 15);
         let result = OrchestrationResult {
             provider_responses: vec![provider_success],
-            mediator_response: Some(mediator_response),
-            winning_bids: HashMap::from([("slot-1".to_owned(), mediator_bid)]),
+            adserver_response: Some(adserver_response),
+            winning_bids: HashMap::from([("slot-1".to_owned(), adserver_bid)]),
             total_time_ms: 80,
             metadata: HashMap::new(),
         };
@@ -1393,12 +1393,12 @@ mod tests {
         assert_eq!(
             winning_rows[0].provider.as_deref(),
             Some("prebid"),
-            "should mark original provider row when mediator winner matches"
+            "should mark original provider row when adserver winner matches"
         );
         assert_eq!(
             winning_rows[0].price_cpm,
             Some(2.0),
-            "should copy mediator decoded price onto original null-price bid"
+            "should copy adserver decoded price onto original null-price bid"
         );
     }
 
@@ -1407,7 +1407,7 @@ mod tests {
         let request = test_request("ts-ec-derived-id");
         let result = OrchestrationResult {
             provider_responses: Vec::new(),
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 1,
             metadata: HashMap::new(),

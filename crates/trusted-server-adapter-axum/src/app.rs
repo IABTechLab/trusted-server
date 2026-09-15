@@ -139,7 +139,7 @@ pub fn build_state_with_registrations(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
-    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
     let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
 
     // Composition root: reject a provider selection this adapter can never
@@ -833,7 +833,7 @@ mod tests {
         let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
             .expect("should parse settings selecting an uninjected provider");
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
-        let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)
+        let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))
             .expect("should build orchestrator");
         let registry =
             IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");

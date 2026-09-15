@@ -60,6 +60,7 @@ pub mod permission_signal;
 pub mod permissions;
 pub mod platform;
 pub mod price_bucket;
+pub mod provider_table;
 pub mod proxy;
 pub mod publisher;
 pub mod redacted;

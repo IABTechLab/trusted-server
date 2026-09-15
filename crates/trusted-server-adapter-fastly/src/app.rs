@@ -265,7 +265,7 @@ pub(crate) fn build_state_with_registrations(
 
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
-    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
     let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
 
     // Composition root: resolve the provider selection once, before any request
@@ -1877,7 +1877,7 @@ mod tests {
                 .expect("should compile auction plan"),
         );
         let orchestrator =
-            trusted_server_core::auction::build_orchestrator_with_plan(plan, &settings)
+            trusted_server_core::auction::build_orchestrator_with_plan(plan)
                 .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
@@ -3274,7 +3274,7 @@ mod tests {
                 .expect("should build integration registry"),
         );
         let orchestrator = Arc::new(
-            build_orchestrator_with_plan(plan, &settings)
+            build_orchestrator_with_plan(plan)
                 .expect("should build auction orchestrator"),
         );
 

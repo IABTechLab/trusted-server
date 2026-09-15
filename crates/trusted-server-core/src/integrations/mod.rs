@@ -8,6 +8,7 @@ use futures::StreamExt as _;
 use http::Request;
 use url::Url;
 
+use crate::auction::demand::{AdServerImplementation, DemandImplementation};
 use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
@@ -22,9 +23,11 @@ pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
+pub mod openrtb;
 pub mod osano;
 pub mod permutive;
 pub mod prebid;
+pub mod prebid_server;
 mod registry;
 pub mod sourcepoint;
 pub mod testlight;
@@ -168,7 +171,7 @@ fn integration_backend_spec(
 /// Maximum body size accepted by integration proxy endpoints (256 KiB).
 pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// Maximum response body size from RTB providers (prebid, aps, mediator).
+/// Maximum response body size from RTB providers (prebid, aps, ad server).
 pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
 pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -348,6 +351,21 @@ pub struct IntegrationBuilder {
     build: IntegrationBuilderFn,
     validate: IntegrationValidateFn,
     prepare_request: Option<IntegrationPrepareRequestFn>,
+    supplies_integration: bool,
+    demand: Option<&'static DemandImplementation>,
+    adserver: Option<&'static AdServerImplementation>,
+}
+
+/// The build function of a builder that supplies no page integration.
+fn no_registration(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(None)
+}
+
+/// The validate function of a builder that supplies no page integration.
+fn nothing_to_validate(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(false)
 }
 
 impl IntegrationBuilder {
@@ -366,7 +384,67 @@ impl IntegrationBuilder {
             build,
             validate,
             prepare_request: None,
+            supplies_integration: true,
+            demand: None,
+            adserver: None,
         }
+    }
+
+    /// Creates a builder that supplies only implementations, such as a demand
+    /// or ad server implementation, and no page integration.
+    ///
+    /// Its `id` still claims a place among builder ids, so two crates cannot
+    /// register under one id, but it is not an integration a deployment can
+    /// name.
+    #[must_use]
+    pub const fn implementations(id: &'static str, source: &'static str) -> Self {
+        Self {
+            id,
+            source,
+            build: no_registration,
+            validate: nothing_to_validate,
+            prepare_request: None,
+            supplies_integration: false,
+            demand: None,
+            adserver: None,
+        }
+    }
+
+    /// Registers a demand implementation, which `[demand] provider` or an
+    /// `implementation` line can name.
+    #[must_use]
+    pub const fn with_demand(mut self, demand: &'static DemandImplementation) -> Self {
+        self.demand = Some(demand);
+        self
+    }
+
+    /// Registers an ad server implementation, which `[adserver] provider` or
+    /// an `implementation` line can name.
+    #[must_use]
+    pub const fn with_adserver(mut self, adserver: &'static AdServerImplementation) -> Self {
+        self.adserver = Some(adserver);
+        self
+    }
+
+    /// Whether this builder supplies a page integration, as opposed to only
+    /// implementations.
+    #[must_use]
+    pub const fn supplies_integration(&self) -> bool {
+        self.supplies_integration
+    }
+
+    /// The demand implementation this builder registers, when it registers
+    /// one.
+    #[must_use]
+    pub const fn demand(&self) -> Option<&'static DemandImplementation> {
+        self.demand
+    }
+
+    /// The ad server implementation this builder registers, when it registers
+    /// one.
+    #[must_use]
+    pub const fn adserver(&self) -> Option<&'static AdServerImplementation> {
+        self.adserver
     }
 
     /// Attaches a request preparation function that runs before routing on
@@ -471,6 +549,16 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
         gpt_diagnostics::validate,
     )
     .with_request_preparer(gpt_diagnostics::prepare_request_hook),
+    // Implementations `[demand]` and `[adserver]` can name. None of them is a
+    // page integration, so none can be named in `[integration] provider`.
+    IntegrationBuilder::implementations(openrtb::OPENRTB_ID, CORE_SOURCE)
+        .with_demand(&openrtb::DEMAND),
+    IntegrationBuilder::implementations(prebid_server::PREBID_SERVER_ID, CORE_SOURCE)
+        .with_demand(&prebid_server::DEMAND),
+    IntegrationBuilder::implementations(aps::APS_INTEGRATION_ID, CORE_SOURCE)
+        .with_demand(&aps::DEMAND),
+    IntegrationBuilder::implementations(adserver_mock::ADSERVER_MOCK_ID, CORE_SOURCE)
+        .with_adserver(&adserver_mock::ADSERVER),
 ];
 
 /// The built-in integration builders, in hook order.

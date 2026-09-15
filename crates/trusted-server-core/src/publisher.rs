@@ -2991,14 +2991,14 @@ pub async fn stream_publisher_body_async<W: Write>(
     .await
 }
 
-/// Builds the canonical mediator placeholder [`Request`] passed to the collect
+/// Builds the canonical ad server placeholder [`Request`] passed to the collect
 /// phase via [`make_collect_context`].
 ///
 /// The URI is the compile-time constant
 /// [`MEDIATOR_PLACEHOLDER_URL`](crate::auction::types::MEDIATOR_PLACEHOLDER_URL),
 /// so the builder is infallible; a default-URI fallback would trip
 /// [`make_collect_context`]'s `debug_assert_eq!`.
-fn mediator_placeholder_request() -> Request<EdgeBody> {
+fn adserver_placeholder_request() -> Request<EdgeBody> {
     Request::builder()
         .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
         .body(EdgeBody::empty())
@@ -3059,7 +3059,7 @@ fn rewrite_origin_request(
 /// See [`AuctionContext::request`]: the orchestrator's collect path runs
 /// after `send_async` has already consumed the real client request, so this
 /// context carries a synthetic placeholder. The orchestrator itself
-/// instantiates a fresh placeholder when it actually invokes a mediator —
+/// instantiates a fresh placeholder when it actually invokes a ad server —
 /// this argument is plumbing for the (presently unused) case where the
 /// orchestrator needs the caller's request shape.
 fn make_collect_context<'a>(
@@ -3484,7 +3484,7 @@ pub(crate) fn prepend_auction_debug_comment(
     options: &AuctionDebugCommentOptions,
 ) {
     let ssp_count = result.provider_responses.len();
-    let mediator_info = match &result.mediator_response {
+    let adserver_info = match &result.adserver_response {
         Some(r) => format!("ok({}_bids)", r.bids.len()),
         None => "none".to_string(),
     };
@@ -3520,14 +3520,14 @@ pub(crate) fn prepend_auction_debug_comment(
             ),
         );
     }
-    // Only include the mediator response when one actually ran; otherwise the
-    // `mediator=none` on the summary line already conveys it.
-    if options.include_mediator_response
-        && let Some(mediator_response) = &result.mediator_response
+    // Only include the ad server response when one actually ran; otherwise the
+    // `ad server=none` on the summary line already conveys it.
+    if options.include_adserver_response
+        && let Some(adserver_response) = &result.adserver_response
     {
         dump.insert(
-            "mediator_response".to_string(),
-            redact_response_for_dump(mediator_response, options),
+            "adserver_response".to_string(),
+            redact_response_for_dump(adserver_response, options),
         );
     }
     // A single `replace("--", …)` is deliberately NOT used — because
@@ -3558,7 +3558,7 @@ pub(crate) fn prepend_auction_debug_comment(
     let dump =
         render_dump(serialized.unwrap_or_else(|error| format!("<dump serialize error: {error}>")));
     let debug_comment = format!(
-        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
+        "<!-- ts-debug: path={path_label} ssp={ssp_count} adserver={adserver_info} winning={} time={}ms\n\
          dump={dump}\n\
          -->",
         result.winning_bids.len(),
@@ -3994,7 +3994,7 @@ async fn collect_non_html_auction(
         .auction_request
         .as_ref()
         .and_then(|_| diagnostics_auction_id(settings));
-    let placeholder = mediator_placeholder_request();
+    let placeholder = adserver_placeholder_request();
     let result = orchestrator
         .collect_dispatched_auction(
             dispatched,
@@ -4049,7 +4049,7 @@ async fn collect_stream_auction(
         .as_ref()
         .and_then(|_| diagnostics_auction_id(settings));
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
-    let placeholder = mediator_placeholder_request();
+    let placeholder = adserver_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
@@ -7113,7 +7113,7 @@ mod tests {
         lookups: Arc<AtomicUsize>,
     }
 
-    const SCHEDULING_PROVIDER: &str = "scheduling-capture";
+    const SCHEDULING_PROVIDER: &str = "scheduling_capture";
 
     #[derive(Debug)]
     struct CapturedSchedulingAuction {
@@ -7263,8 +7263,7 @@ mod tests {
             crate_test_settings_str()
         );
         let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
-        settings.auction.providers =
-            crate::auction::AuctionConfig::legacy_provider_map(&[SCHEDULING_PROVIDER]);
+        settings.demand = crate::auction::test_support::demand_named(&[SCHEDULING_PROVIDER]);
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         settings
             .integrations
@@ -7339,7 +7338,7 @@ mod tests {
             ec_context.ec_allowed() && ec_context.ec_value().is_some(),
             "test precondition: an active, consent-allowed EC must exist"
         );
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
         let captured_auction = Arc::new(Mutex::new(None));
         let mut orchestrator = orchestrator;
         orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
@@ -7600,7 +7599,7 @@ mod tests {
                 AuctionResponse::no_bid("prebid", 665),
                 AuctionResponse::success("aps", vec![bid], 42),
             ],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 665,
             metadata: std::collections::HashMap::new(),
@@ -7629,7 +7628,7 @@ mod tests {
         response.metadata = metadata;
         let result = OrchestrationResult {
             provider_responses: vec![response],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
@@ -7675,10 +7674,10 @@ mod tests {
             comment.contains("dump={\"provider_responses\":"),
             "should dump the provider_responses payload: {comment}"
         );
-        // No mediator ran, so it is omitted (mediator=none already says so).
+        // No ad server ran, so it is omitted (ad server=none already says so).
         assert!(
-            !comment.contains("mediator_response"),
-            "should omit mediator_response when no mediator ran: {comment}"
+            !comment.contains("adserver_response"),
+            "should omit adserver_response when no adserver ran: {comment}"
         );
     }
 
@@ -7686,7 +7685,7 @@ mod tests {
     fn auction_debug_comment_reaches_the_shared_template_seam() {
         let result = OrchestrationResult {
             provider_responses: vec![AuctionResponse::no_bid("prebid", 12)],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
@@ -7790,7 +7789,7 @@ mod tests {
             .with_metadata("error_type", serde_json::json!("http_status"));
         let result = OrchestrationResult {
             provider_responses: vec![response],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
@@ -8052,7 +8051,7 @@ mod tests {
         );
         let result = OrchestrationResult {
             provider_responses: vec![response],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
@@ -8157,7 +8156,7 @@ mod tests {
         );
         let result = OrchestrationResult {
             provider_responses: vec![response],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
@@ -8226,18 +8225,18 @@ mod tests {
     }
 
     #[test]
-    fn include_mediator_response_false_omits_even_when_mediator_ran() {
+    fn include_adserver_response_false_omits_even_when_adserver_ran() {
         let response = AuctionResponse::success("aps", vec![], 10);
-        let mediator = AuctionResponse::success("mediator", vec![], 5);
+        let adserver = AuctionResponse::success("adserver", vec![], 5);
         let result = OrchestrationResult {
             provider_responses: vec![response],
-            mediator_response: Some(mediator),
+            adserver_response: Some(adserver),
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 10,
             metadata: std::collections::HashMap::new(),
         };
         let options = AuctionDebugCommentOptions {
-            include_mediator_response: false,
+            include_adserver_response: false,
             ..AuctionDebugCommentOptions::default()
         };
         let state = AdBidsState::with_script("BIDS_SCRIPT");
@@ -8248,7 +8247,7 @@ mod tests {
             .expect("should lock state")
             .clone()
             .expect("should have comment");
-        assert!(!comment.contains("mediator_response"));
+        assert!(!comment.contains("adserver_response"));
     }
 
     #[test]
@@ -8641,7 +8640,7 @@ mod tests {
         services: &RuntimeServices,
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
         let mut ec_context =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
         let registry = test_registry(settings);
@@ -9797,7 +9796,7 @@ mod tests {
         }
 
         /// Name of the bidding test double, matched by `[auction].providers`.
-        const STUB_BIDDER: &str = "stub-bidder";
+        const STUB_BIDDER: &str = "stub_bidder";
 
         /// The CPM the stub bids. Chosen so its price bucket (`"3.50"`) is a distinctive
         /// string that cannot appear in the fixture page by accident.
@@ -9890,8 +9889,7 @@ mod tests {
         /// [`settings_with_mode`], with an auction provider that actually bids.
         fn settings_with_bidder(mode: &str) -> Settings {
             let mut settings = settings_with_mode(mode);
-            settings.auction.providers =
-                crate::auction_config_types::AuctionConfig::legacy_provider_map(&[STUB_BIDDER]);
+            settings.demand = crate::auction::test_support::demand_named(&[STUB_BIDDER]);
             settings
         }
 
@@ -9930,7 +9928,7 @@ mod tests {
                 settings,
                 services,
                 request,
-                AuctionOrchestrator::new(settings.auction.clone()),
+                AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)),
                 Finalizer::Streaming,
             )
             .await
@@ -9947,7 +9945,7 @@ mod tests {
                 settings,
                 services,
                 request,
-                AuctionOrchestrator::new(settings.auction.clone()),
+                AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)),
                 finalizer,
             )
             .await
@@ -9959,7 +9957,7 @@ mod tests {
             services: &RuntimeServices,
             request: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             orchestrator.register_provider(Arc::new(WinningBidProvider));
             run_with_orchestrator(
                 settings,
@@ -10299,7 +10297,7 @@ mod tests {
             });
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
             // Only the cold request has an origin response available.
             queue_shareable_html(&stub);
 
@@ -11527,7 +11525,7 @@ mod tests {
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
 
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
             let consent = crate::consent::ConsentContext {
@@ -11700,7 +11698,7 @@ mod tests {
                 .build();
             queue_shareable_html(&stub);
 
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
             let consent = crate::consent::ConsentContext {
@@ -12764,7 +12762,7 @@ mod tests {
                 "the cold request should have populated the cache"
             );
 
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
                 ..Default::default()
@@ -14016,7 +14014,7 @@ mod tests {
 
         const ORIGIN_ETAG: &str = "\"origin-tag\"";
         const ORIGIN_LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
-        const UNEXPECTED_304_PROVIDER: &str = "example-navigation-bidder";
+        const UNEXPECTED_304_PROVIDER: &str = "example_navigation_bidder";
         const UNEXPECTED_304_BACKEND: &str = "example-navigation-bidder-backend";
 
         struct DispatchingTestProvider;
@@ -14177,7 +14175,7 @@ mod tests {
 
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[auction.providers.{UNEXPECTED_304_PROVIDER}]\nprotocol = \"openrtb-2.6\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[auction]\nenabled = true\n\n[demand]\nprovider = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n[demand.{UNEXPECTED_304_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
@@ -14284,7 +14282,7 @@ mod tests {
             req: Request<EdgeBody>,
             consent: crate::consent::ConsentContext,
         ) -> PublisherResponse {
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             run_with_orchestrator_and_consent(
                 settings,
                 services,
@@ -14372,7 +14370,7 @@ mod tests {
         #[tokio::test]
         async fn pending_origin_wait_failure_abandons_dispatched_auction_once() {
             let settings = settings_with_dispatching_provider();
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             orchestrator.register_provider(Arc::new(DispatchingTestProvider));
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
             let stub = Arc::new(StubHttpClient::new());
@@ -14443,7 +14441,7 @@ mod tests {
         #[tokio::test]
         async fn pending_origin_start_failure_skips_kv_auction_and_telemetry() {
             let settings = settings_with_dispatching_provider();
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             orchestrator.register_provider(Arc::new(DispatchingTestProvider));
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
             let stub = Arc::new(StubHttpClient::new());
@@ -14510,7 +14508,7 @@ mod tests {
                 crate::auction::compile_auction_plan(&settings)
                     .expect("should compile signed navigation auction"),
             );
-            let orchestrator = crate::auction::build_orchestrator_with_plan(plan, &settings)
+            let orchestrator = crate::auction::build_orchestrator_with_plan(plan)
                 .expect("should build signed plan-backed orchestrator");
             let stub = Arc::new(StubHttpClient::new());
             queue_html_response_with_cache_control(&stub, "public, max-age=300");
@@ -14739,7 +14737,7 @@ mod tests {
             .await;
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let response = buffer_publisher_response_async(
                 response,
                 &Method::GET,
@@ -15123,7 +15121,7 @@ mod tests {
             for content_type in [None, Some("text/html; charset=utf-8")] {
                 // Arrange
                 let settings = settings_with_dispatching_provider();
-                let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                let mut orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
                 orchestrator.register_provider(Arc::new(DispatchingTestProvider));
                 let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
                 let stub = Arc::new(StubHttpClient::new());
@@ -15619,7 +15617,7 @@ mod tests {
             "test precondition: consent must allow EC creation"
         );
 
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
         let req = HttpRequest::builder()
             .method(Method::GET)
             .uri("https://publisher.example/article")
@@ -15712,7 +15710,7 @@ mod tests {
             &Method::GET,
             &settings,
             &registry,
-            &AuctionOrchestrator::new(settings.auction.clone()),
+            &AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)),
             &services,
         )
         .await
@@ -16160,7 +16158,7 @@ mod tests {
     async fn body_close_hold_loop_processes_close_tail_before_reading_post_body_chunks() {
         let settings = create_test_settings();
         let services = noop_services();
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
         let dispatched = DispatchedAuction::empty_for_test(test_auction_request(), 500);
         let read_count = Arc::new(AtomicUsize::new(0));
         let body_close_processed_at = Arc::new(AtomicUsize::new(0));
@@ -16220,7 +16218,7 @@ mod tests {
         // remains pending.
         let settings = create_test_settings();
         let services = noop_services();
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
         let ad_bids_state = AdBidsState::default();
         let mut state = AuctionHoldState::new(
             DispatchedAuctionGuard::new(DispatchedAuction::empty_for_test(
@@ -17604,7 +17602,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
@@ -17669,7 +17667,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
@@ -17737,7 +17735,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
@@ -17805,7 +17803,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
@@ -17873,7 +17871,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
@@ -17960,7 +17958,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = non_html_stream_params("gzip");
             let compressed =
@@ -18003,7 +18001,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = non_html_stream_params("deflate");
             let compressed =
@@ -18051,7 +18049,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = non_html_stream_params("gzip");
             let compressed = gzip_encode(&vec![b'a'; 64 * 1024]);
@@ -18140,7 +18138,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
@@ -18216,7 +18214,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
@@ -18295,7 +18293,7 @@ mod tests {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
@@ -18362,7 +18360,7 @@ mod tests {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
         let services = noop_services();
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -18495,7 +18493,7 @@ mod tests {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
         let services = noop_services();
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -18771,7 +18769,7 @@ mod tests {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
 
         for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
         {
@@ -18836,7 +18834,7 @@ mod tests {
             ),
         )
         .expect("should create integration registry");
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
         let services = noop_services();
 
         for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
@@ -18922,7 +18920,7 @@ mod tests {
             ),
         )
         .expect("should create integration registry");
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
 
         let make_params = || {
             let ec_context =
@@ -19104,7 +19102,7 @@ mod tests {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings)));
         let services = noop_services();
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -21380,7 +21378,7 @@ mod tests {
         #[tokio::test]
         async fn page_bids_format_absent_or_json_returns_json() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             for path_and_format in ["/2024/article", "/2024/article&format=json"] {
                 let response = run_page_bids_response(
                     &settings,
@@ -21412,7 +21410,7 @@ mod tests {
         #[tokio::test]
         async fn page_bids_format_rejects_removed_unknown_and_empty_values() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             for format in ["fragment", "scrpit", ""] {
                 let response = run_page_bids_response(
                     &settings,
@@ -21491,7 +21489,7 @@ mod tests {
             captured_request: Arc<Mutex<Option<AuctionRequest>>>,
             winning_bid: bool,
         ) -> AuctionOrchestrator {
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
                 captured_request,
                 winning_bid,
@@ -21502,8 +21500,7 @@ mod tests {
         #[tokio::test]
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
-            settings.auction.providers =
-                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
+            settings.demand = crate::auction::test_support::demand_named(&[AUCTION_ID_TEST_PROVIDER]);
             settings
                 .integrations
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
@@ -21659,8 +21656,7 @@ mod tests {
             }
 
             let mut settings = settings_with_co();
-            settings.auction.providers =
-                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
+            settings.demand = crate::auction::test_support::demand_named(&[AUCTION_ID_TEST_PROVIDER]);
             settings
                 .integrations
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
@@ -21699,7 +21695,7 @@ mod tests {
         #[tokio::test]
         async fn deprecated_alias_response_matches_canonical_path() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
 
             let canonical = run_page_bids_response(
                 &settings,
@@ -21736,7 +21732,7 @@ mod tests {
         #[tokio::test]
         async fn deprecated_alias_response_is_marked_deprecated() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
 
             let canonical = run_page_bids_response(
                 &settings,
@@ -21780,7 +21776,7 @@ mod tests {
                 settings.creative_opportunities.is_none(),
                 "test settings should have no creative opportunities configured"
             );
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
 
             let response = run_page_bids_response(
                 &settings,
@@ -21807,7 +21803,7 @@ mod tests {
         #[tokio::test]
         async fn cross_site_request_is_denied_before_configuration_is_revealed() {
             let settings = settings_without_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let mut req = Request::builder()
                 .method(Method::GET)
                 .uri(format!("https://test-publisher.com{PAGE_BIDS_PATH}?path=/"))
@@ -21827,7 +21823,7 @@ mod tests {
         #[tokio::test]
         async fn cross_site_fetch_metadata_is_rejected() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let mut req = make_page_bids_request("/2024/01/my-article/");
             set_test_header(&mut req, "sec-fetch-site", "cross-site");
 
@@ -21844,7 +21840,7 @@ mod tests {
         #[tokio::test]
         async fn missing_fetch_metadata_without_tsjs_header_is_rejected() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.headers_mut().remove("sec-fetch-site");
 
@@ -21861,7 +21857,7 @@ mod tests {
         #[tokio::test]
         async fn missing_fetch_metadata_with_tsjs_header_is_allowed() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.headers_mut().remove("sec-fetch-site");
             set_test_header(&mut req, "x-tsjs-page-bids", "1");
@@ -21879,7 +21875,7 @@ mod tests {
         #[tokio::test]
         async fn same_site_fetch_metadata_is_rejected() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let mut req = make_page_bids_request("/2024/01/my-article/");
             // `same-site` admits sibling origins under the same registrable
             // domain — not trusted to spend SSP quota.
@@ -21900,7 +21896,7 @@ mod tests {
             // Spec §8 kill-switch: creative-opportunities.toml with zero slots disables
             // all server-side auction activity and injection.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let req = make_page_bids_request("/2024/01/my-article/");
 
             let body = run_page_bids(&settings, &orchestrator, &[], req).await;
@@ -21929,7 +21925,7 @@ mod tests {
             // but the server must not burn SSP request quota running a real auction
             // for them. Same gate the publisher path applies.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             set_test_header(
@@ -21963,7 +21959,7 @@ mod tests {
             // Navigations triggered by Sec-Purpose=prefetch should not fire real
             // SSP auctions — the user has not yet visited the page.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             set_test_header(&mut req, "sec-purpose", "prefetch");
@@ -21991,7 +21987,7 @@ mod tests {
         #[tokio::test]
         async fn page_bids_omits_only_over_limit_dynamic_slot() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let mut over_limit = article_slot()
                 .into_iter()
                 .next()
@@ -22032,7 +22028,7 @@ mod tests {
         async fn url_not_matching_any_pattern_returns_empty_response() {
             // Slots exist but request path does not match — no auction, no injection.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let slots = article_slot(); // slot matches /20** only
             let req = make_page_bids_request("/about"); // does not match
 
@@ -22094,7 +22090,7 @@ mod tests {
             // the auction is off. Consent is allowed here so the test isolates
             // the kill switch.
             let settings = settings_with_co_auction_disabled();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let slots = article_slot();
             let req = make_page_bids_request("/2024/01/my-article/");
 
@@ -22123,7 +22119,7 @@ mod tests {
             // The dedicated template switch must suppress publisher/page-bids
             // delivery without using the global auction switch.
             let settings = settings_with_co_templates_disabled();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let slots = article_slot();
             let req = make_page_bids_request("/2024/01/my-article/");
 
@@ -22154,7 +22150,7 @@ mod tests {
             // hook does not create GPT slots client-side — matching the publisher
             // navigation path's `should_run_server_side_ad_stack` gate.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             let slots = article_slot();
             let req = make_page_bids_request("/2024/01/my-article/");
 
@@ -22251,7 +22247,7 @@ mod tests {
         /// `[publisher] domain` from [`crate_test_settings_str`].
         const CONFIGURED_DOMAIN: &str = "test-publisher.com";
 
-        const CAPTURING_PROVIDER: &str = "request-capturing-provider";
+        const CAPTURING_PROVIDER: &str = "request_capturing_provider";
 
         /// Records the [`AuctionRequest`] the orchestrator dispatched, then
         /// fails its launch so no real transport handle is needed.
@@ -22320,7 +22316,7 @@ mod tests {
 
         fn settings_with_capturing_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[auction.providers.{CAPTURING_PROVIDER}]\nprotocol = \"openrtb-2.6\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[auction]\nenabled = true\n\n[demand]\nprovider = [\"{CAPTURING_PROVIDER}\"]\n\n[demand.{CAPTURING_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
@@ -22408,7 +22404,7 @@ mod tests {
             settings: &Settings,
             captured: &Arc<Mutex<Option<AuctionRequest>>>,
         ) -> AuctionOrchestrator {
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
             orchestrator.register_provider(Arc::new(RequestCapturingProvider {
                 captured: Arc::clone(captured),
             }));

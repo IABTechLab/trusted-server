@@ -10,12 +10,11 @@ use serde_json::{Value, json};
 use super::test_executor::execute_standard_fixture;
 use super::*;
 use crate::auction::plan::{
-    AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationConfig,
-    ProviderConfig, ProviderId, RoutingMode,
+    AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, ProviderId,
 };
 use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
 use crate::auction::routing::route_auction;
-use crate::auction::test_support::canonical_parity_auction_request;
+use crate::auction::test_support::{canonical_parity_auction_request, demand_table, plan_config};
 use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{ConsentContext, ConsentSource};
@@ -26,52 +25,45 @@ use crate::platform::test_support::{
 };
 use crate::request_signing::RequestSigner;
 
-fn config(profile: &str, profile_config: Value) -> AuctionPlanConfig {
+fn config(implementation: &str, settings: Value) -> AuctionPlanConfig {
     config_with_endpoint(
-        profile,
-        profile_config,
+        implementation,
+        settings,
         "https://exchange.example.test/openrtb",
     )
 }
 
-fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) -> AuctionPlanConfig {
-    let provider_id = ProviderId::from_str("fictional-provider").expect("should parse provider ID");
-    let prebid_server = profile == "prebid-server";
-    AuctionPlanConfig {
-        timeout_ms: 321,
-        providers: BTreeMap::from([(
-            provider_id.clone(),
-            ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: profile.to_string(),
-                endpoint: endpoint.to_string(),
-                timeout_ms: Some(321),
-                routing: if prebid_server {
-                    RoutingMode::Explicit
-                } else {
-                    RoutingMode::AllEligible
-                },
-                notifications: NotificationConfig::default(),
-                profile_config,
-            },
-        )]),
-        bidders: if prebid_server {
-            BTreeMap::from([(
-                BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
-                BidderRouteConfig {
-                    provider: provider_id,
-                },
-            )])
-        } else {
-            BTreeMap::new()
-        },
-        mediator: None,
-        request_signing: None,
+fn config_with_endpoint(
+    implementation: &str,
+    settings: Value,
+    endpoint: &str,
+) -> AuctionPlanConfig {
+    let provider_id = ProviderId::from_str("fictional_provider").expect("should parse provider ID");
+    let prebid_server = implementation == "prebid_server";
+    let mut table = demand_table(implementation, endpoint);
+    table.insert("timeout_ms".to_string(), json!(321));
+    if !prebid_server {
+        table.insert("routing".to_string(), json!("all_eligible"));
     }
+    if let Value::Object(settings) = settings {
+        table.extend(settings);
+    }
+    let mut config = plan_config(vec![("fictional_provider", table)]);
+    config.timeout_ms = 321;
+    if prebid_server {
+        config.bidders = BTreeMap::from([(
+            BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
+            BidderRouteConfig {
+                provider: provider_id,
+            },
+        )]);
+    }
+    config
 }
 
-fn routed(profile: &str, profile_config: Value) -> (AuctionPlan, RoutedAuction) {
-    let plan = AuctionPlan::compile(config(profile, profile_config)).expect("should compile plan");
+fn routed(implementation: &str, settings: Value) -> (AuctionPlan, RoutedAuction) {
+    let plan =
+        AuctionPlan::compile(config(implementation, settings)).expect("should compile plan");
     let inbound = Request::builder()
         .uri("https://publisher.example/auction")
         .header(
@@ -87,12 +79,12 @@ fn routed(profile: &str, profile_config: Value) -> (AuctionPlan, RoutedAuction) 
 }
 
 fn routed_with_request(
-    profile: &str,
-    profile_config: Value,
+    implementation: &str,
+    settings: Value,
     request: crate::auction::types::AuctionRequest,
     accept_language: Option<&str>,
 ) -> (AuctionPlan, RoutedAuction) {
-    let plan = AuctionPlan::compile(config(profile, profile_config)).expect("should compile plan");
+    let plan = AuctionPlan::compile(config(implementation, settings)).expect("should compile plan");
     let mut builder = Request::builder().uri("https://publisher.example/auction");
     if let Some(language) = accept_language {
         builder = builder.header(header::ACCEPT_LANGUAGE, language);
@@ -105,12 +97,12 @@ fn routed_with_request(
 }
 
 fn build_with_request(
-    profile: &str,
-    profile_config: Value,
+    implementation: &str,
+    settings: Value,
     request: crate::auction::types::AuctionRequest,
     accept_language: Option<&str>,
 ) -> OpenRtbRequest {
-    let (plan, routed) = routed_with_request(profile, profile_config, request, accept_language);
+    let (plan, routed) = routed_with_request(implementation, settings, request, accept_language);
     match build_request(
         &routed.inputs()[0],
         &routed,
@@ -137,8 +129,8 @@ fn finalization<'a>(signer: Option<&'a RequestSigner>) -> RequestFinalization<'a
     }
 }
 
-fn build(profile: &str, profile_config: Value, signer: Option<&RequestSigner>) -> OpenRtbRequest {
-    let (plan, routed) = routed(profile, profile_config);
+fn build(implementation: &str, settings: Value, signer: Option<&RequestSigner>) -> OpenRtbRequest {
+    let (plan, routed) = routed(implementation, settings);
     match build_request(
         &routed.inputs()[0],
         &routed,
@@ -212,18 +204,18 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
         ),
     ];
     for (name, consent) in cases {
-        for profile in ["standard", "prebid-server", "aps"] {
+        for implementation in ["openrtb", "prebid_server", "aps"] {
             let mut canonical = canonical_parity_auction_request();
             canonical.user.consent = Some(consent.clone());
-            let config = if profile == "aps" {
+            let config = if implementation == "aps" {
                 json!({"account_id": "example-account-id"})
             } else {
                 json!({})
             };
-            let value = serde_json::to_value(build_with_request(profile, config, canonical, None))
+            let value = serde_json::to_value(build_with_request(implementation, config, canonical, None))
                 .expect("should serialize request");
             let regs = value.get("regs");
-            if profile == "aps" {
+            if implementation == "aps" {
                 let regs = regs.expect("APS should preserve empty admitted context");
                 assert_eq!(
                     regs["gdpr"],
@@ -231,7 +223,7 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
                     "{name}"
                 );
             } else if name == "empty" {
-                assert!(regs.is_none(), "{profile} should omit empty regs");
+                assert!(regs.is_none(), "{implementation} should omit empty regs");
             } else {
                 let regs = regs.expect("should emit actionable regs");
                 let expected_gdpr = match consent.jurisdiction {
@@ -242,7 +234,7 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
                 assert_eq!(
                     regs.get("gdpr"),
                     expected_gdpr.map(|value| json!(u8::from(value))).as_ref(),
-                    "{name} {profile}"
+                    "{name} {implementation}"
                 );
             }
             let serialized = value.to_string();
@@ -280,7 +272,7 @@ fn pbs_body_consent_respects_source_and_forwarding_mode() {
             .expect("should have consent context")
             .source = source;
         let value = serde_json::to_value(build_with_request(
-            "prebid-server",
+            "prebid_server",
             json!({"consent_forwarding": mode}),
             canonical,
             None,
@@ -298,18 +290,18 @@ fn pbs_body_consent_respects_source_and_forwarding_mode() {
 #[test]
 fn language_limits_are_profile_specific() {
     let language = "abcdefghijk";
-    for (profile, expected) in [
-        ("prebid-server", Some(language)),
+    for (implementation, expected) in [
+        ("prebid_server", Some(language)),
         ("aps", None),
-        ("standard", None),
+        ("openrtb", None),
     ] {
-        let config = if profile == "aps" {
+        let config = if implementation == "aps" {
             json!({"account_id": "example-account-id"})
         } else {
             json!({})
         };
         let request = build_with_request(
-            profile,
+            implementation,
             config,
             canonical_parity_auction_request(),
             Some(language),
@@ -319,14 +311,14 @@ fn language_limits_are_profile_specific() {
             expected
         );
     }
-    for profile in ["prebid-server", "aps", "standard"] {
-        let config = if profile == "aps" {
+    for implementation in ["prebid_server", "aps", "openrtb"] {
+        let config = if implementation == "aps" {
             json!({"account_id": "example-account-id"})
         } else {
             json!({})
         };
         let request = build_with_request(
-            profile,
+            implementation,
             config,
             canonical_parity_auction_request(),
             Some("en-US,en;q=0.9"),
@@ -370,7 +362,7 @@ fn pbs_debug_query_fragment_preserves_exact_legacy_configured_semantics() {
         let mut request = canonical_parity_auction_request();
         request.publisher.page_url = Some(page.to_string());
         let built = build_with_request(
-            "prebid-server",
+            "prebid_server",
             json!({"debug_query_params": fragment}),
             request,
             None,
@@ -385,8 +377,8 @@ fn pbs_debug_query_fragment_preserves_exact_legacy_configured_semantics() {
 
 #[test]
 fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
-    let mut raw = config(
-        "prebid-server",
+    let raw = config(
+        "prebid_server",
         json!({
             "debug": true,
             "test_mode": true,
@@ -397,16 +389,6 @@ fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
                 {"when":{"bidder":"exampleBidder","zone":"zone-a"},"set":{"ordered":2,"shared":"rule-two"}}
             ]
         }),
-    );
-    raw.providers
-        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
-        .expect("should find provider")
-        .routing = RoutingMode::Explicit;
-    raw.bidders.insert(
-        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
-        BidderRouteConfig {
-            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
-        },
     );
     let plan = AuctionPlan::compile(raw).expect("should compile PBS override plan");
     let mut request = canonical_parity_auction_request();
@@ -462,7 +444,7 @@ fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
     assert_eq!(
         value["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
         json!({"generic":1,"ordered":2,"shared":"rule-two","zone":2}),
-        "should allow profile overrides to populate empty browser params"
+        "should allow implementation overrides to populate empty browser params"
     );
 
     let mut stored = canonical_parity_auction_request();
@@ -489,17 +471,7 @@ fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
 
 #[test]
 fn pbs_pairs_each_impression_with_its_routed_slot_params() {
-    let mut raw = config("prebid-server", json!({}));
-    raw.providers
-        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
-        .expect("should find provider")
-        .routing = RoutingMode::Explicit;
-    raw.bidders.insert(
-        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
-        BidderRouteConfig {
-            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
-        },
-    );
+    let raw = config("prebid_server", json!({}));
     let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
     let mut request = canonical_parity_auction_request();
     request.slots[0].id = "first-slot".to_string();
@@ -548,17 +520,7 @@ fn pbs_pairs_each_impression_with_its_routed_slot_params() {
 
 #[test]
 fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
-    let mut raw = config("prebid-server", json!({}));
-    raw.providers
-        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
-        .expect("should find provider")
-        .routing = RoutingMode::Explicit;
-    raw.bidders.insert(
-        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
-        BidderRouteConfig {
-            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
-        },
-    );
+    let raw = config("prebid_server", json!({}));
     let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
     let mut request = canonical_parity_auction_request();
     request.slots[0].bidders = HashMap::from([(
@@ -592,17 +554,7 @@ fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
 
 #[test]
 fn pbs_driver_exact_golden_preserves_profile_policy() {
-    let mut raw = config("prebid-server", json!({"consent_forwarding": "both"}));
-    raw.providers
-        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
-        .expect("should find provider")
-        .routing = RoutingMode::Explicit;
-    raw.bidders.insert(
-        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
-        BidderRouteConfig {
-            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
-        },
-    );
+    let raw = config("prebid_server", json!({"consent_forwarding": "both"}));
     let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
     let mut common = canonical_parity_auction_request();
     common.slots[0].bidders = HashMap::from([(
@@ -701,15 +653,15 @@ fn aps_driver_exact_golden_preserves_profile_policy() {
 #[test]
 fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
     let signer = deterministic_signer();
-    for (profile, config) in [
-        ("standard", json!({"request_ext": {"fictional": true}})),
-        ("prebid-server", json!({})),
+    for (implementation, config) in [
+        ("openrtb", json!({"request_ext": {"fictional": true}})),
+        ("prebid_server", json!({})),
         ("aps", json!({"account_id": "example-account-id"})),
     ] {
-        let unsigned = serde_json::to_value(build(profile, config.clone(), None))
+        let unsigned = serde_json::to_value(build(implementation, config.clone(), None))
             .expect("should serialize unsigned request");
         let unsigned_ts = unsigned["ext"].get("trusted_server");
-        if profile == "prebid-server" {
+        if implementation == "prebid_server" {
             assert_eq!(
                 unsigned_ts,
                 Some(&json!({"request_host": "publisher.example", "request_scheme": "https"})),
@@ -722,7 +674,7 @@ fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
             );
         }
 
-        let signed = serde_json::to_value(build(profile, config, Some(&signer)))
+        let signed = serde_json::to_value(build(implementation, config, Some(&signer)))
             .expect("should serialize signed request");
         let extension = &signed["ext"]["trusted_server"];
         assert_eq!(extension["version"], "1.1", "should set signing version");
@@ -750,12 +702,12 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
     let signer = deterministic_signer();
     let cases = [
         (
-            "standard",
+            "openrtb",
             json!({"request_ext": {"fictional": true}}),
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true,"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
         (
-            "prebid-server",
+            "prebid_server",
             json!({}),
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
@@ -765,18 +717,18 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
     ];
-    for (profile, config, expected) in cases {
+    for (implementation, config, expected) in cases {
         assert_eq!(
-            serde_json::to_string(&build(profile, config, Some(&signer)))
+            serde_json::to_string(&build(implementation, config, Some(&signer)))
                 .expect("should serialize signed request"),
             expected,
-            "{profile} signed wire fixture should stay exact"
+            "{implementation} signed wire fixture should stay exact"
         );
     }
 
     assert_eq!(
         serde_json::to_string(&build(
-            "standard",
+            "openrtb",
             json!({"request_ext": {"fictional": true}}),
             None,
         ))
@@ -789,7 +741,7 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
 #[test]
 fn standard_static_extensions_have_no_invented_bidder_param_location() {
     let request = build(
-        "standard",
+        "openrtb",
         json!({
             "request_ext": {"fictional_request": {"enabled": true}},
             "imp_ext": {"fictional_imp": "value"}
@@ -801,13 +753,13 @@ fn standard_static_extensions_have_no_invented_bidder_param_location() {
     assert_eq!(value["imp"][0]["ext"]["fictional_imp"], "value");
     assert!(
         !value.to_string().contains("exampleBidder"),
-        "standard profile must not invent bidder params placement"
+        "standard implementation must not invent bidder params placement"
     );
 }
 
 #[test]
 fn defensive_no_impression_outcome_does_not_build_transportable_request() {
-    let (plan, mut routed) = routed("standard", json!({}));
+    let (plan, mut routed) = routed("openrtb", json!({}));
     let mut common = routed.inputs()[0].common_request().clone();
     common.slots = vec![AdSlot {
         id: "video-only".to_string(),
@@ -835,17 +787,13 @@ fn standard_fixture_with_formats(
     formats: Vec<AdFormat>,
 ) -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
     let mut raw = config(
-        "standard",
+        "openrtb",
         json!({"request_ext": {"fixture": true}, "imp_ext": {"slot_fixture": true}}),
     );
-    raw.providers
-        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
-        .expect("should find provider")
-        .routing = RoutingMode::Explicit;
     raw.bidders.insert(
-        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
+        BidderId::from_str("exampleBidder").expect("should parse bidder"),
         BidderRouteConfig {
-            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
+            provider: ProviderId::from_str("fictional_provider").expect("should parse provider"),
         },
     );
     let plan = AuctionPlan::compile(raw).expect("should compile standard fixture plan");
@@ -883,7 +831,7 @@ fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
 fn standard_response_extraction_isolates_malformed_siblings_and_ignores_response_id() {
     let (_plan, routed, _request) = standard_fixture();
     let response = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({
             "id": "informational-mismatch",
@@ -915,7 +863,7 @@ fn standard_response_currency_accepts_omitted_and_usd_but_rejects_other_or_malfo
             value["cur"] = currency;
         }
         let response =
-            extract_standard_response("fictional-provider", &routed.inputs()[0], &value, 0);
+            extract_standard_response("fictional_provider", &routed.inputs()[0], &value, 0);
         assert_eq!(
             response.status,
             BidStatus::Success,
@@ -926,14 +874,14 @@ fn standard_response_currency_accepts_omitted_and_usd_but_rejects_other_or_malfo
 
     let mut eur = bid.clone();
     eur["cur"] = json!("EUR");
-    let response = extract_standard_response("fictional-provider", &routed.inputs()[0], &eur, 0);
+    let response = extract_standard_response("fictional_provider", &routed.inputs()[0], &eur, 0);
     assert_eq!(response.status, BidStatus::NoBid);
     assert_eq!(response.metadata["unsupported_currency"], "EUR");
 
     let mut malformed = bid;
     malformed["cur"] = json!(["USD"]);
     let response =
-        extract_standard_response("fictional-provider", &routed.inputs()[0], &malformed, 0);
+        extract_standard_response("fictional_provider", &routed.inputs()[0], &malformed, 0);
     assert_eq!(response.status, BidStatus::Error);
     assert_eq!(response.metadata["error_type"], "parse_response");
 }
@@ -942,7 +890,7 @@ fn standard_response_currency_accepts_omitted_and_usd_but_rejects_other_or_malfo
 fn standard_response_rejects_unknown_impressions_and_dimensions_but_keeps_siblings() {
     let (_plan, routed, _request) = standard_fixture();
     let response = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [{"seat": "seat", "bid": [
             {"id":"good","impid":"fictional-slot","price":1.0,"adm":"ok","w":300,"h":250},
@@ -972,7 +920,7 @@ fn standard_response_rejects_unknown_impressions_and_dimensions_but_keeps_siblin
 fn standard_response_infers_only_unambiguous_missing_dimensions() {
     let (_plan, routed, _request) = standard_fixture();
     let inferred = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [{"bid": [
             {"id":"inferred","impid":"fictional-slot","price":1.0,"adm":"ok"}
@@ -997,7 +945,7 @@ fn standard_response_infers_only_unambiguous_missing_dimensions() {
     ];
     let (_plan, routed, _request) = standard_fixture_with_formats(formats);
     let ambiguous = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [{"bid": [
             {"id":"ambiguous","impid":"fictional-slot","price":1.0,"adm":"ok"}
@@ -1032,7 +980,7 @@ fn standard_response_infers_dimensions_from_partial_unique_matches() {
     let (_plan, routed, _request) = standard_fixture_with_formats(formats);
 
     let response = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [{"bid": [
             {"id":"width-only","impid":"fictional-slot","price":1.0,"adm":"width","w":300},
@@ -1064,7 +1012,7 @@ fn standard_response_accepts_null_and_integral_float_dimensions() {
     let (_plan, routed, _request) = standard_fixture();
 
     let response = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [{"bid": [
             {"id":"null","impid":"fictional-slot","price":1.0,"adm":"null","w":null,"h":null},
@@ -1114,7 +1062,7 @@ fn standard_response_rejects_partial_dimension_mismatch_and_ambiguity() {
     let (_plan, routed, _request) = standard_fixture_with_formats(formats);
 
     let response = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [{"bid": [
             {"id":"ambiguous","impid":"fictional-slot","price":1.0,"adm":"ambiguous","w":300},
@@ -1143,7 +1091,7 @@ fn standard_response_rejects_invalid_numeric_dimension_shapes() {
     let (_plan, routed, _request) = standard_fixture();
 
     let response = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [{"bid": [
             {"id":"fractional","impid":"fictional-slot","price":1.0,"adm":"bad","w":300.5},
@@ -1174,7 +1122,7 @@ fn standard_response_rejects_invalid_numeric_dimension_shapes() {
 fn notification_suppression_matrix_uses_only_exact_valid_returned_seat() {
     let (_plan, routed, _request) = standard_fixture();
     let response = extract_standard_response(
-        "fictional-provider",
+        "fictional_provider",
         &routed.inputs()[0],
         &json!({"seatbid": [
             {"seat": "exact", "bid": [{"id":"exact","impid":"fictional-slot","price":1.0,"adm":"ok","w":300,"h":250,"nurl":"https://n.example","burl":"https://b.example"}]},
@@ -1312,7 +1260,7 @@ fn fictional_standard_executor_covers_bid_no_bid_malformed_unused_and_redirect()
         );
         let spec = provider.backend_spec();
         assert_eq!(spec.host, "exchange.example.test");
-        assert_eq!(spec.discriminator.as_deref(), Some("fictional-provider"));
+        assert_eq!(spec.discriminator.as_deref(), Some("fictional_provider"));
     });
 }
 
@@ -1327,7 +1275,7 @@ fn prebid_endpoint_normalization_reaches_generic_execution_and_preserves_custom_
             ("https://pbs.example/bid", "https://pbs.example/bid"),
         ] {
             let plan = AuctionPlan::compile(config_with_endpoint(
-                "prebid-server",
+                "prebid_server",
                 json!({}),
                 configured_endpoint,
             ))
@@ -1392,7 +1340,7 @@ fn prebid_endpoint_normalization_reaches_generic_execution_and_preserves_custom_
 fn malformed_top_level_standard_response_is_error() {
     let (_plan, routed, _request) = standard_fixture();
     let response =
-        extract_standard_response("fictional-provider", &routed.inputs()[0], &json!([]), 0);
+        extract_standard_response("fictional_provider", &routed.inputs()[0], &json!([]), 0);
     assert_eq!(response.status, BidStatus::Error);
     assert_eq!(response.metadata["error_type"], "parse_response");
 }

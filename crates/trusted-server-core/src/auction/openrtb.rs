@@ -1,23 +1,20 @@
-//! Shared `OpenRTB` 2.6 request/response support for config-first providers.
+//! The shared `OpenRTB` 2.6 request and response driver.
 //!
-//! Profiles receive only routed, privacy-approved facts and never the raw
-//! downstream request or unrestricted runtime services.
+//! Every demand source's request is built here from routed, privacy-approved
+//! facts, never from the raw downstream request or unrestricted runtime
+//! services. A demand implementation decides only what
+//! [`crate::auction::demand`] exposes, and this driver builds the rest the same
+//! way for all of them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use error_stack::Report;
 use serde_json::{Map, Value, json};
-use url::Url;
 
+use super::demand::{CompiledDemand, DemandFieldPolicy, RegsPolicy};
 use super::plan::{NotificationPolicy, ProviderPlan};
-use super::profile::{
-    ApsProfilePlan, CompiledOpenRtbProfile, PrebidProfilePlan, StandardProfilePlan,
-};
-use super::routing::{
-    PrebidTransportHeaders, ProviderAuctionInput, ProviderSlotInput, RoutedAuction,
-};
+use super::routing::{ProviderAuctionInput, ProviderSlotInput, RoutedAuction, TransportHeaders};
 use super::types::{AdFormat, AuctionResponse, Bid};
-use crate::consent::ConsentSource;
 use crate::error::TrustedServerError;
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
@@ -26,9 +23,6 @@ use crate::openrtb::{
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 
 const DEFAULT_CURRENCY: &str = "USD";
-const APS_SDK_SOURCE: &str = "prebid";
-const APS_SDK_VERSION: &str = "2.2.0";
-const MAX_CONSERVATIVE_LANGUAGE_BYTES: usize = 8;
 
 /// Fixed reasons why an upstream bid failed response admission.
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -244,12 +238,13 @@ pub(crate) struct RequestFinalization<'a> {
     pub(crate) signing_params: SigningParams,
 }
 
-/// Build one provider request from its immutable routed input.
+/// Build one demand source's request from its immutable routed input.
 ///
 /// # Errors
 ///
-/// Returns an auction error when static/profile extensions cannot be merged or
-/// the supplied signing input does not bind the already-fixed request ID.
+/// Returns an auction error when an implementation's own extensions cannot be
+/// built or the supplied signing input does not bind the already-fixed request
+/// ID.
 pub(crate) fn build_request(
     input: &ProviderAuctionInput,
     routed: &RoutedAuction,
@@ -257,56 +252,22 @@ pub(crate) fn build_request(
     effective_timeout_ms: u32,
     finalization: &RequestFinalization<'_>,
 ) -> Result<OpenRtbBuildOutcome, Report<TrustedServerError>> {
-    let policy = ProfilePolicy::from(&provider.profile);
-    let mut request = build_common_request(input, routed, policy, effective_timeout_ms);
+    let demand = provider.demand.as_ref();
+    let policy = demand.field_policy();
+    let mut request = build_common_request(input, routed, demand, policy, effective_timeout_ms);
     if request.imp.is_empty() {
         return Ok(OpenRtbBuildOutcome::NoImpressions);
     }
-    policy.augment_request(&mut request, input, routed)?;
+    demand.augment_request(&mut request, input)?;
     finalize_request(&mut request, policy, finalization)?;
     Ok(OpenRtbBuildOutcome::Ready(request))
-}
-
-#[derive(Clone, Copy)]
-enum ProfilePolicy<'a> {
-    Standard(&'a StandardProfilePlan),
-    Prebid(&'a PrebidProfilePlan),
-    Aps(&'a ApsProfilePlan),
-}
-
-impl<'a> From<&'a CompiledOpenRtbProfile> for ProfilePolicy<'a> {
-    fn from(profile: &'a CompiledOpenRtbProfile) -> Self {
-        match profile {
-            CompiledOpenRtbProfile::Standard(plan) => Self::Standard(plan),
-            CompiledOpenRtbProfile::PrebidServer(plan) => Self::Prebid(plan),
-            CompiledOpenRtbProfile::Aps(plan) => Self::Aps(plan),
-        }
-    }
-}
-
-impl ProfilePolicy<'_> {
-    fn augment_request(
-        self,
-        request: &mut OpenRtbRequest,
-        input: &ProviderAuctionInput,
-        routed: &RoutedAuction,
-    ) -> Result<(), Report<TrustedServerError>> {
-        match self {
-            Self::Standard(plan) => apply_standard(request, plan),
-            Self::Prebid(plan) => apply_prebid(request, input, routed, plan),
-            Self::Aps(plan) => apply_aps(request, plan),
-        }
-    }
-
-    fn keeps_pbs_identity_when_unsigned(self) -> bool {
-        matches!(self, Self::Prebid(_))
-    }
 }
 
 fn build_common_request(
     input: &ProviderAuctionInput,
     routed: &RoutedAuction,
-    policy: ProfilePolicy<'_>,
+    demand: &dyn CompiledDemand,
+    policy: DemandFieldPolicy,
     effective_timeout_ms: u32,
 ) -> OpenRtbRequest {
     let common = input.common_request();
@@ -315,40 +276,17 @@ fn build_common_request(
         .iter()
         .filter_map(|slot| build_imp(slot, policy))
         .collect();
-    let site_domain = match policy {
-        ProfilePolicy::Aps(plan) => plan
-            .inventory_domain
-            .clone()
-            .unwrap_or_else(|| common.publisher.domain.clone()),
-        _ => common.publisher.domain.clone(),
-    };
-    let page = match policy {
-        ProfilePolicy::Aps(plan) => {
-            aps_inventory_page(plan, common.publisher.page_url.as_deref(), &site_domain)
-        }
-        ProfilePolicy::Prebid(plan) => common.publisher.page_url.as_deref().map(|page| {
-            plan.debug_query_params.as_deref().map_or_else(
-                || page.to_string(),
-                |query| append_query_fragment(page, query),
-            )
-        }),
-        ProfilePolicy::Standard(_) => common.publisher.page_url.clone(),
-    };
-    let consent = common.user.consent.as_ref();
-    let body_consent = match policy {
-        ProfilePolicy::Prebid(plan) => consent.filter(|value| {
-            plan.consent_forwarding.includes_body_consent()
-                || !matches!(value.source, ConsentSource::Cookie)
-        }),
-        _ => consent,
-    };
+    let site_domain = demand.site_domain(&common.publisher.domain);
+    let page = demand.site_page(common.publisher.page_url.as_deref(), &site_domain);
+    let body_consent = demand.body_consent(common.user.consent.as_ref());
     let raw_tc = body_consent.and_then(|value| value.raw_tc_string.clone());
     let user = Some(User {
         id: common.user.id.clone(),
         consent: raw_tc.clone(),
         ext: UserExt {
             consent: raw_tc,
-            consented_providers_settings: matches!(policy, ProfilePolicy::Prebid(_))
+            consented_providers_settings: policy
+                .additional_consent
                 .then(|| {
                     body_consent
                         .and_then(|value| value.raw_ac_string.clone())
@@ -362,7 +300,7 @@ fn build_common_request(
         .to_ext(),
         ..Default::default()
     });
-    let language = normalized_language(routed.prebid_transport_headers(), policy);
+    let language = normalized_language(routed.transport_headers(), policy);
     let device = common
         .device
         .as_ref()
@@ -373,8 +311,8 @@ fn build_common_request(
                 country: Some(geo.country.clone()),
                 region: geo.region.clone(),
                 city: Some(geo.city.clone()),
-                lat: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.latitude),
-                lon: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.longitude),
+                lat: policy.precise_geo.then_some(geo.latitude),
+                lon: policy.precise_geo.then_some(geo.longitude),
                 metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
                 r#type: Some(2),
                 ..Default::default()
@@ -397,8 +335,9 @@ fn build_common_request(
         site: Some(Site {
             domain: Some(site_domain.clone()),
             page,
-            r#ref: matches!(policy, ProfilePolicy::Prebid(_))
-                .then(|| header_string(routed.prebid_transport_headers().referer()))
+            r#ref: policy
+                .site_ref
+                .then(|| header_string(routed.transport_headers().referer()))
                 .flatten(),
             publisher: Some(Publisher {
                 domain: Some(site_domain),
@@ -408,11 +347,8 @@ fn build_common_request(
         }),
         user,
         device,
-        regs: build_regs(body_consent, policy),
-        test: match policy {
-            ProfilePolicy::Prebid(plan) => plan.test_mode.then_some(true),
-            _ => None,
-        },
+        regs: build_regs(body_consent, policy.regs),
+        test: policy.test.then_some(true),
         tmax: to_openrtb_i32(
             effective_timeout_ms,
             "tmax",
@@ -423,7 +359,7 @@ fn build_common_request(
     }
 }
 
-fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp> {
+fn build_imp(slot: &ProviderSlotInput, policy: DemandFieldPolicy) -> Option<Imp> {
     let formats = slot
         .slot()
         .formats
@@ -439,17 +375,17 @@ fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp>
         .collect::<Vec<_>>();
     let first_width = formats.first()?.w;
     let first_height = formats.first()?.h;
-    let aps_banner = matches!(policy, ProfilePolicy::Aps(_));
+    let primary_size = policy.primary_banner_size;
     Some(Imp {
         id: Some(slot.slot().id.clone()),
         banner: Some(Banner {
             format: formats,
-            w: aps_banner.then_some(first_width).flatten(),
-            h: aps_banner.then_some(first_height).flatten(),
-            topframe: aps_banner.then_some(false),
+            w: primary_size.then_some(first_width).flatten(),
+            h: primary_size.then_some(first_height).flatten(),
+            topframe: primary_size.then_some(false),
             ..Default::default()
         }),
-        tagid: matches!(policy, ProfilePolicy::Prebid(_)).then(|| slot.slot().id.clone()),
+        tagid: policy.imp_tagid.then(|| slot.slot().id.clone()),
         bidfloor: slot.slot().floor_price,
         bidfloorcur: slot
             .slot()
@@ -460,89 +396,9 @@ fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp>
     })
 }
 
-fn apply_standard(
-    request: &mut OpenRtbRequest,
-    plan: &StandardProfilePlan,
-) -> Result<(), Report<TrustedServerError>> {
-    request.ext = nonempty_map(plan.request_ext.as_object().clone());
-    for imp in &mut request.imp {
-        imp.ext = nonempty_map(plan.imp_ext.as_object().clone());
-    }
-    Ok(())
-}
-
-fn apply_prebid(
-    request: &mut OpenRtbRequest,
-    input: &ProviderAuctionInput,
-    _routed: &RoutedAuction,
-    plan: &PrebidProfilePlan,
-) -> Result<(), Report<TrustedServerError>> {
-    debug_assert_eq!(
-        request.imp.len(),
-        input.slots().len(),
-        "should keep one impression per routed slot"
-    );
-    for (imp, slot) in request.imp.iter_mut().zip(input.slots()) {
-        let bidder = slot
-            .bidder_params()
-            .iter()
-            .filter_map(|(bidder, params)| {
-                let mut params = params.clone();
-                plan.override_engine
-                    .apply_routed(bidder.as_str(), slot.prebid_zone(), &mut params);
-                params
-                    .as_object()
-                    .is_some_and(|params| !params.is_empty())
-                    .then(|| (bidder.as_str().to_string(), params))
-            })
-            .collect::<Map<_, _>>();
-        let mut prebid = Map::new();
-        if !bidder.is_empty() {
-            prebid.insert("bidder".to_string(), Value::Object(bidder));
-        } else if slot.has_trusted_stored_request() || !slot.bidder_params().is_empty() {
-            prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
-        }
-        debug_assert!(
-            !prebid.is_empty(),
-            "should never route a demandless slot to prebid-server"
-        );
-        imp.ext = Some(Map::from_iter([(
-            "prebid".to_string(),
-            Value::Object(prebid),
-        )]));
-    }
-    let mut prebid_request = Map::new();
-    if plan.debug {
-        prebid_request.insert("debug".to_string(), Value::Bool(true));
-        prebid_request.insert("returnallbidstatus".to_string(), Value::Bool(true));
-    }
-    request.ext = Some(Map::from_iter([(
-        "prebid".to_string(),
-        Value::Object(prebid_request),
-    )]));
-    Ok(())
-}
-
-fn apply_aps(
-    request: &mut OpenRtbRequest,
-    plan: &ApsProfilePlan,
-) -> Result<(), Report<TrustedServerError>> {
-    request.ext = Some(Map::from_iter([
-        (
-            "account".to_string(),
-            Value::String(plan.account_id.clone()),
-        ),
-        (
-            "sdk".to_string(),
-            json!({"source": APS_SDK_SOURCE, "version": APS_SDK_VERSION}),
-        ),
-    ]));
-    Ok(())
-}
-
 fn finalize_request(
     request: &mut OpenRtbRequest,
-    policy: ProfilePolicy<'_>,
+    policy: DemandFieldPolicy,
     finalization: &RequestFinalization<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
     let request_id = request.id.as_deref().ok_or_else(|| {
@@ -565,7 +421,7 @@ fn finalize_request(
             request_scheme: Some(finalization.signing_params.request_scheme.clone()),
             ts: Some(finalization.signing_params.timestamp),
         })
-    } else if policy.keeps_pbs_identity_when_unsigned() {
+    } else if policy.unsigned_request_identity {
         Some(TrustedServerExt {
             version: None,
             signature: None,
@@ -591,12 +447,12 @@ fn finalize_request(
 
 fn build_regs(
     consent: Option<&crate::consent::ConsentContext>,
-    policy: ProfilePolicy<'_>,
+    policy: RegsPolicy,
 ) -> Option<Regs> {
     let consent = consent?;
-    if matches!(policy, ProfilePolicy::Aps(_)) {
-        // Preserve APS exactly: any admitted context produces regs and GDPR is
-        // derived only from the applicability bit, without jurisdiction rules.
+    if policy == RegsPolicy::ApplicabilityBit {
+        // Any admitted context produces regs and GDPR comes from the
+        // applicability bit alone, without jurisdiction rules.
         let ext = RegsExt {
             gdpr: Some(u8::from(consent.gdpr_applies)),
             us_privacy: consent.raw_us_privacy.clone(),
@@ -617,8 +473,8 @@ fn build_regs(
         });
     }
 
-    // Standard deliberately shares PBS's conservative consent baseline. Keep
-    // the legacy PBS empty-context and jurisdiction behavior byte-for-byte.
+    // The jurisdiction policy sends no regs for an empty context and reads
+    // GDPR from the applicability bit or from a GDPR jurisdiction.
     let has_data = consent.gdpr_applies
         || consent.raw_us_privacy.is_some()
         || consent.raw_gpp_string.is_some()
@@ -663,8 +519,8 @@ fn build_regs(
 }
 
 fn normalized_language(
-    headers: &PrebidTransportHeaders,
-    policy: ProfilePolicy<'_>,
+    headers: &TransportHeaders,
+    policy: DemandFieldPolicy,
 ) -> Option<String> {
     let value = header_string(headers.accept_language())
         .and_then(|value| value.split(',').next().map(str::to_string))
@@ -672,11 +528,9 @@ fn normalized_language(
         .and_then(|value| value.split('-').next().map(str::to_string))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())?;
-    match policy {
-        ProfilePolicy::Prebid(_) => Some(value),
-        ProfilePolicy::Aps(_) | ProfilePolicy::Standard(_) => {
-            (value.len() <= MAX_CONSERVATIVE_LANGUAGE_BYTES).then_some(value)
-        }
+    match policy.language_max_bytes {
+        None => Some(value),
+        Some(max_bytes) => (value.len() <= max_bytes).then_some(value),
     }
 }
 
@@ -684,52 +538,6 @@ fn header_string(value: Option<&http::HeaderValue>) -> Option<String> {
     value
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
-}
-
-fn aps_inventory_page(
-    plan: &ApsProfilePlan,
-    publisher_page: Option<&str>,
-    domain: &str,
-) -> Option<String> {
-    let fallback = publisher_page
-        .and_then(valid_aps_page_url)
-        .unwrap_or_else(|| format!("https://{domain}"));
-    let Some(origin) = plan.inventory_page_origin.as_deref() else {
-        return Some(fallback);
-    };
-    let (Ok(mut canonical), Ok(current)) = (Url::parse(origin), Url::parse(&fallback)) else {
-        return Some(fallback);
-    };
-    canonical.set_path(current.path());
-    canonical.set_query(current.query());
-    canonical.set_fragment(None);
-    Some(canonical.to_string())
-}
-
-fn append_query_fragment(url: &str, query: &str) -> String {
-    if query.is_empty() || url.contains(query) {
-        return url.to_string();
-    }
-    let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}{query}")
-}
-
-fn valid_aps_page_url(value: &str) -> Option<String> {
-    const MAX_APS_PAGE_URL_BYTES: usize = 8192;
-
-    if value.len() > MAX_APS_PAGE_URL_BYTES {
-        return None;
-    }
-    let parsed = Url::parse(value).ok()?;
-    (matches!(parsed.scheme(), "http" | "https")
-        && parsed.host_str().is_some()
-        && parsed.username().is_empty()
-        && parsed.password().is_none())
-    .then(|| parsed.to_string())
-}
-
-fn nonempty_map(value: Map<String, Value>) -> Option<Map<String, Value>> {
-    (!value.is_empty()).then_some(value)
 }
 
 /// Suppress notification URLs using exact returned-seat identity.
@@ -875,19 +683,19 @@ fn extract_standard_bid(
     })
 }
 
-/// Count bidder parameter objects a profile did not consume.
+/// Count bidder parameter objects a demand source did not consume.
 #[must_use]
 pub(crate) fn unused_bidder_params_count(
-    profile: &CompiledOpenRtbProfile,
+    demand: &dyn CompiledDemand,
     input: &ProviderAuctionInput,
 ) -> u32 {
-    if profile.is_prebid_server() {
+    if demand.field_policy().consumes_bidder_params {
         return 0;
     }
     ignored_bidder_params_count(input)
 }
 
-/// Count routed bidder params for a profile known to ignore them.
+/// Count routed bidder params for a demand source known to ignore them.
 #[must_use]
 pub(crate) fn ignored_bidder_params_count(input: &ProviderAuctionInput) -> u32 {
     saturating_bidder_param_counts(input.slots().iter().map(|slot| slot.bidder_params().len()))
@@ -904,15 +712,12 @@ mod routing_metadata_tests {
     use std::collections::BTreeMap;
     use std::str::FromStr as _;
 
-    use serde_json::json;
-
     use super::{saturating_bidder_param_counts, unused_bidder_params_count};
-    use crate::auction::plan::{
-        AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationConfig,
-        ProviderConfig, ProviderId, RoutingMode,
-    };
+    use crate::auction::plan::{AuctionPlan, BidderId, BidderRouteConfig, ProviderId};
     use crate::auction::routing::route_auction;
-    use crate::auction::test_support::canonical_parity_auction_request;
+    use crate::auction::test_support::{
+        canonical_parity_auction_request, demand_table, plan_config,
+    };
 
     #[test]
     fn unused_bidder_param_count_saturates_across_slots_and_large_values() {
@@ -925,49 +730,33 @@ mod routing_metadata_tests {
     }
 
     #[test]
-    fn unused_bidder_param_count_is_profile_aware() {
-        for (profile, profile_config, expected) in [
-            ("prebid-server", json!({}), 0),
-            ("standard", json!({}), 1),
-            ("aps", json!({"account_id":"example-account"}), 1),
-        ] {
+    fn unused_bidder_param_count_follows_the_implementation() {
+        for (implementation, expected) in [("prebid_server", 0), ("openrtb", 1), ("aps", 1)] {
+            let endpoint = if implementation == "aps" {
+                "https://aps.example/e/pb/bid"
+            } else {
+                "https://provider.example/openrtb"
+            };
             let provider_id =
-                ProviderId::from_str("fictional-provider").expect("should parse provider ID");
-            let plan = AuctionPlan::compile(AuctionPlanConfig {
-                timeout_ms: 1_000,
-                providers: BTreeMap::from([(
-                    provider_id.clone(),
-                    ProviderConfig {
-                        protocol: "openrtb-2.6".to_string(),
-                        profile: profile.to_string(),
-                        endpoint: if profile == "aps" {
-                            "https://aps.example/e/pb/bid".to_string()
-                        } else {
-                            "https://provider.example/openrtb".to_string()
-                        },
-                        timeout_ms: None,
-                        routing: RoutingMode::Explicit,
-                        notifications: NotificationConfig::default(),
-                        profile_config,
-                    },
-                )]),
-                bidders: BTreeMap::from([(
-                    BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
-                    BidderRouteConfig {
-                        provider: provider_id,
-                    },
-                )]),
-                mediator: None,
-                request_signing: None,
-            })
-            .expect("should compile profile plan");
+                ProviderId::from_str("fictional_provider").expect("should parse provider ID");
+            let mut config = plan_config(vec![(
+                "fictional_provider",
+                demand_table(implementation, endpoint),
+            )]);
+            config.bidders = BTreeMap::from([(
+                BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
+                BidderRouteConfig {
+                    provider: provider_id,
+                },
+            )]);
+            let plan = AuctionPlan::compile(config).expect("should compile the plan");
             let inbound = http::Request::new(edgezero_core::body::Body::empty());
             let routed = route_auction(canonical_parity_auction_request(), &inbound, &plan, None);
 
             assert_eq!(
-                unused_bidder_params_count(&plan.providers()[0].profile, &routed.inputs()[0]),
+                unused_bidder_params_count(plan.providers()[0].demand.as_ref(), &routed.inputs()[0]),
                 expected,
-                "{profile} should report only bidder params it ignores"
+                "{implementation} should report only bidder params it ignores"
             );
         }
     }

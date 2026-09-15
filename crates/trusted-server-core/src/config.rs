@@ -15,11 +15,10 @@ use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
-use crate::integrations::adserver_mock::AdServerMockConfig;
-use crate::integrations::aps::ApsConfig;
+
 use crate::integrations::datadome::DataDomeConfig;
 use crate::integrations::{IntegrationBuilder, prebid};
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::settings::{AssetOriginAuth, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 
@@ -299,8 +298,6 @@ fn validate_enabled_integrations(
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
     validate_prebid(settings, plan)?;
-    validate_integration::<ApsConfig>(settings, "aps")?;
-    validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
     for builder in crate::integrations::all_builders(extra_integrations) {
         builder.validate(settings)?;
     }
@@ -317,18 +314,6 @@ fn validate_prebid(
     };
     prebid::validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
     prebid::validate_browser_bidder_ownership(&config, plan)
-}
-
-fn validate_integration<T>(
-    settings: &Settings,
-    integration_id: &str,
-) -> Result<bool, Report<TrustedServerError>>
-where
-    T: IntegrationConfig,
-{
-    settings
-        .integration_config::<T>(integration_id)
-        .map(|config| config.is_some())
 }
 
 fn validate_non_secret_deploy_placeholders(
@@ -504,7 +489,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID;
     use crate::integrations::{
         IntegrationRegistration, lockr::LockrConfig, permutive::PermutiveConfig,
@@ -588,17 +572,18 @@ formats = [{ width = 300, height = 250 }]
     }
 
     fn insert_aps_provider(settings: &mut Settings, account_id: &str) {
-        settings.auction.providers.insert(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example.com/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: RoutingMode::AllEligible,
-                notifications: NotificationConfig::default(),
-                profile_config: serde_json::json!({ "account_id": account_id }),
-            },
+        let table = serde_json::Map::from_iter([
+            ("implementation".to_string(), serde_json::json!("aps")),
+            (
+                "endpoint".to_string(),
+                serde_json::json!("https://aps.example.com/e/pb/bid"),
+            ),
+            ("routing".to_string(), serde_json::json!("all_eligible")),
+            ("account_id".to_string(), serde_json::json!(account_id)),
+        ]);
+        settings.demand = crate::provider_table::ProviderList::new(
+            vec!["aps_main".to_string()],
+            std::collections::BTreeMap::from([("aps_main".to_string(), table)]),
         );
     }
 
@@ -665,9 +650,9 @@ formats = [{ width = 300, height = 250 }]
         let base = template_with_resolved_required_secrets();
 
         for (header, id) in [
-            ("[integrations.permutive]", "permutive"),
-            ("[integrations.lockr]", "lockr"),
-            ("[integrations.sourcepoint]", "sourcepoint"),
+            ("[integration.permutive]", "permutive"),
+            ("[integration.lockr]", "lockr"),
+            ("[integration.sourcepoint]", "sourcepoint"),
         ] {
             let toml = uncomment_block(&base, header);
             let settings = Settings::from_toml(&toml)
@@ -967,8 +952,8 @@ formats = [{ width = 300, height = 250 }]
             "should identify the removed field: {rendered}"
         );
         assert!(
-            rendered.contains("CHANGELOG.md"),
-            "should direct operators to migration guidance: {rendered}"
+            rendered.contains("[demand] provider"),
+            "should name where the setting moved to: {rendered}"
         );
     }
 
@@ -1252,29 +1237,35 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
-    fn deploy_validation_rejects_retired_aps_fields_when_explicitly_disabled() {
+    fn deploy_validation_rejects_an_aps_demand_setting_it_does_not_know() {
         let mut settings = valid_settings();
-        settings
-            .integrations
-            .insert_config(
-                "aps",
-                &serde_json::json!({
-                    "enabled": false,
-                    "endpoint": "https://aps.example.com/e/pb/bid"
-                }),
-            )
-            .expect("should insert disabled APS config with a retired field");
+        let table = serde_json::Map::from_iter([
+            ("implementation".to_string(), serde_json::json!("aps")),
+            (
+                "endpoint".to_string(),
+                serde_json::json!("https://aps.example.com/e/pb/bid"),
+            ),
+            (
+                "account_id".to_string(),
+                serde_json::json!("example-account"),
+            ),
+            ("enabled".to_string(), serde_json::json!(false)),
+        ]);
+        settings.demand = crate::provider_table::ProviderList::new(
+            vec!["aps_main".to_string()],
+            std::collections::BTreeMap::from([("aps_main".to_string(), table)]),
+        );
 
         let error = validate_settings_for_deploy(&settings)
-            .expect_err("should reject retired APS server fields when explicitly disabled");
+            .expect_err("should reject a setting the APS implementation does not know");
         let rendered = format!("{error:?}");
         assert!(
-            rendered.contains("Integration 'aps' configuration could not be parsed"),
-            "should identify the APS configuration: {rendered}"
+            rendered.contains("aps_main"),
+            "should identify the demand source: {rendered}"
         );
         assert!(
-            rendered.contains("endpoint"),
-            "should identify the retired APS field: {rendered}"
+            rendered.contains("enabled"),
+            "should identify the setting it does not know: {rendered}"
         );
     }
 
@@ -1337,6 +1328,7 @@ password = "production-admin-password-32-bytes"
     fn deploy_validation_reaches_every_built_in_builder() {
         for id in crate::integrations::builders()
             .iter()
+            .filter(|builder| builder.supplies_integration())
             .map(IntegrationBuilder::id)
         {
             let mut settings = valid_settings();
@@ -1361,7 +1353,7 @@ password = "production-admin-password-32-bytes"
     /// it.
     #[test]
     fn validation_reaches_every_plan_backed_integration() {
-        for id in ["prebid", "aps", "adserver_mock"] {
+        for id in ["prebid"] {
             let mut settings = valid_settings();
             settings
                 .integrations
@@ -1490,15 +1482,16 @@ password = "production-admin-password-32-bytes"
     fn validate_trait_reports_deploy_errors() {
         let mut settings = valid_settings();
         settings.auction.enabled = true;
-        settings.auction.providers =
-            crate::auction::AuctionConfig::legacy_provider_map(&["missing-provider"]);
-        settings
-            .auction
-            .providers
-            .values_mut()
-            .next()
-            .expect("should have provider")
-            .protocol = "unsupported".to_string();
+        settings.demand = crate::provider_table::ProviderList::new(
+            vec!["missing_provider".to_string()],
+            std::collections::BTreeMap::from([(
+                "missing_provider".to_string(),
+                serde_json::Map::from_iter([(
+                    "implementation".to_string(),
+                    serde_json::json!("no_such_implementation"),
+                )]),
+            )]),
+        );
         let app_config = TrustedServerAppConfig { settings };
 
         let err = app_config
@@ -1506,8 +1499,8 @@ password = "production-admin-password-32-bytes"
             .expect_err("should reject invalid auction provider");
 
         assert!(
-            err.to_string().contains("missing-provider"),
-            "validation error should mention invalid provider"
+            err.to_string().contains("no_such_implementation"),
+            "validation error should name the implementation this build does not have"
         );
     }
 }

@@ -28,10 +28,10 @@ use crate::auction::openrtb::{
 };
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::plan::AuctionPlan;
-use crate::auction::profile::PrebidProfilePlan;
+use crate::integrations::prebid_server::PrebidServerDemand;
 #[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::routing::{PrebidTransportHeaders, ProviderAuctionInput};
+use crate::auction::routing::{TransportHeaders, ProviderAuctionInput};
 #[cfg(test)]
 use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
@@ -1847,7 +1847,7 @@ fn copy_request_headers(
 
 /// Apply the common raw-header transport policy for a planned PBS request.
 pub(crate) fn apply_prebid_transport_headers(
-    from: &PrebidTransportHeaders,
+    from: &TransportHeaders,
     to: &mut http::Request<EdgeBody>,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
@@ -1937,7 +1937,7 @@ fn append_query_params(url: &str, params: &str) -> String {
 /// semantics while allowing each planned provider to retain its own identity.
 pub(crate) async fn parse_planned_prebid_response(
     provider_id: &str,
-    profile: &PrebidProfilePlan,
+    demand: &PrebidServerDemand,
     input: &ProviderAuctionInput,
     response: PlatformResponse,
     response_time_ms: u64,
@@ -1971,7 +1971,7 @@ pub(crate) async fn parse_planned_prebid_response(
                 None
             }
         };
-        if profile.debug
+        if demand.debug
             && let Some(body_bytes) = body_bytes.as_deref()
         {
             match prebid_body_preview(body_bytes) {
@@ -2000,7 +2000,7 @@ pub(crate) async fn parse_planned_prebid_response(
                 "message",
                 serde_json::json!(format!("Prebid Server returned HTTP {status_code}")),
             );
-        if profile.debug
+        if demand.debug
             && let Some(message) = body_bytes
                 .as_deref()
                 .and_then(|body| extract_prebid_error_message(body, content_type.as_deref()))
@@ -2022,7 +2022,7 @@ pub(crate) async fn parse_planned_prebid_response(
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
             message: "Failed to parse Prebid response".to_string(),
         })?;
-    if profile.debug && log::log_enabled!(log::Level::Trace) {
+    if demand.debug && log::log_enabled!(log::Level::Trace) {
         match serde_json::to_string_pretty(&response_json) {
             Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
             Err(error) => log::warn!("Prebid: failed to serialize response for logging: {error}"),
@@ -2031,7 +2031,7 @@ pub(crate) async fn parse_planned_prebid_response(
 
     let mut parsed =
         parse_planned_prebid_openrtb(provider_id, input, &response_json, response_time_ms);
-    enrich_planned_prebid_metadata(profile, &response_json, &mut parsed);
+    enrich_planned_prebid_metadata(demand, &response_json, &mut parsed);
     log::info!(
         "Prebid provider {provider_id} returned {} bids in {}ms",
         parsed.bids.len(),
@@ -2109,7 +2109,7 @@ fn parse_planned_prebid_openrtb(
 }
 
 fn enrich_planned_prebid_metadata(
-    profile: &PrebidProfilePlan,
+    demand: &PrebidServerDemand,
     response_json: &Json,
     parsed: &mut AuctionResponse,
 ) {
@@ -2119,7 +2119,7 @@ fn enrich_planned_prebid_metadata(
             parsed.metadata.insert(key.to_string(), value.clone());
         }
     }
-    if profile.debug {
+    if demand.debug {
         if let Some(value) = ext.and_then(|ext| ext.get("debug")) {
             parsed.metadata.insert("debug".to_string(), value.clone());
         }
@@ -3392,10 +3392,7 @@ mod tests {
     use super::*;
     use crate::auction::formats::convert_to_openrtb_response;
     use crate::auction::orchestrator::OrchestrationResult;
-    use crate::auction::plan::{
-        AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationConfig, ProviderConfig,
-        ProviderId, RoutingMode,
-    };
+    use crate::auction::plan::{BidderId, BidderRouteConfig, ProviderId};
     use crate::auction::test_support::{
         canonical_parity_auction_request,
         create_test_auction_context as shared_test_auction_context,
@@ -4827,53 +4824,40 @@ external_bundle_sri = "sha384-AAAA"
         browser_config.account_id = Some("browser-account".to_string());
         browser_config.timeout_ms = 1750;
         browser_config.debug = false;
-        let plan = AuctionPlan::compile(AuctionPlanConfig {
-            timeout_ms: 2500,
-            providers: BTreeMap::from([
-                (
-                    ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
-                    ProviderConfig {
-                        protocol: "openrtb-2.6".to_string(),
-                        profile: "prebid-server".to_string(),
-                        endpoint: "https://primary.example.test/openrtb".to_string(),
-                        timeout_ms: Some(3000),
-                        routing: RoutingMode::Explicit,
-                        notifications: NotificationConfig::default(),
-                        profile_config: json!({"debug": true}),
-                    },
-                ),
-                (
-                    ProviderId::from_str("pbs-secondary").expect("should parse provider ID"),
-                    ProviderConfig {
-                        protocol: "openrtb-2.6".to_string(),
-                        profile: "prebid-server".to_string(),
-                        endpoint: "https://secondary.example.test/openrtb".to_string(),
-                        timeout_ms: Some(4000),
-                        routing: RoutingMode::Explicit,
-                        notifications: NotificationConfig::default(),
-                        profile_config: json!({"debug": true}),
-                    },
-                ),
-            ]),
-            bidders: BTreeMap::from([
-                (
-                    BidderId::from_str("secondaryRoute").expect("should parse bidder ID"),
-                    BidderRouteConfig {
-                        provider: ProviderId::from_str("pbs-secondary")
-                            .expect("should parse provider ID"),
-                    },
-                ),
-                (
-                    BidderId::from_str("primaryRoute").expect("should parse bidder ID"),
-                    BidderRouteConfig {
-                        provider: ProviderId::from_str("pbs-primary")
-                            .expect("should parse provider ID"),
-                    },
-                ),
-            ]),
-            mediator: None,
-            request_signing: None,
-        })
+        let mut primary = crate::auction::test_support::demand_table(
+            "prebid_server",
+            "https://primary.example.test/openrtb",
+        );
+        primary.insert("timeout_ms".to_string(), json!(3000));
+        primary.insert("debug".to_string(), json!(true));
+        let mut secondary = crate::auction::test_support::demand_table(
+            "prebid_server",
+            "https://secondary.example.test/openrtb",
+        );
+        secondary.insert("timeout_ms".to_string(), json!(4000));
+        secondary.insert("debug".to_string(), json!(true));
+        let mut config = crate::auction::test_support::plan_config(vec![
+            ("pbs_primary", primary),
+            ("pbs_secondary", secondary),
+        ]);
+        config.timeout_ms = 2500;
+        config.bidders = BTreeMap::from([
+            (
+                BidderId::from_str("secondaryRoute").expect("should parse bidder ID"),
+                BidderRouteConfig {
+                    provider: ProviderId::from_str("pbs_secondary")
+                        .expect("should parse provider ID"),
+                },
+            ),
+            (
+                BidderId::from_str("primaryRoute").expect("should parse bidder ID"),
+                BidderRouteConfig {
+                    provider: ProviderId::from_str("pbs_primary")
+                        .expect("should parse provider ID"),
+                },
+            ),
+        ]);
+        let plan = AuctionPlan::compile(config)
         .expect("should compile plan while browser integration is not part of compilation");
 
         let inserts = integration.head_inserts_for_plan(&browser_config, &plan);
@@ -4884,8 +4868,8 @@ external_bundle_sri = "sha384-AAAA"
             script.contains(r#""serverSideBidders":["primaryRoute","secondaryRoute"]"#),
             "should inject deterministic browser route codes: {script}"
         );
-        assert!(!script.contains("pbs-primary"));
-        assert!(!script.contains("pbs-secondary"));
+        assert!(!script.contains("pbs_primary"));
+        assert!(!script.contains("pbs_secondary"));
         assert!(!script.contains("3000"));
         assert!(!script.contains("4000"));
 
@@ -6644,7 +6628,7 @@ external_bundle_sri = "sha384-AAAA"
             .expect("should classify upstream HTTP error");
         let result = OrchestrationResult {
             provider_responses: vec![provider_response],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 42,
             metadata: HashMap::new(),
@@ -8255,8 +8239,8 @@ set = { networkId = 42 }
         );
     }
 
-    fn planned_prebid_profile(debug: bool) -> PrebidProfilePlan {
-        PrebidProfilePlan {
+    fn planned_prebid_demand(debug: bool) -> PrebidServerDemand {
+        PrebidServerDemand {
             debug,
             test_mode: false,
             debug_query_params: None,
@@ -8269,32 +8253,23 @@ set = { networkId = 42 }
         slot_ids: &[&str],
         formats: &[AdFormat],
     ) -> ProviderAuctionInput {
-        let provider_id = ProviderId::from_str("pbs-instance").expect("should parse provider ID");
+        let provider_id = ProviderId::from_str("pbs_instance").expect("should parse provider ID");
         let bidder_id = BidderId::from_str("exampleBidder").expect("should parse bidder ID");
-        let plan = crate::auction::plan::AuctionPlan::compile(AuctionPlanConfig {
-            timeout_ms: 1_000,
-            providers: BTreeMap::from([(
-                provider_id.clone(),
-                ProviderConfig {
-                    protocol: "openrtb-2.6".to_string(),
-                    profile: "prebid-server".to_string(),
-                    endpoint: "https://pbs.example/openrtb2/auction".to_string(),
-                    timeout_ms: None,
-                    routing: RoutingMode::Explicit,
-                    notifications: NotificationConfig::default(),
-                    profile_config: json!({}),
-                },
-            )]),
-            bidders: BTreeMap::from([(
-                bidder_id,
-                BidderRouteConfig {
-                    provider: provider_id,
-                },
-            )]),
-            mediator: None,
-            request_signing: None,
-        })
-        .expect("should compile planned PBS test plan");
+        let mut config = crate::auction::test_support::plan_config(vec![(
+            "pbs_instance",
+            crate::auction::test_support::demand_table(
+                "prebid_server",
+                "https://pbs.example/openrtb2/auction",
+            ),
+        )]);
+        config.bidders = BTreeMap::from([(
+            bidder_id,
+            BidderRouteConfig {
+                provider: provider_id,
+            },
+        )]);
+        let plan = crate::auction::plan::AuctionPlan::compile(config)
+            .expect("should compile planned PBS test plan");
         let inbound = http::Request::new(EdgeBody::empty());
         let request = make_auction_request(
             slot_ids
@@ -8332,9 +8307,9 @@ set = { networkId = 42 }
 
     #[test]
     fn planned_parser_preserves_non_success_debug_and_204_json_parity() {
-        let profile = planned_prebid_profile(true);
+        let profile = planned_prebid_demand(true);
         let error = futures::executor::block_on(parse_planned_prebid_response(
-            "pbs-instance",
+            "pbs_instance",
             &profile,
             &planned_prebid_input(&["fictional-slot"]),
             prebid_platform_response(
@@ -8346,7 +8321,7 @@ set = { networkId = 42 }
             "auction-1",
         ))
         .expect("should classify non-success response");
-        assert_eq!(error.provider, "pbs-instance");
+        assert_eq!(error.provider, "pbs_instance");
         assert_eq!(error.status, crate::auction::types::BidStatus::Error);
         assert_eq!(error.metadata["error_type"], ERROR_TYPE_HTTP_STATUS);
         assert_eq!(error.metadata["http_status"], 502);
@@ -8354,7 +8329,7 @@ set = { networkId = 42 }
         assert_eq!(error.metadata["upstream_message_truncated"], false);
 
         let no_content = futures::executor::block_on(parse_planned_prebid_response(
-            "pbs-instance",
+            "pbs_instance",
             &profile,
             &planned_prebid_input(&["fictional-slot"]),
             prebid_platform_response(StatusCode::NO_CONTENT, None, Vec::new()),
@@ -8369,7 +8344,7 @@ set = { networkId = 42 }
 
     #[test]
     fn planned_parser_validates_top_level_currency_and_preserves_debug_metadata() {
-        let profile = planned_prebid_profile(true);
+        let profile = planned_prebid_demand(true);
         let input = planned_prebid_input(&["fictional-slot"]);
         let cases = [
             (
@@ -8434,7 +8409,7 @@ set = { networkId = 42 }
                     .insert("cur".to_string(), currency);
             }
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
-                "pbs-instance",
+                "pbs_instance",
                 &profile,
                 &input,
                 prebid_platform_response(
@@ -8485,9 +8460,9 @@ set = { networkId = 42 }
 
     #[test]
     fn planned_parser_preserves_seat_identity_and_suppression() {
-        let profile = planned_prebid_profile(false);
+        let profile = planned_prebid_demand(false);
         let mut parsed = futures::executor::block_on(parse_planned_prebid_response(
-            "pbs-instance",
+            "pbs_instance",
             &profile,
             &planned_prebid_input(&["literal", "missing", "non-string"]),
             prebid_platform_response(
@@ -8530,10 +8505,10 @@ set = { networkId = 42 }
 
     #[test]
     fn planned_parser_rejects_unrequested_mismatched_and_negative_bids() {
-        let profile = planned_prebid_profile(false);
+        let profile = planned_prebid_demand(false);
         let input = planned_prebid_input(&["requested"]);
         let parsed = futures::executor::block_on(parse_planned_prebid_response(
-            "pbs-instance",
+            "pbs_instance",
             &profile,
             &input,
             prebid_platform_response(
@@ -8576,10 +8551,10 @@ set = { networkId = 42 }
 
     #[test]
     fn planned_parser_infers_only_unambiguous_missing_dimensions() {
-        let profile = planned_prebid_profile(false);
+        let profile = planned_prebid_demand(false);
         let input = planned_prebid_input(&["requested"]);
         let inferred = futures::executor::block_on(parse_planned_prebid_response(
-            "pbs-instance",
+            "pbs_instance",
             &profile,
             &input,
             prebid_platform_response(
@@ -8619,7 +8594,7 @@ set = { networkId = 42 }
         ];
         let input = planned_prebid_input_with_formats(&["requested"], &formats);
         let ambiguous = futures::executor::block_on(parse_planned_prebid_response(
-            "pbs-instance",
+            "pbs_instance",
             &profile,
             &input,
             prebid_platform_response(
@@ -8649,7 +8624,7 @@ set = { networkId = 42 }
 
     #[test]
     fn planned_parser_matches_legacy_error_content_type_and_debug_metadata() {
-        let debug_profile = planned_prebid_profile(true);
+        let debug_profile = planned_prebid_demand(true);
         for (content_type, body, expected_message) in [
             (
                 Some("application/json"),
@@ -8673,7 +8648,7 @@ set = { networkId = 42 }
             ),
         ] {
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
-                "pbs-instance",
+                "pbs_instance",
                 &debug_profile,
                 &planned_prebid_input(&["fictional-slot"]),
                 prebid_platform_response(StatusCode::BAD_REQUEST, content_type, body.to_vec()),
@@ -8691,9 +8666,9 @@ set = { networkId = 42 }
             );
         }
 
-        let no_debug = planned_prebid_profile(false);
+        let no_debug = planned_prebid_demand(false);
         let parsed = futures::executor::block_on(parse_planned_prebid_response(
-            "pbs-instance",
+            "pbs_instance",
             &no_debug,
             &planned_prebid_input(&["fictional-slot"]),
             prebid_platform_response(
@@ -8714,7 +8689,7 @@ set = { networkId = 42 }
 
     #[test]
     fn planned_parser_bounds_oversized_success_and_error_bodies() {
-        let profile = planned_prebid_profile(true);
+        let profile = planned_prebid_demand(true);
         for response in [
             prebid_platform_response(
                 StatusCode::OK,
@@ -8732,7 +8707,7 @@ set = { networkId = 42 }
         ] {
             assert!(
                 futures::executor::block_on(parse_planned_prebid_response(
-                    "pbs-instance",
+                    "pbs_instance",
                     &profile,
                     &planned_prebid_input(&["fictional-slot"]),
                     response,
@@ -8761,7 +8736,7 @@ set = { networkId = 42 }
         ] {
             let expected_status = response.response.status().as_u16();
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
-                "pbs-instance",
+                "pbs_instance",
                 &profile,
                 &planned_prebid_input(&["fictional-slot"]),
                 response,
@@ -9077,10 +9052,7 @@ set = { networkId = 42 }
         let plan =
             crate::auction::plan::AuctionPlan::compile(crate::auction::plan::AuctionPlanConfig {
                 timeout_ms: 321,
-                providers: std::collections::BTreeMap::new(),
-                bidders: std::collections::BTreeMap::new(),
-                mediator: None,
-                request_signing: None,
+                ..crate::auction::plan::AuctionPlanConfig::default()
             })
             .expect("should compile empty plan");
         let routed = crate::auction::routing::route_auction(
@@ -9095,7 +9067,7 @@ set = { networkId = 42 }
             .expect("should build outbound request");
 
         apply_prebid_transport_headers(
-            routed.prebid_transport_headers(),
+            routed.transport_headers(),
             &mut outbound,
             ConsentForwardingMode::OpenrtbOnly,
             routed.attested_client_ip(),

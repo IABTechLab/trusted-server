@@ -15,13 +15,16 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use url::Url;
-use validator::{Validate, ValidationError};
+#[cfg(test)]
+use validator::Validate;
+use validator::ValidationError;
 
 use crate::auction::openrtb::ignored_bidder_params_count;
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
-#[cfg(test)]
-use crate::auction::plan::{AuctionPlanConfig, NotificationConfig, ProviderConfig, RoutingMode};
-use crate::auction::profile::ApsProfilePlan;
+use crate::auction::demand::{
+    CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy,
+    DemandImplementation, DemandResponse, DemandTimeoutDefault, RegsPolicy,
+};
 #[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::routing::ProviderAuctionInput;
@@ -47,7 +50,7 @@ use crate::openrtb::{
 #[cfg(test)]
 use crate::platform::PlatformHttpRequest;
 use crate::platform::{PlatformResponse, RuntimeServices};
-use crate::settings::{IntegrationConfig, Settings};
+use crate::settings::Settings;
 
 pub(crate) const APS_INTEGRATION_ID: &str = "aps";
 /// Renderer type tag carried on the wire by an APS bid, read by the browser to
@@ -63,9 +66,9 @@ pub const APS_RENDERER_TYPE: &str = "aps";
 pub const APS_RENDERER_BID_ID_KEY: &str = "bidId";
 const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
 const DEFAULT_CURRENCY: &str = "USD";
-#[cfg(test)]
+/// The SDK source APS expects from a Prebid-shaped caller.
 const APS_SDK_SOURCE: &str = "prebid";
-#[cfg(test)]
+/// The SDK version APS expects from a Prebid-shaped caller.
 const APS_SDK_VERSION: &str = "2.2.0";
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_CREATIVE_ID_BYTES: usize = 1024;
@@ -422,80 +425,216 @@ impl Default for LegacyApsProviderConfig {
     }
 }
 
-/// Browser integration toggle retained independently from APS server providers.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, Validate)]
+
+/// The APS demand implementation.
+pub static DEMAND: DemandImplementation = DemandImplementation {
+    id: APS_INTEGRATION_ID,
+    default_timeout: DemandTimeoutDefault::Fixed(800),
+    allows_all_eligible: true,
+    serves_stored_requests: false,
+    canonicalize_endpoint: check_aps_endpoint,
+    compile: compile_demand,
+};
+
+/// One compiled APS demand source, from its `[demand.<name>]` table.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ApsConfig {
-    /// Whether browser-side APS integration behavior is enabled.
+pub struct ApsDemand {
+    /// APS account identifier.
+    #[serde(deserialize_with = "deserialize_account_id")]
+    pub account_id: String,
+    /// Include APS request and response diagnostics.
+    ///
+    /// This default-off metadata is unredacted and client-visible, so it can
+    /// carry identity, consent, page, account, bid and creative data. Set it
+    /// only on a controlled test site and never in production.
     #[serde(default)]
-    pub enabled: bool,
+    pub debug: bool,
+    /// Permit APS script creatives.
+    #[serde(default)]
+    pub allow_script_creatives: bool,
+    /// APS-authorized inventory domain used instead of the deployment hostname.
+    #[serde(default)]
+    pub inventory_domain: Option<String>,
+    /// Canonical inventory page origin, keeping the sanitized path.
+    #[serde(default)]
+    pub inventory_page_origin: Option<String>,
     /// Rendering owner for selected APS bids.
     #[serde(default)]
     pub rendering_mode: ApsRenderingMode,
 }
 
-#[cfg(test)]
-impl IntegrationConfig for LegacyApsProviderConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
+/// Refuse the legacy APS bid path, which this implementation does not speak.
+fn check_aps_endpoint(endpoint: &mut Url) -> Result<(), String> {
+    if endpoint.path().trim_end_matches('/').ends_with("/e/dtb/bid") {
+        return Err("names the unsupported legacy APS path `/e/dtb/bid`".to_string());
     }
+    Ok(())
 }
 
-impl IntegrationConfig for ApsConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
+fn compile_demand(
+    settings: &serde_json::Map<String, Json>,
+) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
+    Ok(Arc::new(compile_aps_settings(Json::Object(
+        settings.clone(),
+    ))?))
 }
 
-/// Typed server-side APS profile configuration used by the auction compiler.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ApsProfileConfig {
-    #[serde(deserialize_with = "deserialize_account_id")]
-    pub(crate) account_id: String,
-    #[serde(default)]
-    pub(crate) debug: bool,
-    #[serde(default)]
-    pub(crate) allow_script_creatives: bool,
-    #[serde(default)]
-    pub(crate) inventory_domain: Option<String>,
-    #[serde(default)]
-    pub(crate) inventory_page_origin: Option<String>,
-}
-
-/// Parse and validate server-owned APS profile fields without browser enablement.
-pub(crate) fn compile_profile_config(
-    value: serde_json::Value,
-) -> Result<ApsProfileConfig, Report<TrustedServerError>> {
-    let profile: ApsProfileConfig = serde_json::from_value(value).map_err(|error| {
+/// Parse and validate the settings of one APS demand source.
+///
+/// # Errors
+///
+/// Returns a configuration error when a setting is missing, unknown or invalid.
+pub(crate) fn compile_aps_settings(
+    value: Json,
+) -> Result<ApsDemand, Report<TrustedServerError>> {
+    let demand: ApsDemand = serde_json::from_value(value).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("invalid `aps` profile_config: {error}"),
+            message: format!("invalid `aps` settings: {error}"),
         })
     })?;
-    if let Some(domain) = profile.inventory_domain.as_deref() {
+    if let Some(domain) = demand.inventory_domain.as_deref() {
         validate_inventory_domain(domain).map_err(|error| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("invalid `aps` profile_config inventory_domain: {error}"),
+                message: format!("invalid `aps` inventory_domain: {error}"),
             })
         })?;
     }
-    if let Some(origin) = profile.inventory_page_origin.as_deref() {
+    if let Some(origin) = demand.inventory_page_origin.as_deref() {
         validate_inventory_page_origin(origin).map_err(|error| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("invalid `aps` profile_config inventory_page_origin: {error}"),
+                message: format!("invalid `aps` inventory_page_origin: {error}"),
             })
         })?;
     }
     validate_inventory_identity_override_values(
-        profile.inventory_domain.as_deref(),
-        profile.inventory_page_origin.as_deref(),
+        demand.inventory_domain.as_deref(),
+        demand.inventory_page_origin.as_deref(),
     )
     .map_err(|error| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("invalid `aps` profile_config inventory identity: {error}"),
+            message: format!("invalid `aps` inventory identity: {error}"),
         })
     })?;
-    Ok(profile)
+    if demand.rendering_mode == ApsRenderingMode::PublisherNative && demand.allow_script_creatives {
+        log::warn!(
+            "APS publisher-native rendering with script creatives is ON; selected bidder scripts execute with publisher-origin privileges"
+        );
+    }
+    if demand.debug {
+        log::warn!(
+            "APS debug mode is ON. Raw request and response data, including creative markup, is included in client-visible /auction responses"
+        );
+    }
+    Ok(demand)
+}
+
+#[async_trait(?Send)]
+impl CompiledDemand for ApsDemand {
+    fn field_policy(&self) -> DemandFieldPolicy {
+        DemandFieldPolicy {
+            primary_banner_size: true,
+            language_max_bytes: Some(CONSERVATIVE_LANGUAGE_MAX_BYTES),
+            regs: RegsPolicy::ApplicabilityBit,
+            ..DemandFieldPolicy::default()
+        }
+    }
+
+    fn site_domain(&self, publisher_domain: &str) -> String {
+        self.inventory_domain
+            .clone()
+            .unwrap_or_else(|| publisher_domain.to_owned())
+    }
+
+    fn site_page(&self, publisher_page: Option<&str>, site_domain: &str) -> Option<String> {
+        let fallback = publisher_page
+            .and_then(valid_aps_page_url)
+            .unwrap_or_else(|| format!("https://{site_domain}"));
+        let Some(origin) = self.inventory_page_origin.as_deref() else {
+            return Some(fallback);
+        };
+        let (Ok(mut canonical), Ok(current)) = (Url::parse(origin), Url::parse(&fallback)) else {
+            return Some(fallback);
+        };
+        canonical.set_path(current.path());
+        canonical.set_query(current.query());
+        canonical.set_fragment(None);
+        Some(canonical.to_string())
+    }
+
+    fn augment_request(
+        &self,
+        request: &mut crate::openrtb::OpenRtbRequest,
+        _input: &ProviderAuctionInput,
+    ) -> Result<(), Report<TrustedServerError>> {
+        request.ext = Some(serde_json::Map::from_iter([
+            ("account".to_string(), Json::String(self.account_id.clone())),
+            (
+                "sdk".to_string(),
+                json!({"source": APS_SDK_SOURCE, "version": APS_SDK_VERSION}),
+            ),
+        ]));
+        Ok(())
+    }
+
+    fn capture_request(
+        &self,
+        body: &[u8],
+        headers: &HeaderMap,
+    ) -> Option<Box<dyn core::any::Any + Send + Sync>> {
+        self.debug
+            .then(|| Box::new(ApsDebugRequest::capture(body, headers)) as Box<_>)
+    }
+
+    async fn parse_response(
+        &self,
+        context: DemandResponse<'_>,
+        response: PlatformResponse,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let provider_id = context.provider_id;
+        let response_time_ms = context.response_time_ms;
+        let debug_request = context
+            .captured
+            .and_then(|captured| captured.downcast_ref::<ApsDebugRequest>())
+            .cloned();
+        match parse_planned_aps_response(
+            provider_id,
+            self,
+            context.endpoint,
+            context.input,
+            response,
+            response_time_ms,
+            debug_request,
+        )
+        .await
+        {
+            Ok(parsed) => Ok(parsed),
+            Err(error) => {
+                log::warn!("Provider '{provider_id}' APS response parse failed: {error:?}");
+                Ok(AuctionResponse::error(provider_id, response_time_ms)
+                    .with_metadata("error_type", json!("parse_response")))
+            }
+        }
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// Accept only a page URL APS can be given.
+fn valid_aps_page_url(value: &str) -> Option<String> {
+    const MAX_APS_PAGE_URL_BYTES: usize = 8192;
+
+    if value.len() > MAX_APS_PAGE_URL_BYTES {
+        return None;
+    }
+    let parsed = Url::parse(value).ok()?;
+    (matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none())
+    .then(|| parsed.to_string())
 }
 
 #[cfg(test)]
@@ -915,7 +1054,7 @@ fn parse_planned_aps_value(
 /// Parse one APS-profile response using only provider-local routed state.
 pub(crate) async fn parse_planned_aps_response(
     provider_id: &str,
-    profile: &ApsProfilePlan,
+    demand: &ApsDemand,
     endpoint: &str,
     input: &ProviderAuctionInput,
     response: PlatformResponse,
@@ -925,9 +1064,9 @@ pub(crate) async fn parse_planned_aps_response(
     let policy = PlannedApsResponsePolicy {
         provider_id,
         endpoint,
-        account_id: &profile.account_id,
-        debug: profile.debug,
-        allow_script_creatives: profile.allow_script_creatives,
+        account_id: &demand.account_id,
+        debug: demand.debug,
+        allow_script_creatives: demand.allow_script_creatives,
         publisher_domain: &input.common_request().publisher.domain,
     };
     let response = response.response;
@@ -1924,26 +2063,44 @@ impl IntegrationHeadInjector for ApsRendererIntegration {
     }
 }
 
-/// Register renderer support when the auction plan contains an APS provider.
+/// Register renderer support when the plan selects an APS demand source.
 ///
-/// Browser integration enablement does not control server-side APS rendering.
-/// An absent or disabled browser block uses trusted-server rendering. An enabled
-/// browser block may select publisher-native rendering.
+/// The rendering owner comes from the demand table itself, so a deployment
+/// sets it where it sets the rest of that source's settings. Two APS sources
+/// that disagree is a configuration error, because one page can only be
+/// rendered one way.
 ///
 /// # Errors
 ///
-/// Returns an error when APS browser configuration is invalid.
+/// Returns an error when two selected APS sources set different rendering
+/// modes.
 pub fn register_for_plan(
-    settings: &Settings,
     plan: &crate::auction::AuctionPlan,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    if !plan.has_profile(APS_INTEGRATION_ID) {
-        return Ok(None);
+    let mut selected: Option<(&str, ApsRenderingMode)> = None;
+    for provider in plan.providers() {
+        if provider.implementation.id != APS_INTEGRATION_ID {
+            continue;
+        }
+        let Some(demand) = provider.demand.as_any().downcast_ref::<ApsDemand>() else {
+            continue;
+        };
+        match selected {
+            Some((first, mode)) if mode != demand.rendering_mode => {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "[demand.{}] and [demand.{first}] set different rendering_mode values, and one page can be rendered only one way",
+                        provider.id.as_str()
+                    ),
+                }));
+            }
+            Some(_) => {}
+            None => selected = Some((provider.id.as_str(), demand.rendering_mode)),
+        }
     }
-    let rendering_mode = settings
-        .integration_config::<ApsConfig>(APS_INTEGRATION_ID)?
-        .map(|config| config.rendering_mode)
-        .unwrap_or_default();
+    let Some((_, rendering_mode)) = selected else {
+        return Ok(None);
+    };
     let integration = Arc::new(ApsRendererIntegration { rendering_mode });
     let registration = IntegrationRegistration::builder(APS_INTEGRATION_ID)
         .without_js()
@@ -1954,75 +2111,6 @@ pub fn register_for_plan(
         registration
     };
     Ok(Some(registration.build()))
-}
-
-/// Register the APS auction provider when enabled.
-///
-/// # Errors
-///
-/// Returns an error when enabled APS configuration is invalid.
-#[cfg(test)]
-#[allow(clippy::missing_panics_doc)]
-pub fn register(
-    settings: &Settings,
-) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    let Some(config) =
-        settings.integration_config::<LegacyApsProviderConfig>(APS_INTEGRATION_ID)?
-    else {
-        return Ok(None);
-    };
-    let mut browser_settings = settings.clone();
-    browser_settings.integrations.insert_config(
-        APS_INTEGRATION_ID,
-        &ApsConfig {
-            enabled: true,
-            rendering_mode: config.rendering_mode,
-        },
-    )?;
-    register_for_plan(
-        &browser_settings,
-        &crate::auction::AuctionPlan::compile(AuctionPlanConfig {
-            timeout_ms: 1000,
-            providers: BTreeMap::from([(
-                "aps".parse().expect("should parse APS provider ID"),
-                ProviderConfig {
-                    protocol: "openrtb-2.6".to_string(),
-                    profile: "aps".to_string(),
-                    endpoint: default_endpoint(),
-                    timeout_ms: None,
-                    routing: RoutingMode::AllEligible,
-                    notifications: NotificationConfig::default(),
-                    profile_config: serde_json::json!({"account_id":"example-account"}),
-                },
-            )]),
-            ..AuctionPlanConfig::default()
-        })
-        .expect("should compile APS renderer test plan"),
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::missing_errors_doc)]
-pub fn register_providers(
-    settings: &Settings,
-) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let Some(config) =
-        settings.integration_config::<LegacyApsProviderConfig>(APS_INTEGRATION_ID)?
-    else {
-        return Ok(Vec::new());
-    };
-    log::info!("Registering APS OpenRTB provider");
-    if config.debug {
-        log::warn!(
-            "APS debug mode is ON — raw request and response data, including creative markup, will be included in client-visible /auction responses"
-        );
-    }
-    if config.rendering_mode == ApsRenderingMode::PublisherNative && config.allow_script_creatives {
-        log::warn!(
-            "APS publisher-native rendering with script creatives is ON; selected bidder scripts execute with publisher-origin privileges"
-        );
-    }
-    Ok(vec![Arc::new(ApsAuctionProvider::new(config))])
 }
 
 #[cfg(test)]
@@ -2244,8 +2332,8 @@ mod tests {
             .is_err()
         );
         assert!(
-            serde_json::from_value::<ApsConfig>(json!({
-                "enabled": true,
+            compile_aps_settings(json!({
+                "account_id": "example-account",
                 "rendering_mode": "unsupported"
             }))
             .is_err(),
@@ -3118,122 +3206,77 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    fn plan_with_aps_profile() -> crate::auction::AuctionPlan {
-        crate::auction::AuctionPlan::compile(AuctionPlanConfig {
-            timeout_ms: 1_000,
-            providers: BTreeMap::from([(
-                "aps".parse().expect("should parse APS provider ID"),
-                ProviderConfig {
-                    protocol: "openrtb-2.6".to_string(),
-                    profile: "aps".to_string(),
-                    endpoint: default_endpoint(),
-                    timeout_ms: None,
-                    routing: RoutingMode::AllEligible,
-                    notifications: NotificationConfig::default(),
-                    profile_config: serde_json::json!({"account_id":"example-account"}),
-                },
-            )]),
-            ..AuctionPlanConfig::default()
-        })
-        .expect("should compile APS plan")
+fn aps_plan(rendering_modes: &[Option<&str>]) -> crate::auction::AuctionPlan {
+        let tables = rendering_modes
+            .iter()
+            .enumerate()
+            .map(|(index, mode)| {
+                let mut table = crate::auction::test_support::demand_table(
+                    APS_INTEGRATION_ID,
+                    &default_endpoint(),
+                );
+                table.insert("routing".to_string(), json!("all_eligible"));
+                if let Some(mode) = mode {
+                    table.insert("rendering_mode".to_string(), json!(mode));
+                }
+                (
+                    if index == 0 { "aps_main" } else { "aps_second" },
+                    table,
+                )
+            })
+            .collect::<Vec<_>>();
+        crate::auction::AuctionPlan::compile(crate::auction::test_support::plan_config(tables))
+            .expect("should compile APS plan")
     }
 
     #[test]
-    fn aps_plan_registers_trusted_server_renderer_without_enabled_browser_config() {
-        for disabled_browser_config in [false, true] {
-            let mut settings = create_test_settings();
-            if disabled_browser_config {
-                settings
-                    .integrations
-                    .insert_config(
-                        APS_INTEGRATION_ID,
-                        &json!({
-                            "enabled": false,
-                            "rendering_mode": "publisher_native"
-                        }),
-                    )
-                    .expect("should insert disabled APS browser config");
-            }
+    fn a_selected_aps_source_registers_the_trusted_server_renderer() {
+        let registration = register_for_plan(&aps_plan(&[None]))
+            .expect("should register APS renderer support")
+            .expect("should return APS renderer registration");
 
-            let registration = register_for_plan(&settings, &plan_with_aps_profile())
-                .expect("should register APS renderer support")
-                .expect("should return APS renderer registration");
-
-            assert_eq!(
-                registration.proxies.len(),
-                1,
-                "APS plan should register trusted-server renderer route"
-            );
-            assert!(
-                registration.head_injectors[0]
-                    .tsjs_script_tag_attributes()
-                    .is_empty(),
-                "disabled or absent browser config should not select publisher-native rendering"
-            );
-        }
-    }
-
-    #[test]
-    fn enabled_config_registers_renderer_proxy() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({"enabled": true, "account_id": "example-account"}),
-            )
-            .expect("should insert APS config");
-
-        let registration = register(&settings)
-            .expect("should register APS")
-            .expect("should return enabled registration");
-
-        assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
-        assert_eq!(registration.proxies.len(), 1);
-        assert_eq!(registration.head_injectors.len(), 1);
-        let document_state = IntegrationDocumentState::default();
-        let context = IntegrationHtmlContext {
-            request_host: "publisher.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-        assert!(
-            registration.head_injectors[0]
-                .head_inserts(&context)
-                .is_empty(),
-            "should not inject a native-mode head marker by default"
+        assert_eq!(
+            registration.integration_id, APS_INTEGRATION_ID,
+            "the renderer registers under the APS id"
         );
+        assert_eq!(
+            registration.proxies.len(),
+            1,
+            "a selected APS source should register the trusted-server renderer route"
+        );
+        assert_eq!(registration.head_injectors.len(), 1);
         assert!(
             registration.head_injectors[0]
                 .tsjs_script_tag_attributes()
                 .is_empty(),
-            "should not authorize native rendering by default"
+            "the default rendering mode should not authorize publisher-native rendering"
         );
         assert!(registration.js_disabled);
     }
 
     #[test]
-    fn publisher_native_config_registers_runner_mode_without_renderer_route() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({
-                    "enabled": true,
-                    "account_id": "example-account",
-                    "rendering_mode": "publisher_native"
-                }),
-            )
-            .expect("should insert native APS config");
+    fn no_aps_source_registers_nothing() {
+        let plan = crate::auction::AuctionPlan::compile(
+            crate::auction::test_support::plan_config(Vec::new()),
+        )
+        .expect("should compile an empty plan");
 
-        let registration = register(&settings)
-            .expect("should register APS")
-            .expect("should return enabled registration");
+        assert!(
+            register_for_plan(&plan)
+                .expect("should evaluate renderer registration")
+                .is_none(),
+            "a plan with no APS source should register no renderer"
+        );
+    }
+
+    #[test]
+    fn publisher_native_rendering_drops_the_renderer_route_and_marks_the_bundle_tag() {
+        let registration = register_for_plan(&aps_plan(&[Some("publisher_native")]))
+            .expect("should register APS renderer support")
+            .expect("should return APS renderer registration");
         assert!(
             registration.proxies.is_empty(),
-            "should not register the static renderer"
+            "publisher-native rendering should not register the static renderer"
         );
         assert_eq!(registration.head_injectors.len(), 1);
 
@@ -3263,74 +3306,42 @@ mod tests {
     }
 
     #[test]
+    fn two_aps_sources_that_disagree_on_rendering_are_refused() {
+        let plan = aps_plan(&[None, Some("publisher_native")]);
+        let error = match register_for_plan(&plan) {
+            Ok(_) => panic!("should refuse two rendering modes"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("rendering_mode") && message.contains("aps_second"),
+            "should name the setting and the source that disagrees: {error:?}"
+        );
+    }
+
+    #[test]
     fn publisher_native_script_creatives_remain_available_for_controlled_validation() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({
-                    "enabled": true,
-                    "account_id": "example-account",
-                    "allow_script_creatives": true,
-                    "rendering_mode": "publisher_native"
-                }),
-            )
-            .expect("should insert native APS script config");
+        let demand = compile_aps_settings(json!({
+            "account_id": "example-account",
+            "allow_script_creatives": true,
+            "rendering_mode": "publisher_native"
+        }))
+        .expect("should compile the controlled experiment");
 
-        let providers = register_providers(&settings).expect("should register APS provider");
-
-        assert_eq!(
-            providers.len(),
-            1,
-            "should retain the controlled experiment"
-        );
+        assert!(demand.allow_script_creatives);
+        assert_eq!(demand.rendering_mode, ApsRenderingMode::PublisherNative);
     }
 
     #[test]
-    fn config_without_enabled_does_not_register_provider_or_renderer() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({"account_id": "example-account"}),
-            )
-            .expect("should insert default-disabled APS config");
-
+    fn an_aps_source_needs_an_account() {
+        let error = compile_aps_settings(json!({"debug": true}))
+            .expect_err("should refuse an APS source with no account");
         assert!(
-            register(&settings)
-                .expect("should evaluate renderer registration")
-                .is_none(),
-            "omitted enabled should not register the renderer route"
-        );
-        assert!(
-            register_providers(&settings)
-                .expect("should evaluate provider registration")
-                .is_empty(),
-            "omitted enabled should not register the auction provider"
+            format!("{error:?}").contains("account_id"),
+            "should name the missing setting: {error:?}"
         );
     }
 
-    #[test]
-    fn enabled_invalid_config_fails_provider_registration() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({
-                    "enabled": true,
-                    "account_id": "example-account",
-                    "endpoint": "http://insecure.example/openrtb"
-                }),
-            )
-            .expect("should insert invalid APS config for startup validation");
-
-        let _error = register_providers(&settings)
-            .err()
-            .expect("should reject invalid enabled APS configuration");
-    }
 
     #[test]
     fn renderer_document_is_static_and_nonce_bound() {

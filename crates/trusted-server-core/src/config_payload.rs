@@ -249,7 +249,7 @@ mod tests {
         let mut settings = test_settings();
         settings.proxy.allowed_domains = vec!["*.example".to_string()];
         settings.auction.enabled = auction_enabled;
-        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.demand = crate::auction::test_support::demand_named(&["pbs"]);
         settings.auction.bidders.insert(
             "exampleBidder"
                 .parse()
