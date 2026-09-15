@@ -678,4 +678,32 @@ mod tests {
             "error should explain unsupported option"
         );
     }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dev_proxy_bare_invocation_shows_help_before_running() {
+        let error = Args::try_parse_from(["ts", "dev", "proxy"])
+            .expect_err("a bare `ts dev proxy` should short-circuit to help, not run");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "should print help instead of touching system proxy state or attempting sudo"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dev_proxy_ca_subcommands_still_parse_under_arg_required_else_help() {
+        for action in ["path", "install", "uninstall", "regenerate"] {
+            parse(&["ts", "dev", "proxy", "ca", action]);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dev_proxy_partial_rule_parses_instead_of_showing_help() {
+        // An explicit but incomplete rule (`--from` with no `--to`) must reach
+        // `run` and surface the concise no-rule error there, not clap help.
+        parse(&["ts", "dev", "proxy", "--from", "a.example.com"]);
+    }
 }

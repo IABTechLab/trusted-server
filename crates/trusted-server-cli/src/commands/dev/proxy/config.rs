@@ -349,6 +349,7 @@ fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
     use hyper::header::HeaderValue;
     use rustls::pki_types::ServerName;
 
@@ -359,30 +360,26 @@ mod tests {
     };
 
     fn base_args() -> crate::commands::dev::proxy::ProxyArgs {
-        // Construct via clap so defaults match the real surface.
-        use clap::Parser;
-        #[derive(clap::Parser)]
-        struct W {
-            #[command(flatten)]
-            a: crate::commands::dev::proxy::ProxyArgs,
-        }
-        W::parse_from(["ts"]).a
+        parse_args(&[
+            "ts",
+            "--listen",
+            crate::commands::dev::proxy::DEFAULT_LISTEN,
+        ])
     }
 
     fn parse_args(argv: &[&str]) -> crate::commands::dev::proxy::ProxyArgs {
-        use clap::Parser;
         #[derive(clap::Parser)]
         struct W {
             #[command(flatten)]
             a: crate::commands::dev::proxy::ProxyArgs,
         }
-        W::parse_from(argv).a
+        W::try_parse_from(argv).expect("should parse proxy args").a
     }
 
     #[test]
     fn clap_parses_rewrite_host_as_a_bool() {
         assert!(
-            !parse_args(&["ts"]).rewrite_host,
+            !parse_args(&["ts", "--insecure"]).rewrite_host,
             "absent --rewrite-host is false"
         );
         assert!(
