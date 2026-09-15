@@ -69,7 +69,8 @@ seventh PR targets, and the five series PRs do not touch these files.
 4. **Auction providers are a second closed table.**
    The list of Prebid, APS and the ad server mock is at
    `crates/trusted-server-core/src/auction/mod.rs:51` to `:53`, inside
-   `provider_builders()` at `:49`.
+   `provider_builders()` at `:49`. `main` has since replaced that table with
+   a compiled auction plan, in PR #1016, and §3.4 follows the plan.
 5. **Two vendors reach further into core.** DataDome drives cache privacy
    and the origin fetch decision through a marker type
    (`html_processor.rs:303`, `publisher.rs:4369` to `:4381`,
@@ -104,16 +105,18 @@ Make the builder contract public and give the registry a second input.
 
 - `IntegrationBuilder` becomes `pub` with a public constructor, and
   `builders()` stays as the built-in set.
-- `IntegrationRegistry::new` gains a companion,
-  `IntegrationRegistry::with_registrations(settings, extra)`, where `extra`
-  is a slice of externally supplied builders. `new` keeps its signature and
-  calls the companion with an empty slice, so no existing caller changes
-  behavior.
+- `IntegrationRegistry::with_plan`, the constructor every adapter calls
+  since PR #1016, gains a companion,
+  `IntegrationRegistry::with_plan_and_registrations(settings, plan, extra)`,
+  where `extra` is a slice of externally supplied builders. `with_plan` keeps
+  its signature and calls the companion with an empty slice, so no existing
+  caller changes behavior.
 - Duplicate integration ids are a startup error, naming both sources, so a
   vendor crate cannot silently shadow a built-in. There is no such check
-  today, only a per-route conflict check and a debug-only assertion, and
-  `AuctionOrchestrator::register_provider` silently keeps the last writer,
-  so the builder carries a source label and both tables get the check.
+  today, only a per-route conflict check and a debug-only assertion, so the
+  builder carries a source label and the registry gets the check. Prebid and
+  APS register through the auction plan rather than through a builder, and
+  their ids are reserved by the same check.
 
 ### 3.2 Carrying browser JavaScript on the registration
 
@@ -154,28 +157,55 @@ every registered integration is covered by deploy validation
 survives in a vendor-neutral form. Two details the map of `main` adds. The
 enumeration the test needs is independent of which integrations a
 configuration enables, so the registry exposes the full set of registrations
-it was built from, not only the enabled ones. And `adserver_mock` is
-validated today without being a registration (it exists only as an auction
-provider), so auction-side registrations carry the same validation hook and
-the test covers both tables.
+it was built from, not only the enabled ones. And Prebid, APS and
+`adserver_mock` are auction plan providers rather than registrations, so
+validation checks their three configuration blocks by name next to the
+builders' hooks, and a test plants a block each of them must reject.
 
 ### 3.4 Auction providers
 
-Give `AuctionOrchestrator` the same treatment as the registry: a public
-provider-builder type and a second input, so an auction-side vendor such as
-APS can register from its own crate. Prebid stays in core as protocol
-support rather than as a vendor integration.
+This change does not open the auction to providers from outside core. An
+earlier revision of this section gave `AuctionOrchestrator` a public
+provider-builder type and a second input. `main` has since replaced the
+provider table that revision addressed with a compiled auction plan, in PR
+#1016. Bidders are declared under `[auction.providers]`, each one selects an
+OpenRTB profile, and the orchestrator and the integration registry share the
+one compiled plan. This change follows that design and adds no auction
+provider builder.
 
-The bid renderer contract is generalized in the same change. Today
-`BidRenderer` is an enum with one variant, `Aps(ApsRendererV1)`
+The bid renderer contract is still generalized in this change. Before it,
+`BidRenderer` was an enum with one variant, `Aps(ApsRendererV1)`
 (`crates/trusted-server-core/src/auction/types.rs:216`), serialized into the
 OpenRTB response extension under a `type` tag
 (`crates/trusted-server-core/src/auction/formats.rs:377`,
 `crates/trusted-server-core/src/openrtb.rs:183`). It becomes an open
 descriptor, a type tag and a payload the auction provider supplies, with
 the same serialized form, so the response a page receives does not change
-and the APS renderer type moves with APS. The ad server mock in core uses
-the neutral form.
+and the APS renderer type moves out of the shared auction types into
+`crates/trusted-server-core/src/integrations/aps.rs`. The ad server mock
+uses the neutral form.
+
+The plan keeps three things closed, read from `main` at 066ea3c69, and they
+are recorded here rather than solved.
+
+- The profile registry is a fixed list of three in core, being `standard`,
+  `prebid-server` and `aps`
+  (`crates/trusted-server-core/src/auction/profile.rs:170`), and the
+  compiled profile is a closed enum (`profile.rs:63`) whose Prebid and APS
+  behavior is imported from those integrations (`profile.rs:11` and `:12`).
+  Any number of providers may select one profile
+  (`compiler_supports_two_instances_of_the_same_profile` in
+  `crates/trusted-server-core/src/auction/plan.rs`), but a vendor cannot add
+  a profile without changing core.
+- The plan compiler treats `prebid-server` and `aps` specially by name
+  (`plan.rs:307`, `:585` and `:595`).
+- The only mediator the plan accepts is `adserver_mock` (`plan.rs:20` and
+  `:556`), and the orchestrator builds it by calling that integration
+  directly (`crates/trusted-server-core/src/auction/mod.rs:90`). An ad
+  server is not a provider an operator declares, as a bidder is.
+
+Moving an auction-side vendor out of core therefore needs a change to the
+auction plan, which is outside this stack.
 
 ### 3.5 The two neutral hooks
 
@@ -259,12 +289,12 @@ One vendor per PR, after this change lands. Each migration PR gives its vendor c
 TypeScript, its config type and its tests into
 `crates/integrations/<vendor>`, and the adapter that wants it depends on it.
 
-| Vendor                                                           | What it needs                                                                                                                                                                                                           |
-| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                             |
-| APS                                                              | Needs the auction provider seam and the generalized renderer contract in §3.4, both of which this change delivers, and browser-side work it does not deliver, because core TypeScript imports APS directly (§8 item 8). |
-| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                            |
-| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                            |
+| Vendor                                                           | What it needs                                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                                                                                                    |
+| APS                                                              | Needs the generalized renderer contract in §3.4, which this change delivers. It also needs a change to the auction plan so an auction-side vendor can live outside core (§3.4), and browser-side work, because core TypeScript imports APS directly (§8 item 8). This change delivers neither. |
+| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                                                                                                   |
+| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                                                                                                   |
 
 `[integrations.<vendor>]` configuration tables need no change, because
 `IntegrationSettings` is a flattened map that already accepts unknown vendor
@@ -386,7 +416,7 @@ for each vendor to rediscover.
 4. **One core reader still reaches into a vendor's payload.** The
    `hb_adid` fallback in the publisher reads the APS renderer's fields, so
    the APS migration needs a neutral answer for it rather than only the
-   seam in §3.4.
+   renderer contract in §3.4.
 
 5. **Request preparation covers different routes on each host.** Every
    adapter runs preparers before routing, but not on the same set of
@@ -455,17 +485,17 @@ defines, and both should land before the first vendor is asked to use it.
 
 ## 9. Sign-off
 
-| #   | Decision                                                                                                                                                                                                                                                  | Status               |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| 1   | Vendor integrations belong outside core, behind the registration contract                                                                                                                                                                                 | Proposed             |
-| 2   | Tech Lab engineering reviews vendor crates, and does not maintain them                                                                                                                                                                                    | Proposed, governance |
-| 3   | A registration may carry its own browser JavaScript                                                                                                                                                                                                       | Proposed             |
-| 4   | Deploy validation moves onto the registration                                                                                                                                                                                                             | Proposed             |
-| 5   | The nine existing integrations migrate one PR each, on the schedule in §4                                                                                                                                                                                 | Proposed             |
-| 6   | This change completes the Rust side, so after it no vendor move needs a Rust core change. The browser side is not complete, because TSJS core still imports the APS renderer directly (§8 item 8), so an APS move still needs a browser renderer contract | Proposed             |
-| 7   | Identity, geo and device providers are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                         | Proposed             |
-| 8   | No provider is built into core: HMAC and the User-Agent-only device provider are Tech Lab-owned modules configured under `[integrations.<id>]`, and core keeps only `none`                                                                                | Proposed             |
-| 9   | This spec and its core implementation precede #1043; 51Degrees implements the core seam, the nine vendor moves in §4 stay one PR each                                                                                                                     | Proposed             |
+| #   | Decision                                                                                                                                                                                                                                                                                                                                                   | Status               |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| 1   | Vendor integrations belong outside core, behind the registration contract                                                                                                                                                                                                                                                                                  | Proposed             |
+| 2   | Tech Lab engineering reviews vendor crates, and does not maintain them                                                                                                                                                                                                                                                                                     | Proposed, governance |
+| 3   | A registration may carry its own browser JavaScript                                                                                                                                                                                                                                                                                                        | Proposed             |
+| 4   | Deploy validation moves onto the registration                                                                                                                                                                                                                                                                                                              | Proposed             |
+| 5   | The nine existing integrations migrate one PR each, on the schedule in §4                                                                                                                                                                                                                                                                                  | Proposed             |
+| 6   | This change completes the Rust side for integrations, so after it no integration move needs a Rust core change. An auction-side vendor still needs a change to the auction plan (§3.4), and the browser side is not complete, because TSJS core still imports the APS renderer directly (§8 item 8), so an APS move also needs a browser renderer contract | Proposed             |
+| 7   | Identity, geo and device providers are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                                                                                                                          | Proposed             |
+| 8   | No provider is built into core: HMAC and the User-Agent-only device provider are Tech Lab-owned modules configured under `[integrations.<id>]`, and core keeps only `none`                                                                                                                                                                                 | Proposed             |
+| 9   | This spec and its core implementation precede #1043; 51Degrees implements the core seam, the nine vendor moves in §4 stay one PR each                                                                                                                                                                                                                      | Proposed             |
 
 ## Revision record
 
