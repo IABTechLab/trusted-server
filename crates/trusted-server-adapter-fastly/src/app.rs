@@ -2893,6 +2893,12 @@ mod tests {
             Ok(())
         }
 
+        /// A no-op beyond succeeding: this double stores by cache key, so it cannot
+        /// resolve a surrogate key to entries the way the platform does.
+        async fn purge_url_surrogate_key(&self, _key: &str) -> Result<(), TemplateCacheError> {
+            Ok(())
+        }
+
         async fn purge_all(&self) -> Result<(), TemplateCacheError> {
             self.entries.lock().expect("should lock entries").clear();
             Ok(())

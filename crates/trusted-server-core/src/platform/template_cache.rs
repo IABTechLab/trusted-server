@@ -746,6 +746,14 @@ pub trait PlatformTemplateCache: Send + Sync {
     /// Purge every cached variant for one publisher URL.
     async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError>;
 
+    /// Purge one already-derived surrogate key.
+    ///
+    /// Exists because [`Self::purge_url`] needs a whole [`TemplateCacheKey`], which a
+    /// purge caller cannot build: an operator or a CMS webhook has a URL, not an origin
+    /// identity, a template fingerprint, or the origin's `Vary` values. Pair it with
+    /// [`reader_url_surrogate_key`].
+    async fn purge_url_surrogate_key(&self, key: &str) -> Result<(), TemplateCacheError>;
+
     /// Purge every stored template. The rollback lever.
     async fn purge_all(&self) -> Result<(), TemplateCacheError>;
 }
@@ -790,6 +798,13 @@ impl PlatformTemplateCache for UnavailableTemplateCache {
     }
 
     async fn purge_url(&self, _key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
+        Err(TemplateCacheError::Unsupported)
+    }
+
+    /// Reports unsupported rather than succeeding. A purge surface that silently does
+    /// nothing is worse than one that refuses: an operator mid-incident would read the
+    /// success and stop looking.
+    async fn purge_url_surrogate_key(&self, _key: &str) -> Result<(), TemplateCacheError> {
         Err(TemplateCacheError::Unsupported)
     }
 
@@ -1032,6 +1047,19 @@ mod tests {
                 "URL punctuation must be reduced, got {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_adapter_without_a_template_cache_refuses_a_surrogate_purge() {
+        let outcome = futures::executor::block_on(
+            UnavailableTemplateCache.purge_url_surrogate_key("ts-template-readerurl-abc"),
+        );
+
+        assert!(
+            matches!(outcome, Err(TemplateCacheError::Unsupported)),
+            "a purge surface that silently does nothing is worse than one that refuses: \
+             an operator mid-incident would read the success and stop looking"
+        );
     }
 
     #[test]

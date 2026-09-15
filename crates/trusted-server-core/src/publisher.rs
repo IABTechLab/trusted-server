@@ -9027,6 +9027,13 @@ mod tests {
                 Ok(())
             }
 
+            async fn purge_url_surrogate_key(
+                &self,
+                _key: &str,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                Ok(())
+            }
+
             async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
                 Ok(())
             }
@@ -9173,6 +9180,10 @@ mod tests {
             /// Force the lookup transaction to fail, for the fail-open + telemetry
             /// contract. A backend outage must never become a publisher outage.
             fail_lookup: AtomicBool,
+            /// Surrogate keys a purge asked for. This double stores by cache key, so it
+            /// cannot resolve a surrogate key to entries the way the platform does —
+            /// recording the request is what a test can assert on.
+            purged_surrogate_keys: Arc<Mutex<Vec<String>>>,
         }
 
         struct MemoryTemplateReservation {
@@ -9355,6 +9366,21 @@ mod tests {
                     .lock()
                     .expect("should lock entries")
                     .remove(&key.to_cache_key());
+                Ok(())
+            }
+
+            /// Records the key so a test can assert what a purge asked for.
+            ///
+            /// This double stores by cache key, not by surrogate key, so it cannot
+            /// resolve one to the other the way the platform does.
+            async fn purge_url_surrogate_key(
+                &self,
+                key: &str,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.purged_surrogate_keys
+                    .lock()
+                    .expect("should lock purged surrogate keys")
+                    .push(key.to_owned());
                 Ok(())
             }
 
