@@ -194,8 +194,8 @@ let request_can_use_shared_template = origin_response_is_shareable
     && reader_supports_assembly;
 ```
 
-This is a pure refactor with no behavior change, which is why it ships in PR 1 rather than
-with the gate: Observability's `origin_cache_shareable` field needs the binding to exist.
+This is a pure refactor with no behavior change, which is why it is the first commit rather than
+part of the gate: the `origin_cache_shareable` telemetry field needs the binding to exist.
 
 ### Gating the bypass, at both sites
 
@@ -675,30 +675,47 @@ alignment gate. If the new authenticated POST helper pulls a dependency, fix wit
 
 ## Sequencing
 
-Five PRs. The ordering rule: nothing that changes caching behavior ships before the tooling to
-observe and reverse it, and every PR is revertible on its own.
+**One PR, by decision.** An earlier revision split this into five. The work is now a single
+change set, so the ordering below is commit order within one branch rather than a merge order.
 
-1. **Predicate split + observability.** The predicate split (pure refactor, no behavior
-   change) plus the observability work, with the Tinybird datasource migration deployed before
-   the code. The split belongs here
-   rather than with the gate because `origin_cache_shareable` reports the binding it creates —
-   without it, observability would need a second schema migration later.
-2. **Probe** — plus the `reqwest` dependency and the loop-accept fixture server.
-   Independently shippable and independently useful.
-3. **Purge plumbing and endpoint** — the `request_path` field, the reader-facing
-   surrogate key with canonicalization, the `url_surrogate_key` extraction, the trait change,
-   the four route registrations, `ADMIN_ENDPOINTS`, parity auth helpers, harness purge leg and
-   its workflow step. The key work lives here rather than with the CLI so there is one URL-purge
-   derivation, not two.
-4. **CLI purge command** — thin wrapper. Droppable if purge-token scope cannot be
-   granted.
-5. **Readthrough gate** — last. Requires the rollback staging verdict written up
-   before this PR opens, and the response-side gap precondition list reflected in the runbook. Reviewed as
-   security-sensitive.
+What that costs, recorded rather than glossed: the readthrough gate is the only change here with
+new blast radius, and in a single PR it lands and reverts together with the telemetry that would
+tell you whether to revert it. A revert takes the instrumentation with it. The mitigations are
+that the gate is inert until an operator sets `origin_is_cookie_independent`, and that
+`assembly_mode` stays a runtime kill switch — so the practical rollback is a config change, not a
+code revert.
 
-The rollback staging check has no PR of its own and must not become an open-ended spike that strands
-PR 5. Timebox it inside PR 3, which already touches the purge trait, and record the verdict in
-the issue.
+Commit order, which still follows the rule that nothing changing cache behavior precedes the
+tooling to observe and reverse it:
+
+1. **Predicate split** — pure refactor, no behavior change. First because everything else
+   references the binding it creates.
+2. **Observability** — the three telemetry fields, the request-side bypass-reason derivation, and
+   the Tinybird datasource migration. The migration must reach Tinybird **before the code
+   deploys**, which in a single PR is a deploy-ordering constraint on the release, not on the
+   merge.
+3. **Probe** — the `reqwest` dependency, the loop-accept fixture server, four axes and four
+   response-header verdicts.
+4. **Purge plumbing and endpoint** — the `request_path` field, the reader-facing surrogate key
+   with canonicalization, the `url_surrogate_key` extraction, the trait change, four route
+   registrations, `ADMIN_ENDPOINTS`, parity auth helpers, the harness purge leg and its workflow
+   step.
+5. **Purge CLI command** — thin wrapper over the key work above. Drop this commit alone if
+   purge-token scope cannot be granted; nothing else depends on it.
+6. **Readthrough gate** — last, and reviewed as security-sensitive. Requires the `ts-origin`
+   staging verdict resolved and the precondition list reflected in the runbook before the PR is
+   marked ready.
+7. **Documentation** — runbook, glossary, config comments, dashboard caveats, CI gate list.
+
+**The `ts-origin` staging check gates the PR, not a commit.** It cannot be verified under Viceroy
+and needs a staging service. Timebox it alongside commit 4, which already touches the purge trait,
+and write the verdict into the PR description. If it comes back negative, the runbook says
+readthrough rollback is flag-flip plus origin TTL — the PR still ships, with an honest rollback
+section.
+
+**Review guidance for a change set this size.** Ask for the readthrough commit to be reviewed on
+its own, against the precondition list. It is one condition at two call sites, and the rest of the
+diff is instrumentation and tooling that will otherwise bury it.
 
 ## Successor issues
 
@@ -744,12 +761,17 @@ before the origin responds and no post-response hook is reachable. The probe's b
 are the only control. An operator who enables readthrough against an unverified origin can
 cross-serve, including session fixation via a cached `Set-Cookie`.
 
-**This is the decision point for whether the readthrough change ships at all.** The alternative is to close
+**Decided: the readthrough change ships.** This paragraph previously left it open. The
+alternative was to close
 #852 item 1 as won't-do and keep the unconditional bypass, accepting that every ad-serving
-pageview pays a full origin round trip. That is a legitimate outcome: the template cache already
-delivers the same benefit on its hit path, and it enforces the response-side rules that
-readthrough cannot. Origin readthrough's marginal value is confined to template-cache misses, and its
-marginal risk is a weaker guarantee on a broader population. Decide this before PR 5, not during.
+pageview pays a full origin round trip — legitimate, because the template cache already delivers
+the same benefit on its hit path and enforces response-side rules readthrough cannot. Its marginal
+value is confined to template-cache misses; its marginal risk is a weaker guarantee on a broader
+population.
+
+It ships anyway, on the understanding that the probe's blocking verdicts are the control, and that
+enablement stays per-operator behind `origin_is_cookie_independent` so nothing changes for anyone
+who does not opt in. Review the readthrough commit against that bar specifically.
 
 **The gate is a no-op for cookie-varying origins.** A publisher whose HTML genuinely depends on
 publisher cookies gets nothing from this work. The probe tells them quickly, which is the honest
@@ -768,7 +790,7 @@ not rediscovered later.
 **Observability is the largest refactor here and is not in #852.** Turning `AuctionObservationContext`
 from an immutable snapshot into a mutable accumulator, plus a 35-column schema migration with
 quarantine risk, sits close to AGENTS.md's "no large refactors without approval". It needs
-explicit approval before PR 1. If that approval is withheld, the trim is to drop
+explicit approval before the work starts. If that approval is withheld, the trim is to drop
 `template_cache_state` — it is already on the `x-ts-template-cache` response header — and keep
 `template_cache_bypass_reason` and `origin_cache_shareable`, which carry the triage.
 
@@ -781,7 +803,8 @@ All five work items landed, and specifically:
   verdicts.
 - `template_cache_bypass_reason` and `origin_cache_shareable` confirmed present on Tinybird rows
   from a staging deploy, with no quarantine.
-- The readthrough ship/no-ship decision from Open risks recorded either way.
+- The readthrough gate reviewed as its own commit against the precondition list, not as part of
+  the wider diff.
 
 Production hit-rate validation is **issue C**, not a condition of this one. Revision 1 required a
 recorded measurement from a real deployment, which makes the issue un-closeable by the engineer

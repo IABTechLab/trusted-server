@@ -1,4 +1,4 @@
-# Predicate split and cache observability implementation plan
+# Issue #852 implementation plan — part 1 of 3: predicate split and observability
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -18,11 +18,22 @@ datasource.
 **Spec:** `docs/superpowers/specs/2026-09-15-852-template-and-origin-caching-design.md` — read
 "Splitting the predicate" and "Observability" before starting.
 
-**This is PR 1 of 5.** No change to responses, cache decisions, or the `x-ts-template-cache`
-header — nothing consumes `origin_response_is_shareable` until PR 5, and the predicate split is
-behavior-neutral by construction. The telemetry row shape **does** change: three always-serialized
-fields, which is why the Tinybird migration must land first. Say it that way in the PR description
-rather than "no behavior change", which is only true of the request path.
+**All of #852 ships as one PR.** This document is the first of three plan parts covering that one
+change set, in commit order:
+
+| Part     | Covers                                                                         | Plan                                 |
+| -------- | ------------------------------------------------------------------------------ | ------------------------------------ |
+| 1 (this) | Predicate split, observability, Tinybird migration, docs caveats, CI gate list | this file                            |
+| 2        | Origin shareability probe; purge endpoint, key plumbing and CLI                | `2026-09-15-852-probe-and-purge.md`  |
+| 3        | Readthrough gate, `ts-origin` staging check, runbook                           | `2026-09-15-852-readthrough-gate.md` |
+
+Complete them in order. Parts 2 and 3 depend on the binding and the telemetry this part creates.
+
+**Behavior impact of this part alone:** no change to responses, cache decisions, or the
+`x-ts-template-cache` header — nothing consumes `origin_response_is_shareable` until part 3, and
+the predicate split is behavior-neutral by construction. The telemetry row shape **does** change:
+three always-serialized fields, which is why the Tinybird migration must reach Tinybird before the
+release deploys.
 
 ---
 
@@ -1146,8 +1157,9 @@ cd docs && npm run format && cd ..
 git diff main --stat
 ```
 
-Expected: only `publisher.rs`, `auction/telemetry.rs`, the two Tinybird files, `AGENTS.md`, and
-the docs touched by Task 11. An adapter file appearing means the telemetry struct is leaking into
+Compare against the branch point rather than `main` if later parts have already landed on the
+branch. Expected for this part: only `publisher.rs`, `auction/telemetry.rs`, the two Tinybird
+files, `AGENTS.md`, and the docs touched by Task 11. An adapter file appearing means the telemetry struct is leaking into
 adapter code.
 
 This check confirms _which files changed_, nothing more. Behavior neutrality of the predicate split
