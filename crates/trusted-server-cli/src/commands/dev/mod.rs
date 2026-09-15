@@ -31,6 +31,6 @@ pub enum DevCommand {
 pub fn run(command: DevCommand) -> Result<(), String> {
     match command {
         #[cfg(target_os = "macos")]
-        DevCommand::Proxy(args) => proxy::run(&args).map_err(|report| format!("{report:#}")),
+        DevCommand::Proxy(args) => proxy::run(&args).map_err(|report| format!("{report:?}")),
     }
 }

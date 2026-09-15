@@ -76,6 +76,10 @@ async fn finish_interrupted_run<Restore, Stop, Drain>(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain_manager).await;
 }
 
+/// Default `--listen` address, shared with the `config` tests so they cannot
+/// silently drift from the real default.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:18080";
+
 /// `ts dev proxy [OPTIONS]` — see the design spec §4.
 #[derive(Debug, clap::Args)]
 #[command(arg_required_else_help = true)]
@@ -95,7 +99,7 @@ pub struct ProxyArgs {
     pub to: Option<String>,
 
     /// Proxy listen address. Non-loopback requires `--allow-non-loopback`.
-    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:18080")]
+    #[arg(long, value_name = "ADDR", default_value = DEFAULT_LISTEN)]
     pub listen: String,
 
     /// Permit binding a non-loopback `--listen` (disables blind tunnel/forward).

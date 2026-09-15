@@ -689,7 +689,14 @@ mod tests {
             clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
             "should print help instead of touching system proxy state or attempting sudo"
         );
-        parse(&["ts", "dev", "proxy", "ca", "path"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dev_proxy_ca_subcommands_still_parse_under_arg_required_else_help() {
+        for action in ["path", "install", "uninstall", "regenerate"] {
+            parse(&["ts", "dev", "proxy", "ca", action]);
+        }
     }
 
     #[test]
