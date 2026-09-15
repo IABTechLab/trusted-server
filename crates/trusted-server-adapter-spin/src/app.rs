@@ -1101,8 +1101,8 @@ mod tests {
     }
 
     /// Settings selecting a vendor Edge Cookie provider this adapter does not
-    /// inject, with the `[ec.providers.<key>]` block configuration validation
-    /// requires. `acme` is a fictional vendor key.
+    /// inject, with the `[ec.acme]` block that provider's settings live in.
+    /// `acme` is a fictional vendor key.
     const UNINJECTED_PROVIDER_TOML: &str = r#"
         [[handlers]]
         path = "^/_ts/admin"
@@ -1118,7 +1118,7 @@ mod tests {
         [ec]
         provider = "acme"
 
-        [ec.providers.acme]
+        [ec.acme]
         endpoint = "https://ec.acme.example.com"
     "#;
 

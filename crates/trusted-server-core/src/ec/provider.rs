@@ -3,14 +3,16 @@
 //! An [`EdgeCookieProvider`] derives an Edge Cookie identifier. The provider is
 //! selected by configuration, with no default, and [`build_provider`] is the
 //! composition root that builds the selected one. A built-in provider is
-//! constructed from its `[ec.providers.<key>]` block, and a vendor provider is
-//! taken from the adapter that injected it. A built-in provider that also needs
-//! a host service, as the host-signal provider needs the [`HostSignals`]
-//! service, is built only on a host that supplies that service.
-//! Construction reads configuration and long-lived services, so a selection
-//! this deployment cannot satisfy fails at startup rather than leaving it
-//! running without an identity. The host-signal provider is the exception: it
-//! is built per request from that request's TLS and HTTP/2 signals (see
+//! constructed from its `[ec.<name>]` block, and a vendor provider is taken
+//! from the adapter that injected it. A built-in provider that also needs a
+//! host service, as the host-signal provider needs the [`HostSignals`]
+//! service, is built only on a host that supplies that service. Construction
+//! reads configuration and long-lived services, so a selection this deployment
+//! cannot satisfy fails at startup rather than leaving it running without an
+//! identity. Fastly, Cloudflare and Spin resolve the provider once per
+//! application state and thread the result. Axum and embedders resolve per
+//! request. The host-signal provider is the exception, being built per request
+//! from that request's TLS and HTTP/2 signals (see
 //! [`is_request_scoped`](EdgeCookieProvider::is_request_scoped)).
 //!
 //! Request evidence reaches a provider at call time rather than at
@@ -34,7 +36,7 @@ use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::{HostSignals, RequestInfo};
 use crate::redacted::Redacted;
-use crate::settings::Ec;
+use crate::settings::{Ec, EcProviderBlock};
 
 use super::cookies::ec_id_has_only_allowed_chars;
 use super::generation;
@@ -64,10 +66,10 @@ pub enum EcProviderSelection {
     /// configured.
     None,
 
-    /// A provider selected by name, configured by the matching
-    /// `[ec.providers.<name>]` block. [`build_provider`] resolves the name to
-    /// an implementation, whether that implementation is built into core or
-    /// injected by the adapter.
+    /// A provider selected by name, configured by the matching `[ec.<name>]`
+    /// block when it has settings. The name is the implementation unless that
+    /// block names one, and [`build_provider`] resolves the implementation,
+    /// whether it is built into core or injected by the adapter.
     Named(String),
 }
 
@@ -112,18 +114,18 @@ impl From<EcProviderSelection> for String {
     }
 }
 
-/// The configuration name of the HMAC provider still built into core.
+/// The implementation id of the HMAC provider still built into core.
 ///
-/// The name lives in the same open-ended namespace every vendor provider name
-/// comes from, and nothing branches on it outside the resolution in
+/// The id lives in the same open-ended namespace every vendor implementation
+/// id comes from, and nothing branches on it outside the resolution in
 /// [`build_provider`]. It is also [`HmacProvider::id`]'s return value and
 /// [`HMAC_PROVIDER_CODE`]'s text. It goes with that resolution arm when the
 /// built-in provider becomes a module of its own.
 pub const HMAC_PROVIDER_KEY: &str = "hmac";
 
-/// The configuration name of the host-signal provider still built into core.
+/// The implementation id of the host-signal provider still built into core.
 ///
-/// An ordinary name in the same open-ended namespace as [`HMAC_PROVIDER_KEY`],
+/// An ordinary id in the same open-ended namespace as [`HMAC_PROVIDER_KEY`],
 /// spelled exactly the way a vendor crate spells its own, and nothing branches
 /// on it outside the resolution in [`build_provider`]. It is also
 /// [`HostSignalProvider::id`]'s return value, and it goes with that resolution
@@ -138,21 +140,21 @@ pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host_signals";
 /// naming [`HOST_SIGNALS_PROVIDER_KEY`], so a deployment still configured with
 /// the old spelling stops there and the operator is told what to write
 /// instead. The refusal comes before any block is looked for, because a block
-/// left under the old name is captured as a vendor block, so without the
-/// refusal the old selector would find that block, pass the settings check,
-/// and fail later in [`resolve_named_provider`] with a message about an
-/// adapter that supplies no such provider.
+/// left under the old name is read as the block of a provider the adapter
+/// injects, so without the refusal the old selector would find that block,
+/// pass the settings check, and fail later in [`resolve_named_provider`] with
+/// a message about an adapter that supplies no such provider.
 pub(crate) const RETIRED_HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
 
-/// The provider names core supplies itself.
+/// The implementation ids core supplies itself.
 ///
-/// A name in this list is already taken, so an adapter that injects a provider
-/// under one of them has two suppliers claiming a single name and
+/// An id in this list is already taken, so an adapter that injects a provider
+/// under one of them has two suppliers claiming a single implementation and
 /// [`build_provider`] refuses the pair rather than picking one. The list holds
 /// one entry per resolution arm in [`resolve_named_provider`], so it grows and
 /// shrinks with them, and it empties when the providers still built into core
-/// become modules like every other provider, at which point no name is
-/// reserved and every provider is injected.
+/// become modules like every other provider, at which point no id is reserved
+/// and every provider is injected.
 const BUILTIN_PROVIDER_KEYS: &[&str] = &[HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY];
 
 /// The registry code of the built-in HMAC provider.
@@ -632,8 +634,12 @@ impl<'a> AcceptedProviders<'a> {
 /// [`GeneratedEdgeCookie`] whose [`id`](GeneratedEdgeCookie::id) is `None`, so
 /// the request proceeds without an Edge Cookie rather than failing.
 pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
-    /// Returns the stable identifier for this provider, used in configuration
-    /// and logs.
+    /// Returns the stable implementation id for this provider, used in
+    /// configuration and logs.
+    ///
+    /// This is what `[ec] provider` selects the provider by, or what an
+    /// `[ec.<name>] implementation` names when the provider is configured
+    /// under a label of the operator's choosing.
     fn id(&self) -> &'static str;
 
     /// The provider's registered code, the `{code}~` namespace of every
@@ -826,19 +832,21 @@ impl EdgeCookieProvider for HostSignalProvider {
     }
 }
 
-/// Refuses an injected provider that claims a name core supplies itself.
+/// Refuses an injected provider that claims an implementation core supplies
+/// itself.
 ///
-/// Two suppliers cannot own one name. Core ships the `hmac` provider, and once
-/// this work merges IAB Tech Lab is itself a vendor shipping an HMAC provider,
-/// so the two really can arrive under the same name in one deployment. The
-/// resolution order alone would answer that by quietly preferring the built-in
-/// one and dropping the injected provider, which an operator has no way to see,
-/// so the pair is refused here and the error names both claimants.
+/// Two suppliers cannot own one implementation. Core ships the `hmac`
+/// provider, and once this work merges IAB Tech Lab is itself a vendor
+/// shipping an HMAC provider, so the two really can arrive under the same id
+/// in one deployment. The resolution order alone would answer that by quietly
+/// preferring the built-in one and dropping the injected provider, which an
+/// operator has no way to see, so the pair is refused here and the error names
+/// both claimants.
 ///
 /// The check runs whatever the selector says, so an operator is told at startup
-/// rather than on the first request that happens to select the contested name,
-/// and it runs before the selection is read so a deployment cannot hide the
-/// clash by selecting something else.
+/// rather than on the first request that happens to select the contested
+/// implementation, and it runs before the selection is read so a deployment
+/// cannot hide the clash by selecting something else.
 ///
 /// # Errors
 ///
@@ -858,11 +866,11 @@ fn ensure_no_name_collision(
     };
     Err(Report::new(TrustedServerError::EdgeCookie {
         message: format!(
-            "Edge Cookie provider name `{claimed}` is claimed twice, by the provider \
-             built into Trusted Server core and by the provider this deployment's \
-             adapter injects. Give the injected provider a name of its own and select \
-             it under that name, because `[ec] provider = \"{claimed}\"` cannot mean \
-             both of them."
+            "Edge Cookie provider implementation `{claimed}` is claimed twice, by the \
+             provider built into Trusted Server core and by the provider this \
+             deployment's adapter injects. Give the injected provider an implementation \
+             of its own and select it under that, because `{claimed}` cannot mean both \
+             of them."
         ),
     }))
 }
@@ -879,10 +887,11 @@ fn ensure_no_name_collision(
 /// # Errors
 ///
 /// Returns [`TrustedServerError::EdgeCookie`] when the named provider cannot be
-/// built: a built-in name whose configuration block is missing, a built-in name
-/// whose host capability this host does not supply, or a name this deployment's
-/// adapter does not inject. All fail loudly rather than leaving the deployment
-/// running stateless under a selector that says otherwise.
+/// built, which is a built-in implementation whose configuration block is
+/// missing, a built-in implementation whose host capability this host does not
+/// supply, or an implementation this deployment's adapter does not inject. All
+/// fail loudly rather than leaving the deployment running stateless under a
+/// selector that says otherwise.
 pub fn build_provider(
     ec: &Ec,
     host_signals: Option<Arc<dyn HostSignals>>,
@@ -896,10 +905,10 @@ pub fn build_provider(
         // Explicit statelessness: the same meaning as omitting the selector.
         EcProviderSelection::None => None,
         // Every provider is named, and this is the one place a name is resolved
-        // to an implementation. Nothing else in the codebase asks whether a
-        // name is built in.
-        EcProviderSelection::Named(key) => {
-            Some(resolve_named_provider(key, ec, host_signals, injected)?)
+        // to an implementation. Nothing else in the codebase asks whether an
+        // implementation is built in.
+        EcProviderSelection::Named(name) => {
+            Some(resolve_named_provider(name, ec, host_signals, injected)?)
         }
     };
     Ok(provider)
@@ -907,62 +916,80 @@ pub fn build_provider(
 
 /// Resolves one provider name to its implementation.
 ///
-/// A name is looked for among the providers built into core first, and is
-/// otherwise the name of a provider the adapter injects through
-/// [`RuntimeServices`](crate::platform::RuntimeServices), the same seam the
-/// device and geo providers use, so core never names a vendor. The injected
-/// provider is used when its own id matches the name, and its
-/// `[ec.providers.<name>]` block is read by the adapter that built it.
+/// The name resolves to the implementation its `[ec.<name>]` block names, or
+/// to the name itself when the block names none or the provider has no block,
+/// and everything below reads that implementation rather than the name the
+/// operator selected. The implementation is looked for among the providers
+/// built into core first, and is otherwise a provider the adapter injects
+/// through [`RuntimeServices`](crate::platform::RuntimeServices), the same seam
+/// the device and geo providers use, so core never names a vendor. The injected
+/// provider is used when its own id matches the implementation, and its
+/// `[ec.<name>]` block is read by the adapter that built it.
 ///
 /// Looking at core first is safe only because
 /// [`ensure_no_name_collision`] has already refused an injected provider that
-/// claims a built-in name, so this order can never shadow one silently.
+/// claims a built-in implementation, so this order can never shadow one
+/// silently.
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError::EdgeCookie`] when the name matches no provider
-/// this deployment can build, when a built-in name has no configuration block,
-/// or when a built-in name needs a host capability this host does not supply.
-/// All fail loudly rather than silently running stateless.
+/// Returns [`TrustedServerError::EdgeCookie`] when the implementation matches
+/// no provider this deployment can build, when a built-in implementation has no
+/// configuration block, or when a built-in implementation needs a host
+/// capability this host does not supply. All fail loudly rather than silently
+/// running stateless, and the unmatched implementation names the
+/// implementations this deployment has.
 fn resolve_named_provider(
-    key: &str,
+    name: &str,
     ec: &Ec,
     host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Box<dyn EdgeCookieProvider>, Report<TrustedServerError>> {
+    let implementation = ec.provider_blocks.implementation(name);
+
     // The only place that knows a provider is built into core rather than
     // supplied as a module. Each arm disappears, along with its name constant,
     // when that provider becomes a module like every other provider, after
     // which its name resolves through the injected path below and nothing else
     // changes.
     //
-    // Settings validation rejects a built-in name with no block before this
-    // runs, so reaching the error means the two checks have drifted apart.
-    // Stopping is the only safe answer: returning no provider would run the
-    // deployment stateless under a selector that says it has an identity
-    // provider.
-    if key == HMAC_PROVIDER_KEY {
-        let config = ec.providers.hmac.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::EdgeCookie {
-                message: "Edge Cookie provider `hmac` is selected but has no \
-                          `[ec.providers.hmac]` configuration"
-                    .to_owned(),
-            })
-        })?;
+    // Settings validation rejects a built-in implementation with no block
+    // before this runs, so reaching the error means the two checks have
+    // drifted apart. Stopping is the only safe answer, because returning no
+    // provider would run the deployment stateless under a selector that says
+    // it has an identity provider.
+    if implementation == HMAC_PROVIDER_KEY {
+        let config = ec
+            .provider_blocks
+            .get(name)
+            .and_then(EcProviderBlock::hmac_settings)
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::EdgeCookie {
+                    message: format!(
+                        "Edge Cookie provider `{name}` uses the `hmac` implementation but \
+                         has no `[ec.{name}]` configuration"
+                    ),
+                })
+            })?;
         return Ok(Box::new(HmacProvider::new(config.passphrase.clone())));
     }
 
     // The host-signal provider needs signals only some hosts supply, and
     // that check cannot be made in settings validation at all, so it is made
     // here rather than creating a degraded identifier under this name.
-    if key == HOST_SIGNALS_PROVIDER_KEY {
-        let config = ec.providers.host_signals.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::EdgeCookie {
-                message: "Edge Cookie provider `host_signals` is selected but has no \
-                          `[ec.providers.host_signals]` configuration"
-                    .to_owned(),
-            })
-        })?;
+    if implementation == HOST_SIGNALS_PROVIDER_KEY {
+        let config = ec
+            .provider_blocks
+            .get(name)
+            .and_then(EcProviderBlock::host_signals_settings)
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::EdgeCookie {
+                    message: format!(
+                        "Edge Cookie provider `{name}` uses the `host_signals` implementation \
+                         but has no `[ec.{name}]` configuration"
+                    ),
+                })
+            })?;
         let signals = host_signals.ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
                 message: "The host_signals Edge Cookie provider requires a host that supplies \
@@ -976,17 +1003,34 @@ fn resolve_named_provider(
         )));
     }
 
+    let known = known_implementations(injected.as_deref());
     injected
-        .filter(|provider| provider.id() == key)
+        .filter(|provider| provider.id() == implementation)
         .map(|provider| Box::new(SharedProvider(provider)) as Box<dyn EdgeCookieProvider>)
         .ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
                 message: format!(
-                    "Edge Cookie provider `{key}` is selected but this deployment's \
-                     adapter does not provide it"
+                    "Edge Cookie provider `{name}` is selected, but its implementation \
+                     `{implementation}` is not one this deployment has. Known \
+                     implementations: {known}"
                 ),
             })
         })
+}
+
+/// The implementations this deployment could build, for an error that has just
+/// refused one it could not.
+///
+/// The providers built into core, plus the one the adapter injects when there
+/// is one, which is the whole set [`resolve_named_provider`] chooses from.
+fn known_implementations(injected: Option<&dyn EdgeCookieProvider>) -> String {
+    BUILTIN_PROVIDER_KEYS
+        .iter()
+        .copied()
+        .chain(injected.map(EdgeCookieProvider::id))
+        .map(|implementation| format!("`{implementation}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Checks once, at startup, that this deployment can build the provider named
@@ -1153,8 +1197,24 @@ impl EdgeCookieProvider for SharedProvider {
 mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
-    use crate::settings::{EcProviders, HmacProviderConfig, HostSignalsProviderConfig};
+    use crate::test_support::tests::{select_hmac_provider, select_host_signals_provider};
     use http::HeaderMap;
+
+    /// Settings selecting the built-in HMAC provider under `name`, which is a
+    /// label whenever it is not the implementation's own name.
+    fn selected_hmac(name: &str) -> Ec {
+        let mut ec = Ec::default();
+        select_hmac_provider(&mut ec, name, test_passphrase().expose());
+        ec
+    }
+
+    /// Settings selecting the built-in host-signal provider under its own
+    /// name, with `passphrase` in its block.
+    fn selected_host_signals(passphrase: &str) -> Ec {
+        let mut ec = Ec::default();
+        select_host_signals_provider(&mut ec, passphrase);
+        ec
+    }
 
     #[test]
     fn a_malformed_provider_code_is_refused_rather_than_panicking() {
@@ -1465,15 +1525,7 @@ mod tests {
         );
 
         // `hmac` with its block builds the built-in provider.
-        let mut providers = EcProviders::default();
-        providers.hmac = Some(HmacProviderConfig {
-            passphrase: test_passphrase(),
-        });
-        let hmac = Ec {
-            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
-            providers,
-            ..Ec::default()
-        };
+        let hmac = selected_hmac(HMAC_PROVIDER_KEY);
         let built = build_provider(&hmac, None, None)
             .expect("the hmac selection should build")
             .expect("the hmac selection should yield a provider");
@@ -1488,8 +1540,8 @@ mod tests {
             "the built-in provider should carry the built-in code"
         );
 
-        // An arbitrary vendor key selects the provider the adapter injected
-        // under that same key.
+        // An arbitrary vendor name selects the provider the adapter injected
+        // under that same implementation.
         let vendor = Ec {
             provider: Some(EcProviderSelection::Named("acme".to_owned())),
             ..Ec::default()
@@ -1500,7 +1552,43 @@ mod tests {
         assert_eq!(
             built.id(),
             "acme",
-            "a vendor key should select the injected provider of that id"
+            "a vendor name should select the injected provider of that id"
+        );
+    }
+
+    #[test]
+    fn a_label_builds_the_implementation_its_block_names() {
+        // The selector names a block, and the block names the implementation,
+        // so everything that resolves the selection has to read the
+        // implementation rather than the label the operator chose.
+        let labeled_hmac = selected_hmac("primary");
+        let built = build_provider(&labeled_hmac, None, None)
+            .expect("a labeled hmac block should build")
+            .expect("a labeled hmac block should yield a provider");
+        assert_eq!(
+            built.id(),
+            HMAC_PROVIDER_KEY,
+            "the label should build the implementation its block names"
+        );
+        assert_eq!(
+            built.code(),
+            HMAC_PROVIDER_CODE,
+            "the identifiers it creates carry the implementation's own code"
+        );
+
+        // The same for a provider the adapter injects, which is matched on the
+        // implementation its block names and not on the label.
+        let labeled_vendor: Ec = toml::from_str(
+            "provider = \"main\"\n\n[main]\nimplementation = \"acme\"\nendpoint = \"https://ec.acme.example.com\"\n",
+        )
+        .expect("should parse a labeled vendor block");
+        let built = build_provider(&labeled_vendor, None, Some(Arc::new(VendorProvider)))
+            .expect("a labeled vendor block should build")
+            .expect("a labeled vendor block should yield a provider");
+        assert_eq!(
+            built.id(),
+            "acme",
+            "the label should build the injected provider its block names"
         );
     }
 
@@ -1658,22 +1746,10 @@ mod tests {
         // deployment really can wire two providers called `hmac`. Resolution
         // order alone would prefer the built-in one and drop the injected one
         // with nothing said, which is the fault this guards.
-        let mut providers = EcProviders::default();
-        providers.hmac = Some(HmacProviderConfig {
-            passphrase: test_passphrase(),
-        });
-        let selected_hmac = Ec {
-            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
-            providers,
-            ..Ec::default()
-        };
+        let hmac = selected_hmac(HMAC_PROVIDER_KEY);
 
-        let err = build_provider(
-            &selected_hmac,
-            None,
-            Some(Arc::new(VendorNamedHmacProvider)),
-        )
-        .expect_err("two providers claiming `hmac` should be refused");
+        let err = build_provider(&hmac, None, Some(Arc::new(VendorNamedHmacProvider)))
+            .expect_err("two providers claiming `hmac` should be refused");
         let message = err.to_string();
         assert!(
             message.contains(HMAC_PROVIDER_KEY),
@@ -1761,6 +1837,36 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_implementation_fails_naming_the_known_ones() {
+        // A label hands the choice of implementation to its block, so a
+        // mistyped implementation has to be refused by name, alongside the
+        // implementations this deployment could have used instead.
+        let ec: Ec =
+            toml::from_str("provider = \"primary\"\n\n[primary]\nimplementation = \"hmca\"\n")
+                .expect("should parse a labeled provider block");
+
+        let err = build_provider(&ec, None, None)
+            .expect_err("an implementation this deployment lacks should be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("`hmca`"),
+            "the error should name the unknown implementation, got: {message}"
+        );
+        assert!(
+            message.contains("`hmac`"),
+            "the error should name the built-in implementation, got: {message}"
+        );
+
+        let err = build_provider(&ec, None, Some(Arc::new(VendorProvider)))
+            .expect_err("an injected provider of another implementation should not stand in");
+        let message = err.to_string();
+        assert!(
+            message.contains("`hmac`") && message.contains("`acme`"),
+            "the error should name every implementation this deployment has, got: {message}"
+        );
+    }
+
+    #[test]
     fn selecting_hmac_without_its_block_fails_loudly() {
         // `Ec::validate_provider_selection` rejects this pair before settings
         // reach the composition root, so the state is built directly here to
@@ -1772,9 +1878,9 @@ mod tests {
         };
 
         let err = build_provider(&ec, None, None)
-            .expect_err("selecting hmac with no [ec.providers.hmac] block should error");
+            .expect_err("selecting hmac with no [ec.hmac] block should error");
         assert!(
-            err.to_string().contains("[ec.providers.hmac]"),
+            err.to_string().contains("[ec.hmac]"),
             "the error should name the missing block, got: {err}"
         );
     }
@@ -1788,15 +1894,7 @@ mod tests {
         // signals and the provider would defer forever. It must come back
         // as nothing to keep, leaving the request path to resolve it against
         // the signals each request actually carried.
-        let mut providers = EcProviders::default();
-        providers.host_signals = Some(HostSignalsProviderConfig {
-            passphrase: test_passphrase(),
-        });
-        let host_signals_selected = Ec {
-            provider: Some(EcProviderSelection::from(HOST_SIGNALS_PROVIDER_KEY)),
-            providers,
-            ..Ec::default()
-        };
+        let host_signals_selected = selected_host_signals(test_passphrase().expose());
         let startup_signals: Arc<dyn HostSignals> = Arc::new(TestHostSignals {
             ja4: None,
             h2: None,
@@ -1830,15 +1928,7 @@ mod tests {
 
         // A provider built from configuration alone is still kept, so the
         // saving stands for every selection that can take it.
-        let mut providers = EcProviders::default();
-        providers.hmac = Some(HmacProviderConfig {
-            passphrase: test_passphrase(),
-        });
-        let hmac_selected = Ec {
-            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
-            providers,
-            ..Ec::default()
-        };
+        let hmac_selected = selected_hmac(HMAC_PROVIDER_KEY);
         let kept = build_reusable_provider(&hmac_selected, None, None)
             .expect("the hmac selection should resolve")
             .expect("a provider built from configuration alone should be kept");
@@ -1923,15 +2013,7 @@ mod tests {
         // Whether the adapter injects a host-signal service is fixed per
         // deployment, so selecting the host-signal provider on an adapter that
         // injects none is knowable without a request.
-        let mut providers = EcProviders::default();
-        providers.host_signals = Some(HostSignalsProviderConfig {
-            passphrase: test_passphrase(),
-        });
-        let selected = Ec {
-            provider: Some(EcProviderSelection::from(HOST_SIGNALS_PROVIDER_KEY)),
-            providers,
-            ..Ec::default()
-        };
+        let selected = selected_host_signals(test_passphrase().expose());
 
         let err = ensure_provider_available(&selected, None, None).expect_err(
             "the host-signal provider should fail the startup check with no host signals",

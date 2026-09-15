@@ -1587,7 +1587,7 @@ mod tests {
                 [ec]
                 provider = "hmac"
 
-                [ec.providers.hmac]
+                [ec.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [request_signing]
@@ -1661,7 +1661,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -2137,7 +2137,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )
@@ -2793,7 +2793,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -3217,7 +3217,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
