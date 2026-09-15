@@ -45,8 +45,8 @@ config_store_id = "app_config"
 secret_store_id = "secrets"
 
 # The integrations this environment runs. GPT diagnostics is the only one, and
-# it takes no settings, so no `[integration.<id>]` block is written: a block
-# for an integration this list does not name is refused at startup.
+# it takes no settings, so no `[integration.<id>]` block is written, and a
+# block for an integration this list does not name is refused at startup.
 [integration]
 provider = ["gpt_diagnostics"]
 

@@ -1902,9 +1902,10 @@ impl IntegrationHeadInjector for ApsRendererIntegration {
 
 /// Register renderer support when the auction plan contains an APS provider.
 ///
-/// Browser integration enablement does not control server-side APS rendering.
-/// An absent or disabled browser block uses trusted-server rendering. An enabled
-/// browser block may select publisher-native rendering.
+/// Naming `aps` in `[integration] provider` does not control server-side APS
+/// rendering. A deployment that does not name it uses trusted-server
+/// rendering, while one that names it may select publisher-native rendering
+/// in its own block.
 ///
 /// # Errors
 ///

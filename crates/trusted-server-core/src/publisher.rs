@@ -5282,10 +5282,10 @@ pub(crate) fn build_auction_request(
 /// EC identifier to any script on the page, and — being stable per visitor — it
 /// could not distinguish one auction from the next either.
 ///
-/// Returns `None` unless the GPT diagnostics integration is enabled, since
+/// Returns `None` unless the GPT diagnostics integration runs, since
 /// nothing else consumes the value.
 fn diagnostics_auction_id(settings: &Settings) -> Option<String> {
-    crate::integrations::gpt_diagnostics::is_enabled(settings)
+    crate::integrations::gpt_diagnostics::runs(settings)
         .then(|| format!("ts-auc-{}", uuid::Uuid::new_v4().simple()))
 }
 
@@ -11823,7 +11823,7 @@ mod tests {
 
         /// [`settings_with_mode`], with one integration configured a stated way.
         ///
-        /// Edits the parsed `[integrations]` map rather than appending TOML, so two
+        /// Edits the parsed `[integration]` map rather than appending TOML, so two
         /// fixtures differ in exactly the field under test.
         fn settings_with_prebid_timeout(mode: &str, timeout_ms: u32) -> Settings {
             let mut settings = settings_with_mode(mode);
@@ -11887,8 +11887,8 @@ mod tests {
             );
             assert_ne!(
                 stored[0], stored[1],
-                "two `[integrations]` configurations must key different templates; one key \
-                 serves the first configuration's injected markup to the second"
+                "two `[integration]` configurations must key different templates, because \
+                 one key serves the first configuration's injected markup to the second"
             );
             assert_eq!(
                 stub.recorded_request_uris().len(),
@@ -11905,7 +11905,7 @@ mod tests {
             // moves between two equal configurations is a cache that never hits, which
             // the spike would report as "no measurable benefit" rather than as a bug.
             //
-            // The two `Settings` are parsed independently, so their `[integrations]`
+            // The two `Settings` are parsed independently, so their `[integration]`
             // maps iterate in different orders — which is what exercises the sort.
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());

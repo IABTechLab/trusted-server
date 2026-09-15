@@ -23,8 +23,10 @@
 //! Add to `trusted-server.toml`:
 //!
 //! ```toml
+//! [integration]
+//! provider = ["datadome"]
+//!
 //! [integration.datadome]
-//! enabled = true
 //! sdk_origin = "https://js.datadome.co"        # SDK script origin
 //! api_origin = "https://api-js.datadome.co"    # Signal collection API origin
 //! cache_ttl_seconds = 3600                     # Cache TTL for tags.js (1 hour)

@@ -239,8 +239,8 @@ pub struct IntegrationSettings {
     /// supplies is refused where the registry is built, which is the only
     /// place an adapter's and a vendor crate's builders are known.
     ///
-    /// The order of the list carries no meaning: integrations run in the order
-    /// their builders are registered. This is unlike
+    /// The order of the list carries no meaning, because integrations run in
+    /// the order their builders are registered. This is unlike
     /// `[permission_signal] sources`, where the order is the policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider: Vec<String>,
@@ -7403,7 +7403,7 @@ source_domain = "partner.example.com"
                     .expect("should compile auction plan"),
             ),
         ) {
-            Ok(_) => panic!("enabled invalid integration should fail registry startup"),
+            Ok(_) => panic!("a named integration with invalid settings should fail startup"),
             Err(err) => err,
         };
         assert!(

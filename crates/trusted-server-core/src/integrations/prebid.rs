@@ -1634,7 +1634,7 @@ impl BidParamOverrideEngine {
 /// Validate and compile server-side Prebid profile override fields.
 ///
 /// This narrow hook shares the existing override compiler without coupling
-/// auction-profile availability to the browser integration's enablement.
+/// auction-profile availability to whether the browser integration runs.
 pub(crate) fn compile_profile_override_rules(
     bid_param_zone_overrides: &std::collections::BTreeMap<
         String,
@@ -3798,7 +3798,7 @@ assume_single_jurisdiction = true
             .integration_config::<LegacyPrebidServerConfig>("prebid")?
             .ok_or_else(|| {
                 Report::new(TrustedServerError::Configuration {
-                    message: "prebid integration config should be present and enabled".to_string(),
+                    message: "prebid integration config should be present".to_string(),
                 })
             })
     }

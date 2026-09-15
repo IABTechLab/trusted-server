@@ -262,7 +262,7 @@ pub fn validate_settings_for_deploy_with(
     structural_settings.validate_admin_coverage()?;
 
     let plan = crate::auction::compile_auction_plan(settings)?;
-    validate_enabled_integrations(settings, &plan, extra_integrations)?;
+    validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     Ok(())
 }
@@ -279,7 +279,7 @@ pub fn validate_settings_for_runtime(
     settings.reject_placeholder_secrets()?;
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
-    validate_enabled_integrations(settings, &plan, &[])?;
+    validate_integration_blocks(settings, &plan, &[])?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
 }
@@ -296,7 +296,7 @@ pub fn validate_settings_for_runtime(
 ///
 /// Returns [`TrustedServerError`] when any integration block fails its
 /// validation.
-fn validate_enabled_integrations(
+fn validate_integration_blocks(
     settings: &Settings,
     plan: &crate::auction::AuctionPlan,
     extra_integrations: &[IntegrationBuilder],
@@ -520,7 +520,7 @@ mod tests {
     /// rejection reached the caller intact.
     const EXTERNAL_REJECTION_MESSAGE: &str = "seam probe refuses to deploy";
 
-    /// Stands in for a vendor integration builder that never enables.
+    /// Stands in for a vendor integration builder that never registers.
     fn build_nothing(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -657,11 +657,11 @@ formats = [{ width = 300, height = 250 }]
         out.join("\n")
     }
 
-    /// Every documented block should be push-ready: uncommenting it, naming
-    /// the integration and setting the shown values must parse and pass field
-    /// validation. Blocks that ship a deliberately-invalid non-secret
-    /// placeholder (GTM `container_id` and `request_signing` store ids) are
-    /// excluded.
+    /// Every documented block should be push-ready, so uncommenting it,
+    /// naming the integration and setting the shown values must parse and
+    /// pass field validation. Blocks that ship a deliberately-invalid
+    /// non-secret placeholder (GTM `container_id` and `request_signing`
+    /// store ids) are excluded.
     #[test]
     fn documented_integration_blocks_validate_when_uncommented_and_named() {
         let base = template_with_resolved_required_secrets();

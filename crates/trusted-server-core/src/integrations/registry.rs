@@ -813,12 +813,12 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
-    // Every builder considered at construction, enabled or not, in order.
+    // Every builder considered at construction, named or not, in order.
     builder_ids: Vec<(&'static str, &'static str)>,
-    enabled_integration_ids: Vec<&'static str>,
+    running_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
     disabled_js_ids: Vec<&'static str>,
-    // Enabled modules served only on their own path, never in the bundle.
+    // Modules that run, served only on their own path, never in the bundle.
     standalone_js_ids: Vec<&'static str>,
     // Modules carried by their registrations, verified against their
     // declared hash at construction.
@@ -832,9 +832,9 @@ struct IntegrationRegistryInner {
     /// a registered integration, for example a module tied to the selected Edge
     /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
     extra_js_module_ids: Vec<&'static str>,
-    // Preparers from every builder, enabled or not, in registration order.
+    // Preparers from every builder, named or not, in registration order.
     request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
-    // Geo providers declared by the enabled registrations, in registration
+    // Geo providers declared by the registrations that run, in registration
     // order. Declaring one does not activate it.
     geo_providers: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
     // Edge Cookie providers each declaring module supplies, in registration
@@ -863,7 +863,7 @@ impl Default for IntegrationRegistryInner {
             options_router: Router::new(),
             routes: Vec::new(),
             builder_ids: Vec::new(),
-            enabled_integration_ids: Vec::new(),
+            running_integration_ids: Vec::new(),
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
             standalone_js_ids: Vec::new(),
@@ -997,10 +997,11 @@ fn resolve_device_provider(
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] naming the module and the
-/// capability when the module declares no device provider, is registered but
-/// not enabled, or is not registered at all. Without this a mistyped selector
-/// would fall back to core's built-in provider with nothing said, which is the
-/// silent wrong answer the geo selector already refuses to give.
+/// capability when the module declares no device provider, is supplied by a
+/// builder `[integration] provider` does not name, or is not registered at
+/// all. Without this a mistyped selector would fall back to core's built-in
+/// provider with nothing said, which is the silent wrong answer the geo
+/// selector already refuses to give.
 fn module_device_provider(
     module_id: &str,
     inner: &IntegrationRegistryInner,
@@ -1014,7 +1015,7 @@ fn module_device_provider(
     }
 
     let message = if inner
-        .enabled_integration_ids
+        .running_integration_ids
         .iter()
         .copied()
         .any(|id| id == module_id)
@@ -1053,8 +1054,8 @@ fn module_device_provider(
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the selector names a
-/// module that is not registered, is registered but not enabled, or is enabled
-/// and declares no geo provider.
+/// module that is not registered, is supplied by a builder `[integration]
+/// provider` does not name, or runs and declares no geo provider.
 fn resolve_geo_provider(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1087,8 +1088,9 @@ fn resolve_geo_provider(
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] naming the module and the
-/// capability when the module declares no geo provider, is registered but not
-/// enabled, or is not registered at all.
+/// capability when the module declares no geo provider, is supplied by a
+/// builder `[integration] provider` does not name, or is not registered at
+/// all.
 fn module_geo_provider(
     module_id: &str,
     inner: &IntegrationRegistryInner,
@@ -1101,7 +1103,7 @@ fn module_geo_provider(
     // loop, so a module that exists but is not named must say so rather than
     // read as a module that never declared the capability.
     let message = if inner
-        .enabled_integration_ids
+        .running_integration_ids
         .iter()
         .copied()
         .any(|id| id == module_id)
@@ -1231,7 +1233,7 @@ impl IntegrationRegistry {
     ///
     /// The plan-backed auction providers, Prebid then APS, register before the
     /// builders, so opening the builder table changes no existing hook order.
-    /// Their ids are reserved for core whether or not they are enabled, so an
+    /// Their ids are reserved for core whether or not they run, so an
     /// outside builder claiming either is refused the way two builders claiming
     /// one id are.
     ///
@@ -1353,7 +1355,7 @@ impl IntegrationRegistry {
 
         for registration in registrations {
             inner
-                .enabled_integration_ids
+                .running_integration_ids
                 .push(registration.integration_id);
 
             for proxy in registration.proxies {
@@ -1511,7 +1513,7 @@ impl IntegrationRegistry {
         self.inner.device_provider.clone()
     }
 
-    /// Every integration id the registry was built from, enabled or not, in
+    /// Every integration id the registry was built from, named or not, in
     /// registration order. A registry test enumerates this to check every
     /// builder was considered, while the deploy validation test iterates the
     /// builder lists themselves rather than this method.
@@ -1758,7 +1760,7 @@ impl IntegrationRegistry {
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
-        for integration_id in &self.inner.enabled_integration_ids {
+        for integration_id in &self.inner.running_integration_ids {
             map.entry(*integration_id)
                 .or_insert_with(|| IntegrationMetadata::new(integration_id));
         }
@@ -1806,14 +1808,14 @@ impl IntegrationRegistry {
 
     /// Return whether an integration runs in this registry.
     #[must_use]
-    pub fn integration_enabled(&self, integration_id: &str) -> bool {
-        self.inner.enabled_integration_ids.contains(&integration_id)
+    pub fn integration_runs(&self, integration_id: &str) -> bool {
+        self.inner.running_integration_ids.contains(&integration_id)
     }
 
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
     /// Always includes JS-only modules with no Rust-side registration.
-    /// Includes enabled integrations only when a browser module serves their
+    /// Includes an integration that runs only when a browser module serves its
     /// id, either compiled into `trusted-server-js` or carried by the
     /// registration, and excludes modules served standalone only.
     #[must_use]
@@ -1823,7 +1825,7 @@ impl IntegrationRegistry {
 
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
-        for id in &self.inner.enabled_integration_ids {
+        for id in &self.inner.running_integration_ids {
             if self.js_part(id).is_some()
                 && !self.inner.standalone_js_ids.contains(id)
                 && !ids.contains(id)
@@ -1844,7 +1846,7 @@ impl IntegrationRegistry {
     }
 
     /// The module part for one id: the registration that carries it, else
-    /// the compile-time module, for an enabled integration or an always-on
+    /// the compile-time module, for an integration that runs or an always-on
     /// core module (`core`, `creative`). `None` when nothing serves that id
     /// or the integration registered without JS.
     ///
@@ -1875,14 +1877,15 @@ impl IntegrationRegistry {
                 sha256: module.sha256,
             });
         }
-        if id != "core" && id != "creative" && !self.integration_enabled(id) {
+        if id != "core" && id != "creative" && !self.integration_runs(id) {
             return None;
         }
         crate::tsjs_bundle::JsModulePart::compile_time(id)
     }
 
-    /// Ids of enabled modules served standalone only. Only enabled
-    /// registrations reach the construction loop, so every id here is enabled.
+    /// Ids of modules that run and are served standalone only. Only a
+    /// registration `[integration] provider` names reaches the construction
+    /// loop, so every id here runs.
     #[must_use]
     pub fn js_standalone_ids(&self) -> Vec<&'static str> {
         self.inner.standalone_js_ids.clone()
@@ -1968,8 +1971,8 @@ impl IntegrationRegistry {
     ///
     /// Only includes modules registered with
     /// [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js)
-    /// that are actually enabled. Returns an empty vec when no deferred
-    /// integrations are configured.
+    /// that actually run. Returns an empty vec when no deferred integration
+    /// runs.
     #[must_use]
     pub fn js_module_ids_deferred(&self) -> Vec<&'static str> {
         self.js_module_ids()
@@ -2004,7 +2007,7 @@ impl IntegrationRegistry {
                 options_router: Router::new(),
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
-                enabled_integration_ids: Vec::new(),
+                running_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
@@ -2045,7 +2048,7 @@ impl IntegrationRegistry {
                 options_router: Router::new(),
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
-                enabled_integration_ids: Vec::new(),
+                running_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
@@ -2082,7 +2085,7 @@ impl IntegrationRegistry {
                 options_router: Router::new(),
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
-                enabled_integration_ids: Vec::new(),
+                running_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
@@ -2159,7 +2162,7 @@ impl IntegrationRegistry {
                 options_router,
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
-                enabled_integration_ids: Vec::new(),
+                running_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
@@ -2220,7 +2223,7 @@ pub(crate) mod test_support {
         ))
     }
 
-    /// Validates nothing and reports the integration as enabled.
+    /// Validates nothing and reports the integration as named.
     pub(crate) fn validate_nothing(
         _settings: &Settings,
     ) -> Result<bool, Report<TrustedServerError>> {
@@ -3345,7 +3348,7 @@ mod tests {
             .expect("should build registry with an external builder");
 
         assert!(
-            registry.integration_enabled("probe"),
+            registry.integration_runs("probe"),
             "should register the external integration"
         );
         let ids = registry.registered_builder_ids();
@@ -3558,7 +3561,7 @@ mod tests {
             .expect("should build registry");
 
         assert!(
-            registry.integration_enabled("probe"),
+            registry.integration_runs("probe"),
             "should still register the integration"
         );
         assert!(
@@ -3754,11 +3757,11 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build registry with request preparers");
         assert!(
-            !registry.integration_enabled("probe-first"),
+            !registry.integration_runs("probe-first"),
             "should leave the first probe integration unnamed, so it does not run"
         );
         assert!(
-            !registry.integration_enabled("probe-second"),
+            !registry.integration_runs("probe-second"),
             "should leave the second probe integration unnamed, so it does not run"
         );
         PREPARER_ORDER
@@ -4161,7 +4164,7 @@ mod tests {
             .expect("should accept an id a supplied builder claims");
 
         assert!(
-            registry.integration_enabled("probe"),
+            registry.integration_runs("probe"),
             "the named module should run"
         );
     }

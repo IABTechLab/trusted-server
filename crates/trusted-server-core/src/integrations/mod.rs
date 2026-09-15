@@ -346,7 +346,7 @@ pub const CORE_SOURCE: &str = "trusted-server-core";
 /// settings.integration.select("example");
 /// let plan = Arc::new(compile_auction_plan(&settings)?);
 /// let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder])?;
-/// assert!(registry.integration_enabled("example"));
+/// assert!(registry.integration_runs("example"));
 /// # Ok(())
 /// # }
 /// ```

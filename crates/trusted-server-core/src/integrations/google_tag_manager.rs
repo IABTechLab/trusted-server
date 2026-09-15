@@ -907,7 +907,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 ///
 /// # Errors
 ///
-/// Returns an error when the Google Tag Manager integration is enabled with
+/// Returns an error when the Google Tag Manager integration runs with
 /// invalid configuration.
 pub fn register(
     settings: &Settings,
@@ -3663,7 +3663,7 @@ assume_single_jurisdiction = true
     }
 
     /// Regression test for the overlapping-rewriter bug: when both the GTM and
-    /// Next.js integrations are enabled and a `<script id="__NEXT_DATA__">`
+    /// Next.js integrations run and a `<script id="__NEXT_DATA__">`
     /// payload is fragmented across chunk boundaries, the GTM rewriter must
     /// NOT clobber the Next.js URL rewrite. In `lol_html`, multiple `text!`
     /// handlers on overlapping selectors run in registration order and the

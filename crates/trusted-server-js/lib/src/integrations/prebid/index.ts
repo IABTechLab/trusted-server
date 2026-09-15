@@ -33,7 +33,7 @@ type PbjsGlobal = typeof _pbjsDefault & {
 
 // Prebid.js itself is NOT bundled into this module. It is served as the
 // external bundle configured via `integration.prebid.external_bundle_url`
-// (required whenever the prebid integration is enabled) and owns the
+// (required whenever the prebid integration runs) and owns the
 // `window.pbjs` global. The Rust head injector emits a stub
 // (`window.pbjs = window.pbjs || {que:[],cmd:[]}`) before any script runs and
 // Prebid.js installs its API onto that same object, so capturing the reference

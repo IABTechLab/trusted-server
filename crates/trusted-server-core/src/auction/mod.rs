@@ -93,7 +93,7 @@ pub fn build_orchestrator_with_plan(
             .ok_or_else(|| {
                 Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "auction mediator `{expected_id}` must reference a separately registered enabled integration with the exact same ID"
+                        "auction mediator `{expected_id}` must reference an integration with the exact same ID that `[integration] provider` names"
                     ),
                 })
             })?;

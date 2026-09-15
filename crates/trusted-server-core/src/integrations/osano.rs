@@ -79,8 +79,8 @@ mod tests {
         settings.integration.select("osano");
 
         let registration = register(&settings)
-            .expect("should parse enabled osano config")
-            .expect("enabled Osano integration should register");
+            .expect("should parse the osano config")
+            .expect("a named Osano integration should register");
 
         assert_eq!(registration.integration_id, "osano");
         assert!(

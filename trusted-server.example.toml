@@ -14,8 +14,8 @@
 # selected, so no identity secret is needed to start. See the Edge Cookie
 # section below.
 #
-# Everything below those is OPTIONAL and commented out: uncomment and edit a
-# block to switch that feature on. An integration takes one more step, because
+# Everything below those is OPTIONAL and commented out, so uncomment and edit
+# a block to switch that feature on. An integration takes one more step, because
 # its id also goes in the `[integration] provider` list (see the Integrations
 # section). All example hosts use `example.com`; replace them with your real
 # endpoints in your private config, not in this template.
@@ -540,7 +540,7 @@ auction_timeout_ms = 500
 # that list is the only switch. The settings it takes, where it takes any, go
 # in an `[integration.<id>]` block, and a block written for an integration the
 # list does not name is refused at startup, so a configuration never reads as
-# though it runs something it does not. Every block below is commented out:
+# though it runs something it does not. Every block below is commented out, so
 # uncomment the ones you want, fill in the fields marked required, and name
 # each id in the list.
 #
@@ -554,7 +554,7 @@ auction_timeout_ms = 500
 # The integrations that run, for example provider = ["gpt", "prebid"].
 provider = []
 
-# JavaScript asset proxy: serves named third-party scripts from first-party
+# JavaScript asset proxy. It serves named third-party scripts from first-party
 # paths. Each asset maps one exact publisher path to one exact HTTPS upstream
 # URL, and `proxy` says what happens to it: "enabled" serves and rewrites it,
 # "disabled" leaves it listed but untouched, "blocked" removes matching script
@@ -670,7 +670,7 @@ provider = []
 # credential_secret_name = "datadome_protection_test_bypass"
 
 # Google Publisher Tag (GPT) first-party proxy. `ts audit` names it in the
-# list above when it finds GPT. Uncomment the block to change a setting: the
+# list above when it finds GPT. Uncomment the block to change a setting. The
 # environment overlay replaces a leaf that is already there and cannot create
 # a missing one, so `gam_attribution_enabled` has to be written here before
 # TRUSTED_SERVER__INTEGRATION__GPT__GAM_ATTRIBUTION_ENABLED can change it.
@@ -694,8 +694,8 @@ provider = []
 
 # Google Tag Manager first-party proxy. `container_id` is required, and
 # `ts audit` writes this block with the container it finds. The placeholder
-# below is invalid on purpose: running GTM without a real GTM-XXXXXX id fails
-# validation.
+# below is invalid on purpose, because running GTM without a real GTM-XXXXXX id
+# fails validation.
 # [integration.google_tag_manager]
 # container_id = "GTM-REPLACE-ME"
 # Must be a credential-free https bare origin with a literal host: no path,
