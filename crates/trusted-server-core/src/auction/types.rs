@@ -113,6 +113,14 @@ pub struct DeviceInfo {
     pub user_agent: Option<String>,
     pub ip: Option<String>,
     pub geo: Option<GeoInfo>,
+    /// Attributes a device module resolved, for the bid request's device
+    /// object.
+    ///
+    /// Absent when no module resolved any, which is the default. Defaulted
+    /// on deserialize so a stored request from before this field existed still
+    /// reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<crate::ec::device::DeviceAttributes>,
 }
 
 /// Site information.

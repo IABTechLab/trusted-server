@@ -20,6 +20,7 @@ use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::module_context::{ModuleContext, ModuleRequest};
 use crate::openrtb::{
     BidExt, BidTrustedServerExt, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt,
     to_openrtb_i32,
@@ -224,6 +225,9 @@ pub fn convert_tsjs_to_auction_request(
             .map(str::to_string),
         ip: services.client_info().client_ip.map(|ip| ip.to_string()),
         geo,
+        // Filled by the caller, which is async and can ask the device
+        // module. This builder is synchronous, so it cannot.
+        attributes: None,
     });
 
     // Forward allowed config entries from the JS request into the context map.
@@ -552,6 +556,67 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     Ok(OpenRtbResponseConversion { response, delivery })
 }
 
+/// Fills the bid request's device attributes from the selected device
+/// module.
+///
+/// Separate from [`convert_tsjs_to_auction_request`] and from the publisher's
+/// own builder because both of those are synchronous and a module that
+/// resolves a device model has to reach a service to do it. Every real auction
+/// path calls this after building its request, so the three surfaces offer the
+/// same inventory rather than one of them being richer by accident.
+///
+/// Does nothing when no module supplies a device module, and nothing when
+/// the module resolves nothing. Neither is a failure: a bidder reads an
+/// absent field as unknown, which is true, whereas a default would be a claim.
+///
+/// The consent-denied path deliberately does not call this. That path builds a
+/// request shape only, to echo the request id back in a no-bid response, and
+/// makes no outbound call of any kind.
+pub async fn attach_device_attributes(
+    request: &mut AuctionRequest,
+    http_req: &http::Request<EdgeBody>,
+    settings: &Settings,
+    services: &RuntimeServices,
+) {
+    let Some(module) = services.device_module() else {
+        return;
+    };
+    let client_ip = services
+        .client_info()
+        .client_ip
+        .map_or_else(String::new, |address| address.to_string());
+    let request_info =
+        crate::evidence::BorrowedRequestInfo::new(&client_ip, Some(http_req.headers()));
+    let context = ModuleContext::new(ModuleRequest::of(http_req, services.client_info()))
+        .with_evidence(&request_info)
+        .with_settings(settings)
+        .with_services(services);
+    let Some(attributes) = module
+        .advertising_attributes(context.call(module.id(), module.required_permissions()))
+        .await
+    else {
+        return;
+    };
+    // An empty object and an absent one say the same to a bidder, and the
+    // absent one is smaller.
+    if attributes.is_empty() {
+        return;
+    }
+
+    // The publisher path leaves the device object out when the request
+    // carried no User-Agent, so this creates one rather than dropping
+    // attributes that were resolved.
+    request
+        .device
+        .get_or_insert(DeviceInfo {
+            user_agent: None,
+            ip: None,
+            geo: None,
+            attributes: None,
+        })
+        .attributes = Some(attributes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +651,193 @@ mod tests {
         )]);
         config.timeout_ms = 900;
         AuctionPlan::compile(config).expect("should compile plan")
+    }
+
+    /// A device module that resolves fixed attributes, standing in for a
+    /// vendor that reaches a service.
+    #[derive(Debug)]
+    struct StubDeviceModule {
+        attributes: Option<crate::ec::device::DeviceAttributes>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::device::DeviceModule for StubDeviceModule {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn detect(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> crate::ec::device::DeviceSignals {
+            crate::ec::device::DeviceSignals::unknown()
+        }
+
+        async fn advertising_attributes(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> Option<crate::ec::device::DeviceAttributes> {
+            self.attributes.clone()
+        }
+    }
+
+    fn empty_request() -> http::Request<EdgeBody> {
+        http::Request::builder()
+            .uri("https://www.example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build the request")
+    }
+
+    fn stub_attributes() -> crate::ec::device::DeviceAttributes {
+        crate::ec::device::DeviceAttributes {
+            device_type: Some(4),
+            make: Some("ExampleCorp".to_owned()),
+            model: Some("EX-1".to_owned()),
+            os: Some("Android".to_owned()),
+            os_version: Some("15.0".to_owned()),
+            screen_width: Some(1080),
+            screen_height: Some(2400),
+        }
+    }
+
+    fn request_with_device(device: Option<DeviceInfo>) -> AuctionRequest {
+        let mut request = make_auction_request();
+        request.device = device;
+        request
+    }
+
+    #[tokio::test]
+    async fn the_selected_module_fills_the_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule {
+                attributes: Some(stub_attributes()),
+            }),
+        );
+        let mut request = request_with_device(Some(DeviceInfo {
+            user_agent: Some("Mozilla/5.0".to_owned()),
+            ip: None,
+            geo: None,
+            attributes: None,
+        }));
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+        )
+        .await;
+
+        assert_eq!(
+            request
+                .device
+                .as_ref()
+                .and_then(|device| device.attributes.as_ref()),
+            Some(&stub_attributes()),
+            "a resolved device must reach the request the bidder is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_that_resolves_an_empty_device_adds_no_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule {
+                attributes: Some(crate::ec::device::DeviceAttributes::default()),
+            }),
+        );
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+        )
+        .await;
+
+        assert!(
+            request.device.is_none(),
+            "an empty device object says nothing a bidder cannot read from its absence"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_device_module_leaves_the_request_untouched() {
+        let services = crate::platform::test_support::noop_services();
+        let mut request = request_with_device(Some(DeviceInfo {
+            user_agent: Some("Mozilla/5.0".to_owned()),
+            ip: None,
+            geo: None,
+            attributes: None,
+        }));
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+        )
+        .await;
+
+        assert!(
+            request
+                .device
+                .as_ref()
+                .is_some_and(|device| device.attributes.is_none()),
+            "the default deployment supplies no device provider and must send no attributes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_resolves_nothing_adds_no_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule { attributes: None }),
+        );
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+        )
+        .await;
+
+        assert!(
+            request.device.is_none(),
+            "an unresolved device must not become an empty device object, which a bidder \
+             reads as a claim that the fields are absent rather than unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_attributes_create_the_device_object_when_there_was_none() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule {
+                attributes: Some(stub_attributes()),
+            }),
+        );
+        // The publisher path leaves the device object out entirely when the
+        // request carried no User-Agent, so this is a real state and not a
+        // contrived one.
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+        )
+        .await;
+
+        assert_eq!(
+            request
+                .device
+                .as_ref()
+                .and_then(|device| device.attributes.as_ref()),
+            Some(&stub_attributes()),
+            "attributes that were resolved must not be dropped for want of a device object"
+        );
     }
 
     fn make_auction_request() -> AuctionRequest {
