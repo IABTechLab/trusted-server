@@ -2974,7 +2974,7 @@ mod tests {
     fn stateless_settings() -> Settings {
         let mut settings = create_test_settings();
         settings.ec.provider = None;
-        settings.ec.providers.hmac = None;
+        settings.ec.provider_blocks.clear();
         settings
     }
 

@@ -120,7 +120,7 @@ fn build_state_with_settings(
     // for every request. It injects and threads no provider, so `EcContext`
     // resolves the selection itself on every request, building a fresh built-in
     // provider that reads no request data. It supplies no host signals either,
-    // so the host-signals argument is `None`.
+    // so the `host_signals` argument is `None`.
     ensure_provider_available(&settings.ec, None, None)?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
@@ -712,8 +712,8 @@ mod tests {
     use super::*;
 
     /// Settings selecting a vendor Edge Cookie provider this adapter does not
-    /// inject, with the `[ec.providers.<key>]` block configuration validation
-    /// requires. `acme` is a fictional vendor key.
+    /// inject, with the `[ec.acme]` block that provider's settings live in.
+    /// `acme` is a fictional vendor key.
     const UNINJECTED_PROVIDER_TOML: &str = r#"
         [[handlers]]
         path = "^/_ts/admin"
@@ -729,7 +729,7 @@ mod tests {
         [ec]
         provider = "acme"
 
-        [ec.providers.acme]
+        [ec.acme]
         endpoint = "https://ec.acme.example.com"
 
         # An Edge Cookie provider is configured, so single-jurisdiction

@@ -76,15 +76,16 @@ proxy_secret = "publisher_proxy_secret"
 # OPTIONAL — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
-# Edge Cookie identity is OFF by default: with no provider selected, Trusted
+# Edge Cookie identity is OFF by default. With no provider selected, Trusted
 # Server runs statelessly and generates no Edge Cookie. Activate one by
-# uncommenting the selector AND its [ec.providers.<key>] block together (a
-# block with no selector is rejected at startup). Deployment tooling can merge
-# a TRUSTED_SERVER__EC__PROVIDER environment value into the published
-# configuration before it is loaded; the running server itself reads its
-# settings from the platform config store, not the environment. The built-in
-# hmac provider is host-neutral, and a vendor provider ships in its own crate
-# that the adapter composes in.
+# uncommenting the selector below, together with that provider's own
+# [ec.<name>] block when it has settings (a block the selector does not name
+# is rejected at startup). Deployment tooling can merge a
+# TRUSTED_SERVER__EC__PROVIDER environment value into the published
+# configuration before it is loaded, and the running server itself reads its
+# settings from the platform config store rather than the environment. The
+# built-in hmac provider is host-neutral, and a vendor provider ships in its
+# own crate that the adapter composes in.
 # provider = "hmac"
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
@@ -101,7 +102,16 @@ pull_sync_concurrency = 3
 # holding the secret used to derive EC identifiers. That secret must be
 # >= 32 bytes and non-placeholder in production. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
-# [ec.providers.hmac]
+# [ec.hmac]
+# passphrase = "ec_passphrase"
+
+# A block can name the implementation it configures, which makes the block's
+# own name a label of your choosing. The same provider could therefore be
+# selected as `provider = "primary"` and configured in the block below
+# instead, which is how a deployment gives a provider a name that means
+# something to the people running it.
+# [ec.primary]
+# implementation = "hmac"
 # passphrase = "ec_passphrase"
 
 # Example partner configuration. Provision referenced keys in
