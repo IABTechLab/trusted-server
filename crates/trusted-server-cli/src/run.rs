@@ -10,6 +10,7 @@ use trusted_server_core::config::TrustedServerAppConfig;
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]
@@ -36,6 +37,8 @@ enum Command {
     Deploy(DeployArgs),
     /// Probe a deployed version until it reports healthy.
     Healthcheck(HealthcheckArgs),
+    /// Experimental self-hosted Prebid Server configuration and AWS operations.
+    Pbs(PbsArgs),
     /// Trusted Server Prebid commands.
     Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
@@ -143,6 +146,9 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Healthcheck(args) => {
             edgezero_cli::run_healthcheck(&args).map(|()| RunOutcome::Success)
         }
+        Command::Pbs(args) => pbs::run(&args)
+            .map(|()| RunOutcome::Success)
+            .map_err(|error| error.current_context().to_string()),
         Command::Prebid(prebid) => {
             let mut generator = NpmPrebidBundleGenerator;
             let mut stdout = std::io::stdout();
@@ -184,6 +190,77 @@ mod tests {
             err.kind(),
             clap::error::ErrorKind::DisplayVersion,
             "should print the version rather than fail to parse"
+        );
+    }
+
+    #[test]
+    fn parses_pbs_inspect() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "pbs",
+                "inspect",
+                "--config",
+                "trusted-server.toml",
+                "--json"
+            ])
+            .is_ok(),
+            "should accept the standalone PBS command namespace"
+        );
+    }
+
+    #[test]
+    fn pbs_rejects_ambiguous_secret_inputs_and_unimplemented_commands() {
+        for arguments in [
+            vec!["ts", "pbs", "deploy"],
+            vec!["ts", "pbs", "rollback", "--release", "example"],
+            vec!["ts", "pbs", "check"],
+            vec![
+                "ts",
+                "pbs",
+                "secrets",
+                "set",
+                "examplebidder",
+                "--deployment",
+                "deployment.yaml",
+                "--region",
+                "us-east-1",
+                "--yes",
+            ],
+            vec![
+                "ts",
+                "pbs",
+                "secrets",
+                "set",
+                "examplebidder",
+                "--deployment",
+                "deployment.yaml",
+                "--region",
+                "us-east-1",
+                "--file",
+                "secret.json",
+                "--stdin",
+            ],
+        ] {
+            assert!(
+                Args::try_parse_from(arguments).is_err(),
+                "should reject unsafe or unsupported command shape"
+            );
+        }
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "pbs",
+                "check",
+                "--deployment",
+                "deployment.yaml",
+                "--json"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(["ts", "prebid", "bundle", "--config", "trusted-server.toml"])
+                .is_ok()
         );
     }
 
