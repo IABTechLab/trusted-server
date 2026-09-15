@@ -15,6 +15,7 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 | [Getting Started](https://iabtechlab.github.io/trusted-server/guide/getting-started)    | Installation and setup                     |
 | [Architecture](https://iabtechlab.github.io/trusted-server/guide/architecture)          | System architecture overview               |
 | [Configuration](https://iabtechlab.github.io/trusted-server/guide/configuration)        | Configuration reference                    |
+| [Configuration Rules](https://iabtechlab.github.io/trusted-server/guide/configuration-rules) | The one syntax every pluggable component shares, and what is checked before a request is served |
 | [Trusted Server CLI](https://iabtechlab.github.io/trusted-server/guide/cli)             | `ts` CLI install and command reference     |
 | [Integrations](https://iabtechlab.github.io/trusted-server/guide/integrations-overview) | Partner integrations (Prebid, Lockr, etc.) |
 
@@ -37,8 +38,9 @@ ts --help
 
 # Create local config, then edit placeholders before validation
 ts config init
-# Edit trusted-server.toml. Server auctions use map-shaped
-# [auction.providers.<id>] and [auction.bidders.<id>] tables.
+# Edit trusted-server.toml. Every pluggable component follows one syntax:
+# [<type>] provider = "<name>" with settings in [<type>.<name>]. See the
+# Configuration Rules guide linked above.
 ts config validate
 
 # Audit a public page with Chrome/Chromium to bootstrap a draft config

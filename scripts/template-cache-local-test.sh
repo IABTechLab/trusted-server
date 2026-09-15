@@ -265,16 +265,22 @@ s = replace_once(
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
-    '[integrations.prebid]\nenabled = false',
-    '[integrations.prebid]\nenabled = true\n'
-    'external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-stub.js"',
-    "Prebid integration",
+    '[integration]\nprovider = []',
+    '[integration]\nprovider = ["prebid"]',
+    "integration selector",
+)
+s = replace_once(
+    s,
+    '# [integration.prebid]\n',
+    '[integration.prebid]\n'
+    'external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-stub.js"\n',
+    "Prebid integration settings",
 )
 s = replace_once(
     s,
     'endpoint = "https://prebid.example.com/openrtb2/auction"',
     f'endpoint = "https://localhost:{bid_port}/bid"\ntimeout_ms = 5000',
-    "Prebid provider endpoint",
+    "Prebid Server demand endpoint",
 )
 s = replace_once(
     s,
@@ -282,12 +288,12 @@ s = replace_once(
     '\n[proxy]\nallowed_domains = ["assets.example.com", "127.0.0.1"]\n',
     "proxy table",
 )
+# The auction's own key is the template's only uncommented `enabled = false`,
+# so the switch does not have to quote the comment block sitting above it.
 s = replace_once(
     s,
-    '[auction]\n# Keep disabled until provider endpoints, routes, and profile values below are\n'
-    '# replaced with deployment-specific settings.\nenabled = false',
-    '[auction]\n# Keep disabled until provider endpoints, routes, and profile values below are\n'
-    '# replaced with deployment-specific settings.\nenabled = true',
+    '\nenabled = false\n',
+    '\nenabled = true\n',
     "auction enablement",
 )
 s = replace_once(
@@ -359,7 +365,7 @@ region = "CA"
 utc_offset = -800
 GEOEOF
 
-# The application registers provider backends dynamically. Pre-register the exact
+# The application registers demand backends dynamically. Pre-register the exact
 # deterministic name so Viceroy reuses a local backend that trusts the temporary CA.
 python3 - "$WORK/fastly.toml" "$WORK/ca-cert.pem" "$BID_PORT" <<'PYEOF'
 import hashlib
@@ -367,7 +373,7 @@ import json
 import sys
 
 manifest, ca_certificate, port = sys.argv[1:4]
-provider_id = "pbs-main"
+provider_id = "pbs_main"
 timeout_ms = "5000"
 
 

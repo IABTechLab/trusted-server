@@ -28,10 +28,9 @@ use crate::auction::openrtb::{
 };
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::plan::AuctionPlan;
-use crate::integrations::prebid_server::PrebidServerDemand;
 #[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::routing::{TransportHeaders, ProviderAuctionInput};
+use crate::auction::routing::{ProviderAuctionInput, TransportHeaders};
 #[cfg(test)]
 use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
@@ -41,6 +40,7 @@ use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
+use crate::integrations::prebid_server::PrebidServerDemand;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
@@ -4858,7 +4858,7 @@ external_bundle_sri = "sha384-AAAA"
             ),
         ]);
         let plan = AuctionPlan::compile(config)
-        .expect("should compile plan while browser integration is not part of compilation");
+            .expect("should compile plan while browser integration is not part of compilation");
 
         let inserts = integration.head_inserts_for_plan(&browser_config, &plan);
         let script = &inserts[0];

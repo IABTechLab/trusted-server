@@ -1004,7 +1004,9 @@ mod tests {
         let settings = Settings::from_toml(&settings_toml)
             .expect("should parse settings with disabled templates");
         let calls = Arc::new(Mutex::new(0));
-        let mut orchestrator = AuctionOrchestrator::new(crate::auction::test_support::legacy_auction_config(&settings));
+        let mut orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
         orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
             calls: Arc::clone(&calls),
         }));

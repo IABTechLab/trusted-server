@@ -1344,16 +1344,16 @@ password = "production-admin-password-32-bytes"
         }
     }
 
-    /// Validation reaches the blocks of the integrations the auction plan
-    /// carries, being Prebid, APS and the ad server mock, which have no builder
-    /// and so are not covered by
-    /// `deploy_validation_reaches_every_built_in_builder`. Each is planted with
-    /// a block its config type cannot deserialize, and the rejection must name
-    /// that integration, so a failure elsewhere in validation cannot pass for
-    /// it.
+    /// Validation reaches the block of the one integration the auction plan
+    /// still carries, being Prebid, which has no builder and so is not covered
+    /// by `deploy_validation_reaches_every_built_in_builder`. It is planted
+    /// with a block its config type cannot deserialize, and the rejection must
+    /// name the integration, so a failure elsewhere in validation cannot pass
+    /// for it.
     #[test]
-    fn validation_reaches_every_plan_backed_integration() {
-        for id in ["prebid"] {
+    fn validation_reaches_the_plan_backed_prebid_block() {
+        {
+            let id = "prebid";
             let mut settings = valid_settings();
             settings
                 .integrations

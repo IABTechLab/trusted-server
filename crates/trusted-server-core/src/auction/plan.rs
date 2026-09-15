@@ -311,8 +311,14 @@ impl AuctionPlan {
                 "auction timeout_ms must be greater than zero",
             ));
         }
-        config.demand.validate("demand").map_err(configuration_error)?;
-        config.adserver.validate("adserver").map_err(configuration_error)?;
+        config
+            .demand
+            .validate("demand")
+            .map_err(configuration_error)?;
+        config
+            .adserver
+            .validate("adserver")
+            .map_err(configuration_error)?;
         let signing_enabled = compile_signing_enabled(config.request_signing.as_ref())?;
 
         let mut providers = Vec::new();
@@ -335,9 +341,7 @@ impl AuctionPlan {
                 })?;
             let mut settings = config.demand.settings_of(name);
             let endpoint = take_setting::<String>(&mut settings, "demand", name, ENDPOINT_KEY)?
-                .ok_or_else(|| {
-                    configuration_error(format!("[demand.{name}] needs an endpoint"))
-                })?;
+                .ok_or_else(|| configuration_error(format!("[demand.{name}] needs an endpoint")))?;
             let timeout_ms = take_setting::<u32>(&mut settings, "demand", name, TIMEOUT_KEY)?;
             let routing = take_setting::<RoutingMode>(&mut settings, "demand", name, ROUTING_KEY)?
                 .unwrap_or_default();
@@ -672,8 +676,7 @@ fn check_endpoint(
         Some(Host::Ipv6(address)) => address.is_loopback(),
         None => false,
     };
-    let scheme_allowed =
-        endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback);
+    let scheme_allowed = endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback);
     if !scheme_allowed
         || endpoint.host().is_none()
         || !endpoint.username().is_empty()
@@ -739,9 +742,9 @@ fn compile_notifications(
 mod tests {
     use super::*;
     use crate::integrations::aps::ApsDemand;
-    use crate::provider_table::IMPLEMENTATION_KEY;
     use crate::integrations::openrtb::OpenRtbDemand;
     use crate::integrations::prebid_server::PrebidServerDemand;
+    use crate::provider_table::IMPLEMENTATION_KEY;
     use serde_json::json;
 
     /// The demand implementations the built-in builders register.
@@ -868,8 +871,7 @@ mod tests {
                 ("left_behind".to_string(), table("openrtb")),
             ]),
         );
-        let error =
-            AuctionPlan::compile(raw).expect_err("should refuse a table nothing selects");
+        let error = AuctionPlan::compile(raw).expect_err("should refuse a table nothing selects");
         let message = error.to_string();
         assert!(
             message.contains("left_behind") && message.contains("provider"),
@@ -1239,7 +1241,10 @@ mod tests {
     #[test]
     fn openrtb_extensions_are_bounded_and_cannot_claim_reserved_fields() {
         let mut valid = table("openrtb");
-        valid.insert("request_ext".to_string(), json!({"fictional_account": "example"}));
+        valid.insert(
+            "request_ext".to_string(),
+            json!({"fictional_account": "example"}),
+        );
         valid.insert("imp_ext".to_string(), json!({"placement_group": "display"}));
         let plan = AuctionPlan::compile(config(vec![("one", valid)]))
             .expect("should compile static extensions");
@@ -1420,10 +1425,8 @@ mod tests {
         );
 
         let mut invalid = config(Vec::new());
-        invalid.adserver = ProviderChoice::new(
-            Some("fictional_adserver".to_string()),
-            BTreeMap::new(),
-        );
+        invalid.adserver =
+            ProviderChoice::new(Some("fictional_adserver".to_string()), BTreeMap::new());
         let error = AuctionPlan::compile(invalid)
             .expect_err("should refuse an ad server this build does not have");
         assert!(

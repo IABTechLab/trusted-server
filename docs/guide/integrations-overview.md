@@ -34,8 +34,10 @@ Server demand.
 **Configuration:**
 
 ```toml
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -44,14 +46,16 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+provider = ["pbs_main"]
+
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [auction.bidders.example-server]
-provider = "pbs-main"
+provider = "pbs_main"
 ```
 
 **Endpoints:**
@@ -81,8 +85,10 @@ provider = "pbs-main"
 **Configuration:**
 
 ```toml
-[integrations.nextjs]
-enabled = false
+[integration]
+provider = ["nextjs"]
+
+[integration.nextjs]
 rewrite_attributes = ["href", "link", "url"]
 ```
 
@@ -109,8 +115,10 @@ rewrite_attributes = ["href", "link", "url"]
 **Configuration:**
 
 ```toml
-[integrations.permutive]
-enabled = true
+[integration]
+provider = ["permutive"]
+
+[integration.permutive]
 organization_id = "myorg"
 workspace_id = "workspace-12345"
 project_id = "project-789"
@@ -150,8 +158,10 @@ rewrite_sdk = true
 **Configuration:**
 
 ```toml
-[integrations.sourcepoint]
-enabled = true
+[integration]
+provider = ["sourcepoint"]
+
+[integration.sourcepoint]
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
 # auth_cookie_name = "sp_auth"
@@ -183,8 +193,8 @@ cache_ttl_seconds = 3600
 **Configuration:**
 
 ```toml
-[integrations.osano]
-enabled = true
+[integration]
+provider = ["osano"]
 ```
 
 **Endpoints:** None. Osano v1 only enables the browser consent mirror module.
@@ -216,8 +226,8 @@ enabled = true
 **Configuration:**
 
 ```toml
-[integrations.gpt_diagnostics]
-enabled = true
+[integration]
+provider = ["gpt_diagnostics"]
 ```
 
 **Endpoints:** None. The feature observes GPT in the browser and makes no diagnostic network request.
@@ -243,8 +253,10 @@ enabled = true
 **Configuration:**
 
 ```toml
-[integrations.testlight]
-enabled = true
+[integration]
+provider = ["testlight"]
+
+[integration.testlight]
 endpoint = "https://testlight-server.example.com"
 timeout_ms = 1000
 shim_src = "/static/tsjs-unified.js"
@@ -334,20 +346,22 @@ Are you developing/testing integrations?
 ## Environment Variables
 
 EdgeZero overlays existing scalar leaves only. Use the
-`TRUSTED_SERVER__INTEGRATIONS__{INTEGRATION}__{SETTING}` pattern for integration
-leaves. Provider map keys preserve hyphens, so `pbs-main` uses `PBS-MAIN`, not
-`PBS_MAIN`. Shell assignment syntax cannot contain that hyphenated name; use
-`env` when running the CLI:
+`TRUSTED_SERVER__INTEGRATION__{INTEGRATION}__{SETTING}` pattern for integration
+leaves and `TRUSTED_SERVER__DEMAND__{NAME}__{SETTING}` for a demand source.
+Every provider name is snake_case, so a name maps straight onto a path
+segment:
 
 ```bash
-env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000' \
-  'TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
-  ts config validate
+export TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=2000
+export TRUSTED_SERVER__INTEGRATION__PREBID__DEBUG=true
+export TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true
+ts config validate
 ```
 
-Edit TOML and re-push it to change arrays, tables, maps, or rules. See
-[Configuration Reference](./configuration.md) for complete details.
+A `provider` list is an array, so it cannot be set this way. Edit TOML and
+re-push it to change arrays, tables, maps, or rules. See
+[Configuration Reference](./configuration.md) and
+[Configuration Rules](./configuration-rules.md) for complete details.
 
 ## Custom Integrations
 

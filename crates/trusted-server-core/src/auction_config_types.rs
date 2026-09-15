@@ -9,7 +9,9 @@ const MOVED_PROVIDERS_MESSAGE: &str = "`[auction.providers]` has moved. Select d
 
 const MOVED_MEDIATOR_MESSAGE: &str = "`[auction] mediator` has moved. Select the ad server with `[adserver] provider = \"<name>\"` and give it its settings in `[adserver.<name>]`, as the configuration rules describe";
 
-pub use crate::auction::plan::{BidderId, BidderRouteConfig, NotificationConfig, ProviderId, RoutingMode};
+pub use crate::auction::plan::{
+    BidderId, BidderRouteConfig, NotificationConfig, ProviderId, RoutingMode,
+};
 
 /// Auction orchestration configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]

@@ -74,9 +74,10 @@ struct OpenRtbSettings {
 fn compile(
     settings: &Map<String, Value>,
 ) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
-    let settings = OpenRtbSettings::deserialize(Value::Object(settings.clone())).map_err(|error| {
-        configuration_error(format!("invalid `{OPENRTB_ID}` settings: {error}"))
-    })?;
+    let settings =
+        OpenRtbSettings::deserialize(Value::Object(settings.clone())).map_err(|error| {
+            configuration_error(format!("invalid `{OPENRTB_ID}` settings: {error}"))
+        })?;
     Ok(Arc::new(OpenRtbDemand {
         request_ext: validate_static_extension("request_ext", settings.request_ext)?,
         imp_ext: validate_static_extension("imp_ext", settings.imp_ext)?,

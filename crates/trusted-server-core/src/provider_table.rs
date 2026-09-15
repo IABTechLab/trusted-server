@@ -76,7 +76,9 @@ impl ProviderSelection for Vec<String> {
             Value::String(name) => Err(format!(
                 "`provider` is a list for this type, so write [\"{name}\"]"
             )),
-            other => Err(format!("`provider` must be a list of names, found `{other}`")),
+            other => Err(format!(
+                "`provider` must be a list of names, found `{other}`"
+            )),
         }
     }
 
@@ -268,7 +270,8 @@ impl<S: ProviderSelection> Serialize for ProviderTable<S> {
         Z: Serializer,
     {
         let selection = self.selected.to_value();
-        let mut map = serializer.serialize_map(Some(self.tables.len() + usize::from(selection.is_some())))?;
+        let mut map =
+            serializer.serialize_map(Some(self.tables.len() + usize::from(selection.is_some())))?;
         if let Some(selection) = selection {
             map.serialize_entry(SELECTOR_KEY, &selection)?;
         }
@@ -303,7 +306,9 @@ mod tests {
             "a name with no table should be its own implementation"
         );
         assert!(
-            !table.settings_of("pbs_demo").contains_key(IMPLEMENTATION_KEY),
+            !table
+                .settings_of("pbs_demo")
+                .contains_key(IMPLEMENTATION_KEY),
             "settings should not carry the implementation line"
         );
         table.validate("demand").expect("should accept the table");
@@ -317,7 +322,9 @@ mod tests {
         }))
         .expect("should read the table");
 
-        let error = table.validate("demand").expect_err("should reject an unselected table");
+        let error = table
+            .validate("demand")
+            .expect_err("should reject an unselected table");
         assert!(
             error.contains("[demand.pbs_demo]") && error.contains("does not select"),
             "should name the table and the fix: {error}"
@@ -326,10 +333,12 @@ mod tests {
 
     #[test]
     fn rejects_a_name_selected_twice() {
-        let table = list(serde_json::json!({ "provider": ["aps", "aps"] }))
-            .expect("should read the table");
+        let table =
+            list(serde_json::json!({ "provider": ["aps", "aps"] })).expect("should read the table");
 
-        let error = table.validate("demand").expect_err("should reject a duplicate");
+        let error = table
+            .validate("demand")
+            .expect_err("should reject a duplicate");
         assert!(error.contains("more than once"), "should say why: {error}");
     }
 
@@ -340,7 +349,10 @@ mod tests {
             let error = table
                 .validate("demand")
                 .expect_err("should reject a name that is not snake_case");
-            assert!(error.contains("snake_case"), "should say why for `{name}`: {error}");
+            assert!(
+                error.contains("snake_case"),
+                "should say why for `{name}`: {error}"
+            );
         }
     }
 

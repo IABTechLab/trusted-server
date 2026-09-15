@@ -45,19 +45,17 @@ fn build(
     name: &str,
     settings: &serde_json::Map<String, Json>,
 ) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
-    let settings: AdServerMockSettings =
-        serde_json::from_value(Json::Object(settings.clone())).map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("invalid `{ADSERVER_MOCK_ID}` settings: {error}"),
-            })
-        })?;
-    settings
-        .validate()
+    let settings: AdServerMockSettings = serde_json::from_value(Json::Object(settings.clone()))
         .map_err(|error| {
             Report::new(TrustedServerError::Configuration {
                 message: format!("invalid `{ADSERVER_MOCK_ID}` settings: {error}"),
             })
         })?;
+    settings.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("invalid `{ADSERVER_MOCK_ID}` settings: {error}"),
+        })
+    })?;
     Ok(Arc::new(AdServerMockProvider::new(name, settings)))
 }
 
@@ -909,8 +907,7 @@ mod tests {
             },
         );
 
-        let auction_response =
-            provider.parse_adserver_response(&adserver_response, 42, &bid_index);
+        let auction_response = provider.parse_adserver_response(&adserver_response, 42, &bid_index);
 
         assert_eq!(auction_response.status, BidStatus::Success);
         assert_eq!(auction_response.bids.len(), 1);
@@ -1013,8 +1010,7 @@ mod tests {
             },
         );
 
-        let auction_response =
-            provider.parse_adserver_response(&adserver_response, 42, &bid_index);
+        let auction_response = provider.parse_adserver_response(&adserver_response, 42, &bid_index);
 
         assert_eq!(
             auction_response.bids[0].bid_id.as_deref(),

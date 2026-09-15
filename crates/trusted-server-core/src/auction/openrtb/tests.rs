@@ -62,8 +62,7 @@ fn config_with_endpoint(
 }
 
 fn routed(implementation: &str, settings: Value) -> (AuctionPlan, RoutedAuction) {
-    let plan =
-        AuctionPlan::compile(config(implementation, settings)).expect("should compile plan");
+    let plan = AuctionPlan::compile(config(implementation, settings)).expect("should compile plan");
     let inbound = Request::builder()
         .uri("https://publisher.example/auction")
         .header(
@@ -212,8 +211,9 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
             } else {
                 json!({})
             };
-            let value = serde_json::to_value(build_with_request(implementation, config, canonical, None))
-                .expect("should serialize request");
+            let value =
+                serde_json::to_value(build_with_request(implementation, config, canonical, None))
+                    .expect("should serialize request");
             let regs = value.get("regs");
             if implementation == "aps" {
                 let regs = regs.expect("APS should preserve empty admitted context");

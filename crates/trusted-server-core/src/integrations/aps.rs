@@ -19,12 +19,12 @@ use url::Url;
 use validator::Validate;
 use validator::ValidationError;
 
+use crate::auction::demand::{
+    CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy, DemandImplementation,
+    DemandResponse, DemandTimeoutDefault, RegsPolicy,
+};
 use crate::auction::openrtb::ignored_bidder_params_count;
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
-use crate::auction::demand::{
-    CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy,
-    DemandImplementation, DemandResponse, DemandTimeoutDefault, RegsPolicy,
-};
 #[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::routing::ProviderAuctionInput;
@@ -425,7 +425,6 @@ impl Default for LegacyApsProviderConfig {
     }
 }
 
-
 /// The APS demand implementation.
 pub static DEMAND: DemandImplementation = DemandImplementation {
     id: APS_INTEGRATION_ID,
@@ -466,7 +465,11 @@ pub struct ApsDemand {
 
 /// Refuse the legacy APS bid path, which this implementation does not speak.
 fn check_aps_endpoint(endpoint: &mut Url) -> Result<(), String> {
-    if endpoint.path().trim_end_matches('/').ends_with("/e/dtb/bid") {
+    if endpoint
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/e/dtb/bid")
+    {
         return Err("names the unsupported legacy APS path `/e/dtb/bid`".to_string());
     }
     Ok(())
@@ -485,9 +488,7 @@ fn compile_demand(
 /// # Errors
 ///
 /// Returns a configuration error when a setting is missing, unknown or invalid.
-pub(crate) fn compile_aps_settings(
-    value: Json,
-) -> Result<ApsDemand, Report<TrustedServerError>> {
+pub(crate) fn compile_aps_settings(value: Json) -> Result<ApsDemand, Report<TrustedServerError>> {
     let demand: ApsDemand = serde_json::from_value(value).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: format!("invalid `aps` settings: {error}"),
@@ -3206,7 +3207,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-fn aps_plan(rendering_modes: &[Option<&str>]) -> crate::auction::AuctionPlan {
+    fn aps_plan(rendering_modes: &[Option<&str>]) -> crate::auction::AuctionPlan {
         let tables = rendering_modes
             .iter()
             .enumerate()
@@ -3219,10 +3220,7 @@ fn aps_plan(rendering_modes: &[Option<&str>]) -> crate::auction::AuctionPlan {
                 if let Some(mode) = mode {
                     table.insert("rendering_mode".to_string(), json!(mode));
                 }
-                (
-                    if index == 0 { "aps_main" } else { "aps_second" },
-                    table,
-                )
+                (if index == 0 { "aps_main" } else { "aps_second" }, table)
             })
             .collect::<Vec<_>>();
         crate::auction::AuctionPlan::compile(crate::auction::test_support::plan_config(tables))
@@ -3256,9 +3254,9 @@ fn aps_plan(rendering_modes: &[Option<&str>]) -> crate::auction::AuctionPlan {
 
     #[test]
     fn no_aps_source_registers_nothing() {
-        let plan = crate::auction::AuctionPlan::compile(
-            crate::auction::test_support::plan_config(Vec::new()),
-        )
+        let plan = crate::auction::AuctionPlan::compile(crate::auction::test_support::plan_config(
+            Vec::new(),
+        ))
         .expect("should compile an empty plan");
 
         assert!(
@@ -3341,7 +3339,6 @@ fn aps_plan(rendering_modes: &[Option<&str>]) -> crate::auction::AuctionPlan {
             "should name the missing setting: {error:?}"
         );
     }
-
 
     #[test]
     fn renderer_document_is_static_and_nonce_bound() {

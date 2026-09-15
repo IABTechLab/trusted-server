@@ -1876,9 +1876,8 @@ mod tests {
             trusted_server_core::auction::compile_auction_plan(&settings)
                 .expect("should compile auction plan"),
         );
-        let orchestrator =
-            trusted_server_core::auction::build_orchestrator_with_plan(plan)
-                .expect("should build orchestrator");
+        let orchestrator = trusted_server_core::auction::build_orchestrator_with_plan(plan)
+            .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
@@ -3274,8 +3273,7 @@ mod tests {
                 .expect("should build integration registry"),
         );
         let orchestrator = Arc::new(
-            build_orchestrator_with_plan(plan)
-                .expect("should build auction orchestrator"),
+            build_orchestrator_with_plan(plan).expect("should build auction orchestrator"),
         );
 
         let handler = {

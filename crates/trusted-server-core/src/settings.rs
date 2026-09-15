@@ -7143,7 +7143,9 @@ source_domain = "partner.example.com"
 
     #[test]
     fn disabled_removed_integration_fields_are_rejected() {
-        for (integration_id, removed_field) in [("prebid", "server_url"), ("datadome", "account_id")] {
+        for (integration_id, removed_field) in
+            [("prebid", "server_url"), ("datadome", "account_id")]
+        {
             let mut settings = create_test_settings();
             settings
                 .integrations

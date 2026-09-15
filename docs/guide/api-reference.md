@@ -92,7 +92,7 @@ creatives. Creative URLs are rewritten by default; set
 
 Configured provider IDs appear in response metadata and provider responses.
 Consumers that previously matched the literal provider name `prebid` must use
-the configured provider ID, such as `pbs-main`.
+the configured demand source name, such as `pbs_main`.
 
 **Request Body:**
 
@@ -196,11 +196,11 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 
 ### POST /\_ts/api/v1/ec/resolve
 
-Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client-fixed` demo). Server-side providers such as HMAC do not use it.
+Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client_fixed` demonstration provider). Server-side providers such as HMAC do not use it.
 
 **Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
 
-**Request Body:** the provider's value, opaque to the core. For the `client-fixed` demo this is the fixed known word sent as `text/plain`.
+**Request Body:** the provider's value, opaque to the core. For `client_fixed` this is the fixed known word sent as `text/plain`.
 
 **Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side provider is configured, no identity graph is available, or the provider produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
 

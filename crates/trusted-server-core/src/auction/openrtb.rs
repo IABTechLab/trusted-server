@@ -518,10 +518,7 @@ fn build_regs(
     })
 }
 
-fn normalized_language(
-    headers: &TransportHeaders,
-    policy: DemandFieldPolicy,
-) -> Option<String> {
+fn normalized_language(headers: &TransportHeaders, policy: DemandFieldPolicy) -> Option<String> {
     let value = header_string(headers.accept_language())
         .and_then(|value| value.split(',').next().map(str::to_string))
         .and_then(|value| value.split(';').next().map(str::to_string))
@@ -754,7 +751,10 @@ mod routing_metadata_tests {
             let routed = route_auction(canonical_parity_auction_request(), &inbound, &plan, None);
 
             assert_eq!(
-                unused_bidder_params_count(plan.providers()[0].demand.as_ref(), &routed.inputs()[0]),
+                unused_bidder_params_count(
+                    plan.providers()[0].demand.as_ref(),
+                    &routed.inputs()[0]
+                ),
                 expected,
                 "{implementation} should report only bidder params it ignores"
             );

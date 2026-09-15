@@ -944,7 +944,9 @@ impl AuctionOrchestrator {
         let provider_responses = self.run_providers_parallel(request, context).await?;
 
         let floor_prices = self.floor_prices_by_slot(request);
-        let (adserver_response, winning_bids) = if let Some(adserver_name) = &self.config.adserver_name {
+        let (adserver_response, winning_bids) = if let Some(adserver_name) =
+            &self.config.adserver_name
+        {
             let adserver = self.get_provider(adserver_name)?;
 
             log::info!(
@@ -2575,9 +2577,7 @@ mod tests {
         AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome,
     };
     use crate::auction::routing::{RoutingDiagnostics, route_auction};
-    use crate::auction::test_support::{
-        create_test_auction_context, demand_table, plan_config,
-    };
+    use crate::auction::test_support::{create_test_auction_context, demand_table, plan_config};
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidRenderer,
         BidStatus, MediaType, PublisherInfo, UserInfo,
@@ -5107,7 +5107,7 @@ mod tests {
             );
             let plan = AuctionPlan::compile(adserver_only)
                 .expect("should compile adserver-only plan")
-            .with_enabled(true);
+                .with_enabled(true);
             let orchestrator = AuctionOrchestrator::from_plan(
                 Arc::new(plan),
                 Some(Arc::new(DeadlineRecordingAdServer {

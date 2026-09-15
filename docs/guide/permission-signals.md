@@ -74,7 +74,7 @@ deployment's to set, not the code's to assume.
 
 ```toml
 [permission_signal]
-sources = ["gpc", "gpp-sale-opt-out", "us-privacy", "tcf"]
+provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
 ```
 
 A provider not on the list does not run, and there is no separate switch. A
@@ -82,7 +82,7 @@ publisher who does not want to act on Global Privacy Control removes `"gpc"`
 from the list, and the provider that reads the header then does not run. One
 caveat: the core's consent pipeline can also synthesize a US Privacy opt-out
 from that header for a visitor in a US state, when the consent settings say to,
-which they do by default, and the `us-privacy` provider then acts on the record
+which they do by default, and the `us_privacy` provider then acts on the record
 it produced. A publisher who wants the header to have no effect at all turns
 that setting off as well. Leaving the section out entirely runs every provider
 the adapter offers, in the order it offers them, so a signal is never quietly
@@ -109,8 +109,8 @@ question about a jurisdiction and a publisher.
 | Identifier         | Crate                                 | Reads                                             |
 | ------------------ | ------------------------------------- | ------------------------------------------------- |
 | `gpc`              | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control      |
-| `gpp-sale-opt-out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string       |
-| `us-privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string           |
+| `gpp_sale_opt_out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string       |
+| `us_privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string           |
 | `tcf`              | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code |
 
 The three opt-outs are separate so that a publisher who does not act on Global

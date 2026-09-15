@@ -10,12 +10,25 @@ Trusted Server uses a flexible configuration system based on:
 2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
 3. **EdgeZero Stores** - Config and secret stores for the pushed blob and runtime secret values
 
+Everything the deployment can switch on is a provider, and every provider type
+is written the same way. Read
+[Configuration Rules](/guide/configuration-rules) first. It is short, and it
+is the pattern every section below follows:
+
+```toml
+[<type>]
+provider = "<name>"            # or a list, where several run
+
+[<type>.<name>]                # only when the provider has settings
+setting = "value"
+```
+
 ## Quick Start
 
 ### Minimal Configuration
 
 Create `trusted-server.toml` in your project root. Generate both secret values
-first with `openssl rand -base64 32`; the placeholders below are intentionally
+first with `openssl rand -base64 32`. The placeholders below are intentionally
 rejected until replaced.
 
 ```toml
@@ -28,7 +41,7 @@ proxy_secret = "publisher_proxy_secret"
 [ec]
 provider = "hmac"
 
-[ec.providers.hmac]
+[ec.hmac]
 passphrase = "ec_passphrase"
 ```
 
@@ -42,10 +55,10 @@ read by the deployed application at request time.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-# Secret overrides, when needed, are key names—not secret values.
+# Secret overrides, when needed, are key names, not secret values.
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 export TRUSTED_SERVER__EC__PROVIDER=hmac
-export TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=ec_passphrase
+export TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 
 # Replace the rejected placeholder values in trusted-server.toml, then validate.
 ts config validate
@@ -59,13 +72,14 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
-- `ec.passphrase`
+- `ec.hmac.passphrase`, when `[ec] provider = "hmac"`
+- `ec.host_signals.passphrase`, when `[ec] provider = "host_signals"`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
-- `integrations.datadome.server_side_key_secret_name`, when protection is enabled
-- `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
+- `integration.datadome.server_side_key_secret_name`, when protection is enabled
+- `integration.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
 
 Their values belong in the logical `trusted_server_secrets` store and are
@@ -85,8 +99,9 @@ Prepare an initial reference-based deployment in this order:
 Changing a store value does not alter already-built state. Restart or redeploy
 instances when rotating static credentials.
 
-Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
-rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
+Keep `publisher.proxy_secret` and the selected Edge Cookie provider's
+passphrase stable unless intentionally rotating signed URLs or EC identifiers.
+On Spin, the app-config blob is stored
 under the `trusted_server_config` key in Spin's built-in `default` key-value
 store. Set the corresponding CLI store mapping before pushing so the write
 matches the runtime lookup:
@@ -146,25 +161,31 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section               | Purpose                                      |
-| --------------------- | -------------------------------------------- |
-| `[publisher]`         | Domain, origin, proxy settings               |
-| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
-| `[ec]`                | Edge Cookie (EC) ID generation               |
-| `[geo]`               | Which module resolves location, if any       |
-| `[tester_cookie]`     | Optional tester-cookie endpoint              |
-| `[device]`            | Device classification provider selection     |
-| `[geo]`               | Geolocation provider selection               |
-| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
-| `[cache]`             | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
-| `[request_signing]`   | Ed25519 request signing                      |
-| `[auction]`           | Auction orchestration                        |
-| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
+Seven of these sections are provider types. Each takes a `provider` key and
+gives each selected provider its own `[<type>.<name>]` settings table, as
+[Configuration Rules](/guide/configuration-rules) describes.
+
+| Section                | Provider type | Purpose                                      |
+| ---------------------- | ------------- | -------------------------------------------- |
+| `[publisher]`          | no            | Domain, origin, proxy settings               |
+| `[trusted_client_ip]`  | no            | Authenticated client-IP forwarding           |
+| `[ec]`                 | yes, one      | Edge Cookie (EC) ID generation               |
+| `[geo]`                | yes, one      | Which provider resolves location, if any     |
+| `[device]`             | yes, one      | Device classification                        |
+| `[permission_signal]`  | yes, several  | Which permission signals are acted on, in order |
+| `[demand]`             | yes, several  | The auction's demand sources                 |
+| `[adserver]`           | yes, one      | The ad server that picks the winner          |
+| `[integration]`        | yes, several  | Partner integrations (Prebid, Next.js, etc.) |
+| `[tester_cookie]`      | no            | Optional tester-cookie endpoint              |
+| `[proxy]`              | no            | Proxy SSRF allowlist and asset routes        |
+| `[cache]`              | no            | Static/rehosted asset cache policy rules     |
+| `[image_optimizer]`    | no            | Reusable Image Optimizer profile sets        |
+| `[request_signing]`    | no            | Ed25519 request signing                      |
+| `[auction]`            | no            | Auction orchestration and bidder routes      |
 
 ## Example: Production Setup
 
-Generate and substitute every `replace-with-*` value before validation or
+Generate and substitute every placeholder value before validation or
 deployment.
 
 ```toml
@@ -177,7 +198,7 @@ proxy_secret = "publisher_proxy_secret"
 [ec]
 provider = "hmac"
 
-[ec.providers.hmac]
+[ec.hmac]
 passphrase = "ec_passphrase"
 
 [request_signing]
@@ -185,8 +206,10 @@ enabled = true
 config_store_id = "01GXXX"
 secret_store_id = "01GYYY"
 
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 client_side_bidders = ["example-browser-bidder"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 
@@ -197,18 +220,18 @@ allowed_domains = ["assets.example.com"]
 enabled = true
 timeout_ms = 2000
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+provider = ["pbs_main"]
+
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1200
 routing = "explicit"
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 
 [auction.bidders.example-server-bidder]
-provider = "pbs-main"
+provider = "pbs_main"
 ```
 
 ## Detailed Reference
@@ -241,20 +264,20 @@ TRUSTED_SERVER__SECTION__SUBSECTION__FIELD
 - Separator: `__` (double underscore)
 - Case: UPPERCASE
 - Sections: Match TOML hierarchy
-- Map keys: Preserve TOML punctuation. For example, provider key `pbs-main`
-  uses the `PBS-MAIN` segment, not `PBS_MAIN`.
+- Provider names: every provider name is snake_case, so a provider table maps
+  straight onto a path segment. `[demand.pbs_main] debug` is
+  `TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG`.
 
-Shell assignment syntax cannot contain a hyphenated variable name. Use `env`
-to apply a provider override to a command:
+A provider setting overrides like any other scalar leaf:
 
 ```bash
-env 'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
-  ts config validate
+export TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true
+ts config validate
 ```
 
 This example changes an existing scalar leaf. Edit TOML and run `ts config
 validate` followed by `ts config push` when changing an array, table, map, or
-rule.
+rule. A `provider` list is an array, so it cannot be overridden this way.
 
 ## Publisher Configuration
 
@@ -393,7 +416,7 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 #### `max_buffered_body_bytes`
 
 **Purpose**: Upper bound on how much of a publisher origin body the rewrite
-pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
+pipeline holds in memory, being the post-rewrite output buffer on buffered adapters,
 and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 
 **Usage**:
@@ -417,7 +440,7 @@ and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 - On **buffered adapters** the response fails before any bytes are committed.
 - On the **streaming path** the response headers are already committed when
   either cap trips, so the body is **truncated mid-stream** and the error is
-  logged — the client receives a short (incomplete) body rather than a `5xx`.
+  logged, and the client receives a short (incomplete) body rather than a `5xx`.
   Size the cap above your largest expected decoded page so legitimate responses
   are never truncated.
 
@@ -584,25 +607,41 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 
 | Field                     | Type           | Required | Description                                                                                                                                                                                                                                    |
 | ------------------------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | String or null | No       | Key of the active Edge Cookie provider: `"hmac"` (built-in), `"host-signals"` (opt-in), or `"none"` (explicitly stateless). Omit to run statelessly with no Edge Cookie. The `"client-fixed"` demo needs the `client-fixed-demo` build feature |
+| `provider`                | String or null | No       | Name of the active Edge Cookie provider: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or a provider an integration supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration provider needs the `client-fixed-demo` build feature |
 | `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                |
 | `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                     |
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                            |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                                                                                                                                        |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                |
 | `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                |
 
-The selected `provider` must have a matching `[ec.providers.<key>]` block. Selecting a provider with no configured block, or an unknown key, fails at startup.
+`ec_store`, `partners` and the cluster thresholds are settings of the job
+rather than of one provider, so they sit directly in `[ec]` whichever provider
+is selected.
 
-### `[ec.providers.hmac]`
+The selected `provider` must have the `[ec.<name>]` table it needs. Selecting a
+provider with no table, naming a provider this build does not have, or leaving
+a table the selector does not name, all fail at startup.
 
-The built-in HMAC-over-client-IP provider, keyed `hmac`.
+A provider an integration supplies also needs that integration named in
+`[integration] provider`.
 
-`passphrase` is a key name in `trusted_server_secrets`; the resolved value must
-be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
+### `[ec.hmac]`
+
+The built-in HMAC-over-client-IP provider, named `hmac`.
+
+`passphrase` is a key name in `trusted_server_secrets`, and the resolved value
+must be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
 | Field        | Type   | Required                    | Description                                                |
 | ------------ | ------ | --------------------------- | ---------------------------------------------------------- |
 | `passphrase` | String | Yes when `hmac` is selected | Secret-store key name whose resolved value is the HMAC key |
+
+### `[ec.host_signals]`
+
+The built-in provider that derives the identifier from the host's TLS JA4 and
+HTTP/2 signals together with the client address, so it needs a host that
+supplies those signals. It takes a `passphrase` on the same terms as
+`[ec.hmac]`.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -620,7 +659,7 @@ outbound pull sync, but cannot authenticate to those inbound APIs.
 provider = "hmac"
 ec_store = "ec_identity_store"
 
-[ec.providers.hmac]
+[ec.hmac]
 passphrase = "ec_passphrase"
 
 [[ec.partners]]
@@ -635,7 +674,7 @@ bidstream_enabled = true
 
 ```bash
 TRUSTED_SERVER__EC__PROVIDER=hmac
-TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
@@ -645,23 +684,23 @@ These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environ
 
 #### `provider`
 
-**Purpose**: Names the active Edge Cookie provider by its key. Omit to run statelessly with no Edge Cookie.
+**Purpose**: Names the active Edge Cookie provider. Omit to run statelessly with no Edge Cookie.
 
-**Validation**: Application startup fails if the selected key has no matching `[ec.providers.<key>]` block, or is unknown.
+**Validation**: Application startup fails if the selected name has no `[ec.<name>]` table where it needs one, names a provider this build does not have, or leaves a table the selector does not name. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
 
-#### `providers.hmac.passphrase`
+#### `hmac.passphrase`
 
 **Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation, read when `provider = "hmac"`.
 
 **Security**:
 
-- The key name is stored in app config; the value is stored in `trusted_server_secrets`
+- The key name is stored in app config, and the value is stored in `trusted_server_secrets`
 - Keep the value stable unless intentionally rotating EC identifiers
 - Do not place the value in environment overlays or the pushed blob
 
-**Validation**: Application startup fails if:
+**Validation**: Application startup fails if the resolved value is:
 
-- Empty string
+- Empty
 - Shorter than 32 characters
 
 ## Device Configuration
@@ -672,9 +711,9 @@ Selects how a request is classified into the coarse device signals the Edge Cook
 
 | Field      | Type           | Required | Description                                                                                                                                                                         |
 | ---------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider` | String or null | No       | Key of the device-detection provider. Defaults to `builtin` (User-Agent only, no host-specific call). Set `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers |
+| `provider` | String or null | No       | Name of the device-detection provider: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or a provider an integration supplies |
 
-The default `builtin` provider classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Selecting an unknown provider key fails at startup.
+The default `builtin` provider classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `fastly` has settings, so neither needs a `[device.<name>]` table. Selecting a provider this build does not have fails at startup.
 
 **Example**:
 
@@ -697,10 +736,13 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 
 | Field                        | Type           | Required        | Description                                                                                                                                                                                                      |
 | ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                   | String or null | No              | Key of the geo provider. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                 |
+| `provider`                   | String or null | No              | Name of the geo provider: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or a provider an integration supplies |
 | `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie provider without a geo provider acknowledges that by setting this to `true`. |
 
-No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
+`assume_single_jurisdiction` is a setting of the job rather than of one
+provider, so it sits directly in `[geo]`.
+
+No provider is the default, so a default deployment is not tied to any host geo service. Selecting a provider this build does not have fails at startup. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
 **Example**:
 
@@ -714,6 +756,41 @@ provider = "platform"
 ```bash
 TRUSTED_SERVER__GEO__PROVIDER=platform
 ```
+
+## Permission Signal Configuration
+
+Which permission signals Trusted Server acts on, and in what order. Signals
+compose rather than select, because a request can carry a TCF string and a
+Global Privacy Control header at once and both have something to say, so this
+type takes a list. The order is the policy, because the last provider with an
+opinion decides.
+
+### `[permission_signal]`
+
+| Field      | Type          | Required | Description                                                                 |
+| ---------- | ------------- | -------- | --------------------------------------------------------------------------- |
+| `provider` | Array[String] | No       | The providers to act on, in order. Omit it to act on every provider this build links, in the order shown below |
+
+The providers that ship are `gpc` (the `Sec-GPC` request header),
+`gpp_sale_opt_out` (a GPP US sale opt-out), `us_privacy` (a US Privacy string
+sale opt-out) and `tcf` (TCF v2). Each is a crate under
+`crates/permission-signal`, outside the core.
+
+A provider that is not on the list does not run, and there is no separate
+switch to turn one off. An empty list acts on nothing, leaving every
+permission at its country and region baseline. An unknown or repeated name
+refuses startup. None of the four has settings, so none needs a
+`[permission_signal.<name>]` table.
+
+**Example**:
+
+```toml
+[permission_signal]
+provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
+```
+
+See [Permission Signals](/guide/permission-signals) for what each provider
+reads and how to add a scheme.
 
 ## Provider Permissions
 
@@ -923,7 +1000,7 @@ percent-encoded aliases before routing. For a whole-site staging gate, use
 `path = "^/"`; do not rely on a decoded-path prefix such as `^/secure` to protect
 equivalent origin paths.
 
-Startup also fails when any handler — admin or not — uses a placeholder or
+Startup also fails when any handler, admin or not, uses a placeholder or
 well-known weak password (`changeme`, `password`, `admin`, or a
 `replace-with-…` template value). Handler selection is first-match-wins, so a
 narrow handler ahead of the admin pattern governs the paths it matches.
@@ -943,7 +1020,7 @@ browser-facing endpoints that anonymous visitors must be able to reach:
 | `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
 
 A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
-fetches never carry Basic credentials, so every visitor gets `401` — on
+fetches never carry Basic credentials, so every visitor gets `401`, on
 `/_ts/page-bids` that means no ads after any client-side navigation. Match the
 admin routes specifically (`^/_ts/admin`) instead.
 
@@ -1088,7 +1165,7 @@ EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
 
 #### `allowed_domains`
 
-**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`. When `integrations.prebid.external_bundle_url` is configured, this list must cover its host and any HTTPS redirect targets.
+**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`. When `integration.prebid.external_bundle_url` is configured, this list must cover its host and any HTTPS redirect targets.
 
 **Behavior**: Trusted Server checks the parsed host before signing a target, before fetching the initial proxy target, and before following each HTTP redirect (301/302/303/307/308). A host that does not match the list is blocked with a 403 error.
 
@@ -1101,8 +1178,8 @@ EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
 | `assets.example.com` | `assets.example.com`                                               | `sub.assets.example.com` |
 | `*.cdn.example.com`  | `cdn.example.com`, `static.cdn.example.com`, `a.b.cdn.example.com` | `evil-cdn.example.com`   |
 
-- `"example.com"` — exact match only.
-- `"*.example.com"` — matches the base domain and any subdomain at any depth.
+- `"example.com"` matches that host exactly and nothing else.
+- `"*.example.com"` matches the base domain and any subdomain at any depth.
 - Matching is case-insensitive; entries are normalized to lowercase at startup.
 - Blank entries are ignored.
 - The `*` wildcard requires a dot boundary: `*.example.com` does **not** match `evil-example.com`.
@@ -1412,96 +1489,110 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Integration Configurations
 
-Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
-integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
+`[integration] provider` lists the integrations that run, and each one that has
+settings gets its own `[integration.<name>]` table. There is no `enabled` flag,
+because an integration that is not on the list does not run. The full rule set
+is in [Configuration Rules](/guide/configuration-rules).
 
-### Common Fields
+```toml
+[integration]
+provider = ["prebid", "gpt", "nextjs"]
+```
 
-All integrations support an `enabled` flag. Defaults vary by integration and only
-apply when the integration section exists in `trusted-server.toml`.
+The integrations this repository ships are `datadome`, `didomi`,
+`google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`,
+`nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint` and `testlight`. A
+name this build does not have refuses startup, and the message lists the ones
+it does. A `[integration.<name>]` table for an integration the list does not
+name refuses startup too, so a block left behind after an integration is
+switched off is caught rather than sitting unread.
 
-| Field     | Type    | Description                    |
-| --------- | ------- | ------------------------------ |
-| `enabled` | Boolean | Enable/disable the integration |
+`openrtb`, `prebid_server`, `aps` and `adserver_mock` supply demand and ad
+server implementations only. They are not page integrations and cannot be
+named here. Their settings live in `[demand.<name>]` and `[adserver.<name>]`.
+
+The sections below cover Prebid, Next.js, Osano, Permutive and Testlight. For
+the others, see the relevant integration guides.
 
 ### Prebid Integration
 
-`[integrations.prebid]` owns browser behavior only. Server endpoint, provider
-timeout, routing, profile debug/test controls, consent forwarding, bidder-param
-overrides, and notification suppression belong under `[auction]`.
+`[integration.prebid]` owns browser behavior only. The server endpoint, the
+demand source timeout, routing, debug and test controls, consent forwarding,
+bidder-param overrides, and notification suppression belong to a `[demand]`
+source with `implementation = "prebid_server"`.
 
 | Browser field                         | Type          | Default                                                                | Description                                                                    |
 | ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `enabled`                             | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
 | `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
-| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
-| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
+| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout, independent of every demand source timeout          |
+| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag, independent of a demand source's `debug`         |
 | `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
 | `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
 | `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
-| `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
+| `external_bundle_url`                 | String        | Required                                                               | HTTPS publisher-specific Prebid.js bundle URL                                  |
 | `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
 | `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                              |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
-`[integrations.prebid]`. A browser bidder stays client-side only when named in
+`[integration.prebid]`. A browser bidder stays client-side only when named in
 `client_side_bidders` and its adapter is present in the generated bundle.
 
 **Example**:
 
 ```toml
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 script_patterns = ["/prebid.js", "/prebid.min.js"]
 
+[integration.prebid.bundle]
+adapters = ["example-browser"]
+
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[integrations.prebid.bundle]
-adapters = ["example-browser"]
+[demand]
+provider = ["pbs_main"]
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 test_mode = false
 consent_forwarding = "both"
 bid_param_overrides = { example-server = { placement = "example-placement" } }
 
-[[auction.providers.pbs-main.profile_config.bid_param_override_rules]]
+[[demand.pbs_main.bid_param_override_rules]]
 when.bidder = "example-server"
 when.zone = "header"
 set = { placement = "example-header-placement" }
 
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = ["example-seat"]
 
 [auction.bidders.example-server]
-provider = "pbs-main"
+provider = "pbs_main"
 ```
 
 **Environment override**:
 
 ```bash
-env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
-  'TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+env 'TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=1000' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true' \
   ts config validate
 ```
 
-Environment overlays only replace existing scalar leaves. Keep
-`client_side_bidders`, provider profile tables, bidder-parameter overrides, and
-rules in TOML, then validate and push the edited file.
+Environment overlays only replace existing scalar leaves. Keep the `provider`
+lists, `client_side_bidders`, bidder-parameter overrides and rules in TOML,
+then validate and push the edited file.
 
 **Script Pattern Matching**:
 
@@ -1515,33 +1606,34 @@ See [Prebid Integration](/guide/integrations/prebid) for full details.
 
 **Server Bid Param Override Surfaces**:
 
-These fields belong under
-`[auction.providers.<id>.profile_config]` for a `prebid-server` provider:
+These fields belong in the `[demand.<name>]` table of a `prebid_server`
+demand source:
 
 - `bid_param_overrides`: static per-bidder shallow-merge overrides;
 - `bid_param_zone_overrides`: per-bidder, per-zone shallow-merge overrides; and
 - `bid_param_override_rules`: canonical ordered rules with `when` matchers and
   `set` objects.
 
-Compatibility-shaped fields are normalized into the same profile-local runtime
-engine. Explicit rules run after compatibility-derived rules, so later rules
-win on conflicts.
+Compatibility-shaped fields are normalized into the same runtime engine.
+Explicit rules run after compatibility-derived rules, so later rules win on
+conflicts.
 
 ### Next.js Integration
 
-**Section**: `[integrations.nextjs]`
+**Section**: `[integration.nextjs]`
 
 | Field                        | Type          | Default                 | Description                   |
 | ---------------------------- | ------------- | ----------------------- | ----------------------------- |
-| `enabled`                    | Boolean       | `false`                 | Enable Next.js integration    |
 | `rewrite_attributes`         | Array[String] | `["href","link","url"]` | Attributes to rewrite         |
 | `max_combined_payload_bytes` | Integer       | `10485760`              | Max combined RSC payload size |
 
 **Example**:
 
 ```toml
-[integrations.nextjs]
-enabled = true
+[integration]
+provider = ["nextjs"]
+
+[integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]
 max_combined_payload_bytes = 10485760
 ```
@@ -1549,42 +1641,33 @@ max_combined_payload_bytes = 10485760
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
+TRUSTED_SERVER__INTEGRATION__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
 
 Edit `rewrite_attributes` in TOML because the overlay cannot replace arrays.
 
 ### Osano Integration
 
-**Section**: `[integrations.osano]`
+**Section**: `[integration.osano]`
 
-| Field     | Type    | Default | Description                             |
-| --------- | ------- | ------- | --------------------------------------- |
-| `enabled` | Boolean | `false` | Enable the Osano browser consent mirror |
+Osano has nothing to set, so naming it in `[integration] provider` is the whole
+configuration and it needs no table.
 
 **Example**:
 
 ```toml
-[integrations.osano]
-enabled = true
-```
-
-**Environment Override**:
-
-```bash
-TRUSTED_SERVER__INTEGRATIONS__OSANO__ENABLED=true
+[integration]
+provider = ["osano"]
 ```
 
 The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
 
 ### Permutive Integration
 
-**Section**: `[integrations.permutive]`
+**Section**: `[integration.permutive]`
 
 | Field                     | Type    | Default                                | Description                      |
 | ------------------------- | ------- | -------------------------------------- | -------------------------------- |
-| `enabled`                 | Boolean | `true`                                 | Enable Permutive integration     |
 | `organization_id`         | String  | Required                               | Permutive organization ID        |
 | `workspace_id`            | String  | Required                               | Permutive workspace ID           |
 | `project_id`              | String  | `""`                                   | Permutive project ID             |
@@ -1596,8 +1679,10 @@ The Osano mirror runs in the browser, so consent cookies it writes are available
 **Example**:
 
 ```toml
-[integrations.permutive]
-enabled = true
+[integration]
+provider = ["permutive"]
+
+[integration.permutive]
 organization_id = "org-12345"
 workspace_id = "ws-67890"
 project_id = "proj-abcde"
@@ -1609,11 +1694,10 @@ rewrite_sdk = true
 
 ### Testlight Integration
 
-**Section**: `[integrations.testlight]`
+**Section**: `[integration.testlight]`
 
 | Field             | Type    | Default                                     | Description                         |
 | ----------------- | ------- | ------------------------------------------- | ----------------------------------- |
-| `enabled`         | Boolean | `true`                                      | Enable Testlight integration        |
 | `endpoint`        | String  | Required                                    | Testlight auction endpoint          |
 | `timeout_ms`      | Integer | `1000`                                      | Request timeout in milliseconds     |
 | `shim_src`        | String  | `/static/tsjs=tsjs-unified.min.js?v=<hash>` | Script source for testlight shim    |
@@ -1622,8 +1706,10 @@ rewrite_sdk = true
 **Example**:
 
 ```toml
-[integrations.testlight]
-enabled = true
+[integration]
+provider = ["testlight"]
+
+[integration.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"
 timeout_ms = 1500
 rewrite_scripts = true
@@ -1631,10 +1717,11 @@ rewrite_scripts = true
 
 ## Auction Configuration
 
-`[auction.providers.*]` is the only server-side provider inventory, and
-`[auction.bidders.*]` is the only client-visible bidder route map. The optional
-`[auction].mediator` remains a separate integration selection; it is not a
-provider or bidder route.
+An auction is configured by three tables. `[demand]` selects the demand sources
+and gives each its settings, `[adserver]` selects the ad server that picks the
+winner, and `[auction]` holds the settings that belong to the auction itself,
+including `[auction.bidders.<code>]`, the only client-visible bidder route map.
+`[auction]` is not a provider type and takes no `provider` key.
 
 ### `[auction]`
 
@@ -1644,8 +1731,7 @@ provider or bidder route.
 | `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery |
 | `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
 | `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                         |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                     |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                     |
+| `creative_store`       | String  | `"creative_store"` | Deprecated, because creatives are delivered inline             |
 | `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                 |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
@@ -1668,7 +1754,7 @@ setting affects HTML or CSS fetched through `/first-party/proxy`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs, upgrade sequencing, and rollback
-Default values are omitted from stored JSON; non-default values
+Default values are omitted from stored JSON. Non-default values
 (`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
 older `AuctionConfig` schemas reject unknown fields.
 
@@ -1694,42 +1780,51 @@ leaves. Existing configs must add **both** leaves under `[auction]`
 missing leaf is silently ignored.
 :::
 
-### Provider map
+### Demand sources
 
-::: danger Breaking migration from the provider list
-The former `[auction].providers = ["prebid", ...]` list and server-owned fields
-under `[integrations.prebid]` and `[integrations.aps]` are no longer accepted,
-even when an integration is disabled. Replace them with provider instances and
-bidder routes before deployment.
+::: danger Breaking migration from `[auction.providers]`
+`[auction] providers` and `[auction.providers.<id>]` are gone, and a
+configuration still carrying either is refused with a message naming where the
+setting moved to. Server-owned fields under `[integrations.prebid]` and
+`[integrations.aps]` are gone with them.
 
-For Prebid Server, move `server_url` to provider `endpoint`, server timeout to
-provider `timeout_ms`, request controls and bidder-parameter overrides to the
-`prebid-server` `profile_config`, notification suppression to `notifications`,
-and each server bidder to `[auction.bidders.<id>]`. Origin-only legacy
-`server_url` values compile to `/openrtb2/auction`; query parameters survive,
-and configured non-root custom endpoint paths remain exact. Browser timeout,
-debug, bundle, script interception, refresh exclusions, and
-`client_side_bidders` remain under `[integrations.prebid]`. Configure timeout or
-debug under both owners when both browser and server behavior should retain the
-old value.
+Move each provider to a `[demand.<name>]` table. `protocol` disappears,
+because every implementation states its own wire format. `profile` becomes
+`implementation`, so `"standard"` becomes `"openrtb"`, `"prebid-server"`
+becomes `"prebid_server"`, and `"aps"` stays `"aps"`. Everything that was
+inside `profile_config` moves up into the table itself, flat beside
+`endpoint`, `timeout_ms`, `routing` and `notifications`. Provider IDs that
+carried a hyphen, such as `pbs-main`, become snake_case, such as `pbs_main`,
+and so does every `[auction.bidders.<code>] provider` value that points at
+one.
 
-For APS, move endpoint and timeout to the provider, then move account,
-inventory, debug, and creative controls to the `aps` `profile_config`.
+For Prebid Server, move `server_url` to `endpoint` and the server timeout to
+`timeout_ms`. Origin-only legacy `server_url` values compile to
+`/openrtb2/auction`, query parameters survive, and configured non-root custom
+endpoint paths remain exact. Browser timeout, debug, bundle, script
+interception, refresh exclusions and `client_side_bidders` stay under
+`[integration.prebid]`. Configure timeout or debug under both owners when both
+browser and server behavior should retain the old value.
+
+For APS, move the endpoint and timeout to the table, then move account,
+inventory, debug and creative controls up beside them. `rendering_mode` moves
+out of `[integrations.aps]` into the same table.
 
 Only bidder codes listed in `[auction.bidders]` are folded into Trusted Server
-requests. Unlisted publisher bids remain native browser demand. All provider
-endpoints must be absolute HTTPS URLs.
+requests. Unlisted publisher bids remain native browser demand.
 
 The old and new blobs are mutually incompatible. Activate the new binary and
-map-shaped config together. A binary-first or config-first rolling deployment
-will put one version on a schema it rejects. Roll back by restoring the old
-binary and old-schema blob together.
+the new-shape config together. A binary-first or config-first rolling
+deployment will put one version on a schema it rejects. Roll back by restoring
+the old binary and old-schema blob together.
 :::
 
-Each table name is the provider ID used for configuration, backend correlation,
-health, response metadata, and telemetry. Provider IDs must match
-`^[a-z][a-z0-9-]{0,62}$`. Multiple instances may select the same profile and
-endpoint because the provider ID remains their distinct runtime identity.
+`[demand] provider` lists the demand sources, in a list because several run.
+Each table name is the demand source's identity for configuration, backend
+correlation, health, response metadata and telemetry, and must be snake_case.
+The name is the implementation unless the table carries an `implementation`
+line, which is how two Prebid Servers run side by side under names of their
+own.
 
 **Example**:
 
@@ -1739,85 +1834,133 @@ enabled = true
 sanitize_creatives = false
 rewrite_creatives = true
 timeout_ms = 2000
-mediator = "adserver_mock"
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+provider = ["pbs_main", "aps_main"]
+
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 timeout_ms = 1200
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 test_mode = false
 consent_forwarding = "both"
 
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = ["example-seat"]
 
-[auction.providers.aps-main]
-protocol = "openrtb-2.6"
-profile = "aps"
+[demand.aps_main]
+implementation = "aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
-
-[auction.providers.aps-main.profile_config]
 account_id = "example-aps-account"
 debug = false
 allow_script_creatives = false
 
 [auction.bidders.example-server]
-provider = "pbs-main"
+provider = "pbs_main"
 
-[integrations.adserver_mock]
-enabled = true
-endpoint = "https://mediator.example.com/mediate"
+[adserver]
+provider = "adserver_mock"
+
+[adserver.adserver_mock]
+endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
 
-| Provider field   | Required | Default         | Description                                                   |
-| ---------------- | -------- | --------------- | ------------------------------------------------------------- |
-| `protocol`       | Yes      | None            | Must be `openrtb-2.6`                                         |
-| `profile`        | No       | `standard`      | `standard`, `prebid-server`, or `aps`                         |
-| `endpoint`       | Yes      | None            | Absolute HTTPS URL with host and no credentials or fragment   |
-| `timeout_ms`     | No       | Profile default | Provider logical budget before the remaining-auction cap      |
-| `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles            |
-| `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
-| `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
+Every `[demand.<name>]` table takes these four settings, whichever
+implementation it names:
 
-Timeout defaults are 1000 ms for `prebid-server`, 800 ms for `aps`, and the
-auction timeout for `standard`. An explicit provider timeout overrides the
-profile default. Runtime uses `min(provider timeout, auction time remaining)`
-for launch decisions and OpenRTB `tmax`.
+| Setting          | Required | Default                | Description                                                   |
+| ---------------- | -------- | ---------------------- | ------------------------------------------------------------- |
+| `endpoint`       | Yes      | None                   | Absolute HTTPS URL with a host and no credentials or fragment. Plain HTTP is accepted only to `127.0.0.1`, `::1` or `localhost` |
+| `timeout_ms`     | No       | Implementation default | This source's logical budget before the remaining-auction cap |
+| `routing`        | No       | `explicit`             | `explicit`, or `all_eligible` where the implementation allows it |
+| `notifications`  | No       | No suppression         | Common `nurl`/`burl` suppression after response normalization |
+
+Every other key in the table belongs to the implementation, which rejects any
+key it does not know.
+
+| Implementation   | Default timeout    | `all_eligible` | Its own settings                                                                                       |
+| ---------------- | ------------------ | -------------- | ------------------------------------------------------------------------------------------------------ |
+| `openrtb`        | the auction budget | yes            | `request_ext`, `imp_ext`                                                                                 |
+| `prebid_server`  | 1000 ms            | no             | `debug`, `test_mode`, `debug_query_params`, `consent_forwarding`, `bid_param_overrides`, `bid_param_zone_overrides`, `bid_param_override_rules` |
+| `aps`            | 800 ms             | yes            | `account_id` (required), `debug`, `allow_script_creatives`, `inventory_domain`, `inventory_page_origin`, `rendering_mode` |
+
+An explicit `timeout_ms` overrides the implementation default. Runtime uses
+`min(source timeout, auction time remaining)` for launch decisions and OpenRTB
+`tmax`.
 
 `routing = "explicit"` sends only slots carrying a bidder assigned to that
-provider, plus trusted stored-request routes. `routing = "all_eligible"` sends
-every banner-compatible slot to the provider, regardless of bidder routes. It
-does not disclose bidder parameters assigned to another provider. APS commonly
+source, plus trusted stored-request routes. `routing = "all_eligible"` sends
+every banner-compatible slot to the source, regardless of bidder routes. It
+does not disclose bidder parameters assigned to another source. APS commonly
 uses `all_eligible` to preserve its whole-inventory participation. The
-`prebid-server` profile rejects `all_eligible` because every PBS impression must
-carry routed bidder or stored-request demand.
+`prebid_server` implementation rejects `all_eligible` because every PBS
+impression must carry routed bidder or stored-request demand.
+
+APS `rendering_mode` is `trusted_server` by default, which renders through
+Trusted Server's opaque static renderer route. Set `publisher_native` only for
+a controlled publisher-origin friendly-frame cohort.
+
+### Ad server
+
+`[adserver] provider` names the one ad server that picks the winner, as a
+string rather than a list, and `[adserver.<name>]` holds its settings. With no
+ad server the orchestrator selects the highest decoded CPM per slot and
+applies floors locally. With one configured, normalized demand responses are
+sent to it, and Trusted Server falls back to local ranking when the ad server
+cannot run.
+
+The one implementation this repository ships is `adserver_mock`, for
+development and testing.
+
+| Setting                | Required | Default | Description                                                  |
+| ---------------------- | -------- | ------- | ------------------------------------------------------------ |
+| `endpoint`             | Yes      | None    | Decision endpoint URL, on the same scheme rule as a demand endpoint |
+| `timeout_ms`           | No       | `500`   | Request timeout, 1 to 60000                                  |
+| `price_floor`          | No       | None    | Minimum acceptable CPM                                       |
+| `context_query_params` | No       | `{}`    | Maps auction context keys to decision-URL query parameters   |
+
+```toml
+[adserver]
+provider = "adserver_mock"
+
+[adserver.adserver_mock]
+endpoint = "https://adserver.example.com/decide"
+timeout_ms = 500
+
+[adserver.adserver_mock.context_query_params]
+example_segments = "segments"
+```
+
+The word mediator is gone. It is "ad server" in prose and `adserver` in
+configuration, `[debug.auction_html_comment_options] include_mediator_response`
+is now `include_adserver_response`, and the auction response metadata that read
+`parallel_mediation` now reads `parallel_adserver`.
 
 ### Bidder routes and bounds
 
-Each `[auction.bidders.<bidder-id>]` maps one client-visible bidder ID to exactly
-one provider. Bidder IDs must be nonempty, no more than 128 UTF-8 bytes, contain
-no control characters or surrounding whitespace, and cannot be the reserved
-exact ID `trustedServer`. Browser `trustedServer.bidderParams` accepts at most
-128 bidder entries; its optional `zone` is at most 256 UTF-8 bytes.
+Each `[auction.bidders.<bidder-id>]` maps one client-visible bidder ID to
+exactly one demand source, named by its `[demand]` table name. A route naming
+a source `[demand] provider` does not select is refused. Bidder IDs must be
+nonempty, no more than 128 UTF-8 bytes, contain no control characters or
+surrounding whitespace, and cannot be the reserved exact ID `trustedServer`.
+Browser `trustedServer.bidderParams` accepts at most 128 bidder entries, and
+its optional `zone` is at most 256 UTF-8 bytes.
 
-For the `standard` profile, `profile_config.request_ext` and `imp_ext` must be
-JSON objects. Each object is limited to 16 KiB serialized, eight container
-levels, and 256 keys at any one object level. Reserved driver, profile, and
+For the `openrtb` implementation, `request_ext` and `imp_ext` must be JSON
+objects. Each object is limited to 16 KiB serialized, eight container levels,
+and 256 keys at any one object level. Reserved driver, implementation and
 signing fields cannot be overwritten.
 
 Common notification suppression uses exact returned OpenRTB seat values, not
 bidder route IDs:
 
 ```toml
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = ["example-seat"]
 ```
@@ -1828,50 +1971,56 @@ UTF-8 bytes and without ASCII control characters.
 ### Validation timing and target limits
 
 `ts config validate` and ordinary deploy validation compile the complete
-target-independent plan: profiles and defaults, routes, endpoint ownership,
-extension bounds, notifications, signing structure, and mediator selection.
-Target-specific checks are deferred to adapter startup. Startup uses the same
-compiled plan and additionally validates backend-name prediction/collisions and
-provider fan-out capability.
+target-independent plan from `[demand]`, `[adserver]` and `[auction.bidders]`.
+That covers unselected tables, names that are not snake_case, an
+implementation this build does not have, endpoint scheme and host, timeouts,
+routing modes, notification bounds, bidder route ownership, signing structure,
+and any setting the chosen implementation rejects. Target-specific checks are
+deferred to adapter startup. Startup uses the same compiled plan and
+additionally validates backend-name prediction and collisions, and demand
+fan-out capability.
 
-Fastly and Axum support multiple configured providers. Cloudflare and Spin
-currently reject an enabled auction with more than one provider because those
-adapters do not support concurrent provider fan-out. Disabled auctions may keep
-dormant multi-provider maps without target rejection.
+Fastly and Axum support several configured demand sources. Cloudflare and Spin
+currently reject an enabled auction with more than one, because those adapters
+do not support concurrent fan-out. A disabled auction may keep a dormant
+multi-source plan without target rejection.
 
 A target-aware pre-write `ts config push --adapter <target>` callback is **not
 available in this tree** because the required EdgeZero callback is not yet
 available. Until it lands, push performs target-independent validation and
 adapter startup is the mandatory target-aware gate. Do not treat a successful
-push as proof that a Cloudflare or Spin multi-provider plan can start.
+push as proof that a Cloudflare or Spin multi-source plan can start.
 
 ### Deadline behavior
 
 Configured timeouts are logical budgets, not hard wall-clock guarantees. No
-current adapter claims an abortable provider-wide total-request deadline.
-Already-launched work may complete after the logical budget and a completed late
-response can remain eligible. Once the logical auction budget is exhausted,
-Trusted Server starts no additional provider or mediator network work, then
-finishes local decision and delivery. An auction can therefore exceed its
-configured wall-clock timeout.
+current adapter claims an abortable total-request deadline across demand
+sources. Already-launched work may complete after the logical budget and a
+completed late response can remain eligible. Once the logical auction budget is
+exhausted, Trusted Server starts no additional demand or ad server network
+work, then finishes local decision and delivery. An auction can therefore
+exceed its configured wall-clock timeout.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
 markup before delivery. `rewrite_creatives = false` skips first-party URL
 rewriting and creative TSJS injection. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
-**Environment overrides** replace map leaves that already exist in TOML:
+**Environment overrides** replace scalar leaves that already exist in TOML:
 
 ```bash
 env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
   'TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false' \
   'TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true' \
   'TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=900' \
-  'TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__TIMEOUT_MS=900' \
   ts config validate
 ```
+
+A `provider` list is an array, so `[demand] provider` and
+`[integration] provider` cannot be changed by an overlay. Edit the TOML, then
+validate and push.
 
 ## Creative Opportunities Configuration
 
@@ -1915,7 +2064,7 @@ enabled = true # set to false to disable server-side ad templates
 gam_network_id = "123456789"
 price_granularity = "dense"
 
-# Shared placeholder value for the site root ("/") — see {section} below.
+# Shared placeholder value for the site root ("/"). See {section} below.
 section_root = "home"
 # Which path segment names the section, 0-based. Default 0 (first segment).
 # Set to 1 for locale-prefixed URLs such as "/en/news/article".
@@ -1925,7 +2074,7 @@ section_root = "home"
 id = "ad-header"
 gam_unit_path = "/{network_id}/example/{section}"
 # List each section landing page as well as its subtree: `/news/*` matches
-# `/news/article` but NOT `/news` — the glob requires the trailing separator.
+# `/news/article` but NOT `/news`, because the glob requires the trailing separator.
 page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
@@ -2060,9 +2209,9 @@ fresh origin response; they do not fail the page. The corresponding
 
 `X-TS-Assembly` identifies how the private response was assembled:
 
-- `esi-parser` — authorized cold miss assembled by the repaired parser;
-- `byte-seam` — warm template-cache hit using the streaming byte seam;
-- `byte-seam-fallback` — cold response safely assembled by byte seam because
+- `esi-parser`, an authorized cold miss assembled by the repaired parser;
+- `byte-seam`, a warm template-cache hit using the streaming byte seam;
+- `byte-seam-fallback`, a cold response safely assembled by byte seam because
   the platform parser was unavailable or rejected the document.
 
 The two headers together are the reliable verification signal. Timing alone can
@@ -2123,12 +2272,12 @@ dynamic-only limit.
 - Casing is preserved. [Google documents GAM ad-unit codes as
   case-insensitive](https://support.google.com/admanager/answer/10477476?hl=en),
   so do not lowercase the value.
-- The path is used **raw — it is not percent-decoded**. So `/new%20s` →
+- The path is used **raw, and is not percent-decoded**. So `/new%20s` →
   `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
   `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
   same raw path.
-- When the path has no segment at that index — the site root (`/`, or repeated
-  slashes), or a path shorter than `section_segment` — `{section}` is
+- When the path has no segment at that index, being the site root (`/`, or
+  repeated slashes) or a path shorter than `section_segment`, `{section}` is
   `section_root`. So with `section_segment = 1`, the path `/en` renders the root
   section rather than reusing the locale.
 
@@ -2175,7 +2324,7 @@ The same config with `section_segment = 1` and locale-prefixed patterns
 | `/en/news`         | `/123456789/example/news` |
 | `/en/news/article` | `/123456789/example/news` |
 
-An **unmatched route** — a path matched by no slot's `page_patterns` — produces
+An **unmatched route**, a path matched by no slot's `page_patterns`, produces
 no slot at all, so no template is rendered for it.
 
 Startup validation rejects a malformed template: an unknown placeholder (e.g.
@@ -2214,47 +2363,64 @@ version if that is required.
 
 ## Validation
 
-### Automatic Validation
+Configuration is checked at two gates.
+[Configuration Rules](/guide/configuration-rules#what-is-checked-before-a-request-is-served)
+sets out which rule is caught where. In short, `ts config validate`,
+`ts config diff` and `ts config push` check everything that can be decided
+from the file, and startup checks the rest and runs the first set again.
 
-Configuration is validated at startup:
+### Checked when the configuration is validated or pushed
 
-**Publisher Validation**:
+**Publisher**:
 
 - All fields non-empty
-- `origin_url` is valid URL
+- `origin_url` is a valid URL
 
-**EC Validation**:
+**Demand, ad server and bidder routes**:
 
-- `provider`, when set, names a provider with a matching `[ec.providers.<key>]` block; an unknown or unconfigured selection fails at startup
-- The `providers.hmac.passphrase` key name is non-empty at push time
-- The resolved passphrase is at least 32 bytes at runtime
-- Known placeholder values are rejected after resolution
+- The complete auction plan compiles from `[demand]`, `[adserver]` and
+  `[auction.bidders]`, so an unselected table, a name that is not snake_case,
+  an implementation this build does not have, a bad endpoint, an out-of-range
+  timeout, an unsupported routing mode, a route naming an unselected demand
+  source, or a setting the implementation rejects, all fail here
 
-**Handler Validation**:
+**Secrets**:
 
-- `path` is valid regex
+- Every secret setting holds a key name and no secret value
+
+**Handlers**:
+
+- `path` is a valid regex
 - `username` is ordinary configuration and non-empty
-- The resolved `password` is non-empty and is checked for placeholders at runtime
+- At least one handler covers the `/_ts/admin` namespace
 
-**Integration Validation**:
+**Integrations**:
 
-- Each integration implements `Validate` trait
-- Custom rules per integration
+- Each integration validates its own block, selected or not, so a typo in a
+  block that is switched off is still caught
+
+### Checked when the service starts
+
+Everything above runs again on the loaded configuration, and these join it:
+
+- The `[ec]`, `[geo]`, `[device]` and `[permission_signal]` selections. A name
+  this build does not have, a missing settings table, or a table the selector
+  does not name, stops the service on its next start. A passing
+  `ts config validate` is not proof that a change to those four will start
+- Resolved secret values, so a passphrase shorter than 32 bytes, a placeholder
+  or a weak handler password fails here
+- The compiled `permissions.yaml` policy, and the `assume_single_jurisdiction`
+  acknowledgment an Edge Cookie provider needs when no geo provider is selected
+- The checks only the host can make, being backend name prediction and
+  collisions, and whether the adapter can call more than one demand source at
+  once
 
 ### Validation Errors
-
-**Startup Failure** if:
-
-- Required fields missing
-- Invalid data types
-- Regex compilation fails
-- Secret key is default value
-- Integration config fails validation
 
 **Error Format**:
 
 ```
-Configuration error: provider `pbs-main` endpoint must be an absolute HTTPS URL
+Configuration error: [demand.pbs_main] endpoint must be HTTPS, or HTTP to 127.0.0.1, ::1 or localhost, with a host and no credentials or fragment
 ```
 
 ## Best Practices

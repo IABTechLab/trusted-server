@@ -43,7 +43,7 @@ pub static DEMAND: DemandImplementation = DemandImplementation {
     default_timeout: DemandTimeoutDefault::Fixed(1000),
     allows_all_eligible: false,
     serves_stored_requests: true,
-    canonicalize_endpoint: canonicalize_endpoint,
+    canonicalize_endpoint,
     compile,
 };
 
@@ -85,13 +85,12 @@ struct PrebidServerSettings {
 fn compile(
     settings: &Map<String, Value>,
 ) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
-    let settings = PrebidServerSettings::deserialize(Value::Object(settings.clone())).map_err(
-        |error| {
+    let settings =
+        PrebidServerSettings::deserialize(Value::Object(settings.clone())).map_err(|error| {
             Report::new(TrustedServerError::Configuration {
                 message: format!("invalid `{PREBID_SERVER_ID}` settings: {error}"),
             })
-        },
-    )?;
+        })?;
     let override_engine = compile_profile_override_rules(
         &settings.bid_param_zone_overrides,
         &settings.bid_param_overrides,
@@ -317,7 +316,10 @@ mod tests {
             Some("https://example.com/news?pbjs_debug=true".to_string())
         );
         assert_eq!(
-            demand.site_page(Some("https://example.com/news?pbjs_debug=true"), "example.com"),
+            demand.site_page(
+                Some("https://example.com/news?pbjs_debug=true"),
+                "example.com"
+            ),
             Some("https://example.com/news?pbjs_debug=true".to_string())
         );
     }

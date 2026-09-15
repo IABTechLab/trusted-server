@@ -17,8 +17,10 @@ The Sourcepoint integration:
 Add the following to `trusted-server.toml`:
 
 ```toml
-[integrations.sourcepoint]
-enabled = true
+[integration]
+provider = ["sourcepoint"]
+
+[integration.sourcepoint]
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
 # Optional: forward a custom Sourcepoint authCookie name upstream.
@@ -27,14 +29,13 @@ cache_ttl_seconds = 3600
 ```
 
 ::: warning Migration note
-The Sourcepoint browser module is now opt-in through `[integrations.sourcepoint].enabled = true`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should enable this integration explicitly before upgrading.
+The Sourcepoint browser module is now opt-in. Name `sourcepoint` in `[integration] provider`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should select the integration explicitly before upgrading.
 :::
 
 ### Configuration Options
 
 | Option              | Type             | Default                        | Description                                                                                                                                                                |
 | ------------------- | ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`           | boolean          | `false`                        | Enable the Sourcepoint integration                                                                                                                                         |
 | `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                                                                                                  |
 | `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                                                                                                     |
 | `auth_cookie_name`  | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies. Names must be 1-64 characters and contain only letters, numbers, `_`, or `-` |

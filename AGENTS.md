@@ -25,7 +25,7 @@ crates/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device provider)
   edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC provider is in core)
   geo/                                  # vendor geo provider crates (host geo is injected by the adapter)
-  permission-signal/                    # permission signal provider crates, one per scheme (gpc, gpp, tcf, us-privacy); core links none
+  permission-signal/                    # permission signal provider crates, one per scheme (gpc, gpp, tcf, us-privacy), and core links none
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -358,14 +358,26 @@ Bad: `"fix: added feature flags"`
 ## Provider Architecture
 
 Each vendor-differentiated capability is pluggable behind its own trait, so a
-deployment selects an implementation and the core stays neutral:
+deployment selects an implementation and the core stays neutral. Every
+pluggable thing follows one configuration convention, which is a top-level
+table named for the job, a `provider` key that selects what runs, and a
+`[<type>.<name>]` table for a provider that has settings. The rules and what
+is checked when are in `docs/guide/configuration-rules.md`, which is the page
+to read before changing any provider configuration.
 
-| Capability            | Trait                                    | Selector            | Built-in (core)                         | Vendor / host crates         |
-| --------------------- | ---------------------------------------- | ------------------- | --------------------------------------- | ---------------------------- |
-| Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
-| Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
-| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
-| Permission signals    | `PermissionSignalProvider` (`permission_signal/mod.rs`) | `[permission_signal] sources` (an ordered list) | None, and with no provider every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
+| Capability            | Trait                                    | Selector                  | Built-in (core)                              | Vendor / host crates         |
+| --------------------- | ---------------------------------------- | ------------------------- | -------------------------------------------- | ---------------------------- |
+| Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`           | `hmac`, `host_signals`, `client_fixed` (opt-in, no default) | `crates/edgecookie/<vendor>` |
+| Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider`       | `builtin`, User-Agent only (the default)     | `crates/device/<vendor>`     |
+| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`          | None, no location (the default), or `platform` | `crates/geo/<vendor>`      |
+| Permission signals    | `PermissionSignalProvider` (`permission_signal/mod.rs`) | `[permission_signal] provider` (an ordered list) | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`, all of them with no list | `crates/permission-signal/<scheme>` |
+| Auction demand        | `DemandImplementation` (`auction/demand.rs`) | `[demand] provider` (a list) | `openrtb`, `prebid_server`, `aps`        | an integration builder       |
+| Ad server             | `AdServerImplementation` (`auction/demand.rs`) | `[adserver] provider` | `adserver_mock`                            | an integration builder       |
+| Page integrations     | `IntegrationBuilder` (`integrations/mod.rs`) | `[integration] provider` (a list) | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` | an adapter-supplied builder |
+
+`openrtb`, `prebid_server`, `aps` and `adserver_mock` supply implementations
+only. They are not page integrations and cannot be named in
+`[integration] provider`.
 
 Principles for adding or changing a provider:
 
@@ -404,7 +416,8 @@ IntegrationRegistration::builder(ID)
 ```
 
 - Integration IDs match JS directory names: `prebid` (deferred), `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
-- `creative` is JS-only (no Rust registration); `nextjs`, `aps`, `adserver_mock` are Rust-only.
+- An integration runs when `[integration] provider` names it. There is no `enabled` flag.
+- `creative` is JS-only (no Rust registration), and `nextjs` is Rust-only. `openrtb`, `prebid_server`, `aps` and `adserver_mock` register demand or ad server implementations rather than page integrations.
 - Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
 
@@ -424,7 +437,7 @@ IntegrationRegistration::builder(ID)
 | --------------------- | ---------------------------------------------------------- |
 | `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
 | `fastly.toml`                   | Fastly service configuration and build settings                 |
-| `trusted-server.example.toml`   | Source-controlled app-config template (includes the `[ec]` / `[geo]` / `[device]` provider selectors and the `[permission_signal] sources` list) |
+| `trusted-server.example.toml`   | Source-controlled app-config template (includes the `[ec]`, `[geo]`, `[device]`, `[permission_signal]`, `[demand]`, `[adserver]` and `[integration]` provider selectors) |
 | `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
 | `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
 | `.env.dev`                      | Local development environment variables                         |

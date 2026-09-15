@@ -28,7 +28,7 @@ The `replace-with-*` values below are intentionally rejected placeholders:
 provider = "hmac"
 ec_store = "ec_identity_store"
 
-[ec.providers.hmac]
+[ec.hmac]
 passphrase = "ec_passphrase"
 
 [[ec.partners]]
@@ -43,11 +43,11 @@ secret store, not the credential values. This workflow calls the inbound
 identify and batch-sync APIs, so its partner needs `api_token`. Partners that
 do not call either API may omit it. Provision high-entropy values under
 `ec_passphrase` and `partner_api_token`; see
-[Configuration](/guide/configuration#secret-store-migration).
+[Configuration](/guide/configuration#static-secret-references).
 
 Required behavior assumptions:
 
-- `provider = "hmac"` selects the built-in HMAC provider; its `passphrase` lives under `[ec.providers.hmac]`
+- `provider = "hmac"` selects the built-in HMAC provider, and its `passphrase` lives under `[ec.hmac]`
 - The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones

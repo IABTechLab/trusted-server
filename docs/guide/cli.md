@@ -207,10 +207,10 @@ publisher-specific settings, then run:
 ts config validate
 ```
 
-The draft also fills `[integrations.js_asset_proxy]` with disabled third-party
+The draft also fills `[integration.js_asset_proxy]` with disabled third-party
 script candidates from the audit. These entries are inventory only: they do not
 register routes or rewrite HTML until you set
-`integrations.js_asset_proxy.enabled = true` and change individual
+`js_asset_proxy` in the `[integration] provider` list and change individual
 `assets[].proxy` values to `"enabled"` or `"blocked"`. Some candidates may be
 runtime-injected scripts; JS Asset Proxy only rewrites matching script `src` URLs
 present in HTML processed by Trusted Server.
@@ -245,7 +245,7 @@ APIs.
 `trusted-server.toml`.
 
 ```toml
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["rubicon", "kargo"]
 user_id_modules = ["sharedIdSystem"]
 ```
@@ -259,8 +259,8 @@ ts prebid bundle
 ```
 
 By default, generated artifacts are written to `dist/prebid/`, and the command
-updates `integrations.prebid.external_bundle_sha256` and
-`integrations.prebid.external_bundle_sri` in `trusted-server.toml`. Upload the
+updates `integration.prebid.external_bundle_sha256` and
+`integration.prebid.external_bundle_sri` in `trusted-server.toml`. Upload the
 generated JavaScript file yourself, set `external_bundle_url` to its HTTPS
 asset URL, and include that host (plus any redirect targets) in
 `proxy.allowed_domains` before running `ts config validate` or `ts config push`.

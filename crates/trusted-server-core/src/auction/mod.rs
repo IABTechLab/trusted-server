@@ -138,7 +138,7 @@ pub fn build_orchestrator(
 #[cfg(test)]
 mod plan_sharing_tests {
     use super::*;
-    use crate::auction::test_support::{demand_named, demand_table, demand_selection};
+    use crate::auction::test_support::{demand_named, demand_selection, demand_table};
     use crate::integrations::IntegrationRegistry;
     use crate::provider_table::ProviderChoice;
     use crate::test_support::tests::create_test_settings;
@@ -169,7 +169,8 @@ mod plan_sharing_tests {
     #[test]
     fn an_ad_server_this_build_does_not_have_fails_the_plan() {
         let mut settings = create_test_settings();
-        settings.adserver = ProviderChoice::new(Some("fictional_adserver".to_string()), BTreeMap::new());
+        settings.adserver =
+            ProviderChoice::new(Some("fictional_adserver".to_string()), BTreeMap::new());
         let error = compile_auction_plan(&settings)
             .expect_err("should refuse an ad server no builder registers");
         assert!(
@@ -197,8 +198,8 @@ mod plan_sharing_tests {
     fn an_ad_server_table_with_no_endpoint_fails_the_plan() {
         let mut settings = create_test_settings();
         settings.adserver = adserver("adserver_mock", Map::new());
-        let error =
-            compile_auction_plan(&settings).expect_err("should refuse an ad server with no endpoint");
+        let error = compile_auction_plan(&settings)
+            .expect_err("should refuse an ad server with no endpoint");
         assert!(
             format!("{error:?}").contains("endpoint"),
             "should say an endpoint is needed: {error:?}"
@@ -246,7 +247,10 @@ mod plan_sharing_tests {
         let mut publisher_native = demand_table("aps", "https://aps.example/e/pb/bid");
         publisher_native.insert("rendering_mode".to_string(), json!("publisher_native"));
         settings.demand = demand_selection(vec![
-            ("aps_one", demand_table("aps", "https://aps.example/e/pb/bid")),
+            (
+                "aps_one",
+                demand_table("aps", "https://aps.example/e/pb/bid"),
+            ),
             ("aps_two", publisher_native),
         ]);
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile APS plan"));

@@ -108,6 +108,10 @@ export default withMermaid(
           items: [
             { text: 'Architecture', link: '/guide/architecture' },
             { text: 'Configuration', link: '/guide/configuration' },
+            {
+              text: 'Configuration Rules',
+              link: '/guide/configuration-rules',
+            },
             { text: 'CLI', link: '/guide/cli' },
             { text: 'Testing', link: '/guide/testing' },
             { text: 'Integration Guide', link: '/guide/integration-guide' },

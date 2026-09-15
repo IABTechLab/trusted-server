@@ -172,7 +172,6 @@ pub(crate) fn plan_config(
     }
 }
 
-
 /// A `[demand]` selection of ordinary `OpenRTB` sources under the names given,
 /// each taking every eligible slot.
 pub(crate) fn demand_named(names: &[&str]) -> crate::provider_table::ProviderList {
@@ -180,8 +179,10 @@ pub(crate) fn demand_named(names: &[&str]) -> crate::provider_table::ProviderLis
         names
             .iter()
             .map(|name| {
-                let mut table =
-                    demand_table("openrtb", &format!("https://{name}.example/openrtb2/auction"));
+                let mut table = demand_table(
+                    "openrtb",
+                    &format!("https://{name}.example/openrtb2/auction"),
+                );
                 table.insert("routing".to_string(), json!("all_eligible"));
                 (*name, table)
             })

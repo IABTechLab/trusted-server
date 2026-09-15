@@ -25,8 +25,8 @@ use crate::error::TrustedServerError;
 use crate::openrtb::OpenRtbRequest;
 use crate::platform::PlatformResponse;
 
-pub use super::routing::{ProviderAuctionInput, ProviderSlotInput, TransportHeaders};
 use super::provider::AuctionProvider;
+pub use super::routing::{ProviderAuctionInput, ProviderSlotInput, TransportHeaders};
 use super::types::AuctionResponse;
 
 /// The longest primary `Accept-Language` tag a conservative source receives.
@@ -187,6 +187,21 @@ pub trait CompiledDemand: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Compiles one demand source from its settings.
+///
+/// The map holds the table's own settings, without `implementation` and the
+/// common keys the driver reads, which are `endpoint`, `timeout_ms`, `routing`
+/// and `notifications`.
+pub type CompileDemandFn =
+    fn(&Map<String, Value>) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>>;
+
+/// Builds an ad server from its configured name and its settings.
+///
+/// The map holds the table's own settings without `implementation`, and the
+/// name is what the ad server reports itself as in responses and telemetry.
+pub type BuildAdServerFn =
+    fn(&str, &Map<String, Value>) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>>;
+
 /// A demand implementation an integration registers, named by `[demand]`
 /// `provider` or by an `implementation` line.
 #[derive(Clone, Copy)]
@@ -202,10 +217,8 @@ pub struct DemandImplementation {
     pub serves_stored_requests: bool,
     /// Checks and canonicalizes the endpoint after the common checks passed.
     pub canonicalize_endpoint: fn(&mut Url) -> Result<(), String>,
-    /// Compiles one source from its settings. The map holds the table's own
-    /// settings, without `implementation` and the common keys the driver
-    /// reads (`endpoint`, `timeout_ms`, `routing` and `notifications`).
-    pub compile: fn(&Map<String, Value>) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>>,
+    /// Compiles one source from its settings.
+    pub compile: CompileDemandFn,
 }
 
 impl core::fmt::Debug for DemandImplementation {
@@ -236,10 +249,8 @@ pub fn accept_endpoint(endpoint: &mut Url) -> Result<(), String> {
 pub struct AdServerImplementation {
     /// The implementation id, in `snake_case`.
     pub id: &'static str,
-    /// Builds the ad server from its configured name and its settings. The map
-    /// holds the table's own settings without `implementation`, and the name
-    /// is what the ad server reports itself as in responses and telemetry.
-    pub build: fn(&str, &Map<String, Value>) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>>,
+    /// Builds the ad server from its configured name and its settings.
+    pub build: BuildAdServerFn,
 }
 
 impl core::fmt::Debug for AdServerImplementation {
