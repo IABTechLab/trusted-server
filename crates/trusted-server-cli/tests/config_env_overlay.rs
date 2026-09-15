@@ -31,7 +31,7 @@ const REWRITE_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES";
 const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
 const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__INTEGRATION__GPT__GAM_ATTRIBUTION_ENABLED";
 const AD_TEMPLATES_ENABLED_ENV: &str = "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED";
-const PROVIDER_ENDPOINT_ENV: &str = "TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT";
+const PROVIDER_ENDPOINT_ENV: &str = "TRUSTED_SERVER__DEMAND__PBS_MAIN__ENDPOINT";
 const BIDDER_PROVIDER_ENV: &str = "TRUSTED_SERVER__AUCTION__BIDDERS__EXAMPLE-BIDDER__PROVIDER";
 
 struct MigratedProject {
@@ -54,13 +54,9 @@ fn migrated_project() -> MigratedProject {
     document["auction"]["sanitize_creatives"] = value(false);
     document["creative_opportunities"]["enabled"] = value(true);
     document["creative_opportunities"]["gam_network_id"] = value("123456789");
-    document["auction"]["providers"]["pbs-main"] = toml_edit::table();
-    document["auction"]["providers"]["pbs-main"]["protocol"] = value("openrtb-2.6");
-    document["auction"]["providers"]["pbs-main"]["profile"] = value("standard");
-    document["auction"]["providers"]["pbs-main"]["endpoint"] =
-        value("https://original.example/openrtb2/auction");
-    document["auction"]["bidders"]["example-bidder"] = toml_edit::table();
-    document["auction"]["bidders"]["example-bidder"]["provider"] = value("pbs-main");
+    // The demand source `pbs_main` and the bidder route `example-bidder`
+    // that names it come from the fixture itself, so the map-shaped overlays
+    // below have leaves to replace.
     // An integration reads its settings only when the provider list names it,
     // and the overlay cannot create a leaf, so the GPT block carries the one
     // the override replaces.
@@ -123,8 +119,8 @@ fn config_validate_explains_legacy_provider_list_migration() {
         "error should identify the removed field: {stderr}"
     );
     assert!(
-        stderr.contains("CHANGELOG.md"),
-        "error should direct operators to migration guidance: {stderr}"
+        stderr.contains("[demand] provider"),
+        "error should name where the setting moved to: {stderr}"
     );
 }
 
@@ -363,7 +359,7 @@ fn map_shaped_provider_and_bidder_environment_overlays_apply() {
             PROVIDER_ENDPOINT_ENV,
             "https://overlay.example/openrtb2/auction",
         )
-        .env(BIDDER_PROVIDER_ENV, "pbs-main")
+        .env(BIDDER_PROVIDER_ENV, "pbs_main")
         .output()
         .expect("should run ts config push with map overlays");
 
@@ -389,11 +385,11 @@ fn map_shaped_provider_and_bidder_environment_overlays_apply() {
         serde_json::from_str(envelope_json).expect("should parse blob envelope");
 
     assert_eq!(
-        envelope["data"]["auction"]["providers"]["pbs-main"]["endpoint"],
+        envelope["data"]["demand"]["pbs_main"]["endpoint"],
         "https://overlay.example/openrtb2/auction"
     );
     assert_eq!(
         envelope["data"]["auction"]["bidders"]["example-bidder"]["provider"],
-        "pbs-main"
+        "pbs_main"
     );
 }
