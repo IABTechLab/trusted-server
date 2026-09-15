@@ -83,7 +83,7 @@ pub struct AppState {
     /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
     /// `None` for a deployment that selects no provider.
     ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
-    /// The permission signal providers `[permission_signal] sources` selects
+    /// The permission signal providers `[permission_signal] provider` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
@@ -734,8 +734,8 @@ mod tests {
     use super::*;
 
     /// Settings selecting a vendor Edge Cookie provider this adapter does not
-    /// inject, with the `[ec.providers.<key>]` block configuration validation
-    /// requires. `acme` is a fictional vendor key.
+    /// inject, with the `[ec.acme]` block that provider's settings live in.
+    /// `acme` is a fictional vendor key.
     const UNINJECTED_PROVIDER_TOML: &str = r#"
         [[handlers]]
         path = "^/_ts/admin"
@@ -751,7 +751,7 @@ mod tests {
         [ec]
         provider = "acme"
 
-        [ec.providers.acme]
+        [ec.acme]
         endpoint = "https://ec.acme.example.com"
 
         # An Edge Cookie provider is configured, so single-jurisdiction

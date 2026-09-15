@@ -1,7 +1,7 @@
-// Demonstration client for the client-cycle Edge Cookie provider (client-fixed).
+// Demonstration client for the client-cycle Edge Cookie provider (`client_fixed`).
 //
 // Client and server share one fixed, known word. When the resolved marker is
-// absent, this posts that word to the resolve endpoint. With the `client-fixed`
+// absent, this posts that word to the resolve endpoint. With the `client_fixed`
 // provider selected, the server verifies the word and, on a match, persists the
 // identity-graph row and sets the coded form of the word (cfix~an-ec) as an
 // HttpOnly Edge Cookie on the
@@ -44,7 +44,7 @@ const REQUIRED_PERMISSION = 'necessary.operations.storage';
 export async function requiredPermissionIsSet(): Promise<boolean> {
   const whenPermissions = window.tsjs?.whenPermissions;
   if (typeof whenPermissions !== 'function') {
-    log.warn('ec client-fixed: no permission state on the page, not posting');
+    log.warn('ec client_fixed: no permission state on the page, not posting');
     return false;
   }
   const snapshot = await whenPermissions();
@@ -71,7 +71,7 @@ export async function resolveEdgeCookie(): Promise<string | null> {
     return null;
   }
   if (!(await requiredPermissionIsSet())) {
-    log.info('ec client-fixed: required permission not set, not posting');
+    log.info('ec client_fixed: required permission not set, not posting');
     return null;
   }
 
@@ -82,10 +82,10 @@ export async function resolveEdgeCookie(): Promise<string | null> {
       headers: { 'Content-Type': 'text/plain' },
       body: FIXED_WORD,
     });
-    log.info('ec client-fixed: posted the known word to the resolve endpoint');
+    log.info('ec client_fixed: posted the known word to the resolve endpoint');
     return FIXED_WORD;
   } catch (err) {
-    log.warn('ec client-fixed: resolve request failed', err);
+    log.warn('ec client_fixed: resolve request failed', err);
     return null;
   }
 }

@@ -392,7 +392,7 @@ pub struct SignalPolicy {
     /// Whether a present TCF record's grants and revokes apply. Whether a
     /// consenting record then stands over an opt-out, or the opt-out over it,
     /// is decided by the order the providers are asked in, which is
-    /// `[permission_signal] sources`, not by this flag.
+    /// `[permission_signal] provider`, not by this flag.
     tcf_authoritative: bool,
     /// The signals that constitute a US-style opt-out.
     opt_out_sources: Vec<OptOutSource>,
