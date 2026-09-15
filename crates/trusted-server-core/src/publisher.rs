@@ -4509,7 +4509,7 @@ pub async fn handle_publisher_request(
             .headers()
             .get("user-agent")
             .and_then(|value| value.to_str().ok());
-        let observation = AuctionObservationContext::from_parts(
+        let mut observation = AuctionObservationContext::from_parts(
             AuctionSource::InitialNavigation,
             &settings.publisher.domain,
             &request_path,
@@ -4517,6 +4517,9 @@ pub async fn handle_publisher_request(
             user_agent,
             ec_context,
         );
+        // Written on the value, before it is moved into `auction_observation` below. Sites
+        // after that move reach it through `auction_observation.as_mut()` instead.
+        observation.set_origin_cache_shareable(origin_response_is_shareable);
 
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
@@ -9447,8 +9450,7 @@ mod tests {
                 .expect("should lock recorded telemetry batches")
                 .iter()
                 .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
-                .filter(|row| row.event_kind == "summary")
-                .next_back()
+                .rfind(|row| row.event_kind == "summary")
                 .cloned()
         }
 
@@ -9804,6 +9806,57 @@ mod tests {
             assert!(
                 last_summary_row(&sink).is_some(),
                 "the harness must emit a summary row, or every assertion built on it is vacuous"
+            );
+        }
+
+        #[tokio::test]
+        async fn navigation_records_whether_the_origin_response_was_shareable() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(
+                &settings,
+                &services,
+                navigation_request_with_cookie("ts-ec=abc"),
+            )
+            .await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .origin_cache_shareable,
+                Some(0),
+                "a cookie-bearing request must record as not shareable"
+            );
+        }
+
+        #[tokio::test]
+        async fn cookieless_navigation_records_the_origin_response_as_shareable() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .origin_cache_shareable,
+                Some(1),
+                "a cookieless GET navigation is the population the gate is meant to admit"
             );
         }
 
