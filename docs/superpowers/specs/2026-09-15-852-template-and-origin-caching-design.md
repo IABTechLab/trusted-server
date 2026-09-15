@@ -544,7 +544,15 @@ Carry outcomes on the auction telemetry rows, wired in `AuctionEventRow::base()`
 alone (`AuctionEventRow` is at `:277`), which
 already flows to Tinybird with `publisher_domain` and `page_path`:
 
-- `template_cache_state: Option<String>` — the `TemplateCacheResponseState` string
+- ~~`template_cache_state`~~ — **dropped during implementation, and it cannot be added
+  back without restructuring when telemetry is emitted.** On a cold fill the ordering is
+  fixed: `stream_publisher_body_async` collects the auction, takes the observation and emits
+  the batch, and only then does `store_template_if_authorized` run and the state get
+  stamped. The store cannot move earlier (it needs the transform) and the emit cannot move
+  later without giving up collecting during body streaming — which is a latency decision on
+  the path this whole issue exists to improve. `hit` was reachable and `miss-stored` was
+  not, so the column would have made hit rate compute as roughly 100%. The
+  `x-ts-template-cache` header still carries all nine states per response.
 - `template_cache_bypass_reason: Option<String>` — the `TemplateCacheBypassReason` display
   string, or `None` when there was no bypass
 - `origin_cache_shareable: Option<bool>` — whether `origin_response_is_shareable` was true,
@@ -560,6 +568,8 @@ adds one: "cookie-disqualified" is an expected default, "no
 positive freshness" is an origin configuration problem, "vary not covered" is a stale
 `template_cache_vary` list, "malformed cache policy" is a bug. Without it a zero hit rate is
 uninterpretable.
+
+This is the spec's own trim, reached by the code rather than by the approval gate.
 
 **The reason has two sources, and only one of them exists today.** `template_cache_ttl`
 (`publisher.rs:6129`) returns `Result<Duration, TemplateCacheBypassReason>`, but it runs inside

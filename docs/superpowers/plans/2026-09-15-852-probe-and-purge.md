@@ -197,10 +197,20 @@ Each axis fetches the URL twice and compares the bodies. All four are blocking.
 | Cookie            | bare       | with the TS cookie set plus any `--cookie` | raw bytes              |
 | `Accept-Encoding` | `gzip`     | `identity`                                 | bytes **after decode** |
 | `User-Agent`      | desktop UA | mobile UA                                  | raw bytes              |
+| RSC / router      | bare       | `rsc: 1` plus configured `next-router-*`   | raw bytes              |
 
 The TS cookie set for the cookie arm is `ts-ec`, the consent cookies from
 `CONSENT_COOKIE_NAMES` (`core/src/cookies.rs:20`), and the tester cookie — representative of what
 a real repeat visitor carries.
+
+**The RSC axis is specific to this change and easy to miss.** RSC fetches are not navigations —
+`http_util.rs:73-82` requires `Sec-Fetch-Dest: document` — so they never set the bypass and
+**already flow through the readthrough cache today**, while HTML navigations are PASS. Removing
+the bypass puts both representations under one cache key for the first time. If the origin varies
+on `rsc` / `next-router-*` without declaring it in `Vary`, the cache can serve a flight payload to
+an HTML navigation. Recorded in the #1009 measurement findings as a risk nobody had considered.
+Drive this axis from the operator's configured `template_cache_vary` list rather than a fixed set,
+since the varying headers are publisher-specific.
 
 - [ ] **Step 1: Write the failing tests**
 

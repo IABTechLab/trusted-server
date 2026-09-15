@@ -956,108 +956,22 @@ hit rate cannot be told apart from an origin misconfiguration."
 
 ---
 
-## Task 9: Record the terminal template-cache state
+## Task 9: Record the terminal template-cache state — NOT DONE, and cannot be
 
-**Files:**
+**Attempted and reverted.** The store outcome cannot reach the summary row. On a cold fill
+`stream_publisher_body_async` collects the auction, takes the observation and emits the batch,
+and only afterwards does `store_template_if_authorized` run and the state get stamped. The store
+cannot move earlier (it needs the transform) and the emit cannot move later without giving up
+collecting during body streaming, which is a latency decision on the path this issue exists to
+improve.
 
-- Modify: `crates/trusted-server-core/src/publisher.rs` around `:4824`
+`hit` was reachable and `miss-stored` was not, so the column would have reported hits without
+misses and made hit rate compute as roughly 100%. A silently wrong metric is worse than an absent
+one, so `template_cache_state` was dropped from the observation, the row, the datasource and the
+fixture — the spec's own trim, reached by the code rather than by the approval gate.
 
-There are three `set_template_cache_response_state` call sites — `:1795`, `:2202`, `:4824` — and
-only `:4824` is inside `handle_publisher_request`. The other two are in the finalizer and
-assembly paths, where the observation has already been moved into `params`. The reachable hook
-is the `template_cache_response_state` local that accumulates from `:4386` to `:4824`.
-
-`auction_observation.take()` fires at `:4669`, `:4726` and `:4748` **before** `:4824`, and at
-`:4957` and `:4996` **after** it. Only the first three can rob the write; the last two happen
-later, so their rows do carry the state. Write at `:4824` for the paths that reach it, and at the
-Hit arm (`:4617`) for the path that returns early via `:4669`.
-
-- [ ] **Step 1: Write the failing test**
-
-```rust
-        #[tokio::test]
-        async fn template_cache_hit_records_its_state() {
-            let sink = Arc::new(RecordingTelemetrySink::default());
-            let cache = Arc::new(MemoryTemplateCache::default());
-            let services = services_with_cache_and_telemetry(
-                Arc::new(cacheable_html_client()),
-                Arc::clone(&cache),
-                Arc::clone(&sink),
-            );
-            let settings = esi_settings_with_auction_and_slots();
-
-            let _cold = run(&settings, &services, navigation_request()).await;
-            let _warm = run(&settings, &services, navigation_request()).await;
-
-            assert_eq!(
-                last_summary_row(&sink)
-                    .expect("should emit a summary row for the warm request")
-                    .template_cache_state
-                    .as_deref(),
-                Some("hit"),
-                "the telemetry state must match the x-ts-template-cache header"
-            );
-        }
-```
-
-Model the cold/warm setup and the cacheable-origin stub on the existing test at `:9612`, which
-already drives a cold fill then a warm hit and asserts on the header.
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cargo test-fastly -- template_cache_end_to_end_tests::template_cache_hit_records_its_state --nocapture`
-Expected: FAIL — state is `None`.
-
-- [ ] **Step 3: Write at the reachable sites**
-
-At `:4824`, extend the existing block:
-
-```rust
-    if let Some(state) = template_cache_response_state {
-        set_template_cache_response_state(&mut response, state);
-        if let Some(observation) = auction_observation.as_mut() {
-            observation.set_template_cache_state(state.as_str());
-        }
-    }
-```
-
-And in the `TemplateCacheLookup::Hit` arm (`:4617`), before the observation is moved out at
-`:4669`:
-
-```rust
-                if let Some(observation) = auction_observation.as_mut() {
-                    observation.set_template_cache_state(TemplateCacheResponseState::Hit.as_str());
-                }
-```
-
-`TemplateCacheResponseState::as_str` is at `:107` and is in the same module, so no visibility
-change is needed.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `cargo test-fastly -- template_cache_end_to_end_tests::template_cache_hit_records_its_state --nocapture`
-Expected: PASS.
-
-- [ ] **Step 5: Document the known-None paths**
-
-Add a comment above the `:4824` block recording that the abandon paths at `:4726` and `:4748`
-take the observation before this point, so their rows legitimately carry
-`template_cache_state: None`. Do **not** include `:4957` or `:4996` — they take afterwards and
-their rows do carry the state; naming them would make the comment false. Without the note a future reader will read it as a bug.
-
-Run: `cargo test-fastly && cargo clippy-fastly`
-Expected: PASS, no warnings.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/trusted-server-core/src/publisher.rs
-git commit -m "Record the terminal template-cache state on the auction observation
-
-Written beside the response-header stamp so the header and the telemetry
-cannot drift. Abandon paths take the observation earlier and legitimately
-report no state."
-```
+`template_cache_bypass_reason` and `origin_cache_shareable` carry the triage. The
+`x-ts-template-cache` header still reports all nine states per response for debugging one request.
 
 ---
 
