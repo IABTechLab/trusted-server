@@ -4069,6 +4069,51 @@ pub struct AuctionDispatch<'a> {
     pub registry: Option<&'a PartnerRegistry>,
 }
 
+/// Request-side conditions that decide whether this request's origin response may be
+/// shared between readers.
+///
+/// Necessary for both the origin readthrough cache and the template cache, which is why it
+/// is one type rather than two parallel expressions that must be kept in step. Keeping the
+/// template-only conditions out of it is deliberate: the assembly mode and the reader's
+/// encoding support say whether *this pipeline* can assemble a shared template, not whether
+/// the origin's bytes may be shared at all.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SharedRequestInputs {
+    /// The method admits a shared representation. Only `GET` does.
+    pub(crate) method_is_cacheable: bool,
+    /// A request host was resolved. The post-processed output is host-dependent.
+    pub(crate) host_present: bool,
+    /// The request carried an `Authorization` value that did not pass edge auth unchanged.
+    pub(crate) authorization_disqualifies: bool,
+    /// The request carried a `Cookie` and the operator has not declared the origin
+    /// cookie-independent.
+    pub(crate) cookie_disqualifies: bool,
+    /// Request cache semantics, diagnostics, or an integration require a fresh origin
+    /// response for this reader specifically.
+    pub(crate) request_requires_origin: bool,
+}
+
+/// Whether this request's origin response may be shared between readers at all.
+pub(crate) fn origin_response_is_shareable(inputs: SharedRequestInputs) -> bool {
+    inputs.method_is_cacheable
+        && inputs.host_present
+        && !inputs.authorization_disqualifies
+        && !inputs.cookie_disqualifies
+        && !inputs.request_requires_origin
+}
+
+/// Whether this request may additionally use a shared *template*.
+///
+/// The two extra conditions say whether this pipeline can assemble one, not whether the
+/// origin's bytes may be shared — see [`SharedRequestInputs`].
+pub(crate) fn request_can_use_shared_template(
+    inputs: SharedRequestInputs,
+    assembly_mode_is_esi: bool,
+    reader_supports_assembly: bool,
+) -> bool {
+    origin_response_is_shareable(inputs) && assembly_mode_is_esi && reader_supports_assembly
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
@@ -4322,13 +4367,19 @@ pub async fn handle_publisher_request(
     }
 
     let method_is_cacheable = req.method() == Method::GET;
-    let request_can_use_shared_template = method_is_cacheable
-        && matches!(assembly_mode, AssemblyMode::Esi)
-        && !request_host.is_empty()
-        && !authorization_disqualifies
-        && !cookie_disqualifies
-        && !request_requires_origin
-        && reader_supports_assembly;
+    let shared_request_inputs = SharedRequestInputs {
+        method_is_cacheable,
+        host_present: !request_host.is_empty(),
+        authorization_disqualifies,
+        cookie_disqualifies,
+        request_requires_origin,
+    };
+    let origin_response_is_shareable = origin_response_is_shareable(shared_request_inputs);
+    let request_can_use_shared_template = request_can_use_shared_template(
+        shared_request_inputs,
+        matches!(assembly_mode, AssemblyMode::Esi),
+        reader_supports_assembly,
+    );
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode. This
     // remains unconditional when template cache negotiation fails: that request bypasses shared
@@ -4372,6 +4423,14 @@ pub async fn handle_publisher_request(
             url: target_uri.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
+            // Read here, before `rewrite_origin_request` below replaces the URI with the
+            // origin target. Path *and* query: a different query is a different page, and
+            // a purge caller types the whole address.
+            request_path: req
+                .uri()
+                .path_and_query()
+                .map(|path_and_query| path_and_query.as_str().to_owned())
+                .unwrap_or_else(|| "/".to_owned()),
             origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
             assembly_mode,
             vary_values: settings
@@ -4458,7 +4517,7 @@ pub async fn handle_publisher_request(
             .headers()
             .get("user-agent")
             .and_then(|value| value.to_str().ok());
-        let observation = AuctionObservationContext::from_parts(
+        let mut observation = AuctionObservationContext::from_parts(
             AuctionSource::InitialNavigation,
             &settings.publisher.domain,
             &request_path,
@@ -4466,6 +4525,9 @@ pub async fn handle_publisher_request(
             user_agent,
             ec_context,
         );
+        // Written on the value, before it is moved into `auction_observation` below. Sites
+        // after that move reach it through `auction_observation.as_mut()` instead.
+        observation.set_origin_cache_shareable(origin_response_is_shareable);
 
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
@@ -6815,6 +6877,98 @@ mod tests {
     use crate::auction::types::AuctionResponse;
     use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
 
+    /// Every shared condition passing, as the base for single-condition negations.
+    fn all_shareable() -> SharedRequestInputs {
+        SharedRequestInputs {
+            method_is_cacheable: true,
+            host_present: true,
+            authorization_disqualifies: false,
+            cookie_disqualifies: false,
+            request_requires_origin: false,
+        }
+    }
+
+    #[test]
+    fn template_eligibility_implies_origin_shareability() {
+        for bits in 0u8..128 {
+            let inputs = SharedRequestInputs {
+                method_is_cacheable: bits & 1 != 0,
+                host_present: bits & 2 != 0,
+                authorization_disqualifies: bits & 4 != 0,
+                cookie_disqualifies: bits & 8 != 0,
+                request_requires_origin: bits & 16 != 0,
+            };
+            let is_esi = bits & 32 != 0;
+            let reader_supports_assembly = bits & 64 != 0;
+
+            let shareable = origin_response_is_shareable(inputs);
+            let template =
+                request_can_use_shared_template(inputs, is_esi, reader_supports_assembly);
+
+            assert!(
+                !template || shareable,
+                "template eligibility must imply origin shareability, input bits {bits}"
+            );
+            assert_eq!(
+                template,
+                shareable && is_esi && reader_supports_assembly,
+                "template eligibility must be the shared base plus the two template conditions, \
+                 input bits {bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_shared_input_is_necessary_for_shareability() {
+        assert!(
+            origin_response_is_shareable(all_shareable()),
+            "should be shareable when every condition passes"
+        );
+
+        for (label, broken) in [
+            (
+                "method",
+                SharedRequestInputs {
+                    method_is_cacheable: false,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "host",
+                SharedRequestInputs {
+                    host_present: false,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "authorization",
+                SharedRequestInputs {
+                    authorization_disqualifies: true,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "cookie",
+                SharedRequestInputs {
+                    cookie_disqualifies: true,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "requires-origin",
+                SharedRequestInputs {
+                    request_requires_origin: true,
+                    ..all_shareable()
+                },
+            ),
+        ] {
+            assert!(
+                !origin_response_is_shareable(broken),
+                "dropping the {label} condition must make the request unshareable"
+            );
+        }
+    }
+
     #[test]
     fn request_head_snapshot_preserves_downstream_shape_without_body() {
         let request = Request::builder()
@@ -8512,8 +8666,11 @@ mod tests {
         fn shared_template_ad_seam_is_readable_and_versioned() {
             assert_eq!(
                 (crate::platform::TEMPLATE_SCHEMA_VERSION, AD_ASSEMBLY_SEAM,),
-                (4, "<!--ts-ad-seam-->"),
-                "the readable seam and its cache schema must move together"
+                (5, "<!--ts-ad-seam-->"),
+                "changing the seam must bump the cache schema, or a deploy assembles \
+                 against a marker that moved. The converse does not hold — the schema \
+                 also moves when the cache key's shape changes, as it did for v5 — so \
+                 updating this pin with an unchanged seam is legitimate."
             );
             assert_eq!(
                 body_close_injection(AssemblyMode::Esi, false),
@@ -8870,6 +9027,13 @@ mod tests {
                 Ok(())
             }
 
+            async fn purge_url_surrogate_key(
+                &self,
+                _key: &str,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                Ok(())
+            }
+
             async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
                 Ok(())
             }
@@ -8889,6 +9053,7 @@ mod tests {
                 url: "https://example.com/page".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/page".to_string(),
                 origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
                 assembly_mode: AssemblyMode::Esi,
                 vary_values: vec![],
@@ -9015,6 +9180,10 @@ mod tests {
             /// Force the lookup transaction to fail, for the fail-open + telemetry
             /// contract. A backend outage must never become a publisher outage.
             fail_lookup: AtomicBool,
+            /// Surrogate keys a purge asked for. This double stores by cache key, so it
+            /// cannot resolve a surrogate key to entries the way the platform does —
+            /// recording the request is what a test can assert on.
+            purged_surrogate_keys: Arc<Mutex<Vec<String>>>,
         }
 
         struct MemoryTemplateReservation {
@@ -9200,6 +9369,21 @@ mod tests {
                 Ok(())
             }
 
+            /// Records the key so a test can assert what a purge asked for.
+            ///
+            /// This double stores by cache key, not by surrogate key, so it cannot
+            /// resolve one to the other the way the platform does.
+            async fn purge_url_surrogate_key(
+                &self,
+                key: &str,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.purged_surrogate_keys
+                    .lock()
+                    .expect("should lock purged surrogate keys")
+                    .push(key.to_owned());
+                Ok(())
+            }
+
             async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
                 self.entries.lock().expect("should lock entries").clear();
                 Ok(())
@@ -9266,6 +9450,55 @@ mod tests {
             assembler: Arc<RecordingTemplateAssembler>,
         ) -> RuntimeServices {
             services(http_client, cache).with_template_assembler(assembler)
+        }
+
+        /// A template cache **and** a telemetry sink.
+        ///
+        /// Neither existing builder wires both — `services` above sets the cache and no
+        /// sink, and `services_with_telemetry` in the SSAT module sets the sink and no
+        /// cache. Cache-outcome telemetry cannot be asserted end to end without both.
+        fn services_with_cache_and_telemetry(
+            http_client: Arc<StubHttpClient>,
+            cache: Arc<MemoryTemplateCache>,
+            telemetry_sink: Arc<RecordingTelemetrySink>,
+        ) -> RuntimeServices {
+            let telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink> =
+                telemetry_sink;
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(http_client)
+                .geo(Arc::new(NoopGeo))
+                .client_info(ClientInfo::default())
+                .template_cache(cache)
+                .auction_telemetry_sink(telemetry_sink)
+                .build()
+        }
+
+        /// The most recent `summary` row the sink recorded.
+        ///
+        /// `RecordingTelemetrySink` exposes no accessor, so this reads the field directly.
+        fn last_summary_row(
+            sink: &RecordingTelemetrySink,
+        ) -> Option<crate::auction::telemetry::AuctionEventRow> {
+            sink.batches
+                .lock()
+                .expect("should lock recorded telemetry batches")
+                .iter()
+                .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+                .rfind(|row| row.event_kind == "summary")
+                .cloned()
+        }
+
+        fn navigation_request_with_cookie(cookie: &str) -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::COOKIE,
+                HeaderValue::from_str(cookie).expect("should build a cookie header"),
+            );
+            request
         }
 
         /// Shareable HTML: no `Set-Cookie`, no `Vary`, a public `Cache-Control`. Every
@@ -9592,6 +9825,77 @@ mod tests {
                     .expect("a non-stream body has its bytes in hand")
                     .to_vec(),
             }
+        }
+
+        #[tokio::test]
+        async fn harness_emits_a_summary_row_for_an_ad_serving_navigation() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert!(
+                last_summary_row(&sink).is_some(),
+                "the harness must emit a summary row, or every assertion built on it is vacuous"
+            );
+        }
+
+        #[tokio::test]
+        async fn navigation_records_whether_the_origin_response_was_shareable() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(
+                &settings,
+                &services,
+                navigation_request_with_cookie("ts-ec=abc"),
+            )
+            .await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .origin_cache_shareable,
+                Some(0),
+                "a cookie-bearing request must record as not shareable"
+            );
+        }
+
+        #[tokio::test]
+        async fn cookieless_navigation_records_the_origin_response_as_shareable() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .origin_cache_shareable,
+                Some(1),
+                "a cookieless GET navigation is the population the gate is meant to admit"
+            );
         }
 
         #[tokio::test]
@@ -10503,7 +10807,7 @@ mod tests {
 
         #[test]
         fn parser_validation_does_not_change_the_cached_schema() {
-            assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 4);
+            assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 5);
             assert_eq!(AD_ASSEMBLY_SEAM, "<!--ts-ad-seam-->");
             assert!(!contains_publisher_esi_directive(
                 AD_ASSEMBLY_SEAM.as_bytes()

@@ -35,6 +35,7 @@ SCHEMA >
   `is_win` Nullable(UInt8),
   `ad_domain` Nullable(String),
   `ad_id` Nullable(String),
+  `origin_cache_shareable` Nullable(UInt8),
   `event_date` Date DEFAULT toDate(event_ts)
 
 ENGINE "MergeTree"
