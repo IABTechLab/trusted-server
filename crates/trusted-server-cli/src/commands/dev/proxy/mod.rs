@@ -78,6 +78,7 @@ async fn finish_interrupted_run<Restore, Stop, Drain>(
 
 /// `ts dev proxy [OPTIONS]` — see the design spec §4.
 #[derive(Debug, clap::Args)]
+#[command(arg_required_else_help = true)]
 pub struct ProxyArgs {
     /// Rewrite rule `FROM=TO` (repeatable).
     #[arg(long = "map", value_name = "FROM=TO")]

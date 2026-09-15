@@ -359,14 +359,7 @@ mod tests {
     };
 
     fn base_args() -> crate::commands::dev::proxy::ProxyArgs {
-        // Construct via clap so defaults match the real surface.
-        use clap::Parser;
-        #[derive(clap::Parser)]
-        struct W {
-            #[command(flatten)]
-            a: crate::commands::dev::proxy::ProxyArgs,
-        }
-        W::parse_from(["ts"]).a
+        parse_args(&["ts", "--listen", "127.0.0.1:18080"])
     }
 
     fn parse_args(argv: &[&str]) -> crate::commands::dev::proxy::ProxyArgs {
@@ -382,7 +375,7 @@ mod tests {
     #[test]
     fn clap_parses_rewrite_host_as_a_bool() {
         assert!(
-            !parse_args(&["ts"]).rewrite_host,
+            !parse_args(&["ts", "--listen", "127.0.0.1:18080"]).rewrite_host,
             "absent --rewrite-host is false"
         );
         assert!(
