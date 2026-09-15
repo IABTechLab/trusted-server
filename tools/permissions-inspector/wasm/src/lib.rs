@@ -16,7 +16,7 @@ use trusted_server_core::permissions::{Permission, PermissionMaps};
 use trusted_server_core::platform::GeoInfo;
 
 /// The signal providers the inspector asks, in the order every adapter offers
-/// them when `[permission_signal] sources` names none.
+/// them when `[permission_signal] provider` names none.
 fn providers() -> Vec<Arc<dyn PermissionSignalProvider>> {
     vec![
         Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),

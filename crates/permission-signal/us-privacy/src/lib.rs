@@ -14,8 +14,8 @@ use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInp
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission};
 
 /// The stable identifier this provider answers to in `[permission_signal]`
-/// `sources`, in logs, and when a peer consults it.
-pub const ID: &str = "us-privacy";
+/// `provider`, in logs, and when a peer consults it.
+pub const ID: &str = "us_privacy";
 
 /// A US Privacy string sale opt-out, read from `us_privacy`.
 #[derive(Debug, Default, Clone, Copy)]

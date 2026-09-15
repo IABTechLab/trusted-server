@@ -6,5 +6,13 @@ from `trusted-server-core` and is wired in by an adapter.
 
 The built-in HMAC provider (HMAC over the client IP) ships in
 `trusted-server-core` (`ec::provider`), so no crate is needed for it. There is
-no default provider; a deployment selects one explicitly with `[ec] provider`.
+no default provider, and a deployment selects one explicitly with
+`[ec] provider`.
+
+A provider's own settings live in the `[ec.<name>]` table the selector names.
+The name is the provider's implementation id, the same string its
+`EdgeCookieProvider::id` returns, unless the table names one with
+`implementation = "<id>"`, which lets an operator configure a provider under a
+name of their own choosing. A provider with no settings needs no table.
+
 This directory is a placeholder until a vendor provider is added.

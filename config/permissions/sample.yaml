@@ -513,7 +513,7 @@ rules:
 # Data Use is the TCF scheme's knowledge and lives in the TCF permission signal
 # provider crate, crates/permission-signal/tcf, so a deployment that runs no
 # TCF carries no table of another scheme's numbers. Which schemes run at all,
-# and in what order, is [permission_signal] sources in trusted-server.toml.
+# and in what order, is [permission_signal] provider in trusted-server.toml.
 signals:
   # A present TCF v2 record (a standalone TC string, or the EU TCF section of a
   # GPP string). With authoritative true, the record's consent to a purpose
@@ -521,7 +521,7 @@ signals:
   # revokes them, whereas with authoritative false the record is ignored.
   # The flag governs only whether the record answers. Whether its answer
   # stands over an opt-out signal below, or the opt-out over it, is the order
-  # the providers are asked in, [permission_signal] sources in
+  # the providers are asked in, [permission_signal] provider in
   # trusted-server.toml, where the last provider with an opinion decides. The
   # default order asks Global Privacy Control first, being a browser setting
   # with no interface of its own, and the schemes carrying a choice someone

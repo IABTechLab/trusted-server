@@ -74,7 +74,7 @@ deployment's to set, not the code's to assume.
 
 ```toml
 [permission_signal]
-sources = ["gpc", "gpp-sale-opt-out", "us-privacy", "tcf"]
+provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
 ```
 
 A provider not on the list does not run, and there is no separate switch. A
@@ -82,18 +82,24 @@ publisher who does not want to act on Global Privacy Control removes `"gpc"`
 from the list, and the provider that reads the header then does not run. One
 caveat: the core's consent pipeline can also synthesize a US Privacy opt-out
 from that header for a visitor in a US state, when the consent settings say to,
-which they do by default, and the `us-privacy` provider then acts on the record
+which they do by default, and the `us_privacy` provider then acts on the record
 it produced. A publisher who wants the header to have no effect at all turns
-that setting off as well. Leaving the section out entirely runs every provider
-the adapter offers, in the order it offers them, so a signal is never quietly
-ignored because someone forgot to list it. An empty list runs none of them,
-which is a publisher acting on no signal at all, and leaves every permission
-at its country and region baseline.
+that setting off as well. Leaving `provider` out, or the section entirely, runs
+every provider the adapter offers, in the order it offers them, so a signal is
+never quietly ignored because someone forgot to list it. An empty list runs
+none of them, which is a publisher acting on no signal at all, and leaves every
+permission at its country and region baseline.
 
 A name matching no provider the adapter links, or a name given twice, is
 refused at startup rather than ignored, so a typo cannot silently stop a
 scheme being honored. What ran, and what was left out, is written to the log
 once at startup.
+
+Providers are named in `snake_case`, lowercase words joined by underscores. A
+provider that gains settings will take them in a `[permission_signal.<name>]`
+block named for it. None of the four that ship has settings, so `provider` is
+the only key the section accepts, and a block or any other key is refused as
+an unknown field rather than ignored.
 
 The default order asks the signal with no interface of its own first and the
 ones carrying a choice made through an interface after. Global Privacy
@@ -109,8 +115,8 @@ question about a jurisdiction and a publisher.
 | Identifier         | Crate                                 | Reads                                             |
 | ------------------ | ------------------------------------- | ------------------------------------------------- |
 | `gpc`              | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control      |
-| `gpp-sale-opt-out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string       |
-| `us-privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string           |
+| `gpp_sale_opt_out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string       |
+| `us_privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string           |
 | `tcf`              | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code |
 
 The three opt-outs are separate so that a publisher who does not act on Global
@@ -177,7 +183,8 @@ record at all, so it must not degrade to the no-signal baseline.
 
 1. Create a crate that depends on `trusted-server-core` and implements
    `PermissionSignalProvider` from `trusted_server_core::permission_signal`.
-   Give it a stable identifier, which is the name configuration uses.
+   Give it a stable identifier in `snake_case`, which is the name
+   configuration uses.
 2. Answer neutral for a permission the scheme has no opinion on, including
    when its signal is absent from the request. Reading an absent signal as a
    refusal would revoke the permission on every request that did not carry
