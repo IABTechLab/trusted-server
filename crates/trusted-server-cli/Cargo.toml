@@ -17,20 +17,25 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
+derive_more = { workspace = true }
+error-stack = { workspace = true }
 edgezero-cli = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
+rpassword = "7.5"
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = "0.10"
 tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 which = { workspace = true }
 
 # `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
@@ -42,9 +47,7 @@ which = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
-derive_more = { workspace = true }
 directories = { workspace = true }
-error-stack = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server", "client"] }
 hyper-util = { workspace = true, features = ["tokio"] }

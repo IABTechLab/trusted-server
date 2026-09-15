@@ -16,6 +16,8 @@ This workflow permits planning and, after design approval, file generation and s
 
 Inspect repository instructions, Git status, existing infrastructure, runtime files, and supplied documents. Preserve unrelated changes. Identify the target repository and deployment directory before proposing edits.
 
+For read-only discovery from any existing `trusted-server.toml`, and for designing the operator commands and PBS config/secret delivery, read [configuration and secrets](references/configuration-and-secrets.md). Select the authoritative config source before inferring requirements; examples and disabled integrations are not active deployment inputs.
+
 Record requirements in one decision record, initially in the conversation, then in the approved deployment plan:
 
 | Requirement          | Value                   | Status                             | Evidence or decision owner | Blocks                                    |
@@ -24,7 +26,7 @@ Record requirements in one decision record, initially in the conversation, then 
 
 Treat supplied examples as evidence of intent, not accepted requirements for this deployment. Reconcile conflicting inputs with the user. Inspect existing answers before asking again.
 
-Done when the current deployment, requested outcome, reusable resources, and unanswered decisions are identified.
+Done when the current deployment, requested outcome, reusable resources, selected Trusted Server config source or its absence, and unanswered decisions are identified.
 
 ## 2. Interview by decision
 
@@ -53,6 +55,7 @@ Present one recommended design and only alternatives that resolve a real tradeof
 - Each selected AWS service, its requirement, and whether to reuse or create it.
 - Capacity assumptions, cost drivers and estimate date, accepted limitations, and blockers.
 - Runtime, infrastructure, secret, and traffic-control ownership.
+- Use the experimental `ts pbs` commands for supported local checks, secret writes, and EC2 status. Record the selected YAML/secret delivery path and unsupported operations explicitly. Deployment, rollback, and other runtime support need a separately approved implementation; avoid competing wrappers for implemented commands.
 - Target files and checks, with cloud-dependent checks separated from local checks.
 
 Ask the user to approve the architecture, assumptions, target files, and accepted limitations. Approval to generate files is not approval to execute them. Reopen approval if later findings change topology, cost commitments, or ownership.
@@ -63,9 +66,11 @@ Done when the user explicitly approves the design and file scope. If blockers re
 
 Read [file generation and validation](references/file-generation.md). Follow existing repository conventions and generate only artifacts used by the selected design. Keep the decision record in the deployment plan; reference it from the runbook rather than repeating it.
 
+Read the [PBS CLI usage and descriptor schema](../../../crates/trusted-server-cli/README.md) before generating inputs consumed by `ts pbs`. Its current descriptor supports EC2/Compose only. Keep other architecture choices available, but mark their CLI integration deferred rather than generating unsupported fields.
+
 Verify version-specific PBS fields and adapter bindings against the selected release. Verify AWS/Terraform behavior and pricing against current primary documentation. Record source links, versions, and verification dates in the deployment plan. Unavailable evidence remains a named blocker; do not invent image digests, configuration keys, prices, or benchmark results.
 
-Done when every approved artifact exists, has a named owner and check, and every unresolved input is visible and prevents unsafe use where applicable.
+Done when every approved artifact exists, has a named owner and check, and every unresolved input is visible and prevents unsafe use where applicable. Every generated operator command must have documented inputs, access requirements, output, failure behavior, and a recovery action; proposing command names alone is not implementation.
 
 ## 5. Validate and hand off
 

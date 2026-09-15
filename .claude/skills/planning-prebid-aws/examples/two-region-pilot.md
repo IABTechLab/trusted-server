@@ -41,6 +41,22 @@ The user must accept one-host-per-region outages and maintenance behavior. If re
 
 File generation starts after architecture-changing questions and target paths are approved. Live-traffic gates remain deferred to authorized execution: zero-allocation deployment checks, internal inventory validation, then agreed 1% and 5% observation windows. A tested caller kill switch and measured refresh bound are required before the live pilot.
 
+## Configuration and operator walkthroughs
+
+The experimental `ts pbs` CLI implements local inspection/checks, secret value writes, and EC2 infrastructure status. The release, runtime delivery, and rollback scenarios below remain acceptance criteria for a future approved implementation, not executed deployment evidence. Consult the [current command contract](../references/configuration-and-secrets.md#operator-command-contract) before documenting an invocation.
+
+| Input or task                                                             | Expected behavior                                                                                                                                                     |
+| ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Several `trusted-server.toml` files, including a disabled example         | Ask which source/environment is authoritative; preserve every source file and report uncertainty about remote overrides                                               |
+| The config lists server bidders, client-side bidders, and bundle adapters | Classify them separately; verify candidate server adapters and report host-secret needs as required, not needed, or unresolved without activating bidders             |
+| An operator changes a PBS timeout                                         | Check and render regional YAML, prepare an immutable release, preview and approve deployment; no manual environment-file edits or Terraform apply                     |
+| A binding conflicts with YAML or a required secret key is missing         | Reject conflicting local inputs or stop the authorized deployment preflight; preserve working capacity and never print credential values                              |
+| A credential contains quotes, dollars, or newlines                        | Prompt without echo or accept file/stdin, validate and safely encode it; no secret-value command argument or log output                                               |
+| East consumes a rotated credential while West still runs the old version  | Report actual regional versions and pending work, verify replication and replacement, then coordinate partner revocation; never report global success from East alone |
+| An operator requests rollback after the old credential was revoked        | Refuse known-incompatible recovery and explain the credential action needed; a Git release rollback cannot restore bidder validity                                    |
+| A command resolves the wrong AWS account or an ambiguous deployment       | Stop before mutation and require corrected target selection; local inspect/check stay credential-free                                                                 |
+| ECS is selected instead of Compose                                        | Generate one concrete YAML delivery mechanism and task secret references behind the same operator commands; do not generate unused host loaders                       |
+
 ## Walkthrough assertions
 
 Use these contrasts when reviewing the skill. They are expected behavior, not executed deployment tests. Terraform cases exercise the rules in `references/terraform.md`.

@@ -8,17 +8,9 @@ Identify the caller as browser Prebid.js, backend, or edge service. Capture a sa
 
 For each bidder, confirm server-side authorization, host credentials, supported formats, approved endpoints, adapter support in the pinned release, and source-IP allowlists. Existing provider credentials and account IDs may not transfer to a self-hosted PBS.
 
-Distinguish publisher request parameters from host-level adapter secrets. Map each secret to a real field or environment binding supported by the pinned adapter. A generic API-key environment variable does not configure arbitrary bidders. Ask for secret identifiers and required keys, never credential values.
+Use [configuration and secrets](configuration-and-secrets.md) to discover candidate requirements from the selected `trusted-server.toml`, distinguish caller parameters from host credentials, and define supported runtime bindings. Discovery is evidence for the interview, not bidder activation.
 
 For browsers, resolve CORS/OPTIONS, cookie scope, user-sync and callback URLs, consent-dependent endpoints, and identity behavior across regions. For backend/edge callers, define trusted forwarding hops and preserve device IP, privacy signals, request identifiers, and the caller deadline. Verify outgoing bidder requests use the intended device context rather than the proxy's identity.
-
-## Configuration
-
-PBS Go supports environment variables and configuration files. Resolve one nonsecret configuration file and verify precedence, search paths, required fields, and environment-name mapping against the selected release. Use a parser for structured overrides; PBS is not an arbitrary multi-file YAML merger.
-
-Account for external URL, listener, enabled adapters, bidder endpoints, auction timeout, privacy defaults, account policy, user sync, stored requests, cache, metrics, and logs. Privacy choices need an approved policy owner; do not weaken them to make a smoke test pass.
-
-Preserve required upstream static assets when assembling or mounting the runtime. Check startup output and adapter debug paths with dummy values for unintended disclosure, even if PBS documents secret redaction.
 
 ## Stored requests, accounts, and cache
 
@@ -46,7 +38,6 @@ A legitimate no-bid is not an infrastructure failure. `/status` is one health si
 
 Use these entry points, then inspect the corresponding tag or commit for the chosen PBS Go release. Upstream `master` is navigation, not a reproducible configuration contract.
 
-- [Go configuration guide](https://github.com/prebid/prebid-server/blob/master/docs/developers/configuration.md)
 - [Go configuration definitions](https://github.com/prebid/prebid-server/blob/master/config/config.go)
 - [Go stored requests](https://docs.prebid.org/prebid-server/features/pbs-storedreqs-go.html)
 - [Prebid.js PBS integration](https://docs.prebid.org/dev-docs/modules/prebidServer.html)
