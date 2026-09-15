@@ -336,15 +336,32 @@ IntegrationRegistration::builder(ID)
 
 ## CI Gates
 
-Every PR must pass:
+`.github/workflows/` is authoritative. The list below is the commonly-run subset — if it
+disagrees with a workflow file, the workflow file is right.
+
+**Format and lint** (`format.yml`):
 
 1. `cargo fmt --all -- --check`
 2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm`
-3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
-4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
-5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
-6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
-7. Docs format (`cd docs && npm run format`)
+3. `cargo clippy --package trusted-server-cli --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings`
+4. `cargo clippy --package trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu --all-targets -- -D warnings`
+5. JS lint and format (`cd crates/trusted-server-js/lib && npm run lint && npm run format`)
+6. Docs lint, format and build (`cd docs && npm run lint && npm run format && npm run build`)
+
+**Test** (`test.yml`):
+
+7. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
+8. `BID_DELAY=3 ./scripts/template-cache-local-test.sh esi` and `… inline` — a shell harness
+   that greps for literal served header strings
+9. `./scripts/test-cli.sh` (host-target CLI tests; also run on Linux in the `test-axum` job)
+10. `cargo bench -p trusted-server-core --bench html_processor_bench -- --test`
+11. Release WASM builds for Fastly and Spin
+12. `cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check`,
+    its `--test parity` run, and its clippy
+13. JS build and test (`cd crates/trusted-server-js/lib && npm run build && npm test -- --run`)
+
+**Integration** (`integration-tests.yml`): a separate workflow running Playwright suites
+against generated Viceroy configs. Not reproducible from the commands above.
 
 ---
 
