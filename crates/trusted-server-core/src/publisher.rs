@@ -4423,6 +4423,14 @@ pub async fn handle_publisher_request(
             url: target_uri.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
+            // Read here, before `rewrite_origin_request` below replaces the URI with the
+            // origin target. Path *and* query: a different query is a different page, and
+            // a purge caller types the whole address.
+            request_path: req
+                .uri()
+                .path_and_query()
+                .map(|path_and_query| path_and_query.as_str().to_owned())
+                .unwrap_or_else(|| "/".to_owned()),
             origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
             assembly_mode,
             vary_values: settings
@@ -8658,8 +8666,11 @@ mod tests {
         fn shared_template_ad_seam_is_readable_and_versioned() {
             assert_eq!(
                 (crate::platform::TEMPLATE_SCHEMA_VERSION, AD_ASSEMBLY_SEAM,),
-                (4, "<!--ts-ad-seam-->"),
-                "the readable seam and its cache schema must move together"
+                (5, "<!--ts-ad-seam-->"),
+                "changing the seam must bump the cache schema, or a deploy assembles \
+                 against a marker that moved. The converse does not hold — the schema \
+                 also moves when the cache key's shape changes, as it did for v5 — so \
+                 updating this pin with an unchanged seam is legitimate."
             );
             assert_eq!(
                 body_close_injection(AssemblyMode::Esi, false),
@@ -9035,6 +9046,7 @@ mod tests {
                 url: "https://example.com/page".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/page".to_string(),
                 origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
                 assembly_mode: AssemblyMode::Esi,
                 vary_values: vec![],
@@ -10769,7 +10781,7 @@ mod tests {
 
         #[test]
         fn parser_validation_does_not_change_the_cached_schema() {
-            assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 4);
+            assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 5);
             assert_eq!(AD_ASSEMBLY_SEAM, "<!--ts-ad-seam-->");
             assert!(!contains_publisher_esi_directive(
                 AD_ASSEMBLY_SEAM.as_bytes()

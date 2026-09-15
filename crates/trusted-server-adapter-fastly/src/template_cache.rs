@@ -316,6 +316,7 @@ mod tests {
             url: url.to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/page".to_string(),
             origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
             assembly_mode: AssemblyMode::Esi,
             vary_values: vec![trusted_server_core::platform::VaryHeaderValues {
