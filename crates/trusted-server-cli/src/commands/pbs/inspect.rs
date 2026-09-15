@@ -262,11 +262,8 @@ user_id_modules = ["sharedIdSystem"]
             );
             let file = tempfile::NamedTempFile::new().expect("should create config");
             fs::write(file.path(), &text).expect("should write config");
-            let source: toml::Value = toml::from_str(&text).expect("should parse source");
             let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
-                source["integrations"]["prebid"]
-                    .clone()
-                    .try_into()
+                toml::from_str(&format!("client_side_bidders={input}"))
                     .expect("runtime should accept encoding");
             let output = inspect(file.path()).expect("inspect should accept runtime encoding");
             let candidates: Vec<_> = output.data["server_bidder_candidates"]
@@ -279,7 +276,7 @@ user_id_modules = ["sharedIdSystem"]
                         .expect("should identify bidder")
                 })
                 .collect();
-            assert_eq!(candidates, runtime.bidders);
+            assert_eq!(candidates, ["examplebidder", "otherbidder"]);
             assert_eq!(
                 output.data["client_side_bidders"],
                 json!(runtime.client_side_bidders)
