@@ -4114,6 +4114,40 @@ pub(crate) fn request_can_use_shared_template(
     origin_response_is_shareable(inputs) && assembly_mode_is_esi && reader_supports_assembly
 }
 
+/// Why a request was refused a template-cache key, before the origin was contacted.
+///
+/// [`template_cache_ttl`] cannot produce these. It runs only inside
+/// `template_cache_reservation.and_then(...)`, and a reservation exists only when a key was
+/// built from [`request_can_use_shared_template`] — so its `InlineMode`, `AuthorizedRequest`
+/// and `CookieForwarded` variants are structurally unreachable there. Those requests never
+/// get a key in the first place, and cookie-disqualified is the expected production default.
+///
+/// Condition order matches [`template_cache_ttl`] so one request cannot be described two
+/// different ways depending on which side reported it.
+pub(crate) fn request_side_bypass_reason(
+    assembly_mode: AssemblyMode,
+    inputs: SharedRequestInputs,
+    reader_supports_assembly: bool,
+) -> Option<TemplateCacheBypassReason> {
+    if matches!(assembly_mode, AssemblyMode::Inline) {
+        return Some(TemplateCacheBypassReason::InlineMode);
+    }
+    if inputs.authorization_disqualifies {
+        return Some(TemplateCacheBypassReason::AuthorizedRequest);
+    }
+    if inputs.cookie_disqualifies {
+        return Some(TemplateCacheBypassReason::CookieForwarded);
+    }
+    if !inputs.method_is_cacheable
+        || !inputs.host_present
+        || inputs.request_requires_origin
+        || !reader_supports_assembly
+    {
+        return Some(TemplateCacheBypassReason::NotShareableRequest);
+    }
+    None
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
@@ -4436,6 +4470,14 @@ pub async fn handle_publisher_request(
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
+    // Computed here, where the inputs are still in scope, and applied to the observation at
+    // its construction below. The response-side gate overwrites it when it runs, which is
+    // correct: a request that earned a key had no request-side reason to begin with.
+    let request_side_bypass_reason = request_side_bypass_reason(
+        assembly_mode,
+        shared_request_inputs,
+        reader_supports_assembly,
+    );
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
 
     let request_method = req.method().clone();
@@ -4520,6 +4562,9 @@ pub async fn handle_publisher_request(
         // Written on the value, before it is moved into `auction_observation` below. Sites
         // after that move reach it through `auction_observation.as_mut()` instead.
         observation.set_origin_cache_shareable(origin_response_is_shareable);
+        if let Some(reason) = request_side_bypass_reason {
+            observation.set_template_cache_bypass_reason(&reason.to_string());
+        }
 
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
@@ -4837,6 +4882,11 @@ pub async fn handle_publisher_request(
             &template_cache_policy,
         ) {
             Err(reason) => {
+                // Guarded rather than expected: a non-ad-stack request has no auction and
+                // no observation, and that absence is legitimate rather than a bug.
+                if let Some(observation) = auction_observation.as_mut() {
+                    observation.set_template_cache_bypass_reason(&reason.to_string());
+                }
                 log::debug!("template_cache bypass: {reason}");
                 None
             }
@@ -5773,6 +5823,14 @@ pub(crate) enum TemplateCacheBypassReason {
     /// it.
     #[display("request carried Cookie and the origin's Vary does not cover it")]
     CookieForwarded,
+    /// The request failed one of the remaining shareability conditions — method, host,
+    /// request-directed cache semantics, or a reader representation TS cannot assemble.
+    ///
+    /// One variant rather than four: each of those already has its own `log::debug!` line,
+    /// none is a cross-serving vector on its own, and splitting them would widen the
+    /// telemetry column's cardinality for no operational gain.
+    #[display("request is not eligible for a shared template")]
+    NotShareableRequest,
     /// The origin varies on a header the cache key does not cover.
     ///
     /// The key is built *before* the fetch from a configured [`VarySpec`], because a
@@ -6878,6 +6936,84 @@ mod tests {
             cookie_disqualifies: false,
             request_requires_origin: false,
         }
+    }
+
+    #[test]
+    fn request_side_bypass_reason_names_the_first_failing_condition() {
+        let esi = AssemblyMode::Esi;
+
+        assert_eq!(
+            request_side_bypass_reason(AssemblyMode::Inline, all_shareable(), true),
+            Some(TemplateCacheBypassReason::InlineMode),
+        );
+        assert_eq!(
+            request_side_bypass_reason(
+                esi,
+                SharedRequestInputs {
+                    authorization_disqualifies: true,
+                    ..all_shareable()
+                },
+                true,
+            ),
+            Some(TemplateCacheBypassReason::AuthorizedRequest),
+        );
+        assert_eq!(
+            request_side_bypass_reason(
+                esi,
+                SharedRequestInputs {
+                    cookie_disqualifies: true,
+                    ..all_shareable()
+                },
+                true,
+            ),
+            Some(TemplateCacheBypassReason::CookieForwarded),
+            "cookie-disqualified is the expected production default and must be reportable"
+        );
+        assert_eq!(
+            request_side_bypass_reason(
+                esi,
+                SharedRequestInputs {
+                    request_requires_origin: true,
+                    ..all_shareable()
+                },
+                true,
+            ),
+            Some(TemplateCacheBypassReason::NotShareableRequest),
+        );
+        assert_eq!(
+            request_side_bypass_reason(esi, all_shareable(), false),
+            Some(TemplateCacheBypassReason::NotShareableRequest),
+            "a reader TS cannot re-encode for is ineligible, and the reason must say so"
+        );
+        assert_eq!(
+            request_side_bypass_reason(esi, all_shareable(), true),
+            None,
+            "an eligible request has no bypass reason"
+        );
+    }
+
+    /// The ordering must match `template_cache_ttl`, or one request is described two ways
+    /// depending on which side reported it.
+    #[test]
+    fn request_side_bypass_reason_orders_conditions_like_the_response_side_gate() {
+        let every_condition_failing = SharedRequestInputs {
+            method_is_cacheable: false,
+            host_present: false,
+            authorization_disqualifies: true,
+            cookie_disqualifies: true,
+            request_requires_origin: true,
+        };
+
+        assert_eq!(
+            request_side_bypass_reason(AssemblyMode::Inline, every_condition_failing, false),
+            Some(TemplateCacheBypassReason::InlineMode),
+            "inline mode is reported before any request condition, as in template_cache_ttl"
+        );
+        assert_eq!(
+            request_side_bypass_reason(AssemblyMode::Esi, every_condition_failing, false),
+            Some(TemplateCacheBypassReason::AuthorizedRequest),
+            "authorization is reported before cookie, as in template_cache_ttl"
+        );
     }
 
     #[test]
@@ -9857,6 +9993,60 @@ mod tests {
                     .origin_cache_shareable,
                 Some(1),
                 "a cookieless GET navigation is the population the gate is meant to admit"
+            );
+        }
+
+        #[tokio::test]
+        async fn cookie_bearing_navigation_records_the_request_side_bypass_reason() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(
+                &settings,
+                &services,
+                navigation_request_with_cookie("ts-ec=abc"),
+            )
+            .await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .template_cache_bypass_reason
+                    .as_deref(),
+                Some("request carried Cookie and the origin's Vary does not cover it"),
+                "cookie-disqualified is the expected production default; it is produced on the \
+                 request side, because template_cache_ttl never sees these requests"
+            );
+        }
+
+        #[tokio::test]
+        async fn inline_mode_navigation_records_the_inline_bypass_reason() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("inline"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .template_cache_bypass_reason
+                    .as_deref(),
+                Some("assembly mode is inline"),
+                "the default deployment must report why it is not using the template cache"
             );
         }
 
