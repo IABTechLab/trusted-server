@@ -5449,6 +5449,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "log",
+ "serde_json",
  "spin-sdk",
  "tokio",
  "trusted-server-core",

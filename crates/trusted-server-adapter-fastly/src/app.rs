@@ -1977,18 +1977,23 @@ mod tests {
     #[test]
     fn startup_registers_aps_renderer_route() {
         let mut settings = test_settings();
-        settings.auction.providers.clear();
-        settings.auction.providers.insert(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            trusted_server_core::auction::ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                notifications: trusted_server_core::auction::NotificationConfig::default(),
-                profile_config: serde_json::json!({"account_id":"example-account"}),
-            },
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            vec!["aps_main".to_string()],
+            std::collections::BTreeMap::from([(
+                "aps_main".to_string(),
+                serde_json::Map::from_iter([
+                    ("implementation".to_string(), serde_json::json!("aps")),
+                    (
+                        "endpoint".to_string(),
+                        serde_json::json!("https://aps.example/e/pb/bid"),
+                    ),
+                    ("routing".to_string(), serde_json::json!("all_eligible")),
+                    (
+                        "account_id".to_string(),
+                        serde_json::json!("example-account"),
+                    ),
+                ]),
+            )]),
         );
 
         let state = build_state_from_settings(settings)

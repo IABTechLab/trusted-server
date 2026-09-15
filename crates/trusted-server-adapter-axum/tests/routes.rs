@@ -75,10 +75,7 @@ fn assert_route_registered(method: &str, path: &str) {
 async fn an_aps_demand_source_serves_the_renderer_through_adapter_fallback() {
     let mut settings = test_settings();
     let table = serde_json::Map::from_iter([
-        (
-            "implementation".to_string(),
-            serde_json::json!("aps"),
-        ),
+        ("implementation".to_string(), serde_json::json!("aps")),
         (
             "endpoint".to_string(),
             serde_json::json!("https://aps.example/e/pb/bid"),

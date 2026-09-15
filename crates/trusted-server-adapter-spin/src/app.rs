@@ -1092,46 +1092,49 @@ mod tests {
         )
         .expect("should parse startup test settings");
         settings.auction.enabled = true;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
+        let names = ["provider_a", "provider_b"];
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            names.iter().map(|name| (*name).to_string()).collect(),
+            names
+                .iter()
+                .map(|name| {
                     (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: "{}"
-                                .parse()
-                                .expect("should parse empty profile config object"),
-                        },
+                        (*name).to_string(),
+                        serde_json::Map::from_iter([
+                            ("implementation".to_string(), serde_json::json!("openrtb")),
+                            (
+                                "endpoint".to_string(),
+                                serde_json::json!(format!("https://{name}.example/openrtb")),
+                            ),
+                            ("routing".to_string(), serde_json::json!("all_eligible")),
+                        ]),
                     )
                 })
-                .collect();
+                .collect(),
+        );
         settings
     }
 
     #[test]
     fn startup_registers_aps_renderer_route() {
         let mut settings = multi_provider_settings();
-        settings.auction.providers.clear();
-        settings.auction.providers.insert(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            trusted_server_core::auction::ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                notifications: trusted_server_core::auction::NotificationConfig::default(),
-                profile_config: "{\"account_id\":\"example-account\"}"
-                    .parse()
-                    .expect("should parse APS profile config"),
-            },
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            vec!["aps_main".to_string()],
+            std::collections::BTreeMap::from([(
+                "aps_main".to_string(),
+                serde_json::Map::from_iter([
+                    ("implementation".to_string(), serde_json::json!("aps")),
+                    (
+                        "endpoint".to_string(),
+                        serde_json::json!("https://aps.example/e/pb/bid"),
+                    ),
+                    ("routing".to_string(), serde_json::json!("all_eligible")),
+                    (
+                        "account_id".to_string(),
+                        serde_json::json!("example-account"),
+                    ),
+                ]),
+            )]),
         );
 
         let state =

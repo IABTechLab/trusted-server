@@ -888,19 +888,50 @@ mod tests {
             "#,
         )
         .expect("should parse startup test settings");
-        settings.auction.providers.insert(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            trusted_server_core::auction::ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                notifications: trusted_server_core::auction::NotificationConfig::default(),
-                profile_config: serde_json::json!({"account_id":"example-account"}),
-            },
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            vec!["aps_main".to_string()],
+            std::collections::BTreeMap::from([(
+                "aps_main".to_string(),
+                serde_json::Map::from_iter([
+                    ("implementation".to_string(), serde_json::json!("aps")),
+                    (
+                        "endpoint".to_string(),
+                        serde_json::json!("https://aps.example/e/pb/bid"),
+                    ),
+                    ("routing".to_string(), serde_json::json!("all_eligible")),
+                    (
+                        "account_id".to_string(),
+                        serde_json::json!("example-account"),
+                    ),
+                ]),
+            )]),
         );
         settings
+    }
+
+    /// Two ordinary `OpenRTB` demand sources, which is the fanout Cloudflare
+    /// refuses because its HTTP client runs one request at a time.
+    fn two_source_demand() -> trusted_server_core::provider_table::ProviderList {
+        let names = ["provider_a", "provider_b"];
+        trusted_server_core::provider_table::ProviderList::new(
+            names.iter().map(|name| (*name).to_string()).collect(),
+            names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_string(),
+                        serde_json::Map::from_iter([
+                            ("implementation".to_string(), serde_json::json!("openrtb")),
+                            (
+                                "endpoint".to_string(),
+                                serde_json::json!(format!("https://{name}.example/openrtb")),
+                            ),
+                            ("routing".to_string(), serde_json::json!("all_eligible")),
+                        ]),
+                    )
+                })
+                .collect(),
+        )
     }
 
     #[test]
@@ -940,24 +971,7 @@ mod tests {
         )
         .expect("should parse startup test settings");
         settings.auction.enabled = false;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
-                    (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: serde_json::json!({}),
-                        },
-                    )
-                })
-                .collect();
+        settings.demand = two_source_demand();
 
         build_state_with_settings(settings)
             .expect("disabled Cloudflare auction should accept dormant fanout");
@@ -987,24 +1001,7 @@ mod tests {
         )
         .expect("should parse startup test settings");
         settings.auction.enabled = true;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
-                    (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: serde_json::json!({}),
-                        },
-                    )
-                })
-                .collect();
+        settings.demand = two_source_demand();
 
         let error = match build_state_with_settings(settings) {
             Ok(_) => panic!("Cloudflare startup should reject multi-provider fanout"),
