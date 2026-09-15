@@ -40,7 +40,7 @@ use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
 
 /// Integration id, which is also the key of the probe's configuration block
-/// (`[integrations.seam_probe]`) and the value `[geo] provider` names to
+/// (`[integration.seam_probe]`) and the value `[geo] provider` names to
 /// select the probe's geo provider.
 pub const SEAM_PROBE_ID: &str = "seam_probe";
 
@@ -73,7 +73,7 @@ pub const PROBE_JS_SHA256: &str =
 /// can prove deploy validation reached a vendor's rules rather than stopping
 /// at the core ones.
 pub const SEAM_PROBE_COUNTRY_MESSAGE: &str =
-    "`[integrations.seam_probe] country` must be exactly two letters";
+    "`[integration.seam_probe] country` must be exactly two letters";
 
 /// Request header a caller sets to have the preparer count that request.
 ///
@@ -131,14 +131,10 @@ pub struct SeamProbePrepared {
     pub runs: usize,
 }
 
-/// The probe's own configuration block, `[integrations.seam_probe]`.
+/// The probe's own configuration block, `[integration.seam_probe]`.
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct SeamProbeConfig {
-    /// Whether the probe is enabled. Defaults to enabled, so writing the
-    /// block is enough to switch the probe on.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// Country the probe's geo provider resolves for every request.
     ///
     /// Rejected by [`validate`] when it is not two letters, which is the
@@ -147,22 +143,14 @@ pub struct SeamProbeConfig {
     pub country: String,
     /// Whether the registration declares the probe's geo provider.
     ///
-    /// Set this to `false` to build an enabled module that supplies no geo
+    /// Set this to `false` to build a selected module that supplies no geo
     /// provider, which is what `[geo] provider = "seam_probe"` must reject at
     /// startup.
     #[serde(default = "default_declares_geo")]
     pub declares_geo: bool,
 }
 
-impl IntegrationConfig for SeamProbeConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-const fn default_enabled() -> bool {
-    true
-}
+impl IntegrationConfig for SeamProbeConfig {}
 
 /// `ZZ` is reserved in ISO 3166-1 for private use, so it names no real place.
 fn default_country() -> String {
@@ -341,8 +329,8 @@ fn check_country(country: &str) -> Result<(), Report<TrustedServerError>> {
     }))
 }
 
-/// Reads the probe's configuration block, or `None` when the probe is not
-/// enabled.
+/// Reads the probe's configuration block, or `None` when `[integration]
+/// provider` does not name the probe.
 ///
 /// # Errors
 ///
@@ -352,12 +340,13 @@ fn read_config(settings: &Settings) -> Result<Option<SeamProbeConfig>, Report<Tr
     settings.integration_config::<SeamProbeConfig>(SEAM_PROBE_ID)
 }
 
-/// Builds the probe's registration, or `None` when the probe is not enabled.
+/// Builds the probe's registration, or `None` when `[integration] provider`
+/// does not name the probe.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration block cannot be parsed or fails
-/// validation, or when the probe is enabled with a country that is not two
+/// validation, or when the probe is selected with a country that is not two
 /// letters.
 pub fn register(
     settings: &Settings,
@@ -388,12 +377,12 @@ pub fn register(
 }
 
 /// Validates the probe's configuration for deployment and reports whether the
-/// probe is enabled.
+/// probe is selected.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration block cannot be parsed or fails
-/// validation, or when the probe is enabled with a country that is not two
+/// validation, or when the probe is selected with a country that is not two
 /// letters.
 pub fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     let Some(config) = read_config(settings)? else {
@@ -406,7 +395,7 @@ pub fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>>
 /// Inserts [`SeamProbePrepared`] into the request extensions, counting how
 /// many times the request path ran it.
 ///
-/// Runs whether or not the probe is enabled, which is the contract the
+/// Runs whether or not the probe is selected, which is the contract the
 /// registry gives preparers.
 ///
 /// # Errors
@@ -546,7 +535,7 @@ mod tests {
             .build()
     }
 
-    /// Settings carrying a `[integrations.seam_probe]` block with `body`
+    /// Settings carrying a `[integration.seam_probe]` block with `body`
     /// appended to it.
     fn settings_with_probe(body: &str) -> Settings {
         Settings::from_toml(&format!(
@@ -568,7 +557,10 @@ mod tests {
                 [geo]
                 assume_single_jurisdiction = true
 
-                [integrations.seam_probe]
+                [integration]
+                provider = ["seam_probe"]
+
+                [integration.seam_probe]
                 {body}
             "#
         ))
@@ -604,7 +596,7 @@ mod tests {
 
         assert!(
             validate(&settings).expect("should accept a two letter country"),
-            "should report the probe as enabled"
+            "should report the probe as selected"
         );
     }
 
@@ -621,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_reports_not_enabled_without_a_configuration_block() {
+    fn validate_reports_not_selected_without_a_provider_entry() {
         let settings = Settings::from_toml(
             r#"
                 [[handlers]]
@@ -642,17 +634,17 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse settings without a probe block");
+        .expect("should parse settings that do not name the probe");
 
         assert!(
-            !validate(&settings).expect("should validate settings without a probe block"),
-            "should report the probe as not enabled"
+            !validate(&settings).expect("should validate settings that do not name the probe"),
+            "should report the probe as not selected"
         );
         assert!(
             register(&settings)
                 .expect("should build no registration")
                 .is_none(),
-            "should build no registration when the probe is not configured"
+            "should build no registration when the probe is not selected"
         );
     }
 
@@ -662,7 +654,7 @@ mod tests {
 
         let registration = register(&settings)
             .expect("should build a registration")
-            .expect("should be enabled");
+            .expect("should be selected");
 
         assert!(
             registration.geo_provider.is_none(),

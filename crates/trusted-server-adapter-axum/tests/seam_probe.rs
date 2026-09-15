@@ -82,7 +82,10 @@ assume_single_jurisdiction = true
 /// The probe's own configuration block, enabling it with the country the geo
 /// assertions expect.
 const PROBE_BLOCK: &str = r#"
-            [integrations.seam_probe]
+            [integration]
+            provider = ["seam_probe"]
+
+            [integration.seam_probe]
             country = "ZZ"
 "#;
 
@@ -317,7 +320,10 @@ async fn every_route_prepares_the_request_exactly_once() {
 fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
     let settings = settings_with(
         r#"
-            [integrations.seam_probe]
+            [integration]
+            provider = ["seam_probe"]
+
+            [integration.seam_probe]
             country = "ZZZ"
         "#,
     );
@@ -350,7 +356,10 @@ fn geo_selector_naming_a_module_without_a_provider_fails_at_startup() {
             [geo]
             provider = "seam_probe"
 
-            [integrations.seam_probe]
+            [integration]
+            provider = ["seam_probe"]
+
+            [integration.seam_probe]
             country = "ZZ"
             declares_geo = false
         "#,

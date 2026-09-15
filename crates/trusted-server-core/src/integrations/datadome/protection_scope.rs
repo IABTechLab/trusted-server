@@ -744,7 +744,6 @@ mod tests {
 
     fn config_with_protection() -> DataDomeConfig {
         DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             ..DataDomeConfig::default()
         }

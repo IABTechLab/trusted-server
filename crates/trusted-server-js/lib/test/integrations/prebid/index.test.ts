@@ -4516,7 +4516,7 @@ describe('prebid/client-side bidders', () => {
     // The error should point at the operator surface: the CLI config key,
     // not the internal build script.
     const pointsAtBundleConfig = errorCalls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle].adapters'))
+      args.some((a) => typeof a === 'string' && a.includes('[integration.prebid.bundle].adapters'))
     );
     expect(pointsAtBundleConfig).toBe(true);
 

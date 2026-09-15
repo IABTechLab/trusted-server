@@ -1740,12 +1740,11 @@ mod tests {
                 [consent]
                 consent_store = "missing-consent-store"
 
-                [integrations.prebid]
-                enabled = true
-                external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+                [integration]
+                provider = ["prebid", "datadome"]
 
-                [integrations.datadome]
-                enabled = true
+                [integration.prebid]
+                external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
                 [auction]
                 enabled = true
@@ -1814,8 +1813,10 @@ mod tests {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [integrations.prebid]
-            enabled = true
+            [integration]
+            provider = ["prebid"]
+
+            [integration.prebid]
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]

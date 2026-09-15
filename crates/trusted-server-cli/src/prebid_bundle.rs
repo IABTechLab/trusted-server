@@ -166,12 +166,12 @@ pub(crate) fn run_bundle(
     if config.external_bundle_url.is_none() {
         writeln!(
             out,
-            "Next: upload {bundle_filename} and set integrations.prebid.external_bundle_url to its HTTPS URL."
+            "Next: upload {bundle_filename} and set integration.prebid.external_bundle_url to its HTTPS URL."
         )
     } else {
         writeln!(
             out,
-            "Next: upload {bundle_filename} and update integrations.prebid.external_bundle_url if the hosted filename changed."
+            "Next: upload {bundle_filename} and update integration.prebid.external_bundle_url if the hosted filename changed."
         )
     }
     .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
@@ -194,17 +194,17 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
     })?;
 
     let prebid = root
-        .get("integrations")
-        .and_then(|integrations| integrations.get("prebid"))
+        .get("integration")
+        .and_then(|integration| integration.get("prebid"))
         .ok_or_else(|| {
             report_error(format!(
-                "{} is missing [integrations.prebid]",
+                "{} is missing [integration.prebid]",
                 config_path.display()
             ))
         })?;
     let bundle = prebid.get("bundle").ok_or_else(|| {
         report_error(format!(
-            "{} is missing [integrations.prebid.bundle]",
+            "{} is missing [integration.prebid.bundle]",
             config_path.display()
         ))
     })?;
@@ -212,12 +212,12 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
     let adapters = read_required_string_array(
         bundle,
         "adapters",
-        "integrations.prebid.bundle.adapters",
+        "integration.prebid.bundle.adapters",
         config_path,
     )?;
     if adapters.is_empty() {
         return cli_error(format!(
-            "{} must define at least one integrations.prebid.bundle.adapters entry",
+            "{} must define at least one integration.prebid.bundle.adapters entry",
             config_path.display()
         ));
     }
@@ -225,12 +225,12 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
     let user_id_modules = read_optional_string_array(
         bundle,
         "user_id_modules",
-        "integrations.prebid.bundle.user_id_modules",
+        "integration.prebid.bundle.user_id_modules",
         config_path,
     )?;
     if matches!(user_id_modules.as_ref(), Some(modules) if modules.is_empty()) {
         return cli_error(format!(
-            "{} integrations.prebid.bundle.user_id_modules must not be empty when present",
+            "{} integration.prebid.bundle.user_id_modules must not be empty when present",
             config_path.display()
         ));
     }
@@ -467,25 +467,25 @@ fn patch_config_metadata(config_path: &Path, sha256: &str, sri: &str) -> CliResu
         ))
     })?;
 
-    if !document.contains_key("integrations") {
-        document.insert("integrations", table());
+    if !document.contains_key("integration") {
+        document.insert("integration", table());
     }
-    let integrations = table_like_mut(
+    let integration = table_like_mut(
         document
-            .get_mut("integrations")
-            .expect("should have integrations table"),
-        "integrations",
+            .get_mut("integration")
+            .expect("should have the integration table"),
+        "integration",
         config_path,
     )?;
 
-    if !integrations.contains_key("prebid") {
-        integrations.insert("prebid", table());
+    if !integration.contains_key("prebid") {
+        integration.insert("prebid", table());
     }
     let prebid = table_like_mut(
-        integrations
+        integration
             .get_mut("prebid")
             .expect("should have prebid table"),
-        "integrations.prebid",
+        "integration.prebid",
         config_path,
     )?;
 
@@ -557,11 +557,10 @@ mod tests {
 
     fn valid_config() -> String {
         r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-old.js"
 
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["rubicon", "kargo"]
 user_id_modules = ["sharedIdSystem", "uid2IdSystem"]
 "#
@@ -592,10 +591,9 @@ user_id_modules = ["sharedIdSystem", "uid2IdSystem"]
     fn bundle_config_loader_allows_missing_user_id_modules() {
         let (_temp, path) = write_config(
             r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["rubicon"]
 "#,
         );
@@ -613,7 +611,7 @@ adapters = ["rubicon"]
         let error = load_bundle_config(&path).expect_err("should reject missing prebid block");
 
         assert!(
-            error.to_string().contains("missing [integrations.prebid]"),
+            error.to_string().contains("missing [integration.prebid]"),
             "error should explain missing prebid block: {error:?}"
         );
     }
@@ -622,8 +620,7 @@ adapters = ["rubicon"]
     fn bundle_config_loader_rejects_missing_bundle_block() {
         let (_temp, path) = write_config(
             r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 "#,
         );
 
@@ -632,7 +629,7 @@ enabled = true
         assert!(
             error
                 .to_string()
-                .contains("missing [integrations.prebid.bundle]"),
+                .contains("missing [integration.prebid.bundle]"),
             "error should explain missing bundle block: {error:?}"
         );
     }
@@ -641,10 +638,9 @@ enabled = true
     fn bundle_config_loader_rejects_empty_adapters() {
         let (_temp, path) = write_config(
             r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = []
 "#,
         );
@@ -661,10 +657,9 @@ adapters = []
     fn bundle_config_loader_rejects_malformed_adapters() {
         let (_temp, path) = write_config(
             r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["rubicon", 123]
 "#,
         );
@@ -763,8 +758,8 @@ adapters = ["rubicon", 123]
         let contents = fs::read_to_string(&path).expect("should read patched config");
         let value: toml::Value = toml::from_str(&contents).expect("should parse patched config");
         let prebid = value
-            .get("integrations")
-            .and_then(|integrations| integrations.get("prebid"))
+            .get("integration")
+            .and_then(|integration| integration.get("prebid"))
             .expect("should have prebid table");
         assert_eq!(
             prebid
@@ -858,7 +853,7 @@ adapters = ["rubicon", 123]
         assert!(output.contains("generator stdout"));
         assert!(
             output.contains(&format!(
-                "Next: upload trusted-prebid-{}.js and update integrations.prebid.external_bundle_url",
+                "Next: upload trusted-prebid-{}.js and update integration.prebid.external_bundle_url",
                 "b".repeat(64)
             )),
             "should tell operators which content-addressed filename to host: {output}"

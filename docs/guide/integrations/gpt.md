@@ -124,8 +124,8 @@ value `ts=true`. It is applied before publisher GPT initialization and remains
 for the browser document's lifetime, so initial, lazy, refresh, publisher-owned,
 and SPA-route requests inherit it unless another targeting consumer clears or
 overrides the key. The attribution switch is independently controlled and
-defaults to `false`, and `gpt` must also be named in `[integration] provider`
-for any of the GPT integration to run.
+defaults to `false`, but `[integration] provider` must also name `gpt`, which
+be `true`.
 
 This key is distinct from the existing slot-level `ts_initial=1` value.
 `ts_initial` retains its current cleanup lifecycle; Trusted Server does not

@@ -52,11 +52,11 @@ project_id = "your-project-id"
 
 ### Configuration Options
 
-| Field             | Type    | Required | Description                                   |
-| ----------------- | ------- | -------- | --------------------------------------------- |
-| `api_endpoint`    | string  | Yes      | Lockr API endpoint URL                        |
-| `organization_id` | string  | Yes      | Your Lockr organization ID                    |
-| `project_id`      | string  | Yes      | Your Lockr project ID                         |
+| Field             | Type   | Required | Description                |
+| ----------------- | ------ | -------- | -------------------------- |
+| `api_endpoint`    | string | Yes      | Lockr API endpoint URL     |
+| `organization_id` | string | Yes      | Your Lockr organization ID |
+| `project_id`      | string | Yes      | Your Lockr project ID      |
 
 ### Environment Variables
 

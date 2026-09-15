@@ -35,6 +35,8 @@ Add the following to your `trusted-server.toml`:
 [integration]
 provider = ["datadome"]
 
+[integration.datadome]
+
 # First-party JavaScript/proxy layer
 sdk_origin = "https://js.datadome.co"
 api_origin = "https://api-js.datadome.co"
@@ -119,6 +121,9 @@ Trusted Server emits the DataDome configuration before the Trusted Server JavaSc
 If your site already manages the DataDome tag, disable auto-injection:
 
 ```toml
+[integration]
+provider = ["datadome"]
+
 [integration.datadome]
 inject_client_side_tag = false
 ```
@@ -162,7 +167,7 @@ When `enable_protection = true`, Trusted Server calls DataDome before normal rou
 
 A request is protected when all of the following are true:
 
-1. `datadome` is named in `[integration] provider`.
+1. `[integration] provider` names the DataDome integration.
 2. `enable_protection = true`.
 3. The method is not listed in `protection_excluded_methods`.
 4. The path is not one of Trusted Server's internal routes.
@@ -183,6 +188,9 @@ Protection API:
 
 ```toml
 # Runtime activation also requires FASTLY_IS_STAGING=1.
+[integration]
+provider = ["datadome"]
+
 [integration.datadome.protection_test_bypass]
 enabled = true
 credential_secret_name = "datadome_test_bypass"
@@ -263,6 +271,9 @@ fields. For example:
 Use structured rules for all DataDome protection exclusions. Each rule has an `id`, optional `methods`, and a typed matcher. The default configuration includes a `path_regex` rule for common static assets.
 
 ```toml
+[integration]
+provider = ["datadome"]
+
 [[integration.datadome.protection_exclusion_rules]]
 id = "legacy-static-get-head"
 methods = ["GET", "HEAD"]
@@ -293,6 +304,9 @@ Supported rule types are:
 Config Store-backed CIDR sources accept newline-, comma-, whitespace-, or JSON-array encoded CIDR lists. They are useful for large or frequently updated vendor crawler lists.
 
 ```toml
+[integration]
+provider = ["datadome"]
+
 [[integration.datadome.protection_excluded_ip_cidr_sources]]
 config_store = "datadome-ip-bypass"
 key = "googlebot_ips"
@@ -393,7 +407,7 @@ This keeps DataDome scripts routed through first-party context, even when insert
 
 ### Script not loading
 
-Check that `datadome` is named in `[integration] provider`:
+Check that `[integration] provider` names the integration:
 
 ```toml
 [integration]

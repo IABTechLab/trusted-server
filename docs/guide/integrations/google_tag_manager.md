@@ -47,13 +47,13 @@ container_id = "GTM-XXXXXX"
 
 ### Configuration Options
 
-| Field                  | Type    | Required | Description                                                                                                                                                                  |
-| ---------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `container_id`         | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                                                                                                                                   |
-| `upstream_url`         | string  | No       | Custom upstream, as a credential-free `https` bare origin with a literal host — no path, query, fragment, userinfo or wildcard (default: `https://www.googletagmanager.com`) |
-| `allowed_tag_ids`      | array   | No       | Extra tag ids servable on `gtag/js` besides `container_id` (default: none)                                                                                                   |
-| `cache_max_age`        | number  | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)                                                                                                              |
-| `max_beacon_body_size` | number  | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`)                                                                                                      |
+| Field                  | Type   | Required | Description                                                                                                                                                                  |
+| ---------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `container_id`         | string | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                                                                                                                                   |
+| `upstream_url`         | string | No       | Custom upstream, as a credential-free `https` bare origin with a literal host — no path, query, fragment, userinfo or wildcard (default: `https://www.googletagmanager.com`) |
+| `allowed_tag_ids`      | array  | No       | Extra tag ids servable on `gtag/js` besides `container_id` (default: none)                                                                                                   |
+| `cache_max_age`        | number | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)                                                                                                              |
+| `max_beacon_body_size` | number | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`)                                                                                                      |
 
 ### Upgrading: check `allowed_tag_ids`
 
@@ -102,7 +102,7 @@ A trailing slash is still accepted; it is trimmed before targets are built.
 
 **This is a breaking change.** A path-based value such as
 `https://tags.example.com/gateway` passed validation before this release and
-produced targets below that path, so a selected deployment using one now fails
+produced targets below that path, so a deployment using one now fails
 config validation. `ts config push` rejects it, which is where you should expect
 to see this. Validation is fail-closed rather than skip-the-integration: a
 config that reaches the runtime without having been pushed through that check

@@ -19,20 +19,12 @@ const OSANO_INTEGRATION_ID: &str = "osano";
 /// Configuration for the Osano consent mirror integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
-pub struct OsanoConfig {
-    /// Whether the Osano browser consent mirror is enabled.
-    #[serde(default)]
-    pub enabled: bool,
-}
+pub struct OsanoConfig {}
 
-impl IntegrationConfig for OsanoConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for OsanoConfig {}
 
 /// Validates the Osano configuration for deployment and reports whether
-/// the integration is enabled.
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
@@ -44,7 +36,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
         .map(|config| config.is_some())
 }
 
-/// Register the Osano JS integration when enabled.
+/// Register the Osano JS integration when `[integration] provider` names it.
 ///
 /// # Errors
 ///
@@ -70,32 +62,25 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
 
     #[test]
-    fn register_returns_none_when_disabled() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config("osano", &json!({ "enabled": false }))
-            .expect("should insert osano config");
+    fn register_returns_none_when_the_provider_list_does_not_name_it() {
+        let settings = create_test_settings();
 
-        let registration = register(&settings).expect("should parse disabled osano config");
+        let registration = register(&settings).expect("should read an unnamed integration");
 
         assert!(
             registration.is_none(),
-            "disabled Osano integration should not register"
+            "an Osano integration nothing names should not register"
         );
     }
 
     #[test]
     fn register_returns_js_module_registration_when_enabled() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config("osano", &json!({ "enabled": true }))
-            .expect("should insert osano config");
+        settings.integration.select("osano");
 
         let registration = register(&settings)
-            .expect("should parse enabled osano config")
-            .expect("enabled Osano integration should register");
+            .expect("should parse the osano config")
+            .expect("a named Osano integration should register");
 
         assert_eq!(registration.integration_id, "osano");
         assert!(
@@ -112,8 +97,8 @@ mod tests {
     fn config_rejects_unknown_fields() {
         let mut settings = create_test_settings();
         settings
-            .integrations
-            .insert_config("osano", &json!({ "enabled": true, "typo": true }))
+            .integration
+            .insert_config("osano", &json!({"typo": true }))
             .expect("should insert osano config");
 
         let err = settings

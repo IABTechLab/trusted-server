@@ -29,7 +29,7 @@ cache_ttl_seconds = 3600
 ```
 
 ::: warning Migration note
-The Sourcepoint browser module is now opt-in. Name `sourcepoint` in `[integration] provider`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should select the integration explicitly before upgrading.
+The Sourcepoint browser module is now opt-in through `[integration] provider`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should name `sourcepoint` there before upgrading.
 :::
 
 ### Configuration Options

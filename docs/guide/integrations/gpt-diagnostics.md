@@ -23,13 +23,13 @@ server integration configuration plus `?ts_console=1`; it does not require new
 publisher JavaScript, React, Next.js, DOM, or GAM configuration.
 
 The diagnostics integration is independent of the
-[GPT first-party script integration](./gpt.md). Either integration can be enabled
+[GPT first-party script integration](./gpt.md). Either integration can run
 without the other, although Trusted Server creative-progress evidence is available
 only for slots served through the existing GPT integration.
 
 ## Deployment Configuration
 
-The module is unavailable unless explicitly enabled for the deployment:
+The module is unavailable unless the deployment names it:
 
 ```toml
 [integration]
@@ -477,7 +477,7 @@ trigger GPT or Prebid work, gate an auction, or delay delivery.
 
 ### The API or panel is absent
 
-1. Confirm `gpt_diagnostics` is named in `[integration] provider` in the deployed configuration.
+1. Confirm `[integration] provider` names `gpt_diagnostics` in the deployed configuration.
 2. Activate the browser session with an exact recognized `ts_console` value.
 3. Confirm the Trusted Server script bundle loaded successfully.
 4. Use `ts_console=false` and then `ts_console=true` on a new document to reset

@@ -42,12 +42,12 @@ Publish application configuration with:
 ts config push --adapter fastly
 ```
 
-| Field                  | Type    | Required | Default                               | Description                                             |
-| ---------------------- | ------- | -------- | ------------------------------------- | ------------------------------------------------------- |
-| `geo_query_parameters` | boolean | No       | `false`                               | Enables trusted geo canonicalization for notice loaders |
-| `proxy_path`           | string  | No       | `integrations/didomi/consent`         | Changes the first-party path prefix                     |
-| `sdk_origin`           | string  | No       | `https://sdk.privacy-center.org`      | Changes the SDK origin, primarily for testing           |
-| `api_origin`           | string  | No       | `https://api.privacy-center.org`      | Changes the API origin, primarily for testing           |
+| Field                  | Type    | Required | Default                          | Description                                             |
+| ---------------------- | ------- | -------- | -------------------------------- | ------------------------------------------------------- |
+| `geo_query_parameters` | boolean | No       | `false`                          | Enables trusted geo canonicalization for notice loaders |
+| `proxy_path`           | string  | No       | `integrations/didomi/consent`    | Changes the first-party path prefix                     |
+| `sdk_origin`           | string  | No       | `https://sdk.privacy-center.org` | Changes the SDK origin, primarily for testing           |
+| `api_origin`           | string  | No       | `https://api.privacy-center.org` | Changes the API origin, primarily for testing           |
 
 `geo_query_parameters` is disabled by default for compatibility. It currently
 supports Fastly only because Cloudflare does not expose a trusted region through

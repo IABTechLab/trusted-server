@@ -31,7 +31,7 @@ pub enum ContextValue {
 /// integration-specific knowledge.
 ///
 /// ```toml
-/// [integrations.adserver_mock.context_query_params]
+/// [integration.adserver_mock.context_query_params]
 /// permutive_segments = "permutive"
 /// lockr_ids          = "lockr"
 /// ```

@@ -75,7 +75,7 @@ TOML file.
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `ec.hmac.passphrase` (when `ec.provider = "hmac"`)
+- `ec.providers.hmac.passphrase` (when `ec.provider = "hmac"`)
 
 ---
 
@@ -84,23 +84,25 @@ TOML file.
 **Error Message:**
 
 ```
-[demand.pbs_main] endpoint must be HTTPS, or HTTP to 127.0.0.1, ::1 or localhost, with a host and no credentials or fragment
+provider `pbs-main` endpoint must be an absolute HTTPS URL
 ```
 
-**Cause:** Malformed demand source endpoint.
+**Cause:** Malformed auction provider endpoint.
 
 **Solution:** Configure an absolute HTTPS endpoint with a host and no embedded
-credentials or fragment. Plain HTTP is accepted only to a loopback host:
+credentials or fragment:
 
 ```toml
 # ❌ Wrong
-[demand.pbs_main]
-implementation = "prebid_server"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
 endpoint = "prebid.example.com/openrtb2/auction"
 
 # ✅ Correct
-[demand.pbs_main]
-implementation = "prebid_server"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 ```
 
@@ -116,19 +118,17 @@ Failed to parse environment variable: TRUSTED_SERVER__PUBLISHER__DOMAIN
 
 **Cause:** Environment variable format doesn't match expected type
 
-**Solution:** Override an existing scalar leaf with the expected type. Every
-provider name is snake_case, so a name maps straight onto a path segment:
+**Solution:** Override an existing scalar leaf with the expected type. Provider
+map keys preserve hyphens, so shell users must invoke the CLI through `env`:
 
 ```bash
-export TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com
-export TRUSTED_SERVER__DEMAND__PBS_MAIN__TIMEOUT_MS=1000
-export TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=1000
-ts config validate
+env 'TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=1000' \
+  ts config validate
 ```
 
-Edit TOML and re-push it for arrays, tables, maps, and rules, because EdgeZero
-cannot override those values through environment variables. That includes every
-`provider` list.
+Edit TOML and re-push it for arrays, tables, maps, and rules; EdgeZero cannot
+override those values through environment variables.
 
 See [Configuration Reference](./configuration.md) for complete patterns.
 
@@ -154,7 +154,7 @@ Failed to generate EC ID: HMAC error
 [ec]
 provider = "hmac"
 
-[ec.hmac]
+[ec.providers.hmac]
 passphrase = "ec_passphrase"
 ```
 
@@ -163,7 +163,7 @@ passphrase = "ec_passphrase"
 
 ```bash
 TRUSTED_SERVER__EC__PROVIDER=hmac
-TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=ec_passphrase
 ```
 
 3. Provision a high-entropy value of at least 32 characters under
@@ -179,14 +179,14 @@ TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 Backend not found: prebid-server
 ```
 
-**Cause:** Dynamic backend creation for a configured demand endpoint failed.
-Demand backends are derived from `[demand.<name>]`, and are not manually named
-static Fastly backends.
+**Cause:** Dynamic backend creation for a configured provider endpoint failed.
+Provider backends are derived from `[auction.providers.<id>]`; they are not
+manually named static Fastly backends.
 
 **Solution:**
 
-- Verify the demand endpoint is canonical HTTPS and reachable from the edge
-- Check the demand source name and target-specific backend-name validation error
+- Verify the provider endpoint is canonical HTTPS and reachable from the edge
+- Check the provider ID and target-specific backend-name validation error
 - Check platform backend-count limits
 - Run `ts config validate`, then verify target-aware startup validation on the selected adapter
 
@@ -230,10 +230,10 @@ Upstream request timeout after 1000ms
 
 **Solution:**
 
-1. Increase the affected demand source timeout:
+1. Increase the affected server provider timeout:
 
 ```toml
-[demand.pbs_main]
+[auction.providers.pbs-main]
 timeout_ms = 2000
 ```
 
@@ -292,11 +292,11 @@ Prebid Server returned 400: Invalid OpenRTB request
 
 **Solution:**
 
-1. Enable debug mode on the Prebid Server demand source:
+1. Enable debug mode on the Prebid Server profile:
 
 ```toml
-[demand.pbs_main]
-debug = true
+[auction.providers.pbs-main]
+profile_config = { debug = true }
 ```
 
 `[integration.prebid].debug` controls browser Prebid.js only.
@@ -334,6 +334,9 @@ Next.js links still pointing to origin domain
 2. Update `rewrite_attributes` to match actual keys:
 
 ```toml
+[integration]
+provider = ["nextjs"]
+
 [integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]  # Add keys you find
 ```
@@ -362,6 +365,9 @@ Failed to fetch Permutive SDK: 404 Not Found
 2. Update configuration:
 
 ```toml
+[integration]
+provider = ["permutive"]
+
 [integration.permutive]
 organization_id = "myorg"
 workspace_id = "workspace-123"
@@ -383,11 +389,11 @@ curl https://myorg.edge.permutive.app/workspace-123-web.js
 No route matched for /integrations/custom/endpoint
 ```
 
-**Cause:** Integration not selected, or its route is not registered
+**Cause:** `[integration] provider` does not name the integration, or the route is not registered
 
 **Solution:**
 
-1. Name the integration in the `[integration]` list:
+1. Name the integration so it runs:
 
 ```toml
 [integration]
@@ -647,15 +653,18 @@ cargo install viceroy --version 0.17.0 --locked --force
 Browser Prebid.js debug remains under `[integration.prebid]`:
 
 ```toml
+[integration]
+provider = ["prebid"]
+
 [integration.prebid]
 debug = true
 ```
 
-For Prebid Server diagnostics, enable debug in that demand source's table:
+For Prebid Server diagnostics, enable debug in that provider's profile:
 
 ```toml
-[demand.pbs_main]
-debug = true
+[auction.providers.pbs-main]
+profile_config = { debug = true }
 ```
 
 **Check Fastly logs:**

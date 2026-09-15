@@ -33,10 +33,6 @@ const LOCKR_INTEGRATION_ID: &str = "lockr";
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]
 pub struct LockrConfig {
-    /// Enable/disable the integration
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
     /// Lockr app ID (from meta tag lockr-signin-app_id)
     #[validate(length(min = 1))]
     pub app_id: String,
@@ -73,11 +69,7 @@ pub struct LockrConfig {
     pub origin_override: Option<String>,
 }
 
-impl IntegrationConfig for LockrConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for LockrConfig {}
 
 /// Lockr integration implementation.
 pub struct LockrIntegration {
@@ -313,7 +305,7 @@ fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<Tr
 }
 
 /// Validates the Lockr configuration for deployment and reports whether
-/// the integration is enabled.
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
@@ -329,7 +321,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 ///
 /// # Errors
 ///
-/// Returns an error when the Lockr integration is enabled with invalid
+/// Returns an error when the Lockr integration runs with invalid
 /// configuration.
 pub fn register(
     settings: &Settings,
@@ -422,10 +414,6 @@ impl IntegrationAttributeRewriter for LockrIntegration {
     }
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
 fn default_api_endpoint() -> String {
     "https://identity.loc.kr".to_string()
 }
@@ -448,14 +436,12 @@ mod tests {
 
     use super::*;
     use edgezero_core::http::Method as HttpMethod;
-    use serde_json::json;
 
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> LockrConfig {
         LockrConfig {
-            enabled: true,
             app_id: "test-app-id".to_string(),
             api_endpoint: default_api_endpoint(),
             sdk_url: default_sdk_url(),
@@ -713,24 +699,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_invalid_config_does_not_error() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                LOCKR_INTEGRATION_ID,
-                &json!({
-                    "enabled": false,
-                    "app_id": "",
-                    "sdk_url": "not a url",
-                }),
-            )
-            .expect("should insert disabled invalid Lockr config");
+    fn an_integration_that_is_not_named_does_not_register() {
+        let settings = create_test_settings();
 
-        let registration = register(&settings).expect("disabled invalid Lockr config should skip");
+        let registration =
+            register(&settings).expect("an unnamed integration should read no settings");
         assert!(
             registration.is_none(),
-            "disabled invalid Lockr config should not register"
+            "an integration [integration] provider does not name should not register"
         );
     }
 }

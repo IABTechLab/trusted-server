@@ -46,16 +46,14 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[demand]
-provider = ["pbs_main"]
-
-[demand.pbs_main]
-implementation = "prebid_server"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+provider = "pbs-main"
 ```
 
 **Endpoints:**
@@ -286,11 +284,12 @@ All integrations use a consistent architecture:
 
 ### Configuration Pattern
 
-All integrations support:
+All integrations share one pattern:
 
-- TOML configuration in `trusted-server.toml`
-- Environment variable overrides
-- Enable/disable flags
+- `[integration] provider` names the ones that run
+- `[integration.<id>]` holds one integration's settings, where it takes any
+- Environment variable overrides for those settings, which cannot name an
+  integration because the list is an array
 - Validation at startup
 
 ### Rewriting System
@@ -308,27 +307,27 @@ Use this flowchart to determine which integrations you need:
 
 ```
 Do you serve ads?
-├─ Yes → Enable Prebid integration
+├─ Yes → Name "prebid" in [integration] provider
 └─ No → Skip Prebid
 
 Do you use Next.js?
-├─ Yes → Enable Next.js integration
+├─ Yes → Name "nextjs" in [integration] provider
 └─ No → Skip Next.js
 
 Do you use Permutive for audience data?
-├─ Yes → Enable Permutive integration
+├─ Yes → Name "permutive" in [integration] provider
 └─ No → Skip Permutive
 
 Do you use Sourcepoint for consent management?
-├─ Yes → Enable Sourcepoint integration
+├─ Yes → Name "sourcepoint" in [integration] provider
 └─ No → Skip Sourcepoint
 
 Do you use Osano for consent management?
-├─ Yes → Enable Osano integration
+├─ Yes → Name "osano" in [integration] provider
 └─ No → Skip Osano
 
 Are you developing/testing integrations?
-├─ Yes → Enable Testlight integration
+├─ Yes → Name "testlight" in [integration] provider
 └─ No → Skip Testlight
 ```
 
@@ -347,21 +346,19 @@ Are you developing/testing integrations?
 
 EdgeZero overlays existing scalar leaves only. Use the
 `TRUSTED_SERVER__INTEGRATION__{INTEGRATION}__{SETTING}` pattern for integration
-leaves and `TRUSTED_SERVER__DEMAND__{NAME}__{SETTING}` for a demand source.
-Every provider name is snake_case, so a name maps straight onto a path
-segment:
+leaves. Provider map keys preserve hyphens, so `pbs-main` uses `PBS-MAIN`, not
+`PBS_MAIN`. Shell assignment syntax cannot contain that hyphenated name; use
+`env` when running the CLI:
 
 ```bash
-export TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=2000
-export TRUSTED_SERVER__INTEGRATION__PREBID__DEBUG=true
-export TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true
-ts config validate
+env 'TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=2000' \
+  'TRUSTED_SERVER__INTEGRATION__PREBID__DEBUG=true' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+  ts config validate
 ```
 
-A `provider` list is an array, so it cannot be set this way. Edit TOML and
-re-push it to change arrays, tables, maps, or rules. See
-[Configuration Reference](./configuration.md) and
-[Configuration Rules](./configuration-rules.md) for complete details.
+Edit TOML and re-push it to change arrays, tables, maps, or rules. See
+[Configuration Reference](./configuration.md) for complete details.
 
 ## Custom Integrations
 
@@ -392,7 +389,7 @@ No. Integration configuration is read at startup. You must redeploy to change in
 
 ### Are integrations required?
 
-No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for EC ID generation and first-party proxying.
+No. All integrations are optional. With an empty `[integration] provider` list none of them run, and Trusted Server serves EC ID generation and first-party proxying alone.
 
 ### How do I add a new integration?
 

@@ -35,9 +35,9 @@ rewrite_attributes = ["href", "link", "url"]
 
 ### Configuration Options
 
-| Field                | Type    | Default                   | Description                           |
-| -------------------- | ------- | ------------------------- | ------------------------------------- |
-| `rewrite_attributes` | array   | `["href", "link", "url"]` | Attributes to rewrite in Next.js data |
+| Field                | Type  | Default                   | Description                           |
+| -------------------- | ----- | ------------------------- | ------------------------------------- |
+| `rewrite_attributes` | array | `["href", "link", "url"]` | Attributes to rewrite in Next.js data |
 
 ## How It Works
 
@@ -135,9 +135,9 @@ Combine Next.js SSR/SSG with Trusted Server edge logic.
 
 ## Best Practices
 
-### 1. Select It Only When Needed
+### 1. Enable Only When Needed
 
-Name `nextjs` in `[integration] provider` only when the site is Next.js:
+Name it only if you're using Next.js:
 
 ```toml
 [integration]
@@ -149,6 +149,9 @@ provider = ["nextjs"]
 Add custom attributes if your Next.js app uses non-standard fields:
 
 ```toml
+[integration]
+provider = ["nextjs"]
+
 [integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "customImageUrl"]
 ```

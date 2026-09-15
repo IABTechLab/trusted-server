@@ -287,23 +287,28 @@ pub(crate) async fn collect_response_bounded(
 }
 
 /// Builds an integration's registration from settings, or `None` when the
-/// integration is not enabled.
+/// settings give it nothing to register.
+///
+/// The registry calls this only for an integration `[integration] provider`
+/// names, so an integration runs exactly when an operator names it.
 pub type IntegrationBuilderFn =
     fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
 
 /// Validates an integration's configuration for deployment and reports
-/// whether the integration is enabled.
+/// whether `[integration] provider` names it.
 ///
-/// Runs for every builder, enabled or not, so a typo in a disabled block is
-/// still caught. At deploy time secret fields hold secret-store key names
-/// rather than values, so a validator must not depend on a resolved secret.
+/// Runs for every builder, named or not, so one builder's rules cannot be
+/// skipped by the order the builders happen to be in. At deploy time secret
+/// fields hold secret-store key names rather than values, so a validator must
+/// not depend on a resolved secret.
 pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedServerError>>;
 
 /// Prepares a request before routing, for every routed request except the
 /// health check.
 ///
-/// Runs whether or not the integration is enabled, so an integration can
-/// strip its reserved query or cookie even when it is switched off.
+/// Runs whether or not `[integration] provider` names the integration, so one
+/// can strip its own reserved query or cookie in a deployment that does not
+/// run it.
 pub type IntegrationPrepareRequestFn =
     fn(&Settings, &mut Request<EdgeBody>) -> Result<(), Report<TrustedServerError>>;
 
@@ -338,9 +343,13 @@ pub const CORE_SOURCE: &str = "trusted-server-core";
 ///
 /// # fn demo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
 /// let builder = IntegrationBuilder::new("example", "example-crate", build, validate);
-/// let plan = Arc::new(compile_auction_plan(settings)?);
-/// let registry = IntegrationRegistry::with_plan_and_registrations(settings, plan, &[builder])?;
-/// assert!(registry.integration_enabled("example"));
+/// // The registry builds an integration `[integration] provider` names, so a
+/// // deployment that wants this one writes `provider = ["example"]`.
+/// let mut settings = settings.clone();
+/// settings.integration.select("example");
+/// let plan = Arc::new(compile_auction_plan(&settings)?);
+/// let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder])?;
+/// assert!(registry.integration_runs("example"));
 /// # Ok(())
 /// # }
 /// ```
@@ -448,7 +457,7 @@ impl IntegrationBuilder {
     }
 
     /// Attaches a request preparation function that runs before routing on
-    /// every request, enabled or not.
+    /// every request, whether or not the integration runs.
     #[must_use]
     pub const fn with_request_preparer(mut self, prepare: IntegrationPrepareRequestFn) -> Self {
         self.prepare_request = Some(prepare);
@@ -467,12 +476,12 @@ impl IntegrationBuilder {
         self.source
     }
 
-    /// Builds the registration, or `None` when the integration is not enabled.
+    /// Builds the registration, or `None` when the settings give the
+    /// integration nothing to register.
     ///
     /// # Errors
     ///
-    /// Returns an error when the integration is enabled with invalid
-    /// configuration.
+    /// Returns an error when the integration runs with invalid configuration.
     pub(crate) fn build(
         &self,
         settings: &Settings,
@@ -481,7 +490,7 @@ impl IntegrationBuilder {
     }
 
     /// Validates the integration's configuration for deployment and reports
-    /// whether the integration is enabled.
+    /// whether `[integration] provider` names the integration.
     ///
     /// # Errors
     ///

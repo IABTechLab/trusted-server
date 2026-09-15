@@ -427,7 +427,7 @@ IntegrationRegistration::builder(ID)
 - Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js`.
 - `build.rs` auto-generates `tsjs_modules.rs` with `include_str!()` for each discovered file.
 - `bundle.rs` provides `concatenate_modules(ids)` and `concatenated_hash(ids)` APIs.
-- Runtime: Rust server concatenates core + enabled integration JS files at request time.
+- Runtime: Rust server concatenates core + the JS files of the integrations that run, at request time.
 
 ---
 

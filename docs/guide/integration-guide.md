@@ -4,20 +4,23 @@ This document explains how to integrate a new integration module with the Truste
 
 ## Architecture Overview
 
-| Component                                                               | Purpose                                                                                                                                                                                                                                                      |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/trusted-server-core/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, and `IntegrationHeadInjector` traits and hosts the `IntegrationRegistry`, which drives proxy routing, HTML/text rewrites, and head injection.                   |
-| The `[integration]` table (`crates/trusted-server-core/src/settings.rs`) | `[integration] provider` lists the modules that run, and each module's settings live in its own `[integration.<id>]` table. A module deserializes and validates (`validator::Validate`) its own settings, so the core settings schema stays stable. |
-| Fastly entrypoint (`crates/trusted-server-adapter-fastly/src/main.rs`)  | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                              |
-| `html_processor.rs`                                                     | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                     |
+| Component                                                              | Purpose                                                                                                                                                                                                                                                                                                                         |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/registry.rs`              | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, and `IntegrationHeadInjector` traits and hosts the `IntegrationRegistry`, which drives proxy routing, HTML/text rewrites, and head injection.                                                                                      |
+| `Settings::integration` (`crates/trusted-server-core/src/settings.rs`) | `[integration] provider` names the modules that run, and each `[integration.<id>]` block is a free-form JSON blob keyed by integration ID. Use `IntegrationSettings::insert_config` to seed one, and each module deserializes and validates (`validator::Validate`) its own settings, so the core settings schema stays stable. |
+| Fastly entrypoint (`crates/trusted-server-adapter-fastly/src/main.rs`) | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                                                                                                 |
+| `html_processor.rs`                                                    | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                                                                                        |
 
 ## Step-by-Step Integration
 
 ### 1. Define Integration Configuration
 
-Name the module in `[integration] provider`, add its `[integration.<id>]` settings table, and set any environment overrides under `TRUSTED_SERVER__INTEGRATION__<ID>__*`. Configuration values are exposed to your module via `Settings::integration_config(<id>)`.
+Add a `trusted-server.toml` block and any environment overrides under `TRUSTED_SERVER__INTEGRATION__<ID>__*`. Configuration values are exposed to your module via `Settings::integration_config(<id>)`.
 
 ```toml
+[integration]
+provider = ["my_integration"]
+
 [integration.my_integration]
 endpoint = "https://example.com/api"
 timeout_ms = 1000
@@ -33,14 +36,10 @@ Key pieces:
 ```rust
 #[derive(Deserialize, Validate)]
 struct MyIntegrationConfig {
-    #[serde(default = "default_enabled")]
-    enabled: bool,
     // …
 }
 
-impl IntegrationConfig for MyIntegrationConfig {
-    fn is_enabled(&self) -> bool { self.enabled }
-}
+impl IntegrationConfig for MyIntegrationConfig {}
 
 pub struct MyIntegration {
     config: MyIntegrationConfig,
@@ -54,19 +53,19 @@ pub fn build(settings: &Settings) -> Option<Arc<MyIntegration>> {
     Some(Arc::new(MyIntegration { config }))
 }
 
-// Tests or scaffolding code can seed configs without hand-writing JSON:
+// Tests or scaffolding code can name the module and seed its settings
+// without hand-writing JSON:
 settings
-    .integrations
+    .integration
     .insert_config(
         "my_integration",
         &serde_json::json!({
-            "enabled": true,
             "endpoint": "https://example.com/api"
         }),
     )?;
 ```
 
-`Settings::integration_config::<T>` deserializes the module's settings table and runs [`validator`](https://docs.rs/validator/latest/validator/) on the type. Always derive or implement `Validate` for schema enforcement. There is no `enabled` flag to write, because an operator switches a module on by naming it in `[integration] provider` and off by removing it, and the settings type rejects any key it does not know.
+`Settings::integration_config::<T>` hands back nothing when `[integration] provider` does not name the module, and otherwise deserializes the raw JSON blob, running [`validator`](https://docs.rs/validator/latest/validator/) on the type. A module named with no block of its own is read from an empty one, so a module that takes no settings runs on its id alone and one with a required setting reports the setting it is missing. Always derive or implement `Validate` for schema enforcement, and implement `IntegrationConfig` so the type can be read this way.
 
 ### 3. Return an IntegrationRegistration
 
@@ -276,13 +275,13 @@ Every step above puts the module inside `trusted-server-core`. A module can inst
 
 The crate hands out an `IntegrationBuilder`, which names the module and points at the functions that do the work.
 
-| Part              | Type                          | Purpose                                                                                                                                                                                                                          |
-| ----------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Id                | `&'static str`                | Names the module. The same string is what `[integration] provider` lists, the name of its `[integration.<id>]` settings table, and the value `[geo] provider` uses to select it                                                  |
-| Source            | `&'static str`                | The crate or package name, reported when two builders claim the same id so an operator can tell which crates collided                                                                                                            |
-| Build function    | `IntegrationBuilderFn`        | Reads `Settings` and returns a registration when the module is enabled, or nothing when it is not                                                                                                                                |
-| Validate function | `IntegrationValidateFn`       | The module's own deploy-time rules. They run when deploy validation is invoked with this builder, for every builder passed, enabled or not. The registry does not call them and the CLI does not carry them, see the traps below |
-| Request preparer  | `IntegrationPrepareRequestFn` | Optional. Added with `.with_request_preparer()`, it runs once per request before routing, whether or not the module is enabled                                                                                                   |
+| Part              | Type                          | Purpose                                                                                                                                                                                                                           |
+| ----------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Id                | `&'static str`                | Names the module. The same string is what `[integration] provider` names to run it, the key of its `[integration.<id>]` block, and the value `[geo] provider` uses to select it                                                   |
+| Source            | `&'static str`                | The crate or package name, reported when two builders claim the same id so an operator can tell which crates collided                                                                                                             |
+| Build function    | `IntegrationBuilderFn`        | Reads `Settings` and returns a registration. It is called only for a module `[integration] provider` names, so a module runs exactly when an operator names it                                                                    |
+| Validate function | `IntegrationValidateFn`       | The module's own deploy-time rules. They run when deploy validation is invoked with this builder, for every builder passed, selected or not. The registry does not call them and the CLI does not carry them, see the traps below |
+| Request preparer  | `IntegrationPrepareRequestFn` | Optional. Added with `.with_request_preparer()`, it runs once per request before routing, whether or not the module is selected                                                                                                   |
 
 ```rust
 pub fn builder() -> IntegrationBuilder {
@@ -291,7 +290,7 @@ pub fn builder() -> IntegrationBuilder {
 }
 ```
 
-Demand sources do not come through this seam. They are selected in `[demand] provider` and compiled into the auction plan, as the [auction orchestration guide](./auction-orchestration.md#configuration-first-plan) describes.
+Auction providers do not come through this seam. Bidders are declared in `[auction.providers]` and compiled into the auction plan, as the [auction orchestration guide](./auction-orchestration.md#configuration-first-plan) describes.
 
 ### What a Registration Can Declare
 
@@ -355,7 +354,7 @@ The Fastly adapter is a binary rather than a library and its `build_state_with_r
 
 **The carried module's hash literal must match the file's bytes.** A registration that carries a browser script states the script's SHA-256 next to it, the registry hashes the source when it builds the registry, and a disagreement refuses to start, so a stale literal is a startup error rather than a stale script quietly reaching browsers. The usual cause is not a stale literal at all but line-ending rewriting on checkout, because a Windows clone with `core.autocrlf` turned on rewrites a script's newlines and every byte after the first line moves. The probe crate ships a `.gitattributes` marking its script `text eol=lf`, and a unit test comparing the literal to the file's bytes, so the failure names the cause instead of surfacing as a startup error in every other test. Copy both into a vendor crate.
 
-**A vendor's own deploy rules do not run through the CLI.** `ts config validate` and `ts config push` go through `TrustedServerAppConfig`, which calls `validate_settings_for_deploy` with no extra builders, so only core's rules run there. A module's validate function runs only when something calls `validate_settings_for_deploy_with` and hands it that module's builder, which today means the deployment's own code or its tests. An operator can therefore push a configuration that the module rejects when the server starts. Until the CLI can be given the same builder list, run the vendor's validation from the deployment's own build or test step, and do not read a clean `ts config validate` as the module having agreed.
+**A vendor's own deploy rules do not run through the CLI.** `ts config validate` and `ts config push` go through `TrustedServerAppConfig`, which calls `validate_settings_for_deploy` with no extra builders, so only core's rules run there. A module's validate function runs only when something calls `validate_settings_for_deploy_with` and hands it that module's builder, which today means the deployment's own code or its tests. An operator can therefore push a configuration that the module rejects when the server starts. The same gap applies to the module's id: `[integration] provider` may name an id the CLI has never heard of, and the CLI accepts it rather than refusing a vendor it cannot see, while the registry refuses an id no builder supplies when the server starts. Until the CLI can be given the same builder list, run the vendor's validation from the deployment's own build or test step, and do not read a clean `ts config validate` as the module having agreed.
 
 ## Existing Integrations
 
@@ -394,7 +393,7 @@ Prebid applies the same steps outlined above with a few notable patterns:
 
 **1. Typed Configuration**
 
-`PrebidIntegrationConfig` lives alongside the integration module (`crates/trusted-server-core/src/integrations/prebid.rs`) and implements `IntegrationConfig + Validate`. Its settings live under `[integration.prebid]`:
+`PrebidIntegrationConfig` lives alongside the integration module (`crates/trusted-server-core/src/integrations/prebid.rs`) and implements `IntegrationConfig + Validate`. Naming `prebid` in `[integration] provider` runs it, and its settings live under `[integration.prebid]`:
 
 ```toml
 [integration]
@@ -408,16 +407,14 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 # external_bundle_sri = "sha384-..."
 # script_patterns = ["/static/prebid/*"]
 
-[demand]
-provider = ["pbs_main"]
-
-[demand.pbs_main]
-implementation = "prebid_server"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+provider = "pbs-main"
 
 [proxy]
 allowed_domains = ["assets.example.com"]
@@ -427,9 +424,9 @@ The `proxy.allowed_domains` entry is required for `external_bundle_url` and must
 cover the bundle host plus any HTTPS redirect targets used by that host.
 
 Browser integration tests can inject `[integration.prebid]` settings with the
-same registry helper as other integrations. Demand source and bidder behavior
-must be constructed from the compiled auction plan rather than from
-integration-owned endpoint or bidder fields.
+same registry helper as other integrations. Server provider and bidder behavior
+must be constructed from the compiled auction plan rather than integration-owned
+endpoint or bidder fields.
 
 **2. Routes Owned by the Integration**
 
@@ -437,7 +434,7 @@ integration-owned endpoint or bidder fields.
 
 **3. HTML Rewrites Through the Registry**
 
-When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. Trusted Server injects `window.__tsjs_prebid` plus a same-origin `<script defer src="/integrations/prebid/bundle.js">` tag, so dropping publisher assets prevents duplicate downloads while configuration is available before the external bundle initializes.
+When the integration runs, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. Trusted Server injects `window.__tsjs_prebid` plus a same-origin `<script defer src="/integrations/prebid/bundle.js">` tag, so dropping publisher assets prevents duplicate downloads while configuration is available before the external bundle initializes.
 
 **4. External Bundle Assets & Testing**
 

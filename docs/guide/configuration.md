@@ -1494,6 +1494,8 @@ settings gets its own `[integration.<name>]` table. There is no `enabled` flag,
 because an integration that is not on the list does not run. The full rule set
 is in [Configuration Rules](/guide/configuration-rules).
 
+### Naming the integrations that run
+
 ```toml
 [integration]
 provider = ["prebid", "gpt", "nextjs"]

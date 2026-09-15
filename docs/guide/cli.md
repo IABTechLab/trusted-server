@@ -207,13 +207,14 @@ publisher-specific settings, then run:
 ts config validate
 ```
 
-The draft also fills `[integration.js_asset_proxy]` with disabled third-party
-script candidates from the audit. These entries are inventory only: they do not
-register routes or rewrite HTML until you set
-`js_asset_proxy` in the `[integration] provider` list and change individual
-`assets[].proxy` values to `"enabled"` or `"blocked"`. Some candidates may be
-runtime-injected scripts; JS Asset Proxy only rewrites matching script `src` URLs
-present in HTML processed by Trusted Server.
+The draft also names in `[integration] provider` the integrations it can
+configure from what it found, and writes their blocks. Where it found
+third-party scripts it writes `[integration.js_asset_proxy]` with each one
+`proxy = "disabled"`, so they are inventory only, and nothing is served or
+rewritten until you review a candidate and change its `proxy` value to
+`"enabled"` or `"blocked"`. Some candidates may be runtime-injected scripts,
+and JS Asset Proxy only rewrites matching script `src` URLs present in HTML
+processed by Trusted Server.
 
 If a config already exists, avoid overwriting it:
 
@@ -245,6 +246,9 @@ APIs.
 `trusted-server.toml`.
 
 ```toml
+[integration]
+provider = ["prebid"]
+
 [integration.prebid.bundle]
 adapters = ["rubicon", "kargo"]
 user_id_modules = ["sharedIdSystem"]

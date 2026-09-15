@@ -157,10 +157,8 @@ only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- integrations selected by `[integration] provider`, each with its own
-  `[integration.<name>]` settings table;
-- demand sources selected by `[demand] provider`, each with its own
-  `[demand.<name>]` settings table;
+- the integrations that run, in `[integration] provider`, with their settings under `[integration.<id>]`;
+- server auction providers under map-shaped `[auction.providers.<id>]`;
 - server bidder routes under `[auction.bidders.<id>]`;
 - KV store mappings;
 - EC configuration;
@@ -168,11 +166,9 @@ Edit `trusted-server.toml` to configure:
 - stable key names for `trusted_server_secrets`.
 
 Do not put a Prebid Server URL or server bidder list under
-`[integration.prebid]`, and do not put APS account, endpoint or timeout fields
-under `[integration.aps]`, which no longer exists. Those server values belong
-in the `[demand.<name>]` table of the demand source. See
-[Configuration Rules](/guide/configuration-rules) for the syntax every
-provider type shares.
+`[integration.prebid]`, and do not put APS account/endpoint/timeout fields under
+`[integration.aps]`. Those server values belong to auction provider common
+fields and `profile_config`.
 
 Before the first push, provision the physical store mapped from logical
 `trusted_server_secrets` with the credential values referenced by the config.

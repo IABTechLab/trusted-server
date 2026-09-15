@@ -170,7 +170,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    optional_object("integrations"),
+                    optional_object("integration"),
                     optional_object("datadome"),
                     object("server_side_key_secret_name"),
                 ],
@@ -178,7 +178,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    optional_object("integrations"),
+                    optional_object("integration"),
                     optional_object("datadome"),
                     optional_object("protection_test_bypass"),
                     object("credential_secret_name"),
@@ -250,6 +250,9 @@ pub fn validate_settings_for_deploy_with(
     settings: &Settings,
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
+    // The selection is checked first, so a block nothing runs is reported as
+    // that rather than as whatever its unread settings fail next.
+    settings.integration.validate_selection()?;
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
 
@@ -258,7 +261,7 @@ pub fn validate_settings_for_deploy_with(
     structural_settings.validate_admin_coverage()?;
 
     let plan = crate::auction::compile_auction_plan(settings)?;
-    validate_enabled_integrations(settings, &plan, extra_integrations)?;
+    validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     Ok(())
 }
@@ -275,7 +278,7 @@ pub fn validate_settings_for_runtime(
     settings.reject_placeholder_secrets()?;
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
-    validate_enabled_integrations(settings, &plan, &[])?;
+    validate_integration_blocks(settings, &plan, &[])?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
 }
@@ -292,7 +295,7 @@ pub fn validate_settings_for_runtime(
 ///
 /// Returns [`TrustedServerError`] when any integration block fails its
 /// validation.
-fn validate_enabled_integrations(
+fn validate_integration_blocks(
     settings: &Settings,
     plan: &crate::auction::AuctionPlan,
     extra_integrations: &[IntegrationBuilder],
@@ -410,12 +413,10 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
                 .server_side_key_secret_name
                 .as_ref()
                 .ok_or_else(|| {
-                    missing_secret_key_reference(
-                        "integrations.datadome.server_side_key_secret_name",
-                    )
+                    missing_secret_key_reference("integration.datadome.server_side_key_secret_name")
                 })?;
             validate_secret_key_reference(
-                "integrations.datadome.server_side_key_secret_name",
+                "integration.datadome.server_side_key_secret_name",
                 key.expose(),
             )?;
         }
@@ -426,11 +427,11 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         {
             let credential = bypass.credential_secret_name.as_ref().ok_or_else(|| {
                 missing_secret_key_reference(
-                    "integrations.datadome.protection_test_bypass.credential_secret_name",
+                    "integration.datadome.protection_test_bypass.credential_secret_name",
                 )
             })?;
             validate_secret_key_reference(
-                "integrations.datadome.protection_test_bypass.credential_secret_name",
+                "integration.datadome.protection_test_bypass.credential_secret_name",
                 credential.expose(),
             )?;
         }
@@ -503,7 +504,7 @@ mod tests {
     /// rejection reached the caller intact.
     const EXTERNAL_REJECTION_MESSAGE: &str = "seam probe refuses to deploy";
 
-    /// Stands in for a vendor integration builder that never enables.
+    /// Stands in for a vendor integration builder that never registers.
     fn build_nothing(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -641,12 +642,13 @@ formats = [{ width = 300, height = 250 }]
         out.join("\n")
     }
 
-    /// Every documented block should be push-ready: uncommenting it and setting
-    /// the shown values must parse and pass field validation. Blocks that ship
-    /// a deliberately-invalid non-secret placeholder (GTM `container_id` and
-    /// `request_signing` store ids) are excluded.
+    /// Every documented block should be push-ready, so uncommenting it,
+    /// naming the integration and setting the shown values must parse and
+    /// pass field validation. Blocks that ship a deliberately-invalid
+    /// non-secret placeholder (GTM `container_id` and `request_signing`
+    /// store ids) are excluded.
     #[test]
-    fn documented_integration_blocks_validate_when_uncommented() {
+    fn documented_integration_blocks_validate_when_uncommented_and_named() {
         let base = template_with_resolved_required_secrets();
 
         for (header, id) in [
@@ -654,7 +656,8 @@ formats = [{ width = 300, height = 250 }]
             ("[integration.lockr]", "lockr"),
             ("[integration.sourcepoint]", "sourcepoint"),
         ] {
-            let toml = uncomment_block(&base, header);
+            let toml = uncomment_block(&base, header)
+                .replace("provider = []", &format!("provider = [\"{id}\"]"));
             let settings = Settings::from_toml(&toml)
                 .unwrap_or_else(|err| panic!("uncommented {header} should parse: {err:?}"));
 
@@ -664,21 +667,21 @@ formats = [{ width = 300, height = 250 }]
                         .integration_config::<PermutiveConfig>(id)
                         .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
                         .is_some(),
-                    "{header} should resolve to an enabled, valid config"
+                    "{header} should resolve to a valid config"
                 ),
                 "lockr" => assert!(
                     settings
                         .integration_config::<LockrConfig>(id)
                         .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
                         .is_some(),
-                    "{header} should resolve to an enabled, valid config"
+                    "{header} should resolve to a valid config"
                 ),
                 "sourcepoint" => assert!(
                     settings
                         .integration_config::<SourcepointConfig>(id)
                         .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
                         .is_some(),
-                    "{header} should resolve to an enabled, valid config"
+                    "{header} should resolve to a valid config"
                 ),
                 other => panic!("unhandled integration id {other}"),
             }
@@ -792,12 +795,11 @@ formats = [{ width = 300, height = 250 }]
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 (
-                    "integrations.datadome.server_side_key_secret_name".to_owned(),
+                    "integration.datadome.server_side_key_secret_name".to_owned(),
                     true,
                 ),
                 (
-                    "integrations.datadome.protection_test_bypass.credential_secret_name"
-                        .to_owned(),
+                    "integration.datadome.protection_test_bypass.credential_secret_name".to_owned(),
                     true,
                 ),
                 ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
@@ -853,11 +855,10 @@ formats = [{ width = 300, height = 250 }]
         let mut settings = valid_settings();
         settings.tinybird.secret_store = Some("legacy-tinybird-store".to_string());
         settings
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "server_side_key_secret_store": "legacy-datadome-store",
                     "protection_test_bypass": {
                         "enabled": false,
@@ -902,11 +903,10 @@ formats = [{ width = 300, height = 250 }]
         settings.tinybird.auction_token_secret =
             Some(Redacted::new("resolved-tinybird-secret".to_string()));
         settings
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "server_side_key_secret_name": "resolved-datadome-secret",
                 }),
             )
@@ -1219,21 +1219,37 @@ password = "production-admin-password-32-bytes"
         );
     }
 
-    /// Integrations that default to disabled do not validate inactive fields.
+    /// A block written for an integration the provider list does not name is
+    /// refused by deploy validation, so `ts config validate` reports it before
+    /// the configuration reaches a deployment.
     #[test]
-    fn deploy_validation_skips_field_validation_for_integrations_with_omitted_enabled() {
+    fn deploy_validation_rejects_a_block_for_an_integration_that_is_not_named() {
         let mut settings = valid_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &serde_json::json!({ "endpoint": "not-a-valid-url" }),
-            )
-            .expect("should insert adserver_mock config");
-
-        validate_settings_for_deploy(&settings).expect(
-            "should skip field validation for integrations that resolve to disabled via default",
+        settings.integration.insert(
+            "adserver_mock".to_owned(),
+            serde_json::json!({ "endpoint": "https://mediator.example.com/mediate" }),
         );
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject a block nothing on the list names");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[integration.adserver_mock]") && rendered.contains("provider"),
+            "should name the block and where to name the integration: {rendered}"
+        );
+    }
+
+    /// An id no builder in this deployment supplies is refused where the
+    /// registry is built, not here, because a vendor crate the CLI never links
+    /// may supply it.
+    #[test]
+    fn deploy_validation_accepts_an_id_it_does_not_know() {
+        let mut settings = valid_settings();
+        settings.integration.select("a_vendors_own_integration");
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy validation should leave unknown ids to the registry");
     }
 
     #[test]
@@ -1315,15 +1331,14 @@ password = "production-admin-password-32-bytes"
     }
 
     /// Deploy validation reaches each built-in builder's own config type, one
-    /// id at a time, by planting a block that type cannot deserialize. Every
-    /// integration config carries a boolean `enabled`, so a string there fails
-    /// for all of them.
+    /// id at a time, by planting a block no config type can deserialize. A
+    /// string where the block belongs fails for all of them, whatever settings
+    /// each one takes.
     ///
-    /// This catches deploy validation ceasing to validate the built-ins, or
-    /// validating only the enabled ones. It cannot catch a builder deleted
-    /// from `BUILT_IN_BUILDERS`, because the loop below reads the same
-    /// constant the validation walks; no independent list of the built-ins
-    /// exists in the crate.
+    /// This catches deploy validation ceasing to validate the built-ins. It
+    /// cannot catch a builder deleted from `BUILT_IN_BUILDERS`, because the
+    /// loop below reads the same constant the validation walks; no independent
+    /// list of the built-ins exists in the crate.
     #[test]
     fn deploy_validation_reaches_every_built_in_builder() {
         for id in crate::integrations::builders()
@@ -1332,10 +1347,10 @@ password = "production-admin-password-32-bytes"
             .map(IntegrationBuilder::id)
         {
             let mut settings = valid_settings();
+            settings.integration.select(id);
             settings
-                .integrations
-                .insert_config(id, &serde_json::json!({ "enabled": "not-a-boolean" }))
-                .expect("should insert the probe config");
+                .integration
+                .insert(id.to_owned(), serde_json::json!("not-a-block"));
 
             assert!(
                 validate_settings_for_deploy(&settings).is_err(),
@@ -1355,10 +1370,10 @@ password = "production-admin-password-32-bytes"
         {
             let id = "prebid";
             let mut settings = valid_settings();
+            settings.integration.select(id);
             settings
-                .integrations
-                .insert_config(id, &serde_json::json!({ "enabled": "not-a-boolean" }))
-                .expect("should insert the planted config");
+                .integration
+                .insert(id.to_owned(), serde_json::json!("not-a-block"));
             let expected = format!("Integration '{id}'");
 
             let Err(deploy_error) = validate_settings_for_deploy(&settings) else {
@@ -1401,11 +1416,8 @@ password = "production-admin-password-32-bytes"
     fn deploy_validation_rejects_invalid_osano_config() {
         let mut settings = valid_settings();
         settings
-            .integrations
-            .insert_config(
-                "osano",
-                &serde_json::json!({ "enabled": true, "typo": true }),
-            )
+            .integration
+            .insert_config("osano", &serde_json::json!({"typo": true }))
             .expect("should insert Osano config");
 
         let err = validate_settings_for_deploy(&settings)
@@ -1426,11 +1438,10 @@ password = "production-admin-password-32-bytes"
         ] {
             let mut settings = valid_settings();
             settings
-                .integrations
+                .integration
                 .insert_config(
                     "datadome",
                     &serde_json::json!({
-                        "enabled": true,
                         "enable_protection": enable_protection,
                         "server_side_key_secret_name": "datadome_server_side_key",
                         "protection_test_bypass": {
@@ -1451,22 +1462,24 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
-    fn validate_rejects_invalid_disabled_js_asset_proxy_assets() {
+    fn validate_rejects_invalid_js_asset_proxy_assets() {
         let mut settings = valid_settings();
-        settings.integrations.insert(
-            JS_ASSET_PROXY_INTEGRATION_ID.to_string(),
-            serde_json::json!({
-                "enabled": false,
-                "assets": [{
-                    "path": "bad path",
-                    "origin_url": "not-a-url",
-                    "proxy": "disabled"
-                }]
-            }),
-        );
+        settings
+            .integration
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &serde_json::json!({
+                    "assets": [{
+                        "path": "bad path",
+                        "origin_url": "not-a-url",
+                        "proxy": "disabled"
+                    }]
+                }),
+            )
+            .expect("should insert the asset inventory");
 
         let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject invalid disabled asset inventory");
+            .expect_err("should reject an invalid asset inventory");
         let message = err.to_string();
         assert!(
             message.contains(JS_ASSET_PROXY_INTEGRATION_ID),

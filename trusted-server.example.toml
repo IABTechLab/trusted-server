@@ -603,12 +603,7 @@ auction_timeout_ms = 500
 # table the list does not name refuses startup, so a block left behind after an
 # integration is switched off is caught rather than sitting unread. Required
 # fields are noted per table.
-# =============================================================================
-
-# Browser-side Prebid.js integration. Server-side bidder routing belongs in
-# [demand] and [auction.bidders]. When selected, `external_bundle_url` is
-# required and its host must be listed in [proxy].allowed_domains.
-# [integration.prebid]
+# ======================================================================# [integration.prebid]
 # timeout_ms = 1000
 # debug = false
 # client_side_bidders = []          # bidders running via native Prebid.js adapters

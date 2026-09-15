@@ -35,17 +35,9 @@ const CLEAR_CONSOLE_COOKIE: &str =
 /// Configuration for the GPT runtime diagnostics integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
-pub struct GptDiagnosticsConfig {
-    /// Whether the GPT diagnostics browser module is available.
-    #[serde(default)]
-    pub enabled: bool,
-}
+pub struct GptDiagnosticsConfig {}
 
-impl IntegrationConfig for GptDiagnosticsConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for GptDiagnosticsConfig {}
 
 /// Cookie mutation requested by an activation directive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -225,7 +217,7 @@ struct ConsoleCookieState {
 }
 
 /// Validates the GPT diagnostics configuration for deployment and reports whether
-/// the integration is enabled.
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
@@ -237,7 +229,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
         .map(|config| config.is_some())
 }
 
-/// Register GPT diagnostics when explicitly enabled.
+/// Register GPT diagnostics when `[integration] provider` names it.
 ///
 /// # Errors
 ///
@@ -259,14 +251,15 @@ pub fn register(
     ))
 }
 
-/// Whether the diagnostics integration is present and enabled in configuration.
+/// Whether `[integration] provider` names the diagnostics integration.
 ///
-/// This is the deployment-level switch, not the per-document activation state:
-/// callers that only need to know whether diagnostics could consume a value use
-/// this, while document behaviour uses [`GptDiagnosticsRequestDecision::active`].
-/// A configuration that cannot be parsed reads as disabled.
+/// This says whether the deployment runs diagnostics at all, rather than the
+/// per-document activation state, so a caller that only needs to know whether
+/// diagnostics could consume a value uses this, while document behaviour uses
+/// [`GptDiagnosticsRequestDecision::active`].
+/// A configuration that cannot be parsed reads as not running.
 #[must_use]
-pub fn is_enabled(settings: &Settings) -> bool {
+pub fn runs(settings: &Settings) -> bool {
     settings
         .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)
         .ok()
@@ -292,7 +285,7 @@ pub fn prepare_request(
         return Ok(existing.clone());
     }
 
-    let integration_enabled = settings
+    let integration_runs = settings
         .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)?
         .is_some();
     let (directive, clean_path, had_reserved_query) = console_query(request.uri());
@@ -308,7 +301,7 @@ pub fn prepare_request(
     }
 
     let mut decision = GptDiagnosticsRequestDecision::default();
-    if integration_enabled && eligible_navigation && had_reserved_query {
+    if integration_runs && eligible_navigation && had_reserved_query {
         decision.clean_browser_path_and_query = Some(clean_path);
         match directive {
             QueryDirective::Enable => {
@@ -320,7 +313,7 @@ pub fn prepare_request(
             }
             QueryDirective::Invalid | QueryDirective::Absent => {}
         }
-    } else if integration_enabled
+    } else if integration_runs
         && directive == QueryDirective::Absent
         && cookie_state.occurrences == 1
         && cookie_state.canonical
@@ -481,15 +474,9 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
 
-    fn settings(enabled: bool) -> Settings {
+    fn settings() -> Settings {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                GPT_DIAGNOSTICS_INTEGRATION_ID,
-                &json!({ "enabled": enabled }),
-            )
-            .expect("should insert diagnostics config");
+        settings.integration.select(GPT_DIAGNOSTICS_INTEGRATION_ID);
         settings
     }
 
@@ -508,14 +495,14 @@ mod tests {
 
     #[test]
     fn register_excludes_diagnostics_from_unified_and_deferred_bundles() {
-        let settings = settings(true);
+        let settings = settings();
         let plan = std::sync::Arc::new(
             crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
         );
         let registry =
             IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");
 
-        assert!(registry.integration_enabled(GPT_DIAGNOSTICS_INTEGRATION_ID));
+        assert!(registry.integration_runs(GPT_DIAGNOSTICS_INTEGRATION_ID));
         assert!(
             !registry
                 .js_module_ids_immediate()
@@ -539,7 +526,7 @@ mod tests {
             Some("other=value; __Host-ts-console=1"),
         );
 
-        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut request).expect("should prepare");
 
         assert!(decision.active());
         assert_eq!(
@@ -563,7 +550,7 @@ mod tests {
             .headers_mut()
             .insert("purpose", HeaderValue::from_static("prefetch"));
 
-        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut request).expect("should prepare");
 
         assert!(
             !decision.active(),
@@ -579,7 +566,7 @@ mod tests {
             "https://publisher.example/page",
             Some("__Host-ts-console=1; other=value"),
         );
-        let decision = prepare_request(&settings(true), &mut active).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut active).expect("should prepare");
         assert!(decision.active());
         assert_eq!(active.headers()[header::COOKIE], "other=value");
 
@@ -587,7 +574,7 @@ mod tests {
             "https://publisher.example/page",
             Some("__Host-ts-console=1; __Host-ts-console=1; other=value"),
         );
-        let decision = prepare_request(&settings(true), &mut duplicate).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut duplicate).expect("should prepare");
         assert!(!decision.active());
         assert_eq!(duplicate.headers()[header::COOKIE], "other=value");
     }
@@ -603,7 +590,7 @@ mod tests {
                 &format!("https://publisher.example/page?{query}&keep=1"),
                 Some("__Host-ts-console=1"),
             );
-            let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+            let decision = prepare_request(&settings(), &mut request).expect("should prepare");
             assert!(!decision.active(), "{query} should fail closed");
             assert_eq!(decision.cookie_action, GptDiagnosticsCookieAction::None);
             assert_eq!(request.uri().query(), Some("keep=1"));
@@ -613,7 +600,7 @@ mod tests {
             "https://publisher.example/page?ts_console=false&keep=1",
             Some("__Host-ts-console=1"),
         );
-        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut request).expect("should prepare");
         assert!(!decision.active());
         assert_eq!(
             decision.cookie_action,
@@ -624,7 +611,7 @@ mod tests {
     #[test]
     fn finalization_sets_cookie_and_strips_shared_cache_headers() {
         let mut request = navigation("https://publisher.example/?ts_console=1", None);
-        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut request).expect("should prepare");
         let mut response = Response::builder()
             .header(header::CACHE_CONTROL, "public, max-age=60")
             .header(header::ETAG, "\"origin\"")
@@ -667,7 +654,7 @@ mod tests {
         // because the adapter's terminal guard keys on the marker, not on the stamp, and
         // the `Set-Cookie` privacy net never sees a response that sets no cookie.
         let mut request = navigation("https://publisher.example/", Some("__Host-ts-console=1"));
-        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut request).expect("should prepare");
         assert!(decision.active(), "the session cookie should activate");
         assert_eq!(
             decision.cookie_action,
@@ -696,7 +683,7 @@ mod tests {
     #[test]
     fn an_inactive_decision_leaves_the_origin_cache_policy_alone() {
         let mut request = navigation("https://publisher.example/", None);
-        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let decision = prepare_request(&settings(), &mut request).expect("should prepare");
         assert!(!decision.requires_private_no_store());
         let mut response = Response::builder()
             .header(header::CACHE_CONTROL, "public, max-age=60")
@@ -724,11 +711,8 @@ mod tests {
     fn config_rejects_unknown_fields() {
         let mut settings = create_test_settings();
         settings
-            .integrations
-            .insert_config(
-                GPT_DIAGNOSTICS_INTEGRATION_ID,
-                &json!({ "enabled": true, "typo": true }),
-            )
+            .integration
+            .insert_config(GPT_DIAGNOSTICS_INTEGRATION_ID, &json!({"typo": true }))
             .expect("should insert diagnostics config");
 
         let error = settings

@@ -249,9 +249,9 @@ is excluded from the wasm workspace aliases and run via `./scripts/integration-t
 
 - **GDPR consent propagation** — the consent field exists in `AuctionRequest`
   but is not yet populated or forwarded. Requires implementation first.
-- **Next.js integration features** — the test config does not name `nextjs`
-  in `[integration] provider`, so Next.js-specific rewriters/post-processors
-  are not exercised. RSC Flight/Server Actions tests are compatibility smoke
+- **Next.js integration features** — the test configuration does not name
+  `nextjs` in `[integration] provider`, so Next.js-specific
+  rewriters/post-processors are not exercised. RSC Flight/Server Actions tests are compatibility smoke
   tests only.
-- **GTM integration** — not enabled in test config. Has unit coverage in
+- **GTM integration** — not named in the test config. Has unit coverage in
   `google_tag_manager.rs`.
