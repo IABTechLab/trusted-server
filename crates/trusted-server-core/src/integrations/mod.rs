@@ -5,8 +5,10 @@ use std::time::Duration;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
+use http::Request;
 use url::Url;
 
+use crate::auction::demand::{AdServerImplementation, DemandImplementation};
 use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
@@ -21,17 +23,21 @@ pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
+pub mod openrtb;
 pub mod osano;
 pub mod permutive;
 pub mod prebid;
+pub mod prebid_server;
 mod registry;
 pub mod sourcepoint;
 pub mod testlight;
 
+#[cfg(test)]
+pub(crate) use registry::test_support as registry_test_support;
 pub use registry::{
-    AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationDocumentState,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
+    AttributeRewriteAction, AttributeRewriteOutcome, CarriedJsModule, HeaderMutation,
+    HeaderMutationMode, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationDocumentState, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
     IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy, IntegrationRegistration,
     IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
     IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
@@ -165,7 +171,7 @@ fn integration_backend_spec(
 /// Maximum body size accepted by integration proxy endpoints (256 KiB).
 pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// Maximum response body size from RTB providers (prebid, aps, mediator).
+/// Maximum response body size from RTB providers (prebid, aps, ad server).
 pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
 pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -280,69 +286,299 @@ pub(crate) async fn collect_response_bounded(
     }
 }
 
-type IntegrationBuilderFn =
+/// Builds an integration's registration from settings, or `None` when the
+/// settings give it nothing to register.
+///
+/// The registry calls this only for an integration `[integration] provider`
+/// names, so an integration runs exactly when an operator names it.
+pub type IntegrationBuilderFn =
     fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
 
-pub(crate) struct IntegrationBuilder {
+/// Validates an integration's configuration for deployment and reports
+/// whether `[integration] provider` names it.
+///
+/// Runs for every builder, named or not, so one builder's rules cannot be
+/// skipped by the order the builders happen to be in. At deploy time secret
+/// fields hold secret-store key names rather than values, so a validator must
+/// not depend on a resolved secret.
+pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedServerError>>;
+
+/// Prepares a request before routing, for every routed request except the
+/// health check.
+///
+/// Runs whether or not `[integration] provider` names the integration, so one
+/// can strip its own reserved query or cookie in a deployment that does not
+/// run it.
+pub type IntegrationPrepareRequestFn =
+    fn(&Settings, &mut Request<EdgeBody>) -> Result<(), Report<TrustedServerError>>;
+
+/// Source label for the built-in integrations.
+pub const CORE_SOURCE: &str = "trusted-server-core";
+
+/// A named factory for one integration, the unit an adapter or a vendor crate
+/// hands to [`IntegrationRegistry::with_plan_and_registrations`].
+///
+/// # Examples
+///
+/// ```
+/// use error_stack::Report;
+/// use trusted_server_core::error::TrustedServerError;
+/// use std::sync::Arc;
+///
+/// use trusted_server_core::auction::compile_auction_plan;
+/// use trusted_server_core::integrations::{
+///     IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
+/// };
+/// use trusted_server_core::settings::Settings;
+///
+/// fn build(
+///     _settings: &Settings,
+/// ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+///     Ok(Some(IntegrationRegistration::builder("example").build()))
+/// }
+///
+/// fn validate(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+///     Ok(true)
+/// }
+///
+/// # fn demo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+/// let builder = IntegrationBuilder::new("example", "example-crate", build, validate);
+/// // The registry builds an integration `[integration] provider` names, so a
+/// // deployment that wants this one writes `provider = ["example"]`.
+/// let mut settings = settings.clone();
+/// settings.integration.select("example");
+/// let plan = Arc::new(compile_auction_plan(&settings)?);
+/// let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder])?;
+/// assert!(registry.integration_runs("example"));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct IntegrationBuilder {
     id: &'static str,
+    source: &'static str,
     build: IntegrationBuilderFn,
+    validate: IntegrationValidateFn,
+    prepare_request: Option<IntegrationPrepareRequestFn>,
+    supplies_integration: bool,
+    demand: Option<&'static DemandImplementation>,
+    adserver: Option<&'static AdServerImplementation>,
 }
 
+/// The build function of a builder that supplies no page integration.
+fn no_registration(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(None)
+}
+
+/// The validate function of a builder that supplies no page integration.
+fn nothing_to_validate(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(false)
+}
+
+impl IntegrationBuilder {
+    /// Creates a builder for the integration `id`, attributed to `source`
+    /// (a crate or package name used in duplicate-id errors).
+    #[must_use]
+    pub const fn new(
+        id: &'static str,
+        source: &'static str,
+        build: IntegrationBuilderFn,
+        validate: IntegrationValidateFn,
+    ) -> Self {
+        Self {
+            id,
+            source,
+            build,
+            validate,
+            prepare_request: None,
+            supplies_integration: true,
+            demand: None,
+            adserver: None,
+        }
+    }
+
+    /// Creates a builder that supplies only implementations, such as a demand
+    /// or ad server implementation, and no page integration.
+    ///
+    /// Its `id` still claims a place among builder ids, so two crates cannot
+    /// register under one id, but it is not an integration a deployment can
+    /// name.
+    #[must_use]
+    pub const fn implementations(id: &'static str, source: &'static str) -> Self {
+        Self {
+            id,
+            source,
+            build: no_registration,
+            validate: nothing_to_validate,
+            prepare_request: None,
+            supplies_integration: false,
+            demand: None,
+            adserver: None,
+        }
+    }
+
+    /// Registers a demand implementation, which `[demand] provider` or an
+    /// `implementation` line can name.
+    #[must_use]
+    pub const fn with_demand(mut self, demand: &'static DemandImplementation) -> Self {
+        self.demand = Some(demand);
+        self
+    }
+
+    /// Registers an ad server implementation, which `[adserver] provider` or
+    /// an `implementation` line can name.
+    #[must_use]
+    pub const fn with_adserver(mut self, adserver: &'static AdServerImplementation) -> Self {
+        self.adserver = Some(adserver);
+        self
+    }
+
+    /// Whether this builder supplies a page integration, as opposed to only
+    /// implementations.
+    #[must_use]
+    pub const fn supplies_integration(&self) -> bool {
+        self.supplies_integration
+    }
+
+    /// The demand implementation this builder registers, when it registers
+    /// one.
+    #[must_use]
+    pub const fn demand(&self) -> Option<&'static DemandImplementation> {
+        self.demand
+    }
+
+    /// The ad server implementation this builder registers, when it registers
+    /// one.
+    #[must_use]
+    pub const fn adserver(&self) -> Option<&'static AdServerImplementation> {
+        self.adserver
+    }
+
+    /// Attaches a request preparation function that runs before routing on
+    /// every request, whether or not the integration runs.
+    #[must_use]
+    pub const fn with_request_preparer(mut self, prepare: IntegrationPrepareRequestFn) -> Self {
+        self.prepare_request = Some(prepare);
+        self
+    }
+
+    /// The integration id this builder produces.
+    #[must_use]
+    pub const fn id(&self) -> &'static str {
+        self.id
+    }
+
+    /// The source label used in diagnostics.
+    #[must_use]
+    pub const fn source(&self) -> &'static str {
+        self.source
+    }
+
+    /// Builds the registration, or `None` when the settings give the
+    /// integration nothing to register.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the integration runs with invalid configuration.
+    pub(crate) fn build(
+        &self,
+        settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        (self.build)(settings)
+    }
+
+    /// Validates the integration's configuration for deployment and reports
+    /// whether `[integration] provider` names the integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration cannot be parsed or fails
+    /// validation.
+    pub(crate) fn validate(&self, settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        (self.validate)(settings)
+    }
+
+    /// The request preparation function, when one is attached.
+    pub(crate) fn prepare_request(&self) -> Option<IntegrationPrepareRequestFn> {
+        self.prepare_request
+    }
+}
+
+/// The built-in integrations, in hook order.
+const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
+    // This must remain first: attribute rewriters chain replacements and
+    // short-circuit removals.
+    IntegrationBuilder::new(
+        js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
+        CORE_SOURCE,
+        js_asset_proxy::register,
+        js_asset_proxy::validate,
+    ),
+    IntegrationBuilder::new(
+        "testlight",
+        CORE_SOURCE,
+        testlight::register,
+        testlight::validate,
+    ),
+    IntegrationBuilder::new("nextjs", CORE_SOURCE, nextjs::register, nextjs::validate),
+    IntegrationBuilder::new(
+        "permutive",
+        CORE_SOURCE,
+        permutive::register,
+        permutive::validate,
+    ),
+    IntegrationBuilder::new("lockr", CORE_SOURCE, lockr::register, lockr::validate),
+    IntegrationBuilder::new("didomi", CORE_SOURCE, didomi::register, didomi::validate),
+    IntegrationBuilder::new(
+        "sourcepoint",
+        CORE_SOURCE,
+        sourcepoint::register,
+        sourcepoint::validate,
+    ),
+    IntegrationBuilder::new("osano", CORE_SOURCE, osano::register, osano::validate),
+    IntegrationBuilder::new(
+        "google_tag_manager",
+        CORE_SOURCE,
+        google_tag_manager::register,
+        google_tag_manager::validate,
+    ),
+    IntegrationBuilder::new(
+        "datadome",
+        CORE_SOURCE,
+        datadome::register,
+        datadome::validate,
+    ),
+    IntegrationBuilder::new("gpt", CORE_SOURCE, gpt::register, gpt::validate),
+    IntegrationBuilder::new(
+        "gpt_diagnostics",
+        CORE_SOURCE,
+        gpt_diagnostics::register,
+        gpt_diagnostics::validate,
+    )
+    .with_request_preparer(gpt_diagnostics::prepare_request_hook),
+    // Implementations `[demand]` and `[adserver]` can name. None of them is a
+    // page integration, so none can be named in `[integration] provider`.
+    IntegrationBuilder::implementations(openrtb::OPENRTB_ID, CORE_SOURCE)
+        .with_demand(&openrtb::DEMAND),
+    IntegrationBuilder::implementations(prebid_server::PREBID_SERVER_ID, CORE_SOURCE)
+        .with_demand(&prebid_server::DEMAND),
+    IntegrationBuilder::implementations(aps::APS_INTEGRATION_ID, CORE_SOURCE)
+        .with_demand(&aps::DEMAND),
+    IntegrationBuilder::implementations(adserver_mock::ADSERVER_MOCK_ID, CORE_SOURCE)
+        .with_adserver(&adserver_mock::ADSERVER),
+];
+
+/// The built-in integration builders, in hook order.
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
-    &[
-        // This must remain first: attribute rewriters chain replacements and short-circuit removals.
-        IntegrationBuilder {
-            id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
-            build: js_asset_proxy::register,
-        },
-        IntegrationBuilder {
-            id: "testlight",
-            build: testlight::register,
-        },
-        IntegrationBuilder {
-            id: "nextjs",
-            build: nextjs::register,
-        },
-        IntegrationBuilder {
-            id: "permutive",
-            build: permutive::register,
-        },
-        IntegrationBuilder {
-            id: "lockr",
-            build: lockr::register,
-        },
-        IntegrationBuilder {
-            id: "didomi",
-            build: didomi::register,
-        },
-        IntegrationBuilder {
-            id: "sourcepoint",
-            build: sourcepoint::register,
-        },
-        IntegrationBuilder {
-            id: "osano",
-            build: osano::register,
-        },
-        IntegrationBuilder {
-            id: "google_tag_manager",
-            build: google_tag_manager::register,
-        },
-        IntegrationBuilder {
-            id: "datadome",
-            build: datadome::register,
-        },
-        IntegrationBuilder {
-            id: "gpt",
-            build: gpt::register,
-        },
-        IntegrationBuilder {
-            id: "gpt_diagnostics",
-            build: gpt_diagnostics::register,
-        },
-    ]
+    BUILT_IN_BUILDERS
 }
 
-#[cfg(test)]
-pub(crate) fn registered_builder_ids() -> impl Iterator<Item = &'static str> {
-    builders().iter().map(|builder| builder.id)
+/// Every builder the registry will consider: the built-in set followed by
+/// `extra`, in that order, so hook order for the built-ins never changes.
+pub(crate) fn all_builders(
+    extra: &[IntegrationBuilder],
+) -> impl Iterator<Item = IntegrationBuilder> + '_ {
+    builders().iter().copied().chain(extra.iter().copied())
 }

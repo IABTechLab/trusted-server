@@ -92,7 +92,7 @@ creatives. Creative URLs are rewritten by default; set
 
 Configured provider IDs appear in response metadata and provider responses.
 Consumers that previously matched the literal provider name `prebid` must use
-the configured provider ID, such as `pbs-main`.
+the configured demand source name, such as `pbs_main`.
 
 **Request Body:**
 
@@ -194,16 +194,29 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 
 ---
 
+### POST /\_ts/api/v1/ec/resolve
+
+Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client_fixed` demonstration provider). Server-side providers such as HMAC do not use it.
+
+**Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
+
+**Request Body:** the provider's value, opaque to the core. For `client_fixed` this is the fixed known word sent as `text/plain`.
+
+**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side provider is configured, no identity graph is available, or the provider produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
+
+---
+
 ### GET /first-party/proxy
 
 Unified proxy for resources referenced by creatives (images, scripts, CSS, etc.).
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `tsurl` | string | Yes | Target URL without query parameters (base URL) |
-| `tstoken` | string | Yes | Base64 URL-safe SHA-256 digest of encrypted full target URL |
-| `*` | any | No | Original target URL query parameters (preserved as-is) |
+
+| Parameter | Type   | Required | Description                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+| `tsurl`   | string | Yes      | Target URL without query parameters (base URL)              |
+| `tstoken` | string | Yes      | Base64 URL-safe SHA-256 digest of encrypted full target URL |
+| `*`       | any    | No       | Original target URL query parameters (preserved as-is)      |
 
 **Response:**
 
@@ -241,11 +254,12 @@ curl "https://edge.example.com/first-party/proxy?tsurl=https://ad.doubleclick.ne
 Click tracking redirect endpoint.
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `tsurl` | string | Yes | Target redirect URL without query parameters |
-| `tstoken` | string | Yes | Base64 URL-safe SHA-256 digest of encrypted full target URL |
-| `*` | any | No | Original target URL query parameters |
+
+| Parameter | Type   | Required | Description                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+| `tsurl`   | string | Yes      | Target redirect URL without query parameters                |
+| `tstoken` | string | Yes      | Base64 URL-safe SHA-256 digest of encrypted full target URL |
+| `*`       | any    | No       | Original target URL query parameters                        |
 
 **Response:**
 
@@ -547,13 +561,13 @@ The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec/`{id}`
 
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the provider this deployment selects, such as the built-in HMAC provider's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC provider also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no provider selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
 
 This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
 
 **Response fields:**
 
-- `ec_id`, `store`, and `generation` identify the raw KV lookup.
+- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC provider issued. `store` and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
@@ -632,9 +646,10 @@ Serves the TSJS (Trusted Server JavaScript) library.
 - `tsjs-unified.min.js`
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `v` | string | No | Cache-busting hash (SHA256 of bundle contents) |
+
+| Parameter | Type   | Required | Description                                    |
+| --------- | ------ | -------- | ---------------------------------------------- |
+| `v`       | string | No       | Cache-busting hash (SHA256 of bundle contents) |
 
 **Response:**
 
@@ -652,7 +667,7 @@ Serves the TSJS (Trusted Server JavaScript) library.
 ```
 
 **Module Selection:**
-All integration modules are built at compile time. At runtime, the server concatenates only the modules whose integrations are enabled in `trusted-server.toml` (or env vars). No rebuild is required to change the module set.
+All integration modules are built at compile time. At runtime, the server concatenates only the modules of the integrations `[integration] provider` names in `trusted-server.toml`. No rebuild is required to change the module set.
 
 ---
 
@@ -760,15 +775,16 @@ All endpoints use consistent error response format:
 ```
 
 **Common HTTP Status Codes:**
-| Code | Meaning | Common Causes |
-|------|---------|---------------|
-| 400 | Bad Request | Missing required parameters, invalid JSON |
-| 401 | Unauthorized | Missing or invalid basic auth credentials |
-| 403 | Forbidden | Invalid token signature, disabled integration |
-| 404 | Not Found | Unknown endpoint, missing resource |
-| 500 | Internal Server Error | Upstream service failure, configuration error |
-| 502 | Bad Gateway | Backend service unavailable |
-| 504 | Gateway Timeout | Backend service timeout exceeded |
+
+| Code | Meaning               | Common Causes                                 |
+| ---- | --------------------- | --------------------------------------------- |
+| 400  | Bad Request           | Missing required parameters, invalid JSON     |
+| 401  | Unauthorized          | Missing or invalid basic auth credentials     |
+| 403  | Forbidden             | Invalid token signature, disabled integration |
+| 404  | Not Found             | Unknown endpoint, missing resource            |
+| 500  | Internal Server Error | Upstream service failure, configuration error |
+| 502  | Bad Gateway           | Backend service unavailable                   |
+| 504  | Gateway Timeout       | Backend service timeout exceeded              |
 
 ---
 

@@ -1,6 +1,6 @@
 //! Context query-parameter forwarding for auction providers.
 //!
-//! Provides a config-driven mechanism for ad-server / mediator providers to
+//! Provides a config-driven mechanism for ad server providers to
 //! forward integration-supplied data (e.g. audience segments) as URL query
 //! parameters without hard-coding integration-specific knowledge.
 
@@ -26,12 +26,12 @@ pub enum ContextValue {
 
 /// Mapping from auction-request context keys to query-parameter names.
 ///
-/// Used by ad-server / mediator providers to forward integration-supplied data
+/// Used by ad server providers to forward integration-supplied data
 /// (e.g. audience segments) as URL query parameters without hard-coding
 /// integration-specific knowledge.
 ///
 /// ```toml
-/// [integrations.adserver_mock.context_query_params]
+/// [adserver.adserver_mock.context_query_params]
 /// permutive_segments = "permutive"
 /// lockr_ids          = "lockr"
 /// ```

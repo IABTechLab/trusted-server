@@ -38,8 +38,10 @@ profile_config = { account_id = "example-aps-account", debug = false }
 [auction.bidders.example-server]
 provider = "pbs-main"
 
-[integrations.adserver_mock]
-enabled = true
+[integration]
+provider = ["adserver_mock"]
+
+[integration.adserver_mock]
 endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```

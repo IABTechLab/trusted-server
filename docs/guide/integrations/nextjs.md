@@ -26,17 +26,18 @@ Next.js applications generate framework-specific JSON data (`__NEXT_DATA__`) and
 ## Configuration
 
 ```toml
-[integrations.nextjs]
-enabled = false
+[integration]
+provider = ["nextjs"]
+
+[integration.nextjs]
 rewrite_attributes = ["href", "link", "url"]
 ```
 
 ### Configuration Options
 
-| Field                | Type    | Default                   | Description                           |
-| -------------------- | ------- | ------------------------- | ------------------------------------- |
-| `enabled`            | boolean | `false`                   | Enable Next.js integration            |
-| `rewrite_attributes` | array   | `["href", "link", "url"]` | Attributes to rewrite in Next.js data |
+| Field                | Type  | Default                   | Description                           |
+| -------------------- | ----- | ------------------------- | ------------------------------------- |
+| `rewrite_attributes` | array | `["href", "link", "url"]` | Attributes to rewrite in Next.js data |
 
 ## How It Works
 
@@ -136,11 +137,11 @@ Combine Next.js SSR/SSG with Trusted Server edge logic.
 
 ### 1. Enable Only When Needed
 
-Only enable if you're using Next.js:
+Name it only if you're using Next.js:
 
 ```toml
-[integrations.nextjs]
-enabled = true  # Only if using Next.js
+[integration]
+provider = ["nextjs"]
 ```
 
 ### 2. Configure Rewrite Attributes
@@ -148,7 +149,10 @@ enabled = true  # Only if using Next.js
 Add custom attributes if your Next.js app uses non-standard fields:
 
 ```toml
-[integrations.nextjs]
+[integration]
+provider = ["nextjs"]
+
+[integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "customImageUrl"]
 ```
 

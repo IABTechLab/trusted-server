@@ -51,8 +51,10 @@ There are three layers:
 Add GPT configuration to `trusted-server.toml`:
 
 ```toml
-[integrations.gpt]
-enabled = true
+[integration]
+provider = ["gpt"]
+
+[integration.gpt]
 gam_attribution_enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
@@ -63,15 +65,14 @@ rewrite_script = true
 
 | Field                     | Type    | Required | Default                                                | Description                                                       |
 | ------------------------- | ------- | -------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
-| `enabled`                 | boolean | No       | `true`                                                 | Enable/disable the integration                                    |
 | `gam_attribution_enabled` | boolean | No       | `false`                                                | Add fixed page-level `ts=true` targeting for GAM cohort reporting |
 | `script_url`              | string  | No       | `https://securepubads.g.doubleclick.net/tag/js/gpt.js` | URL for the GPT bootstrap script                                  |
 | `cache_ttl_seconds`       | integer | No       | `3600`                                                 | Cache TTL for proxied scripts (60--86400s)                        |
 | `rewrite_script`          | boolean | No       | `true`                                                 | Whether to rewrite GPT script URLs in HTML                        |
 
 The environment override
-`TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED` works only when
-`gam_attribution_enabled` is already present under `[integrations.gpt]` in the
+`TRUSTED_SERVER__INTEGRATION__GPT__GAM_ATTRIBUTION_ENABLED` works only when
+`gam_attribution_enabled` is already present under `[integration.gpt]` in the
 TOML file. The environment overlay cannot create a missing configuration leaf.
 
 ## Endpoints
@@ -123,7 +124,7 @@ value `ts=true`. It is applied before publisher GPT initialization and remains
 for the browser document's lifetime, so initial, lazy, refresh, publisher-owned,
 and SPA-route requests inherit it unless another targeting consumer clears or
 overrides the key. The attribution switch is independently controlled and
-defaults to `false`, but the GPT integration's `enabled` master switch must also
+defaults to `false`, but `[integration] provider` must also name `gpt`, which
 be `true`.
 
 This key is distinct from the existing slot-level `ts_initial=1` value.

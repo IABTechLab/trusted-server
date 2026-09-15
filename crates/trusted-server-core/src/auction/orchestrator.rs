@@ -40,7 +40,7 @@ pub struct DispatchedAuction {
     timeout_ms: u32,
     floor_prices: HashMap<String, f64>,
     provider_request_context: Box<Request<EdgeBody>>,
-    /// Carried so the mediator call in collect can pass it as the auction request.
+    /// Carried so the ad server call in collect can pass it as the auction request.
     request: AuctionRequest,
     planned_unused_bidder_params: HashMap<String, u32>,
     planned_unroutable_bidder_count: u32,
@@ -309,7 +309,7 @@ pub struct AuctionOrchestrator {
     plan_backed: bool,
     plan: Arc<AuctionPlan>,
     planned_providers: Vec<Arc<GenericOpenRtbProvider>>,
-    mediator: Option<Arc<dyn AuctionProvider>>,
+    adserver: Option<Arc<dyn AuctionProvider>>,
     #[cfg(test)]
     config: AuctionConfig,
     #[cfg(test)]
@@ -321,7 +321,7 @@ pub struct AuctionOrchestrator {
 pub(crate) struct AuctionOrchestratorHarness {
     plan: Arc<AuctionPlan>,
     providers: Vec<Arc<GenericOpenRtbProvider>>,
-    mediator: Option<Arc<dyn AuctionProvider>>,
+    adserver: Option<Arc<dyn AuctionProvider>>,
 }
 
 struct PlannedLaunchState {
@@ -338,7 +338,7 @@ struct PlannedLaunchState {
 impl AuctionOrchestratorHarness {
     pub(crate) fn new(
         plan: impl Into<Arc<AuctionPlan>>,
-        mediator: Option<Arc<dyn AuctionProvider>>,
+        adserver: Option<Arc<dyn AuctionProvider>>,
     ) -> Self {
         let plan = plan.into();
         let providers = plan
@@ -351,7 +351,7 @@ impl AuctionOrchestratorHarness {
         Self {
             plan,
             providers,
-            mediator,
+            adserver,
         }
     }
 
@@ -359,8 +359,8 @@ impl AuctionOrchestratorHarness {
         self.providers.len()
     }
 
-    pub(crate) fn mediator(&self) -> Option<&Arc<dyn AuctionProvider>> {
-        self.mediator.as_ref()
+    pub(crate) fn adserver(&self) -> Option<&Arc<dyn AuctionProvider>> {
+        self.adserver.as_ref()
     }
 
     /// Route and execute config-first bidder providers in deterministic order.
@@ -423,11 +423,11 @@ impl AuctionOrchestratorHarness {
                 (
                     input.provider_id().as_str().to_string(),
                     unused_bidder_params_count(
-                        &self
-                            .plan
+                        self.plan
                             .provider(input.provider_id())
                             .expect("should find routed provider in compiled plan")
-                            .profile,
+                            .demand
+                            .as_ref(),
                         input,
                     ),
                 )
@@ -642,33 +642,33 @@ impl AuctionOrchestratorHarness {
             .collect::<HashMap<_, _>>();
         let helper = AuctionOrchestrator::new(AuctionConfig::default());
         let local_winners = || helper.select_winning_bids(&responses, &floor_prices);
-        let (mediator_response, winning_bids) = if let Some(mediator) = &self.mediator {
+        let (adserver_response, winning_bids) = if let Some(adserver) = &self.adserver {
             let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
-            let logical_budget_ms = remaining_ms.min(mediator.timeout_ms());
+            let logical_budget_ms = remaining_ms.min(adserver.timeout_ms());
             if logical_budget_ms == 0 {
                 log::warn!(
-                    "Auction deadline exhausted before planned mediator; using local ranking"
+                    "Auction deadline exhausted before planned adserver; using local ranking"
                 );
                 (None, local_winners())
             } else {
                 let transport_timeout_ms = context
                     .services
                     .backend()
-                    .canonicalize_transport_timeout_ms(logical_budget_ms, mediator.timeout_ms());
+                    .canonicalize_transport_timeout_ms(logical_budget_ms, adserver.timeout_ms());
                 if transport_timeout_ms == 0 {
                     log::warn!(
-                        "Planned mediator transport budget canonicalized to zero; using local ranking"
+                        "Planned adserver transport budget canonicalized to zero; using local ranking"
                     );
                     let winning_bids = local_winners();
                     return Ok(OrchestrationResult {
                         provider_responses: responses,
-                        mediator_response: None,
+                        adserver_response: None,
                         winning_bids,
                         total_time_ms: auction_start.elapsed().as_millis() as u64,
                         metadata: routing_metadata(routed.diagnostics().unroutable_bidder_count()),
                     });
                 }
-                let mediator_context = AuctionContext {
+                let adserver_context = AuctionContext {
                     settings: context.settings,
                     request: context.request,
                     timeout_ms: logical_budget_ms,
@@ -676,9 +676,9 @@ impl AuctionOrchestratorHarness {
                     provider_responses: Some(&responses),
                     services: context.services,
                 };
-                let mediator_start = Instant::now();
-                let mediated = match mediator
-                    .request_bids(original_request, &mediator_context)
+                let adserver_start = Instant::now();
+                let decided = match adserver
+                    .request_bids(original_request, &adserver_context)
                     .await
                 {
                     Ok(ProviderRequestOutcome::Immediate(response)) => Some(response),
@@ -687,30 +687,30 @@ impl AuctionOrchestratorHarness {
                         parse_state,
                     }) => match context.services.http_client().wait(pending).await {
                         Ok(platform_response) => {
-                            let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                            let response_time_ms = adserver_start.elapsed().as_millis() as u64;
                             if AuctionDeadlinePolicy::for_runtime(context.services)
                                 .rejects_late_completion(auction_start, context.timeout_ms)
                             {
                                 log::warn!(
-                                    "Planned mediator '{}' completed after the hard auction deadline; using local ranking ({}ms)",
-                                    mediator.provider_name(),
+                                    "Planned adserver '{}' completed after the hard auction deadline; using local ranking ({}ms)",
+                                    adserver.provider_name(),
                                     response_time_ms
                                 );
                                 None
                             } else {
-                                mediator
+                                adserver
                                     .parse_response_with_context_and_state(
                                         platform_response,
                                         response_time_ms,
                                         original_request,
-                                        &mediator_context,
+                                        &adserver_context,
                                         parse_state.as_deref(),
                                     )
                                     .await
                                     .map_err(|error| {
                                         log::warn!(
-                                            "Planned mediator '{}' parse failed: {:?}",
-                                            mediator.provider_name(),
+                                            "Planned adserver '{}' parse failed: {:?}",
+                                            adserver.provider_name(),
                                             error
                                         );
                                     })
@@ -719,8 +719,8 @@ impl AuctionOrchestratorHarness {
                         }
                         Err(error) => {
                             log::warn!(
-                                "Planned mediator '{}' request failed: {:?}",
-                                mediator.provider_name(),
+                                "Planned adserver '{}' request failed: {:?}",
+                                adserver.provider_name(),
                                 error
                             );
                             None
@@ -728,21 +728,21 @@ impl AuctionOrchestratorHarness {
                     },
                     Err(error) => {
                         log::warn!(
-                            "Planned mediator '{}' failed to launch: {:?}",
-                            mediator.provider_name(),
+                            "Planned adserver '{}' failed to launch: {:?}",
+                            adserver.provider_name(),
                             error
                         );
                         None
                     }
                 };
-                if let Some(mediated) = mediated {
-                    let winners = mediated
+                if let Some(decided) = decided {
+                    let winners = decided
                         .bids
                         .iter()
                         .filter_map(|bid| {
                             if bid.price.is_none() {
                                 log::warn!(
-                                    "Planned mediator returned a bid without a decoded price"
+                                    "Planned adserver returned a bid without a decoded price"
                                 );
                                 None
                             } else {
@@ -751,7 +751,7 @@ impl AuctionOrchestratorHarness {
                         })
                         .collect();
                     (
-                        Some(mediated),
+                        Some(decided),
                         helper.apply_floor_prices(winners, &floor_prices),
                     )
                 } else {
@@ -769,7 +769,7 @@ impl AuctionOrchestratorHarness {
         );
         Ok(OrchestrationResult {
             provider_responses: responses,
-            mediator_response,
+            adserver_response,
             winning_bids,
             total_time_ms: auction_start.elapsed().as_millis() as u64,
             metadata: routing_metadata(unroutable_bidder_count),
@@ -785,10 +785,7 @@ impl AuctionOrchestrator {
         let plan = Arc::new(
             AuctionPlan::compile(super::plan::AuctionPlanConfig {
                 timeout_ms: config.timeout_ms,
-                providers: std::collections::BTreeMap::new(),
-                bidders: std::collections::BTreeMap::new(),
-                mediator: None,
-                request_signing: None,
+                ..super::plan::AuctionPlanConfig::default()
             })
             .expect("should compile empty legacy test plan")
             .with_enabled(config.enabled),
@@ -799,14 +796,14 @@ impl AuctionOrchestrator {
             config,
             plan,
             planned_providers: Vec::new(),
-            mediator: None,
+            adserver: None,
             providers: HashMap::new(),
         }
     }
 
     /// Create the live orchestrator from one shared compiled auction plan.
     #[must_use]
-    pub fn from_plan(plan: Arc<AuctionPlan>, mediator: Option<Arc<dyn AuctionProvider>>) -> Self {
+    pub fn from_plan(plan: Arc<AuctionPlan>, adserver: Option<Arc<dyn AuctionProvider>>) -> Self {
         let planned_providers = plan
             .providers()
             .iter()
@@ -819,7 +816,7 @@ impl AuctionOrchestrator {
             plan_backed: true,
             plan,
             planned_providers,
-            mediator,
+            adserver,
             #[cfg(test)]
             config: AuctionConfig::default(),
             #[cfg(test)]
@@ -886,7 +883,7 @@ impl AuctionOrchestrator {
     /// # Errors
     ///
     /// Returns an error if the auction execution fails due to provider errors or
-    /// mediation errors.
+    /// ad server decision errors.
     pub async fn run_auction(
         &self,
         request: &AuctionRequest,
@@ -904,12 +901,12 @@ impl AuctionOrchestrator {
         #[cfg(test)]
         let start_time = Instant::now();
 
-        // Auto-detect strategy based on mediator configuration.
+        // Auto-detect strategy based on ad server configuration.
         #[cfg(test)]
-        let (strategy_name, result) = if self.config.has_mediator() {
+        let (strategy_name, result) = if self.config.has_adserver() {
             (
-                "parallel_mediation",
-                self.run_parallel_mediation(request, context).await?,
+                "parallel_adserver",
+                self.run_parallel_adserver(request, context).await?,
             )
         } else {
             (
@@ -920,7 +917,7 @@ impl AuctionOrchestrator {
 
         #[cfg(test)]
         log::info!(
-            "Running auction with strategy: {} (auto-detected from mediator config)",
+            "Running auction with strategy: {} (auto-detected from adserver config)",
             strategy_name
         );
 
@@ -931,128 +928,130 @@ impl AuctionOrchestrator {
         })
     }
 
-    /// Run auction with parallel bidding + mediation.
+    /// Run auction with parallel bidding + ad server decision.
     #[cfg(test)]
     ///
     /// Flow:
     /// 1. Run all bidders in parallel
     /// 2. Collect bids from all bidders
-    /// 3. Send combined bids to mediator for final decision
-    async fn run_parallel_mediation(
+    /// 3. Send combined bids to ad server for final decision
+    async fn run_parallel_adserver(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
-        let mediation_start = Instant::now();
+        let adserver_start = Instant::now();
         let provider_responses = self.run_providers_parallel(request, context).await?;
 
         let floor_prices = self.floor_prices_by_slot(request);
-        let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
-            let mediator = self.get_provider(mediator_name)?;
+        let (adserver_response, winning_bids) = if let Some(adserver_name) =
+            &self.config.adserver_name
+        {
+            let adserver = self.get_provider(adserver_name)?;
 
             log::info!(
-                "Sending {} provider responses to mediator: {}",
+                "Sending {} provider responses to adserver: {}",
                 provider_responses.len(),
-                mediator.provider_name()
+                adserver.provider_name()
             );
 
-            // Give the mediator only the remaining time from the auction
+            // Give the ad server only the remaining time from the auction
             // deadline, not the full timeout — the bidding phase already
             // consumed part of it. Canonicalize the transport timeout so the
             // backend name remains stable across equivalent budget values.
-            let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
-            let mediator_timeout = context
+            let remaining_ms = remaining_budget_ms(adserver_start, context.timeout_ms);
+            let adserver_timeout = context
                 .services
                 .backend()
-                .canonicalize_transport_timeout_ms(remaining_ms, mediator.timeout_ms());
+                .canonicalize_transport_timeout_ms(remaining_ms, adserver.timeout_ms());
 
-            if mediator_timeout == 0 {
-                log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
+            if adserver_timeout == 0 {
+                log::warn!("Auction timeout exhausted during bidding phase; skipping adserver");
                 let winning = self.select_winning_bids(&provider_responses, &floor_prices);
                 return Ok(OrchestrationResult {
                     provider_responses,
-                    mediator_response: None,
+                    adserver_response: None,
                     winning_bids: winning,
                     total_time_ms: 0,
                     metadata: HashMap::new(),
                 });
             }
 
-            let mediator_context = AuctionContext {
+            let adserver_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                timeout_ms: mediator_timeout,
-                transport_timeout_ms: mediator_timeout,
+                timeout_ms: adserver_timeout,
+                transport_timeout_ms: adserver_timeout,
                 provider_responses: Some(&provider_responses),
                 services: context.services,
             };
 
             let start_time = Instant::now();
-            let mediator_resp = match mediator
-                .request_bids(request, &mediator_context)
+            let adserver_resp = match adserver
+                .request_bids(request, &adserver_context)
                 .await
                 .change_context(TrustedServerError::Auction {
-                    message: format!("Mediator {} failed to launch", mediator.provider_name()),
+                    message: format!("AdServer {} failed to launch", adserver.provider_name()),
                 })? {
                 ProviderRequestOutcome::Immediate(response) => response,
                 ProviderRequestOutcome::Pending {
                     request: pending,
                     parse_state,
                 } => {
-                    let platform_resp = mediator_context
+                    let platform_resp = adserver_context
                         .services
                         .http_client()
                         .wait(pending)
                         .await
                         .change_context(TrustedServerError::Auction {
                             message: format!(
-                                "Mediator {} request failed",
-                                mediator.provider_name()
+                                "AdServer {} request failed",
+                                adserver.provider_name()
                             ),
                         })?;
                     let response_time_ms = start_time.elapsed().as_millis() as u64;
                     if AuctionDeadlinePolicy::for_runtime(context.services)
-                        .rejects_late_completion(mediation_start, context.timeout_ms)
+                        .rejects_late_completion(adserver_start, context.timeout_ms)
                     {
                         log::warn!(
-                            "Mediator '{}' completed after the hard auction deadline; using local ranking ({}ms)",
-                            mediator.provider_name(),
+                            "AdServer '{}' completed after the hard auction deadline; using local ranking ({}ms)",
+                            adserver.provider_name(),
                             response_time_ms
                         );
                         let winning = self.select_winning_bids(&provider_responses, &floor_prices);
                         return Ok(OrchestrationResult {
                             provider_responses,
-                            mediator_response: None,
+                            adserver_response: None,
                             winning_bids: winning,
                             total_time_ms: 0,
                             metadata: HashMap::new(),
                         });
                     }
 
-                    mediator
+                    adserver
                         .parse_response_with_context_and_state(
                             platform_resp,
                             response_time_ms,
                             request,
-                            &mediator_context,
+                            &adserver_context,
                             parse_state.as_deref(),
                         )
                         .await
                         .change_context(TrustedServerError::Auction {
-                            message: format!("Mediator {} parse failed", mediator.provider_name()),
+                            message: format!("AdServer {} parse failed", adserver.provider_name()),
                         })?
                 }
             };
 
-            // Extract only mediator bids with comparable numeric prices.
-            let winning = mediator_resp
+            // Extract only ad server bids with comparable numeric prices.
+            let winning = adserver_resp
                 .bids
                 .iter()
                 .filter_map(|bid| {
                     if bid.price.is_none() {
                         log::warn!(
-                            "Mediator '{}' returned bid for slot '{}' without a price - skipping",
-                            mediator.provider_name(),
+                            "AdServer '{}' returned bid for slot '{}' without a price - skipping",
+                            adserver.provider_name(),
                             bid.slot_id
                         );
                         None
@@ -1063,25 +1062,25 @@ impl AuctionOrchestrator {
                 .collect();
 
             (
-                Some(mediator_resp),
+                Some(adserver_resp),
                 self.apply_floor_prices(winning, &floor_prices),
             )
         } else {
-            // No mediator - select best bid per slot from bidder responses
+            // No ad server - select best bid per slot from bidder responses
             let winning = self.select_winning_bids(&provider_responses, &floor_prices);
             (None, winning)
         };
 
         Ok(OrchestrationResult {
             provider_responses,
-            mediator_response,
+            adserver_response,
             winning_bids,
             total_time_ms: 0, // Will be set by caller
             metadata: HashMap::new(),
         })
     }
 
-    /// Run auction with only parallel bidding (no mediation).
+    /// Run auction with only parallel bidding (no ad server decision).
     #[cfg(test)]
     async fn run_parallel_only(
         &self,
@@ -1094,7 +1093,7 @@ impl AuctionOrchestrator {
 
         Ok(OrchestrationResult {
             provider_responses,
-            mediator_response: None,
+            adserver_response: None,
             winning_bids,
             total_time_ms: 0,
             metadata: HashMap::new(),
@@ -1113,9 +1112,9 @@ impl AuctionOrchestrator {
     ) -> Result<Vec<AuctionResponse>, Report<TrustedServerError>> {
         let provider_names = self
             .config
-            .providers
-            .keys()
-            .map(super::plan::ProviderId::as_str)
+            .provider_names
+            .iter()
+            .map(String::as_str)
             .collect::<Vec<_>>();
 
         if provider_names.is_empty() {
@@ -1616,10 +1615,10 @@ impl AuctionOrchestrator {
                 (
                     input.provider_id().as_str().to_string(),
                     unused_bidder_params_count(
-                        &plan
-                            .provider(input.provider_id())
+                        plan.provider(input.provider_id())
                             .expect("should find routed provider in compiled plan")
-                            .profile,
+                            .demand
+                            .as_ref(),
                         input,
                     ),
                 )
@@ -1648,10 +1647,10 @@ impl AuctionOrchestrator {
                         materialize_planned_response(
                             provider_launch_failed_response(input.provider_id().as_str(), 0),
                             unused_bidder_params_count(
-                                &plan
-                                    .provider(input.provider_id())
+                                plan.provider(input.provider_id())
                                     .expect("should find routed provider in compiled plan")
-                                    .profile,
+                                    .demand
+                                    .as_ref(),
                                 input,
                             ),
                         )
@@ -1859,9 +1858,9 @@ impl AuctionOrchestrator {
         #[cfg(test)]
         let provider_names = self
             .config
-            .providers
-            .keys()
-            .map(super::plan::ProviderId::as_str)
+            .provider_names
+            .iter()
+            .map(String::as_str)
             .collect::<Vec<_>>();
         #[cfg(test)]
         if provider_names.is_empty() {
@@ -2085,7 +2084,7 @@ impl AuctionOrchestrator {
     /// Collect bid responses from a previously-dispatched auction.
     ///
     /// Runs the select-loop phase (equivalent to Phase 2 of
-    /// `run_providers_parallel`) and, if the orchestrator has a mediator
+    /// `run_providers_parallel`) and, if the orchestrator has an ad server
     /// configured, forwards collected bids to it. The overall auction deadline
     /// is enforced from `dispatched.auction_start`.
     ///
@@ -2292,7 +2291,7 @@ impl AuctionOrchestrator {
             // collect phase the remaining handles may already be ready even if
             // wall-clock time elapsed while the origin was slow. Dropping them
             // here would discard SSP responses that already arrived. The
-            // mediator launch below still observes A_deadline via
+            // ad server launch below still observes A_deadline via
             // `remaining_budget_ms`.
         }
 
@@ -2329,35 +2328,35 @@ impl AuctionOrchestrator {
         }
 
         #[cfg(not(test))]
-        let mediator = self.mediator.as_ref();
+        let adserver = self.adserver.as_ref();
         #[cfg(test)]
-        let mediator = self.mediator.as_ref().or_else(|| {
+        let adserver = self.adserver.as_ref().or_else(|| {
             self.config
-                .mediator
+                .adserver_name
                 .as_ref()
                 .and_then(|name| self.providers.get(name))
         });
-        let (mediator_response, winning_bids) = if let Some(mediator) = mediator {
+        let (adserver_response, winning_bids) = if let Some(adserver) = adserver {
             {
-                // Cap the mediator at whichever is tighter: its own configured
+                // Cap the ad server at whichever is tighter, being its own configured
                 // timeout or the remaining auction budget (A_deadline). Backend
                 // first-byte and between-bytes timeouts bound normal collection, but
                 // they are transport timers rather than absolute wall-clock limits:
                 // connection setup and byte-trickling can still consume more of the
                 // auction budget. Recomputing the remaining budget here prevents the
-                // mediator from extending that bounded response hold.
+                // ad server from extending that bounded response hold.
                 let remaining = remaining_budget_ms(auction_start, timeout_ms);
-                let logical_budget_ms = remaining.min(mediator.timeout_ms());
+                let logical_budget_ms = remaining.min(adserver.timeout_ms());
                 if logical_budget_ms == 0 {
                     log::warn!(
-                        "A_deadline exhausted before mediator '{}' — returning {} SSP bids without mediation",
-                        mediator.provider_name(),
+                        "A_deadline exhausted before adserver '{}', returning {} SSP bids without an ad server decision",
+                        adserver.provider_name(),
                         responses.len(),
                     );
                     let winning = self.select_winning_bids(&responses, &floor_prices);
                     return OrchestrationResult {
                         provider_responses: responses,
-                        mediator_response: None,
+                        adserver_response: None,
                         winning_bids: winning,
                         total_time_ms: auction_start.elapsed().as_millis() as u64,
                         metadata: routing_metadata(planned_unroutable_bidder_count),
@@ -2365,43 +2364,43 @@ impl AuctionOrchestrator {
                 }
                 let transport_timeout_ms = services
                     .backend()
-                    .canonicalize_transport_timeout_ms(logical_budget_ms, mediator.timeout_ms());
+                    .canonicalize_transport_timeout_ms(logical_budget_ms, adserver.timeout_ms());
                 if transport_timeout_ms == 0 {
                     log::warn!(
-                        "Mediator '{}' transport budget canonicalized to zero — returning {} SSP bids without mediation",
-                        mediator.provider_name(),
+                        "AdServer '{}' transport budget canonicalized to zero, returning {} SSP bids without an ad server decision",
+                        adserver.provider_name(),
                         responses.len(),
                     );
                     let winning = self.select_winning_bids(&responses, &floor_prices);
                     return OrchestrationResult {
                         provider_responses: responses,
-                        mediator_response: None,
+                        adserver_response: None,
                         winning_bids: winning,
                         total_time_ms: auction_start.elapsed().as_millis() as u64,
                         metadata: routing_metadata(planned_unroutable_bidder_count),
                     };
                 }
-                let mediator_start = Instant::now();
-                // This logs a configured mediator identifier and timeout values, not request data or secrets.
+                let adserver_start = Instant::now();
+                // This logs a configured ad server identifier and timeout values, not request data or secrets.
                 log::info!(
-                    "Running mediator '{}' with {}ms logical budget and {}ms transport timeout (A_deadline remaining: {}ms, configured: {}ms)",
-                    mediator.provider_name(),
+                    "Running adserver '{}' with {}ms logical budget and {}ms transport timeout (A_deadline remaining: {}ms, configured: {}ms)",
+                    adserver.provider_name(),
                     logical_budget_ms,
                     transport_timeout_ms,
                     remaining,
-                    mediator.timeout_ms(),
+                    adserver.timeout_ms(),
                 );
-                // The mediator runs on the collect path. See the doc-comment on
+                // The ad server runs on the collect path. See the doc-comment on
                 // `AuctionContext::request`: the real client request was already
                 // consumed by `send_async` during dispatch, so we substitute a
-                // canonical placeholder URL. Any future mediator that needs real
+                // canonical placeholder URL. Any future ad server that needs real
                 // client headers must snapshot them at dispatch time onto
                 // `DispatchedAuction` rather than reading `context.request` here.
                 let placeholder = http::Request::builder()
                     .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
                     .body(edgezero_core::body::Body::empty())
                     .unwrap_or_else(|_| http::Request::new(edgezero_core::body::Body::empty()));
-                let mediator_context = AuctionContext {
+                let adserver_context = AuctionContext {
                     settings: context.settings,
                     request: &placeholder,
                     timeout_ms: logical_budget_ms,
@@ -2409,8 +2408,8 @@ impl AuctionOrchestrator {
                     provider_responses: Some(&responses),
                     services: context.services,
                 };
-                let mediator_response = match mediator
-                    .request_bids(&request, &mediator_context)
+                let adserver_response = match adserver
+                    .request_bids(&request, &adserver_context)
                     .await
                 {
                     Ok(ProviderRequestOutcome::Immediate(response)) => Some(response),
@@ -2420,27 +2419,27 @@ impl AuctionOrchestrator {
                     }) => match services.http_client().wait(pending).await.change_context(
                         TrustedServerError::Auction {
                             message: format!(
-                                "Mediator {} request failed",
-                                mediator.provider_name()
+                                "AdServer {} request failed",
+                                adserver.provider_name()
                             ),
                         },
                     ) {
                         Ok(platform_resp) => {
-                            let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                            let response_time_ms = adserver_start.elapsed().as_millis() as u64;
                             if deadline_policy.rejects_late_completion(auction_start, timeout_ms) {
                                 log::warn!(
-                                    "Mediator '{}' completed after the hard auction deadline; using local ranking ({}ms)",
-                                    mediator.provider_name(),
+                                    "AdServer '{}' completed after the hard auction deadline; using local ranking ({}ms)",
+                                    adserver.provider_name(),
                                     response_time_ms
                                 );
                                 None
                             } else {
-                                match mediator
+                                match adserver
                                     .parse_response_with_context_and_state(
                                         platform_resp,
                                         response_time_ms,
                                         &request,
-                                        &mediator_context,
+                                        &adserver_context,
                                         parse_state.as_deref(),
                                     )
                                     .await
@@ -2448,8 +2447,8 @@ impl AuctionOrchestrator {
                                     Ok(response) => Some(response),
                                     Err(error) => {
                                         log::warn!(
-                                            "Mediator '{}' parse failed: {:?}",
-                                            mediator.provider_name(),
+                                            "AdServer '{}' parse failed: {:?}",
+                                            adserver.provider_name(),
                                             error
                                         );
                                         None
@@ -2458,29 +2457,29 @@ impl AuctionOrchestrator {
                             }
                         }
                         Err(error) => {
-                            log::warn!("Mediator request failed: {:?}", error);
+                            log::warn!("AdServer request failed: {:?}", error);
                             None
                         }
                     },
                     Err(error) => {
                         log::warn!(
-                            "Mediator '{}' failed to dispatch: {:?}",
-                            mediator.provider_name(),
+                            "AdServer '{}' failed to dispatch: {:?}",
+                            adserver.provider_name(),
                             error
                         );
                         None
                     }
                 };
 
-                if let Some(mediator_response) = mediator_response {
-                    let winning = mediator_response
+                if let Some(adserver_response) = adserver_response {
+                    let winning = adserver_response
                             .bids
                             .iter()
                             .filter_map(|bid| {
                                 if bid.price.is_none() {
                                     log::warn!(
-                                        "Mediator '{}' returned bid for slot '{}' without decoded price - skipping",
-                                        mediator.provider_name(),
+                                        "AdServer '{}' returned bid for slot '{}' without decoded price - skipping",
+                                        adserver.provider_name(),
                                         bid.slot_id
                                     );
                                     None
@@ -2490,7 +2489,7 @@ impl AuctionOrchestrator {
                             })
                             .collect();
                     let winning = self.apply_floor_prices(winning, &floor_prices);
-                    (Some(mediator_response), winning)
+                    (Some(adserver_response), winning)
                 } else {
                     (None, self.select_winning_bids(&responses, &floor_prices))
                 }
@@ -2501,7 +2500,7 @@ impl AuctionOrchestrator {
 
         OrchestrationResult {
             provider_responses: responses,
-            mediator_response,
+            adserver_response,
             winning_bids,
             total_time_ms: auction_start.elapsed().as_millis() as u64,
             metadata: routing_metadata(planned_unroutable_bidder_count),
@@ -2520,8 +2519,8 @@ impl AuctionOrchestrator {
 pub struct OrchestrationResult {
     /// All responses from providers
     pub provider_responses: Vec<AuctionResponse>,
-    /// Final response from mediator (if used)
-    pub mediator_response: Option<AuctionResponse>,
+    /// Final response from ad server (if used)
+    pub adserver_response: Option<AuctionResponse>,
     /// Winning bids per slot
     pub winning_bids: HashMap<String, Bid>,
     /// Total orchestration time in milliseconds
@@ -2534,7 +2533,7 @@ impl OrchestrationResult {
     fn no_bid() -> Self {
         Self {
             provider_responses: Vec::new(),
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 0,
             metadata: HashMap::new(),
@@ -2566,7 +2565,6 @@ impl OrchestrationResult {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr as _;
     use std::time::Duration;
 
     use base64::Engine as _;
@@ -2574,20 +2572,19 @@ mod tests {
 
     use crate::auction::config::AuctionConfig;
     use crate::auction::orchestrator::DispatchAuctionOutcome;
-    use crate::auction::plan::{
-        AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
-    };
+    use crate::auction::plan::{AuctionPlan, AuctionPlanConfig, NotificationConfig, RoutingMode};
     use crate::auction::provider::{
         AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome,
     };
     use crate::auction::routing::{RoutingDiagnostics, route_auction};
-    use crate::auction::test_support::create_test_auction_context;
+    use crate::auction::test_support::{create_test_auction_context, demand_table, plan_config};
     use crate::auction::types::{
-        AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest,
-        AuctionResponse, Bid, BidRenderer, BidStatus, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidRenderer,
+        BidStatus, MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
-    use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
+    use crate::integrations::adserver_mock::{AdServerMockProvider, AdServerMockSettings};
+    use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_backend_and_http_client,
         build_services_with_http_client, noop_services,
@@ -2609,67 +2606,81 @@ mod tests {
         ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT, OrchestrationResult,
     };
 
-    fn planned_config(providers: &[(&str, RoutingMode)], signing: bool) -> AuctionPlanConfig {
-        AuctionPlanConfig {
-            timeout_ms: 777,
-            providers: providers
-                .iter()
-                .map(|(id, routing)| {
-                    (
-                        ProviderId::from_str(id).expect("should parse fictional provider ID"),
-                        ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: "https://example.test/openrtb".to_string(),
-                            timeout_ms: Some(1_000),
-                            routing: *routing,
-                            notifications: Default::default(),
-                            profile_config: serde_json::json!({}),
-                        },
-                    )
-                })
-                .collect(),
-            bidders: BTreeMap::new(),
-            mediator: None,
-            request_signing: signing.then(|| crate::settings::RequestSigning {
-                enabled: true,
-                config_store_id: "fictional-config-store".to_string(),
-                secret_store_id: "fictional-secret-store".to_string(),
-            }),
+    /// One `[demand.<name>]` table for a planned test source.
+    fn planned_table(
+        implementation: &str,
+        endpoint: &str,
+        routing: RoutingMode,
+        settings: &serde_json::Value,
+        notifications: &NotificationConfig,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut entry = demand_table(implementation, endpoint);
+        entry.insert("timeout_ms".to_string(), serde_json::json!(1_000));
+        if routing == RoutingMode::AllEligible {
+            entry.insert("routing".to_string(), serde_json::json!("all_eligible"));
         }
+        entry.insert(
+            "notifications".to_string(),
+            serde_json::to_value(notifications).expect("should serialize notifications"),
+        );
+        if let serde_json::Value::Object(settings) = settings {
+            entry.extend(settings.clone());
+        }
+        entry
+    }
+
+    fn planned_config(providers: &[(&str, RoutingMode)], signing: bool) -> AuctionPlanConfig {
+        let tables = providers
+            .iter()
+            .map(|(id, routing)| {
+                (
+                    *id,
+                    planned_table(
+                        "openrtb",
+                        "https://example.test/openrtb",
+                        *routing,
+                        &serde_json::json!({}),
+                        &NotificationConfig::default(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut config = plan_config(tables);
+        config.timeout_ms = 777;
+        config.request_signing = signing.then(|| crate::settings::RequestSigning {
+            enabled: true,
+            config_store_id: "fictional-config-store".to_string(),
+            secret_store_id: "fictional-secret-store".to_string(),
+        });
+        config
     }
 
     fn planned_prebid_config(
         providers: &[(&str, serde_json::Value, NotificationConfig)],
     ) -> AuctionPlanConfig {
-        AuctionPlanConfig {
-            timeout_ms: 777,
-            providers: providers
-                .iter()
-                .map(|(id, profile_config, notifications)| {
-                    (
-                        ProviderId::from_str(id).expect("should parse fictional provider ID"),
-                        ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "prebid-server".to_string(),
-                            endpoint: format!("https://{id}.example.test/openrtb"),
-                            timeout_ms: Some(1_000),
-                            routing: RoutingMode::Explicit,
-                            notifications: notifications.clone(),
-                            profile_config: profile_config.clone(),
-                        },
-                    )
-                })
-                .collect(),
-            bidders: BTreeMap::new(),
-            mediator: None,
-            request_signing: None,
-        }
+        let tables = providers
+            .iter()
+            .map(|(id, settings, notifications)| {
+                (
+                    *id,
+                    planned_table(
+                        "prebid_server",
+                        &format!("https://{id}.example.test/openrtb"),
+                        RoutingMode::Explicit,
+                        settings,
+                        notifications,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut config = plan_config(tables);
+        config.timeout_ms = 777;
+        config
     }
 
     fn planned_aps_config() -> AuctionPlanConfig {
         planned_aps_instances_config(&[(
-            "aps-instance",
+            "aps_instance",
             serde_json::json!({"account_id": "example-account"}),
             NotificationConfig::default(),
         )])
@@ -2678,29 +2689,24 @@ mod tests {
     fn planned_aps_instances_config(
         providers: &[(&str, serde_json::Value, NotificationConfig)],
     ) -> AuctionPlanConfig {
-        AuctionPlanConfig {
-            timeout_ms: 777,
-            providers: providers
-                .iter()
-                .map(|(id, profile_config, notifications)| {
-                    (
-                        ProviderId::from_str(id).expect("should parse fictional provider ID"),
-                        ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "aps".to_string(),
-                            endpoint: "https://aps.example/e/pb/bid".to_string(),
-                            timeout_ms: Some(1_000),
-                            routing: RoutingMode::AllEligible,
-                            notifications: notifications.clone(),
-                            profile_config: profile_config.clone(),
-                        },
-                    )
-                })
-                .collect(),
-            bidders: BTreeMap::new(),
-            mediator: None,
-            request_signing: None,
-        }
+        let tables = providers
+            .iter()
+            .map(|(id, settings, notifications)| {
+                (
+                    *id,
+                    planned_table(
+                        "aps",
+                        "https://aps.example/e/pb/bid",
+                        RoutingMode::AllEligible,
+                        settings,
+                        notifications,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut config = plan_config(tables);
+        config.timeout_ms = 777;
+        config
     }
 
     fn planned_request() -> AuctionRequest {
@@ -2744,7 +2750,7 @@ mod tests {
     async fn disabled_from_plan_is_a_no_work_kill_switch_for_sync_and_split_paths() {
         let plan = Arc::new(
             AuctionPlan::compile(planned_config(
-                &[("provider-a", RoutingMode::AllEligible)],
+                &[("provider_a", RoutingMode::AllEligible)],
                 false,
             ))
             .expect("should compile plan")
@@ -2815,14 +2821,14 @@ mod tests {
     async fn all_planned_launch_failures_error_direct_and_surface_split_failure() {
         let plan = Arc::new(
             AuctionPlan::compile(planned_config(
-                &[("launch-fail", RoutingMode::AllEligible)],
+                &[("launch_fail", RoutingMode::AllEligible)],
                 false,
             ))
             .expect("should compile launch-failure plan"),
         );
         let orchestrator = AuctionOrchestrator::from_plan(plan, None);
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
-        backend.fail_ensure_for("launch-fail");
+        backend.fail_ensure_for("launch_fail");
         let http = Arc::new(StubHttpClient::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
@@ -2869,7 +2875,7 @@ mod tests {
             "should keep one launch-failure response"
         );
         assert_eq!(
-            provider_responses[0].provider, "launch-fail",
+            provider_responses[0].provider, "launch_fail",
             "should attribute the response to the failed provider"
         );
         assert_eq!(
@@ -2884,7 +2890,7 @@ mod tests {
         let plan = Arc::new(
             AuctionPlan::compile(planned_config(
                 &[
-                    ("launch-fail", RoutingMode::AllEligible),
+                    ("launch_fail", RoutingMode::AllEligible),
                     ("timeout", RoutingMode::AllEligible),
                 ],
                 false,
@@ -2921,7 +2927,7 @@ mod tests {
         );
         assert!(
             result.provider_responses.iter().any(|response| {
-                response.provider == "launch-fail"
+                response.provider == "launch_fail"
                     && response.metadata["error_type"] == ERROR_TYPE_LAUNCH_FAILED
             }),
             "should retain the launch-failure outcome"
@@ -3452,19 +3458,19 @@ mod tests {
         }
     }
 
-    type RecordedMediatorBudgets = Arc<Mutex<Vec<(u32, u32)>>>;
+    type RecordedAdServerBudgets = Arc<Mutex<Vec<(u32, u32)>>>;
 
-    struct DeadlineRecordingMediator {
+    struct DeadlineRecordingAdServer {
         launches: Arc<AtomicUsize>,
-        budgets: Option<RecordedMediatorBudgets>,
+        budgets: Option<RecordedAdServerBudgets>,
     }
 
-    struct PendingDeadlineMediator;
+    struct PendingDeadlineAdServer;
 
     #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for PendingDeadlineMediator {
+    impl AuctionProvider for PendingDeadlineAdServer {
         fn provider_name(&self) -> &str {
-            "pending-deadline-mediator"
+            "pending_deadline_adserver"
         }
 
         async fn request_bids(
@@ -3477,8 +3483,8 @@ mod tests {
                     .method("POST")
                     .uri("https://example.com/mediate")
                     .body(edgezero_core::body::Body::empty())
-                    .expect("should build pending mediator request"),
-                "pending-mediator-backend",
+                    .expect("should build pending adserver request"),
+                "pending-adserver-backend",
             );
             context
                 .services
@@ -3486,7 +3492,7 @@ mod tests {
                 .send_async(request)
                 .await
                 .change_context(TrustedServerError::Auction {
-                    message: "pending mediator launch failed".to_string(),
+                    message: "pending adserver launch failed".to_string(),
                 })
                 .map(ProviderRequestOutcome::pending)
         }
@@ -3498,7 +3504,7 @@ mod tests {
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
             Ok(AuctionResponse::success(
                 self.provider_name(),
-                vec![auction_bid("mediated", 9.0)],
+                vec![auction_bid("adserver", 9.0)],
                 response_time_ms,
             ))
         }
@@ -3508,14 +3514,14 @@ mod tests {
         }
 
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("pending-mediator-backend".to_string())
+            Some("pending-adserver-backend".to_string())
         }
     }
 
     #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for DeadlineRecordingMediator {
+    impl AuctionProvider for DeadlineRecordingAdServer {
         fn provider_name(&self) -> &str {
-            "deadline-mediator"
+            "deadline_adserver"
         }
 
         async fn request_bids(
@@ -3527,7 +3533,7 @@ mod tests {
             if let Some(budgets) = &self.budgets {
                 budgets
                     .lock()
-                    .expect("should lock mediator budgets")
+                    .expect("should lock adserver budgets")
                     .push((context.timeout_ms, context.transport_timeout_ms));
             }
             Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
@@ -3541,7 +3547,7 @@ mod tests {
             _response: PlatformResponse,
             _response_time_ms: u64,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("immediate mediator response should not be parsed");
+            panic!("immediate adserver response should not be parsed");
         }
 
         fn timeout_ms(&self) -> u32 {
@@ -3719,24 +3725,28 @@ mod tests {
         }
     }
 
-    /// Mediator whose context-aware parse restores `nurl`/`ad_id` (mirroring
+    /// Ad server whose context-aware parse restores `nurl`/`ad_id` (mirroring
     /// `adserver_mock`), while its context-free parse does not. Lets a test prove
-    /// the synchronous mediation path calls `parse_response_with_context`.
-    struct CacheRestoringMediator;
+    /// the synchronous ad server decision path calls `parse_response_with_context`.
+    struct CacheRestoringAdServer;
 
     fn auction_bid(bidder: &str, price: f64) -> Bid {
         let renderer = (bidder == "aps").then(|| {
-            BidRenderer::Aps(ApsRendererV1 {
-                version: 1,
-                account_id: "example-account".to_string(),
-                bid_id: "aps-selected-bid".to_string(),
-                creative_id: None,
-                tag_type: ApsTagType::Iframe,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "fictional-base64".to_string(),
-                width: 300,
-                height: 250,
-            })
+            BidRenderer::from_typed(
+                APS_RENDERER_TYPE,
+                &ApsRendererV1 {
+                    version: 1,
+                    account_id: "example-account".to_string(),
+                    bid_id: "aps-selected-bid".to_string(),
+                    creative_id: None,
+                    tag_type: ApsTagType::Iframe,
+                    creative_url: "https://creative.example/render".to_string(),
+                    aax_response: "fictional-base64".to_string(),
+                    width: 300,
+                    height: 250,
+                },
+            )
+            .expect("the APS renderer payload should be a JSON object")
         });
         Bid {
             slot_id: "slot-1".to_string(),
@@ -3763,14 +3773,14 @@ mod tests {
         }
     }
 
-    fn mediated_bid(nurl: Option<String>) -> Bid {
+    fn adserver_bid(nurl: Option<String>) -> Bid {
         Bid {
             slot_id: "header-banner".to_string(),
             price: Some(2.5),
             currency: "USD".to_string(),
             creative: Some("<div>ad</div>".to_string()),
             adomain: None,
-            bidder: "mediator".to_string(),
+            bidder: "adserver".to_string(),
             returned_seat: None,
             width: 728,
             height: 90,
@@ -3788,9 +3798,9 @@ mod tests {
     }
 
     #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for CacheRestoringMediator {
+    impl AuctionProvider for CacheRestoringAdServer {
         fn provider_name(&self) -> &str {
-            "mediator"
+            "adserver"
         }
 
         async fn request_bids(
@@ -3803,8 +3813,8 @@ mod tests {
                     .method("POST")
                     .uri("https://example.com/mediate")
                     .body(edgezero_core::body::Body::empty())
-                    .expect("should build mediator request"),
-                "mediator-backend",
+                    .expect("should build adserver request"),
+                "adserver-backend",
             );
             context
                 .services
@@ -3812,7 +3822,7 @@ mod tests {
                 .send_async(req)
                 .await
                 .change_context(TrustedServerError::Auction {
-                    message: "mediator launch failed".to_string(),
+                    message: "adserver launch failed".to_string(),
                 })
                 .map(ProviderRequestOutcome::pending)
         }
@@ -3824,8 +3834,8 @@ mod tests {
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
             // Context-free path: cannot restore SSP-only render/accounting fields.
             Ok(AuctionResponse::success(
-                "mediator",
-                vec![mediated_bid(None)],
+                "adserver",
+                vec![adserver_bid(None)],
                 response_time_ms,
             ))
         }
@@ -3839,8 +3849,8 @@ mod tests {
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
             // Context-aware path: restores nurl/ad_id from the collected SSP bids.
             Ok(AuctionResponse::success(
-                "mediator",
-                vec![mediated_bid(Some("https://nurl.example/win".to_string()))],
+                "adserver",
+                vec![adserver_bid(Some("https://nurl.example/win".to_string()))],
                 response_time_ms,
             ))
         }
@@ -3850,16 +3860,16 @@ mod tests {
         }
 
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("mediator-backend".to_string())
+            Some("adserver-backend".to_string())
         }
     }
 
-    struct ImmediateMediator;
+    struct ImmediateAdServer;
 
     #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for ImmediateMediator {
+    impl AuctionProvider for ImmediateAdServer {
         fn provider_name(&self) -> &str {
-            "immediate-mediator"
+            "immediate_adserver"
         }
 
         async fn request_bids(
@@ -3869,7 +3879,7 @@ mod tests {
         ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
             Ok(ProviderRequestOutcome::Immediate(AuctionResponse::success(
                 self.provider_name(),
-                vec![mediated_bid(Some(
+                vec![adserver_bid(Some(
                     "https://nurl.example/immediate".to_string(),
                 ))],
                 0,
@@ -3881,7 +3891,7 @@ mod tests {
             _response: PlatformResponse,
             _response_time_ms: u64,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("immediate mediator response should not be parsed");
+            panic!("immediate adserver response should not be parsed");
         }
 
         fn timeout_ms(&self) -> u32 {
@@ -3890,22 +3900,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mediated_bid_preserves_restored_fields_through_run_auction() {
-        // run_parallel_mediation must parse the mediator response via
+    async fn adserver_bid_preserves_restored_fields_through_run_auction() {
+        // run_parallel_adserver must parse the ad server response via
         // parse_response_with_context so cache/nurl fields restored from SSP
-        // responses survive the synchronous mediation path (POST /auction,
+        // responses survive the synchronous ad server decision path (POST /auction,
         // /_ts/page-bids), matching the dispatched collect path.
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"{}".to_vec()); // bidder send_async
-        stub.push_response(200, b"{}".to_vec()); // mediator send_async
+        stub.push_response(200, b"{}".to_vec()); // adserver send_async
         let services = build_services_with_http_client(stub);
         // SAFETY: `Box::leak` creates a `'static` reference for test use only.
         let services: &'static RuntimeServices = Box::leak(Box::new(services));
 
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["bidder"]),
-            mediator: Some("mediator".to_string()),
+            provider_names: vec!["bidder".to_string()],
+            adserver_name: Some("adserver".to_string()),
             timeout_ms: 2000,
             ..Default::default()
         };
@@ -3914,7 +3924,7 @@ mod tests {
             name: "bidder",
             backend: "bidder-backend",
         }));
-        orchestrator.register_provider(Arc::new(CacheRestoringMediator));
+        orchestrator.register_provider(Arc::new(CacheRestoringAdServer));
 
         let request = create_test_auction_request();
         let settings = create_test_settings();
@@ -3935,34 +3945,34 @@ mod tests {
         let result = orchestrator
             .run_auction(&request, &context)
             .await
-            .expect("mediated auction should complete");
+            .expect("ad server auction should complete");
 
         let bid = result
             .winning_bids
             .get("header-banner")
-            .expect("mediator should produce a winning bid for the slot");
+            .expect("adserver should produce a winning bid for the slot");
         assert_eq!(
             bid.nurl.as_deref(),
             Some("https://nurl.example/win"),
-            "synchronous mediation must restore nurl via parse_response_with_context"
+            "the synchronous ad server must restore nurl via parse_response_with_context"
         );
         assert_eq!(
             bid.ad_id.as_deref(),
             Some("creative-123"),
-            "mediated bid must keep its restored ad_id"
+            "decided bid must keep its restored ad_id"
         );
     }
 
     #[tokio::test]
-    async fn immediate_mediator_completes_in_sync_and_split_paths() {
+    async fn immediate_adserver_completes_in_sync_and_split_paths() {
         for split in [false, true] {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec());
             let services = build_services_with_http_client(stub);
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["bidder"]),
-                mediator: Some("immediate-mediator".to_string()),
+                provider_names: vec!["bidder".to_string()],
+                adserver_name: Some("immediate_adserver".to_string()),
                 timeout_ms: 2000,
                 ..Default::default()
             };
@@ -3971,7 +3981,7 @@ mod tests {
                 name: "bidder",
                 backend: "bidder-backend",
             }));
-            orchestrator.register_provider(Arc::new(ImmediateMediator));
+            orchestrator.register_provider(Arc::new(ImmediateAdServer));
             let request = create_test_auction_request();
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
@@ -3997,15 +4007,15 @@ mod tests {
                 orchestrator
                     .run_auction(&request, &context)
                     .await
-                    .expect("auction with immediate mediator should complete")
+                    .expect("auction with immediate adserver should complete")
             };
 
             assert_eq!(
                 result
-                    .mediator_response
+                    .adserver_response
                     .as_ref()
                     .map(|response| response.provider.as_str()),
-                Some("immediate-mediator")
+                Some("immediate_adserver")
             );
             assert_eq!(
                 result
@@ -4029,17 +4039,17 @@ mod tests {
         let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["late-one", "late-two"]),
+            provider_names: vec!["late_one".to_string(), "late_two".to_string()],
             timeout_ms: 10,
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
         orchestrator.register_provider(Arc::new(DeadlineBidProvider {
-            name: "late-one",
+            name: "late_one",
             backend: "late-one-backend",
         }));
         orchestrator.register_provider(Arc::new(DeadlineBidProvider {
-            name: "late-two",
+            name: "late_two",
             backend: "late-two-backend",
         }));
         let request = create_test_auction_request();
@@ -4076,9 +4086,9 @@ mod tests {
         for split in [false, true] {
             let result = collect_deadline_test_result(split, false).await;
             assert_eq!(result.provider_responses.len(), 2);
-            assert_eq!(result.provider_responses[0].provider, "late-one");
+            assert_eq!(result.provider_responses[0].provider, "late_one");
             assert_eq!(result.provider_responses[0].status, BidStatus::Success);
-            assert_eq!(result.provider_responses[1].provider, "late-two");
+            assert_eq!(result.provider_responses[1].provider, "late_two");
             assert_eq!(result.provider_responses[1].status, BidStatus::Success);
             assert!(
                 result
@@ -4088,7 +4098,7 @@ mod tests {
                 "late response times should retain actual elapsed duration"
             );
             assert_eq!(
-                result.winning_bids["slot-1"].bidder, "late-one",
+                result.winning_bids["slot-1"].bidder, "late_one",
                 "a completed response remains eligible after the logical deadline"
             );
         }
@@ -4108,7 +4118,7 @@ mod tests {
         }
     }
 
-    async fn pending_mediator_deadline_test_result(
+    async fn pending_adserver_deadline_test_result(
         split: bool,
         enforceable_total_request_deadline: bool,
     ) -> OrchestrationResult {
@@ -4121,8 +4131,8 @@ mod tests {
         let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["local"]),
-            mediator: Some("pending-deadline-mediator".to_string()),
+            provider_names: vec!["local".to_string()],
+            adserver_name: Some("pending_deadline_adserver".to_string()),
             timeout_ms: 20,
             ..Default::default()
         };
@@ -4131,7 +4141,7 @@ mod tests {
             name: "local",
             backend: "local-backend",
         }));
-        orchestrator.register_provider(Arc::new(PendingDeadlineMediator));
+        orchestrator.register_provider(Arc::new(PendingDeadlineAdServer));
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let downstream = http::Request::new(edgezero_core::body::Body::empty());
@@ -4162,31 +4172,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_mediator_late_completion_policy_is_equivalent_in_sync_and_split_paths() {
+    async fn pending_adserver_late_completion_policy_is_equivalent_in_sync_and_split_paths() {
         for split in [false, true] {
-            let current = pending_mediator_deadline_test_result(split, false).await;
-            let current_mediator = current
-                .mediator_response
+            let current = pending_adserver_deadline_test_result(split, false).await;
+            let current_adserver = current
+                .adserver_response
                 .as_ref()
-                .expect("current adapters should accept completed late mediator responses");
+                .expect("current adapters should accept completed late adserver responses");
             assert!(
-                current_mediator.response_time_ms >= 50,
-                "mediator timing should preserve actual elapsed duration"
+                current_adserver.response_time_ms >= 50,
+                "adserver timing should preserve actual elapsed duration"
             );
-            assert_eq!(current.winning_bids["slot-1"].bidder, "mediated");
+            assert_eq!(current.winning_bids["slot-1"].bidder, "adserver");
 
-            let hard = pending_mediator_deadline_test_result(split, true).await;
-            assert!(hard.mediator_response.is_none());
+            let hard = pending_adserver_deadline_test_result(split, true).await;
+            assert!(hard.adserver_response.is_none());
             assert_eq!(hard.winning_bids["slot-1"].bidder, "local");
             assert!(
                 hard.total_time_ms >= 50,
-                "discarding a late mediator must retain actual total elapsed time"
+                "discarding a late adserver must retain actual total elapsed time"
             );
         }
     }
 
     #[tokio::test]
-    async fn split_deadline_skips_mediator_and_falls_back_to_provider_winner() {
+    async fn split_deadline_skips_adserver_and_falls_back_to_provider_winner() {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"{}".to_vec());
         stub.push_select_delay(Duration::from_millis(50));
@@ -4194,17 +4204,17 @@ mod tests {
         let launches = Arc::new(AtomicUsize::new(0));
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["late-one"]),
-            mediator: Some("deadline-mediator".to_string()),
+            provider_names: vec!["late_one".to_string()],
+            adserver_name: Some("deadline_adserver".to_string()),
             timeout_ms: 10,
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
         orchestrator.register_provider(Arc::new(DeadlineBidProvider {
-            name: "late-one",
+            name: "late_one",
             backend: "late-one-backend",
         }));
-        orchestrator.register_provider(Arc::new(DeadlineRecordingMediator {
+        orchestrator.register_provider(Arc::new(DeadlineRecordingAdServer {
             launches: Arc::clone(&launches),
             budgets: None,
         }));
@@ -4229,12 +4239,12 @@ mod tests {
             .await;
 
         assert_eq!(launches.load(Ordering::Relaxed), 0);
-        assert!(result.mediator_response.is_none());
-        assert_eq!(result.winning_bids["slot-1"].bidder, "late-one");
+        assert!(result.adserver_response.is_none());
+        assert_eq!(result.winning_bids["slot-1"].bidder, "late_one");
     }
 
     #[tokio::test]
-    async fn synchronous_deadline_skips_mediator_and_falls_back_to_provider_winner() {
+    async fn synchronous_deadline_skips_adserver_and_falls_back_to_provider_winner() {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"{}".to_vec());
         stub.push_select_delay(Duration::from_millis(50));
@@ -4242,17 +4252,17 @@ mod tests {
         let launches = Arc::new(AtomicUsize::new(0));
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["late-one"]),
-            mediator: Some("deadline-mediator".to_string()),
+            provider_names: vec!["late_one".to_string()],
+            adserver_name: Some("deadline_adserver".to_string()),
             timeout_ms: 10,
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
         orchestrator.register_provider(Arc::new(DeadlineBidProvider {
-            name: "late-one",
+            name: "late_one",
             backend: "late-one-backend",
         }));
-        orchestrator.register_provider(Arc::new(DeadlineRecordingMediator {
+        orchestrator.register_provider(Arc::new(DeadlineRecordingAdServer {
             launches: Arc::clone(&launches),
             budgets: None,
         }));
@@ -4273,8 +4283,8 @@ mod tests {
             .expect("synchronous deadline test should complete");
 
         assert_eq!(launches.load(Ordering::Relaxed), 0);
-        assert!(result.mediator_response.is_none());
-        assert_eq!(result.winning_bids["slot-1"].bidder, "late-one");
+        assert!(result.adserver_response.is_none());
+        assert_eq!(result.winning_bids["slot-1"].bidder, "late_one");
     }
 
     fn create_test_auction_request() -> AuctionRequest {
@@ -4412,7 +4422,7 @@ mod tests {
     async fn synchronous_auction_accepts_an_all_immediate_no_bid_result() {
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["immediate"]),
+            provider_names: vec!["immediate".to_string()],
             timeout_ms: 2000,
             ..Default::default()
         };
@@ -4437,7 +4447,7 @@ mod tests {
     async fn split_auction_accepts_an_all_immediate_no_bid_result() {
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["immediate"]),
+            provider_names: vec!["immediate".to_string()],
             timeout_ms: 2000,
             ..Default::default()
         };
@@ -4468,7 +4478,7 @@ mod tests {
         for split in [false, true] {
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["immediate", "pending"]),
+                provider_names: vec!["immediate".to_string(), "pending".to_string()],
                 timeout_ms: 2000,
                 ..Default::default()
             };
@@ -4682,7 +4692,7 @@ mod tests {
 
     // Timeout paths still need a controllable delayed pending response:
     // - Deadline check in select() loop (drops remaining requests)
-    // - Mediator skip when remaining_ms == 0 (bidding exhausts budget)
+    // - Ad server skip when remaining_ms == 0 (bidding exhausts budget)
     // - Provider skip when effective_timeout == 0 (budget exhausted before launch)
     // - Provider context receives reduced timeout_ms per remaining budget
     //
@@ -4696,12 +4706,13 @@ mod tests {
                 enabled: true,
                 sanitize_creatives: true,
                 rewrite_creatives: true,
-                providers: AuctionConfig::legacy_provider_map(&[]),
+                provider_names: vec![],
                 bidders: Default::default(),
-                mediator: None,
+                adserver_name: None,
                 timeout_ms: 2000,
                 creative_store: "creative_store".to_string(),
                 allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
+                ..Default::default()
             };
 
             let orchestrator = AuctionOrchestrator::new(config);
@@ -4728,7 +4739,7 @@ mod tests {
         futures::executor::block_on(async {
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["launch-failing"]),
+                provider_names: vec!["launch_failing".to_string()],
                 timeout_ms: 2000,
                 ..Default::default()
             };
@@ -4763,17 +4774,17 @@ mod tests {
         for split in [false, true] {
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["provider-a", "provider-b"]),
+                provider_names: vec!["provider_a".to_string(), "provider_b".to_string()],
                 timeout_ms: 2000,
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
+                name: "provider_a",
                 backend: "shared-backend",
             }));
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
+                name: "provider_b",
                 backend: "shared-backend",
             }));
             let stub = Arc::new(StubHttpClient::new());
@@ -4801,10 +4812,10 @@ mod tests {
             };
 
             assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-a" && response.status == BidStatus::Success
+                response.provider == "provider_a" && response.status == BidStatus::Success
             }));
             assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-b" && response.status == BidStatus::Error
+                response.provider == "provider_b" && response.status == BidStatus::Error
             }));
         }
     }
@@ -4878,7 +4889,7 @@ mod tests {
             let requested = Arc::new(Mutex::new(Vec::new()));
             let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["bidder"]),
+                provider_names: vec!["bidder".to_string()],
                 timeout_ms: 2000,
                 ..Default::default()
             });
@@ -4922,7 +4933,7 @@ mod tests {
             let requested = Arc::new(Mutex::new(Vec::new()));
             let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["bidder"]),
+                provider_names: vec!["bidder".to_string()],
                 timeout_ms: 2000,
                 ..Default::default()
             });
@@ -4948,7 +4959,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronous_mediation_applies_canonical_timeout_to_mediator() {
+    fn synchronous_adserver_applies_canonical_timeout_to_adserver() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec());
@@ -4965,8 +4976,8 @@ mod tests {
             let requested = Arc::new(Mutex::new(Vec::new()));
             let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["bidder"]),
-                mediator: Some("mediator".to_string()),
+                provider_names: vec!["bidder".to_string()],
+                adserver_name: Some("adserver".to_string()),
                 timeout_ms: 2000,
                 ..Default::default()
             });
@@ -4975,8 +4986,8 @@ mod tests {
                 backend: "bidder-backend",
             }));
             orchestrator.register_provider(Arc::new(recording_provider(
-                "mediator",
-                "mediator-backend",
+                "adserver",
+                "adserver-backend",
                 2000,
                 &predicted,
                 &requested,
@@ -4988,7 +4999,7 @@ mod tests {
             orchestrator
                 .run_auction(&create_test_auction_request(), &context)
                 .await
-                .expect("should complete mediated auction");
+                .expect("should complete ad server auction");
 
             assert!(predicted.lock().expect("should lock predicted").is_empty());
             assert_eq!(*requested.lock().expect("should lock requested"), vec![500]);
@@ -5011,12 +5022,12 @@ mod tests {
             );
             let bidder_predicted = Arc::new(Mutex::new(Vec::new()));
             let bidder_requested = Arc::new(Mutex::new(Vec::new()));
-            let mediator_predicted = Arc::new(Mutex::new(Vec::new()));
-            let mediator_requested = Arc::new(Mutex::new(Vec::new()));
+            let adserver_predicted = Arc::new(Mutex::new(Vec::new()));
+            let adserver_requested = Arc::new(Mutex::new(Vec::new()));
             let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["bidder"]),
-                mediator: Some("mediator".to_string()),
+                provider_names: vec!["bidder".to_string()],
+                adserver_name: Some("adserver".to_string()),
                 timeout_ms: 2000,
                 ..Default::default()
             });
@@ -5028,11 +5039,11 @@ mod tests {
                 &bidder_requested,
             )));
             orchestrator.register_provider(Arc::new(recording_provider(
-                "mediator",
-                "mediator-backend",
+                "adserver",
+                "adserver-backend",
                 2000,
-                &mediator_predicted,
-                &mediator_requested,
+                &adserver_predicted,
+                &adserver_requested,
             )));
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
@@ -5057,20 +5068,20 @@ mod tests {
                 vec![500]
             );
             assert!(
-                mediator_predicted
+                adserver_predicted
                     .lock()
                     .expect("should lock predicted")
                     .is_empty()
             );
             assert_eq!(
-                *mediator_requested.lock().expect("should lock requested"),
+                *adserver_requested.lock().expect("should lock requested"),
                 vec![500]
             );
         });
     }
 
     #[test]
-    fn planned_collect_skips_mediator_with_zero_canonical_transport_budget() {
+    fn planned_collect_skips_adserver_with_zero_canonical_transport_budget() {
         futures::executor::block_on(async {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let services = build_services_with_backend_and_http_client(
@@ -5082,18 +5093,24 @@ mod tests {
             );
             let launches = Arc::new(AtomicUsize::new(0));
             let budgets = Arc::new(Mutex::new(Vec::new()));
-            let plan = AuctionPlan::compile(AuctionPlanConfig {
-                timeout_ms: 49,
-                providers: BTreeMap::new(),
-                bidders: BTreeMap::new(),
-                mediator: Some("adserver_mock".to_string()),
-                request_signing: None,
-            })
-            .expect("should compile mediator-only plan")
-            .with_enabled(true);
+            let mut adserver_only = plan_config(Vec::new());
+            adserver_only.timeout_ms = 49;
+            adserver_only.adserver = crate::provider_table::ProviderChoice::new(
+                Some("adserver_mock".to_string()),
+                BTreeMap::from([(
+                    "adserver_mock".to_string(),
+                    serde_json::Map::from_iter([(
+                        "endpoint".to_string(),
+                        serde_json::json!("https://adserver.example/mediate"),
+                    )]),
+                )]),
+            );
+            let plan = AuctionPlan::compile(adserver_only)
+                .expect("should compile adserver-only plan")
+                .with_enabled(true);
             let orchestrator = AuctionOrchestrator::from_plan(
                 Arc::new(plan),
-                Some(Arc::new(DeadlineRecordingMediator {
+                Some(Arc::new(DeadlineRecordingAdServer {
                     launches: Arc::clone(&launches),
                     budgets: Some(Arc::clone(&budgets)),
                 })),
@@ -5119,11 +5136,11 @@ mod tests {
             assert!(
                 budgets
                     .lock()
-                    .expect("should lock mediator budgets")
+                    .expect("should lock adserver budgets")
                     .is_empty()
             );
             assert_eq!(calls.lock().expect("should lock calls").len(), 1);
-            assert!(result.mediator_response.is_none());
+            assert!(result.adserver_response.is_none());
         });
     }
 
@@ -5135,12 +5152,12 @@ mod tests {
             let services = build_services_with_http_client(stub);
             let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["provider-a"]),
+                provider_names: vec!["provider_a".to_string()],
                 timeout_ms: 2000,
                 ..Default::default()
             });
             orchestrator.register_provider(Arc::new(DivergentBackendProvider {
-                name: "provider-a",
+                name: "provider_a",
                 predicted: "predicted-backend",
                 resolved: "resolved-backend",
             }));
@@ -5159,7 +5176,7 @@ mod tests {
                 .await;
 
             assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-a" && response.status == BidStatus::Success
+                response.provider == "provider_a" && response.status == BidStatus::Success
             }));
         });
     }
@@ -5173,17 +5190,17 @@ mod tests {
             let services = build_services_with_http_client(stub);
             let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["provider-a", "provider-b"]),
+                provider_names: vec!["provider_a".to_string(), "provider_b".to_string()],
                 timeout_ms: 2000,
                 ..Default::default()
             });
             orchestrator.register_provider(Arc::new(DivergentBackendProvider {
-                name: "provider-a",
+                name: "provider_a",
                 predicted: "predicted-a",
                 resolved: "shared-resolved",
             }));
             orchestrator.register_provider(Arc::new(DivergentBackendProvider {
-                name: "provider-b",
+                name: "provider_b",
                 predicted: "predicted-b",
                 resolved: "shared-resolved",
             }));
@@ -5202,10 +5219,10 @@ mod tests {
                 .await;
 
             assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-a" && response.status == BidStatus::Success
+                response.provider == "provider_a" && response.status == BidStatus::Success
             }));
             assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-b" && response.status == BidStatus::Error
+                response.provider == "provider_b" && response.status == BidStatus::Error
             }));
         });
     }
@@ -5228,18 +5245,18 @@ mod tests {
 
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["provider-a", "provider-b"]),
+                provider_names: vec!["provider_a".to_string(), "provider_b".to_string()],
                 timeout_ms: 2000,
-                mediator: None,
+                adserver_name: None,
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
+                name: "provider_a",
                 backend: "backend-a",
             }));
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
+                name: "provider_b",
                 backend: "backend-b",
             }));
 
@@ -5275,12 +5292,12 @@ mod tests {
             let provider_a = result
                 .provider_responses
                 .iter()
-                .find(|r| r.provider == "provider-a")
+                .find(|r| r.provider == "provider_a")
                 .expect("should have provider-a response");
             let provider_b = result
                 .provider_responses
                 .iter()
-                .find(|r| r.provider == "provider-b")
+                .find(|r| r.provider == "provider_b")
                 .expect("should have provider-b response");
 
             assert_eq!(
@@ -5307,7 +5324,7 @@ mod tests {
         );
         let plan = Arc::new(
             AuctionPlan::compile(planned_config(
-                &[("provider-a", RoutingMode::AllEligible)],
+                &[("provider_a", RoutingMode::AllEligible)],
                 false,
             ))
             .expect("should compile planned auction"),
@@ -5357,7 +5374,7 @@ mod tests {
         );
         let plan = Arc::new(
             AuctionPlan::compile(planned_config(
-                &[("provider-a", RoutingMode::AllEligible)],
+                &[("provider_a", RoutingMode::AllEligible)],
                 false,
             ))
             .expect("should compile planned auction"),
@@ -5404,8 +5421,8 @@ mod tests {
         let plan = Arc::new(
             AuctionPlan::compile(planned_config(
                 &[
-                    ("provider-b", RoutingMode::AllEligible),
-                    ("provider-a", RoutingMode::AllEligible),
+                    ("provider_b", RoutingMode::AllEligible),
+                    ("provider_a", RoutingMode::AllEligible),
                 ],
                 false,
             ))
@@ -5441,8 +5458,8 @@ mod tests {
                 .iter()
                 .map(|response| response.provider.as_str())
                 .collect::<Vec<_>>(),
-            vec!["provider-a", "provider-b"],
-            "outer select errors should retain deterministic plan order"
+            vec!["provider_b", "provider_a"],
+            "outer select errors should keep the order the deployment selected"
         );
         for response in &result.provider_responses {
             assert_eq!(response.status, BidStatus::Error);
@@ -5462,14 +5479,14 @@ mod tests {
             let services = build_services_with_http_client(stub);
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["provider-a"]),
+                provider_names: vec!["provider_a".to_string()],
                 timeout_ms: 750,
-                mediator: None,
+                adserver_name: None,
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
+                name: "provider_a",
                 backend: "backend-a",
             }));
             let request = create_test_auction_request();
@@ -5542,18 +5559,18 @@ mod tests {
 
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["provider-a", "provider-b"]),
+                provider_names: vec!["provider_a".to_string(), "provider_b".to_string()],
                 timeout_ms: 2000,
-                mediator: None,
+                adserver_name: None,
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
+                name: "provider_a",
                 backend: "backend-a",
             }));
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
+                name: "provider_b",
                 backend: "backend-b",
             }));
 
@@ -5608,18 +5625,18 @@ mod tests {
 
             let config = AuctionConfig {
                 enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["provider-a", "provider-b"]),
+                provider_names: vec!["provider_a".to_string(), "provider_b".to_string()],
                 timeout_ms: 2000,
-                mediator: None,
+                adserver_name: None,
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
+                name: "provider_a",
                 backend: "backend-a",
             }));
             orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
+                name: "provider_b",
                 backend: "backend-b",
             }));
 
@@ -5673,13 +5690,13 @@ mod tests {
                 Arc::clone(&backend) as Arc<_>,
                 Arc::clone(&http) as Arc<_>,
             );
-            let mut config = planned_config(&[("provider-a", RoutingMode::AllEligible)], false);
+            let mut config = planned_config(&[("provider_a", RoutingMode::AllEligible)], false);
             config.bidders.insert(
                 "routed-bidder"
                     .parse()
                     .expect("should parse fictional bidder ID"),
                 crate::auction::plan::BidderRouteConfig {
-                    provider: "provider-a"
+                    provider: "provider_a"
                         .parse()
                         .expect("should parse fictional provider ID"),
                 },
@@ -5725,7 +5742,7 @@ mod tests {
             assert_eq!(http.recorded_backend_names().len(), 1);
             assert_eq!(backend.ensured.load(Ordering::Relaxed), 1);
             assert_eq!(result.provider_responses.len(), 1);
-            assert_eq!(result.provider_responses[0].provider, "provider-a");
+            assert_eq!(result.provider_responses[0].provider, "provider_a");
             assert_eq!(result.provider_responses[0].status, BidStatus::Success);
             assert_eq!(
                 result.provider_responses[0].metadata["routing"]["unused_bidder_params_count"],
@@ -5743,7 +5760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_executor_invokes_immediate_mediator_and_applies_floor() {
+    async fn planned_executor_invokes_immediate_adserver_and_applies_floor() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(
             200,
@@ -5761,11 +5778,11 @@ mod tests {
             Arc::clone(&http) as Arc<_>,
         );
         let plan = AuctionPlan::compile(planned_config(
-            &[("provider-a", RoutingMode::AllEligible)],
+            &[("provider_a", RoutingMode::AllEligible)],
             false,
         ))
         .expect("should compile planned auction");
-        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(ImmediateMediator)));
+        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(ImmediateAdServer)));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -5781,14 +5798,14 @@ mod tests {
         let result = orchestrator
             .run_auction(&request, &context)
             .await
-            .expect("should execute planned mediation");
+            .expect("should execute the planned ad server");
 
         assert_eq!(
             result
-                .mediator_response
+                .adserver_response
                 .as_ref()
                 .map(|response| response.provider.as_str()),
-            Some("immediate-mediator")
+            Some("immediate_adserver")
         );
         assert_eq!(
             result.winning_bids["header-banner"].nurl.as_deref(),
@@ -5796,11 +5813,11 @@ mod tests {
         );
         assert!(
             !result.winning_bids.contains_key("fictional-slot"),
-            "mediator output owns final selection"
+            "adserver output owns final selection"
         );
     }
 
-    async fn planned_pending_mediator_deadline_result(
+    async fn planned_pending_adserver_deadline_result(
         enforceable_total_request_deadline: bool,
     ) -> OrchestrationResult {
         let http = Arc::new(StubHttpClient::new());
@@ -5824,12 +5841,12 @@ mod tests {
             Arc::clone(&http) as Arc<_>,
         );
         let plan = AuctionPlan::compile(planned_config(
-            &[("provider-a", RoutingMode::AllEligible)],
+            &[("provider_a", RoutingMode::AllEligible)],
             false,
         ))
         .expect("should compile planned auction");
         let orchestrator =
-            AuctionOrchestratorHarness::new(plan, Some(Arc::new(PendingDeadlineMediator)));
+            AuctionOrchestratorHarness::new(plan, Some(Arc::new(PendingDeadlineAdServer)));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -5845,21 +5862,21 @@ mod tests {
         orchestrator
             .run_auction(&request, &context)
             .await
-            .expect("should execute planned pending mediator")
+            .expect("should execute planned pending adserver")
     }
 
     #[tokio::test]
-    async fn planned_pending_mediator_applies_explicit_hard_deadline_policy() {
-        let current = planned_pending_mediator_deadline_result(false).await;
-        let current_mediator = current
-            .mediator_response
+    async fn planned_pending_adserver_applies_explicit_hard_deadline_policy() {
+        let current = planned_pending_adserver_deadline_result(false).await;
+        let current_adserver = current
+            .adserver_response
             .as_ref()
-            .expect("current adapters should accept completed late mediator responses");
-        assert!(current_mediator.response_time_ms >= 50);
-        assert_eq!(current.winning_bids["slot-1"].bidder, "mediated");
+            .expect("current adapters should accept completed late adserver responses");
+        assert!(current_adserver.response_time_ms >= 50);
+        assert_eq!(current.winning_bids["slot-1"].bidder, "adserver");
 
-        let hard = planned_pending_mediator_deadline_result(true).await;
-        assert!(hard.mediator_response.is_none());
+        let hard = planned_pending_adserver_deadline_result(true).await;
+        assert!(hard.adserver_response.is_none());
         assert_eq!(
             hard.winning_bids["fictional-slot"].bid_id.as_deref(),
             Some("provider")
@@ -5868,7 +5885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_executor_mediator_transport_failure_falls_back_locally() {
+    async fn planned_executor_adserver_transport_failure_falls_back_locally() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(
             200,
@@ -5889,12 +5906,12 @@ mod tests {
             Arc::clone(&http) as Arc<_>,
         );
         let plan = AuctionPlan::compile(planned_config(
-            &[("provider-a", RoutingMode::AllEligible)],
+            &[("provider_a", RoutingMode::AllEligible)],
             false,
         ))
         .expect("should compile planned auction");
         let orchestrator =
-            AuctionOrchestratorHarness::new(plan, Some(Arc::new(CacheRestoringMediator)));
+            AuctionOrchestratorHarness::new(plan, Some(Arc::new(CacheRestoringAdServer)));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -5910,9 +5927,9 @@ mod tests {
         let result = orchestrator
             .run_auction(&request, &context)
             .await
-            .expect("should fall back from mediator transport failure");
+            .expect("should fall back from adserver transport failure");
 
-        assert!(result.mediator_response.is_none());
+        assert!(result.adserver_response.is_none());
         assert_eq!(
             result.winning_bids["fictional-slot"].bid_id.as_deref(),
             Some("provider")
@@ -5953,11 +5970,11 @@ mod tests {
         };
         let plan = AuctionPlan::compile(planned_prebid_config(&[
             (
-                "pbs-a",
+                "pbs_a",
                 serde_json::json!({"debug":true,"test_mode":true,"consent_forwarding":"openrtb_only"}),
                 notifications,
             ),
-            ("pbs-b", serde_json::json!({}), NotificationConfig::default()),
+            ("pbs_b", serde_json::json!({}), NotificationConfig::default()),
         ]))
         .expect("should compile planned PBS auction");
         let orchestrator = AuctionOrchestratorHarness::new(plan, None);
@@ -5991,7 +6008,7 @@ mod tests {
 
         assert_eq!(result.provider_responses.len(), 2);
         let first = &result.provider_responses[0];
-        assert_eq!(first.provider, "pbs-a");
+        assert_eq!(first.provider, "pbs_a");
         assert_eq!(first.bids.len(), 1, "should isolate malformed sibling");
         assert_eq!(
             first.bids[0].returned_seat.as_deref(),
@@ -6015,7 +6032,7 @@ mod tests {
         assert!(first.metadata.contains_key("debug"));
         assert!(first.metadata.contains_key("bidstatus"));
         let second = &result.provider_responses[1];
-        assert_eq!(second.provider, "pbs-b");
+        assert_eq!(second.provider, "pbs_b");
         assert_eq!(second.bids[0].returned_seat.as_deref(), Some("keep-seat"));
         assert!(second.bids[0].nurl.is_some());
         assert!(!second.metadata.contains_key("debug"));
@@ -6064,7 +6081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_aps_mock_mediation_preserves_three_identities_and_renderer() {
+    async fn planned_aps_mock_adserver_preserves_three_identities_and_renderer() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(
             200,
@@ -6080,12 +6097,12 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "aps-instance", "bid": [{
-                    "id": "mediated-aps", "impid": "fictional-slot", "price": 2.0,
+                "seatbid": [{"seat": "aps_instance", "bid": [{
+                    "id": "adserver-aps", "impid": "fictional-slot", "price": 2.0,
                     "adm": "ignored", "w": 300, "h": 250, "crid": "aps-creative"
                 }]}]
             }))
-            .expect("should serialize mediator response"),
+            .expect("should serialize adserver response"),
         );
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let services = build_services_with_backend_and_http_client(
@@ -6094,13 +6111,15 @@ mod tests {
         );
         let plan =
             AuctionPlan::compile(planned_aps_config()).expect("should compile planned APS auction");
-        let mediator = AdServerMockProvider::new(AdServerMockConfig {
-            enabled: true,
-            endpoint: "https://mediator.example/mediate".to_string(),
-            timeout_ms: 500,
-            ..AdServerMockConfig::default()
-        });
-        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(mediator)));
+        let adserver = AdServerMockProvider::new(
+            "adserver_mock",
+            AdServerMockSettings {
+                endpoint: "https://adserver.example/mediate".to_string(),
+                timeout_ms: 500,
+                ..AdServerMockSettings::default()
+            },
+        );
+        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(adserver)));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -6116,10 +6135,10 @@ mod tests {
         let result = orchestrator
             .run_auction(&request, &context)
             .await
-            .expect("should mediate planned APS bid");
+            .expect("should decide planned APS bid");
 
         let provider_bid = &result.provider_responses[0].bids[0];
-        assert_eq!(result.provider_responses[0].provider, "aps-instance");
+        assert_eq!(result.provider_responses[0].provider, "aps_instance");
         assert_eq!(provider_bid.returned_seat.as_deref(), Some("upstream-seat"));
         assert_eq!(provider_bid.bidder, "aps");
         let winner = &result.winning_bids["fictional-slot"];
@@ -6129,7 +6148,7 @@ mod tests {
         assert!(winner.creative.is_none());
         assert_eq!(
             result
-                .mediator_response
+                .adserver_response
                 .as_ref()
                 .map(|response| response.provider.as_str()),
             Some("adserver_mock")
@@ -6228,7 +6247,7 @@ mod tests {
             Arc::clone(&http) as Arc<_>,
         );
         let plan = AuctionPlan::compile(planned_aps_instances_config(&[(
-            "aps-instance",
+            "aps_instance",
             serde_json::json!({"account_id": "example-account", "debug": true}),
             NotificationConfig {
                 suppress_all: false,
@@ -6255,7 +6274,7 @@ mod tests {
             .expect("should execute planned APS profile");
 
         let response = &result.provider_responses[0];
-        assert_eq!(response.provider, "aps-instance");
+        assert_eq!(response.provider, "aps_instance");
         assert_eq!(response.status, BidStatus::Success);
         assert_eq!(
             response.bids.len(),
@@ -6278,7 +6297,7 @@ mod tests {
         let renderer = bid
             .renderer
             .as_ref()
-            .and_then(BidRenderer::as_aps)
+            .and_then(|renderer| renderer.payload_as::<ApsRendererV1>(APS_RENDERER_TYPE))
             .expect("should construct typed APS renderer");
         assert_eq!(renderer.account_id, "example-account");
         let decoded = base64::engine::general_purpose::STANDARD
@@ -6353,12 +6372,12 @@ mod tests {
         );
         let plan = AuctionPlan::compile(planned_aps_instances_config(&[
             (
-                "aps-a",
+                "aps_a",
                 serde_json::json!({"account_id":"account-a"}),
                 NotificationConfig::default(),
             ),
             (
-                "aps-b",
+                "aps_b",
                 serde_json::json!({"account_id":"account-b"}),
                 NotificationConfig::default(),
             ),
@@ -6383,12 +6402,12 @@ mod tests {
             .expect("should execute two APS instances");
 
         assert_eq!(result.provider_responses.len(), 2);
-        assert_eq!(result.provider_responses[0].provider, "aps-a");
+        assert_eq!(result.provider_responses[0].provider, "aps_a");
         assert_eq!(
             result.provider_responses[0].bids[0].bid_id.as_deref(),
             Some("bid-a")
         );
-        assert_eq!(result.provider_responses[1].provider, "aps-b");
+        assert_eq!(result.provider_responses[1].provider, "aps_b");
         assert_eq!(
             result.provider_responses[1].bids[0].bid_id.as_deref(),
             Some("bid-b")
@@ -6586,7 +6605,7 @@ mod tests {
     #[tokio::test]
     async fn planned_aps_script_opt_in_matches_shared_renderer_fixture() {
         let plan = AuctionPlan::compile(planned_aps_instances_config(&[(
-            "aps-instance",
+            "aps_instance",
             serde_json::json!({
                 "account_id":"example-account-id",
                 "allow_script_creatives":true
@@ -6633,7 +6652,7 @@ mod tests {
         let renderer = parsed.bids[0]
             .renderer
             .as_ref()
-            .and_then(BidRenderer::as_aps)
+            .and_then(|renderer| renderer.payload_as::<ApsRendererV1>(APS_RENDERER_TYPE))
             .expect("should construct APS renderer");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&renderer.aax_response)
@@ -6652,7 +6671,7 @@ mod tests {
     #[tokio::test]
     async fn planned_aps_debug_response_headers_are_allowlisted() {
         let plan = AuctionPlan::compile(planned_aps_instances_config(&[(
-            "aps-instance",
+            "aps_instance",
             serde_json::json!({"account_id":"example-account","debug":true}),
             NotificationConfig::default(),
         )]))
@@ -6717,8 +6736,8 @@ mod tests {
         );
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("provider-a", RoutingMode::AllEligible),
-                ("provider-b", RoutingMode::AllEligible),
+                ("provider_a", RoutingMode::AllEligible),
+                ("provider_b", RoutingMode::AllEligible),
             ],
             false,
         ))
@@ -6745,9 +6764,9 @@ mod tests {
             .expect("should execute planned auction");
 
         assert_eq!(orchestrator.provider_count(), 2);
-        assert!(orchestrator.mediator().is_none());
+        assert!(orchestrator.adserver().is_none());
         assert_eq!(result.provider_responses.len(), 2);
-        assert_eq!(result.provider_responses[0].provider, "provider-a");
+        assert_eq!(result.provider_responses[0].provider, "provider_a");
         assert_eq!(
             result.provider_responses[0].bids[0].bid_id.as_deref(),
             Some("bid-a")
@@ -6762,7 +6781,7 @@ mod tests {
             result.provider_responses[0].metadata["routing"]["unused_bidder_params_count"],
             0
         );
-        assert_eq!(result.provider_responses[1].provider, "provider-b");
+        assert_eq!(result.provider_responses[1].provider, "provider_b");
         assert_eq!(
             result.provider_responses[1].bids[0].bid_id.as_deref(),
             Some("bid-b")
@@ -6833,8 +6852,8 @@ mod tests {
         );
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("provider-a", RoutingMode::AllEligible),
-                ("provider-b", RoutingMode::AllEligible),
+                ("provider_a", RoutingMode::AllEligible),
+                ("provider_b", RoutingMode::AllEligible),
             ],
             false,
         ))
@@ -6858,12 +6877,12 @@ mod tests {
             .expect("should isolate backend collision");
 
         assert_eq!(http.recorded_backend_names().len(), 1);
-        assert_eq!(result.provider_responses[0].provider, "provider-a");
+        assert_eq!(result.provider_responses[0].provider, "provider_a");
         assert_eq!(
             result.provider_responses[0].bids[0].bid_id.as_deref(),
             Some("first-bid")
         );
-        assert_eq!(result.provider_responses[1].provider, "provider-b");
+        assert_eq!(result.provider_responses[1].provider, "provider_b");
         assert_eq!(
             result.provider_responses[1].metadata["error_type"],
             "launch_failed"
@@ -6883,8 +6902,8 @@ mod tests {
         );
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("provider-a", RoutingMode::AllEligible),
-                ("provider-b", RoutingMode::AllEligible),
+                ("provider_a", RoutingMode::AllEligible),
+                ("provider_b", RoutingMode::AllEligible),
             ],
             false,
         ))
@@ -6908,12 +6927,12 @@ mod tests {
             .expect("should isolate divergent pending backend");
 
         assert_eq!(result.provider_responses.len(), 2);
-        assert_eq!(result.provider_responses[0].provider, "provider-a");
+        assert_eq!(result.provider_responses[0].provider, "provider_a");
         assert_eq!(
             result.provider_responses[0].metadata["error_type"],
             "launch_failed"
         );
-        assert_eq!(result.provider_responses[1].provider, "provider-b");
+        assert_eq!(result.provider_responses[1].provider, "provider_b");
         assert_eq!(result.provider_responses[1].status, BidStatus::NoBid);
     }
 
@@ -6930,8 +6949,8 @@ mod tests {
         );
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("provider-a", RoutingMode::AllEligible),
-                ("provider-b", RoutingMode::AllEligible),
+                ("provider_a", RoutingMode::AllEligible),
+                ("provider_b", RoutingMode::AllEligible),
             ],
             false,
         ))
@@ -6955,12 +6974,12 @@ mod tests {
             .expect("should isolate missing pending backend");
 
         assert_eq!(result.provider_responses.len(), 2);
-        assert_eq!(result.provider_responses[0].provider, "provider-a");
+        assert_eq!(result.provider_responses[0].provider, "provider_a");
         assert_eq!(
             result.provider_responses[0].metadata["error_type"],
             "launch_failed"
         );
-        assert_eq!(result.provider_responses[1].provider, "provider-b");
+        assert_eq!(result.provider_responses[1].provider, "provider_b");
         assert_eq!(result.provider_responses[1].status, BidStatus::NoBid);
     }
 
@@ -6968,8 +6987,8 @@ mod tests {
     async fn planned_same_profile_rejects_cross_provider_parse_state() {
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("provider-a", RoutingMode::AllEligible),
-                ("provider-b", RoutingMode::AllEligible),
+                ("provider_a", RoutingMode::AllEligible),
+                ("provider_b", RoutingMode::AllEligible),
             ],
             false,
         ))
@@ -6996,7 +7015,7 @@ mod tests {
             .expect_err("should reject another provider's parse state");
 
         assert!(
-            error.to_string().contains("owned by provider provider-a"),
+            error.to_string().contains("owned by provider provider_a"),
             "should identify cross-provider state ownership"
         );
     }
@@ -7005,12 +7024,12 @@ mod tests {
     async fn planned_prebid_rejects_cross_provider_parse_state() {
         let plan = AuctionPlan::compile(planned_prebid_config(&[
             (
-                "pbs-a",
+                "pbs_a",
                 serde_json::json!({}),
                 NotificationConfig::default(),
             ),
             (
-                "pbs-b",
+                "pbs_b",
                 serde_json::json!({}),
                 NotificationConfig::default(),
             ),
@@ -7038,7 +7057,7 @@ mod tests {
             .expect_err("should reject another PBS provider's parse state");
 
         assert!(
-            error.to_string().contains("owned by provider pbs-a"),
+            error.to_string().contains("owned by provider pbs_a"),
             "should identify cross-provider PBS state ownership"
         );
     }
@@ -7106,18 +7125,27 @@ mod tests {
                 Arc::clone(&http) as Arc<_>,
             );
             let mut config = planned_config(&[("provider", RoutingMode::AllEligible)], false);
-            config.mediator = Some("adserver_mock".to_string());
+            config.adserver = crate::provider_table::ProviderChoice::new(
+                Some("adserver_mock".to_string()),
+                BTreeMap::from([(
+                    "adserver_mock".to_string(),
+                    serde_json::Map::from_iter([(
+                        "endpoint".to_string(),
+                        serde_json::json!("https://adserver.example/mediate"),
+                    )]),
+                )]),
+            );
             let plan = AuctionPlan::compile(config).expect("should compile planned auction");
-            let mediator_predicted = Arc::new(Mutex::new(Vec::new()));
-            let mediator_requested = Arc::new(Mutex::new(Vec::new()));
-            let mediator = Arc::new(recording_provider(
+            let adserver_predicted = Arc::new(Mutex::new(Vec::new()));
+            let adserver_requested = Arc::new(Mutex::new(Vec::new()));
+            let adserver = Arc::new(recording_provider(
                 "adserver_mock",
-                "mediator-backend",
+                "adserver-backend",
                 777,
-                &mediator_predicted,
-                &mediator_requested,
+                &adserver_predicted,
+                &adserver_requested,
             ));
-            let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator));
+            let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(adserver));
             let request = planned_request();
             let settings = create_test_settings();
             let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -7155,15 +7183,15 @@ mod tests {
             assert_eq!(backend.ensured.load(Ordering::Relaxed), 0);
             assert!(http.recorded_backend_names().is_empty());
             assert!(
-                mediator_predicted
+                adserver_predicted
                     .lock()
-                    .expect("should lock mediator predictions")
+                    .expect("should lock adserver predictions")
                     .is_empty()
             );
             assert!(
-                mediator_requested
+                adserver_requested
                     .lock()
-                    .expect("should lock mediator requests")
+                    .expect("should lock adserver requests")
                     .is_empty()
             );
         }
@@ -7172,12 +7200,14 @@ mod tests {
     #[tokio::test]
     async fn planned_launch_transport_parse_failures_are_isolated_from_valid_winner_and_floor() {
         let http = Arc::new(StubHttpClient::new());
-        // BTreeMap plan order is alphabetical: below-floor, parse-fail,
-        // transport-fail, valid-winner. Queue responses in that exact order.
+        // The plan runs its sources in the order the deployment selected them,
+        // so queue the responses in that same order: below_floor, parse_fail,
+        // transport_fail, valid_winner, with launch_fail never reaching
+        // transport.
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "below-floor", "bid": [{
+                "seatbid": [{"seat": "below_floor", "bid": [{
                     "id": "below", "impid": "fictional-slot", "price": 0.5,
                     "adm": "<div>below</div>", "w": 300, "h": 250
                 }, {
@@ -7203,18 +7233,18 @@ mod tests {
         http.push_select_success();
         http.push_select_error();
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
-        backend.fail_ensure_for("launch-fail");
+        backend.fail_ensure_for("launch_fail");
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
         );
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("launch-fail", RoutingMode::AllEligible),
-                ("transport-fail", RoutingMode::AllEligible),
-                ("parse-fail", RoutingMode::AllEligible),
-                ("below-floor", RoutingMode::AllEligible),
-                ("valid-winner", RoutingMode::AllEligible),
+                ("below_floor", RoutingMode::AllEligible),
+                ("launch_fail", RoutingMode::AllEligible),
+                ("parse_fail", RoutingMode::AllEligible),
+                ("transport_fail", RoutingMode::AllEligible),
+                ("valid_winner", RoutingMode::AllEligible),
             ],
             false,
         ))
@@ -7247,7 +7277,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(
             by_provider
-                .get("launch-fail")
+                .get("launch_fail")
                 .unwrap_or_else(|| panic!(
                     "should include launch-fail response; got {:?}",
                     by_provider.keys().collect::<Vec<_>>()
@@ -7255,7 +7285,7 @@ mod tests {
                 .metadata["error_type"],
             "launch_failed"
         );
-        let below_floor = by_provider.get("below-floor").unwrap_or_else(|| {
+        let below_floor = by_provider.get("below_floor").unwrap_or_else(|| {
             panic!(
                 "should include below-floor response; got {:?}",
                 by_provider.keys().collect::<Vec<_>>()
@@ -7266,10 +7296,10 @@ mod tests {
         assert_eq!(below_floor.bids[0].price, Some(0.5));
         assert_eq!(below_floor.bids[1].bid_id.as_deref(), Some("below-only"));
         assert_eq!(
-            by_provider["transport-fail"].metadata["error_type"],
+            by_provider["transport_fail"].metadata["error_type"],
             "transport"
         );
-        let parse_failure = by_provider.get("parse-fail").unwrap_or_else(|| {
+        let parse_failure = by_provider.get("parse_fail").unwrap_or_else(|| {
             panic!(
                 "should include parse-fail response; got {:?}",
                 by_provider.keys().collect::<Vec<_>>()
@@ -7287,7 +7317,7 @@ mod tests {
                 "every materialized planned provider response should have routing count"
             );
         }
-        assert_eq!(by_provider["valid-winner"].status, BidStatus::Success);
+        assert_eq!(by_provider["valid_winner"].status, BidStatus::Success);
         assert_eq!(
             result.winning_bids["fictional-slot"].bid_id.as_deref(),
             Some("winner")
@@ -7300,7 +7330,7 @@ mod tests {
 
     #[tokio::test]
     async fn planned_routing_count_survives_standard_and_aps_bounded_body_failures() {
-        for (profile, provider_id) in [("standard", "standard"), ("aps", "aps-instance")] {
+        for (profile, provider_id) in [("standard", "standard"), ("aps", "aps_instance")] {
             let http = Arc::new(StubHttpClient::new());
             http.push_response(200, vec![b'x'; 1024 * 1024 + 1]);
             let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
@@ -7452,8 +7482,8 @@ mod tests {
             .build();
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("provider-a", RoutingMode::AllEligible),
-                ("provider-b", RoutingMode::AllEligible),
+                ("provider_a", RoutingMode::AllEligible),
+                ("provider_b", RoutingMode::AllEligible),
             ],
             true,
         ))
@@ -7660,11 +7690,11 @@ mod tests {
             ))
             .expect("should compile signed plan"),
         );
-        let mediator_launches = Arc::new(AtomicUsize::new(0));
+        let adserver_launches = Arc::new(AtomicUsize::new(0));
         let orchestrator = AuctionOrchestrator::from_plan(
             plan,
-            Some(Arc::new(DeadlineRecordingMediator {
-                launches: Arc::clone(&mediator_launches),
+            Some(Arc::new(DeadlineRecordingAdServer {
+                launches: Arc::clone(&adserver_launches),
                 budgets: None,
             })),
         );
@@ -7700,9 +7730,9 @@ mod tests {
         assert_eq!(backend.ensured.load(Ordering::Relaxed), 0);
         assert!(http.recorded_backend_names().is_empty());
         assert_eq!(
-            mediator_launches.load(Ordering::Relaxed),
+            adserver_launches.load(Ordering::Relaxed),
             0,
-            "zero budget must not invoke even an immediate mediator"
+            "zero budget must not invoke even an immediate adserver"
         );
     }
 
@@ -7717,8 +7747,8 @@ mod tests {
         );
         let plan = AuctionPlan::compile(planned_config(
             &[
-                ("provider-a", RoutingMode::AllEligible),
-                ("provider-b", RoutingMode::AllEligible),
+                ("provider_a", RoutingMode::AllEligible),
+                ("provider_b", RoutingMode::AllEligible),
             ],
             false,
         ))

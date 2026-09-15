@@ -30,7 +30,7 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
     }
 
     fn should_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> bool {
-        if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
+        if self.config.rewrite_attributes.is_empty() {
             return false;
         }
 

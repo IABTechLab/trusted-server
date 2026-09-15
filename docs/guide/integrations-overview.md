@@ -34,8 +34,10 @@ Server demand.
 **Configuration:**
 
 ```toml
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -81,8 +83,10 @@ provider = "pbs-main"
 **Configuration:**
 
 ```toml
-[integrations.nextjs]
-enabled = false
+[integration]
+provider = ["nextjs"]
+
+[integration.nextjs]
 rewrite_attributes = ["href", "link", "url"]
 ```
 
@@ -109,8 +113,10 @@ rewrite_attributes = ["href", "link", "url"]
 **Configuration:**
 
 ```toml
-[integrations.permutive]
-enabled = true
+[integration]
+provider = ["permutive"]
+
+[integration.permutive]
 organization_id = "myorg"
 workspace_id = "workspace-12345"
 project_id = "project-789"
@@ -150,8 +156,10 @@ rewrite_sdk = true
 **Configuration:**
 
 ```toml
-[integrations.sourcepoint]
-enabled = true
+[integration]
+provider = ["sourcepoint"]
+
+[integration.sourcepoint]
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
 # auth_cookie_name = "sp_auth"
@@ -183,8 +191,8 @@ cache_ttl_seconds = 3600
 **Configuration:**
 
 ```toml
-[integrations.osano]
-enabled = true
+[integration]
+provider = ["osano"]
 ```
 
 **Endpoints:** None. Osano v1 only enables the browser consent mirror module.
@@ -216,8 +224,8 @@ enabled = true
 **Configuration:**
 
 ```toml
-[integrations.gpt_diagnostics]
-enabled = true
+[integration]
+provider = ["gpt_diagnostics"]
 ```
 
 **Endpoints:** None. The feature observes GPT in the browser and makes no diagnostic network request.
@@ -243,8 +251,10 @@ enabled = true
 **Configuration:**
 
 ```toml
-[integrations.testlight]
-enabled = true
+[integration]
+provider = ["testlight"]
+
+[integration.testlight]
 endpoint = "https://testlight-server.example.com"
 timeout_ms = 1000
 shim_src = "/static/tsjs-unified.js"
@@ -274,11 +284,12 @@ All integrations use a consistent architecture:
 
 ### Configuration Pattern
 
-All integrations support:
+All integrations share one pattern:
 
-- TOML configuration in `trusted-server.toml`
-- Environment variable overrides
-- Enable/disable flags
+- `[integration] provider` names the ones that run
+- `[integration.<id>]` holds one integration's settings, where it takes any
+- Environment variable overrides for those settings, which cannot name an
+  integration because the list is an array
 - Validation at startup
 
 ### Rewriting System
@@ -296,27 +307,27 @@ Use this flowchart to determine which integrations you need:
 
 ```
 Do you serve ads?
-├─ Yes → Enable Prebid integration
+├─ Yes → Name "prebid" in [integration] provider
 └─ No → Skip Prebid
 
 Do you use Next.js?
-├─ Yes → Enable Next.js integration
+├─ Yes → Name "nextjs" in [integration] provider
 └─ No → Skip Next.js
 
 Do you use Permutive for audience data?
-├─ Yes → Enable Permutive integration
+├─ Yes → Name "permutive" in [integration] provider
 └─ No → Skip Permutive
 
 Do you use Sourcepoint for consent management?
-├─ Yes → Enable Sourcepoint integration
+├─ Yes → Name "sourcepoint" in [integration] provider
 └─ No → Skip Sourcepoint
 
 Do you use Osano for consent management?
-├─ Yes → Enable Osano integration
+├─ Yes → Name "osano" in [integration] provider
 └─ No → Skip Osano
 
 Are you developing/testing integrations?
-├─ Yes → Enable Testlight integration
+├─ Yes → Name "testlight" in [integration] provider
 └─ No → Skip Testlight
 ```
 
@@ -334,14 +345,14 @@ Are you developing/testing integrations?
 ## Environment Variables
 
 EdgeZero overlays existing scalar leaves only. Use the
-`TRUSTED_SERVER__INTEGRATIONS__{INTEGRATION}__{SETTING}` pattern for integration
+`TRUSTED_SERVER__INTEGRATION__{INTEGRATION}__{SETTING}` pattern for integration
 leaves. Provider map keys preserve hyphens, so `pbs-main` uses `PBS-MAIN`, not
 `PBS_MAIN`. Shell assignment syntax cannot contain that hyphenated name; use
 `env` when running the CLI:
 
 ```bash
-env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000' \
-  'TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true' \
+env 'TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=2000' \
+  'TRUSTED_SERVER__INTEGRATION__PREBID__DEBUG=true' \
   'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
   ts config validate
 ```
@@ -360,6 +371,8 @@ You can create your own integrations by implementing the integration traits:
 
 See the [Integration Guide](./integration-guide.md) for details on building custom integrations.
 
+An integration does not have to live in `trusted-server-core`. It can ship in its own crate that a deployment composes in at startup, which keeps the vendor's code and release cycle its own. See [Modules That Live Outside Core](./integration-guide.md#modules-that-live-outside-core).
+
 ## Common Questions
 
 ### Can I enable multiple integrations?
@@ -376,7 +389,7 @@ No. Integration configuration is read at startup. You must redeploy to change in
 
 ### Are integrations required?
 
-No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for EC ID generation and first-party proxying.
+No. All integrations are optional. With an empty `[integration] provider` list none of them run, and Trusted Server serves EC ID generation and first-party proxying alone.
 
 ### How do I add a new integration?
 

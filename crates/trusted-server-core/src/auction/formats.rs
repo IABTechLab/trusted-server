@@ -479,11 +479,12 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         delivery.delivered_winner_slots.insert(slot_id.clone());
     }
 
-    // Determine strategy name for response metadata
-    let strategy_name = if settings.auction.has_mediator() {
-        "parallel_mediation"
-    } else {
+    // The strategy names what the deployment selected, so it reads the same
+    // whether or not the ad server answered this auction.
+    let strategy_name = if settings.adserver.is_empty() {
         "parallel_only"
+    } else {
+        "parallel_adserver"
     };
 
     // Build per-provider summaries from the orchestration result
@@ -552,20 +553,17 @@ pub(crate) fn convert_to_openrtb_response_with_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::plan::{
-        AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
-    };
+    use crate::auction::plan::AuctionPlan;
     use crate::auction::routing::route_auction;
-    use crate::auction::types::{
-        ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
-    };
+    use crate::auction::test_support::{demand_table, plan_config};
+    use crate::auction::types::{AuctionResponse, Bid, BidRenderer, BidStatus};
+    use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
     use http::Method;
     use serde_json::json;
-    use std::collections::{BTreeMap, HashSet};
-    use std::str::FromStr as _;
+    use std::collections::HashSet;
 
     fn make_request() -> Request<EdgeBody> {
         Request::builder()
@@ -581,25 +579,12 @@ mod tests {
     }
 
     fn single_prebid_plan() -> AuctionPlan {
-        AuctionPlan::compile(AuctionPlanConfig {
-            timeout_ms: 900,
-            providers: BTreeMap::from([(
-                ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
-                ProviderConfig {
-                    protocol: "openrtb-2.6".to_string(),
-                    profile: "prebid-server".to_string(),
-                    endpoint: "https://pbs.example.test/openrtb".to_string(),
-                    timeout_ms: None,
-                    routing: RoutingMode::Explicit,
-                    notifications: NotificationConfig::default(),
-                    profile_config: json!({}),
-                },
-            )]),
-            bidders: BTreeMap::new(),
-            mediator: None,
-            request_signing: None,
-        })
-        .expect("should compile plan")
+        let mut config = plan_config(vec![(
+            "pbs_primary",
+            demand_table("prebid_server", "https://pbs.example.test/openrtb"),
+        )]);
+        config.timeout_ms = 900;
+        AuctionPlan::compile(config).expect("should compile plan")
     }
 
     fn make_auction_request() -> AuctionRequest {
@@ -634,7 +619,7 @@ mod tests {
     fn make_empty_result() -> OrchestrationResult {
         OrchestrationResult {
             provider_responses: Vec::new(),
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 10,
             metadata: HashMap::new(),
@@ -683,7 +668,7 @@ mod tests {
                 response_time_ms: 42,
                 metadata: HashMap::new(),
             }],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
             total_time_ms: 50,
             metadata: HashMap::new(),
@@ -763,7 +748,7 @@ mod tests {
 
         assert_eq!(routed.inputs().len(), 1);
         assert!(
-            routed.inputs()[0].slots()[0].has_trusted_stored_request(),
+            routed.inputs()[0].slots()[0].is_stored_request(),
             "canonical empty bidder map should preserve stored-request intent"
         );
     }
@@ -1483,7 +1468,7 @@ mod tests {
                 response_time_ms: 42,
                 metadata: HashMap::from([("debug".to_string(), debug.clone())]),
             }],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
             total_time_ms: 50,
             metadata: HashMap::new(),
@@ -1520,20 +1505,26 @@ mod tests {
         renderer.creative = Some("<script>reject()</script>".to_string());
         renderer.bid_id = Some("upstream-renderer-bid".to_string());
         renderer.creative_id = None;
-        renderer.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
-            version: 1,
-            account_id: "example-account".to_string(),
-            bid_id: "upstream-renderer-bid".to_string(),
-            creative_id: None,
-            tag_type: ApsTagType::Iframe,
-            creative_url: "https://creative.example/render".to_string(),
-            aax_response: "fictional-base64".to_string(),
-            width: 300,
-            height: 250,
-        }));
+        renderer.renderer = Some(
+            BidRenderer::from_typed(
+                APS_RENDERER_TYPE,
+                &ApsRendererV1 {
+                    version: 1,
+                    account_id: "example-account".to_string(),
+                    bid_id: "upstream-renderer-bid".to_string(),
+                    creative_id: None,
+                    tag_type: ApsTagType::Iframe,
+                    creative_url: "https://creative.example/render".to_string(),
+                    aax_response: "fictional-base64".to_string(),
+                    width: 300,
+                    height: 250,
+                },
+            )
+            .expect("the APS renderer payload should be a JSON object"),
+        );
         let result = OrchestrationResult {
             provider_responses: vec![],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([
                 (missing.slot_id.clone(), missing),
                 (whitespace.slot_id.clone(), whitespace),
@@ -1618,17 +1609,23 @@ mod tests {
         let settings = make_settings();
         let auction_request = make_auction_request();
         let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
-        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
-            version: 1,
-            account_id: "example-account".to_string(),
-            bid_id: "fictional-bid".to_string(),
-            creative_id: None,
-            tag_type: ApsTagType::Iframe,
-            creative_url: "https://creative.example/render".to_string(),
-            aax_response: "fictional-base64".to_string(),
-            width: 300,
-            height: 250,
-        }));
+        bid.renderer = Some(
+            BidRenderer::from_typed(
+                APS_RENDERER_TYPE,
+                &ApsRendererV1 {
+                    version: 1,
+                    account_id: "example-account".to_string(),
+                    bid_id: "fictional-bid".to_string(),
+                    creative_id: None,
+                    tag_type: ApsTagType::Iframe,
+                    creative_url: "https://creative.example/render".to_string(),
+                    aax_response: "fictional-base64".to_string(),
+                    width: 300,
+                    height: 250,
+                },
+            )
+            .expect("the APS renderer payload should be a JSON object"),
+        );
         let result = make_result(bid);
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
@@ -1658,17 +1655,23 @@ mod tests {
         bid.bid_id = Some("fictional-bid".to_string());
         bid.ad_id = Some("fictional-ad".to_string());
         bid.creative_id = Some("fictional-creative".to_string());
-        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
-            version: 1,
-            account_id: "example-account".to_string(),
-            bid_id: "fictional-bid".to_string(),
-            creative_id: Some("fictional-creative".to_string()),
-            tag_type: ApsTagType::Iframe,
-            creative_url: "https://creative.example/render".to_string(),
-            aax_response: "fictional-base64".to_string(),
-            width: 300,
-            height: 250,
-        }));
+        bid.renderer = Some(
+            BidRenderer::from_typed(
+                APS_RENDERER_TYPE,
+                &ApsRendererV1 {
+                    version: 1,
+                    account_id: "example-account".to_string(),
+                    bid_id: "fictional-bid".to_string(),
+                    creative_id: Some("fictional-creative".to_string()),
+                    tag_type: ApsTagType::Iframe,
+                    creative_url: "https://creative.example/render".to_string(),
+                    aax_response: "fictional-base64".to_string(),
+                    width: 300,
+                    height: 250,
+                },
+            )
+            .expect("the APS renderer payload should be a JSON object"),
+        );
         let result = make_result(bid);
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
@@ -1724,7 +1727,7 @@ mod tests {
         let auction_request = make_auction_request();
         let result = OrchestrationResult {
             provider_responses: vec![],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 50,
             metadata: HashMap::new(),
@@ -1761,7 +1764,7 @@ mod tests {
                 response_time_ms: 42,
                 metadata: HashMap::new(),
             }],
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::from([
                 (top_bid.slot_id.clone(), top_bid),
                 (sidebar_bid.slot_id.clone(), sidebar_bid),
@@ -1848,9 +1851,12 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_uses_parallel_mediation_when_mediator_configured() {
+    fn convert_to_openrtb_response_uses_parallel_adserver_when_adserver_configured() {
         let mut settings = make_settings();
-        settings.auction.mediator = Some("adserver_mock".to_string());
+        settings.adserver = crate::provider_table::ProviderChoice::new(
+            Some("adserver_mock".to_string()),
+            std::collections::BTreeMap::new(),
+        );
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
 
@@ -1860,8 +1866,8 @@ mod tests {
 
         assert_eq!(
             json["ext"]["orchestrator"]["strategy"],
-            json!("parallel_mediation"),
-            "should use mediation strategy when mediator is configured"
+            json!("parallel_adserver"),
+            "should use ad server decision strategy when adserver is configured"
         );
     }
 

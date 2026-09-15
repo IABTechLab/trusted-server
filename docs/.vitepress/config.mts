@@ -79,6 +79,8 @@ export default withMermaid(
           items: [
             { text: 'Edge Cookies', link: '/guide/edge-cookies' },
             { text: 'EC Setup Guide', link: '/guide/ec-setup-guide' },
+            { text: 'Permission Model', link: '/guide/permission-model' },
+            { text: 'Permission Signals', link: '/guide/permission-signals' },
             { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
             { text: 'Ad Serving', link: '/guide/ad-serving' },
             {
@@ -106,6 +108,10 @@ export default withMermaid(
           items: [
             { text: 'Architecture', link: '/guide/architecture' },
             { text: 'Configuration', link: '/guide/configuration' },
+            {
+              text: 'Configuration Rules',
+              link: '/guide/configuration-rules',
+            },
             { text: 'CLI', link: '/guide/cli' },
             { text: 'Testing', link: '/guide/testing' },
             { text: 'Integration Guide', link: '/guide/integration-guide' },

@@ -1,37 +1,57 @@
-//! Target-independent config-first auction plan compiler.
+//! Target-independent auction plan compiler.
+//!
+//! The plan is compiled once at startup from `[demand]`, `[adserver]` and
+//! `[auction.bidders]`. Every selected name resolves to an implementation an
+//! integration registered, so the compiler names no vendor, and request
+//! handling reads only the compiled plan.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use url::Url;
+use serde_json::{Map, Value};
+use url::{Host, Url};
 
-use super::profile::{CompiledOpenRtbProfile, ProfileTimeoutDefault, find_profile};
+use super::demand::{
+    AdServerImplementation, CompiledDemand, DemandImplementation, DemandTimeoutDefault,
+};
 use crate::error::TrustedServerError;
 use crate::platform::{AuctionTargetId, PlatformBackendSpec};
+use crate::provider_table::{ProviderChoice, ProviderList};
 use crate::settings::RequestSigning;
 
 const MAX_ID_BYTES: usize = 128;
 const MAX_SUPPRESS_SEATS: usize = 128;
 const MAX_SUPPRESS_SEAT_BYTES: usize = 128;
-const MOCK_MEDIATOR_ID: &str = "adserver_mock";
 const RESERVED_BROWSER_ENVELOPE_BIDDER_ID: &str = "trustedServer";
 
-/// Validated operator-defined provider identifier.
+/// The keys of a `[demand.<name>]` table that the common driver reads itself,
+/// so an implementation receives the rest.
+const ENDPOINT_KEY: &str = "endpoint";
+const TIMEOUT_KEY: &str = "timeout_ms";
+const ROUTING_KEY: &str = "routing";
+const NOTIFICATIONS_KEY: &str = "notifications";
+
+/// A validated provider name, as written in `[demand] provider` or
+/// `[adserver] provider`.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, derive_more::Display)]
 pub struct ProviderId(String);
 
 impl ProviderId {
-    /// Borrow the validated identifier.
+    /// Borrow the validated name.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "kept for a legacy test path the provider types will retire"
+    )]
     pub(crate) fn unchecked_for_legacy_test(value: &str) -> Self {
         Self(value.to_string())
     }
@@ -47,10 +67,10 @@ impl FromStr for ProviderId {
             && value
                 .as_bytes()
                 .iter()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_');
         if !valid {
             return Err(configuration_error(format!(
-                "provider ID `{value}` must match ^[a-z][a-z0-9-]{{0,62}}$"
+                "provider name `{value}` must be snake_case, matching ^[a-z][a-z0-9_]{{0,62}}$"
             )));
         }
         Ok(Self(value.to_string()))
@@ -124,80 +144,55 @@ impl Serialize for BidderId {
     }
 }
 
-/// Raw config-first provider declaration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderConfig {
-    /// Protocol identifier. Version one accepts only `openrtb-2.6`.
-    pub protocol: String,
-    /// Registered profile identifier.
-    #[serde(default = "default_profile")]
-    pub profile: String,
-    /// Fixed provider endpoint.
-    pub endpoint: String,
-    /// Optional profile-default timeout override.
-    #[serde(default)]
-    pub timeout_ms: Option<u32>,
-    /// Slot routing mode.
-    #[serde(default)]
-    pub routing: RoutingMode,
-    /// Common `OpenRTB` notification policy.
-    #[serde(default)]
-    pub notifications: NotificationConfig,
-    /// Selected profile's typed configuration object.
-    #[serde(default = "empty_object")]
-    pub profile_config: Value,
-}
-
-/// Raw central bidder route.
+/// A bidder code's route to one selected demand source.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BidderRouteConfig {
-    /// Referenced provider identifier.
+    /// The `[demand]` provider the bidder is sent to.
     pub provider: ProviderId,
 }
 
-/// Provider slot routing behavior.
+/// Which slots a demand source receives.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
-    /// Route only centrally assigned or trusted demand.
+    /// Only slots carrying a bidder routed to the source, or demand the server
+    /// routed to it.
     #[default]
     Explicit,
-    /// Route every banner-compatible slot.
+    /// Every banner-compatible slot.
     AllEligible,
 }
 
-/// Common normalized-notification suppression configuration.
+/// Notification URL suppression for one demand source.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationConfig {
-    /// Suppress notification URLs for every normalized bid.
+    /// Suppress notification URLs for every bid.
     #[serde(default)]
     pub suppress_all: bool,
-    /// Suppress notification URLs for exact returned-seat matches.
+    /// Suppress notification URLs for bids from these returned seats.
     #[serde(default)]
     pub suppress_seats: Vec<String>,
 }
 
-/// Raw internal input for target-independent plan compilation.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// Input for target-independent plan compilation.
+#[derive(Debug, Clone, Default)]
 pub struct AuctionPlanConfig {
     /// Auction-wide logical timeout.
     pub timeout_ms: u32,
-    /// Operator-defined provider instances.
-    #[serde(default)]
-    pub providers: BTreeMap<ProviderId, ProviderConfig>,
-    /// Client bidder-to-provider routes.
-    #[serde(default)]
+    /// The `[demand]` table.
+    pub demand: ProviderList,
+    /// The `[adserver]` table.
+    pub adserver: ProviderChoice,
+    /// Client bidder routes from `[auction.bidders]`.
     pub bidders: BTreeMap<BidderId, BidderRouteConfig>,
-    /// Existing separately registered mock mediator.
-    #[serde(default)]
-    pub mediator: Option<String>,
-    /// Existing global Trusted Server signing configuration.
-    #[serde(default)]
+    /// Trusted Server's request signing configuration.
     pub request_signing: Option<RequestSigning>,
+    /// The demand implementations the integration builders registered.
+    pub demand_implementations: Vec<&'static DemandImplementation>,
+    /// The ad server implementations the integration builders registered.
+    pub adserver_implementations: Vec<&'static AdServerImplementation>,
 }
 
 /// Canonical absolute provider endpoint.
@@ -216,13 +211,6 @@ impl CanonicalProviderEndpoint {
     }
 }
 
-/// Closed first-version protocol plan.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ProtocolPlan {
-    /// `OpenRTB` version 2.6 subset.
-    OpenRtb26,
-}
-
 /// Immutable common notification policy.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct NotificationPolicy {
@@ -232,23 +220,58 @@ pub struct NotificationPolicy {
     pub suppress_seats: BTreeSet<String>,
 }
 
-/// Immutable compiled provider instance.
-#[derive(Debug, Clone)]
+/// One compiled demand source.
+#[derive(Clone)]
 pub struct ProviderPlan {
-    /// Provider identity.
+    /// The configured name.
     pub id: ProviderId,
+    /// The implementation the name resolved to.
+    pub implementation: &'static DemandImplementation,
     /// Canonical endpoint.
     pub endpoint: CanonicalProviderEndpoint,
-    /// Resolved profile-default or explicit timeout.
+    /// The table's timeout, or the implementation's default.
     pub timeout_ms: u32,
     /// Slot routing mode.
     pub routing: RoutingMode,
     /// Common notification policy.
     pub notifications: NotificationPolicy,
-    /// Compiled protocol behavior.
-    pub protocol: ProtocolPlan,
-    /// Compiled typed profile behavior.
-    pub profile: CompiledOpenRtbProfile,
+    /// The compiled request and response behavior.
+    pub demand: Arc<dyn CompiledDemand>,
+}
+
+impl core::fmt::Debug for ProviderPlan {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ProviderPlan")
+            .field("id", &self.id)
+            .field("implementation", &self.implementation.id)
+            .field("endpoint", &self.endpoint)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("routing", &self.routing)
+            .field("notifications", &self.notifications)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The compiled ad server selection.
+#[derive(Clone)]
+pub struct AdServerPlan {
+    /// The configured name.
+    pub id: ProviderId,
+    /// The implementation the name resolved to.
+    pub implementation: &'static AdServerImplementation,
+    /// The table's own settings, without `implementation`.
+    pub settings: Map<String, Value>,
+}
+
+impl core::fmt::Debug for AdServerPlan {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AdServerPlan")
+            .field("id", &self.id)
+            .field("implementation", &self.implementation.id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Immutable target-independent auction plan.
@@ -259,7 +282,7 @@ pub struct AuctionPlan {
     providers: Vec<ProviderPlan>,
     bidder_routes: BTreeMap<BidderId, usize>,
     signing_enabled: bool,
-    mediator: Option<String>,
+    adserver: Option<AdServerPlan>,
 }
 
 impl AuctionPlan {
@@ -278,68 +301,98 @@ impl AuctionPlan {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error for invalid identifiers, protocol/profile
-    /// declarations, endpoints, profile configuration, routes, notifications,
-    /// signing structure, or mediator selection.
+    /// Returns a configuration error for a table no selector names, a name
+    /// that is not `snake_case`, an implementation no builder registered, an
+    /// invalid endpoint, timeout, route or notification setting, settings an
+    /// implementation rejects, or invalid signing structure.
     pub fn compile(config: AuctionPlanConfig) -> Result<Self, Report<TrustedServerError>> {
         if config.timeout_ms == 0 {
             return Err(configuration_error(
                 "auction timeout_ms must be greater than zero",
             ));
         }
-        validate_mediator(config.mediator.as_deref())?;
+        config
+            .demand
+            .validate("demand")
+            .map_err(configuration_error)?;
+        config
+            .adserver
+            .validate("adserver")
+            .map_err(configuration_error)?;
         let signing_enabled = compile_signing_enabled(config.request_signing.as_ref())?;
-        let mut providers = Vec::with_capacity(config.providers.len());
+
+        let mut providers = Vec::new();
         let mut provider_indices = BTreeMap::new();
-        for (id, raw) in config.providers {
-            if raw.protocol != "openrtb-2.6" {
+        for name in config.demand.selected() {
+            let id = ProviderId::from_str(name)?;
+            let implementation_id = config.demand.implementation_of(name);
+            let implementation = config
+                .demand_implementations
+                .iter()
+                .copied()
+                .find(|implementation| implementation.id == implementation_id)
+                .ok_or_else(|| {
+                    unknown_implementation("demand", name, implementation_id, {
+                        config
+                            .demand_implementations
+                            .iter()
+                            .map(|implementation| implementation.id)
+                    })
+                })?;
+            let mut settings = config.demand.settings_of(name);
+            let endpoint = take_setting::<String>(&mut settings, "demand", name, ENDPOINT_KEY)?
+                .ok_or_else(|| configuration_error(format!("[demand.{name}] needs an endpoint")))?;
+            let timeout_ms = take_setting::<u32>(&mut settings, "demand", name, TIMEOUT_KEY)?;
+            let routing = take_setting::<RoutingMode>(&mut settings, "demand", name, ROUTING_KEY)?
+                .unwrap_or_default();
+            let notifications = take_setting::<NotificationConfig>(
+                &mut settings,
+                "demand",
+                name,
+                NOTIFICATIONS_KEY,
+            )?
+            .unwrap_or_default();
+
+            if routing == RoutingMode::AllEligible && !implementation.allows_all_eligible {
                 return Err(configuration_error(format!(
-                    "provider `{id}` uses unsupported protocol `{}`",
-                    raw.protocol
+                    "[demand.{name}] cannot use routing `all_eligible` with implementation `{}`; configure explicit bidder routes",
+                    implementation.id
                 )));
             }
-            let registration = find_profile(&raw.profile).ok_or_else(|| {
-                configuration_error(format!(
-                    "provider `{id}` uses unknown OpenRTB profile `{}`",
-                    raw.profile
-                ))
+            let mut endpoint_url = check_endpoint("demand", name, &endpoint)?;
+            (implementation.canonicalize_endpoint)(&mut endpoint_url).map_err(|reason| {
+                configuration_error(format!("[demand.{name}] endpoint {reason}"))
             })?;
-            if registration.id == "prebid-server" && raw.routing == RoutingMode::AllEligible {
-                return Err(configuration_error(format!(
-                    "provider `{id}` cannot use routing `all_eligible` with profile `prebid-server`; configure explicit bidder routes"
-                )));
-            }
-            if !raw.profile_config.is_object() {
-                return Err(configuration_error(format!(
-                    "provider `{id}` profile_config must be an object"
-                )));
-            }
-            let endpoint = canonicalize_endpoint(&id, registration.id, &raw.endpoint)?;
-            let timeout_ms = raw
-                .timeout_ms
-                .unwrap_or(match registration.default_timeout {
-                    ProfileTimeoutDefault::Auction => config.timeout_ms,
-                    ProfileTimeoutDefault::Fixed(value) => value,
-                });
+            let timeout_ms = timeout_ms.unwrap_or(match implementation.default_timeout {
+                DemandTimeoutDefault::Auction => config.timeout_ms,
+                DemandTimeoutDefault::Fixed(value) => value,
+            });
             if timeout_ms == 0 {
                 return Err(configuration_error(format!(
-                    "provider `{id}` timeout_ms must be greater than zero"
+                    "[demand.{name}] timeout_ms must be greater than zero"
                 )));
             }
-            let notifications = compile_notifications(&id, raw.notifications)?;
-            let profile = registration.compile(&raw.profile_config)?;
-            let index = providers.len();
-            provider_indices.insert(id.clone(), index);
+            let notifications = compile_notifications(&id, notifications)?;
+            let demand = (implementation.compile)(&settings).change_context(
+                TrustedServerError::Configuration {
+                    message: format!(
+                        "[demand.{name}] settings are not valid for implementation `{}`",
+                        implementation.id
+                    ),
+                },
+            )?;
+            provider_indices.insert(id.clone(), providers.len());
             providers.push(ProviderPlan {
                 id,
-                endpoint,
+                implementation,
+                endpoint: CanonicalProviderEndpoint(endpoint_url),
                 timeout_ms,
-                routing: raw.routing,
+                routing,
                 notifications,
-                protocol: ProtocolPlan::OpenRtb26,
-                profile,
+                demand,
             });
         }
+
         let mut bidder_routes = BTreeMap::new();
         for (bidder, route) in config.bidders {
             if bidder.as_str() == RESERVED_BROWSER_ENVELOPE_BIDDER_ID {
@@ -353,19 +406,61 @@ impl AuctionPlan {
                     .copied()
                     .ok_or_else(|| {
                         configuration_error(format!(
-                            "bidder `{bidder}` references unknown provider `{}`",
+                            "[auction.bidders.{bidder}] sends the bidder to `{}`, which [demand] provider does not select",
                             route.provider
                         ))
                     })?;
             bidder_routes.insert(bidder, provider_index);
         }
+
+        let adserver = match config.adserver.selected().first().copied() {
+            None => None,
+            Some(name) => {
+                let id = ProviderId::from_str(name)?;
+                let implementation_id = config.adserver.implementation_of(name);
+                let implementation = config
+                    .adserver_implementations
+                    .iter()
+                    .copied()
+                    .find(|implementation| implementation.id == implementation_id)
+                    .ok_or_else(|| {
+                        unknown_implementation("adserver", name, implementation_id, {
+                            config
+                                .adserver_implementations
+                                .iter()
+                                .map(|implementation| implementation.id)
+                        })
+                    })?;
+                let settings = config.adserver.settings_of(name);
+                if let Some(endpoint) = settings.get(ENDPOINT_KEY) {
+                    let endpoint = endpoint.as_str().ok_or_else(|| {
+                        configuration_error(format!("[adserver.{name}] endpoint must be a URL"))
+                    })?;
+                    check_endpoint("adserver", name, endpoint)?;
+                }
+                (implementation.build)(name, &settings).change_context(
+                    TrustedServerError::Configuration {
+                        message: format!(
+                            "[adserver.{name}] settings are not valid for implementation `{}`",
+                            implementation.id
+                        ),
+                    },
+                )?;
+                Some(AdServerPlan {
+                    id,
+                    implementation,
+                    settings,
+                })
+            }
+        };
+
         Ok(Self {
             enabled: true,
             timeout_ms: config.timeout_ms,
             providers,
             bidder_routes,
             signing_enabled,
-            mediator: config.mediator,
+            adserver,
         })
     }
 }
@@ -470,38 +565,39 @@ impl AuctionPlan {
         Ok(())
     }
 
-    /// Borrow compiled providers in deterministic provider-ID order.
+    /// Borrow compiled demand sources in the order `[demand] provider` lists
+    /// them.
     #[must_use]
     pub fn providers(&self) -> &[ProviderPlan] {
         &self.providers
     }
 
-    /// Borrow a compiled provider by its validated identity.
+    /// Borrow a compiled demand source by its name.
     #[must_use]
     pub(crate) fn provider(&self, id: &ProviderId) -> Option<&ProviderPlan> {
         self.providers.iter().find(|provider| provider.id == *id)
     }
 
-    /// Return whether any compiled provider uses the named profile.
+    /// Return whether any compiled demand source uses the named implementation.
     ///
-    /// This narrow query allows capability activation to follow the validated
-    /// plan without exposing profile configuration.
+    /// This narrow query lets an implementation's integration activate its own
+    /// capabilities from the validated plan.
     #[must_use]
-    pub fn has_profile(&self, profile_id: &str) -> bool {
+    pub fn has_implementation(&self, implementation_id: &str) -> bool {
         self.providers
             .iter()
-            .any(|provider| provider.profile.id() == profile_id)
+            .any(|provider| provider.implementation.id == implementation_id)
     }
 
     /// Borrow validated client-visible bidder route codes in deterministic order.
     ///
     /// This intentionally exposes route keys rather than provider identities or
-    /// profile configuration for the browser Prebid injection boundary.
+    /// implementation settings for the browser Prebid injection boundary.
     pub(crate) fn browser_bidder_codes(&self) -> impl Iterator<Item = &str> {
         self.bidder_routes.keys().map(BidderId::as_str)
     }
 
-    /// Resolve a bidder route to a compiled provider.
+    /// Resolve a bidder route to a compiled demand source.
     #[must_use]
     pub fn provider_for_bidder(&self, bidder: &BidderId) -> Option<&ProviderPlan> {
         self.bidder_routes
@@ -515,25 +611,83 @@ impl AuctionPlan {
         self.signing_enabled
     }
 
-    /// Borrow the separately validated static mediator identifier.
+    /// Borrow the selected ad server, when `[adserver] provider` names one.
     #[must_use]
-    pub fn mediator(&self) -> Option<&str> {
-        self.mediator.as_deref()
+    pub fn adserver(&self) -> Option<&AdServerPlan> {
+        self.adserver.as_ref()
     }
-}
-
-fn default_profile() -> String {
-    "standard".to_string()
-}
-
-fn empty_object() -> Value {
-    Value::Object(serde_json::Map::new())
 }
 
 fn configuration_error(message: impl Into<String>) -> Report<TrustedServerError> {
     Report::new(TrustedServerError::Configuration {
         message: message.into(),
     })
+}
+
+fn unknown_implementation<'a>(
+    type_name: &str,
+    name: &str,
+    implementation_id: &str,
+    known: impl Iterator<Item = &'a str>,
+) -> Report<TrustedServerError> {
+    let mut known = known.collect::<Vec<_>>();
+    known.sort_unstable();
+    configuration_error(format!(
+        "[{type_name}] `{name}` uses implementation `{implementation_id}`, which this build does not have. The implementations it has are: {}",
+        known.join(", ")
+    ))
+}
+
+/// Takes one common setting out of a table's settings, parsing it as `T`.
+fn take_setting<T>(
+    settings: &mut Map<String, Value>,
+    type_name: &str,
+    name: &str,
+    key: &str,
+) -> Result<Option<T>, Report<TrustedServerError>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    settings
+        .remove(key)
+        .map(|value| {
+            T::deserialize(value).map_err(|error| {
+                configuration_error(format!("[{type_name}.{name}] {key} is not valid: {error}"))
+            })
+        })
+        .transpose()
+}
+
+/// Checks an endpoint the common way. It must be HTTPS, or plain HTTP to a
+/// loopback address, with a host and no credentials or fragment.
+fn check_endpoint(
+    type_name: &str,
+    name: &str,
+    value: &str,
+) -> Result<Url, Report<TrustedServerError>> {
+    let endpoint = Url::parse(value).map_err(|error| {
+        configuration_error(format!(
+            "[{type_name}.{name}] endpoint must be an absolute URL: {error}"
+        ))
+    })?;
+    let loopback = match endpoint.host() {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    let scheme_allowed = endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback);
+    if !scheme_allowed
+        || endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(configuration_error(format!(
+            "[{type_name}.{name}] endpoint must be HTTPS, or HTTP to 127.0.0.1, ::1 or localhost, with a host and no credentials or fragment"
+        )));
+    }
+    Ok(endpoint)
 }
 
 fn compile_signing_enabled(
@@ -551,59 +705,6 @@ fn compile_signing_enabled(
         ));
     }
     Ok(request_signing.enabled)
-}
-
-fn validate_mediator(mediator: Option<&str>) -> Result<(), Report<TrustedServerError>> {
-    if mediator.is_some_and(|value| value != MOCK_MEDIATOR_ID) {
-        return Err(configuration_error(format!(
-            "auction mediator must be `{MOCK_MEDIATOR_ID}` when configured"
-        )));
-    }
-    Ok(())
-}
-
-fn canonicalize_endpoint(
-    provider_id: &ProviderId,
-    profile_id: &str,
-    value: &str,
-) -> Result<CanonicalProviderEndpoint, Report<TrustedServerError>> {
-    let mut endpoint = Url::parse(value).map_err(|error| {
-        configuration_error(format!(
-            "provider `{provider_id}` endpoint must be an absolute HTTPS URL: {error}"
-        ))
-    })?;
-    if endpoint.scheme() != "https"
-        || endpoint.host_str().is_none()
-        || !endpoint.username().is_empty()
-        || endpoint.password().is_some()
-        || endpoint.fragment().is_some()
-    {
-        return Err(configuration_error(format!(
-            "provider `{provider_id}` endpoint must be absolute HTTPS with a host and no credentials or fragment"
-        )));
-    }
-    if profile_id == "aps"
-        && endpoint
-            .path()
-            .trim_end_matches('/')
-            .ends_with("/e/dtb/bid")
-    {
-        return Err(configuration_error(format!(
-            "provider `{provider_id}` uses unsupported legacy APS endpoint `/e/dtb/bid`"
-        )));
-    }
-    if profile_id == "prebid-server" {
-        normalize_prebid_server_endpoint(&mut endpoint);
-    }
-    Ok(CanonicalProviderEndpoint(endpoint))
-}
-
-fn normalize_prebid_server_endpoint(endpoint: &mut Url) {
-    match endpoint.path() {
-        "" | "/" => endpoint.set_path("/openrtb2/auction"),
-        "/openrtb2/auction/" => endpoint.set_path("/openrtb2/auction"),
-        _ => {}
-    }
 }
 
 fn compile_notifications(
@@ -640,26 +741,71 @@ fn compile_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::profile::CompiledOpenRtbProfile;
+    use crate::integrations::aps::ApsDemand;
+    use crate::integrations::openrtb::OpenRtbDemand;
+    use crate::integrations::prebid_server::PrebidServerDemand;
+    use crate::provider_table::IMPLEMENTATION_KEY;
+    use serde_json::json;
 
-    fn provider(profile: &str) -> ProviderConfig {
-        ProviderConfig {
-            protocol: "openrtb-2.6".to_string(),
-            profile: profile.to_string(),
-            endpoint: "https://bid.example/openrtb2/auction".to_string(),
-            timeout_ms: None,
-            routing: RoutingMode::Explicit,
-            notifications: NotificationConfig::default(),
-            profile_config: empty_object(),
+    /// The demand implementations the built-in builders register.
+    fn demand_implementations() -> Vec<&'static DemandImplementation> {
+        crate::integrations::all_builders(&[])
+            .filter_map(|builder| builder.demand())
+            .collect()
+    }
+
+    /// The ad server implementations the built-in builders register.
+    fn adserver_implementations() -> Vec<&'static AdServerImplementation> {
+        crate::integrations::all_builders(&[])
+            .filter_map(|builder| builder.adserver())
+            .collect()
+    }
+
+    /// One `[demand.<name>]` table naming an implementation.
+    fn table(implementation: &str) -> Map<String, Value> {
+        let mut table = Map::from_iter([
+            (IMPLEMENTATION_KEY.to_string(), json!(implementation)),
+            (
+                ENDPOINT_KEY.to_string(),
+                json!("https://bid.example/openrtb2/auction"),
+            ),
+        ]);
+        if implementation == "aps" {
+            table.insert(
+                ENDPOINT_KEY.to_string(),
+                json!("https://aps.example/e/pb/bid"),
+            );
+            table.insert("account_id".to_string(), json!("example-account"));
+        }
+        table
+    }
+
+    /// A `[demand]` table selecting every name given, in order.
+    fn demand(tables: Vec<(&str, Map<String, Value>)>) -> ProviderList {
+        let selected = tables
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<Vec<_>>();
+        let tables = tables
+            .into_iter()
+            .map(|(name, table)| (name.to_string(), table))
+            .collect::<BTreeMap<_, _>>();
+        ProviderList::new(selected, tables)
+    }
+
+    fn config(tables: Vec<(&str, Map<String, Value>)>) -> AuctionPlanConfig {
+        AuctionPlanConfig {
+            timeout_ms: 1500,
+            demand: demand(tables),
+            demand_implementations: demand_implementations(),
+            adserver_implementations: adserver_implementations(),
+            ..AuctionPlanConfig::default()
         }
     }
 
-    fn config(providers: BTreeMap<ProviderId, ProviderConfig>) -> AuctionPlanConfig {
-        AuctionPlanConfig {
-            timeout_ms: 1500,
-            providers,
-            ..AuctionPlanConfig::default()
-        }
+    /// A plan with one ordinary `OpenRTB` source called `one`.
+    fn one_source() -> AuctionPlanConfig {
+        config(vec![("one", table("openrtb"))])
     }
 
     fn id(value: &str) -> ProviderId {
@@ -673,10 +819,7 @@ mod tests {
     fn nested_object(levels: usize) -> Value {
         let mut value = Value::String("leaf".to_string());
         for level in 0..levels {
-            value = Value::Object(serde_json::Map::from_iter([(
-                format!("level-{level}"),
-                value,
-            )]));
+            value = Value::Object(Map::from_iter([(format!("level_{level}"), value)]));
         }
         value
     }
@@ -691,11 +834,11 @@ mod tests {
 
     #[test]
     fn target_validation_accepts_fanout_and_rejects_unsupported_targets() {
-        let providers = BTreeMap::from([
-            (id("provider-one"), provider("standard")),
-            (id("provider-two"), provider("standard")),
-        ]);
-        let plan = AuctionPlan::compile(config(providers)).expect("should compile plan");
+        let plan = AuctionPlan::compile(config(vec![
+            ("provider_one", table("openrtb")),
+            ("provider_two", table("openrtb")),
+        ]))
+        .expect("should compile plan");
 
         assert!(
             plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
@@ -708,236 +851,128 @@ mod tests {
             "Axum should accept provider fanout"
         );
         for target in [
-            crate::platform::AuctionTargetId::Cloudflare,
             crate::platform::AuctionTargetId::Spin,
+            crate::platform::AuctionTargetId::Cloudflare,
         ] {
-            let error = plan
-                .validate_for_target(target)
-                .expect_err("should reject unsupported provider fanout");
             assert!(
-                error.to_string().contains("fanout"),
-                "should explain fanout rejection: {error:?}"
+                plan.validate_for_target(target).is_err(),
+                "{target:?} runs one demand source at a time and should refuse fanout"
             );
         }
     }
 
     #[test]
-    fn fastly_target_validation_canonicalizes_url_derived_ipv6_prediction() {
-        let mut ipv6_provider = provider("standard");
-        ipv6_provider.endpoint = "https://[2001:db8::5]:8443/openrtb".to_string();
-        ipv6_provider.timeout_ms = Some(750);
-        let plan = AuctionPlan::compile(config(BTreeMap::from([(
-            id("ipv6-provider"),
-            ipv6_provider,
-        )])))
-        .expect("should compile IPv6 provider plan");
-
-        plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("Fastly target validation should accept canonical IPv6 prediction");
-        let bracketed_spec = plan.providers()[0].backend_spec();
-        assert_eq!(bracketed_spec.host, "[2001:db8::5]");
-        let mut bare_spec = bracketed_spec.clone();
-        bare_spec.host = "2001:db8::5".to_string();
-        let policy = crate::platform::BackendNamingPolicy::Fastly;
-        assert_eq!(
-            policy
-                .predict(&bracketed_spec)
-                .expect("should predict URL-derived bracketed IPv6 backend"),
-            policy
-                .predict(&bare_spec)
-                .expect("should predict runtime-normalized bare IPv6 backend"),
-            "startup target validation and Fastly runtime must hash the same backend spec"
+    fn a_table_no_selector_names_is_refused() {
+        let mut raw = one_source();
+        raw.demand = ProviderList::new(
+            vec!["one".to_string()],
+            BTreeMap::from([
+                ("one".to_string(), table("openrtb")),
+                ("left_behind".to_string(), table("openrtb")),
+            ]),
         );
-    }
-
-    #[test]
-    fn fastly_target_validation_reserves_dynamic_backends_outside_auction() {
-        let plan_with = |count: usize| {
-            let providers = (0..count)
-                .map(|index| {
-                    let mut provider = provider("standard");
-                    provider.timeout_ms = Some(1000);
-                    (id(&format!("provider-{index}")), provider)
-                })
-                .collect();
-            AuctionPlan::compile(config(providers)).expect("should compile provider plan")
-        };
-
-        plan_with(19)
-            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("below-budget provider plan should validate");
-        plan_with(20)
-            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("at-budget provider plan should validate");
-        let error = plan_with(21)
-            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect_err("over-budget provider plan should fail");
+        let error = AuctionPlan::compile(raw).expect_err("should refuse a table nothing selects");
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("exceeding its auction budget of 160")
+            message.contains("left_behind") && message.contains("provider"),
+            "should name the table and the selector: {error:?}"
         );
     }
 
     #[test]
-    fn fastly_backend_quota_uses_auction_timeout_as_reachable_bucket_ceiling() {
-        let providers = (0..21)
-            .map(|index| {
-                let mut provider = provider("standard");
-                provider.timeout_ms = Some(1000);
-                (id(&format!("provider-{index}")), provider)
-            })
-            .collect();
-        let mut bounded = config(providers);
-        bounded.timeout_ms = 100;
-        let plan = AuctionPlan::compile(bounded).expect("should compile bounded provider plan");
-
-        assert!(
-            plan.providers()
-                .iter()
-                .all(|provider| provider.timeout_ms == 1000),
-            "quota validation must not rewrite configured provider timeouts"
-        );
-        plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("21 providers reach only the 50ms and 100ms Fastly buckets");
-    }
-
-    #[test]
-    fn disabled_target_validation_skips_fanout_and_collision_checks() {
-        let providers = BTreeMap::from([
-            (id("provider-one"), provider("standard")),
-            (id("provider-two"), provider("standard")),
-        ]);
-        let disabled = AuctionPlan::compile(config(providers))
-            .expect("should compile plan")
-            .with_enabled(false);
-
-        for target in [
-            crate::platform::AuctionTargetId::Cloudflare,
-            crate::platform::AuctionTargetId::Spin,
-        ] {
-            disabled
-                .validate_for_target(target)
-                .expect("disabled dormant providers should skip target validation");
-        }
-
-        let provider = disabled.providers[0].clone();
-        let disabled_collision = AuctionPlan {
-            enabled: false,
-            timeout_ms: disabled.timeout_ms,
-            providers: vec![provider.clone(), provider],
-            bidder_routes: BTreeMap::new(),
-            signing_enabled: false,
-            mediator: None,
-        };
-        disabled_collision
-            .validate_for_target(crate::platform::AuctionTargetId::Axum)
-            .expect("disabled dormant providers should skip collision validation");
-    }
-
-    #[test]
-    fn target_validation_keeps_same_origin_timeout_profile_instances_distinct() {
-        let shared = ProviderConfig {
-            timeout_ms: Some(777),
-            ..provider("standard")
-        };
-        let plan = AuctionPlan::compile(config(BTreeMap::from([
-            (id("provider-one"), shared.clone()),
-            (id("provider-two"), shared),
-        ])))
-        .expect("should compile same-origin provider instances");
-
-        for target in [
-            crate::platform::AuctionTargetId::Fastly,
-            crate::platform::AuctionTargetId::Axum,
-        ] {
-            plan.validate_for_target(target)
-                .expect("provider ID discriminators should prevent predicted collisions");
+    fn an_unknown_implementation_names_the_ones_this_build_has() {
+        let mut absent = table("openrtb");
+        absent.insert(IMPLEMENTATION_KEY.to_string(), json!("fictional_exchange"));
+        let error = AuctionPlan::compile(config(vec![("one", absent)]))
+            .expect_err("should refuse an implementation this build does not have");
+        let message = error.to_string();
+        for expected in ["fictional_exchange", "openrtb", "prebid_server", "aps"] {
+            assert!(
+                message.contains(expected),
+                "should name the unknown implementation and the known ones: {error:?}"
+            );
         }
     }
 
     #[test]
-    fn target_validation_rejects_predicted_name_collisions() {
-        let compiled = AuctionPlan::compile(config(BTreeMap::from([(
-            id("provider-a"),
-            provider("standard"),
-        )])))
-        .expect("should compile plan");
-        let provider = compiled.providers[0].clone();
-        // The compiler prevents duplicate provider IDs. Construct the otherwise
-        // impossible duplicate internally to pin validation's defense-in-depth
-        // collision rejection independently of compiler invariants.
-        let collision_plan = AuctionPlan {
-            enabled: true,
-            timeout_ms: compiled.timeout_ms,
-            providers: vec![provider.clone(), provider],
-            bidder_routes: BTreeMap::new(),
-            signing_enabled: false,
-            mediator: None,
-        };
+    fn a_name_that_is_its_own_implementation_needs_no_implementation_line() {
+        let mut named = Map::from_iter([(
+            ENDPOINT_KEY.to_string(),
+            json!("https://bid.example/openrtb2/auction"),
+        )]);
+        named.insert("request_ext".to_string(), json!({"fictional": "example"}));
+        let plan = AuctionPlan::compile(config(vec![("openrtb", named)]))
+            .expect("should take the name as the implementation");
+        assert_eq!(plan.providers()[0].implementation.id, "openrtb");
+    }
 
-        let error = collision_plan
-            .validate_for_target(crate::platform::AuctionTargetId::Axum)
-            .expect_err("should reject predicted backend collision");
-        assert!(error.to_string().contains("same backend name"));
+    #[test]
+    fn a_demand_table_needs_an_endpoint() {
+        let mut without = table("openrtb");
+        without.remove(ENDPOINT_KEY);
+        let error = AuctionPlan::compile(config(vec![("one", without)]))
+            .expect_err("should refuse a source with no endpoint");
+        assert!(
+            error.to_string().contains("endpoint"),
+            "should say an endpoint is needed: {error:?}"
+        );
     }
 
     #[test]
     fn provider_id_enforces_exact_grammar_and_bounds() {
-        for valid in ["a", "pbs-primary", &format!("a{}", "0".repeat(62))] {
-            assert!(ProviderId::from_str(valid).is_ok(), "should accept {valid}");
+        for value in ["a", "provider_one", "p0", &format!("a{}", "b".repeat(62))] {
+            assert!(
+                ProviderId::from_str(value).is_ok(),
+                "should accept `{value}`"
+            );
         }
-        for invalid in [
+        for value in [
             "",
-            "A",
+            "Provider",
+            "provider-one",
             "1provider",
-            "provider_name",
-            "provider.name",
-            "provider/one",
-            &format!("a{}", "0".repeat(63)),
+            "_provider",
+            "provider.one",
+            &format!("a{}", "b".repeat(63)),
         ] {
             assert!(
-                ProviderId::from_str(invalid).is_err(),
-                "should reject {invalid}"
+                ProviderId::from_str(value).is_err(),
+                "should reject `{value}`"
             );
         }
     }
 
     #[test]
     fn bidder_id_enforces_admission_bounds() {
-        assert!(BidderId::from_str("exampleBidder").is_ok());
-        for invalid in ["", " bidder", "bidder\n", &"a".repeat(129)] {
-            let error = BidderId::from_str(invalid).expect_err("should reject invalid bidder ID");
-            assert!(
-                error.to_string().contains(&format!("{invalid:?}")),
-                "should identify invalid bidder ID {invalid:?}: {error:?}"
-            );
-        }
+        assert!(BidderId::from_str("example").is_ok());
+        assert!(BidderId::from_str("Example").is_ok());
+        assert!(BidderId::from_str("").is_err());
+        assert!(BidderId::from_str(&"a".repeat(MAX_ID_BYTES + 1)).is_err());
     }
 
     #[test]
-    fn compiler_rejects_all_eligible_for_prebid_server_only() {
-        let mut prebid = provider("prebid-server");
-        prebid.routing = RoutingMode::AllEligible;
-        let error = AuctionPlan::compile(config(BTreeMap::from([(id("pbs-main"), prebid)])))
-            .expect_err("should reject all_eligible Prebid Server routing");
+    fn all_eligible_is_refused_for_an_implementation_that_forbids_it() {
+        let mut prebid = table("prebid_server");
+        prebid.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        let error = AuctionPlan::compile(config(vec![("pbs_main", prebid)]))
+            .expect_err("should refuse all_eligible Prebid Server routing");
         let message = error.to_string();
-        for expected in ["pbs-main", "all_eligible", "prebid-server"] {
+        for expected in ["pbs_main", "all_eligible", "prebid_server"] {
             assert!(
                 message.contains(expected),
-                "should identify provider, routing, and profile: {error:?}"
+                "should name the source, the routing and the implementation: {error:?}"
             );
         }
 
-        let mut standard = provider("standard");
-        standard.routing = RoutingMode::AllEligible;
-        AuctionPlan::compile(config(BTreeMap::from([(id("standard-main"), standard)])))
-            .expect("should retain all_eligible for non-Prebid profiles");
+        let mut openrtb = table("openrtb");
+        openrtb.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        AuctionPlan::compile(config(vec![("openrtb_main", openrtb)]))
+            .expect("should keep all_eligible for an implementation that allows it");
     }
 
     #[test]
     fn compiler_rejects_exact_reserved_browser_envelope_bidder_id() {
-        let mut raw = config(BTreeMap::from([(id("one"), provider("standard"))]));
+        let mut raw = one_source();
         raw.bidders.insert(
             bidder("trustedServer"),
             BidderRouteConfig {
@@ -949,7 +984,7 @@ mod tests {
             "exact reserved bidder ID should be rejected"
         );
 
-        let mut case_distinct = config(BTreeMap::from([(id("one"), provider("standard"))]));
+        let mut case_distinct = one_source();
         case_distinct.bidders.insert(
             bidder("TrustedServer"),
             BidderRouteConfig {
@@ -963,26 +998,30 @@ mod tests {
     }
 
     #[test]
-    fn compiler_orders_providers_and_routes_deterministically() {
-        let mut providers = BTreeMap::new();
-        providers.insert(id("z-provider"), provider("standard"));
-        providers.insert(id("a-provider"), provider("standard"));
-        let mut raw = config(providers);
+    fn sources_keep_the_order_they_were_selected_in_and_routes_are_deterministic() {
+        let mut raw = config(vec![
+            ("z_provider", table("openrtb")),
+            ("a_provider", table("openrtb")),
+        ]);
         raw.bidders.insert(
             bidder("z-bidder"),
             BidderRouteConfig {
-                provider: id("z-provider"),
+                provider: id("z_provider"),
             },
         );
         raw.bidders.insert(
             bidder("a-bidder"),
             BidderRouteConfig {
-                provider: id("a-provider"),
+                provider: id("a_provider"),
             },
         );
         let plan = AuctionPlan::compile(raw).expect("should compile deterministic plan");
-        assert_eq!(plan.providers()[0].id.as_str(), "a-provider");
-        assert_eq!(plan.providers()[1].id.as_str(), "z-provider");
+        assert_eq!(
+            plan.providers()[0].id.as_str(),
+            "z_provider",
+            "the selector's order is the deployment's order"
+        );
+        assert_eq!(plan.providers()[1].id.as_str(), "a_provider");
         assert_eq!(
             plan.browser_bidder_codes().collect::<Vec<_>>(),
             vec!["a-bidder", "z-bidder"],
@@ -991,113 +1030,98 @@ mod tests {
         assert_eq!(
             plan.provider_for_bidder(&bidder("a-bidder"))
                 .map(|provider| provider.id.as_str()),
-            Some("a-provider")
+            Some("a_provider")
         );
     }
 
     #[test]
-    fn compiler_supports_two_instances_of_the_same_profile() {
-        let mut providers = BTreeMap::new();
-        providers.insert(id("pbs-a"), provider("prebid-server"));
-        providers.insert(id("pbs-b"), provider("prebid-server"));
-        let plan = AuctionPlan::compile(config(providers)).expect("should compile two PBS plans");
+    fn two_sources_can_run_one_implementation_under_their_own_names() {
+        let plan = AuctionPlan::compile(config(vec![
+            ("pbs_a", table("prebid_server")),
+            ("pbs_b", table("prebid_server")),
+        ]))
+        .expect("should compile two Prebid Server sources");
         assert_eq!(plan.providers().len(), 2);
         assert!(
-            plan.providers().iter().all(|provider| matches!(
-                provider.profile,
-                CompiledOpenRtbProfile::PrebidServer(_)
-            ))
+            plan.providers()
+                .iter()
+                .all(|provider| provider.implementation.id == "prebid_server"),
+            "both names should resolve to the same implementation"
+        );
+        assert!(
+            plan.providers()
+                .iter()
+                .all(|provider| provider.demand.as_any().is::<PrebidServerDemand>()),
+            "each source should compile its own settings"
         );
     }
 
     #[test]
-    fn profile_defaults_and_explicit_timeout_override_are_resolved() {
-        let mut providers = BTreeMap::new();
-        providers.insert(id("standard-one"), provider("standard"));
-        providers.insert(id("pbs-one"), provider("prebid-server"));
-        providers.insert(
-            id("aps-one"),
-            ProviderConfig {
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                profile_config: serde_json::json!({"account_id": "example-account"}),
-                ..provider("aps")
-            },
-        );
-        providers.insert(
-            id("pbs-override"),
-            ProviderConfig {
-                timeout_ms: Some(321),
-                ..provider("prebid-server")
-            },
-        );
-        let plan = AuctionPlan::compile(config(providers)).expect("should resolve timeouts");
+    fn implementation_defaults_and_an_explicit_timeout_are_resolved() {
+        let mut override_table = table("prebid_server");
+        override_table.insert(TIMEOUT_KEY.to_string(), json!(321));
+        let plan = AuctionPlan::compile(config(vec![
+            ("openrtb_one", table("openrtb")),
+            ("pbs_one", table("prebid_server")),
+            ("aps_one", table("aps")),
+            ("pbs_override", override_table),
+        ]))
+        .expect("should resolve timeouts");
         let timeouts = plan
             .providers()
             .iter()
             .map(|provider| (provider.id.as_str(), provider.timeout_ms))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(timeouts["standard-one"], 1500);
-        assert_eq!(timeouts["pbs-one"], 1000);
-        assert_eq!(timeouts["aps-one"], 800);
-        assert_eq!(timeouts["pbs-override"], 321);
+        assert_eq!(timeouts["openrtb_one"], 1500);
+        assert_eq!(timeouts["pbs_one"], 1000);
+        assert_eq!(timeouts["aps_one"], 800);
+        assert_eq!(timeouts["pbs_override"], 321);
     }
 
     #[test]
-    fn profile_registry_is_independent_of_browser_configuration() {
-        let ids = crate::auction::profile::profile_registrations()
-            .iter()
-            .map(|registration| registration.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["standard", "prebid-server", "aps"]);
-        let mut providers = BTreeMap::new();
-        providers.insert(id("pbs"), provider("prebid-server"));
-        let plan = AuctionPlan::compile(config(providers))
+    fn the_plan_reports_which_implementations_it_selected() {
+        let plan = AuctionPlan::compile(config(vec![("pbs", table("prebid_server"))]))
             .expect("should compile without Settings or browser integration state");
-        assert!(!plan.has_profile("aps"));
+        assert!(!plan.has_implementation("aps"));
+        assert!(plan.has_implementation("prebid_server"));
 
-        let mut providers = BTreeMap::new();
-        providers.insert(
-            id("aps-instance"),
-            ProviderConfig {
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                profile_config: serde_json::json!({"account_id": "example-account"}),
-                ..provider("aps")
-            },
-        );
-        let plan = AuctionPlan::compile(config(providers)).expect("should compile APS plan");
+        let plan = AuctionPlan::compile(config(vec![("aps_instance", table("aps"))]))
+            .expect("should compile APS plan");
         assert!(
-            plan.has_profile("aps"),
-            "validated plan should expose APS renderer capability"
+            plan.has_implementation("aps"),
+            "a validated plan should expose its APS renderer capability"
         );
-        assert!(!plan.has_profile("prebid-server"));
+        assert!(!plan.has_implementation("prebid_server"));
+        assert!(
+            plan.providers()[0].demand.as_any().is::<ApsDemand>(),
+            "the APS source should compile its own settings"
+        );
     }
 
     #[test]
-    fn compiler_rejects_unknown_protocol_profile_and_route() {
-        let mut unknown_protocol = provider("standard");
-        unknown_protocol.protocol = "openrtb-2.5".to_string();
-        assert!(
-            AuctionPlan::compile(config(BTreeMap::from([(id("one"), unknown_protocol)]))).is_err()
-        );
-        assert!(
-            AuctionPlan::compile(config(BTreeMap::from([(id("one"), provider("unknown"))])))
-                .is_err()
-        );
-        let mut raw = config(BTreeMap::from([(id("one"), provider("standard"))]));
+    fn a_bidder_route_must_name_a_selected_source() {
+        let mut raw = one_source();
         raw.bidders.insert(
             bidder("example"),
             BidderRouteConfig {
                 provider: id("missing"),
             },
         );
-        assert!(AuctionPlan::compile(raw).is_err());
+        let error = AuctionPlan::compile(raw).expect_err("should refuse an unrouted bidder");
+        assert!(
+            error.to_string().contains("missing"),
+            "should name the source the route wanted: {error:?}"
+        );
     }
 
     #[test]
     fn compiler_canonicalizes_https_endpoints_and_rejects_unsafe_forms() {
-        let mut canonical = provider("standard");
-        canonical.endpoint = "https://BID.EXAMPLE:443/path".to_string();
-        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("one"), canonical)])))
+        let mut canonical = table("openrtb");
+        canonical.insert(
+            ENDPOINT_KEY.to_string(),
+            json!("https://BID.EXAMPLE:443/path"),
+        );
+        let plan = AuctionPlan::compile(config(vec![("one", canonical)]))
             .expect("should canonicalize endpoint");
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
@@ -1110,21 +1134,55 @@ mod tests {
             "https://bid.example/path#fragment",
             "/relative",
         ] {
-            let mut raw_provider = provider("standard");
-            raw_provider.endpoint = endpoint.to_string();
+            let mut raw = table("openrtb");
+            raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
             assert!(
-                AuctionPlan::compile(config(BTreeMap::from([(id("one"), raw_provider)]))).is_err(),
+                AuctionPlan::compile(config(vec![("one", raw)])).is_err(),
                 "should reject {endpoint}"
             );
         }
-        let mut aps = provider("aps");
-        aps.endpoint = "https://aps.example/e/dtb/bid".to_string();
-        aps.profile_config = serde_json::json!({"account_id": "example-account"});
-        assert!(AuctionPlan::compile(config(BTreeMap::from([(id("aps"), aps)]))).is_err());
+        let mut aps = table("aps");
+        aps.insert(
+            ENDPOINT_KEY.to_string(),
+            json!("https://aps.example/e/dtb/bid"),
+        );
+        assert!(
+            AuctionPlan::compile(config(vec![("aps", aps)])).is_err(),
+            "should refuse the legacy APS path"
+        );
     }
 
     #[test]
-    fn compiler_normalizes_only_prebid_server_origin_and_canonical_paths() {
+    fn plain_http_is_allowed_only_to_a_loopback_host() {
+        for endpoint in [
+            "http://127.0.0.1:8000/openrtb2/auction",
+            "http://[::1]:8000/openrtb2/auction",
+            "http://localhost:8000/openrtb2/auction",
+            "http://LOCALHOST:8000/openrtb2/auction",
+        ] {
+            let mut raw = table("openrtb");
+            raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
+            AuctionPlan::compile(config(vec![("local", raw)]))
+                .unwrap_or_else(|error| panic!("should accept {endpoint}: {error:?}"));
+        }
+        for endpoint in [
+            "http://192.0.2.10:8000/openrtb2/auction",
+            "http://bid.example/openrtb2/auction",
+            "http://localhost.example/openrtb2/auction",
+        ] {
+            let mut raw = table("openrtb");
+            raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
+            let error = AuctionPlan::compile(config(vec![("remote", raw)]))
+                .expect_err("should reject plain HTTP off the loopback");
+            assert!(
+                error.to_string().contains("127.0.0.1"),
+                "should say which hosts plain HTTP may reach: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_prebid_server_completes_an_endpoint_that_names_a_host_alone() {
         for (configured, expected) in [
             (
                 "https://pbs.example",
@@ -1152,9 +1210,9 @@ mod tests {
                 "https://pbs.example/custom/pbs",
             ),
         ] {
-            let mut pbs = provider("prebid-server");
-            pbs.endpoint = configured.to_string();
-            let plan = AuctionPlan::compile(config(BTreeMap::from([(id("pbs"), pbs)])))
+            let mut pbs = table("prebid_server");
+            pbs.insert(ENDPOINT_KEY.to_string(), json!(configured));
+            let plan = AuctionPlan::compile(config(vec![("pbs", pbs)]))
                 .expect("should compile Prebid Server endpoint");
             assert_eq!(
                 plan.providers()[0].endpoint.as_str(),
@@ -1163,19 +1221,16 @@ mod tests {
             );
         }
 
-        let mut standard = provider("standard");
-        standard.endpoint = "https://bid.example/".to_string();
-        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("standard"), standard)])))
-            .expect("should compile standard root endpoint");
+        let mut openrtb = table("openrtb");
+        openrtb.insert(ENDPOINT_KEY.to_string(), json!("https://bid.example/"));
+        let plan = AuctionPlan::compile(config(vec![("openrtb", openrtb)]))
+            .expect("should compile a root endpoint unchanged");
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
             "https://bid.example/"
         );
 
-        let mut aps = provider("aps");
-        aps.endpoint = "https://aps.example/e/pb/bid".to_string();
-        aps.profile_config = serde_json::json!({"account_id": "example-account"});
-        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("aps"), aps)])))
+        let plan = AuctionPlan::compile(config(vec![("aps", table("aps"))]))
             .expect("should compile APS endpoint");
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
@@ -1184,103 +1239,80 @@ mod tests {
     }
 
     #[test]
-    fn standard_extensions_are_typed_bounded_and_cannot_claim_reserved_fields() {
-        let mut valid = provider("standard");
-        valid.profile_config = serde_json::json!({
-            "request_ext": {"fictional_account": "example"},
-            "imp_ext": {"placement_group": "display"}
-        });
-        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("one"), valid)])))
+    fn openrtb_extensions_are_bounded_and_cannot_claim_reserved_fields() {
+        let mut valid = table("openrtb");
+        valid.insert(
+            "request_ext".to_string(),
+            json!({"fictional_account": "example"}),
+        );
+        valid.insert("imp_ext".to_string(), json!({"placement_group": "display"}));
+        let plan = AuctionPlan::compile(config(vec![("one", valid)]))
             .expect("should compile static extensions");
-        let CompiledOpenRtbProfile::Standard(standard) = &plan.providers()[0].profile else {
-            panic!("should compile standard profile")
-        };
+        let openrtb = plan.providers()[0]
+            .demand
+            .as_any()
+            .downcast_ref::<OpenRtbDemand>()
+            .expect("should compile the OpenRTB implementation");
         assert_eq!(
-            standard.request_ext.as_object()["fictional_account"],
+            openrtb.request_ext.as_object()["fictional_account"],
             "example"
         );
 
-        let mut standard_owned_fields = provider("standard");
-        standard_owned_fields.profile_config = serde_json::json!({
-            "request_ext": {
-                "account": "example-account",
-                "sdk": {"source": "example"},
-                "prebid": {"example": true}
-            },
-            "imp_ext": {"prebid": {"example": true}}
-        });
-        AuctionPlan::compile(config(BTreeMap::from([(
-            id("standard-owned-fields"),
-            standard_owned_fields,
-        )])))
-        .expect("should allow standard static extensions outside common-owned fields");
-
-        for profile_config in [
-            serde_json::json!({"request_ext": "bad"}),
-            serde_json::json!({"request_ext": {"trusted_server": {}}}),
-        ] {
-            let mut invalid = provider("standard");
-            invalid.profile_config = profile_config;
-            assert!(AuctionPlan::compile(config(BTreeMap::from([(id("one"), invalid)]))).is_err());
-        }
-        let oversized = "x".repeat(16 * 1024);
-        let mut invalid = provider("standard");
-        invalid.profile_config = serde_json::json!({"request_ext": {"value": oversized}});
-        assert!(AuctionPlan::compile(config(BTreeMap::from([(id("one"), invalid)]))).is_err());
-
-        let too_many_keys = (0..257)
-            .map(|index| (format!("key-{index}"), Value::Bool(true)))
-            .collect::<serde_json::Map<_, _>>();
-        let mut invalid = provider("standard");
-        invalid.profile_config = serde_json::json!({"imp_ext": too_many_keys});
-        assert!(AuctionPlan::compile(config(BTreeMap::from([(id("one"), invalid)]))).is_err());
-    }
-
-    #[test]
-    fn standard_extension_depth_counts_container_levels() {
-        let mut object_valid = provider("standard");
-        object_valid.profile_config = serde_json::json!({"request_ext": nested_object(8)});
-        AuctionPlan::compile(config(BTreeMap::from([(id("object-valid"), object_valid)])))
-            .expect("should accept eight nested object levels");
-
-        let mut object_invalid = provider("standard");
-        object_invalid.profile_config = serde_json::json!({"request_ext": nested_object(9)});
+        let mut reserved = table("openrtb");
+        reserved.insert(
+            "request_ext".to_string(),
+            json!({"trusted_server": {"signature": "forged"}}),
+        );
         assert!(
-            AuctionPlan::compile(config(BTreeMap::from([(
-                id("object-invalid"),
-                object_invalid,
-            )])))
-            .is_err(),
-            "should reject nine nested object levels"
+            AuctionPlan::compile(config(vec![("one", reserved)])).is_err(),
+            "should refuse an extension claiming a reserved field"
         );
 
-        let mut array_valid = provider("standard");
-        array_valid.profile_config = serde_json::json!({"request_ext": {"value": nested_array(7)}});
-        AuctionPlan::compile(config(BTreeMap::from([(id("array-valid"), array_valid)])))
-            .expect("should accept one object plus seven nested array levels");
-
-        let mut array_invalid = provider("standard");
-        array_invalid.profile_config =
-            serde_json::json!({"request_ext": {"value": nested_array(8)}});
+        let mut too_large = table("openrtb");
+        too_large.insert(
+            "request_ext".to_string(),
+            json!({"padding": "x".repeat(17 * 1024)}),
+        );
         assert!(
-            AuctionPlan::compile(config(BTreeMap::from([(
-                id("array-invalid"),
-                array_invalid,
-            )])))
-            .is_err(),
-            "should reject one object plus eight nested array levels"
+            AuctionPlan::compile(config(vec![("one", too_large)])).is_err(),
+            "should refuse an extension over the size bound"
+        );
+
+        let mut too_deep = table("openrtb");
+        too_deep.insert("request_ext".to_string(), nested_object(9));
+        assert!(
+            AuctionPlan::compile(config(vec![("one", too_deep)])).is_err(),
+            "should refuse an extension over the depth bound"
+        );
+
+        let mut deep_array = table("openrtb");
+        deep_array.insert(
+            "request_ext".to_string(),
+            json!({"levels": nested_array(8)}),
+        );
+        assert!(
+            AuctionPlan::compile(config(vec![("one", deep_array)])).is_err(),
+            "should count array levels toward the depth bound"
+        );
+
+        let mut not_an_object = table("openrtb");
+        not_an_object.insert("request_ext".to_string(), json!("string"));
+        assert!(
+            AuctionPlan::compile(config(vec![("one", not_an_object)])).is_err(),
+            "should refuse an extension that is not an object"
         );
     }
 
     #[test]
     fn notification_policy_rejects_duplicates_and_bounds() {
-        let mut valid = provider("standard");
-        valid.notifications = NotificationConfig {
-            suppress_all: true,
-            suppress_seats: vec!["seat-b".to_string(), "seat-a".to_string()],
-        };
-        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("one"), valid)])))
+        let mut valid = table("openrtb");
+        valid.insert(
+            NOTIFICATIONS_KEY.to_string(),
+            json!({"suppress_all": true, "suppress_seats": ["seat-b", "seat-a"]}),
+        );
+        let plan = AuctionPlan::compile(config(vec![("one", valid)]))
             .expect("should compile notifications");
+        assert!(plan.providers()[0].notifications.suppress_all);
         assert_eq!(
             plan.providers()[0]
                 .notifications
@@ -1291,42 +1323,57 @@ mod tests {
             vec!["seat-a", "seat-b"]
         );
         for seats in [
-            vec!["same".to_string(), "same".to_string()],
-            vec![String::new()],
-            vec!["bad\nseat".to_string()],
-            vec!["x".repeat(129)],
-            (0..129).map(|index| format!("seat-{index}")).collect(),
+            json!(["same", "same"]),
+            json!([""]),
+            json!(["bad\nseat"]),
+            json!(["x".repeat(129)]),
+            Value::Array(
+                (0..129)
+                    .map(|index| json!(format!("seat-{index}")))
+                    .collect(),
+            ),
         ] {
-            let mut invalid = provider("standard");
-            invalid.notifications.suppress_seats = seats;
-            assert!(AuctionPlan::compile(config(BTreeMap::from([(id("one"), invalid)]))).is_err());
+            let mut invalid = table("openrtb");
+            invalid.insert(
+                NOTIFICATIONS_KEY.to_string(),
+                json!({"suppress_seats": seats}),
+            );
+            assert!(
+                AuctionPlan::compile(config(vec![("one", invalid)])).is_err(),
+                "should refuse {seats}"
+            );
         }
     }
 
     #[test]
-    fn typed_profile_config_rejects_unknown_fields_and_validates_aps_pairing() {
-        let mut pbs = provider("prebid-server");
-        pbs.profile_config = serde_json::json!({"browser_only": true});
-        assert!(AuctionPlan::compile(config(BTreeMap::from([(id("pbs"), pbs)]))).is_err());
-
-        let mut non_object = provider("standard");
-        non_object.profile_config = Value::Null;
+    fn an_implementation_rejects_settings_it_does_not_know() {
+        let mut pbs = table("prebid_server");
+        pbs.insert("browser_only".to_string(), json!(true));
+        let error = AuctionPlan::compile(config(vec![("pbs", pbs)]))
+            .expect_err("should refuse a setting the implementation does not know");
         assert!(
-            AuctionPlan::compile(config(BTreeMap::from([(id("standard"), non_object,)]))).is_err()
+            format!("{error:?}").contains("browser_only"),
+            "should name the setting: {error:?}"
         );
 
-        let mut aps = provider("aps");
-        aps.endpoint = "https://aps.example/e/pb/bid".to_string();
-        aps.profile_config = serde_json::json!({
-            "account_id": "example-account",
-            "inventory_domain": "publisher.example"
-        });
-        assert!(AuctionPlan::compile(config(BTreeMap::from([(id("aps"), aps)]))).is_err());
+        let mut aps = table("aps");
+        aps.insert("inventory_domain".to_string(), json!("publisher.example"));
+        assert!(
+            AuctionPlan::compile(config(vec![("aps", aps)])).is_err(),
+            "should refuse an APS inventory domain without its page origin"
+        );
+
+        let mut without_account = table("aps");
+        without_account.remove("account_id");
+        assert!(
+            AuctionPlan::compile(config(vec![("aps", without_account)])).is_err(),
+            "should refuse an APS source with no account"
+        );
     }
 
     #[test]
     fn enabled_signing_requires_nonblank_existing_global_store_ids() {
-        let mut raw = config(BTreeMap::from([(id("one"), provider("standard"))]));
+        let mut raw = one_source();
         raw.request_signing = Some(RequestSigning {
             enabled: true,
             config_store_id: " ".to_string(),
@@ -1337,7 +1384,7 @@ mod tests {
             "should reject enabled signing without a config store ID"
         );
 
-        let mut raw = config(BTreeMap::from([(id("one"), provider("standard"))]));
+        let mut raw = one_source();
         raw.request_signing = Some(RequestSigning {
             enabled: true,
             config_store_id: "example-config-store".to_string(),
@@ -1350,23 +1397,85 @@ mod tests {
     }
 
     #[test]
-    fn routing_signing_and_static_mediator_are_preserved_in_plan() {
-        let mut provider = provider("standard");
-        provider.routing = RoutingMode::AllEligible;
-        let mut raw = config(BTreeMap::from([(id("one"), provider)]));
+    fn routing_signing_and_the_selected_ad_server_are_preserved_in_the_plan() {
+        let mut openrtb = table("openrtb");
+        openrtb.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        let mut raw = config(vec![("one", openrtb)]);
         raw.request_signing = Some(RequestSigning {
             enabled: true,
             config_store_id: "example-config-store".to_string(),
             secret_store_id: "example-secret-store".to_string(),
         });
-        raw.mediator = Some(MOCK_MEDIATOR_ID.to_string());
+        raw.adserver = ProviderChoice::new(
+            Some("adserver_mock".to_string()),
+            BTreeMap::from([(
+                "adserver_mock".to_string(),
+                Map::from_iter([(
+                    ENDPOINT_KEY.to_string(),
+                    json!("http://127.0.0.1:6767/adserver/mediate"),
+                )]),
+            )]),
+        );
         let plan = AuctionPlan::compile(raw).expect("should compile common policies");
         assert_eq!(plan.providers()[0].routing, RoutingMode::AllEligible);
         assert!(plan.signing_enabled());
-        assert_eq!(plan.mediator(), Some(MOCK_MEDIATOR_ID));
+        assert_eq!(
+            plan.adserver().map(|adserver| adserver.id.as_str()),
+            Some("adserver_mock")
+        );
 
-        let mut invalid = config(BTreeMap::new());
-        invalid.mediator = Some("generic-mediator".to_string());
-        assert!(AuctionPlan::compile(invalid).is_err());
+        let mut invalid = config(Vec::new());
+        invalid.adserver =
+            ProviderChoice::new(Some("fictional_adserver".to_string()), BTreeMap::new());
+        let error = AuctionPlan::compile(invalid)
+            .expect_err("should refuse an ad server this build does not have");
+        assert!(
+            error.to_string().contains("fictional_adserver"),
+            "should name the ad server: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_ad_server_is_built_from_its_own_table() {
+        let mut raw = one_source();
+        raw.adserver = ProviderChoice::new(
+            Some("house".to_string()),
+            BTreeMap::from([(
+                "house".to_string(),
+                Map::from_iter([
+                    (IMPLEMENTATION_KEY.to_string(), json!("adserver_mock")),
+                    (
+                        ENDPOINT_KEY.to_string(),
+                        json!("https://adserver.example/mediate"),
+                    ),
+                    ("timeout_ms".to_string(), json!(750)),
+                ]),
+            )]),
+        );
+        let plan = AuctionPlan::compile(raw).expect("should compile a named ad server");
+        let adserver = plan.adserver().expect("should select an ad server");
+        assert_eq!(adserver.id.as_str(), "house");
+        assert_eq!(adserver.implementation.id, "adserver_mock");
+
+        let mut unknown_setting = one_source();
+        unknown_setting.adserver = ProviderChoice::new(
+            Some("adserver_mock".to_string()),
+            BTreeMap::from([(
+                "adserver_mock".to_string(),
+                Map::from_iter([
+                    (
+                        ENDPOINT_KEY.to_string(),
+                        json!("https://adserver.example/mediate"),
+                    ),
+                    ("enabled".to_string(), json!(true)),
+                ]),
+            )]),
+        );
+        let error = AuctionPlan::compile(unknown_setting)
+            .expect_err("should refuse a setting the ad server does not know");
+        assert!(
+            format!("{error:?}").contains("enabled"),
+            "should name the setting: {error:?}"
+        );
     }
 }

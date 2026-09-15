@@ -1028,17 +1028,14 @@ pub fn match_slots<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::str::FromStr as _;
 
     use edgezero_core::body::Body as EdgeBody;
     use http::Request;
 
     use super::*;
-    use crate::auction::plan::{
-        AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
-    };
+    use crate::auction::plan::AuctionPlan;
     use crate::auction::routing::route_auction;
+    use crate::auction::test_support::{demand_table, plan_config};
     use crate::auction::types::{AuctionRequest, PublisherInfo, UserInfo};
 
     fn make_slot(id: &str, patterns: Vec<&str>) -> CreativeOpportunitySlot {
@@ -1965,25 +1962,12 @@ mod tests {
         slot.providers.prebid = Some(PrebidSlotParams {
             bidders: HashMap::new(),
         });
-        let plan = AuctionPlan::compile(AuctionPlanConfig {
-            timeout_ms: 900,
-            providers: BTreeMap::from([(
-                ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
-                ProviderConfig {
-                    protocol: "openrtb-2.6".to_string(),
-                    profile: "prebid-server".to_string(),
-                    endpoint: "https://pbs.example.test/openrtb".to_string(),
-                    timeout_ms: None,
-                    routing: RoutingMode::Explicit,
-                    notifications: NotificationConfig::default(),
-                    profile_config: serde_json::json!({}),
-                },
-            )]),
-            bidders: BTreeMap::new(),
-            mediator: None,
-            request_signing: None,
-        })
-        .expect("should compile plan");
+        let mut config = plan_config(vec![(
+            "pbs_primary",
+            demand_table("prebid_server", "https://pbs.example.test/openrtb"),
+        )]);
+        config.timeout_ms = 900;
+        let plan = AuctionPlan::compile(config).expect("should compile plan");
         let auction_request = AuctionRequest {
             id: "auction-1".to_string(),
             slots: vec![slot.to_ad_slot()],
@@ -2007,8 +1991,8 @@ mod tests {
         let routed = route_auction(auction_request, &inbound, &plan, None);
 
         assert_eq!(routed.inputs().len(), 1);
-        assert!(routed.inputs()[0].slots()[0].has_trusted_stored_request());
-        assert_eq!(routed.inputs()[0].slots()[0].prebid_zone(), Some("header"));
+        assert!(routed.inputs()[0].slots()[0].is_stored_request());
+        assert_eq!(routed.inputs()[0].slots()[0].zone(), Some("header"));
         assert!(
             routed.inputs()[0].slots().iter().all(|slot| {
                 !slot

@@ -9,10 +9,23 @@ cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration_proxy_secret"
 
+# Viceroy does not resolve geolocation for the loopback test client, so the
+# request carries no country and the top of the permissions.yaml rules tree
+# supplies the baseline the permission model uses.
+[geo]
+# Viceroy maps the loopback client to US/CA (see viceroy-template.toml), so
+# the platform geo provider resolves a real place and the EC lifecycle
+# scenarios exercise the US state opt-out machinery, the same posture the
+# retired default_country setting pointed at, now through the real lookup.
+provider = "platform"
+
 [ec]
-passphrase = "integration_ec_passphrase"
+provider = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
+
+[ec.hmac]
+passphrase = "integration_ec_passphrase"
 
 [[ec.partners]]
 name = "Integration Test Partner"
@@ -31,67 +44,12 @@ enabled = false
 config_store_id = "app_config"
 secret_store_id = "secrets"
 
-[integrations.prebid]
-enabled = false
-timeout_ms = 1000
-debug = false
-client_side_bidders = []
-
-[integrations.nextjs]
-enabled = false
-rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
-max_combined_payload_bytes = 10485760
-
-[integrations.testlight]
-enabled = false
-endpoint = "https://testlight.example.com/openrtb2/auction"
-timeout_ms = 1200
-rewrite_scripts = true
-
-[integrations.didomi]
-enabled = false
-geo_query_parameters = false
-sdk_origin = "https://sdk.example.com"
-api_origin = "https://api.example.com"
-
-[integrations.sourcepoint]
-enabled = false
-rewrite_sdk = true
-cdn_origin = "https://cdn.example.com"
-cache_ttl_seconds = 3600
-
-[integrations.permutive]
-enabled = false
-organization_id = ""
-workspace_id = ""
-project_id = ""
-api_endpoint = "https://api.example.com"
-secure_signals_endpoint = "https://secure-signals.example.com"
-
-[integrations.lockr]
-enabled = false
-app_id = ""
-api_endpoint = "https://identity.example.com"
-sdk_url = "https://identity.example.com/trusted-server.js"
-cache_ttl_seconds = 3600
-rewrite_sdk = true
-
-[integrations.datadome]
-enabled = false
-sdk_origin = "https://sdk.example.com"
-api_origin = "https://api.example.com"
-cache_ttl_seconds = 3600
-rewrite_sdk = true
-
-[integrations.gpt]
-enabled = false
-gam_attribution_enabled = false
-script_url = "https://ads.example.com/gpt.js"
-cache_ttl_seconds = 3600
-rewrite_script = true
-
-[integrations.gpt_diagnostics]
-enabled = true
+# Only the GPT diagnostics overlay runs, which is what the browser tests need.
+# Every other integration used to sit here as an `enabled = false` stub. A
+# settings table its type's `provider` does not name now refuses startup, so
+# the stubs are gone instead of sitting unselected.
+[integration]
+provider = ["gpt_diagnostics"]
 
 [proxy]
 certificate_check = false
@@ -101,47 +59,31 @@ enabled = false
 timeout_ms = 2000
 allowed_context_keys = []
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+provider = ["pbs_main", "aps_main"]
+
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 test_mode = false
 consent_forwarding = "both"
 
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = []
 
-[auction.providers.aps-main]
-protocol = "openrtb-2.6"
-profile = "aps"
+[demand.aps_main]
+implementation = "aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
-
-[auction.providers.aps-main.profile_config]
 account_id = "example-aps-account-id"
 debug = false
 allow_script_creatives = false
 
 [auction.bidders.example-bidder]
-provider = "pbs-main"
-
-[integrations.google_tag_manager]
-enabled = false
-container_id = "GTM-EXAMPLE"
-upstream_url = "https://tags.example.com"
-
-[integrations.adserver_mock]
-enabled = false
-endpoint = "https://adserver.example.com/mediate"
-timeout_ms = 1000
-
-[integrations.adserver_mock.context_query_params]
-example_segments = "segments"
+provider = "pbs_main"
 
 [debug]
 ja4_endpoint_enabled = false

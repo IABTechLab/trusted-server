@@ -365,6 +365,24 @@ export interface GptSlotHandoff {
   suppressPublisherRefresh: boolean;
 }
 
+/**
+ * Permission state the server resolved for this request.
+ *
+ * The names in `set` are IAB Privacy Taxonomy Data Use keys, as resolved by the
+ * server for this request.
+ *
+ * `tdls` are the terms documents the data for this request is available under,
+ * as declared by the permission signal providers the deployment runs, in the
+ * order they were asked. Each entry addresses a published document a person can
+ * read. An empty list says no terms were declared, which is not the same as
+ * terms that permit anything, so page code that needs a basis and finds none
+ * has none.
+ */
+export interface PermissionsSnapshot {
+  set: string[];
+  tdls: string[];
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -392,6 +410,20 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /**
+   * Permission state resolved by the server for this request, injected at head
+   * open in inline mode or at the body seam in shared-template mode.
+   */
+  permissions?: PermissionsSnapshot;
+  /**
+   * Resolves with the permission state once it arrives.
+   *
+   * It resolves straight away when the state was already present at
+   * initialization, on the first assignment when the body seam makes one, and
+   * on `DOMContentLoaded` with whatever the current value is when no assignment
+   * arrives at all. Every later call returns the same resolved promise.
+   */
+  whenPermissions?(): Promise<PermissionsSnapshot>;
   /**
    * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
    * `hb_adid`. The Universal Creative bridge consumes each entry at most once.

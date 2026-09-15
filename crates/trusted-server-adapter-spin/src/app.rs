@@ -24,10 +24,13 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::provider::{EdgeCookieProvider, build_reusable_provider};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
-use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::integrations::{
+    IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
+};
 use trusted_server_core::platform::RuntimeServices;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
@@ -36,7 +39,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    AppContext, AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
     buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
     handle_tsjs_dynamic, page_bids_preflight_denied,
 };
@@ -67,14 +70,39 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// The Edge Cookie provider `[ec] provider` selects, resolved once here.
+    ///
+    /// This adapter runs a fresh instance per request, so application state and
+    /// the request path used to resolve the same selection twice for every
+    /// request, once to check it could be satisfied and once to use it.
+    /// Resolving reads no request data, so the result is kept and handed to
+    /// every request through
+    /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
+    /// `None` for a deployment that selects no provider, and for one whose
+    /// provider must be resolved per request.
+    resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// The permission signal providers `[permission_signal] provider` selects
+    /// from the scheme crates this adapter links, in the order they run.
+    /// Selected once here so a name no crate answers to fails startup rather
+    /// than the first request, and handed to every request's services.
+    permission_signal_providers:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
 ///
+/// Settings are read from the platform config store at run time, the same way
+/// the Fastly and Axum adapters read them, so an operator publishes one with
+/// `ts config push` and the deployed component picks it up. This
+/// adapter previously compiled `trusted-server.example.toml` into the binary
+/// and parsed it here, which could never succeed, because that template ships
+/// placeholder secrets and the placeholder admin password fails validation.
+///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
+/// Returns an error when the config store holds no readable app config, or when
+/// settings, the auction orchestrator, or the integration registry fail to
+/// initialize.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = load_startup_settings()?;
     build_state_with_settings(settings)
@@ -118,21 +146,112 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 ///
 /// # Errors
 ///
-/// Returns an error when the auction orchestrator or the integration
-/// registry fail to initialise.
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, or when the auction orchestrator or the integration registry
+/// fail to initialize.
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations(settings, &[])
+}
+
+/// Build the application state from explicit settings, composing the built-in
+/// integrations with the externally supplied builders in `integrations`.
+///
+/// A deployment that ships a vendor crate calls this to add that crate's
+/// integration builder without the adapter naming the vendor. Auction
+/// providers come from the compiled auction plan, as they do without any
+/// external builders.
+///
+/// # Errors
+///
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, when the auction plan does not compile or cannot run on this
+/// adapter, or when the auction orchestrator or the integration registry fail
+/// to initialize, which includes two builders claiming the same integration
+/// id.
+pub fn build_state_with_registrations(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
-    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
-    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+
+    // Composition root: resolve the provider selection once, before any request
+    // is served, so a selection this adapter can never supply fails here rather
+    // than on the first request. Keeping what the resolution produced is what
+    // stops the request path resolving the same settings again. The registry is
+    // built first because a module can supply the vendor Edge Cookie provider
+    // the selector names, and resolving without it would reject a selection
+    // this deployment can in fact satisfy. This adapter supplies no host
+    // signals, so that argument stays `None` until it does.
+    let resolved_ec_provider = build_reusable_provider(&settings.ec, None, registry.ec_provider())?;
+    let permission_signal_providers =
+        trusted_server_core::permission_signal::build_permission_signal_providers(
+            &settings,
+            &shipped_signal_providers(),
+        )?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        resolved_ec_provider,
+        permission_signal_providers,
     }))
+}
+
+/// The permission signal providers this adapter links, in the order they run
+/// when configuration names none. Global Privacy Control is first because it
+/// is a browser setting with no interface of its own, and the three that
+/// carry a choice someone made through an interface follow, so an answer
+/// given at a prompt amends the header the visitor arrived with.
+///
+/// Core supplies no provider of its own, so this is where a deployment's
+/// schemes are decided. A scheme is added by linking its crate here, and a
+/// scheme core has never heard of plugs in the same way.
+fn shipped_signal_providers()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+    vec![
+        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Per-request RuntimeServices
+// ---------------------------------------------------------------------------
+
+/// Build per-request [`RuntimeServices`], carrying the Edge Cookie provider the
+/// composition root already resolved and applying the module-supplied geo,
+/// Edge Cookie and device providers selected by `[geo]`, `[ec]` and
+/// `[device] provider`.
+///
+/// No Edge Cookie provider is carried when the composition root found nothing
+/// safe to keep, so the request path resolves the selection for itself.
+///
+/// For geo, unset and `"none"` both resolve nothing, so no client IP reaches a
+/// host geo service. `"platform"` opts in to this adapter's own lookup, and any
+/// other key names an integration module that declares a geo provider. Identity
+/// and device are applied the same way when a module supplies them.
+fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    let mut services =
+        build_runtime_services(ctx, &state.settings, &state.permission_signal_providers)
+            .with_resolved_ec_provider(state.resolved_ec_provider.clone());
+    if let Some(provider) = state.registry.geo_provider() {
+        services = services.with_geo(provider);
+    }
+    if let Some(provider) = state.registry.ec_provider() {
+        services = services.with_ec_provider(provider);
+    }
+    if let Some(provider) = state.registry.device_provider() {
+        services = services.with_device_provider(provider);
+    }
+    services
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +307,8 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // reaches the publisher origin rather than a router-level 405.
 //
 // The EC API routes that the Fastly entry point registers — POST
-// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
+// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify`, POST
+// `/_ts/api/v1/ec/resolve`, are
 // intentionally absent here, matching the Axum and Cloudflare adapters: those
 // handlers require a platform KV `ec_store` (and, for batch-sync, a partner
 // registry and rate limiter) that the portability adapters do not yet wire.
@@ -391,25 +511,31 @@ fn health_response() -> Response {
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
-/// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
-/// Unknown, which fails the auction consent gate closed even for consented
-/// users. Spin's platform geo is a no-op, so jurisdiction stays Unknown unless
-/// the request carries TCF consent. A malformed consent string is logged and
-/// falls back to the default (fail-closed) context rather than being silently
-/// swallowed.
-fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
-        .unwrap_or_else(|e| {
-            log::warn!("EC context read failed: {e:?}");
-            EcContext::default()
-        })
+/// The geo lookup runs inside
+/// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
+/// same distinction: no location falls back to the top of the
+/// `permissions.yaml` rules tree, while a failed lookup resolves every
+/// permission at the requires-signal floor and is logged at error level.
+/// Spin's platform geo is a no-op, so a request resolves at that top node
+/// unless it carries a signal.
+///
+/// Mirrors the Fastly entry point, which keeps the report and answers with an
+/// error response: when the Edge Cookie context cannot be read the request
+/// fails rather than continuing with `EcContext::default()`, which would serve
+/// every request with no identity. A malformed cookie value, a bad consent
+/// string and a failed geo lookup do not reach this error path at all, so
+/// failing here does not fail requests for ordinary parse problems.
+///
+/// # Errors
+///
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this request, or when the request's `Cookie` header is not valid UTF-8.
+async fn build_ec_context(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request,
+) -> Result<EcContext, Report<TrustedServerError>> {
+    EcContext::read_from_request_resolving_geo(settings, req, services).await
 }
 
 fn admin_key_management_not_supported() -> Response {
@@ -548,6 +674,28 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
+
+    /// Build the full application router from explicit settings, composing the
+    /// built-in integrations with the externally supplied builders in
+    /// `integrations`.
+    ///
+    /// The route table is the one [`TrustedServerApp::routes_with_settings`]
+    /// builds, so a composed deployment routes exactly as the plain one does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected Edge Cookie provider cannot be built
+    /// for this adapter, when the auction plan does not compile or cannot run
+    /// on this adapter, or when the auction orchestrator or the integration
+    /// registry fail to initialize, which includes two builders claiming the
+    /// same integration id.
+    pub fn routes_with_registrations(
+        settings: Settings,
+        integrations: &[IntegrationBuilder],
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_registrations(settings, integrations)?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
@@ -559,7 +707,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -571,7 +719,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -604,25 +752,25 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 // Request normalization (forwarded-header stripping, trusted
                 // Host/scheme/client-IP derivation) is applied centrally by
                 // `NormalizeMiddleware` before this handler runs, so the signed
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                     return Ok(http_error(&error));
                 }
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
-                // closed for consented users.
-                let mut ec_context = build_ec_context(&s.settings, &services, &req);
+                // closed for consented users. When identity cannot be
+                // established at all, answer with an error rather than running
+                // the auction with no identity.
+                let mut ec_context = match build_ec_context(&s.settings, &services, &req).await {
+                    Ok(context) => context,
+                    Err(report) => return Ok(http_error(&report)),
+                };
                 Ok(handle_auction(
                     &s.settings,
                     &s.orchestrator,
@@ -642,17 +790,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let page_bids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                     return Ok(http_error(&error));
                 }
-                let mut ec_context = build_ec_context(&s.settings, &services, &req);
+                // Identity could not be established (for example the selected
+                // Edge Cookie provider is unavailable). Answer with an error
+                // rather than re-running the auction with no identity.
+                let mut ec_context = match build_ec_context(&s.settings, &services, &req).await {
+                    Ok(context) => context,
+                    Err(report) => return Ok(http_error(&report)),
+                };
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
@@ -677,7 +826,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
@@ -690,7 +839,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
@@ -703,7 +852,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_sign_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -720,7 +869,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
@@ -736,15 +885,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_runtime_services(&ctx);
+            let services = build_per_request_services(&state, &ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                &state.settings,
-                &mut req,
-            ) {
+            if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
                 return Ok(http_error(&error));
             }
 
@@ -775,14 +921,24 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                let mut ec_context = build_ec_context(&state.settings, &services, &req);
+                // Identity could not be established (for example the selected
+                // Edge Cookie provider is unavailable). Answer with an error
+                // rather than serving the page with no identity.
+                let mut ec_context = match build_ec_context(&state.settings, &services, &req).await
+                {
+                    Ok(context) => context,
+                    Err(report) => return Ok(http_error(&report)),
+                };
                 let auction = AuctionDispatch {
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
                 };
                 match handle_publisher_request(
-                    &state.settings,
+                    AppContext {
+                        settings: &state.settings,
+                        integration_registry: &state.registry,
+                    },
                     &services,
                     None,
                     &mut ec_context,
@@ -908,6 +1064,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
 #[cfg(test)]
 mod tests {
+    use edgezero_core::http::request_builder;
+    use edgezero_core::params::PathParams;
+
     use super::*;
 
     fn multi_provider_settings() -> Settings {
@@ -926,50 +1085,56 @@ mod tests {
 
                 [ec]
                 passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse startup test settings");
         settings.auction.enabled = true;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
+        let names = ["provider_a", "provider_b"];
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            names.iter().map(|name| (*name).to_string()).collect(),
+            names
+                .iter()
+                .map(|name| {
                     (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: "{}"
-                                .parse()
-                                .expect("should parse empty profile config object"),
-                        },
+                        (*name).to_string(),
+                        serde_json::Map::from_iter([
+                            ("implementation".to_string(), serde_json::json!("openrtb")),
+                            (
+                                "endpoint".to_string(),
+                                serde_json::json!(format!("https://{name}.example/openrtb")),
+                            ),
+                            ("routing".to_string(), serde_json::json!("all_eligible")),
+                        ]),
                     )
                 })
-                .collect();
+                .collect(),
+        );
         settings
     }
 
     #[test]
     fn startup_registers_aps_renderer_route() {
         let mut settings = multi_provider_settings();
-        settings.auction.providers.clear();
-        settings.auction.providers.insert(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            trusted_server_core::auction::ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                notifications: trusted_server_core::auction::NotificationConfig::default(),
-                profile_config: "{\"account_id\":\"example-account\"}"
-                    .parse()
-                    .expect("should parse APS profile config"),
-            },
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            vec!["aps_main".to_string()],
+            std::collections::BTreeMap::from([(
+                "aps_main".to_string(),
+                serde_json::Map::from_iter([
+                    ("implementation".to_string(), serde_json::json!("aps")),
+                    (
+                        "endpoint".to_string(),
+                        serde_json::json!("https://aps.example/e/pb/bid"),
+                    ),
+                    ("routing".to_string(), serde_json::json!("all_eligible")),
+                    (
+                        "account_id".to_string(),
+                        serde_json::json!("example-account"),
+                    ),
+                ]),
+            )]),
         );
 
         let state =
@@ -1001,6 +1166,99 @@ mod tests {
         assert!(
             format!("{error:?}").contains("concurrent provider fanout"),
             "should identify unsupported fanout: {error:?}"
+        );
+    }
+
+    #[test]
+    fn build_state_takes_its_settings_from_the_platform_config_store() {
+        // This adapter used to compile the shipped example template into the
+        // binary and parse it here. That template carries placeholder secrets
+        // by design, and the placeholder admin password fails
+        // `validate_admin_handler_passwords`, so `build_state` could never
+        // return `Ok` and the router fell back to the start-up error handler
+        // that answers every request with 503. Nothing caught it because every
+        // other test enters through the `routes_with_settings` parity seam and
+        // never calls this function.
+        //
+        // There is no Spin runtime under `cargo test`, so there are no
+        // component variables to read and this cannot return `Ok` here. What it
+        // must never do again is fail because of a configuration baked into the
+        // binary, so the failure has to be the absence of a config store and
+        // nothing else.
+        let Err(error) = build_state() else {
+            return;
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config store"),
+            "build_state should fail only for want of a config store, got: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("password"),
+            "build_state must not fail on a configuration compiled into the binary, got: {message}"
+        );
+    }
+
+    /// Settings selecting a vendor Edge Cookie provider this adapter does not
+    /// inject, with the `[ec.acme]` block that provider's settings live in.
+    /// `acme` is a fictional vendor key.
+    const UNINJECTED_PROVIDER_TOML: &str = r#"
+        [[handlers]]
+        path = "^/_ts/admin"
+        username = "admin"
+        password = "admin-pass"
+
+        [publisher]
+        domain = "test-publisher.example.com"
+        cookie_domain = ".test-publisher.example.com"
+        origin_url = "https://origin.test-publisher.example.com"
+        proxy_secret = "unit-test-proxy-secret"
+
+        [ec]
+        provider = "acme"
+
+        [ec.acme]
+        endpoint = "https://ec.acme.example.com"
+
+        # An Edge Cookie provider is configured, so single-jurisdiction
+        # operation is acknowledged because no geo provider is selected.
+        [geo]
+        assume_single_jurisdiction = true
+    "#;
+
+    /// The per-request Edge Cookie read must return its error rather than a
+    /// default context.
+    ///
+    /// This adapter used to log the failure and continue with
+    /// `EcContext::default()`, so a deployment whose selected provider could not
+    /// be built served every request with no identity. The call sites propagate
+    /// the error to `http_error`, matching the Fastly adapter. The settings are
+    /// parsed directly, bypassing the composition root's startup check, so the
+    /// per-request behavior can be exercised with a selection the adapter
+    /// cannot supply.
+    #[tokio::test]
+    async fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
+        let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
+            .expect("should parse settings selecting an uninjected provider");
+        let req = request_builder()
+            .method("POST")
+            .uri("https://test-publisher.example.com/auction")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+        let ctx = RequestContext::new(req, PathParams::default());
+        // No resolved provider is threaded here, so the request path resolves
+        // the selection itself, which is what an embedder driving core
+        // directly does and where the loud failure has to stay.
+        let services = build_runtime_services(&ctx, &settings, &Arc::default());
+        let req = ctx.into_request();
+
+        let error = build_ec_context(&settings, &services, &req)
+            .await
+            .expect_err("an unavailable Edge Cookie provider must fail the request");
+
+        assert!(
+            error.to_string().contains("acme"),
+            "the error should name the selected provider, got: {error}"
         );
     }
 

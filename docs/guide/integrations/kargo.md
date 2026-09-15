@@ -28,8 +28,10 @@ Kargo is a mobile-first SSP specializing in high-impact, brand-safe advertising 
 ## Expected Configuration
 
 ```toml
-[integrations.kargo]
-enabled = true
+[integration]
+provider = ["kargo"]
+
+[integration.kargo]
 publisher_id = "your-kargo-publisher-id"
 endpoint = "https://krk.kargo.com"
 timeout_ms = 1000

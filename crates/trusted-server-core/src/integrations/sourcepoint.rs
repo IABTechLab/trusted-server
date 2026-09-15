@@ -170,10 +170,8 @@ static SP_MESSAGE_ORIGIN_GUARD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Configuration for the Sourcepoint first-party proxy.
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct SourcepointConfig {
-    /// Whether the integration is enabled.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// Whether Sourcepoint URLs should be rewritten in HTML.
     #[serde(default = "default_rewrite_sdk")]
     pub rewrite_sdk: bool,
@@ -194,15 +192,7 @@ pub struct SourcepointConfig {
     pub cache_ttl_seconds: u32,
 }
 
-impl IntegrationConfig for SourcepointConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-fn default_enabled() -> bool {
-    false
-}
+impl IntegrationConfig for SourcepointConfig {}
 
 fn default_rewrite_sdk() -> bool {
     true
@@ -751,11 +741,24 @@ fn build(
     Ok(Some(SourcepointIntegration::new(Arc::new(config))))
 }
 
-/// Register the Sourcepoint integration when enabled.
+/// Validates the Sourcepoint configuration for deployment and reports whether
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the Sourcepoint integration is enabled with invalid
+/// Returns an error when the Sourcepoint configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<SourcepointConfig>(SOURCEPOINT_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
+/// Register the Sourcepoint integration when `[integration] provider` names it.
+///
+/// # Errors
+///
+/// Returns an error when the Sourcepoint integration runs with invalid
 /// configuration.
 ///
 /// # Examples
@@ -1087,11 +1090,9 @@ mod tests {
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use crate::test_support::tests::create_test_settings;
-    use serde_json::json;
 
-    fn config(enabled: bool) -> SourcepointConfig {
+    fn config() -> SourcepointConfig {
         SourcepointConfig {
-            enabled,
             rewrite_sdk: true,
             cdn_origin: default_cdn_origin(),
             auth_cookie_name: None,
@@ -1119,7 +1120,7 @@ mod tests {
 
     #[test]
     fn rewrites_cdn_urls_to_first_party_paths() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
             element_name: "script",
@@ -1144,7 +1145,7 @@ mod tests {
 
     #[test]
     fn leaves_non_sourcepoint_urls_unchanged() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
             element_name: "script",
@@ -1393,10 +1394,7 @@ mod tests {
     #[test]
     fn registers_sourcepoint_routes() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(SOURCEPOINT_INTEGRATION_ID, &json!({ "enabled": true }))
-            .expect("should insert config");
+        settings.integration.select(SOURCEPOINT_INTEGRATION_ID);
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -1416,7 +1414,7 @@ mod tests {
 
     #[test]
     fn attribute_rewriter_skips_when_rewrite_disabled() {
-        let mut cfg = config(true);
+        let mut cfg = config();
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));
 
@@ -1454,7 +1452,7 @@ mod tests {
 
     #[test]
     fn head_injector_emits_config_script_plus_trap_when_enabled() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
             request_host: "ts.example.com",
@@ -1515,7 +1513,7 @@ mod tests {
 
     #[test]
     fn head_injector_returns_config_when_rewrite_disabled() {
-        let mut cfg = config(true);
+        let mut cfg = config();
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));
         let document_state = IntegrationDocumentState::default();
@@ -1545,7 +1543,6 @@ mod tests {
     #[test]
     fn rejects_cdn_origin_outside_privacy_mgmt_domain() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "http://169.254.169.254".to_string(),
             auth_cookie_name: None,
@@ -1560,7 +1557,6 @@ mod tests {
     #[test]
     fn rejects_cdn_origin_with_non_http_scheme() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "ftp://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
@@ -1572,7 +1568,6 @@ mod tests {
     #[test]
     fn rejects_cdn_origin_with_different_subdomain() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
@@ -1587,7 +1582,6 @@ mod tests {
     #[test]
     fn rejects_cdn_origin_with_path() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_string(),
             auth_cookie_name: None,
@@ -1602,7 +1596,6 @@ mod tests {
     #[test]
     fn rejects_cdn_origin_with_query() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_string(),
             auth_cookie_name: None,
@@ -1617,7 +1610,6 @@ mod tests {
     #[test]
     fn rejects_cdn_origin_with_fragment() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_string(),
             auth_cookie_name: None,
@@ -1632,7 +1624,6 @@ mod tests {
     #[test]
     fn accepts_valid_cdn_origin() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
@@ -1647,7 +1638,6 @@ mod tests {
     #[test]
     fn accepts_http_cdn_origin() {
         let cfg = SourcepointConfig {
-            enabled: true,
             rewrite_sdk: true,
             cdn_origin: "http://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
@@ -1663,7 +1653,6 @@ mod tests {
     fn accepts_valid_auth_cookie_names() {
         for auth_cookie_name in ["sp_auth", "sp-auth_01"] {
             let cfg = SourcepointConfig {
-                enabled: true,
                 rewrite_sdk: true,
                 cdn_origin: default_cdn_origin(),
                 auth_cookie_name: Some(auth_cookie_name.to_string()),
@@ -1694,7 +1683,6 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             let cfg = SourcepointConfig {
-                enabled: true,
                 rewrite_sdk: true,
                 cdn_origin: default_cdn_origin(),
                 auth_cookie_name: Some(auth_cookie_name.to_string()),
@@ -1786,7 +1774,7 @@ mod tests {
 
     #[test]
     fn copy_headers_sets_x_forwarded_for_from_runtime_client_ip() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let original_req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
         let mut proxy_req = make_req(Method::GET, "https://cdn.privacy-mgmt.com/wrapper.js");
         let client_ip = "203.0.113.10".parse().expect("should parse test IP");
@@ -1807,7 +1795,7 @@ mod tests {
 
     #[test]
     fn copy_headers_forwards_preflight_headers() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut original_req =
             make_req(Method::OPTIONS, "https://publisher.example.com/sourcepoint");
         set_req_header(&mut original_req, "access-control-request-method", "POST");
@@ -1834,7 +1822,7 @@ mod tests {
 
     #[test]
     fn forwards_only_allowlisted_sourcepoint_cookies() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
         set_req_header(
             &mut req,
@@ -1853,7 +1841,7 @@ mod tests {
 
     #[test]
     fn forwards_configured_auth_cookie_name() {
-        let mut cfg = config(true);
+        let mut cfg = config();
         cfg.auth_cookie_name = Some("sp_auth".to_string());
         let integration = SourcepointIntegration::new(Arc::new(cfg));
         let mut req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
@@ -1874,7 +1862,7 @@ mod tests {
 
     #[test]
     fn drops_unrelated_publisher_cookies_from_upstream_request() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
         set_req_header(&mut req, header::COOKIE, "session_id=secret; theme=dark");
 
@@ -1887,7 +1875,7 @@ mod tests {
 
     #[test]
     fn apply_cache_headers_uses_private_no_store_for_cookie_setting_responses() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
         set_header(
             &mut response,
@@ -1907,7 +1895,7 @@ mod tests {
 
     #[test]
     fn apply_cache_headers_uses_private_policy_when_cookies_were_forwarded() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
 
         integration.apply_cache_headers(&mut response, true);
@@ -1921,7 +1909,7 @@ mod tests {
 
     #[test]
     fn apply_cache_headers_uses_public_default_without_forwarded_cookies() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
 
         integration.apply_cache_headers(&mut response, false);
@@ -1936,7 +1924,7 @@ mod tests {
 
     #[test]
     fn rewrite_javascript_response_preserves_headers() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
 
         set_header(&mut response, header::VARY, "Accept-Encoding, Origin");
@@ -1979,7 +1967,7 @@ mod tests {
 
     #[test]
     fn rewrite_javascript_response_uses_private_no_store_for_cookie_setting_responses() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
         set_header(
             &mut response,
@@ -2004,7 +1992,7 @@ mod tests {
 
     #[test]
     fn rewrite_javascript_response_removes_exact_accept_encoding_vary() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
         set_header(&mut response, header::VARY, "Accept-Encoding");
         *response.body_mut() = EdgeBody::from(b"payload".to_vec());
@@ -2019,7 +2007,7 @@ mod tests {
 
     #[test]
     fn rewrite_html_response_preserves_upstream_cache_control() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
         set_header(&mut response, header::CONTENT_ENCODING, "gzip");
         set_header(&mut response, header::CONTENT_LENGTH, "4");
@@ -2047,7 +2035,7 @@ mod tests {
 
     #[test]
     fn rewrite_html_response_uses_private_policy_when_cookies_were_forwarded() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
         *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
@@ -2062,7 +2050,7 @@ mod tests {
 
     #[test]
     fn rewrite_html_response_uses_public_default_without_forwarded_cookies() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
         *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
@@ -2078,7 +2066,7 @@ mod tests {
 
     #[test]
     fn rewrite_html_response_uses_private_no_store_for_cookie_setting_responses() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let integration = SourcepointIntegration::new(Arc::new(config()));
         let mut response = make_resp_with_status(StatusCode::OK);
         set_header(
             &mut response,

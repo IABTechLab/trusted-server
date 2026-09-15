@@ -28,11 +28,8 @@ const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
 
 /// Configuration for Permutive integration.
 #[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct PermutiveConfig {
-    /// Enable/disable the integration
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
     /// Organization ID for Permutive edge CDN (e.g., "myorg" from myorg.edge.permutive.app)
     #[validate(length(min = 1))]
     pub organization_id: String,
@@ -65,11 +62,7 @@ pub struct PermutiveConfig {
     pub rewrite_sdk: bool,
 }
 
-impl IntegrationConfig for PermutiveConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for PermutiveConfig {}
 
 /// Permutive integration implementation.
 pub struct PermutiveIntegration {
@@ -303,11 +296,24 @@ fn build(
     Ok(Some(PermutiveIntegration::new(config)))
 }
 
+/// Validates the Permutive configuration for deployment and reports whether
+/// `[integration] provider` names the integration.
+///
+/// # Errors
+///
+/// Returns an error when the Permutive configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<PermutiveConfig>(PERMUTIVE_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Permutive integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the Permutive integration is enabled with invalid
+/// Returns an error when the Permutive integration runs with invalid
 /// configuration.
 pub fn register(
     settings: &Settings,
@@ -449,10 +455,6 @@ impl IntegrationAttributeRewriter for PermutiveIntegration {
 }
 
 // Default value functions
-fn default_enabled() -> bool {
-    true
-}
-
 fn default_api_endpoint() -> String {
     "https://api.permutive.com".to_string()
 }
@@ -480,7 +482,6 @@ mod tests {
     #[test]
     fn test_permutive_sdk_url_generation() {
         let config = PermutiveConfig {
-            enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: "project-456".to_string(),
@@ -500,7 +501,6 @@ mod tests {
     #[test]
     fn test_permutive_sdk_url_detection() {
         let config = PermutiveConfig {
-            enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: String::new(),
@@ -528,7 +528,6 @@ mod tests {
     #[test]
     fn test_attribute_rewriter_rewrites_sdk_urls() {
         let config = PermutiveConfig {
-            enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: String::new(),
@@ -562,7 +561,6 @@ mod tests {
     #[test]
     fn test_attribute_rewriter_noop_when_disabled() {
         let config = PermutiveConfig {
-            enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: String::new(),
@@ -593,7 +591,7 @@ mod tests {
     #[test]
     fn test_build_requires_config() {
         let settings = create_test_settings();
-        // Without [integrations.permutive] config, should not build
+        // Without [integration.permutive] config, should not build
         assert!(
             build(&settings)
                 .expect("should evaluate integration build")
@@ -605,7 +603,6 @@ mod tests {
     #[test]
     fn test_routes_registration() {
         let config = PermutiveConfig {
-            enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: String::new(),
@@ -638,7 +635,6 @@ mod tests {
         );
         let settings = create_test_settings();
         let integration = PermutiveIntegration::new(PermutiveConfig {
-            enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: String::new(),
@@ -679,7 +675,6 @@ mod tests {
         );
         let settings = create_test_settings();
         let integration = PermutiveIntegration::new(PermutiveConfig {
-            enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: String::new(),
