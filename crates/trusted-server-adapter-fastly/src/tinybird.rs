@@ -409,7 +409,6 @@ mod tests {
             ad_domain: None,
             ad_id: None,
             origin_cache_shareable: None,
-            template_cache_state: None,
             template_cache_bypass_reason: None,
         }
     }

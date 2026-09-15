@@ -1792,21 +1792,19 @@ pub async fn buffer_publisher_response_async(
             }
             let store_outcome = store_template_if_authorized(&mut params, &bytes).await;
             if was_authorized {
-                set_template_cache_response_state(
-                    &mut response,
-                    match (bypasses_shared_template, store_outcome) {
-                        (true, _) => TemplateCacheResponseState::BypassResponse,
-                        (false, Some(TemplateStoreOutcome::Stored)) => {
-                            TemplateCacheResponseState::MissStored
-                        }
-                        (false, Some(TemplateStoreOutcome::Expired)) => {
-                            TemplateCacheResponseState::BypassResponse
-                        }
-                        (false, Some(TemplateStoreOutcome::Error) | None) => {
-                            TemplateCacheResponseState::MissStoreError
-                        }
-                    },
-                );
+                let state = match (bypasses_shared_template, store_outcome) {
+                    (true, _) => TemplateCacheResponseState::BypassResponse,
+                    (false, Some(TemplateStoreOutcome::Stored)) => {
+                        TemplateCacheResponseState::MissStored
+                    }
+                    (false, Some(TemplateStoreOutcome::Expired)) => {
+                        TemplateCacheResponseState::BypassResponse
+                    }
+                    (false, Some(TemplateStoreOutcome::Error) | None) => {
+                        TemplateCacheResponseState::MissStoreError
+                    }
+                };
+                set_template_cache_response_state(&mut response, state);
             }
             let (bytes, assembly_state) = if bypasses_shared_template {
                 (bytes, Some(AssemblyResponseState::ByteSeamFallback))
