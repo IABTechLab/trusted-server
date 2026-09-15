@@ -465,6 +465,57 @@ describe('publisher-native APS runner contract tests', () => {
     expect(document.querySelectorAll('#div-header > iframe')).toHaveLength(1);
   });
 
+  it('renders in an authenticated outer container when GPT owns the container', async () => {
+    document.body.innerHTML =
+      '<div id="fictional-slot-container">' +
+      '<div id="fictional-slot"><span>existing</span></div>' +
+      '<iframe id="publisher-creative"></iframe>' +
+      '</div>';
+    const outer = document.getElementById('fictional-slot-container')!;
+    const source = document.getElementById('publisher-creative') as HTMLIFrameElement;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      source: source.contentWindow,
+      trustedServer: () => true,
+    });
+    const frame = outer.querySelector<HTMLIFrameElement>('iframe[title="Ad content"]');
+    expect(frame).not.toBeNull();
+    nativeRunnerState(frame!).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(outer.children).toHaveLength(1);
+    expect(outer.firstElementChild).toBe(frame);
+  });
+
+  it('renders a dynamic slot prefix in its authenticated outer container', async () => {
+    document.body.innerHTML =
+      '<div id="div-responsive-wide-container">' +
+      '<div id="div-responsive-wide"><span>existing</span></div>' +
+      '<iframe id="publisher-creative"></iframe>' +
+      '</div>';
+    window.tsjs = {
+      adSlots: [{ id: 'responsive-slot', div_id: 'div-responsive-' }],
+    } as typeof window.tsjs;
+    const outer = document.getElementById('div-responsive-wide-container')!;
+    const source = document.getElementById('publisher-creative') as HTMLIFrameElement;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'responsive-slot',
+      renderer: descriptor(),
+      source: source.contentWindow,
+      trustedServer: () => true,
+    });
+    const frame = outer.querySelector<HTMLIFrameElement>('iframe[title="Ad content"]');
+    expect(frame).not.toBeNull();
+    nativeRunnerState(frame!).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(outer.children).toHaveLength(1);
+    expect(outer.firstElementChild).toBe(frame);
+  });
+
   it('uses the requesting frame to resolve a dynamic slot prefix', async () => {
     document.body.innerHTML =
       '<div id="div-header-first"><iframe></iframe></div>' +
