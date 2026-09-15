@@ -91,3 +91,284 @@ fn fixture_server_sees_request_headers_and_cookies() {
         "the cookie and user-agent axes both depend on the fixture seeing request headers"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The probe itself, driven against the fixture origin.
+// ---------------------------------------------------------------------------
+
+use trusted_server_cli::commands::origin::{
+    OriginCommand, ProbeShareabilityArgs, report::ProbeReport, run,
+};
+
+/// A fixture that is shareable on every axis and verdict.
+fn shareable(body: &'static str) -> impl Fn(&support_origin::FixtureRequest) -> FixtureResponse {
+    move |_request| FixtureResponse::html(body).with_header("cache-control", "public, max-age=300")
+}
+
+fn probe(server: &FixtureServer, args: ProbeShareabilityArgs) -> (bool, ProbeReport) {
+    let _ = server;
+    let mut out = Vec::new();
+    let outcome = run(OriginCommand::ProbeShareability(args), &mut out);
+    let rendered = String::from_utf8(out).expect("probe output should be UTF-8");
+    let report: ProbeReport =
+        serde_json::from_str(rendered.trim()).expect("probe should emit parseable JSON");
+    (outcome.is_ok(), report)
+}
+
+fn json_args(server: &FixtureServer) -> ProbeShareabilityArgs {
+    ProbeShareabilityArgs {
+        url: vec![server.url("/article")],
+        repeat: 1,
+        cookie: Vec::new(),
+        vary_header: Vec::new(),
+        json: true,
+    }
+}
+
+fn axis<'a>(
+    report: &'a ProbeReport,
+    name: &str,
+) -> &'a trusted_server_cli::commands::origin::report::AxisResult {
+    let found = report.urls[0].axes.iter().find(|axis| axis.name == name);
+    assert!(found.is_some(), "report should contain the {name} axis");
+    found.expect("should be present, asserted above")
+}
+
+fn verdict<'a>(
+    report: &'a ProbeReport,
+    name: &str,
+) -> &'a trusted_server_cli::commands::origin::report::VerdictResult {
+    let found = report.urls[0]
+        .verdicts
+        .iter()
+        .find(|verdict| verdict.name == name);
+    assert!(found.is_some(), "report should contain the {name} verdict");
+    found.expect("should be present, asserted above")
+}
+
+#[test]
+fn a_shareable_origin_passes_every_axis_and_verdict() {
+    let server = FixtureServer::start(shareable("<html>stable</html>"));
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(
+        ok,
+        "a stable, cookie-independent, freshness-declaring origin must pass: {}",
+        report.render_text()
+    );
+    assert!(report.passed());
+}
+
+#[test]
+fn an_unstable_origin_fails_self_identity_and_exits_non_zero() {
+    let server = FixtureServer::start(|request| {
+        // A per-request timestamp or CSRF nonce looks like this.
+        FixtureResponse::html(format!("<html>{}</html>", request.request_index))
+            .with_header("cache-control", "public, max-age=300")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok, "an unstable origin must exit non-zero");
+    assert!(!axis(&report, "self-identity").passed());
+}
+
+#[test]
+fn a_cookie_personalized_origin_fails_the_cookie_axis() {
+    let server = FixtureServer::start(|request| {
+        let body = if request.has_cookie("ts-ec") {
+            "<html>signed in</html>"
+        } else {
+            "<html>anonymous</html>"
+        };
+        FixtureResponse::html(body).with_header("cache-control", "public, max-age=300")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok);
+    assert!(!axis(&report, "cookie").passed());
+    assert!(
+        axis(&report, "self-identity").passed(),
+        "cookie personalization must not be misreported as instability"
+    );
+}
+
+#[test]
+fn a_user_agent_varying_origin_fails_unless_it_declares_vary() {
+    let undeclared = FixtureServer::start(|request| {
+        let mobile = request
+            .header("user-agent")
+            .is_some_and(|agent| agent.contains("Phone"));
+        FixtureResponse::html(if mobile {
+            "<html>m</html>"
+        } else {
+            "<html>d</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+    });
+    let (ok, report) = probe(&undeclared, json_args(&undeclared));
+    assert!(!ok);
+    assert!(!axis(&report, "user-agent").passed());
+    assert!(
+        !verdict(&report, "vary-coverage").passed,
+        "an undeclared varying axis is exactly what gets cross-served"
+    );
+
+    let declared = FixtureServer::start(|request| {
+        let mobile = request
+            .header("user-agent")
+            .is_some_and(|agent| agent.contains("Phone"));
+        FixtureResponse::html(if mobile {
+            "<html>m</html>"
+        } else {
+            "<html>d</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+        .with_header("vary", "User-Agent")
+    });
+    let (_, declared_report) = probe(&declared, json_args(&declared));
+    assert!(
+        verdict(&declared_report, "vary-coverage").passed,
+        "a declared axis is keyed by the platform cache and is therefore safe"
+    );
+}
+
+#[test]
+fn an_rsc_varying_origin_fails_the_rsc_axis() {
+    // RSC fetches already flow through the readthrough cache while HTML navigations are
+    // passed, so this is the axis specific to removing the bypass.
+    let server = FixtureServer::start(|request| {
+        let body = if request.header("rsc").is_some() {
+            "<html>flight payload</html>"
+        } else {
+            "<html>document</html>"
+        };
+        FixtureResponse::html(body).with_header("cache-control", "public, max-age=300")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok);
+    assert!(!axis(&report, "rsc").passed());
+}
+
+#[test]
+fn gzip_and_identity_are_compared_after_decoding() {
+    use std::io::Write as _;
+
+    let server = FixtureServer::start(|request| {
+        let body = "<html>same document either way</html>";
+        let wants_gzip = request
+            .header("accept-encoding")
+            .is_some_and(|value| value.contains("gzip"));
+        if wants_gzip {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(body.as_bytes())
+                .expect("should gzip the fixture body");
+            let compressed = encoder.finish().expect("should finish gzipping");
+            FixtureResponse::html("")
+                .with_header("content-encoding", "gzip")
+                .with_header("cache-control", "public, max-age=300")
+                .with_body(compressed)
+        } else {
+            FixtureResponse::html(body).with_header("cache-control", "public, max-age=300")
+        }
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(
+        ok,
+        "compressed and identity arms carry the same document, so this must pass: {}",
+        report.render_text()
+    );
+    assert!(axis(&report, "accept-encoding").passed());
+}
+
+#[test]
+fn an_origin_without_freshness_fails_its_verdict() {
+    let server = FixtureServer::start(|_request| FixtureResponse::html("<html>stable</html>"));
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok);
+    assert!(
+        !verdict(&report, "freshness").passed,
+        "readthrough would store this on a platform default where the template cache declines it"
+    );
+}
+
+#[test]
+fn a_private_origin_fails_freshness_even_with_a_max_age() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "private, max-age=300")
+    });
+    let (ok, _) = probe(&server, json_args(&server));
+    assert!(
+        !ok,
+        "an origin that marks HTML private must not be declared shareable"
+    );
+}
+
+#[test]
+fn a_set_cookie_response_fails_its_verdict() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("set-cookie", "sid=abc123; Path=/")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok);
+    assert!(
+        !verdict(&report, "set-cookie").passed,
+        "a cached Set-Cookie is replayed to every later cookieless reader"
+    );
+}
+
+#[test]
+fn a_csp_nonce_response_fails_its_verdict() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("content-security-policy", "script-src 'nonce-r4nd0m'")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok);
+    assert!(!verdict(&report, "csp-nonce").passed);
+}
+
+#[test]
+fn human_output_states_the_limits_and_the_verdict() {
+    let server = FixtureServer::start(shareable("<html>stable</html>"));
+    let mut args = json_args(&server);
+    args.json = false;
+
+    let mut out = Vec::new();
+    let outcome = run(OriginCommand::ProbeShareability(args), &mut out);
+    let rendered = String::from_utf8(out).expect("probe output should be UTF-8");
+
+    assert!(outcome.is_ok());
+    assert!(rendered.contains("VERDICT: shareable"));
+    assert!(
+        rendered.contains("one client address"),
+        "IP-keyed personalization is invisible to this tool and the output must say so"
+    );
+}
+
+#[test]
+fn a_malformed_cookie_argument_is_rejected_before_any_fetch() {
+    let server = FixtureServer::start(shareable("<html>stable</html>"));
+    let mut args = json_args(&server);
+    args.cookie = vec!["not-a-pair".to_owned()];
+
+    let mut out = Vec::new();
+    let outcome = run(OriginCommand::ProbeShareability(args), &mut out);
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        server.request_count(),
+        0,
+        "argument validation should happen before the origin is touched"
+    );
+}
