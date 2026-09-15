@@ -15,12 +15,12 @@ use serde_json::{Map, Value, json};
 
 use crate::auction::demand::{
     CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy, DemandImplementation,
-    DemandResponse, DemandTimeoutDefault, ProviderAuctionInput, RegsPolicy, accept_endpoint,
+    DemandResponse, DemandTimeoutDefault, ProviderAuctionInput, RegsPolicy, RequestExtensions,
+    accept_endpoint,
 };
 use crate::auction::openrtb::extract_standard_response;
 use crate::auction::types::AuctionResponse;
 use crate::error::TrustedServerError;
-use crate::openrtb::OpenRtbRequest;
 use crate::platform::PlatformResponse;
 
 /// The implementation id `[demand]` names.
@@ -97,12 +97,12 @@ impl CompiledDemand for OpenRtbDemand {
 
     fn augment_request(
         &self,
-        request: &mut OpenRtbRequest,
+        extensions: &mut RequestExtensions<'_>,
         _input: &ProviderAuctionInput,
     ) -> Result<(), Report<TrustedServerError>> {
-        request.ext = nonempty_map(self.request_ext.as_object().clone());
-        for imp in &mut request.imp {
-            imp.ext = nonempty_map(self.imp_ext.as_object().clone());
+        *extensions.request = nonempty_map(self.request_ext.as_object().clone());
+        for impression in &mut extensions.impressions {
+            *impression.ext = nonempty_map(self.imp_ext.as_object().clone());
         }
         Ok(())
     }

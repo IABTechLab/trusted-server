@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::test_executor::execute_standard_fixture;
 use super::*;
+use crate::auction::demand::DemandResponse;
 use crate::auction::plan::{
     AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, ProviderId,
 };
@@ -18,11 +19,11 @@ use crate::auction::test_support::{canonical_parity_auction_request, demand_tabl
 use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{ConsentContext, ConsentSource};
-use crate::platform::PlatformHttpClient;
 use crate::platform::test_support::{
     HashMapConfigStore, HashMapSecretStore, NoopHttpClient, StubBackend, StubHttpClient,
     build_services_with_backend_and_http_client, build_services_with_config_secret_and_http_client,
 };
+use crate::platform::{PlatformHttpClient, PlatformResponse};
 use crate::request_signing::RequestSigner;
 
 fn config(implementation: &str, settings: Value) -> AuctionPlanConfig {
@@ -1343,4 +1344,91 @@ fn malformed_top_level_standard_response_is_error() {
         extract_standard_response("fictional_provider", &routed.inputs()[0], &json!([]), 0);
     assert_eq!(response.status, BidStatus::Error);
     assert_eq!(response.metadata["error_type"], "parse_response");
+}
+
+/// A demand implementation that tries to write the extension the driver owns.
+struct ForgingDemand;
+
+#[async_trait::async_trait(?Send)]
+impl CompiledDemand for ForgingDemand {
+    fn field_policy(&self) -> DemandFieldPolicy {
+        DemandFieldPolicy::default()
+    }
+
+    fn augment_request(
+        &self,
+        extensions: &mut RequestExtensions<'_>,
+        _input: &ProviderAuctionInput,
+    ) -> Result<(), Report<TrustedServerError>> {
+        *extensions.request = Some(serde_json::Map::from_iter([(
+            "trusted_server".to_string(),
+            json!({"signature": "forged"}),
+        )]));
+        Ok(())
+    }
+
+    async fn parse_response(
+        &self,
+        context: DemandResponse<'_>,
+        _response: PlatformResponse,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        Ok(AuctionResponse::error(
+            context.provider_id,
+            context.response_time_ms,
+        ))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[test]
+fn the_driver_refuses_an_implementation_that_claims_the_trusted_server_extension() {
+    let (plan, routed) = routed("openrtb", json!({}));
+    let mut provider = plan.providers()[0].clone();
+    provider.demand = Arc::new(ForgingDemand);
+
+    let error = match build_request(
+        &routed.inputs()[0],
+        &routed,
+        &provider,
+        321,
+        &finalization(None),
+    ) {
+        Ok(_) => panic!("should refuse a forged trusted_server extension"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("trusted_server"),
+        "should name the extension the driver owns: {error:?}"
+    );
+}
+
+#[test]
+fn an_implementation_sees_each_impression_beside_the_slot_it_came_from() {
+    let (plan, routed) = routed("prebid_server", json!({}));
+    let request = match build_request(
+        &routed.inputs()[0],
+        &routed,
+        &plan.providers()[0],
+        321,
+        &finalization(None),
+    )
+    .expect("should build the request")
+    {
+        OpenRtbBuildOutcome::Ready(request) => request,
+        OpenRtbBuildOutcome::NoImpressions => panic!("should keep the routed impression"),
+    };
+
+    let slots = routed.inputs()[0].slots();
+    assert_eq!(request.imp.len(), slots.len());
+    for (imp, slot) in request.imp.iter().zip(slots) {
+        assert_eq!(imp.id.as_deref(), Some(slot.slot().id.as_str()));
+        assert!(
+            imp.ext.as_ref().and_then(|ext| ext.get("prebid")).is_some(),
+            "each impression should carry the extension built from its own slot"
+        );
+    }
 }

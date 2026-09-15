@@ -9,16 +9,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::Request;
+use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::auction::demand::{
     CompiledDemand, DemandFieldPolicy, DemandImplementation, DemandResponse, DemandTimeoutDefault,
-    DemandTransport, ProviderAuctionInput, RegsPolicy,
+    DemandTransport, ProviderAuctionInput, RegsPolicy, RequestExtensions,
 };
 use crate::auction::types::AuctionResponse;
 use crate::consent::{ConsentContext, ConsentSource};
@@ -28,7 +27,6 @@ use crate::integrations::prebid::{
     BidParamOverrideEngine, BidParamOverrideRule, apply_prebid_transport_headers,
     compile_profile_override_rules, parse_planned_prebid_response,
 };
-use crate::openrtb::OpenRtbRequest;
 use crate::platform::PlatformResponse;
 
 /// The implementation id `[demand]` names.
@@ -149,15 +147,11 @@ impl CompiledDemand for PrebidServerDemand {
 
     fn augment_request(
         &self,
-        request: &mut OpenRtbRequest,
-        input: &ProviderAuctionInput,
+        extensions: &mut RequestExtensions<'_>,
+        _input: &ProviderAuctionInput,
     ) -> Result<(), Report<TrustedServerError>> {
-        debug_assert_eq!(
-            request.imp.len(),
-            input.slots().len(),
-            "should keep one impression per routed slot"
-        );
-        for (imp, slot) in request.imp.iter_mut().zip(input.slots()) {
+        for impression in &mut extensions.impressions {
+            let slot = impression.slot;
             let bidder = slot
                 .bidder_params()
                 .iter()
@@ -183,7 +177,7 @@ impl CompiledDemand for PrebidServerDemand {
                 !prebid.is_empty(),
                 "should never route a demandless slot to Prebid Server"
             );
-            imp.ext = Some(Map::from_iter([(
+            *impression.ext = Some(Map::from_iter([(
                 "prebid".to_string(),
                 Value::Object(prebid),
             )]));
@@ -193,17 +187,17 @@ impl CompiledDemand for PrebidServerDemand {
             prebid_request.insert("debug".to_string(), Value::Bool(true));
             prebid_request.insert("returnallbidstatus".to_string(), Value::Bool(true));
         }
-        request.ext = Some(Map::from_iter([(
+        *extensions.request = Some(Map::from_iter([(
             "prebid".to_string(),
             Value::Object(prebid_request),
         )]));
         Ok(())
     }
 
-    fn prepare_outbound(&self, outbound: &mut Request<EdgeBody>, transport: DemandTransport<'_>) {
+    fn prepare_outbound(&self, headers: &mut HeaderMap, transport: DemandTransport<'_>) {
         apply_prebid_transport_headers(
             transport.headers,
-            outbound,
+            headers,
             self.consent_forwarding,
             transport.attested_client_ip,
         );

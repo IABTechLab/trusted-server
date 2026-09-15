@@ -1821,16 +1821,17 @@ fn copy_request_headers(
         from.headers().get(header::USER_AGENT),
         from.headers().get(header::REFERER),
         from.headers().get(header::ACCEPT_LANGUAGE),
-        to,
+        to.headers_mut(),
         consent_forwarding,
         client_ip,
     );
 }
 
-/// Apply the common raw-header transport policy for a planned PBS request.
+/// Apply the common raw-header transport policy to a planned PBS request's
+/// outbound headers.
 pub(crate) fn apply_prebid_transport_headers(
     from: &TransportHeaders,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut http::HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -1854,7 +1855,7 @@ fn apply_prebid_header_values(
     user_agent: Option<&HeaderValue>,
     referer: Option<&HeaderValue>,
     accept_language: Option<&HeaderValue>,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut http::HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -1864,23 +1865,21 @@ fn apply_prebid_header_values(
         (header::ACCEPT_LANGUAGE, accept_language),
     ] {
         if let Some(value) = value {
-            to.headers_mut().insert(name, value.clone());
+            to.insert(name, value.clone());
         }
     }
 
     if let Some(ip) = client_ip
         && let Ok(value) = HeaderValue::from_str(&ip.to_string())
     {
-        to.headers_mut()
-            .insert(header::HeaderName::from_static("x-forwarded-for"), value);
+        to.insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
     let Some(cookie_value) = cookie else {
         return;
     };
     if !consent_forwarding.strips_consent_cookies() {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
+        to.insert(header::COOKIE, cookie_value.clone());
         return;
     }
     match cookie_value.to_str() {
@@ -1889,12 +1888,11 @@ fn apply_prebid_header_values(
             if !stripped.is_empty()
                 && let Ok(cookie_header) = HeaderValue::from_str(&stripped)
             {
-                to.headers_mut().insert(header::COOKIE, cookie_header);
+                to.insert(header::COOKIE, cookie_header);
             }
         }
         Err(_) => {
-            to.headers_mut()
-                .insert(header::COOKIE, cookie_value.clone());
+            to.insert(header::COOKIE, cookie_value.clone());
         }
     }
 }
@@ -9013,7 +9011,7 @@ set = { networkId = 42 }
 
         apply_prebid_transport_headers(
             routed.transport_headers(),
-            &mut outbound,
+            outbound.headers_mut(),
             ConsentForwardingMode::OpenrtbOnly,
             routed.attested_client_ip(),
         );

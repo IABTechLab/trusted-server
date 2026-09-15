@@ -14,15 +14,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::{HeaderMap, Request};
+use http::HeaderMap;
 use serde_json::{Map, Value};
 use url::Url;
 
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
-use crate::openrtb::OpenRtbRequest;
 use crate::platform::PlatformResponse;
 
 use super::provider::AuctionProvider;
@@ -113,6 +111,29 @@ pub struct DemandResponse<'a> {
     pub captured: Option<&'a (dyn Any + Send + Sync)>,
 }
 
+/// The extension objects an implementation may add to a request the driver
+/// built, one for the request and one for each impression.
+///
+/// This is the only part of the request an implementation writes. Every
+/// standard field is the driver's, chosen through [`DemandFieldPolicy`], so an
+/// implementation can add what its exchange needs and cannot change what
+/// privacy enforcement decided. The `trusted_server` request extension is the
+/// driver's too, and a request that claims it is refused.
+pub struct RequestExtensions<'a> {
+    /// The request-level `ext` object.
+    pub request: &'a mut Option<Map<String, Value>>,
+    /// The impressions the driver built, each beside the slot it came from.
+    pub impressions: Vec<ImpressionExtension<'a>>,
+}
+
+/// One impression's `ext` object beside the routed slot it was built from.
+pub struct ImpressionExtension<'a> {
+    /// The routed slot, with its bidder parameters and zone.
+    pub slot: &'a ProviderSlotInput,
+    /// The impression's `ext` object.
+    pub ext: &'a mut Option<Map<String, Value>>,
+}
+
 /// The request and response behavior of one selected demand source, compiled
 /// from its `[demand.<name>]` table at startup.
 ///
@@ -148,18 +169,20 @@ pub trait CompiledDemand: Send + Sync {
     /// Returns an error when an extension cannot be built for this request.
     fn augment_request(
         &self,
-        request: &mut OpenRtbRequest,
+        extensions: &mut RequestExtensions<'_>,
         input: &ProviderAuctionInput,
     ) -> Result<(), Report<TrustedServerError>>;
 
-    /// Adjusts the outbound HTTP request before it is sent, for example to
-    /// forward admitted headers.
-    fn prepare_outbound(&self, outbound: &mut Request<EdgeBody>, transport: DemandTransport<'_>) {
-        let _ = (outbound, transport);
+    /// Adds to the outbound headers before the request is sent, for example to
+    /// forward admitted headers. The driver has already set `Content-Type`,
+    /// and `Accept` when the field policy asks for it.
+    fn prepare_outbound(&self, headers: &mut HeaderMap, transport: DemandTransport<'_>) {
+        let _ = (headers, transport);
     }
 
     /// Keeps request-local state the response parser needs, taken from the
-    /// serialized body and the outbound headers.
+    /// serialized body and the outbound headers as they will be sent, after
+    /// [`prepare_outbound`](Self::prepare_outbound) has run.
     fn capture_request(
         &self,
         body: &[u8],

@@ -325,10 +325,19 @@ impl GenericOpenRtbProvider {
         if demand.field_policy().accept_json {
             builder = builder.header(header::ACCEPT, "application/json");
         }
+        if let Some(headers) = builder.headers_mut() {
+            demand.prepare_outbound(
+                headers,
+                DemandTransport {
+                    headers: routed.transport_headers(),
+                    attested_client_ip: routed.attested_client_ip(),
+                },
+            );
+        }
         let captured = builder
             .headers_ref()
             .and_then(|headers| demand.capture_request(&body, headers));
-        let mut outbound =
+        let outbound =
             builder
                 .body(EdgeBody::from(body))
                 .change_context(TrustedServerError::Auction {
@@ -337,13 +346,6 @@ impl GenericOpenRtbProvider {
                         self.provider_name()
                     ),
                 })?;
-        demand.prepare_outbound(
-            &mut outbound,
-            DemandTransport {
-                headers: routed.transport_headers(),
-                attested_client_ip: routed.attested_client_ip(),
-            },
-        );
         let pending = services
             .http_client()
             .send_async(PlatformHttpRequest::new(outbound, backend_name.clone()))

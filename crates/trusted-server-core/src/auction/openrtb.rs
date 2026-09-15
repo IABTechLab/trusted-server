@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use error_stack::Report;
 use serde_json::{Map, Value, json};
 
-use super::demand::{CompiledDemand, DemandFieldPolicy, RegsPolicy};
+use super::demand::{
+    CompiledDemand, DemandFieldPolicy, ImpressionExtension, RegsPolicy, RequestExtensions,
+};
 use super::plan::{NotificationPolicy, ProviderPlan};
 use super::routing::{ProviderAuctionInput, ProviderSlotInput, RoutedAuction, TransportHeaders};
 use super::types::{AdFormat, AuctionResponse, Bid};
@@ -23,6 +25,8 @@ use crate::openrtb::{
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 
 const DEFAULT_CURRENCY: &str = "USD";
+/// The request extension the driver writes and no implementation may claim.
+const TRUSTED_SERVER_EXT_KEY: &str = "trusted_server";
 
 /// Fixed reasons why an upstream bid failed response admission.
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -254,28 +258,61 @@ pub(crate) fn build_request(
 ) -> Result<OpenRtbBuildOutcome, Report<TrustedServerError>> {
     let demand = provider.demand.as_ref();
     let policy = demand.field_policy();
-    let mut request = build_common_request(input, routed, demand, policy, effective_timeout_ms);
+    let (mut request, slot_indices) =
+        build_common_request(input, routed, demand, policy, effective_timeout_ms);
     if request.imp.is_empty() {
         return Ok(OpenRtbBuildOutcome::NoImpressions);
     }
-    demand.augment_request(&mut request, input)?;
+    {
+        // The implementation sees the extension objects and the slot each
+        // impression came from, and nothing else of the request.
+        let OpenRtbRequest { ext, imp, .. } = &mut request;
+        let impressions = imp
+            .iter_mut()
+            .zip(&slot_indices)
+            .map(|(imp, &index)| ImpressionExtension {
+                slot: &input.slots()[index],
+                ext: &mut imp.ext,
+            })
+            .collect();
+        let mut extensions = RequestExtensions {
+            request: ext,
+            impressions,
+        };
+        demand.augment_request(&mut extensions, input)?;
+    }
+    if request
+        .ext
+        .as_ref()
+        .is_some_and(|ext| ext.contains_key(TRUSTED_SERVER_EXT_KEY))
+    {
+        return Err(Report::new(TrustedServerError::Auction {
+            message: format!(
+                "Provider {} set ext.{TRUSTED_SERVER_EXT_KEY}, which only the driver writes",
+                provider.id
+            ),
+        }));
+    }
     finalize_request(&mut request, policy, finalization)?;
     Ok(OpenRtbBuildOutcome::Ready(request))
 }
 
+/// Builds every standard field of the request. The second value holds, for
+/// each impression built, the index of the routed slot it came from.
 fn build_common_request(
     input: &ProviderAuctionInput,
     routed: &RoutedAuction,
     demand: &dyn CompiledDemand,
     policy: DemandFieldPolicy,
     effective_timeout_ms: u32,
-) -> OpenRtbRequest {
+) -> (OpenRtbRequest, Vec<usize>) {
     let common = input.common_request();
-    let imps = input
+    let (slot_indices, imps): (Vec<usize>, Vec<Imp>) = input
         .slots()
         .iter()
-        .filter_map(|slot| build_imp(slot, policy))
-        .collect();
+        .enumerate()
+        .filter_map(|(index, slot)| build_imp(slot, policy).map(|imp| (index, imp)))
+        .unzip();
     let site_domain = demand.site_domain(&common.publisher.domain);
     let page = demand.site_page(common.publisher.page_url.as_deref(), &site_domain);
     let body_consent = demand.body_consent(common.user.consent.as_ref());
@@ -329,7 +366,7 @@ fn build_common_request(
             })
         });
 
-    OpenRtbRequest {
+    let request = OpenRtbRequest {
         id: Some(common.id.clone()),
         imp: imps,
         site: Some(Site {
@@ -356,7 +393,8 @@ fn build_common_request(
         ),
         cur: vec![DEFAULT_CURRENCY.to_string()],
         ..Default::default()
-    }
+    };
+    (request, slot_indices)
 }
 
 fn build_imp(slot: &ProviderSlotInput, policy: DemandFieldPolicy) -> Option<Imp> {
@@ -440,7 +478,7 @@ fn finalize_request(
                 message: format!("Failed to serialize Trusted Server extension: {error}"),
             })
         })?;
-        ext.insert("trusted_server".to_string(), serialized);
+        ext.insert(TRUSTED_SERVER_EXT_KEY.to_string(), serialized);
     }
     Ok(())
 }

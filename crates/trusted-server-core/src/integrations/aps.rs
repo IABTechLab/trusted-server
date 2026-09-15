@@ -21,7 +21,7 @@ use validator::ValidationError;
 
 use crate::auction::demand::{
     CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy, DemandImplementation,
-    DemandResponse, DemandTimeoutDefault, RegsPolicy,
+    DemandResponse, DemandTimeoutDefault, RegsPolicy, RequestExtensions,
 };
 use crate::auction::openrtb::ignored_bidder_params_count;
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
@@ -565,10 +565,10 @@ impl CompiledDemand for ApsDemand {
 
     fn augment_request(
         &self,
-        request: &mut crate::openrtb::OpenRtbRequest,
+        extensions: &mut RequestExtensions<'_>,
         _input: &ProviderAuctionInput,
     ) -> Result<(), Report<TrustedServerError>> {
-        request.ext = Some(serde_json::Map::from_iter([
+        *extensions.request = Some(serde_json::Map::from_iter([
             ("account".to_string(), Json::String(self.account_id.clone())),
             (
                 "sdk".to_string(),
