@@ -1163,11 +1163,12 @@ mod tests {
             .expect("should build draft config");
 
         assert_eq!(draft.js_asset_proxy_candidate_count, 1);
+        let parsed =
+            toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
         assert_eq!(
-            draft
-                .toml
-                .matches("[[integration.js_asset_proxy.assets]]")
-                .count(),
+            parsed["integration"]["js_asset_proxy"]["assets"]
+                .as_array()
+                .map_or(0, Vec::len),
             1,
             "should only emit one candidate entry"
         );
@@ -1246,7 +1247,9 @@ mod tests {
                 .contains("No eligible third-party HTTPS script assets")
         );
         assert!(
-            !draft.toml.contains("[[integration.js_asset_proxy.assets]]"),
+            !draft.toml.lines().any(|line| line
+                .trim_start()
+                .starts_with("[[integration.js_asset_proxy.assets]]")),
             "should not emit asset array entries without candidates"
         );
         let parsed =
