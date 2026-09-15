@@ -18,8 +18,11 @@ datasource.
 **Spec:** `docs/superpowers/specs/2026-09-15-852-template-and-origin-caching-design.md` — read
 "Splitting the predicate" and "Observability" before starting.
 
-**This is PR 1 of 5.** It ships no behavior change. The readthrough gate that consumes
-`origin_response_is_shareable` is PR 5.
+**This is PR 1 of 5.** No change to responses, cache decisions, or the `x-ts-template-cache`
+header — nothing consumes `origin_response_is_shareable` until PR 5, and the predicate split is
+behavior-neutral by construction. The telemetry row shape **does** change: three always-serialized
+fields, which is why the Tinybird migration must land first. Say it that way in the PR description
+rather than "no behavior change", which is only true of the request path.
 
 ---
 
@@ -43,11 +46,36 @@ no cache. Task 5 builds the combined one. Do not attempt Tasks 6–9 before it e
 
 | File                                                  | Responsibility                                                          | Change                                                                                                                                    |
 | ----------------------------------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/trusted-server-core/src/publisher.rs`         | Publisher path; both predicates, the observation, the cache-state local | Predicate functions near `:4325`; observation `:4461`; request-side reason `:4370-4386`; response-side reason `:4776`; state hook `:4825` |
+| `crates/trusted-server-core/src/publisher.rs`         | Publisher path; both predicates, the observation, the cache-state local | Predicate functions near `:4325`; observation `:4461`; request-side reason `:4370-4386`; response-side reason `:4785`; state hook `:4824` |
 | `crates/trusted-server-core/src/auction/telemetry.rs` | Observation context, row schema, NDJSON                                 | 3 fields on `AuctionObservationContext` (`:99`) and `AuctionEventRow` (`:277`); wire `base()` (`:347`)                                    |
 | `tinybird/datasources/auction_events_raw.datasource`  | ClickHouse columns                                                      | Add 3 nullable columns                                                                                                                    |
 | `tinybird/fixtures/auction_events_raw.ndjson`         | Fixture rows                                                            | Add 3 keys to all 8 rows                                                                                                                  |
 | `AGENTS.md`                                           | CI gate list                                                            | Correct it                                                                                                                                |
+
+---
+
+## Task 0: Confirm the approval gate, and know the trim boundary
+
+The spec's Open risks section flags this work specifically:
+
+> **Observability is the largest refactor here and is not in #852.** Turning
+> `AuctionObservationContext` from an immutable snapshot into a mutable accumulator, plus a
+> 35-column schema migration with quarantine risk, sits close to AGENTS.md's "no large refactors
+> without approval". It needs explicit approval before PR 1.
+
+- [ ] **Step 1: Get explicit approval before writing code.** Tasks 2 and 4 are exactly the
+      refactor and the migration named above.
+
+- [ ] **Step 2: If approval is withheld, take the trim instead of abandoning the PR.** The spec's
+      trim is to drop `template_cache_state` — it is already on the `x-ts-template-cache` response
+      header — and keep `template_cache_bypass_reason` and `origin_cache_shareable`, which carry
+      the triage. Concretely that means: **skip Task 9 entirely**, and drop the
+      `template_cache_state` field from Tasks 2, 3 and 4 (struct field, `base()` wiring,
+      datasource column, fixture key). Everything else is unchanged. Task 9 is also the most
+      intricate task in the plan, so the trimmed form is substantially cheaper.
+
+- [ ] **Step 3: Record which form you are building** in the PR description, so a reviewer does not
+      read a missing `template_cache_state` as an oversight.
 
 ---
 
@@ -188,8 +216,9 @@ If shadowing a function name with a local trips clippy, rename the locals to
 
 - [ ] **Step 5: Verify**
 
-Run: `cargo test-fastly -p trusted-server-core`
-Expected: PASS, no newly failing tests. Any template-cache test changing outcome means the
+Run: `cargo test-fastly`
+Expected: PASS, no newly failing tests. (The alias already names all four wasm packages; an
+extra `-p` narrows nothing.) Any template-cache test changing outcome means the
 refactor was not behavior-neutral — revert and re-derive.
 
 Run: `cargo clippy-fastly`
@@ -265,7 +294,8 @@ Add to `AuctionObservationContext` after `slot_count`, before the private `start
     pub template_cache_bypass_reason: Option<String>,
 ```
 
-Initialize all three to `None` in both `from_parts` and `from_auction_request`, and add
+Initialize all three to `None` in `from_parts` only — `from_auction_request` (`:130`) has no
+struct literal; it delegates to `Self::from_parts(...)` at `:146`. Add
 `set_origin_cache_shareable(&mut self, bool)`, `set_template_cache_state(&mut self, &str)`,
 `set_template_cache_bypass_reason(&mut self, &str)`.
 
@@ -382,6 +412,10 @@ In `base()`, after `ad_id: None,`:
 Setting these in `base()` rather than only in `push_summary` means provider and bid rows carry
 them too — three nullable columns, and no per-row joins in the dashboard.
 
+**Flag this in the PR description as a deliberate deviation.** The spec scopes the fields to "the
+auction telemetry summary row". Widening to `base()` is defensible but multiplies the emitted
+payload across every row kind, so it should be a stated choice rather than a silent one.
+
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `cargo test-fastly -- auction::telemetry::tests --nocapture`
@@ -423,8 +457,9 @@ In `SCHEMA >`, after `ad_id` and **before** `event_date`:
   `template_cache_bypass_reason` LowCardinality(Nullable(String)),
 ```
 
-`LowCardinality` matches how `terminal_status` and `terminal_reason` are declared — 9 and 16
-possible values respectively. Do not touch `ENGINE_SORTING_KEY` or the TTL.
+`LowCardinality` matches how `terminal_status` and `terminal_reason` are declared. The two new
+string columns have 9 and 16 possible values respectively (`TemplateCacheResponseState` at `:94`,
+`TemplateCacheBypassReason` at `:5673`), so dictionary encoding is right for both. Do not touch `ENGINE_SORTING_KEY` or the TTL.
 
 - [ ] **Step 2: Update every fixture row**
 
@@ -434,6 +469,8 @@ import json, pathlib
 p = pathlib.Path("tinybird/fixtures/auction_events_raw.ndjson")
 rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
 for i, r in enumerate(rows):
+    # Pre-existing gap: user_agent is declared in the datasource but absent from every row.
+    r.setdefault("user_agent", None)
     r["origin_cache_shareable"] = None
     r["template_cache_state"] = None
     r["template_cache_bypass_reason"] = None
@@ -459,7 +496,13 @@ print(f"ok: {len(rows)} rows match {len(cols)} declared columns")
 PY
 ```
 
-Expected: `ok: 8 rows match 38 declared columns`.
+Expected: `ok: 8 rows match 36 declared columns`.
+
+**The fixture has a pre-existing gap.** Before any change, the datasource declares 33 non-`event_date`
+columns and each fixture row has 32 keys: `user_agent` is declared and absent from every row. The
+verifier above will trip on row 0 until that is fixed. Add `"user_agent": null` to every row in the
+Step 2 script (it is a legitimate nullable column), and note in the commit that it was missing
+beforehand — do not let the implementer chase it as damage from this change.
 
 - [ ] **Step 4: Cross-check the Rust struct against the columns**
 
@@ -515,15 +558,27 @@ In `template_cache_end_to_end_tests`, alongside the existing `services()`:
         }
 ```
 
-`RecordingTelemetrySink` lives at `:13657` in `ssat_cache_policy_tests`. Move it to a shared
-parent-module location rather than duplicating it, and update the original use sites. Check the
-exact builder method name for the sink against `services_with_telemetry` (`:13719`).
+There are three copies of `RecordingTelemetrySink` — `:13657` (`ssat_cache_policy_tests`),
+`:18073` (directly in `mod tests`), `:21402` (`navigation_publisher_domain_tests`). **Do not move
+anything.** The `:18073` copy is already in the shared parent module and is reachable from
+`template_cache_end_to_end_tests` through its `use super::*` (`:8989`). You need only add
+`use crate::auction::telemetry::AuctionTelemetrySink;` for the `Arc<dyn AuctionTelemetrySink>`
+coercion — `mod tests` uses the fully-qualified path at `:18078` and does not import the trait.
+
+The builder method for the sink is exactly `.auction_telemetry_sink(...)`, confirmed against
+`services_with_telemetry` (`:13719`).
 
 - [ ] **Step 2: Add a summary-row accessor**
 
+`RecordingTelemetrySink` has **no accessor** — it is
+`#[derive(Default)] struct RecordingTelemetrySink { batches: Mutex<Vec<AuctionEventBatch>> }`
+(`:18073`) and the trait impl reads the field directly. Read the field:
+
 ```rust
         fn last_summary_row(sink: &RecordingTelemetrySink) -> Option<AuctionEventRow> {
-            sink.batches()
+            sink.batches
+                .lock()
+                .expect("should lock recorded telemetry batches")
                 .iter()
                 .flat_map(AuctionEventBatch::rows)
                 .filter(|row| row.event_kind == "summary")
@@ -532,15 +587,19 @@ exact builder method name for the sink against `services_with_telemetry` (`:1371
         }
 ```
 
-`AuctionEventBatch::rows()` is at `telemetry.rs:401`. Match `RecordingTelemetrySink`'s real
-accessor name for recorded batches.
+`AuctionEventBatch::rows()` returns `&[AuctionEventRow]` (`telemetry.rs:401`), so the
+`flat_map` typechecks and `next_back()` is available on both slice-iterator layers.
 
 - [ ] **Step 3: Add settings that emit a summary row**
 
+`run()` takes `&Arc<Settings>` (`:9471`), not `&Settings`. Both settings helpers below must
+return `Arc<Settings>` — existing tests wrap at the call site (`:9601`); returning the `Arc` from
+the helper is cleaner and keeps every test body in this plan correct as written.
+
 A summary row is emitted only when an auction runs, so the settings need `[auction] enabled =
-true` **and** matching creative-opportunity slots. `ssat_cache_policy_tests` has a
-`settings_with_enabled_auction_and_creative_opportunities`-shaped helper (see the TOML built
-around `:13710`); adapt it into this module rather than hand-rolling a second one.
+true` **and** matching creative-opportunity slots. `ssat_cache_policy_tests` has
+`settings_with_enabled_auction_and_creative_opportunities` at `:13675`; adapt it into this module
+rather than hand-rolling a second one, and have it return `Arc<Settings>`.
 
 Add a cookie-bearing request builder alongside the existing `navigation_request()` (`:9285`):
 
@@ -562,7 +621,7 @@ Add a cookie-bearing request builder alongside the existing `navigation_request(
         async fn harness_emits_a_summary_row_for_an_ad_serving_navigation() {
             let sink = Arc::new(RecordingTelemetrySink::default());
             let services = services_with_cache_and_telemetry(
-                Arc::new(StubHttpClient::default()),
+                Arc::new(StubHttpClient::new()),
                 Arc::new(MemoryTemplateCache::default()),
                 Arc::clone(&sink),
             );
@@ -577,7 +636,7 @@ Add a cookie-bearing request builder alongside the existing `navigation_request(
         }
 ```
 
-Run: `cargo test-fastly -- publisher::tests::harness_emits_a_summary_row --nocapture`
+Run: `cargo test-fastly -- template_cache_end_to_end_tests::harness_emits_a_summary_row --nocapture`
 Expected: PASS. If it fails, fix the harness here — do not carry a broken harness into Task 6,
 where the failure will look like a wiring bug.
 
@@ -599,8 +658,17 @@ be asserted end to end."
 
 - Modify: `crates/trusted-server-core/src/publisher.rs:4461-4468`
 
-The observation is constructed at `:4461`, after `origin_response_is_shareable` at `:4325`, so a
-setter right after construction suffices — no stash variable.
+**Know which binding you are holding.** There are two. `observation` is a plain
+`AuctionObservationContext` value built at `:4461`; `auction_observation` is the
+`Option<AuctionObservationContext>` declared at `:4446`, and `observation` is moved into it at
+`:4511`. So this task sets the field on the **value**, before the move, while Tasks 8 and 9 reach
+the **`Option`** with `as_mut()` because they run after it. The two are not in conflict.
+
+That also means the spec is wrong on this point. Its Observability/Carrier section says the value
+"must be stashed in a local and threaded to the construction site, not written through a setter on
+a binding that does not exist yet". The binding does exist: `origin_response_is_shareable` is known
+at `:4325`, construction is at `:4461`, and a setter immediately after it works. Amend the spec
+rather than following it here.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -609,7 +677,7 @@ setter right after construction suffices — no stash variable.
         async fn navigation_records_whether_the_origin_response_was_shareable() {
             let sink = Arc::new(RecordingTelemetrySink::default());
             let services = services_with_cache_and_telemetry(
-                Arc::new(StubHttpClient::default()),
+                Arc::new(StubHttpClient::new()),
                 Arc::new(MemoryTemplateCache::default()),
                 Arc::clone(&sink),
             );
@@ -629,7 +697,7 @@ setter right after construction suffices — no stash variable.
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test-fastly -- publisher::tests::navigation_records_whether --nocapture`
+Run: `cargo test-fastly -- template_cache_end_to_end_tests::navigation_records_whether --nocapture`
 Expected: FAIL — `origin_cache_shareable` is `None`.
 
 - [ ] **Step 3: Set the field**
@@ -642,12 +710,12 @@ Change the binding at `:4461` to `let mut observation = …` and add immediately
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test-fastly -- publisher::tests::navigation_records_whether --nocapture`
+Run: `cargo test-fastly -- template_cache_end_to_end_tests::navigation_records_whether --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Run the full module**
 
-Run: `cargo test-fastly -p trusted-server-core`
+Run: `cargo test-fastly`
 Expected: PASS. Run the whole module — Viceroy aborts on first panic, so a single-test run hides
 later failures.
 
@@ -749,7 +817,14 @@ pub(crate) fn request_side_bypass_reason(
 ```
 
 `NotShareableRequest` does not exist yet — add it to `TemplateCacheBypassReason` (`:5673`) with
-a `#[display("request is not eligible for a shared template")]`. The four conditions it covers
+a `#[display("request is not eligible for a shared template")]`. Nothing matches exhaustively on
+this enum (zero match arms anywhere; only construction and `Display`), so adding a variant is safe.
+
+**Flag this in the PR description as a deliberate deviation.** The spec says to derive the
+request-side reason "reusing the existing `TemplateCacheBypassReason` variants rather than
+inventing a second vocabulary", and elsewhere states the enum has sixteen variants. A seventeenth
+is within the spirit — it is the same vocabulary — but it contradicts the letter, and the spec's
+count needs updating. The four conditions it covers
 already have distinct `log::debug!` lines and none is a leak vector, so one variant is enough;
 do not add four.
 
@@ -776,7 +851,7 @@ report."
 
 **Files:**
 
-- Modify: `crates/trusted-server-core/src/publisher.rs` — after `:4386`, and the `Err` arm at `:4776`
+- Modify: `crates/trusted-server-core/src/publisher.rs` — after `:4386`, and the `Err` arm at `:4785`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -785,7 +860,7 @@ report."
         async fn cookie_bearing_navigation_records_the_request_side_bypass_reason() {
             let sink = Arc::new(RecordingTelemetrySink::default());
             let services = services_with_cache_and_telemetry(
-                Arc::new(StubHttpClient::default()),
+                Arc::new(StubHttpClient::new()),
                 Arc::new(MemoryTemplateCache::default()),
                 Arc::clone(&sink),
             );
@@ -809,7 +884,7 @@ Copy it exactly.
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test-fastly -- publisher::tests::cookie_bearing_navigation_records --nocapture`
+Run: `cargo test-fastly -- template_cache_end_to_end_tests::cookie_bearing_navigation_records --nocapture`
 Expected: FAIL — reason is `None`.
 
 - [ ] **Step 3: Compute and stash the request-side reason**
@@ -835,7 +910,7 @@ Then in Task 6's block after `:4461`:
 
 - [ ] **Step 4: Add the response-side write**
 
-In the `Err(reason)` arm at `:4776`, before the existing `log::debug!`:
+In the `Err(reason)` arm at `:4785`, before the existing `log::debug!`:
 
 ```rust
             Err(reason) => {
@@ -853,7 +928,7 @@ a request that got a key had no request-side reason to begin with.
 
 - [ ] **Step 5: Run to verify it passes**
 
-Run: `cargo test-fastly -p trusted-server-core`
+Run: `cargo test-fastly`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -872,17 +947,17 @@ hit rate cannot be told apart from an origin misconfiguration."
 
 **Files:**
 
-- Modify: `crates/trusted-server-core/src/publisher.rs` around `:4825`
+- Modify: `crates/trusted-server-core/src/publisher.rs` around `:4824`
 
-There are three `set_template_cache_response_state` call sites — `:1795`, `:2202`, `:4825` — and
-only `:4825` is inside `handle_publisher_request`. The other two are in the finalizer and
+There are three `set_template_cache_response_state` call sites — `:1795`, `:2202`, `:4824` — and
+only `:4824` is inside `handle_publisher_request`. The other two are in the finalizer and
 assembly paths, where the observation has already been moved into `params`. The reachable hook
-is the `template_cache_response_state` local that accumulates from `:4386` to `:4825`.
+is the `template_cache_response_state` local that accumulates from `:4386` to `:4824`.
 
-Because `auction_observation.take()` fires at `:4669`, `:4726`, `:4748`, `:4957` and `:4996` —
-all before `:4825` — the state must be written to the observation **before** whichever take applies, or the row
-carries `None`. Handle it by writing at `:4825` for the paths that reach it, and at the Hit arm
-(`:4617`) for the path that returns early.
+`auction_observation.take()` fires at `:4669`, `:4726` and `:4748` **before** `:4824`, and at
+`:4957` and `:4996` **after** it. Only the first three can rob the write; the last two happen
+later, so their rows do carry the state. Write at `:4824` for the paths that reach it, and at the
+Hit arm (`:4617`) for the path that returns early via `:4669`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -917,12 +992,12 @@ already drives a cold fill then a warm hit and asserts on the header.
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test-fastly -- publisher::tests::template_cache_hit_records_its_state --nocapture`
+Run: `cargo test-fastly -- template_cache_end_to_end_tests::template_cache_hit_records_its_state --nocapture`
 Expected: FAIL — state is `None`.
 
 - [ ] **Step 3: Write at the reachable sites**
 
-At `:4825`, extend the existing block:
+At `:4824`, extend the existing block:
 
 ```rust
     if let Some(state) = template_cache_response_state {
@@ -947,14 +1022,15 @@ change is needed.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test-fastly -- publisher::tests::template_cache_hit_records_its_state --nocapture`
+Run: `cargo test-fastly -- template_cache_end_to_end_tests::template_cache_hit_records_its_state --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Document the known-None paths**
 
-Add a comment above the `:4825` block recording that the abandon paths at `:4726`, `:4748`,
-`:4957` and `:4996` take the observation before this point, so their rows legitimately carry
-`template_cache_state: None`. Without the note a future reader will read it as a bug.
+Add a comment above the `:4824` block recording that the abandon paths at `:4726` and `:4748`
+take the observation before this point, so their rows legitimately carry
+`template_cache_state: None`. Do **not** include `:4957` or `:4996` — they take afterwards and
+their rows do carry the state; naming them would make the comment false. Without the note a future reader will read it as a bug.
 
 Run: `cargo test-fastly && cargo clippy-fastly`
 Expected: PASS, no warnings.
@@ -968,6 +1044,43 @@ git commit -m "Record the terminal template-cache state on the auction observati
 Written beside the response-header stamp so the header and the telemetry
 cannot drift. Abandon paths take the observation earlier and legitimately
 report no state."
+```
+
+---
+
+## Task 11: Write the dashboard caveats
+
+The spec requires these be stated where a dashboard author will read them, and the plan's own
+doc rule is that each item's docs land in that item's PR rather than as a lump. Neither caveat is
+discoverable from the Rust doc comments.
+
+**Files:**
+
+- Modify: `docs/guide/` — wherever auction telemetry / Tinybird consumers are documented. If no
+  such page exists, add the caveats next to the datasource in `tinybird/` as a README rather than
+  inventing a new docs page.
+
+- [ ] **Step 1: Write both gaps**
+  1. **The denominator is ad-serving pageviews, not all requests.** A summary row is emitted only
+     when an auction runs, so a request that bypasses the template cache _because_ the ad stack did
+     not run — bot, prefetch, kill-switched, consent-denied — produces no row at all.
+  2. **`None` is not a miss.** `AuctionObservationContext` is `Clone` and shared with the
+     `/auction` source, where all three fields are structurally `None`. A dashboard that reads
+     `None` as "miss" will be wrong for that whole source class. Filter on
+     `auction_source = 'initial_navigation'` before computing any rate.
+
+- [ ] **Step 2: Format**
+
+Run: `cd docs && ./node_modules/.bin/prettier --check <the file you edited>`
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add <the file you edited>
+git commit -m "Document the two caveats on cache-outcome telemetry
+
+The denominator is ad-serving pageviews, and a null is an unmeasured source
+rather than a cache miss. Both are silent misreadings otherwise."
 ```
 
 ---
@@ -1025,14 +1138,19 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --
 cd docs && npm run format && cd ..
 ```
 
-- [ ] **Confirm no behavior change**
+- [ ] **Confirm the change is confined to the expected files**
 
 ```bash
 git diff main --stat
 ```
 
-Expected: only `publisher.rs`, `auction/telemetry.rs`, the two Tinybird files, and `AGENTS.md`.
-An adapter file appearing means the telemetry struct is leaking into adapter code.
+Expected: only `publisher.rs`, `auction/telemetry.rs`, the two Tinybird files, `AGENTS.md`, and
+the docs touched by Task 11. An adapter file appearing means the telemetry struct is leaking into
+adapter code.
+
+This check confirms _which files changed_, nothing more. Behavior neutrality of the predicate split
+rests on Task 1's `every_shared_input_is_necessary_for_shareability` test and on Task 1 Step 5 —
+any template-cache test changing outcome means the refactor was not neutral.
 
 - [ ] **Apply the Tinybird migration before deploying**
 

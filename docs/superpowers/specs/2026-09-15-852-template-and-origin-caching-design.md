@@ -539,7 +539,9 @@ access log to extend — `tinybird.access_enabled` is explicitly rejected as unw
 
 ### Change
 
-Carry outcomes on the auction telemetry summary row (`auction/telemetry.rs:277`), which
+Carry outcomes on the auction telemetry rows, wired in `AuctionEventRow::base()`
+(`auction/telemetry.rs:347`) so provider and bid rows carry them too rather than the summary
+alone (`AuctionEventRow` is at `:277`), which
 already flows to Tinybird with `publisher_domain` and `page_path`:
 
 - `template_cache_state: Option<String>` — the `TemplateCacheResponseState` string
@@ -553,7 +555,8 @@ one change with real blast radius shipping with zero observability — no way to
 "the readthrough gate is working" from "it is inert".
 
 The bypass reason is the field that carries the triage. `TemplateCacheBypassReason` has
-sixteen variants (`publisher.rs:5673`): "cookie-disqualified" is an expected default, "no
+sixteen variants today (`publisher.rs:5673`), seventeen once the request-side derivation below
+adds one: "cookie-disqualified" is an expected default, "no
 positive freshness" is an origin configuration problem, "vary not covered" is a stale
 `template_cache_vary` list, "malformed cache policy" is a bug. Without it a zero hit rate is
 uninterpretable.
@@ -603,11 +606,17 @@ plan must honor:
   Add them via a setter, not `pub` mutation.
 - There are **five** write points, not one. The hit path moves the observation out and returns
   at `publisher.rs:4669` before `template_cache_ttl` is reached at `:4776`; the `Hit` state is
-  stamped separately at `:2202`; the abandon paths at `:4726` and `:4748` also `take()` early.
-- The fifth is a scope problem a setter alone does not solve. `origin_cache_shareable` is known
-  at ~`:4325`, but `auction_observation` is not declared until `:4446` and is an `Option` that
-  is `None` until an auction is observed. The value must be stashed in a local and threaded to
-  the construction site, not written through a setter on a binding that does not exist yet.
+  stamped separately at `:2202` — which is unreachable from the publisher path, so the usable
+  hook is the `TemplateCacheLookup::Hit` arm at `:4617`; the abandon paths at `:4726` and `:4748`
+  also `take()` early, while `:4957` and `:4996` take _after_ the state write and do carry it.
+- There are two bindings, and which one a write site holds decides the mechanism.
+  `observation` is a plain value built at `:4461`; `auction_observation` is the
+  `Option<AuctionObservationContext>` at `:4446`, and `observation` is moved into it at `:4511`.
+  A write before `:4511` sets the value directly; a write after it goes through
+  `auction_observation.as_mut()`. An earlier revision of this section claimed the value had to be
+  stashed in a local because the binding did not yet exist — that is wrong, and the plan overrules
+  it: `origin_cache_shareable` is known at `:4325` and construction is at `:4461`, so a setter
+  immediately after construction works.
 
 ### Known gaps, to be stated in the dashboard docs
 
