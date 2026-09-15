@@ -137,24 +137,24 @@ pub fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    // Composition root: reject a provider selection this adapter can never
-    // supply, once, before any request is served. The Axum dev server injects
-    // no Edge Cookie provider into `RuntimeServices`, so `None` is exactly what
-    // `EcContext` sees per request; pass the injected provider here as well
-    // once this adapter supplies one.
-    //
-    // This adapter checks rather than keeps what the check resolved, unlike the
-    // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
-    // whose application state is built once at start-up while theirs is rebuilt
-    // for every request. It injects and threads no provider, so `EcContext`
-    // resolves the selection itself on every request, building a fresh built-in
-    // provider that reads no request data. It supplies no host signals either,
-    // so the host-signals argument is `None`.
-    ensure_provider_available(&settings.ec, None, None)?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+
+    // Composition root: reject a provider selection this adapter can never
+    // supply, once, before any request is served. The registry is built first
+    // because a module can supply the Edge Cookie provider the selector names,
+    // and `build_per_request_services` hands that provider to every request, so
+    // the check is given the provider the request path sees.
+    //
+    // This adapter checks rather than keeps what the check resolved, unlike the
+    // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
+    // whose application state is built once at start-up while theirs is rebuilt
+    // for every request, so `EcContext` resolves the selection on every
+    // request. It supplies no host signals, so the host-signals argument is
+    // `None`.
+    ensure_provider_available(&settings.ec, None, registry.ec_provider())?;
     let permission_signal_providers =
         trusted_server_core::permission_signal::build_permission_signal_providers(
             &settings,

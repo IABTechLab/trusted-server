@@ -479,6 +479,32 @@ fn ec_selector_naming_a_module_resolves_that_modules_provider() {
     );
 }
 
+/// `[ec] provider` naming a module starts the adapter, because the startup
+/// check is handed the provider the module declared.
+///
+/// The selector tests around this one build the registry directly, so they
+/// cannot see a startup check in the adapter that runs before the registry
+/// exists and refuses a selection only a module can satisfy.
+#[test]
+fn ec_selector_naming_a_module_starts_the_adapter() {
+    let settings = settings_selecting_module(
+        r#"
+            [ec]
+            provider = "seam_probe"
+
+            [ec.providers.seam_probe]
+        "#,
+    );
+
+    let started = TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()]);
+
+    assert!(
+        started.is_ok(),
+        "the adapter should start with a module's Edge Cookie provider selected: {:?}",
+        started.err()
+    );
+}
+
 /// `[device] provider` naming a module resolves that module's device provider
 /// the same way, so all three capabilities travel one route.
 #[test]
