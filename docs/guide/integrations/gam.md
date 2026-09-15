@@ -20,8 +20,10 @@ The Google Ad Manager (GAM) integration will enable direct integration with Goog
 ## Expected Configuration
 
 ```toml
-[integrations.gam]
-enabled = true
+[integration]
+provider = ["gam"]
+
+[integration.gam]
 publisher_id = "your-publisher-id"
 network_code = "your-network-code"
 endpoint = "https://securepubads.g.doubleclick.net"

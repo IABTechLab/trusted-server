@@ -307,8 +307,10 @@ profile_config = { account_id = "example-aps-account" }
 [auction.bidders.example-server]
 provider = "pbs-main"
 
-[integrations.adserver_mock]
-enabled = true
+[integration]
+provider = ["adserver_mock"]
+
+[integration.adserver_mock]
 endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```
@@ -449,8 +451,10 @@ An external mediation service that receives decoded-price bidder responses and p
 **Mediation response:** Standard OpenRTB with decoded prices and selected winners.
 
 ```toml
-[integrations.adserver_mock]
-enabled = true
+[integration]
+provider = ["adserver_mock"]
+
+[integration.adserver_mock]
 endpoint = "https://your-mediator.example.com/adserver/mediate"
 timeout_ms = 500
 price_floor = 0.50
@@ -735,8 +739,10 @@ allow_script_creatives = false
 [auction.bidders.example-server]
 provider = "pbs-main"
 
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid", "adserver_mock"]
+
+[integration.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -745,8 +751,7 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[integrations.adserver_mock]
-enabled = true
+[integration.adserver_mock]
 endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```
@@ -808,7 +813,7 @@ late response can remain eligible. Local decision and delivery also finish
 after network launch closes, so `timeout_ms` is not a hard wall-clock ceiling
 and an auction can exceed it.
 
-Browser Prebid `timeout_ms` and `debug` stay under `[integrations.prebid]` and
+Browser Prebid `timeout_ms` and `debug` stay under `[integration.prebid]` and
 are independent of all server provider values. Server endpoint, timeout,
 routes, profile debug/test/overrides/consent, and notification suppression do
 not belong to the browser integration.

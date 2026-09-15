@@ -664,7 +664,7 @@ Serves the TSJS (Trusted Server JavaScript) library.
 ```
 
 **Module Selection:**
-All integration modules are built at compile time. At runtime, the server concatenates only the modules whose integrations are enabled in `trusted-server.toml` (or env vars). No rebuild is required to change the module set.
+All integration modules are built at compile time. At runtime, the server concatenates only the modules of the integrations `[integration] provider` names in `trusted-server.toml`. No rebuild is required to change the module set.
 
 ---
 

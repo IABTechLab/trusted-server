@@ -29,8 +29,8 @@ It writes the corresponding first-party cookies when Osano reports ready consent
 Add the following to `trusted-server.toml`:
 
 ```toml
-[integrations.osano]
-enabled = true
+[integration]
+provider = ["osano"]
 ```
 
 No additional server-side settings are required for the initial Osano integration.

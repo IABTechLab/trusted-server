@@ -26,10 +26,10 @@ The integration does not implement:
 ## Configuration
 
 APS server ownership is entirely under an auction provider. The optional
-`[integrations.aps]` table controls browser-side behavior; it does not own the
+`[integration.aps]` table controls browser-side behavior; it does not own the
 APS account, endpoint, timeout, debug behavior, inventory identity, or script
 policy. APS renderer support is registered whenever the compiled auction plan
-contains an `aps` profile, even if `[integrations.aps]` is absent or disabled.
+contains an `aps` profile, even when `[integration] provider` does not name `aps`.
 
 ```toml
 [auction]
@@ -52,20 +52,24 @@ allow_script_creatives = false
 # inventory_domain = "inventory.example.com"
 # inventory_page_origin = "https://www.inventory.example.com"
 
-[integrations.adserver_mock]
-enabled = true
+[integration]
+provider = ["adserver_mock"]
+
+[integration.adserver_mock]
 endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```
 
 The optional browser integration table controls rendering ownership. An absent
-or `enabled = false` block keeps the default trusted-server rendering. The
+or unnamed integration keeps the default trusted-server rendering. The
 renderer route stays registered while an APS provider is in the auction plan,
 and a `rendering_mode` inside a disabled block is ignored:
 
 ```toml
-[integrations.aps]
-enabled = true
+[integration]
+provider = ["aps"]
+
+[integration.aps]
 # Default. Set publisher_native only for the controlled friendly-frame experiment below.
 rendering_mode = "trusted_server"
 ```

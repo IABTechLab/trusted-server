@@ -64,8 +64,8 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
-- `integrations.datadome.server_side_key_secret_name`, when protection is enabled
-- `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
+- `integration.datadome.server_side_key_secret_name`, when protection is enabled
+- `integration.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
 
 Their values belong in the logical `trusted_server_secrets` store and are
@@ -146,21 +146,21 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section               | Purpose                                      |
-| --------------------- | -------------------------------------------- |
-| `[publisher]`         | Domain, origin, proxy settings               |
-| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
-| `[ec]`                | Edge Cookie (EC) ID generation               |
-| `[geo]`               | Which module resolves location, if any       |
-| `[tester_cookie]`     | Optional tester-cookie endpoint              |
-| `[device]`            | Device classification provider selection     |
-| `[geo]`               | Geolocation provider selection               |
-| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
-| `[cache]`             | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
-| `[request_signing]`   | Ed25519 request signing                      |
-| `[auction]`           | Auction orchestration                        |
-| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
+| Section               | Purpose                                       |
+| --------------------- | --------------------------------------------- |
+| `[publisher]`         | Domain, origin, proxy settings                |
+| `[trusted_client_ip]` | Authenticated client-IP forwarding            |
+| `[ec]`                | Edge Cookie (EC) ID generation                |
+| `[geo]`               | Which module resolves location, if any        |
+| `[tester_cookie]`     | Optional tester-cookie endpoint               |
+| `[device]`            | Device classification provider selection      |
+| `[geo]`               | Geolocation provider selection                |
+| `[proxy]`             | Proxy SSRF allowlist and asset routes         |
+| `[cache]`             | Static/rehosted asset cache policy rules      |
+| `[image_optimizer]`   | Reusable Image Optimizer profile sets         |
+| `[request_signing]`   | Ed25519 request signing                       |
+| `[auction]`           | Auction orchestration                         |
+| `[integration]`       | The integrations that run, and their settings |
 
 ## Example: Production Setup
 
@@ -185,8 +185,10 @@ enabled = true
 config_store_id = "01GXXX"
 secret_store_id = "01GYYY"
 
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 client_side_bidders = ["example-browser-bidder"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 
@@ -1088,7 +1090,7 @@ EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
 
 #### `allowed_domains`
 
-**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`. When `integrations.prebid.external_bundle_url` is configured, this list must cover its host and any HTTPS redirect targets.
+**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`. When `integration.prebid.external_bundle_url` is configured, this list must cover its host and any HTTPS redirect targets.
 
 **Behavior**: Trusted Server checks the parsed host before signing a target, before fetching the initial proxy target, and before following each HTTP redirect (301/302/303/307/308). A host that does not match the list is blocked with a 403 error.
 
@@ -1415,44 +1417,55 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
 integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
 
-### Common Fields
+### Naming the integrations that run
 
-All integrations support an `enabled` flag. Defaults vary by integration and only
-apply when the integration section exists in `trusted-server.toml`.
+`[integration] provider` lists the integrations that run, by id:
 
-| Field     | Type    | Description                    |
-| --------- | ------- | ------------------------------ |
-| `enabled` | Boolean | Enable/disable the integration |
+```toml
+[integration]
+provider = ["prebid", "osano"]
+```
+
+An integration runs when, and only when, its id is on that list, and there is
+no second switch inside its own section. The settings it takes, where it takes
+any, go in an `[integration.<id>]` section, and writing one for an integration
+the list does not name fails startup rather than being ignored, as does naming
+an id twice. An integration that takes no settings needs no section at all.
+
+The list is an array, so the `TRUSTED_SERVER__` environment overlay cannot set
+it, because the overlay replaces only scalar leaves that already exist. Edit
+the list in TOML.
 
 ### Prebid Integration
 
-`[integrations.prebid]` owns browser behavior only. Server endpoint, provider
+`[integration.prebid]` owns browser behavior only. Server endpoint, provider
 timeout, routing, profile debug/test controls, consent forwarding, bidder-param
 overrides, and notification suppression belong under `[auction]`.
 
-| Browser field                         | Type          | Default                                                                | Description                                                                    |
-| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `enabled`                             | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
-| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
-| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
-| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
-| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
-| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
-| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
-| `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
-| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                              |
+| Browser field                         | Type          | Default                                                                | Description                                                             |
+| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration       |
+| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout |
+| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug       |
+| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                 |
+| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions              |
+| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server             |
+| `external_bundle_url`                 | String        | Required                                                               | HTTPS publisher-specific Prebid.js bundle URL                           |
+| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                            |
+| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                       |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
-`[integrations.prebid]`. A browser bidder stays client-side only when named in
+`[integration.prebid]`. A browser bidder stays client-side only when named in
 `client_side_bidders` and its adapter is present in the generated bundle.
 
 **Example**:
 
 ```toml
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -1462,7 +1475,7 @@ script_patterns = ["/prebid.js", "/prebid.min.js"]
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["example-browser"]
 
 [auction.providers.pbs-main]
@@ -1493,8 +1506,7 @@ provider = "pbs-main"
 **Environment override**:
 
 ```bash
-env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
-  'TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000' \
+env 'TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=1000' \
   'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
   ts config validate
 ```
@@ -1529,19 +1541,20 @@ win on conflicts.
 
 ### Next.js Integration
 
-**Section**: `[integrations.nextjs]`
+**Section**: `[integration.nextjs]`
 
 | Field                        | Type          | Default                 | Description                   |
 | ---------------------------- | ------------- | ----------------------- | ----------------------------- |
-| `enabled`                    | Boolean       | `false`                 | Enable Next.js integration    |
 | `rewrite_attributes`         | Array[String] | `["href","link","url"]` | Attributes to rewrite         |
 | `max_combined_payload_bytes` | Integer       | `10485760`              | Max combined RSC payload size |
 
 **Example**:
 
 ```toml
-[integrations.nextjs]
-enabled = true
+[integration]
+provider = ["nextjs"]
+
+[integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]
 max_combined_payload_bytes = 10485760
 ```
@@ -1549,42 +1562,32 @@ max_combined_payload_bytes = 10485760
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
+TRUSTED_SERVER__INTEGRATION__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
 
 Edit `rewrite_attributes` in TOML because the overlay cannot replace arrays.
 
 ### Osano Integration
 
-**Section**: `[integrations.osano]`
+**Section**: `[integration.osano]`
 
-| Field     | Type    | Default | Description                             |
-| --------- | ------- | ------- | --------------------------------------- |
-| `enabled` | Boolean | `false` | Enable the Osano browser consent mirror |
+Osano takes no settings, so naming it is the whole configuration.
 
 **Example**:
 
 ```toml
-[integrations.osano]
-enabled = true
-```
-
-**Environment Override**:
-
-```bash
-TRUSTED_SERVER__INTEGRATIONS__OSANO__ENABLED=true
+[integration]
+provider = ["osano"]
 ```
 
 The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
 
 ### Permutive Integration
 
-**Section**: `[integrations.permutive]`
+**Section**: `[integration.permutive]`
 
 | Field                     | Type    | Default                                | Description                      |
 | ------------------------- | ------- | -------------------------------------- | -------------------------------- |
-| `enabled`                 | Boolean | `true`                                 | Enable Permutive integration     |
 | `organization_id`         | String  | Required                               | Permutive organization ID        |
 | `workspace_id`            | String  | Required                               | Permutive workspace ID           |
 | `project_id`              | String  | `""`                                   | Permutive project ID             |
@@ -1596,8 +1599,10 @@ The Osano mirror runs in the browser, so consent cookies it writes are available
 **Example**:
 
 ```toml
-[integrations.permutive]
-enabled = true
+[integration]
+provider = ["permutive"]
+
+[integration.permutive]
 organization_id = "org-12345"
 workspace_id = "ws-67890"
 project_id = "proj-abcde"
@@ -1609,11 +1614,10 @@ rewrite_sdk = true
 
 ### Testlight Integration
 
-**Section**: `[integrations.testlight]`
+**Section**: `[integration.testlight]`
 
 | Field             | Type    | Default                                     | Description                         |
 | ----------------- | ------- | ------------------------------------------- | ----------------------------------- |
-| `enabled`         | Boolean | `true`                                      | Enable Testlight integration        |
 | `endpoint`        | String  | Required                                    | Testlight auction endpoint          |
 | `timeout_ms`      | Integer | `1000`                                      | Request timeout in milliseconds     |
 | `shim_src`        | String  | `/static/tsjs=tsjs-unified.min.js?v=<hash>` | Script source for testlight shim    |
@@ -1622,8 +1626,10 @@ rewrite_sdk = true
 **Example**:
 
 ```toml
-[integrations.testlight]
-enabled = true
+[integration]
+provider = ["testlight"]
+
+[integration.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"
 timeout_ms = 1500
 rewrite_scripts = true
@@ -1698,7 +1704,7 @@ missing leaf is silently ignored.
 
 ::: danger Breaking migration from the provider list
 The former `[auction].providers = ["prebid", ...]` list and server-owned fields
-under `[integrations.prebid]` and `[integrations.aps]` are no longer accepted,
+under `[integration.prebid]` and `[integration.aps]` are no longer accepted,
 even when an integration is disabled. Replace them with provider instances and
 bidder routes before deployment.
 
@@ -1709,7 +1715,7 @@ and each server bidder to `[auction.bidders.<id>]`. Origin-only legacy
 `server_url` values compile to `/openrtb2/auction`; query parameters survive,
 and configured non-root custom endpoint paths remain exact. Browser timeout,
 debug, bundle, script interception, refresh exclusions, and
-`client_side_bidders` remain under `[integrations.prebid]`. Configure timeout or
+`client_side_bidders` remain under `[integration.prebid]`. Configure timeout or
 debug under both owners when both browser and server behavior should retain the
 old value.
 
@@ -1771,8 +1777,10 @@ allow_script_creatives = false
 [auction.bidders.example-server]
 provider = "pbs-main"
 
-[integrations.adserver_mock]
-enabled = true
+[integration]
+provider = ["adserver_mock"]
+
+[integration.adserver_mock]
 endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```

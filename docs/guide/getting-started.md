@@ -157,7 +157,7 @@ only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- browser integrations under `[integrations.*]`;
+- the integrations that run, in `[integration] provider`, with their settings under `[integration.<id>]`;
 - server auction providers under map-shaped `[auction.providers.<id>]`;
 - server bidder routes under `[auction.bidders.<id>]`;
 - KV store mappings;
@@ -166,8 +166,8 @@ Edit `trusted-server.toml` to configure:
 - stable key names for `trusted_server_secrets`.
 
 Do not put a Prebid Server URL or server bidder list under
-`[integrations.prebid]`, and do not put APS account/endpoint/timeout fields under
-`[integrations.aps]`. Those server values belong to auction provider common
+`[integration.prebid]`, and do not put APS account/endpoint/timeout fields under
+`[integration.aps]`. Those server values belong to auction provider common
 fields and `profile_config`.
 
 Before the first push, provision the physical store mapped from logical

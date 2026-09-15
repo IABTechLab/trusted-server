@@ -16,15 +16,17 @@ Prebid is the leading open-source header bidding solution that allows publishers
 
 Prebid configuration has two independent owners:
 
-- `[integrations.prebid]` owns browser Prebid.js behavior: bundle selection and
+- `[integration.prebid]` owns browser Prebid.js behavior: bundle selection and
   injection, browser timeout/debug, account injection, script interception,
   client-side bidders, and refresh exclusions.
 - `[auction.providers.<id>]`, its `profile_config`, `notifications`, and
   `[auction.bidders]` own every Prebid Server request.
 
 ```toml
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -34,7 +36,7 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 # external_bundle_sha256 = "<fictional sha256>"
 # external_bundle_sri = "sha384-<fictional digest>"
 
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["example-browser"]
 user_id_modules = ["sharedIdSystem"]
 
@@ -75,20 +77,19 @@ provider = "pbs-main"
 
 ### Browser configuration options
 
-| Field                                | Default                                                                | Ownership and behavior                                                              |
-| ------------------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `enabled`                            | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider |
-| `account_id`                         | `None`                                                                 | Optional browser-injected account value                                             |
-| `timeout_ms`                         | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
-| `debug`                              | `false`                                                                | Browser Prebid.js debug only                                                        |
-| `client_side_bidders`                | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                    |
-| `excluded_gam_ad_unit_path_suffixes` | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                           |
-| `script_patterns`                    | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                 |
-| `external_bundle_url`                | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains`   |
-| `external_bundle_sha256`             | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                   |
-| `external_bundle_sri`                | `None`                                                                 | Optional SRI metadata                                                               |
-| `bundle.adapters`                    | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                           |
-| `bundle.user_id_modules`             | Generator preset                                                       | Browser User ID modules compiled into the external bundle                           |
+| Field                                | Default                                                                | Ownership and behavior                                                            |
+| ------------------------------------ | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `account_id`                         | `None`                                                                 | Optional browser-injected account value                                           |
+| `timeout_ms`                         | `1000`                                                                 | Browser Prebid.js timeout only                                                    |
+| `debug`                              | `false`                                                                | Browser Prebid.js debug only                                                      |
+| `client_side_bidders`                | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                  |
+| `excluded_gam_ad_unit_path_suffixes` | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                         |
+| `script_patterns`                    | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances               |
+| `external_bundle_url`                | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains` |
+| `external_bundle_sha256`             | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                 |
+| `external_bundle_sri`                | `None`                                                                 | Optional SRI metadata                                                             |
+| `bundle.adapters`                    | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                         |
+| `bundle.user_id_modules`             | Generator preset                                                       | Browser User ID modules compiled into the external bundle                         |
 
 ### Server provider options
 
@@ -141,7 +142,7 @@ and a `prebid-server` provider can exist independently from browser injection.
 ## External Bundle Generation
 
 Use `ts prebid bundle` to build the publisher-specific browser bundle from
-`[integrations.prebid.bundle]` selections:
+`[integration.prebid.bundle]` selections:
 
 ```bash
 ts prebid bundle
@@ -385,7 +386,10 @@ impression or measurement purpose but must not participate in Trusted Server's
 Prebid refresh auction:
 
 ```toml
-[integrations.prebid]
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
 ```
 
@@ -435,7 +439,10 @@ owned by Trusted Server.
 ### Configuration
 
 ```toml
-[integrations.prebid]
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 client_side_bidders = ["example-browser"]
 
 [auction.bidders.example-server]
@@ -458,7 +465,7 @@ npm run build:prebid-external -- \
   --out=dist/prebid
 ```
 
-The generator validates that each adapter exists in `prebid.js/modules/{name}BidAdapter.js`, writes a content-addressed bundle plus `manifest.json`, and reports the SHA-256 and SRI values to copy into `integrations.prebid` config. At runtime, TSJS validates that every bidder in `client_side_bidders` has a registered adapter and logs an error if one is missing.
+The generator validates that each adapter exists in `prebid.js/modules/{name}BidAdapter.js`, writes a content-addressed bundle plus `manifest.json`, and reports the SHA-256 and SRI values to copy into `integration.prebid` config. At runtime, TSJS validates that every bidder in `client_side_bidders` has a registered adapter and logs an error if one is missing.
 
 ::: warning
 Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a regenerated external bundle with the adapter included in `--adapters`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.

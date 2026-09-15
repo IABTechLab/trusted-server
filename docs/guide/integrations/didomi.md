@@ -26,8 +26,10 @@ for the upstream contract.
 Add the integration to the operator-owned `trusted-server.toml`:
 
 ```toml
-[integrations.didomi]
-enabled = true
+[integration]
+provider = ["didomi"]
+
+[integration.didomi]
 geo_query_parameters = true
 # proxy_path = "my-custom-consent"
 # sdk_origin = "https://sdk.privacy-center.org"
@@ -40,13 +42,12 @@ Publish application configuration with:
 ts config push --adapter fastly
 ```
 
-| Field                  | Type    | Required | Default                               | Description                                             |
-| ---------------------- | ------- | -------- | ------------------------------------- | ------------------------------------------------------- |
-| `enabled`              | boolean | No       | `true` in a present integration block | Enables the integration                                 |
-| `geo_query_parameters` | boolean | No       | `false`                               | Enables trusted geo canonicalization for notice loaders |
-| `proxy_path`           | string  | No       | `integrations/didomi/consent`         | Changes the first-party path prefix                     |
-| `sdk_origin`           | string  | No       | `https://sdk.privacy-center.org`      | Changes the SDK origin, primarily for testing           |
-| `api_origin`           | string  | No       | `https://api.privacy-center.org`      | Changes the API origin, primarily for testing           |
+| Field                  | Type    | Required | Default                          | Description                                             |
+| ---------------------- | ------- | -------- | -------------------------------- | ------------------------------------------------------- |
+| `geo_query_parameters` | boolean | No       | `false`                          | Enables trusted geo canonicalization for notice loaders |
+| `proxy_path`           | string  | No       | `integrations/didomi/consent`    | Changes the first-party path prefix                     |
+| `sdk_origin`           | string  | No       | `https://sdk.privacy-center.org` | Changes the SDK origin, primarily for testing           |
+| `api_origin`           | string  | No       | `https://api.privacy-center.org` | Changes the API origin, primarily for testing           |
 
 `geo_query_parameters` is disabled by default for compatibility. It currently
 supports Fastly only because Cloudflare does not expose a trusted region through
@@ -62,8 +63,10 @@ already exists in the TOML input.
 `proxy_path` helps avoid a predictable integration path:
 
 ```toml
-[integrations.didomi]
-enabled = true
+[integration]
+provider = ["didomi"]
+
+[integration.didomi]
 geo_query_parameters = true
 proxy_path = "my-custom-consent"
 ```

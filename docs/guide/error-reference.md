@@ -124,7 +124,6 @@ map keys preserve hyphens, so shell users must invoke the CLI through `env`:
 ```bash
 env 'TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com' \
   'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=1000' \
-  'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
   ts config validate
 ```
 
@@ -238,7 +237,7 @@ Upstream request timeout after 1000ms
 timeout_ms = 2000
 ```
 
-Browser `[integrations.prebid].timeout_ms` is independent and does not control
+Browser `[integration.prebid].timeout_ms` is independent and does not control
 Prebid Server transport.
 
 2. Verify upstream service is responsive:
@@ -300,7 +299,7 @@ Prebid Server returned 400: Invalid OpenRTB request
 profile_config = { debug = true }
 ```
 
-`[integrations.prebid].debug` controls browser Prebid.js only.
+`[integration.prebid].debug` controls browser Prebid.js only.
 
 2. Check logs for request/response details
 3. Verify bidders are supported by your Prebid Server
@@ -335,8 +334,10 @@ Next.js links still pointing to origin domain
 2. Update `rewrite_attributes` to match actual keys:
 
 ```toml
-[integrations.nextjs]
-enabled = true
+[integration]
+provider = ["nextjs"]
+
+[integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]  # Add keys you find
 ```
 
@@ -364,7 +365,10 @@ Failed to fetch Permutive SDK: 404 Not Found
 2. Update configuration:
 
 ```toml
-[integrations.permutive]
+[integration]
+provider = ["permutive"]
+
+[integration.permutive]
 organization_id = "myorg"
 workspace_id = "workspace-123"
 ```
@@ -385,15 +389,15 @@ curl https://myorg.edge.permutive.app/workspace-123-web.js
 No route matched for /integrations/custom/endpoint
 ```
 
-**Cause:** Integration not enabled or route not registered
+**Cause:** `[integration] provider` does not name the integration, or the route is not registered
 
 **Solution:**
 
-1. Enable integration:
+1. Name the integration so it runs:
 
 ```toml
-[integrations.custom]
-enabled = true
+[integration]
+provider = ["custom"]
 ```
 
 2. Verify integration is compiled in (check build logs)
@@ -646,10 +650,13 @@ cargo install viceroy --version 0.17.0 --locked --force
 
 ### Enable Debug Logging
 
-Browser Prebid.js debug remains under `[integrations.prebid]`:
+Browser Prebid.js debug remains under `[integration.prebid]`:
 
 ```toml
-[integrations.prebid]
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 debug = true
 ```
 
