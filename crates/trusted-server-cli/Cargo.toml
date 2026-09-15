@@ -22,6 +22,10 @@ futures = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
+# `ts dev audit headers` fetches origin responses over HTTP. Scoped to host
+# targets (not the repo-default wasm32-wasip1) alongside the other native-only
+# deps so unsupported targets do not try to build reqwest's TLS stack.
+reqwest = { workspace = true, features = ["blocking"] }
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
