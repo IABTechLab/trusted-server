@@ -225,8 +225,8 @@ impl Publisher {
 /// Which integrations run, and the settings each one is given.
 ///
 /// Mapped from the `[integration]` TOML section, which follows the convention
-/// every provider type uses: [`provider`](Self::provider) names what runs, and
-/// a named block holds one provider's settings. Here that block is
+/// every provider type uses, where [`provider`](Self::provider) names what runs
+/// and a named block holds one provider's settings. Here that block is
 /// `[integration.<id>]`, and it is written only for an integration that has
 /// settings to give.
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -244,7 +244,7 @@ pub struct IntegrationSettings {
     ///
     /// The order of the list carries no meaning, because integrations run in
     /// the order their builders are registered. This is unlike
-    /// `[permission_signal] sources`, where the order is the policy.
+    /// `[permission_signal] provider`, where the order is the policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider: Vec<String>,
     #[serde(flatten)]
@@ -3647,7 +3647,7 @@ pub struct AuctionDebugCommentOptions {
     #[serde(default = "default_true")]
     pub include_provider_responses: bool,
 
-    /// Include `ad server_response` when a ad server ran.
+    /// Include `adserver_response` when an ad server ran.
     #[serde(default = "default_true")]
     pub include_adserver_response: bool,
 

@@ -170,6 +170,7 @@ static SP_MESSAGE_ORIGIN_GUARD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Configuration for the Sourcepoint first-party proxy.
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct SourcepointConfig {
     /// Whether Sourcepoint URLs should be rewritten in HTML.
     #[serde(default = "default_rewrite_sdk")]

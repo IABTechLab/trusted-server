@@ -76,7 +76,7 @@ impl AuctionTerminalStatus {
 pub struct AbandonedProviderCall {
     /// Provider name.
     pub provider: String,
-    /// Provider role, usually `bidder` or `ad server`.
+    /// Provider role, usually `bidder` or `adserver`.
     pub provider_role: &'static str,
     /// Optional elapsed time for this provider at abandonment.
     pub response_time_ms: Option<u32>,
@@ -313,7 +313,7 @@ pub struct AuctionEventRow {
     pub winning_bid_count: Option<u16>,
     /// Provider name.
     pub provider: Option<String>,
-    /// `bidder` or `ad server`.
+    /// `bidder` or `adserver`.
     pub provider_role: Option<String>,
     /// Provider-call status.
     pub status: Option<String>,

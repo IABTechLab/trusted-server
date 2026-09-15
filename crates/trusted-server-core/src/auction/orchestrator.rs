@@ -2084,7 +2084,7 @@ impl AuctionOrchestrator {
     /// Collect bid responses from a previously-dispatched auction.
     ///
     /// Runs the select-loop phase (equivalent to Phase 2 of
-    /// `run_providers_parallel`) and, if the orchestrator has a ad server
+    /// `run_providers_parallel`) and, if the orchestrator has an ad server
     /// configured, forwards collected bids to it. The overall auction deadline
     /// is enforced from `dispatched.auction_start`.
     ///
@@ -2338,7 +2338,7 @@ impl AuctionOrchestrator {
         });
         let (adserver_response, winning_bids) = if let Some(adserver) = adserver {
             {
-                // Cap the ad server at whichever is tighter: its own configured
+                // Cap the ad server at whichever is tighter, being its own configured
                 // timeout or the remaining auction budget (A_deadline). Backend
                 // first-byte and between-bytes timeouts bound normal collection, but
                 // they are transport timers rather than absolute wall-clock limits:
@@ -2349,7 +2349,7 @@ impl AuctionOrchestrator {
                 let logical_budget_ms = remaining.min(adserver.timeout_ms());
                 if logical_budget_ms == 0 {
                     log::warn!(
-                        "A_deadline exhausted before adserver '{}' — returning {} SSP bids without an ad server decision",
+                        "A_deadline exhausted before adserver '{}', returning {} SSP bids without an ad server decision",
                         adserver.provider_name(),
                         responses.len(),
                     );
@@ -2367,7 +2367,7 @@ impl AuctionOrchestrator {
                     .canonicalize_transport_timeout_ms(logical_budget_ms, adserver.timeout_ms());
                 if transport_timeout_ms == 0 {
                     log::warn!(
-                        "AdServer '{}' transport budget canonicalized to zero — returning {} SSP bids without an ad server decision",
+                        "AdServer '{}' transport budget canonicalized to zero, returning {} SSP bids without an ad server decision",
                         adserver.provider_name(),
                         responses.len(),
                     );
@@ -3901,7 +3901,7 @@ mod tests {
 
     #[tokio::test]
     async fn adserver_bid_preserves_restored_fields_through_run_auction() {
-        // run_parallel_ad server decision must parse the ad server response via
+        // run_parallel_adserver must parse the ad server response via
         // parse_response_with_context so cache/nurl fields restored from SSP
         // responses survive the synchronous ad server decision path (POST /auction,
         // /_ts/page-bids), matching the dispatched collect path.

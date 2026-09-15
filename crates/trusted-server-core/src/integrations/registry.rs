@@ -3535,7 +3535,7 @@ mod tests {
     #[test]
     fn js_part_is_none_for_an_integration_registered_without_js() {
         // The carried lookup would answer `Some` on its own, so this proves the
-        // without-JS check runs first. No built-in integration can stand in:
+        // without-JS check runs first. No built-in integration can stand in, because
         // the only `without_js` built-in with a Rust registration, `aps`, has
         // no compile-time module either.
         let settings = settings_naming("probe");

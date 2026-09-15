@@ -615,7 +615,8 @@ auction_timeout_ms = 500
 # table the list does not name refuses startup, so a block left behind after an
 # integration is switched off is caught rather than sitting unread. Required
 # fields are noted per table.
-# ======================================================================# [integration.prebid]
+# =============================================================================
+# [integration.prebid]
 # timeout_ms = 1000
 # debug = false
 # client_side_bidders = []          # bidders running via native Prebid.js adapters

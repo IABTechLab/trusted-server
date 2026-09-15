@@ -144,6 +144,7 @@ static GTM_QUOTED_URL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleTagManagerConfig {
     /// GTM Container ID (e.g., "GTM-XXXXXX").
     #[validate(

@@ -1023,7 +1023,7 @@ mod tests {
     fn reduced_aps_bid_avoids_adserver_index_renderer_collision() {
         let provider = AdServerMockProvider::new("adserver_mock", AdServerMockSettings::default());
 
-        // Document why APS must reduce before ad server decision: the ad server index is
+        // Document why APS must reduce before the ad server decision, because the ad server index is
         // intentionally last-write-wins for identical provider/slot/bidder keys.
         let unreduced = AuctionResponse::success(
             "aps",

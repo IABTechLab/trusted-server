@@ -1166,7 +1166,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("should accept {endpoint}: {error:?}"));
         }
         for endpoint in [
-            "http://192.168.0.10:8000/openrtb2/auction",
+            "http://192.0.2.10:8000/openrtb2/auction",
             "http://bid.example/openrtb2/auction",
             "http://localhost.example/openrtb2/auction",
         ] {

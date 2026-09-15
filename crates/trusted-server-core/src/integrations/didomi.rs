@@ -23,6 +23,7 @@ const DIDOMI_DEFAULT_PREFIX: &str = "/integrations/didomi/consent";
 
 /// Configuration for the Didomi consent notice reverse proxy.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct DidomiIntegrationConfig {
     /// Add trusted country and region parameters to notice-loader URLs.
     #[serde(default)]

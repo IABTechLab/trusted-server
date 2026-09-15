@@ -32,6 +32,7 @@ const LOCKR_INTEGRATION_ID: &str = "lockr";
 
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct LockrConfig {
     /// Lockr app ID (from meta tag lockr-signin-app_id)
     #[validate(length(min = 1))]

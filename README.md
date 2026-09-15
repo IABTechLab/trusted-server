@@ -10,14 +10,14 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 
 **[Read the full documentation →](https://iabtechlab.github.io/trusted-server/)**
 
-| Guide                                                                                   | Description                                |
-| --------------------------------------------------------------------------------------- | ------------------------------------------ |
-| [Getting Started](https://iabtechlab.github.io/trusted-server/guide/getting-started)    | Installation and setup                     |
-| [Architecture](https://iabtechlab.github.io/trusted-server/guide/architecture)          | System architecture overview               |
-| [Configuration](https://iabtechlab.github.io/trusted-server/guide/configuration)        | Configuration reference                    |
+| Guide                                                                                        | Description                                                                                     |
+| -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| [Getting Started](https://iabtechlab.github.io/trusted-server/guide/getting-started)         | Installation and setup                                                                          |
+| [Architecture](https://iabtechlab.github.io/trusted-server/guide/architecture)               | System architecture overview                                                                    |
+| [Configuration](https://iabtechlab.github.io/trusted-server/guide/configuration)             | Configuration reference                                                                         |
 | [Configuration Rules](https://iabtechlab.github.io/trusted-server/guide/configuration-rules) | The one syntax every pluggable component shares, and what is checked before a request is served |
-| [Trusted Server CLI](https://iabtechlab.github.io/trusted-server/guide/cli)             | `ts` CLI install and command reference     |
-| [Integrations](https://iabtechlab.github.io/trusted-server/guide/integrations-overview) | Partner integrations (Prebid, Lockr, etc.) |
+| [Trusted Server CLI](https://iabtechlab.github.io/trusted-server/guide/cli)                  | `ts` CLI install and command reference                                                          |
+| [Integrations](https://iabtechlab.github.io/trusted-server/guide/integrations-overview)      | Partner integrations (Prebid, Lockr, etc.)                                                      |
 
 ## Quick Start
 

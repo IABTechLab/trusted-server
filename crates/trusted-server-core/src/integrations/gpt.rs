@@ -63,6 +63,7 @@ const ROUTE_PREFIX: &str = "/integrations/gpt";
 
 /// Configuration for the Google Publisher Tags integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct GptConfig {
     /// Enable page-level `ts=true` delivery attribution in GAM.
     #[serde(default)]

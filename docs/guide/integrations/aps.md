@@ -11,7 +11,7 @@ The integration supports:
 
 - banner impressions;
 - APS OpenRTB requests to the provider's configured HTTPS endpoint;
-- decoded-CPM winner selection with or without an ad server;
+- decoded-CPM winner selection with or without an ad server
 - direct `/auction` rendering;
 - client-side `trustedServer` Prebid adapter auctions through GAM; and
 - initial-navigation and page-bids rendering through GAM/Prebid Universal Creative.

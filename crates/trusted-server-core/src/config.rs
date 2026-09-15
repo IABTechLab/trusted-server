@@ -1424,7 +1424,7 @@ password = "production-admin-password-32-bytes"
     ///
     /// This catches deploy validation ceasing to validate the built-ins. It
     /// cannot catch a builder deleted from `BUILT_IN_BUILDERS`, because the
-    /// loop below reads the same constant the validation walks; no independent
+    /// loop below reads the same constant the validation walks, and no independent
     /// list of the built-ins exists in the crate.
     #[test]
     fn deploy_validation_reaches_every_built_in_builder() {
@@ -1442,6 +1442,33 @@ password = "production-admin-password-32-bytes"
             assert!(
                 validate_settings_for_deploy(&settings).is_err(),
                 "deploy validation should reach the `{id}` builder and reject its planted config"
+            );
+        }
+    }
+
+    /// Every built-in page integration refuses a setting it does not know, so
+    /// a misspelt key in its block fails deploy validation naming the
+    /// integration and the key, rather than being ignored.
+    #[test]
+    fn every_integration_rejects_a_setting_it_does_not_know() {
+        for id in crate::integrations::builders()
+            .iter()
+            .filter(|builder| builder.supplies_integration())
+            .map(IntegrationBuilder::id)
+        {
+            let mut settings = valid_settings();
+            settings
+                .integration
+                .insert_config(id, &serde_json::json!({ "no_such_setting": true }))
+                .expect("should insert the planted block");
+
+            let error = match validate_settings_for_deploy(&settings) {
+                Ok(()) => panic!("`{id}` should refuse a setting it does not know"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                error.contains(id) && error.contains("no_such_setting"),
+                "`{id}` should name itself and the unknown setting: {error}"
             );
         }
     }

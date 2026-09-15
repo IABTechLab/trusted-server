@@ -48,14 +48,14 @@ in `auction::endpoints`, so no demand implementation depends on Fastly types.
 startup and operator validation. It reads `[demand]`, `[adserver]` and
 `[auction.bidders]` and validates:
 
-- demand source and ad server names, which must be snake_case;
-- a settings table its type's `provider` does not select;
-- an `implementation` no builder registered, naming the ones that are;
+- demand source and ad server names, which must be snake_case
+- a settings table its type's `provider` does not select
+- an `implementation` no builder registered, naming the ones that are
 - endpoints, which must be HTTPS or HTTP to a loopback host, with no
-  credentials or fragment;
-- timeouts, routing modes and notification bounds;
-- the settings each implementation accepts, since each one rejects unknown keys;
-- bidder-to-demand ownership; and
+  credentials or fragment
+- timeouts, routing modes and notification bounds
+- the settings each implementation accepts, since each one rejects unknown keys
+- bidder-to-demand ownership, and
 - request-signing structure.
 
 Adapters then call `AuctionPlan::validate_for_target` for backend naming,

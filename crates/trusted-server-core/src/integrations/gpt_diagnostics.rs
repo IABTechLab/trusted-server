@@ -255,7 +255,7 @@ pub fn register(
 ///
 /// This says whether the deployment runs diagnostics at all, rather than the
 /// per-document activation state, so a caller that only needs to know whether
-/// diagnostics could consume a value uses this, while document behaviour uses
+/// diagnostics could consume a value uses this, while document behavior uses
 /// [`GptDiagnosticsRequestDecision::active`].
 /// A configuration that cannot be parsed reads as not running.
 #[must_use]

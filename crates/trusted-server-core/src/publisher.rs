@@ -3059,7 +3059,7 @@ fn rewrite_origin_request(
 /// See [`AuctionContext::request`]: the orchestrator's collect path runs
 /// after `send_async` has already consumed the real client request, so this
 /// context carries a synthetic placeholder. The orchestrator itself
-/// instantiates a fresh placeholder when it actually invokes a ad server —
+/// instantiates a fresh placeholder when it actually invokes an ad server,
 /// this argument is plumbing for the (presently unused) case where the
 /// orchestrator needs the caller's request shape.
 fn make_collect_context<'a>(
@@ -3520,8 +3520,8 @@ pub(crate) fn prepend_auction_debug_comment(
             ),
         );
     }
-    // Only include the ad server response when one actually ran; otherwise the
-    // `ad server=none` on the summary line already conveys it.
+    // Only include the ad server response when one actually ran, because
+    // otherwise `adserver=none` on the summary line already conveys it.
     if options.include_adserver_response
         && let Some(adserver_response) = &result.adserver_response
     {
@@ -7675,7 +7675,7 @@ mod tests {
             comment.contains("dump={\"provider_responses\":"),
             "should dump the provider_responses payload: {comment}"
         );
-        // No ad server ran, so it is omitted (ad server=none already says so).
+        // No ad server ran, so it is omitted (adserver=none already says so).
         assert!(
             !comment.contains("adserver_response"),
             "should omit adserver_response when no adserver ran: {comment}"

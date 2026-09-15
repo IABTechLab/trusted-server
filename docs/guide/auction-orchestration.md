@@ -768,12 +768,12 @@ refused. The ad server is selected separately by `[adserver] provider`.
 Four settings are common to every `[demand.<name>]` table, whichever
 implementation it names:
 
-| Field           | Default                | Meaning                                                        |
-| --------------- | ---------------------- | -------------------------------------------------------------- |
-| `endpoint`      | Required               | Absolute HTTPS endpoint, or HTTP to a loopback host            |
-| `timeout_ms`    | Implementation default | PBS 1000 ms, APS 800 ms, `openrtb` inherits the auction timeout |
+| Field           | Default                | Meaning                                                          |
+| --------------- | ---------------------- | ---------------------------------------------------------------- |
+| `endpoint`      | Required               | Absolute HTTPS endpoint, or HTTP to a loopback host              |
+| `timeout_ms`    | Implementation default | PBS 1000 ms, APS 800 ms, `openrtb` inherits the auction timeout  |
 | `routing`       | `explicit`             | `explicit`, or `all_eligible` where the implementation allows it |
-| `notifications` | No suppression         | Common `nurl`/`burl` suppression by all bids or returned seats |
+| `notifications` | No suppression         | Common `nurl`/`burl` suppression by all bids or returned seats   |
 
 Every other key in the table belongs to the implementation, which rejects any
 key it does not know.

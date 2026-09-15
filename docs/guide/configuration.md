@@ -165,23 +165,23 @@ Seven of these sections are provider types. Each takes a `provider` key and
 gives each selected provider its own `[<type>.<name>]` settings table, as
 [Configuration Rules](/guide/configuration-rules) describes.
 
-| Section                | Provider type | Purpose                                      |
-| ---------------------- | ------------- | -------------------------------------------- |
-| `[publisher]`          | no            | Domain, origin, proxy settings               |
-| `[trusted_client_ip]`  | no            | Authenticated client-IP forwarding           |
-| `[ec]`                 | yes, one      | Edge Cookie (EC) ID generation               |
-| `[geo]`                | yes, one      | Which provider resolves location, if any     |
-| `[device]`             | yes, one      | Device classification                        |
-| `[permission_signal]`  | yes, several  | Which permission signals are acted on, in order |
-| `[demand]`             | yes, several  | The auction's demand sources                 |
-| `[adserver]`           | yes, one      | The ad server that picks the winner          |
-| `[integration]`        | yes, several  | Partner integrations (Prebid, Next.js, etc.) |
-| `[tester_cookie]`      | no            | Optional tester-cookie endpoint              |
-| `[proxy]`              | no            | Proxy SSRF allowlist and asset routes        |
-| `[cache]`              | no            | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]`    | no            | Reusable Image Optimizer profile sets        |
-| `[request_signing]`    | no            | Ed25519 request signing                      |
-| `[auction]`            | no            | Auction orchestration and bidder routes      |
+| Section               | Provider type | Purpose                                         |
+| --------------------- | ------------- | ----------------------------------------------- |
+| `[publisher]`         | no            | Domain, origin, proxy settings                  |
+| `[trusted_client_ip]` | no            | Authenticated client-IP forwarding              |
+| `[ec]`                | yes, one      | Edge Cookie (EC) ID generation                  |
+| `[geo]`               | yes, one      | Which provider resolves location, if any        |
+| `[device]`            | yes, one      | Device classification                           |
+| `[permission_signal]` | yes, several  | Which permission signals are acted on, in order |
+| `[demand]`            | yes, several  | The auction's demand sources                    |
+| `[adserver]`          | yes, one      | The ad server that picks the winner             |
+| `[integration]`       | yes, several  | Partner integrations (Prebid, Next.js, etc.)    |
+| `[tester_cookie]`     | no            | Optional tester-cookie endpoint                 |
+| `[proxy]`             | no            | Proxy SSRF allowlist and asset routes           |
+| `[cache]`             | no            | Static/rehosted asset cache policy rules        |
+| `[image_optimizer]`   | no            | Reusable Image Optimizer profile sets           |
+| `[request_signing]`   | no            | Ed25519 request signing                         |
+| `[auction]`           | no            | Auction orchestration and bidder routes         |
 
 ## Example: Production Setup
 
@@ -264,7 +264,7 @@ TRUSTED_SERVER__SECTION__SUBSECTION__FIELD
 - Separator: `__` (double underscore)
 - Case: UPPERCASE
 - Sections: Match TOML hierarchy
-- Provider names: every provider name is snake_case, so a provider table maps
+- Provider names are snake_case, so a provider table maps
   straight onto a path segment. `[demand.pbs_main] debug` is
   `TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG`.
 
@@ -605,15 +605,15 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 
 ### `[ec]`
 
-| Field                     | Type           | Required | Description                                                                                                                                                                                                                                    |
-| ------------------------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                                                                           |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provider`                | String or null | No       | Name of the active Edge Cookie provider: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or a provider an integration supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration provider needs the `client-fixed-demo` build feature |
-| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                            |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                     |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                            |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                |
-| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                |
+| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                                                                                  |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                                                                       |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                                                                            |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                                                                                   |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                                                                       |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                                                                       |
 
 Each provider that has settings is configured in its own `[ec.<name>]` table, and the `provider` selector names which table is active. A table may set `implementation = "<id>"` to say which provider it configures, which makes the table name a label of your choosing, so `provider = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in provider under a name that means something to your deployment. Provider names and implementation ids are `snake_case`.
 
@@ -715,8 +715,8 @@ Selects how a request is classified into the coarse device signals the Edge Cook
 
 ### `[device]`
 
-| Field      | Type           | Required | Description                                                                                                                                                                         |
-| ---------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Field      | Type           | Required | Description                                                                                                                                                                                                              |
+| ---------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `provider` | String or null | No       | Name of the device-detection provider: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or a provider an integration supplies |
 
 The default `builtin` provider classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `fastly` has settings, so neither needs a `[device.<name>]` table. Selecting a provider this build does not have fails at startup.
@@ -742,7 +742,7 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 
 | Field                        | Type           | Required        | Description                                                                                                                                                                                                      |
 | ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                   | String or null | No              | Name of the geo provider: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or a provider an integration supplies |
+| `provider`                   | String or null | No              | Name of the geo provider: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or a provider an integration supplies                               |
 | `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie provider without a geo provider acknowledges that by setting this to `true`. |
 
 `assume_single_jurisdiction` is a setting of the job rather than of one
@@ -773,8 +773,8 @@ opinion decides.
 
 ### `[permission_signal]`
 
-| Field      | Type          | Required | Description                                                                 |
-| ---------- | ------------- | -------- | --------------------------------------------------------------------------- |
+| Field      | Type          | Required | Description                                                                                                    |
+| ---------- | ------------- | -------- | -------------------------------------------------------------------------------------------------------------- |
 | `provider` | Array[String] | No       | The providers to act on, in order. Omit it to act on every provider this build links, in the order shown below |
 
 The providers that ship are `gpc` (the `Sec-GPC` request header),
@@ -1529,17 +1529,17 @@ demand source timeout, routing, debug and test controls, consent forwarding,
 bidder-param overrides, and notification suppression belong to a `[demand]`
 source with `implementation = "prebid_server"`.
 
-| Browser field                         | Type          | Default                                                                | Description                                                                    |
-| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
-| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout, independent of every demand source timeout          |
-| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag, independent of a demand source's `debug`         |
-| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
-| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
-| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
-| `external_bundle_url`                 | String        | Required                                                               | HTTPS publisher-specific Prebid.js bundle URL                                  |
-| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                              |
+| Browser field                         | Type          | Default                                                                | Description                                                            |
+| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration      |
+| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout, independent of every demand source timeout  |
+| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag, independent of a demand source's `debug` |
+| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                |
+| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions             |
+| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server            |
+| `external_bundle_url`                 | String        | Required                                                               | HTTPS publisher-specific Prebid.js bundle URL                          |
+| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                           |
+| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                      |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
@@ -1881,21 +1881,21 @@ timeout_ms = 500
 Every `[demand.<name>]` table takes these four settings, whichever
 implementation it names:
 
-| Setting          | Required | Default                | Description                                                   |
-| ---------------- | -------- | ---------------------- | ------------------------------------------------------------- |
-| `endpoint`       | Yes      | None                   | Absolute HTTPS URL with a host and no credentials or fragment. Plain HTTP is accepted only to `127.0.0.1`, `::1` or `localhost` |
-| `timeout_ms`     | No       | Implementation default | This source's logical budget before the remaining-auction cap |
-| `routing`        | No       | `explicit`             | `explicit`, or `all_eligible` where the implementation allows it |
-| `notifications`  | No       | No suppression         | Common `nurl`/`burl` suppression after response normalization |
+| Setting         | Required | Default                | Description                                                                                                                     |
+| --------------- | -------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`      | Yes      | None                   | Absolute HTTPS URL with a host and no credentials or fragment. Plain HTTP is accepted only to `127.0.0.1`, `::1` or `localhost` |
+| `timeout_ms`    | No       | Implementation default | This source's logical budget before the remaining-auction cap                                                                   |
+| `routing`       | No       | `explicit`             | `explicit`, or `all_eligible` where the implementation allows it                                                                |
+| `notifications` | No       | No suppression         | Common `nurl`/`burl` suppression after response normalization                                                                   |
 
 Every other key in the table belongs to the implementation, which rejects any
 key it does not know.
 
-| Implementation   | Default timeout    | `all_eligible` | Its own settings                                                                                       |
-| ---------------- | ------------------ | -------------- | ------------------------------------------------------------------------------------------------------ |
-| `openrtb`        | the auction budget | yes            | `request_ext`, `imp_ext`                                                                                 |
-| `prebid_server`  | 1000 ms            | no             | `debug`, `test_mode`, `debug_query_params`, `consent_forwarding`, `bid_param_overrides`, `bid_param_zone_overrides`, `bid_param_override_rules` |
-| `aps`            | 800 ms             | yes            | `account_id` (required), `debug`, `allow_script_creatives`, `inventory_domain`, `inventory_page_origin`, `rendering_mode` |
+| Implementation  | Default timeout    | `all_eligible` | Its own settings                                                                                                                                |
+| --------------- | ------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `openrtb`       | the auction budget | yes            | `request_ext`, `imp_ext`                                                                                                                        |
+| `prebid_server` | 1000 ms            | no             | `debug`, `test_mode`, `debug_query_params`, `consent_forwarding`, `bid_param_overrides`, `bid_param_zone_overrides`, `bid_param_override_rules` |
+| `aps`           | 800 ms             | yes            | `account_id` (required), `debug`, `allow_script_creatives`, `inventory_domain`, `inventory_page_origin`, `rendering_mode`                       |
 
 An explicit `timeout_ms` overrides the implementation default. Runtime uses
 `min(source timeout, auction time remaining)` for launch decisions and OpenRTB
@@ -1925,12 +1925,12 @@ cannot run.
 The one implementation this repository ships is `adserver_mock`, for
 development and testing.
 
-| Setting                | Required | Default | Description                                                  |
-| ---------------------- | -------- | ------- | ------------------------------------------------------------ |
+| Setting                | Required | Default | Description                                                         |
+| ---------------------- | -------- | ------- | ------------------------------------------------------------------- |
 | `endpoint`             | Yes      | None    | Decision endpoint URL, on the same scheme rule as a demand endpoint |
-| `timeout_ms`           | No       | `500`   | Request timeout, 1 to 60000                                  |
-| `price_floor`          | No       | None    | Minimum acceptable CPM                                       |
-| `context_query_params` | No       | `{}`    | Maps auction context keys to decision-URL query parameters   |
+| `timeout_ms`           | No       | `500`   | Request timeout, 1 to 60000                                         |
+| `price_floor`          | No       | None    | Minimum acceptable CPM                                              |
+| `context_query_params` | No       | `{}`    | Maps auction context keys to decision-URL query parameters          |
 
 ```toml
 [adserver]
@@ -2384,7 +2384,7 @@ from the file, and startup checks the rest and runs the first set again.
 - All fields non-empty
 - `origin_url` is a valid URL
 
-**Demand, ad server and bidder routes**:
+**EC Validation**:
 
 - `provider`, when set, is `snake_case` and has the `[ec.<name>]` table its
   implementation needs, and no unselected table is left configured, or startup

@@ -28,6 +28,7 @@ const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
 
 /// Configuration for Permutive integration.
 #[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct PermutiveConfig {
     /// Organization ID for Permutive edge CDN (e.g., "myorg" from myorg.edge.permutive.app)
     #[validate(length(min = 1))]

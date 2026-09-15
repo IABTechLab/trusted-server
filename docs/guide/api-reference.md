@@ -211,11 +211,12 @@ Resolve endpoint for client-side Edge Cookie providers. The page posts a value t
 Unified proxy for resources referenced by creatives (images, scripts, CSS, etc.).
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `tsurl` | string | Yes | Target URL without query parameters (base URL) |
-| `tstoken` | string | Yes | Base64 URL-safe SHA-256 digest of encrypted full target URL |
-| `*` | any | No | Original target URL query parameters (preserved as-is) |
+
+| Parameter | Type   | Required | Description                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+| `tsurl`   | string | Yes      | Target URL without query parameters (base URL)              |
+| `tstoken` | string | Yes      | Base64 URL-safe SHA-256 digest of encrypted full target URL |
+| `*`       | any    | No       | Original target URL query parameters (preserved as-is)      |
 
 **Response:**
 
@@ -253,11 +254,12 @@ curl "https://edge.example.com/first-party/proxy?tsurl=https://ad.doubleclick.ne
 Click tracking redirect endpoint.
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `tsurl` | string | Yes | Target redirect URL without query parameters |
-| `tstoken` | string | Yes | Base64 URL-safe SHA-256 digest of encrypted full target URL |
-| `*` | any | No | Original target URL query parameters |
+
+| Parameter | Type   | Required | Description                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+| `tsurl`   | string | Yes      | Target redirect URL without query parameters                |
+| `tstoken` | string | Yes      | Base64 URL-safe SHA-256 digest of encrypted full target URL |
+| `*`       | any    | No       | Original target URL query parameters                        |
 
 **Response:**
 
@@ -644,9 +646,10 @@ Serves the TSJS (Trusted Server JavaScript) library.
 - `tsjs-unified.min.js`
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `v` | string | No | Cache-busting hash (SHA256 of bundle contents) |
+
+| Parameter | Type   | Required | Description                                    |
+| --------- | ------ | -------- | ---------------------------------------------- |
+| `v`       | string | No       | Cache-busting hash (SHA256 of bundle contents) |
 
 **Response:**
 
@@ -772,15 +775,16 @@ All endpoints use consistent error response format:
 ```
 
 **Common HTTP Status Codes:**
-| Code | Meaning | Common Causes |
-|------|---------|---------------|
-| 400 | Bad Request | Missing required parameters, invalid JSON |
-| 401 | Unauthorized | Missing or invalid basic auth credentials |
-| 403 | Forbidden | Invalid token signature, disabled integration |
-| 404 | Not Found | Unknown endpoint, missing resource |
-| 500 | Internal Server Error | Upstream service failure, configuration error |
-| 502 | Bad Gateway | Backend service unavailable |
-| 504 | Gateway Timeout | Backend service timeout exceeded |
+
+| Code | Meaning               | Common Causes                                 |
+| ---- | --------------------- | --------------------------------------------- |
+| 400  | Bad Request           | Missing required parameters, invalid JSON     |
+| 401  | Unauthorized          | Missing or invalid basic auth credentials     |
+| 403  | Forbidden             | Invalid token signature, disabled integration |
+| 404  | Not Found             | Unknown endpoint, missing resource            |
+| 500  | Internal Server Error | Upstream service failure, configuration error |
+| 502  | Bad Gateway           | Backend service unavailable                   |
+| 504  | Gateway Timeout       | Backend service timeout exceeded              |
 
 ---
 

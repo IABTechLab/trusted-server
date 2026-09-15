@@ -24,6 +24,7 @@ use crate::tsjs;
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
 
 #[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct TestlightConfig {
     #[validate(url)]
     pub endpoint: String,

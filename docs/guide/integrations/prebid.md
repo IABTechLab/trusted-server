@@ -81,19 +81,19 @@ provider = "pbs_main"
 
 ### Browser configuration options
 
-| Field                                | Default                                                                | Ownership and behavior                                                              |
-| ------------------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `account_id`                         | `None`                                                                 | Optional browser-injected account value                                             |
-| `timeout_ms`                         | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
-| `debug`                              | `false`                                                                | Browser Prebid.js debug only                                                        |
-| `client_side_bidders`                | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                    |
-| `excluded_gam_ad_unit_path_suffixes` | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                           |
-| `script_patterns`                    | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                 |
+| Field                                | Default                                                                | Ownership and behavior                                                                  |
+| ------------------------------------ | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `account_id`                         | `None`                                                                 | Optional browser-injected account value                                                 |
+| `timeout_ms`                         | `1000`                                                                 | Browser Prebid.js timeout only                                                          |
+| `debug`                              | `false`                                                                | Browser Prebid.js debug only                                                            |
+| `client_side_bidders`                | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                        |
+| `excluded_gam_ad_unit_path_suffixes` | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                               |
+| `script_patterns`                    | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                     |
 | `external_bundle_url`                | Required                                                               | HTTPS generated bundle URL, whose host and redirects must be in `proxy.allowed_domains` |
-| `external_bundle_sha256`             | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                   |
-| `external_bundle_sri`                | `None`                                                                 | Optional SRI metadata                                                               |
-| `bundle.adapters`                    | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                           |
-| `bundle.user_id_modules`             | Generator preset                                                       | Browser User ID modules compiled into the external bundle                           |
+| `external_bundle_sha256`             | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                       |
+| `external_bundle_sri`                | `None`                                                                 | Optional SRI metadata                                                                   |
+| `bundle.adapters`                    | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                               |
+| `bundle.user_id_modules`             | Generator preset                                                       | Browser User ID modules compiled into the external bundle                               |
 
 ### Demand source options
 

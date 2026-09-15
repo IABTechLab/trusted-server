@@ -34,15 +34,15 @@ setting = "value"
 6. **Secrets are key names.** A secret setting holds the name of a key in
    `trusted_server_secrets`, never the secret itself.
 
-| Type | Runs | `provider` is | Implementations in this repository |
-| --- | --- | --- | --- |
-| `ec` | one | a string | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity |
-| `geo` | one | a string | `platform`, `none`, or an integration that supplies location |
-| `device` | one | a string | `builtin` (the default), `fastly`, or an integration that supplies device signals |
-| `permission_signal` | several, in order | a list | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf` |
-| `demand` | several | a list | `openrtb`, `prebid_server`, `aps` |
-| `adserver` | one | a string | `adserver_mock` |
-| `integration` | several | a list | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` |
+| Type                | Runs              | `provider` is | Implementations in this repository                                                                                                                                    |
+| ------------------- | ----------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ec`                | one               | a string      | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity                                                               |
+| `geo`               | one               | a string      | `platform`, `none`, or an integration that supplies location                                                                                                          |
+| `device`            | one               | a string      | `builtin` (the default), `fastly`, or an integration that supplies device signals                                                                                     |
+| `permission_signal` | several, in order | a list        | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`                                                                                                                        |
+| `demand`            | several           | a list        | `openrtb`, `prebid_server`, `aps`                                                                                                                                     |
+| `adserver`          | one               | a string      | `adserver_mock`                                                                                                                                                       |
+| `integration`       | several           | a list        | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` |
 
 `openrtb`, `prebid_server`, `aps` and `adserver_mock` supply implementations
 only. They are not page integrations and cannot be named in
@@ -59,15 +59,15 @@ partner registry and the cluster thresholds, and `[geo]` holds
 
 ### Leaving `provider` out
 
-| Type | With no `provider` line |
-| --- | --- |
-| `ec` | no Edge Cookie is created |
-| `geo` | no location is resolved and no host geo service is called |
-| `device` | `builtin` runs, which reads the User-Agent only |
-| `permission_signal` | every linked provider runs, in the order shown above |
-| `demand` | no demand source is called |
-| `adserver` | the highest bid wins, with no ad server |
-| `integration` | no integration runs |
+| Type                | With no `provider` line                                   |
+| ------------------- | --------------------------------------------------------- |
+| `ec`                | no Edge Cookie is created                                 |
+| `geo`               | no location is resolved and no host geo service is called |
+| `device`            | `builtin` runs, which reads the User-Agent only           |
+| `permission_signal` | every linked provider runs, in the order shown above      |
+| `demand`            | no demand source is called                                |
+| `adserver`          | the highest bid wins, with no ad server                   |
+| `integration`       | no integration runs                                       |
 
 ## What is checked before a request is served
 
@@ -83,7 +83,7 @@ the two lists say which.
 - A selected provider that needs a setting its table does not give, such as
   `hmac` with no `passphrase`.
 - A setting a provider does not know. Every provider rejects unknown keys, so
-  a misspelt setting fails instead of being ignored.
+  a misspelled setting fails instead of being ignored.
 - A name that is not snake_case, or a name selected twice.
 - A key in a type's table that is neither `provider`, one of that type's own
   settings, nor a named provider table.
@@ -105,8 +105,9 @@ implementations compiled into the CLI.
   host, timeouts, routing modes, notification bounds, a bidder route naming a
   demand source `[demand] provider` does not select, and any setting the
   chosen implementation rejects.
-- Every integration's own settings, selected or not, so a typo in a block that
-  is switched off is still caught.
+- Every selected integration's own settings, and the refusal of a block for an
+  integration `[integration] provider` does not name, of an `enabled` key left
+  behind in a block, and of the removed `[integrations]` table.
 - Every secret setting holding a non-empty key name rather than a value, with a
   secret store declared to hold it.
 - Basic-auth coverage of the admin namespace, and the placeholder values the
@@ -125,7 +126,9 @@ loaded, and these join it.
   four will start.** Start an instance on the new configuration to find out.
 - Assembling the integration registry, which is where a module that supplies an
   identity, location or device provider is matched to the type that selected
-  it. A module declaring a provider no type selects is reported here.
+  it, and where an `[integration] provider` entry no builder in this build
+  supplies is refused. A module declaring an identity or device provider that
+  no type selects is logged as a warning here.
 - The resolved secret values, which a key name alone cannot show. A weak or
   placeholder password fails here.
 - The compiled `permissions.yaml` policy, and the acknowledgment an Edge
@@ -139,15 +142,15 @@ loaded, and these join it.
 The other tables configure Trusted Server itself rather than choose a provider.
 They keep their own keys and have no `provider` line.
 
-| Table | Configures |
-| --- | --- |
-| `[publisher]` | the site, its origin and the proxy secret |
-| `[auction]` | whether auctions run, the whole-auction timeout and creative handling |
-| `[auction.bidders.<code>]` | which demand provider a browser bidder code is sent to |
-| `[creative_opportunities]` | server-rendered ad slots |
-| `[proxy]`, `[cache]`, `[rewrite]` | first-party proxying, caching and URL rewriting |
-| `[request_signing]`, `[trusted_client_ip]`, `[[handlers]]` | signing, client addresses and admin access |
-| `[debug]`, `[tinybird]` | diagnostics and telemetry |
+| Table                                                      | Configures                                                            |
+| ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| `[publisher]`                                              | the site, its origin and the proxy secret                             |
+| `[auction]`                                                | whether auctions run, the whole-auction timeout and creative handling |
+| `[auction.bidders.<code>]`                                 | which demand provider a browser bidder code is sent to                |
+| `[creative_opportunities]`                                 | server-rendered ad slots                                              |
+| `[proxy]`, `[cache]`, `[rewrite]`                          | first-party proxying, caching and URL rewriting                       |
+| `[request_signing]`, `[trusted_client_ip]`, `[[handlers]]` | signing, client addresses and admin access                            |
+| `[debug]`, `[tinybird]`                                    | diagnostics and telemetry                                             |
 
 ## Why the file works this way
 
@@ -157,7 +160,7 @@ question "what runs, and how is it set up" is answered the same way, in the
 same place. A change reads plainly in review, because switching a provider is
 a change to one `provider` line. And mistakes are caught when the
 configuration is validated or the server starts, not when a visitor's request
-takes an unexpected path. A leftover table, a misspelt setting or a name the
+takes an unexpected path. A leftover table, a misspelled setting or a name the
 build does not know all stop the deployment with a message that names the
 fix.
 
@@ -269,17 +272,17 @@ endpoint = "https://house.example.com/openrtb2/auction"
 
 ## Moving from the previous layout
 
-| Previous | Now |
-| --- | --- |
-| `[integrations.<id>]` with `enabled = true` | `<id>` in `[integration] provider`, and `[integration.<id>]` only for settings |
-| `[ec.providers.<name>]` | `[ec.<name>]` |
-| `[permission_signal] sources` | `[permission_signal] provider` |
-| `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `us-privacy` | `host_signals`, `client_fixed`, `gpp_sale_opt_out`, `us_privacy` |
+| Previous                                                                   | Now                                                                                                 |
+| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `[integrations.<id>]` with `enabled = true`                                | `<id>` in `[integration] provider`, and `[integration.<id>]` only for settings                      |
+| `[ec.providers.<name>]`                                                    | `[ec.<name>]`                                                                                       |
+| `[permission_signal] sources`                                              | `[permission_signal] provider`                                                                      |
+| `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `us-privacy`           | `host_signals`, `client_fixed`, `gpp_sale_opt_out`, `us_privacy`                                    |
 | `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config` | `[demand] provider` and `[demand.<name>]`, with `implementation` and the settings flat in the table |
-| `profile = "standard"` | `implementation = "openrtb"` |
-| `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]` | `[adserver] provider = "adserver_mock"` and `[adserver.adserver_mock]` |
-| `[integrations.aps] rendering_mode` | `rendering_mode` in the `[demand.<name>]` table of the `aps` provider |
-| `[debug.auction_html_comment_options] include_mediator_response` | `include_adserver_response` |
+| `profile = "standard"`                                                     | `implementation = "openrtb"`                                                                        |
+| `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`  | `[adserver] provider = "adserver_mock"` and `[adserver.adserver_mock]`                              |
+| `[integrations.aps] rendering_mode`                                        | `rendering_mode` in the `[demand.<name>]` table of the `aps` provider                               |
+| `[debug.auction_html_comment_options] include_mediator_response`           | `include_adserver_response`                                                                         |
 
 The word mediator is gone with it. It is "ad server" in prose and `adserver`
 in configuration, and the auction response metadata that read

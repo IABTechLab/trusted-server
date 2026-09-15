@@ -158,14 +158,14 @@ pub struct AuctionContext<'a> {
     /// for transport timers while retaining `timeout_ms` for logical policy.
     pub transport_timeout_ms: u32,
     /// Provider responses from the bidding phase, used by ad servers.
-    /// This is `None` for regular bidders and `Some` when calling a ad server.
+    /// This is `None` for regular bidders and `Some` when calling an ad server.
     pub provider_responses: Option<&'a [AuctionResponse]>,
     /// Platform services (config store, secret store, etc.) for use by providers.
     pub services: &'a RuntimeServices,
 }
 
-/// URL used by the orchestrator when invoking a ad server from the collect
-/// path. Providers can `debug_assert` against this value to catch a ad server
+/// URL used by the orchestrator when invoking an ad server from the collect
+/// path. Providers can `debug_assert` against this value to catch an ad server
 /// that has accidentally started depending on `context.request` carrying real
 /// client headers.
 pub const MEDIATOR_PLACEHOLDER_URL: &str = "https://placeholder.invalid/";
