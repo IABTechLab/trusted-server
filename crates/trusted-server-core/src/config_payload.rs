@@ -840,7 +840,7 @@ mod tests {
     fn resolves_the_host_signals_passphrase_from_the_mapped_store() {
         let mut original = test_settings();
         original.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
-            "host-signals",
+            "host_signals",
         ));
         original.ec.providers.hmac = None;
         original.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
@@ -852,7 +852,7 @@ mod tests {
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
         )
-        .expect("should resolve the host-signals passphrase from the mapped store");
+        .expect("should resolve the host_signals passphrase from the mapped store");
 
         assert_eq!(
             reconstructed
@@ -869,7 +869,7 @@ mod tests {
     fn runtime_validation_rejects_a_short_resolved_host_signals_passphrase() {
         let mut settings = test_settings();
         settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
-            "host-signals",
+            "host_signals",
         ));
         settings.ec.providers.hmac = None;
         settings.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
@@ -877,7 +877,7 @@ mod tests {
         });
 
         let err = load_settings(&envelope_json(&settings))
-            .expect_err("should reject a short resolved host-signals passphrase");
+            .expect_err("should reject a short resolved host_signals passphrase");
 
         assert!(
             err.to_string().contains("short_passphrase"),

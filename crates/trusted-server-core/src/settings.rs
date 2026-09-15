@@ -20,7 +20,10 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
-use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
+use crate::ec::provider::{
+    EcProviderSelection, HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY,
+    RETIRED_HOST_SIGNALS_PROVIDER_KEY,
+};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -678,13 +681,18 @@ impl Ec {
     /// stateless. When no provider is selected, Trusted Server runs statelessly
     /// and this check passes.
     ///
+    /// The host-signal provider's old name, `host-signals`, is refused here
+    /// before any block is looked for, so an operator whose configuration
+    /// still carries that spelling is told the name to write instead.
+    ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when the selected
-    /// provider's `[ec.providers.<key>]` block is absent, when a provider block
-    /// is configured with no selector or alongside `"none"`, or when a
-    /// configured block is not the selected one. Any selector name is accepted
-    /// so long as its block is present, so there is no unknown-key check.
+    /// Returns [`TrustedServerError::Configuration`] when the selector is the
+    /// old `host-signals` spelling, when the selected provider's
+    /// `[ec.providers.<key>]` block is absent, when a provider block is
+    /// configured with no selector or alongside `"none"`, or when a configured
+    /// block is not the selected one. Any other selector name is accepted so
+    /// long as its block is present, so there is no unknown-key check.
     pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
         let Some(selection) = self.provider.as_ref() else {
             if !self.providers.is_empty() {
@@ -713,11 +721,28 @@ impl Ec {
             return Ok(());
         };
 
+        let key = key.as_str();
+
+        // The old spelling of the host-signal provider's name is refused
+        // before any other question is asked. A block left behind under the
+        // old name is captured as a vendor block, so without the refusal the
+        // old selector would find that block, pass the block check below, and
+        // fail later in provider resolution with a message about an adapter
+        // that supplies no such provider.
+        if key == RETIRED_HOST_SIGNALS_PROVIDER_KEY {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[ec] provider = \"host-signals\" is no longer accepted. The \
+                          host-signal provider is now named \"host_signals\", so set [ec] \
+                          provider = \"host_signals\" and rename its block to \
+                          [ec.providers.host_signals]"
+                    .to_owned(),
+            }));
+        }
+
         // Every provider is configured by the `[ec.providers.<key>]` block that
         // carries its own name, so the check is the same lookup for all of
         // them. A provider the adapter injects has the contents of its block
         // validated by that adapter when it builds the provider.
-        let key = key.as_str();
         if !self.providers.has_block(key) {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -817,10 +842,10 @@ pub struct EcProviders {
     #[serde(default)]
     pub hmac: Option<HmacProviderConfig>,
 
-    /// The built-in host-signal provider, keyed `host-signals`. Creates the Edge
+    /// The built-in host-signal provider, keyed `host_signals`. Creates the Edge
     /// Cookie from the host's TLS and HTTP/2 signals plus the client IP, so it
     /// requires a host that supplies those signals.
-    #[serde(default, rename = "host-signals")]
+    #[serde(default)]
     pub host_signals: Option<HostSignalsProviderConfig>,
 
     /// Configuration blocks for vendor or host providers that live in their own
@@ -836,13 +861,15 @@ pub struct EcProviders {
 /// Validates each built-in provider block under the key the configuration
 /// uses for it.
 ///
-/// The derived implementation would key a nested error by the Rust field name,
-/// `host_signals`, while the configuration, the secret-store resolution and the
-/// secret paths `TrustedServerAppConfig::secret_fields` registers all use
-/// `host-signals`. `edgezero_core::app_config::validate_excluding_secrets`
-/// matches those paths against the error keys verbatim, so a derived key would
-/// leave the passphrase checked as a value when it holds a key name at push
-/// time. Vendor blocks are validated by the adapter that builds the provider.
+/// Each key is spelled out here rather than derived because
+/// `edgezero_core::app_config::validate_excluding_secrets` matches the secret
+/// paths `TrustedServerAppConfig::secret_fields` registers against these error
+/// keys verbatim, so the two are read together and a key that drifted from its
+/// registered path would leave the passphrase checked as a value when it holds
+/// a key name at push time. Every built-in name is `snake_case`, so each key
+/// here is also the Rust field name, the configuration name and the name in
+/// the registered path. Vendor blocks are validated by the adapter that builds
+/// the provider.
 impl Validate for EcProviders {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
@@ -850,7 +877,7 @@ impl Validate for EcProviders {
             errors.merge_self("hmac", hmac.validate());
         }
         if let Some(host_signals) = &self.host_signals {
-            errors.merge_self("host-signals", host_signals.validate());
+            errors.merge_self("host_signals", host_signals.validate());
         }
         if errors.errors().is_empty() {
             Ok(())
@@ -920,7 +947,7 @@ pub struct HmacProviderConfig {
 
 /// Configuration for the built-in host-signal Edge Cookie provider.
 ///
-/// Mapped from the `[ec.providers.host-signals]` TOML block.
+/// Mapped from the `[ec.providers.host_signals]` TOML block.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct HostSignalsProviderConfig {
@@ -3491,7 +3518,7 @@ impl Settings {
         if let Some(host_signals) = &self.ec.providers.host_signals
             && Ec::is_placeholder_passphrase(host_signals.passphrase.expose())
         {
-            insecure_fields.push("ec.providers.host-signals.passphrase".to_owned());
+            insecure_fields.push("ec.providers.host_signals.passphrase".to_owned());
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
@@ -5664,6 +5691,77 @@ mod tests {
             ),
             "should be a configuration error, got: {:?}",
             err.current_context()
+        );
+    }
+
+    #[test]
+    fn the_old_host_signals_spelling_fails_at_startup_and_names_the_new_one() {
+        // The host-signal provider was renamed to `host_signals` under the
+        // rule that every name an operator types into configuration is
+        // `snake_case`. A deployment still configured with the old spelling
+        // has to stop when settings load, which every adapter does before it
+        // serves a request, and the error has to name the spelling to write
+        // instead.
+        let selecting = |selector: &str, block: &str| {
+            let toml = crate_test_settings_str()
+                .replace("[ec.providers.hmac]", block)
+                .replace("provider = \"hmac\"", &format!("provider = \"{selector}\""));
+            assert!(
+                toml.contains(&format!("provider = \"{selector}\""))
+                    && toml.contains(block)
+                    && !toml.contains("[ec.providers.hmac]"),
+                "the test configuration should select `{selector}` with only `{block}` configured"
+            );
+            toml
+        };
+
+        // A block left under the old name is captured as a vendor block, so
+        // the old selector would find it and pass this check if the name were
+        // not refused before the block is looked for.
+        let old = selecting(
+            RETIRED_HOST_SIGNALS_PROVIDER_KEY,
+            "[ec.providers.host-signals]",
+        );
+        let err =
+            Settings::from_toml(&old).expect_err("the old spelling should fail when settings load");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "the old spelling should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            err.to_string().contains(HOST_SIGNALS_PROVIDER_KEY),
+            "the error should name `host_signals`, got: {err}"
+        );
+
+        // With no block at all the answer has to be the same one, naming the
+        // new spelling rather than asking for a block under the old name.
+        let old_without_block = crate_test_settings_str()
+            .replace("[ec.providers.hmac]", "")
+            .replace("passphrase = \"test-secret-key-32-bytes-minimum\"", "")
+            .replace(
+                "provider = \"hmac\"",
+                &format!("provider = \"{RETIRED_HOST_SIGNALS_PROVIDER_KEY}\""),
+            );
+        let err = Settings::from_toml(&old_without_block)
+            .expect_err("the old spelling should fail with no block either");
+        assert!(
+            err.to_string().contains(HOST_SIGNALS_PROVIDER_KEY),
+            "the error should still name `host_signals`, got: {err}"
+        );
+
+        // The same configuration written with the new spelling loads.
+        let settings = Settings::from_toml(&selecting(
+            HOST_SIGNALS_PROVIDER_KEY,
+            "[ec.providers.host_signals]",
+        ))
+        .expect("the `host_signals` spelling should load");
+        assert!(
+            settings.ec.providers.host_signals.is_some(),
+            "the renamed block should deserialize into the typed field"
         );
     }
 

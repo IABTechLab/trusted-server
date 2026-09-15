@@ -158,7 +158,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 vec![
                     object("ec"),
                     optional_object("providers"),
-                    optional_object("host-signals"),
+                    optional_object("host_signals"),
                     object("passphrase"),
                 ],
                 true,
@@ -416,7 +416,7 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
     }
     if let Some(host_signals) = &settings.ec.providers.host_signals {
         validate_secret_key_reference(
-            "ec.providers.host-signals.passphrase",
+            "ec.providers.host_signals.passphrase",
             host_signals.passphrase.expose(),
         )?;
     }
@@ -784,12 +784,12 @@ formats = [{ width = 300, height = 250 }]
 
     #[test]
     fn push_validation_accepts_a_host_signals_passphrase_key_name() {
-        // The block is named `host-signals` in the configuration and in the
+        // The block is named `host_signals` in the configuration and in the
         // registered secret path, so push validation has to skip the passphrase
         // check under that name.
         let mut settings = valid_settings();
         settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
-            "host-signals",
+            "host_signals",
         ));
         settings.ec.providers.hmac = None;
         settings.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
@@ -797,7 +797,7 @@ formats = [{ width = 300, height = 250 }]
         });
 
         let app_config = TrustedServerAppConfig::new(settings)
-            .expect("should validate the host-signals passphrase as a key name");
+            .expect("should validate the host_signals passphrase as a key name");
 
         let serialized =
             serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
@@ -818,7 +818,7 @@ formats = [{ width = 300, height = 250 }]
                 ("publisher.proxy_secret".to_owned(), false),
                 ("ec.passphrase".to_owned(), true),
                 ("ec.providers.hmac.passphrase".to_owned(), true),
-                ("ec.providers.host-signals.passphrase".to_owned(), true),
+                ("ec.providers.host_signals.passphrase".to_owned(), true),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),

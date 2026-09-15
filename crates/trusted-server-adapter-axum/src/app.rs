@@ -95,7 +95,7 @@ fn build_state_with_settings(
     // for every request. It injects and threads no provider, so `EcContext`
     // resolves the selection itself on every request, building a fresh built-in
     // provider that reads no request data. It supplies no host signals either,
-    // so the host-signals argument is `None`.
+    // so the `host_signals` argument is `None`.
     ensure_provider_available(&settings.ec, None, None)?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;

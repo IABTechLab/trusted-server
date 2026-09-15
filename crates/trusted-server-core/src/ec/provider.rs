@@ -128,7 +128,21 @@ pub const HMAC_PROVIDER_KEY: &str = "hmac";
 /// on it outside the resolution in [`build_provider`]. It is also
 /// [`HostSignalProvider::id`]'s return value, and it goes with that resolution
 /// arm when the host-signal provider becomes a module of its own.
-pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
+pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host_signals";
+
+/// The name the host-signal provider was selected by before it was renamed
+/// under the rule that every name an operator types into configuration is
+/// `snake_case`.
+///
+/// [`Ec::validate_provider_selection`] refuses it at startup with a message
+/// naming [`HOST_SIGNALS_PROVIDER_KEY`], so a deployment still configured with
+/// the old spelling stops there and the operator is told what to write
+/// instead. The refusal comes before any block is looked for, because a block
+/// left under the old name is captured as a vendor block, so without the
+/// refusal the old selector would find that block, pass the settings check,
+/// and fail later in [`resolve_named_provider`] with a message about an
+/// adapter that supplies no such provider.
+pub(crate) const RETIRED_HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
 
 /// The provider names core supplies itself.
 ///
@@ -795,10 +809,10 @@ impl EdgeCookieProvider for HostSignalProvider {
         let ja4 = self.host_signals.ja4().unwrap_or_default();
         let h2 = self.host_signals.h2().unwrap_or_default();
         // With no signal at all, creating an identifier would silently degrade
-        // to an IP-only identifier under the host-signals name. Defer instead,
-        // meaning no identity this request, and the request proceeds.
+        // to an IP-only identifier under the `host_signals` name. Defer
+        // instead, meaning no identity this request, and the request proceeds.
         if ja4.is_empty() && h2.is_empty() {
-            log::warn!("Host-signal EC provider found no TLS/HTTP-2 signals; deferring");
+            log::warn!("The host_signals EC provider found no TLS/HTTP-2 signals and is deferring");
             return Ok(GeneratedEdgeCookie::default());
         }
         let id = generation::generate_hmac_ec_id(
@@ -944,14 +958,14 @@ fn resolve_named_provider(
     if key == HOST_SIGNALS_PROVIDER_KEY {
         let config = ec.providers.host_signals.as_ref().ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
-                message: "Edge Cookie provider `host-signals` is selected but has no \
-                          `[ec.providers.host-signals]` configuration"
+                message: "Edge Cookie provider `host_signals` is selected but has no \
+                          `[ec.providers.host_signals]` configuration"
                     .to_owned(),
             })
         })?;
         let signals = host_signals.ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
-                message: "The host-signals Edge Cookie provider requires a host that supplies \
+                message: "The host_signals Edge Cookie provider requires a host that supplies \
                           TLS/HTTP-2 signals, which this host does not"
                     .to_owned(),
             })
