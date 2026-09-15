@@ -349,6 +349,7 @@ fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
     use hyper::header::HeaderValue;
     use rustls::pki_types::ServerName;
 
@@ -367,7 +368,6 @@ mod tests {
     }
 
     fn parse_args(argv: &[&str]) -> crate::commands::dev::proxy::ProxyArgs {
-        use clap::Parser;
         #[derive(clap::Parser)]
         struct W {
             #[command(flatten)]
