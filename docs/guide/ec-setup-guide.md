@@ -47,7 +47,7 @@ do not call either API may omit it. Provision high-entropy values under
 
 Required behavior assumptions:
 
-- `provider = "hmac"` selects the built-in HMAC provider; its `passphrase` lives under `[ec.hmac]`
+- `provider = "hmac"` selects the built-in HMAC provider, and its `passphrase` lives under `[ec.hmac]`
 - The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones

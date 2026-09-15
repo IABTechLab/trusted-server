@@ -581,15 +581,15 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 
 ### `[ec]`
 
-| Field                     | Type           | Required | Description                                                                                                                                                                                                                                    |
-| ------------------------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                     |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provider`                | String or null | No       | Name of the active Edge Cookie provider: `"hmac"` (built-in), `"host_signals"` (opt-in), or `"none"` (explicitly stateless). Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demo needs the `client-fixed-demo` build feature |
 | `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                            |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                     |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                            |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                                                                                                                                        |
-| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                 |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                      |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                             |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                                                                                                                                         |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                 |
 
 Each provider that has settings is configured in its own `[ec.<name>]` block, and the `provider` selector names which block is active. A block may set `implementation = "<id>"` to say which provider it configures, which makes the block name a label of your choosing, so `provider = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in provider under a name that means something to your deployment. Provider names and implementation ids are `snake_case`.
 
@@ -2227,7 +2227,7 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- `provider`, when set, is `snake_case` and has the `[ec.<name>]` block its implementation needs, and no unselected block is left configured; otherwise startup fails
+- `provider`, when set, is `snake_case` and has the `[ec.<name>]` block its implementation needs, and no unselected block is left configured, or startup fails
 - The `hmac.passphrase` key name is non-empty at push time
 - The resolved passphrase is at least 32 bytes at runtime
 - Known placeholder values are rejected after resolution
