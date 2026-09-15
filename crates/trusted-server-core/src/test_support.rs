@@ -29,16 +29,14 @@ pub mod tests {
             # is acknowledged the same way a deployment would.
             assume_single_jurisdiction = true
 
-            [integrations.prebid]
-            enabled = true
+            [integration]
+            provider = ["prebid"]
+
+            [integration.prebid]
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
-            [integrations.prebid.bundle]
+            [integration.prebid.bundle]
             adapters = ["exampleBidder"]
-
-            [integrations.nextjs]
-            enabled = false
-            rewrite_attributes = ["href", "link", "url"]
 
             [ec]
             provider = "hmac"
@@ -51,6 +49,17 @@ pub mod tests {
             secret_store_id = "test-secret-store-id"
             "#
         .to_owned()
+    }
+
+    /// The shared fixture TOML with `integration_id` named in
+    /// `[integration] provider` as well, for a test that appends that
+    /// integration's own block.
+    #[must_use]
+    pub fn crate_test_settings_str_running(integration_id: &str) -> String {
+        crate_test_settings_str().replace(
+            "provider = [\"prebid\"]",
+            &format!("provider = [\"prebid\", \"{integration_id}\"]"),
+        )
     }
 
     #[must_use]

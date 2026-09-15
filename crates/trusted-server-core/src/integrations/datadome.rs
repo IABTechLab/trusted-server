@@ -23,7 +23,7 @@
 //! Add to `trusted-server.toml`:
 //!
 //! ```toml
-//! [integrations.datadome]
+//! [integration.datadome]
 //! enabled = true
 //! sdk_origin = "https://js.datadome.co"        # SDK script origin
 //! api_origin = "https://api-js.datadome.co"    # Signal collection API origin
@@ -151,10 +151,6 @@ pub struct ProtectionTestBypassConfig {
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct DataDomeConfig {
-    /// Enable/disable the integration
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
     /// Base URL for `DataDome` SDK script (default: <https://js.datadome.co>)
     /// Used for fetching and serving tags.js
     #[serde(default = "default_sdk_origin")]
@@ -257,10 +253,6 @@ pub struct DataDomeConfig {
     pub client_side_configuration: JsonValue,
 }
 
-fn default_enabled() -> bool {
-    false
-}
-
 fn default_sdk_origin() -> String {
     "https://js.datadome.co".to_string()
 }
@@ -342,7 +334,6 @@ fn escape_html_attribute(value: &str) -> String {
 impl Default for DataDomeConfig {
     fn default() -> Self {
         Self {
-            enabled: default_enabled(),
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
             cache_ttl_seconds: default_cache_ttl(),
@@ -368,11 +359,7 @@ impl Default for DataDomeConfig {
     }
 }
 
-impl IntegrationConfig for DataDomeConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for DataDomeConfig {}
 
 /// `DataDome` integration implementation.
 pub struct DataDomeIntegration {
@@ -978,7 +965,7 @@ fn build(
 }
 
 /// Validates the `DataDome` configuration for deployment and reports whether
-/// the integration is enabled.
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
@@ -998,7 +985,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 ///
 /// # Errors
 ///
-/// Returns an error when the `DataDome` integration is enabled with invalid
+/// Returns an error when the `DataDome` integration runs with invalid
 /// configuration.
 pub fn register(
     settings: &Settings,
@@ -1029,7 +1016,6 @@ mod tests {
 
     fn test_config() -> DataDomeConfig {
         DataDomeConfig {
-            enabled: true,
             sdk_origin: "https://js.datadome.co".to_string(),
             api_origin: "https://api-js.datadome.co".to_string(),
             cache_ttl_seconds: 3600,
@@ -1237,7 +1223,6 @@ mod tests {
     fn protection_test_bypass_deserializes_nested_configuration() {
         let config: DataDomeConfig = toml::from_str(
             r#"
-            enabled = true
             enable_protection = true
 
             [protection_test_bypass]

@@ -25,8 +25,6 @@ const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct TestlightConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     #[validate(url)]
     pub endpoint: String,
     #[serde(default = "default_timeout_ms")]
@@ -39,11 +37,7 @@ pub struct TestlightConfig {
     pub rewrite_scripts: bool,
 }
 
-impl IntegrationConfig for TestlightConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for TestlightConfig {}
 
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 struct TestlightRequestBody {
@@ -142,7 +136,7 @@ fn build(
 }
 
 /// Validates the Testlight configuration for deployment and reports whether
-/// the integration is enabled.
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
@@ -154,11 +148,11 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
         .map(|config| config.is_some())
 }
 
-/// Register the Testlight integration when enabled.
+/// Register the Testlight integration when `[integration] provider` names it.
 ///
 /// # Errors
 ///
-/// Returns an error when the Testlight integration is enabled with invalid
+/// Returns an error when the Testlight integration runs with invalid
 /// configuration.
 pub fn register(
     settings: &Settings,
@@ -287,10 +281,6 @@ fn default_shim_src() -> String {
     tsjs::tsjs_unified_script_src()
 }
 
-fn default_enabled() -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,7 +306,6 @@ mod tests {
     fn html_rewriter_replaces_integration_script() {
         let shim_src = tsjs::tsjs_unified_script_src();
         let config = TestlightConfig {
-            enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
             timeout_ms: 1000,
             shim_src: shim_src.clone(),
@@ -347,7 +336,6 @@ mod tests {
     fn html_rewriter_is_noop_when_disabled() {
         let shim_src = tsjs::tsjs_unified_script_src();
         let config = TestlightConfig {
-            enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
             timeout_ms: 1000,
             shim_src,
@@ -372,11 +360,10 @@ mod tests {
     fn build_uses_settings_integration_block() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 TESTLIGHT_INTEGRATION_ID.to_string(),
                 &json!({
-                    "enabled": true,
                     "endpoint": "https://example.com/bid",
                     "rewrite_scripts": true,
                 }),
@@ -446,7 +433,6 @@ mod tests {
             );
             let settings = create_test_settings();
             let integration = TestlightIntegration::new(TestlightConfig {
-                enabled: true,
                 endpoint: "https://example.com/openrtb".to_string(),
                 timeout_ms: 1000,
                 shim_src: tsjs::tsjs_unified_script_src(),
@@ -506,7 +492,6 @@ mod tests {
 
     fn testlight_integration() -> Arc<TestlightIntegration> {
         TestlightIntegration::new(TestlightConfig {
-            enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
             timeout_ms: 1000,
             shim_src: tsjs::tsjs_unified_script_src(),

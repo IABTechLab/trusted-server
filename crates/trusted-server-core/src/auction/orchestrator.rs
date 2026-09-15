@@ -6100,7 +6100,6 @@ mod tests {
         let plan =
             AuctionPlan::compile(planned_aps_config()).expect("should compile planned APS auction");
         let mediator = AdServerMockProvider::new(AdServerMockConfig {
-            enabled: true,
             endpoint: "https://mediator.example/mediate".to_string(),
             timeout_ms: 500,
             ..AdServerMockConfig::default()

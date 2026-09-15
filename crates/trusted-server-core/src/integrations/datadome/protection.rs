@@ -838,7 +838,6 @@ mod tests {
 
     fn protection_config() -> DataDomeConfig {
         DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             server_side_key_secret_name: Some(Redacted::new("server-side-key".to_string())),
             ..DataDomeConfig::default()
@@ -945,7 +944,6 @@ mod tests {
     #[test]
     fn protection_test_bypass_skips_api_suppresses_tag_and_strips_header() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1014,7 +1012,6 @@ mod tests {
             }),
         ] {
             let config = DataDomeConfig {
-                enabled: true,
                 enable_protection: true,
                 protection_test_bypass,
                 ..protection_config()
@@ -1075,7 +1072,6 @@ mod tests {
     #[test]
     fn protection_test_bypass_is_inactive_outside_staging() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1162,7 +1158,6 @@ mod tests {
     #[test]
     fn protection_test_bypass_wins_over_other_exclusions() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                 id: "staging-page-exclusion".to_string(),
@@ -1222,7 +1217,6 @@ mod tests {
     #[test]
     fn protection_test_bypass_strips_invalid_credential_without_bypassing() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1291,7 +1285,6 @@ mod tests {
     #[test]
     fn duplicate_test_bypass_headers_fail_closed_and_are_all_stripped() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1428,7 +1421,6 @@ mod tests {
     fn ip_exclusions_mark_requests_for_client_tag_suppression() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let mut inline = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
             ..protection_config()
@@ -1468,7 +1460,6 @@ mod tests {
         );
 
         let structured_ip = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                 id: "structured-ip".to_string(),
@@ -1492,7 +1483,6 @@ mod tests {
         );
 
         let structured_source = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                 id: "structured-ip-source".to_string(),
@@ -1556,7 +1546,6 @@ mod tests {
 
         for (matcher, uri) in cases {
             let config = DataDomeConfig {
-                enabled: true,
                 enable_protection: true,
                 protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                     id: "non-ip".to_string(),
@@ -1583,7 +1572,6 @@ mod tests {
     fn overlapping_path_and_ip_exclusions_still_mark_request() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![
                 ProtectionExclusionRuleConfig {
@@ -1621,7 +1609,6 @@ mod tests {
     #[test]
     fn asn_exclusions_do_not_mark_requests_for_client_tag_suppression() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_excluded_asns: vec![64500],
             ..protection_config()
@@ -1654,7 +1641,6 @@ mod tests {
     #[test]
     fn non_matching_ip_does_not_mark_request_for_client_tag_suppression() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
             ..protection_config()

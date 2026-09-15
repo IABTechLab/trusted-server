@@ -144,38 +144,28 @@ mod plan_sharing_tests {
     }
 
     #[test]
-    fn configured_mediator_requires_enabled_exact_registration() {
-        for mediator_config in [None, Some(serde_json::json!({"enabled": false}))] {
-            let mut settings = create_test_settings();
-            settings.auction.mediator = Some("adserver_mock".to_string());
-            if let Some(config) = mediator_config {
-                settings
-                    .integrations
-                    .insert_config("adserver_mock", &config)
-                    .expect("should insert mediator config");
-            } else {
-                settings.integrations.remove("adserver_mock");
-            }
-            let plan = Arc::new(compile_auction_plan(&settings).expect("should compile plan"));
+    fn configured_mediator_requires_the_integration_to_run() {
+        let mut settings = create_test_settings();
+        settings.auction.mediator = Some("adserver_mock".to_string());
 
-            let error = match build_orchestrator_with_plan(plan, &settings) {
-                Ok(_) => panic!("should require enabled mediator registration"),
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("adserver_mock"));
-        }
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile plan"));
+
+        let error = match build_orchestrator_with_plan(plan, &settings) {
+            Ok(_) => panic!("should require a mediator integration that runs"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("adserver_mock"));
     }
 
     #[test]
-    fn configured_mediator_builds_when_exact_registration_is_enabled() {
+    fn configured_mediator_builds_when_the_integration_runs() {
         let mut settings = create_test_settings();
         settings.auction.mediator = Some("adserver_mock".to_string());
         settings
-            .integrations
+            .integration
             .insert_config(
                 "adserver_mock",
                 &serde_json::json!({
-                    "enabled": true,
                     "endpoint": "https://mediator.example/mediate"
                 }),
             )
@@ -183,7 +173,7 @@ mod plan_sharing_tests {
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile plan"));
 
         build_orchestrator_with_plan(plan, &settings)
-            .expect("should build with enabled exact mediator registration");
+            .expect("should build when the named mediator integration runs");
     }
 
     #[test]

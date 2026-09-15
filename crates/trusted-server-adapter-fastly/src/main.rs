@@ -784,8 +784,8 @@ mod tests {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [integrations.gpt_diagnostics]
-            enabled = true
+            [integration]
+            provider = ["gpt_diagnostics"]
             "#,
         )
         .expect("should parse diagnostics settings")

@@ -7267,11 +7267,10 @@ mod tests {
             crate::auction::AuctionConfig::legacy_provider_map(&[SCHEDULING_PROVIDER]);
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         settings
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "client_side_key": "scheduling-test-key",
                 }),
             )
@@ -8481,10 +8480,7 @@ mod tests {
     #[test]
     fn stream_publisher_body_injects_active_diagnostics_for_materialized_html() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-            .expect("should enable diagnostics");
+        settings.integration.select("gpt_diagnostics");
         let integration_registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(
@@ -8985,21 +8981,26 @@ mod tests {
             template_fingerprint(settings, &registry)
         }
 
-        /// Base settings with one integration's config replaced.
+        /// Base settings with one integration's config replaced, and the
+        /// integration itself run or not.
         ///
-        /// Edits the parsed `[integrations]` map rather than appending TOML, so the two
+        /// Edits the parsed `[integration]` map rather than appending TOML, so the two
         /// fixtures differ in exactly the field under test — the base settings already
-        /// declare `[integrations.prebid]`, and a second table would not parse.
-        fn settings_with_prebid(enabled: bool, timeout_ms: u32) -> Settings {
+        /// declare `[integration.prebid]`, and a second table would not parse.
+        fn settings_with_prebid(runs: bool, timeout_ms: u32) -> Settings {
             let mut settings = create_test_settings();
-            settings.integrations.insert(
-                "prebid".to_string(),
-                serde_json::json!({
-                    "enabled": enabled,
-                    "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
-                    "timeout_ms": timeout_ms,
-                }),
-            );
+            if runs {
+                settings.integration.insert(
+                    "prebid".to_string(),
+                    serde_json::json!({
+                        "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
+                        "timeout_ms": timeout_ms,
+                    }),
+                );
+            } else {
+                settings.integration.provider.clear();
+                settings.integration.remove("prebid");
+            }
             settings
         }
 
@@ -9012,7 +9013,7 @@ mod tests {
             assert_ne!(
                 fingerprint(&settings_with_prebid(true, 1000)),
                 fingerprint(&settings_with_prebid(false, 1000)),
-                "the enabled integration set must select a different template"
+                "the set of integrations that run must select a different template"
             );
         }
 
@@ -9073,7 +9074,8 @@ mod tests {
             // A module a vendor crate carries is not in the compile-time map, so a
             // hash built from that map alone would not move when the vendor
             // rebuilt its bundle and a cached template would keep the stale `?v=`.
-            let settings = create_test_settings();
+            let mut settings = create_test_settings();
+            settings.integration.select("probe");
 
             assert_ne!(
                 fingerprint_with_carried(&settings, carrying_before),
@@ -11825,10 +11827,9 @@ mod tests {
         /// fixtures differ in exactly the field under test.
         fn settings_with_prebid_timeout(mode: &str, timeout_ms: u32) -> Settings {
             let mut settings = settings_with_mode(mode);
-            settings.integrations.insert(
+            settings.integration.insert(
                 "prebid".to_string(),
                 serde_json::json!({
-                    "enabled": true,
                     "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
                     "timeout_ms": timeout_ms,
                 }),
@@ -12067,11 +12068,10 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.integrations
+            raw.integration
                 .insert_config(
                     "datadome",
                     &serde_json::json!({
-                        "enabled": true,
                         "client_side_key": "test-client-key",
                     }),
                 )
@@ -12132,9 +12132,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.integrations
-                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-                .expect("should configure diagnostics");
+            raw.integration.select("gpt_diagnostics");
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -12182,9 +12180,7 @@ mod tests {
                 .as_mut()
                 .expect("fixture configures creative opportunities")
                 .origin_is_cookie_independent = Some(true);
-            raw.integrations
-                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-                .expect("should configure diagnostics");
+            raw.integration.select("gpt_diagnostics");
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -15042,10 +15038,7 @@ mod tests {
         async fn inactive_ad_stack_preserves_gpt_diagnostics_cache_privacy() {
             // Arrange
             let mut settings = settings_with_disabled_ad_templates();
-            settings
-                .integrations
-                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-                .expect("should enable GPT diagnostics");
+            settings.integration.select("gpt_diagnostics");
             let stub = Arc::new(StubHttpClient::new());
             queue_html_response_with_cache_control(&stub, "no-cache");
             let services = build_services_with_http_client(
@@ -15659,11 +15652,10 @@ mod tests {
     async fn datadome_filter_marker_survives_into_publisher_html_pipeline() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "enable_protection": true,
                     "server_side_key_secret_name": "server-side-key",
                     "protection_excluded_ip_cidrs": ["192.0.2.0/24"],
@@ -15732,11 +15724,10 @@ mod tests {
     fn suppressed_datadome_tag_reaches_publisher_html_pipeline() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "client_side_key": "test-client-key",
                 }),
             )
@@ -16818,10 +16809,7 @@ mod tests {
     #[test]
     fn tsjs_dynamic_serves_diagnostics_standalone_without_cookie_variance() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-            .expect("should enable diagnostics");
+        settings.integration.select("gpt_diagnostics");
         let registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(
@@ -16874,7 +16862,8 @@ mod tests {
 
     #[test]
     fn parse_single_module_filename_resolves_a_carried_module_id() {
-        let settings = create_test_settings();
+        let mut settings = create_test_settings();
+        settings.integration.select("probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "seam-probe",
@@ -16945,18 +16934,12 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_dynamic_returns_not_found_for_disabled_deferred_module() {
+    fn tsjs_dynamic_returns_not_found_for_a_module_that_is_not_named() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &serde_json::json!({
-                    "enabled": false,
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
-                }),
-            )
-            .expect("should update prebid config");
+        // The shared fixture names prebid, and this asks what is served when
+        // it does not.
+        settings.integration.provider.clear();
+        settings.integration.remove("prebid");
         let registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(
@@ -16975,7 +16958,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "should return 404 for disabled deferred module"
+            "should return 404 for a deferred module that is not named"
         );
     }
 
@@ -17105,7 +17088,8 @@ mod tests {
 
     #[test]
     fn tsjs_dynamic_serves_a_carried_module_in_the_unified_bundle_under_the_composed_hash() {
-        let settings = create_test_settings();
+        let mut settings = create_test_settings();
+        settings.integration.select("probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "seam-probe",
@@ -17143,7 +17127,8 @@ mod tests {
 
     #[test]
     fn tsjs_dynamic_serves_a_carried_deferred_module_standalone() {
-        let settings = create_test_settings();
+        let mut settings = create_test_settings();
+        settings.integration.select("probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "seam-probe",
@@ -17198,12 +17183,10 @@ mod tests {
         // reintroduced constant would fail this test rather than pass it.
         let mut settings = create_test_settings();
         settings
-            .integrations
-            .insert_config(
-                "lockr",
-                &serde_json::json!({ "enabled": true, "app_id": "test-app-id" }),
-            )
+            .integration
+            .insert_config("lockr", &serde_json::json!({"app_id": "test-app-id" }))
             .expect("should insert lockr config");
+        settings.integration.select("probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "standalone-probe",
@@ -18553,11 +18536,10 @@ mod tests {
     fn streaming_finalize_emits_gam_attribution_head_before_origin_eof() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "gpt",
                 &serde_json::json!({
-                    "enabled": true,
                     "gam_attribution_enabled": true
                 }),
             )
@@ -19351,11 +19333,10 @@ mod tests {
         // Configure nextjs so a post-processor is registered.
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &serde_json::json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -19439,11 +19420,10 @@ mod tests {
     fn document_state_placeholders_substitute_through_accumulating_path() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &serde_json::json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -19787,10 +19767,7 @@ mod tests {
                 "no token should be minted without the diagnostics integration"
             );
 
-            settings
-                .integrations
-                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-                .expect("should enable diagnostics");
+            settings.integration.select("gpt_diagnostics");
             let first =
                 diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
             let second =
@@ -21504,10 +21481,7 @@ mod tests {
             let mut settings = settings_with_co();
             settings.auction.providers =
                 crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
-            settings
-                .integrations
-                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-                .expect("should enable diagnostics");
+            settings.integration.select("gpt_diagnostics");
             let slots = article_slot();
             let winning_stub = Arc::new(StubHttpClient::new());
             winning_stub.push_response(200, b"winner".to_vec());
@@ -21661,10 +21635,7 @@ mod tests {
             let mut settings = settings_with_co();
             settings.auction.providers =
                 crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
-            settings
-                .integrations
-                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-                .expect("should enable diagnostics");
+            settings.integration.select("gpt_diagnostics");
 
             let first = winning_auction_id(&settings)
                 .await
@@ -21678,9 +21649,9 @@ mod tests {
             );
 
             settings
-                .integrations
-                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": false }))
-                .expect("should disable diagnostics");
+                .integration
+                .provider
+                .retain(|id| id != "gpt_diagnostics");
             assert_eq!(
                 winning_auction_id(&settings).await,
                 None,

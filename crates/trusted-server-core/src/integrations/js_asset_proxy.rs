@@ -38,9 +38,6 @@ const ERROR_ORIGIN_STATUS: &str = "js-asset-origin-status";
 /// Configuration for the JavaScript asset proxy integration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsAssetProxyConfig {
-    /// Enables or disables the integration.
-    #[serde(default)]
-    pub enabled: bool,
     /// Optional downstream cache TTL override for every asset.
     #[serde(default)]
     pub cache_ttl_seconds: Option<u32>,
@@ -88,18 +85,16 @@ impl JsAssetProxyConfig {
     }
 }
 
-impl IntegrationConfig for JsAssetProxyConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for JsAssetProxyConfig {}
 
 impl Validate for JsAssetProxyConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
         errors.merge_self("assets", self.assets.validate());
 
-        if self.enabled && self.assets.is_empty() {
+        // A selected integration with nothing to serve is a configuration
+        // mistake, so the block has to list at least one asset.
+        if self.assets.is_empty() {
             errors.add("assets", ValidationError::new("empty_assets"));
         }
 
@@ -457,43 +452,23 @@ fn build(
 }
 
 /// Validates the JavaScript asset proxy configuration for deployment and
-/// reports whether the integration is enabled.
+/// reports whether `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration cannot be parsed or fails
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    // Read the raw block rather than going through `integration_config`, which
-    // hands back nothing for a disabled integration. The asset inventory is
-    // checked either way, so a typo in a block nobody has switched on is still
-    // caught at deploy time.
-    let Some(raw_config) = settings.integrations.get(JS_ASSET_PROXY_INTEGRATION_ID) else {
-        return Ok(false);
-    };
-    let config: JsAssetProxyConfig =
-        serde_json::from_value(raw_config.clone()).map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-                ),
-            })
-        })?;
-    config.validate().map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: {error}"
-            ),
-        })
-    })?;
-    Ok(config.enabled)
+    settings
+        .integration_config::<JsAssetProxyConfig>(JS_ASSET_PROXY_INTEGRATION_ID)
+        .map(|config| config.is_some())
 }
 
 /// Register the JavaScript asset proxy integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the integration is enabled with invalid configuration.
+/// Returns an error when the integration runs with invalid configuration.
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -633,7 +608,6 @@ mod tests {
 
     fn config_with_assets(assets: Vec<JsAssetProxyAsset>) -> JsAssetProxyConfig {
         JsAssetProxyConfig {
-            enabled: true,
             cache_ttl_seconds: None,
             assets,
         }
@@ -690,34 +664,20 @@ mod tests {
     }
 
     #[test]
-    fn disabled_config_does_not_register_routes() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
-                &json!({
-                    "enabled": false,
-                    "assets": [{
-                        "path": "/assets/vendor.js",
-                        "origin_url": "https://cdn.example.com/vendor.js"
-                    }]
-                }),
-            )
-            .expect("should insert integration config");
+    fn an_integration_that_is_not_named_registers_no_routes() {
+        let settings = create_test_settings();
 
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
 
         assert!(
             !registry.has_route(&Method::GET, "/assets/vendor.js"),
-            "disabled integration should not register asset route"
+            "an integration that is not named should register no asset route"
         );
     }
 
     #[test]
     fn enabled_config_requires_at_least_one_asset() {
         let config = JsAssetProxyConfig {
-            enabled: true,
             cache_ttl_seconds: None,
             assets: Vec::new(),
         };
@@ -879,16 +839,12 @@ mod tests {
     #[test]
     fn js_asset_proxy_rewriter_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
+        settings.integration.select("gpt");
         settings
-            .integrations
-            .insert_config("gpt", &json!({ "enabled": true }))
-            .expect("should insert GPT config");
-        settings
-            .integrations
+            .integration
             .insert_config(
                 JS_ASSET_PROXY_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "assets": [{
                         "path": "/assets/gpt.js",
                         "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
@@ -915,16 +871,12 @@ mod tests {
     #[test]
     fn js_asset_proxy_blocking_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
+        settings.integration.select("gpt");
         settings
-            .integrations
-            .insert_config("gpt", &json!({ "enabled": true }))
-            .expect("should insert GPT config");
-        settings
-            .integrations
+            .integration
             .insert_config(
                 JS_ASSET_PROXY_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "assets": [{
                         "path": "/assets/gpt.js",
                         "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
@@ -951,16 +903,12 @@ mod tests {
     #[test]
     fn disabled_js_asset_proxy_candidate_allows_native_rewriters() {
         let mut settings = create_test_settings();
+        settings.integration.select("gpt");
         settings
-            .integrations
-            .insert_config("gpt", &json!({ "enabled": true }))
-            .expect("should insert GPT config");
-        settings
-            .integrations
+            .integration
             .insert_config(
                 JS_ASSET_PROXY_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "assets": [{
                         "path": "/assets/gpt.js",
                         "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
@@ -1092,10 +1040,10 @@ mod tests {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [integrations.js_asset_proxy]
-            enabled = true
+            [integration]
+            provider = ["js_asset_proxy"]
 
-            [[integrations.js_asset_proxy.assets]]
+            [[integration.js_asset_proxy.assets]]
             path = "/assets/vendor.js"
             origin_url = "https://cdn.example.com/vendor.js"
             proxy = "passthrough"
@@ -1114,11 +1062,10 @@ mod tests {
     fn exact_configured_routes_are_registered() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 JS_ASSET_PROXY_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "assets": [
                         {
                             "path": "/assets/vendor.js",
@@ -1315,11 +1262,10 @@ mod tests {
     fn configured_origin_urls_are_canonicalized_for_matching_and_duplicates() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 JS_ASSET_PROXY_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "assets": [{
                         "path": "/assets/vendor.js",
                         "origin_url": "HTTPS://CDN.EXAMPLE.COM:443/vendor.js"

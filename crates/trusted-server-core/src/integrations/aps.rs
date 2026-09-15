@@ -200,9 +200,6 @@ pub enum ApsRenderingMode {
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[validate(schema(function = "validate_inventory_identity_override"))]
 pub struct LegacyApsProviderConfig {
-    /// Whether APS integration is enabled.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// APS account ID. `pub_id` remains a deserialization alias only.
     #[serde(alias = "pub_id", deserialize_with = "deserialize_account_id")]
     pub account_id: String,
@@ -391,11 +388,6 @@ fn validate_inventory_identity_override(
 }
 
 #[cfg(test)]
-fn default_enabled() -> bool {
-    false
-}
-
-#[cfg(test)]
 fn default_endpoint() -> String {
     "https://web.ads.aps.amazon-adsystem.com/e/pb/bid".to_string()
 }
@@ -409,7 +401,6 @@ fn default_timeout_ms() -> u32 {
 impl Default for LegacyApsProviderConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             account_id: String::new(),
             endpoint: default_endpoint(),
             timeout_ms: default_timeout_ms(),
@@ -426,26 +417,15 @@ impl Default for LegacyApsProviderConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct ApsConfig {
-    /// Whether browser-side APS integration behavior is enabled.
-    #[serde(default)]
-    pub enabled: bool,
     /// Rendering owner for selected APS bids.
     #[serde(default)]
     pub rendering_mode: ApsRenderingMode,
 }
 
 #[cfg(test)]
-impl IntegrationConfig for LegacyApsProviderConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for LegacyApsProviderConfig {}
 
-impl IntegrationConfig for ApsConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for ApsConfig {}
 
 /// Typed server-side APS profile configuration used by the auction compiler.
 #[derive(Debug, Clone, Deserialize)]
@@ -1844,10 +1824,6 @@ impl AuctionProvider for ApsAuctionProvider {
         self.config.timeout_ms
     }
 
-    fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-
     fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
         predict_integration_backend_name(
             services,
@@ -1956,11 +1932,11 @@ pub fn register_for_plan(
     Ok(Some(registration.build()))
 }
 
-/// Register the APS auction provider when enabled.
+/// Register the APS auction provider when `[integration] provider` names it.
 ///
 /// # Errors
 ///
-/// Returns an error when enabled APS configuration is invalid.
+/// Returns an error when the APS configuration it runs with is invalid.
 #[cfg(test)]
 #[allow(clippy::missing_panics_doc)]
 pub fn register(
@@ -1972,10 +1948,9 @@ pub fn register(
         return Ok(None);
     };
     let mut browser_settings = settings.clone();
-    browser_settings.integrations.insert_config(
+    browser_settings.integration.insert_config(
         APS_INTEGRATION_ID,
         &ApsConfig {
-            enabled: true,
             rendering_mode: config.rendering_mode,
         },
     )?;
@@ -2041,7 +2016,6 @@ mod tests {
 
     fn config() -> LegacyApsProviderConfig {
         LegacyApsProviderConfig {
-            enabled: true,
             account_id: "example-account-id".to_string(),
             endpoint: default_endpoint(),
             timeout_ms: 800,
@@ -2174,7 +2148,6 @@ mod tests {
         .expect("should parse debug flag");
         assert_eq!(canonical.account_id, "example-account");
         assert_eq!(alias.account_id, "1234");
-        assert!(!canonical.enabled);
         assert!(!canonical.debug);
         assert!(debug.debug);
         assert!(!canonical.allow_script_creatives);
@@ -2245,7 +2218,6 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<ApsConfig>(json!({
-                "enabled": true,
                 "rendering_mode": "unsupported"
             }))
             .is_err(),
@@ -2309,7 +2281,6 @@ mod tests {
     #[test]
     fn inventory_identity_override_rewrites_site_and_preserves_page_path() {
         let config: LegacyApsProviderConfig = serde_json::from_value(json!({
-            "enabled": true,
             "account_id": "example-account",
             "inventory_domain": "publisher.example",
             "inventory_page_origin": "https://www.publisher.example"
@@ -3138,22 +3109,12 @@ mod tests {
         .expect("should compile APS plan")
     }
 
+    /// The renderer follows the auction plan, so it registers whether or not
+    /// `[integration] provider` names the browser integration.
     #[test]
-    fn aps_plan_registers_trusted_server_renderer_without_enabled_browser_config() {
-        for disabled_browser_config in [false, true] {
-            let mut settings = create_test_settings();
-            if disabled_browser_config {
-                settings
-                    .integrations
-                    .insert_config(
-                        APS_INTEGRATION_ID,
-                        &json!({
-                            "enabled": false,
-                            "rendering_mode": "publisher_native"
-                        }),
-                    )
-                    .expect("should insert disabled APS browser config");
-            }
+    fn aps_plan_registers_trusted_server_renderer_without_a_browser_block() {
+        {
+            let settings = create_test_settings();
 
             let registration = register_for_plan(&settings, &plan_with_aps_profile())
                 .expect("should register APS renderer support")
@@ -3177,10 +3138,10 @@ mod tests {
     fn enabled_config_registers_renderer_proxy() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 APS_INTEGRATION_ID,
-                &json!({"enabled": true, "account_id": "example-account"}),
+                &json!({"account_id": "example-account"}),
             )
             .expect("should insert APS config");
 
@@ -3217,11 +3178,10 @@ mod tests {
     fn publisher_native_config_registers_runner_mode_without_renderer_route() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 APS_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "account_id": "example-account",
                     "rendering_mode": "publisher_native"
                 }),
@@ -3266,11 +3226,10 @@ mod tests {
     fn publisher_native_script_creatives_remain_available_for_controlled_validation() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 APS_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "account_id": "example-account",
                     "allow_script_creatives": true,
                     "rendering_mode": "publisher_native"
@@ -3288,27 +3247,20 @@ mod tests {
     }
 
     #[test]
-    fn config_without_enabled_does_not_register_provider_or_renderer() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({"account_id": "example-account"}),
-            )
-            .expect("should insert default-disabled APS config");
+    fn an_unnamed_integration_registers_no_provider_or_renderer() {
+        let settings = create_test_settings();
 
         assert!(
             register(&settings)
                 .expect("should evaluate renderer registration")
                 .is_none(),
-            "omitted enabled should not register the renderer route"
+            "an integration nothing names should not register the renderer route"
         );
         assert!(
             register_providers(&settings)
                 .expect("should evaluate provider registration")
                 .is_empty(),
-            "omitted enabled should not register the auction provider"
+            "an integration nothing names should not register the auction provider"
         );
     }
 
@@ -3316,11 +3268,10 @@ mod tests {
     fn enabled_invalid_config_fails_provider_registration() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 APS_INTEGRATION_ID,
                 &json!({
-                    "enabled": true,
                     "account_id": "example-account",
                     "endpoint": "http://insecure.example/openrtb"
                 }),

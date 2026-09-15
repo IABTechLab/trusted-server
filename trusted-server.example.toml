@@ -14,11 +14,11 @@
 # selected, so no identity secret is needed to start. See the Edge Cookie
 # section below.
 #
-# Everything below those is OPTIONAL. Most optional blocks are commented out —
-# uncomment and edit one to enable it — but a few integrations are kept as active
-# `enabled = false` stubs (see the Integrations section for why). All example
-# hosts use `example.com`; replace them with your real endpoints in your private
-# config, not in this template.
+# Everything below those is OPTIONAL and commented out: uncomment and edit a
+# block to switch that feature on. An integration takes one more step, because
+# its id also goes in the `[integration] provider` list (see the Integrations
+# section). All example hosts use `example.com`; replace them with your real
+# endpoints in your private config, not in this template.
 #
 # `TRUSTED_SERVER__` env vars can override values when the `ts` CLI builds and
 # validates this config for push (e.g. TRUSTED_SERVER__PUBLISHER__DOMAIN=...;
@@ -270,20 +270,6 @@ pull_sync_concurrency = 3
 # The layering, what a provider may consult, and how to add a scheme are
 # documented in crates/trusted-server-core/src/permission_signal/README.md
 # and in the Permission Signals guide.
-
-[integrations.js_asset_proxy]
-enabled = false
-# Uncomment to override upstream cache headers for every asset below.
-# This replaces upstream directives, including private and no-store.
-# Use only when each asset's bytes are identical for every visitor.
-# cache_ttl_seconds = 3600
-# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets
-# that vary by browser User-Agent or use integrity hashes for UA-specific bytes.
-
-[[integrations.js_asset_proxy.assets]]
-path = "/assets/example-vendor-loader.js"
-origin_url = "https://cdn.example.com/vendor-loader.js"
-proxy = "enabled"
 
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
@@ -550,23 +536,51 @@ auction_timeout_ms = 500
 # =============================================================================
 # OPTIONAL — Integrations
 # =============================================================================
-# Every integration is off by default. Most are fully commented out; uncomment a
-# block and set `enabled = true` to activate it. Four (gpt, didomi, datadome,
-# google_tag_manager) are kept as active `enabled = false` stubs so the `ts audit`
-# CLI can flip them in place — leave those sections present. Integrations whose
-# `enabled` defaults to true (prebid, permutive, lockr, ...) still stay OFF while
-# their section is commented out. Required fields are noted per block.
+# An integration runs when its id is named in `[integration] provider`, and
+# that list is the only switch. The settings it takes, where it takes any, go
+# in an `[integration.<id>]` block, and a block written for an integration the
+# list does not name is refused at startup, so a configuration never reads as
+# though it runs something it does not. Every block below is commented out:
+# uncomment the ones you want, fill in the fields marked required, and name
+# each id in the list.
+#
+# `ts audit` writes this list for the integrations it finds on a page.
+#
+# The list is an array, and the `TRUSTED_SERVER__` environment overlay replaces
+# only scalar leaves that already exist, so edit the list here.
 # =============================================================================
 
+[integration]
+# The integrations that run, for example provider = ["gpt", "prebid"].
+provider = []
+
+# JavaScript asset proxy: serves named third-party scripts from first-party
+# paths. Each asset maps one exact publisher path to one exact HTTPS upstream
+# URL, and `proxy` says what happens to it: "enabled" serves and rewrites it,
+# "disabled" leaves it listed but untouched, "blocked" removes matching script
+# elements. At least one asset is required. `ts audit` writes this block from
+# the scripts it finds, every asset "disabled" for review.
+# [integration.js_asset_proxy]
+# Uncomment to override upstream cache headers for every asset below.
+# This replaces upstream directives, including private and no-store.
+# Use only when each asset's bytes are identical for every visitor.
+# cache_ttl_seconds = 3600
+# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets
+# that vary by browser User-Agent or use integrity hashes for UA-specific bytes.
+#
+# [[integration.js_asset_proxy.assets]]
+# path = "/assets/example-vendor-loader.js"
+# origin_url = "https://cdn.example.com/vendor-loader.js"
+# proxy = "enabled"
+
 # Browser-side Prebid.js integration. Server-side bidder routing belongs under
-# [auction.providers] and [auction.bidders]. When enabled,
+# [auction.providers] and [auction.bidders]. When it runs,
 # `external_bundle_url` is required and its host must be listed in
-# [proxy].allowed_domains. Kept active but disabled.
-[integrations.prebid]
-enabled = false
-timeout_ms = 1000
-debug = false
-client_side_bidders = []          # bidders running via native Prebid.js adapters
+# [proxy].allowed_domains.
+# [integration.prebid]
+# timeout_ms = 1000
+# debug = false
+# client_side_bidders = []          # bidders running via native Prebid.js adapters
 # Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.
 # Matching slots still refresh through GAM.
 # excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
@@ -575,28 +589,25 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
 # Bundle build inputs consumed by the `ts prebid bundle` CLI (not the runtime):
-# [integrations.prebid.bundle]
+# [integration.prebid.bundle]
 # adapters = ["rubicon"]
 # user_id_modules = ["sharedIdSystem"]
 
 # Next.js first-party rewriting for App Router / RSC payloads.
-# [integrations.nextjs]
-# enabled = true
+# [integration.nextjs]
 # rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
 # max_combined_payload_bytes = 10485760   # 10 MiB
 
-# Testlight OpenRTB test integration. `endpoint` required when enabled.
-# [integrations.testlight]
-# enabled = true
+# Testlight OpenRTB test integration. `endpoint` is required.
+# [integration.testlight]
 # endpoint = "https://testlight.example.com/openrtb2/auction"
 # timeout_ms = 1200
 # rewrite_scripts = true
 
-# Didomi CMP SDK/API first-party proxy. Kept active but disabled so `ts audit`
-# can flip `enabled` to true when Didomi is detected on the audited page.
-[integrations.didomi]
-enabled = false
-geo_query_parameters = false
+# Didomi CMP SDK/API first-party proxy. `ts audit` names it in the list above
+# when it finds Didomi on the audited page.
+# [integration.didomi]
+# geo_query_parameters = false
 # sdk_origin = "https://sdk.example.com"
 # api_origin = "https://api.example.com"
 
@@ -605,28 +616,24 @@ geo_query_parameters = false
 # Sourcepoint's own host and is not operator-selectable. Leave it unset so the
 # validated default applies — overriding it with any other host fails config
 # validation.
-# [integrations.sourcepoint]
-# enabled = true
+# [integration.sourcepoint]
 # rewrite_sdk = true
 # cache_ttl_seconds = 3600
 # auth_cookie_name = "sp_auth"      # optional: forward a custom authCookie upstream
 
-# Osano consent management (proxy toggle only).
-# [integrations.osano]
-# enabled = true
+# Osano consent management (the browser consent mirror). It takes no
+# settings, so naming "osano" in the list above is all it needs.
 
-# Permutive DMP. `organization_id` and `workspace_id` required when enabled.
-# [integrations.permutive]
-# enabled = true
+# Permutive DMP. `organization_id` and `workspace_id` are required.
+# [integration.permutive]
 # organization_id = "your-permutive-organization-id"   # required (non-empty)
 # workspace_id = "your-permutive-workspace-id"          # required (non-empty)
 # project_id = "your-permutive-project-id"
 # api_endpoint = "https://api.example.com"
 # secure_signals_endpoint = "https://secure-signals.example.com"
 
-# lockr identity SDK. `app_id` required when enabled.
-# [integrations.lockr]
-# enabled = true
+# lockr identity SDK. `app_id` is required.
+# [integration.lockr]
 # app_id = "your-lockr-app-id"                          # required (non-empty)
 # api_endpoint = "https://identity.example.com"
 # sdk_url = "https://identity.example.com/trusted-server.js"
@@ -634,9 +641,8 @@ geo_query_parameters = false
 # rewrite_sdk = true
 
 # DataDome bot protection. Proxies tags.js + signal-collection API first-party.
-# Kept active but disabled so `ts audit` can flip `enabled` when detected.
-[integrations.datadome]
-enabled = false
+# `ts audit` names it in the list above when it finds DataDome.
+# [integration.datadome]
 # sdk_origin = "https://sdk.example.com"
 # api_origin = "https://api.example.com"
 # cache_ttl_seconds = 3600
@@ -658,45 +664,40 @@ enabled = false
 # API validation and is stripped before the origin sees it. The credential is
 # loaded from the Secret Store at runtime (>= 32 bytes of high-entropy material).
 # Never enable in production.
-# [integrations.datadome.protection_test_bypass]
+# [integration.datadome.protection_test_bypass]
 # enabled = true
 # credential_secret_store = "ts_secrets"
 # credential_secret_name = "datadome_protection_test_bypass"
 
-# Google Publisher Tag (GPT) first-party proxy. Kept active but disabled so
-# `ts audit` can flip `enabled` to true when GPT is detected.
-[integrations.gpt]
-enabled = false
-# Kept as an active leaf so the environment override can apply; the overlay
-# cannot create a missing configuration leaf. GAM attribution stays off until
-# this is set true.
-gam_attribution_enabled = false
+# Google Publisher Tag (GPT) first-party proxy. `ts audit` names it in the
+# list above when it finds GPT. Uncomment the block to change a setting: the
+# environment overlay replaces a leaf that is already there and cannot create
+# a missing one, so `gam_attribution_enabled` has to be written here before
+# TRUSTED_SERVER__INTEGRATION__GPT__GAM_ATTRIBUTION_ENABLED can change it.
+# [integration.gpt]
+# gam_attribution_enabled = false
 # script_url = "https://ads.example.com/gpt.js"
 # cache_ttl_seconds = 3600
 # rewrite_script = true
 
-# GPT runtime diagnostics browser overlay. Optional and enabled manually (not
-# flipped by `ts audit`); serves a diagnostics module gated behind an activation
-# query param + session cookie.
-# [integrations.gpt_diagnostics]
-# enabled = true
+# GPT runtime diagnostics browser overlay. Named manually rather than by
+# `ts audit`, and it takes no settings. Naming "gpt_diagnostics" in the list
+# above serves a diagnostics module gated behind an activation query param +
+# session cookie.
 
 # APS browser renderer ownership. Server-side APS behavior belongs under an
 # [auction.providers] entry with profile = "aps".
-# [integrations.aps]
-# enabled = true
+# [integration.aps]
 # Default `trusted_server` uses TS's opaque static renderer route. Set
 # `publisher_native` only for a controlled publisher-origin friendly-frame cohort.
 # rendering_mode = "trusted_server"
 
-# Google Tag Manager first-party proxy. Kept active but disabled so `ts audit`
-# can fill container_id and flip `enabled` when GTM is detected. `container_id`
-# is required when this integration is actually enabled.
-[integrations.google_tag_manager]
-enabled = false
-# Invalid placeholder on purpose: enabling GTM without a real GTM-XXXXXX id
-# fails validation. `ts audit` overwrites this when it detects a real container.
-container_id = "GTM-REPLACE-ME"
+# Google Tag Manager first-party proxy. `container_id` is required, and
+# `ts audit` writes this block with the container it finds. The placeholder
+# below is invalid on purpose: running GTM without a real GTM-XXXXXX id fails
+# validation.
+# [integration.google_tag_manager]
+# container_id = "GTM-REPLACE-ME"
 # Must be a credential-free https bare origin with a literal host: no path,
 # query, fragment, `user:pass@` or wildcard. Targets are built by appending a
 # rooted path to this value, so anything beyond an origin corrupts them.
@@ -714,10 +715,9 @@ container_id = "GTM-REPLACE-ME"
 # allowed_tag_ids = ["G-EXAMPLE1", "AW-000000", "MC-EXAMPLE1"]
 
 # Mock ad server used for auction mediation in dev/testing.
-# [integrations.adserver_mock]
-# enabled = true
+# [integration.adserver_mock]
 # endpoint = "https://adserver.example.com/mediate"
 # timeout_ms = 1000
 # Map auction context keys to mediation URL query params:
-# [integrations.adserver_mock.context_query_params]
+# [integration.adserver_mock.context_query_params]
 # example_segments = "segments"

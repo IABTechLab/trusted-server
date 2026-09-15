@@ -33,15 +33,11 @@ use crate::settings::{IntegrationConfig, Settings};
 // ============================================================================
 
 /// Integration id the ad server mock provider is configured under.
-const ADSERVER_MOCK_INTEGRATION_ID: &str = "adserver_mock";
+pub(crate) const ADSERVER_MOCK_INTEGRATION_ID: &str = "adserver_mock";
 
 /// Configuration for mock ad server integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct AdServerMockConfig {
-    /// Whether this integration is enabled
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
     /// Mediation endpoint URL
     #[validate(url)]
     pub endpoint: String,
@@ -60,15 +56,11 @@ pub struct AdServerMockConfig {
     /// to the mediation endpoint without hard-coding integration knowledge.
     ///
     /// ```toml
-    /// [integrations.adserver_mock.context_query_params]
+    /// [integration.adserver_mock.context_query_params]
     /// permutive_segments = "permutive"
     /// ```
     #[serde(default)]
     pub context_query_params: ContextQueryParams,
-}
-
-fn default_enabled() -> bool {
-    false
 }
 
 fn default_timeout_ms() -> u32 {
@@ -78,7 +70,6 @@ fn default_timeout_ms() -> u32 {
 impl Default for AdServerMockConfig {
     fn default() -> Self {
         Self {
-            enabled: default_enabled(),
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: default_timeout_ms(),
             price_floor: None,
@@ -87,11 +78,7 @@ impl Default for AdServerMockConfig {
     }
 }
 
-impl IntegrationConfig for AdServerMockConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for AdServerMockConfig {}
 
 // ============================================================================
 // Provider
@@ -535,10 +522,6 @@ impl AuctionProvider for AdServerMockProvider {
         self.config.timeout_ms
     }
 
-    fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-
     fn backend_name(
         &self,
         services: &RuntimeServices,
@@ -568,7 +551,7 @@ impl AuctionProvider for AdServerMockProvider {
 ///
 /// # Errors
 ///
-/// Returns an error when the ad server mock provider is enabled with invalid
+/// Returns an error when the ad server mock provider runs with invalid
 /// configuration.
 pub fn register_providers(
     settings: &Settings,
@@ -684,7 +667,6 @@ mod tests {
     #[test]
     fn test_build_mediation_request() {
         let config = AdServerMockConfig {
-            enabled: true,
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: Some(1.00),
@@ -1228,7 +1210,6 @@ mod tests {
         let provider = AdServerMockProvider::new(config);
 
         assert_eq!(provider.provider_name(), "adserver_mock");
-        assert!(!provider.is_enabled()); // Default is disabled
         assert_eq!(provider.timeout_ms(), 500);
         assert!(provider.supports_media_type(&MediaType::Banner));
         assert!(!provider.supports_media_type(&MediaType::Video));
@@ -1240,7 +1221,6 @@ mod tests {
         use crate::consent::ConsentContext;
 
         let config = AdServerMockConfig {
-            enabled: true,
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
@@ -1344,7 +1324,6 @@ mod tests {
     #[test]
     fn test_build_endpoint_url_with_context_query_params() {
         let config = AdServerMockConfig {
-            enabled: true,
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
@@ -1378,7 +1357,6 @@ mod tests {
         // With an empty context_query_params, no query params are appended
         // even if context contains data.
         let config = AdServerMockConfig {
-            enabled: true,
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
@@ -1423,7 +1401,6 @@ mod tests {
     #[test]
     fn test_build_endpoint_url_preserves_existing_query_params() {
         let config = AdServerMockConfig {
-            enabled: true,
             endpoint: "http://localhost:6767/adserver/mediate?debug=true".to_string(),
             timeout_ms: 500,
             price_floor: None,

@@ -219,8 +219,31 @@ impl Publisher {
     }
 }
 
+/// Which integrations run, and the settings each one is given.
+///
+/// Mapped from the `[integration]` TOML section, which follows the convention
+/// every provider type uses: [`provider`](Self::provider) names what runs, and
+/// a named block holds one provider's settings. Here that block is
+/// `[integration.<id>]`, and it is written only for an integration that has
+/// settings to give.
 #[derive(Default, Clone, Deserialize, Serialize)]
 pub struct IntegrationSettings {
+    /// The integrations that run, named by id, for example
+    /// `provider = ["gpt", "prebid"]`.
+    ///
+    /// An integration runs when, and only when, its id is on this list, so
+    /// there is no second switch inside its own block and leaving the list out
+    /// runs none of them. A repeated id, and a block for an integration that
+    /// is not named here, are both refused by
+    /// [`validate_selection`](Self::validate_selection). An id that no builder
+    /// supplies is refused where the registry is built, which is the only
+    /// place an adapter's and a vendor crate's builders are known.
+    ///
+    /// The order of the list carries no meaning: integrations run in the order
+    /// their builders are registered. This is unlike
+    /// `[permission_signal] sources`, where the order is the policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider: Vec<String>,
     #[serde(flatten)]
     entries: HashMap<String, JsonValue>,
 }
@@ -231,34 +254,43 @@ impl std::fmt::Debug for IntegrationSettings {
         integration_ids.sort_unstable();
         formatter
             .debug_struct("IntegrationSettings")
+            .field("provider", &self.provider)
             .field("integration_ids", &integration_ids)
             .finish()
     }
 }
 
-pub trait IntegrationConfig: DeserializeOwned + Validate {
-    fn is_enabled(&self) -> bool;
-
-    /// Validate the public field schema for an explicitly disabled config.
-    ///
-    /// The default deserializes the integration's normal schema, except it
-    /// permits omitted enabled-only required fields. Override this only when a
-    /// disabled integration has a distinct public schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns a deserialization error when the disabled public field schema is invalid.
-    fn validate_disabled_schema(raw: &JsonValue) -> Result<(), serde_json::Error> {
-        match serde_json::from_value::<Self>(raw.clone()) {
-            Ok(_) => Ok(()),
-            Err(error) if error.to_string().starts_with("missing field ") => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-}
+/// The settings type an integration reads from its `[integration.<id>]` block.
+///
+/// The type states which settings the integration takes and how they are
+/// validated, and nothing else. Whether the integration runs is not its
+/// business, because `[integration] provider` names what runs.
+pub trait IntegrationConfig: DeserializeOwned + Validate {}
 
 impl IntegrationSettings {
-    /// Inserts a configuration value for an integration.
+    /// Whether `integration_id` is named in `[integration] provider`.
+    #[must_use]
+    pub fn is_selected(&self, integration_id: &str) -> bool {
+        self.provider
+            .iter()
+            .any(|selected| selected == integration_id)
+    }
+
+    /// Names `integration_id` in `[integration] provider`, so it runs.
+    ///
+    /// Naming one that is already on the list changes nothing, so a caller
+    /// never has to check first.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn select(&mut self, integration_id: impl Into<String>) {
+        let integration_id = integration_id.into();
+        if !self.is_selected(&integration_id) {
+            self.provider.push(integration_id);
+        }
+    }
+
+    /// Selects an integration and stores the settings it runs with, which is
+    /// what naming it in `[integration] provider` and writing its
+    /// `[integration.<id>]` block do together.
     ///
     /// # Errors
     ///
@@ -276,15 +308,78 @@ impl IntegrationSettings {
             serde_json::to_value(value).change_context(TrustedServerError::Configuration {
                 message: "Failed to serialize integration configuration".to_string(),
             })?;
-        self.entries.insert(integration_id.into(), json);
+        let integration_id = integration_id.into();
+        self.select(integration_id.clone());
+        self.entries.insert(integration_id, json);
         Ok(())
     }
 
-    fn is_explicitly_disabled(raw: &JsonValue) -> bool {
-        raw.as_object()
-            .and_then(|map| map.get("enabled"))
-            .and_then(JsonValue::as_bool)
-            == Some(false)
+    /// Validates the selection against the blocks that are present.
+    ///
+    /// Three shapes are refused, because each reads as though it does
+    /// something it does not: an id named twice, an `enabled` key left in an
+    /// integration's block, and a block for an integration that is not
+    /// selected. Startup and `ts config validate` both run this, so none of
+    /// them is quietly ignored.
+    ///
+    /// Whether an id names an integration this build supplies is a separate
+    /// question, answered where the registry is built, because only there are
+    /// the adapter's and a vendor crate's builders known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming the ids at fault
+    /// and the fix for them.
+    pub fn validate_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut named = HashSet::new();
+        for integration_id in &self.provider {
+            if !named.insert(integration_id.as_str()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "[integration] provider names `{integration_id}` more than once. \
+                         Name each integration that runs exactly once"
+                    ),
+                }));
+            }
+        }
+
+        // Blocks live in a map, so both lists are sorted before they are
+        // reported and an operator gets the same message every time.
+        let mut carries_enabled = Vec::new();
+        let mut unselected = Vec::new();
+        for (integration_id, block) in &self.entries {
+            if block.get("enabled").is_some() {
+                carries_enabled.push(integration_id.as_str());
+            }
+            if !self.is_selected(integration_id) {
+                unselected.push(integration_id.as_str());
+            }
+        }
+        carries_enabled.sort_unstable();
+        unselected.sort_unstable();
+
+        if !carries_enabled.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[integration.{}] sets `enabled`, which is no longer read. An integration \
+                     runs when its id is named in [integration] provider, so remove the key \
+                     and name the integration there instead",
+                    carries_enabled.join("] and [integration."),
+                ),
+            }));
+        }
+
+        if !unselected.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[integration.{}] is configured but not named in [integration] provider. \
+                     Add the integration to that list to run it, or remove the block",
+                    unselected.join("] and [integration."),
+                ),
+            }));
+        }
+
+        Ok(())
     }
 
     fn remove_legacy_static_secret_store_selectors(&mut self) {
@@ -310,7 +405,14 @@ impl IntegrationSettings {
         }
     }
 
-    /// Retrieves and validates a typed configuration for an integration.
+    /// Reads and validates a selected integration's typed configuration, or
+    /// returns `None` when `[integration] provider` does not name it.
+    ///
+    /// A selected integration with no block of its own is read from an empty
+    /// one, so an integration that takes no settings runs on its id alone and
+    /// one that requires a setting reports the setting it is missing. The
+    /// parse and validation messages carry the underlying error, because a
+    /// report renders only its outermost message in `ts config validate`.
     ///
     /// # Errors
     ///
@@ -322,36 +424,23 @@ impl IntegrationSettings {
     where
         T: IntegrationConfig,
     {
-        let raw = match self.entries.get(integration_id) {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-
-        if Self::is_explicitly_disabled(raw) {
-            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            })?;
+        if !self.is_selected(integration_id) {
             return Ok(None);
         }
 
-        let config: T = serde_json::from_value(raw.clone()).change_context(
-            TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            },
-        )?;
+        let raw = self
+            .entries
+            .get(integration_id)
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
 
-        // Field validation runs only for integrations that resolve to enabled.
-        // An integration whose `enabled` flag is omitted falls back to its
-        // serde default, which the explicit-`false` fast path above cannot
-        // observe. Validating before this check would reject documented
-        // template placeholders in sections that are not actually turned on.
-        if !config.is_enabled() {
-            return Ok(None);
-        }
+        let config: T = serde_json::from_value(raw).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Integration '{integration_id}' configuration could not be parsed: {error}"
+                ),
+            })
+        })?;
 
         config.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
@@ -2240,7 +2329,7 @@ pub struct Proxy {
     ///
     /// When empty (the default), proxy hosts are not restricted. Configure this
     /// in production to constrain signed and fetched first-party proxy targets.
-    /// When `integrations.prebid.external_bundle_url` is configured, this list
+    /// When `integration.prebid.external_bundle_url` is configured, this list
     /// must include its host and any HTTPS redirect targets.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
@@ -3125,6 +3214,41 @@ fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
     *value == PermissionSignalConfig::default()
 }
 
+// `[integration]` is a new section under this name, so a serialized blob that
+// carries it is rejected by a base-revision binary that has never heard of it.
+// An unconfigured section is omitted for the same reason the selector tables
+// above are.
+fn is_default_integration_config(value: &IntegrationSettings) -> bool {
+    value.provider.is_empty() && value.entries.is_empty()
+}
+
+/// Message a configuration still carrying the removed `[integrations]` table
+/// is rejected with.
+const REMOVED_INTEGRATIONS_TABLE_MESSAGE: &str = "Configuration table `[integrations]` was removed. Move each `[integrations.<id>]` block to \
+     `[integration.<id>]`, name the integrations that run in `[integration] provider`, and delete \
+     every `enabled` key, as described in the CHANGELOG.md breaking migration";
+
+/// The removed `[integrations]` table.
+///
+/// Reading one always fails, with [`REMOVED_INTEGRATIONS_TABLE_MESSAGE`], so
+/// the value is never held and the type carries no data.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedIntegrationsTable;
+
+impl<'de> Deserialize<'de> for RemovedIntegrationsTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // The value is read and discarded first so that a table, a string or
+        // anything else all reach the same message. Reporting a type error
+        // instead would send an operator looking for a type problem in a table
+        // that has simply moved.
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(REMOVED_INTEGRATIONS_TABLE_MESSAGE))
+    }
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -3393,8 +3517,20 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
-    #[serde(default)]
-    pub integrations: IntegrationSettings,
+    /// The removed `[integrations]` table.
+    ///
+    /// The name is kept so a configuration written for the previous release is
+    /// told where its blocks moved, rather than being handed a bare
+    /// unknown-field error listing every table Trusted Server accepts. The
+    /// field never holds a value, because reading one always fails.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed table fails with directions"
+    )]
+    integrations: RemovedIntegrationsTable,
+    #[serde(default, skip_serializing_if = "is_default_integration_config")]
+    pub integration: IntegrationSettings,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
@@ -3505,7 +3641,7 @@ impl Settings {
         self.image_optimizer.normalize();
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
-        self.integrations
+        self.integration
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
     }
@@ -3528,6 +3664,7 @@ impl Settings {
 
         settings.ec.migrate_legacy_ec_layout()?;
         settings.ec.validate_provider_selection()?;
+        settings.integration.validate_selection()?;
         settings.device.validate_provider_selection()?;
         settings.geo.validate_provider_selection()?;
         GeoConfig::validate_permission_policy()?;
@@ -3899,7 +4036,11 @@ impl Settings {
         Ok(())
     }
 
-    /// Retrieves the integration configuration of a specific type.
+    /// Retrieves a selected integration's configuration of a specific type.
+    ///
+    /// Hands back `None` when `[integration] provider` does not name the
+    /// integration, so a caller that reads its own configuration is also
+    /// asking whether it runs.
     ///
     /// # Errors
     ///
@@ -3911,7 +4052,7 @@ impl Settings {
     where
         T: IntegrationConfig,
     {
-        self.integrations.get_typed(integration_id)
+        self.integration.get_typed(integration_id)
     }
 }
 
@@ -4258,10 +4399,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use crate::auction::build_orchestrator;
     use crate::integrations::{
-        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
-        prebid::PrebidIntegrationConfig,
+        IntegrationRegistry, nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -4356,6 +4495,7 @@ mod tests {
         // country, so both selector tables are reset to unset here.
         settings.geo = GeoConfig::default();
         settings.device = DeviceConfig::default();
+        settings.integration = IntegrationSettings::default();
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
@@ -5122,17 +5262,12 @@ provider = \"none\"",
                 .integration_config::<NextJsIntegrationConfig>("nextjs")
                 .expect("Next.js config query should succeed")
                 .is_none(),
-            "Next.js integration should default to disabled"
+            "an integration the provider list does not name should not run"
         );
-        let raw_nextjs = settings
-            .integrations
-            .get("nextjs")
-            .expect("test settings should include nextjs block");
-        assert_eq!(raw_nextjs["enabled"], json!(false));
         assert_eq!(
-            raw_nextjs["rewrite_attributes"],
-            json!(["href", "link", "url"]),
-            "Next.js rewrite attributes should default to href/link/url"
+            settings.integration.provider,
+            vec!["prebid".to_owned()],
+            "the fixture should run exactly the integration it names"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
@@ -7051,97 +7186,74 @@ source_domain = "partner.example.com"
         );
     }
 
+    /// An integration `[integration] provider` does not name has no
+    /// configuration, whatever else the settings hold.
     #[test]
-    fn test_disabled_integration_does_not_register() {
+    fn an_integration_that_is_not_named_has_no_configuration() {
         use crate::integrations::testlight::TestlightConfig;
-        use serde_json::json;
+
+        let settings = create_test_settings();
+
+        assert!(
+            !settings.integration.is_selected("testlight"),
+            "the shared fixture should not name testlight"
+        );
+        assert!(
+            settings
+                .integration_config::<TestlightConfig>("testlight")
+                .expect("reading an unnamed integration should succeed")
+                .is_none(),
+            "an integration that is not named should have no configuration"
+        );
+    }
+
+    /// A named integration with no block of its own is read from an empty one,
+    /// so one that takes no settings runs on its id alone.
+    #[test]
+    fn a_named_integration_with_no_block_is_read_from_an_empty_one() {
+        use crate::integrations::osano::OsanoConfig;
 
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "testlight",
-                &json!({
-                    "enabled": false,
-                    "endpoint": "https://testlight.test/auction",
-                    "rewrite_scripts": true,
-                }),
-            )
-            .expect("should insert integration config");
+        settings.integration.select("osano");
 
-        let config = settings
+        assert!(
+            settings
+                .integration_config::<OsanoConfig>("osano")
+                .expect("an integration that takes no settings should read from an empty block")
+                .is_some(),
+            "naming the integration should be the whole configuration"
+        );
+    }
+
+    /// The same empty block makes an integration that requires a setting report
+    /// the setting it is missing, rather than starting without it.
+    #[test]
+    fn a_named_integration_without_a_required_setting_names_it() {
+        use crate::integrations::testlight::TestlightConfig;
+
+        let mut settings = create_test_settings();
+        settings.integration.select("testlight");
+
+        let error = settings
             .integration_config::<TestlightConfig>("testlight")
-            .expect("integration parsing should succeed");
+            .expect_err("should reject a named integration with no endpoint");
 
-        assert!(config.is_none(), "Disabled integrations should be skipped");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("testlight") && rendered.contains("endpoint"),
+            "should name the integration and the missing setting: {rendered}"
+        );
     }
 
     #[test]
-    fn disabled_integration_can_omit_enabled_required_fields_and_skip_semantic_validation() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "gpt",
-                &json!({
-                    "enabled": false,
-                }),
-            )
-            .expect("should insert GPT config");
-
-        let config = settings
-            .integration_config::<GptConfig>("gpt")
-            .expect("minimal disabled GPT config should be ignored");
-        assert!(config.is_none(), "disabled GPT config should be skipped");
-        IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("disabled invalid integration config should not fail registry startup");
-    }
-
-    #[test]
-    fn minimal_disabled_prebid_deserializes_without_enabled_only_validation() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": false,
-                }),
-            )
-            .expect("should insert prebid config");
-
-        let config = settings
-            .integration_config::<PrebidIntegrationConfig>("prebid")
-            .expect("disabled prebid config should be ignored");
-        assert!(config.is_none(), "disabled prebid config should be skipped");
-        IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("disabled default-enabled prebid config should not fail registry startup");
-        build_orchestrator(&settings)
-            .expect("minimal disabled prebid config should not fail orchestrator startup");
-    }
-
-    #[test]
-    fn disabled_removed_prebid_and_aps_fields_are_rejected() {
+    fn removed_prebid_and_aps_fields_are_rejected() {
         for (integration_id, removed_field) in [("prebid", "server_url"), ("aps", "account_id")] {
             let mut settings = create_test_settings();
             settings
-                .integrations
+                .integration
                 .insert_config(
                     integration_id,
                     &json!({
-                        "enabled": false,
                         (removed_field): "removed-value",
                     }),
                 )
@@ -7150,10 +7262,10 @@ source_domain = "partner.example.com"
             let error = match integration_id {
                 "prebid" => settings
                     .integration_config::<PrebidIntegrationConfig>(integration_id)
-                    .expect_err("should reject removed disabled Prebid field"),
+                    .expect_err("should reject the removed Prebid field"),
                 "aps" => settings
                     .integration_config::<crate::integrations::aps::ApsConfig>(integration_id)
-                    .expect_err("should reject removed disabled APS field"),
+                    .expect_err("should reject the removed APS field"),
                 _ => unreachable!("test integration ID should be known"),
             };
             assert!(
@@ -7163,15 +7275,122 @@ source_domain = "partner.example.com"
         }
     }
 
+    /// A block written for an integration the provider list does not name is
+    /// refused, rather than sitting in the configuration doing nothing.
     #[test]
-    fn enabled_invalid_integration_fails_registry_startup() {
+    fn a_block_for_an_integration_that_is_not_named_is_refused() {
+        let toml = format!(
+            "{}\n[integration.osano]\n",
+            crate_test_settings_str().replace(
+                "provider = [\"prebid\"]",
+                "provider = [\"prebid\"]\n\n[integration.nextjs]\nrewrite_attributes = [\"href\"]",
+            )
+        );
+
+        let error =
+            Settings::from_toml(&toml).expect_err("should reject blocks nothing on the list names");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[integration.nextjs]") && rendered.contains("[integration.osano]"),
+            "should name every block that is not on the list: {rendered}"
+        );
+        assert!(
+            rendered.contains("provider"),
+            "should say where to name the integration instead: {rendered}"
+        );
+    }
+
+    /// The removed `enabled` key is refused where it is written, so a
+    /// configuration carried over from the previous release cannot read as
+    /// switched off while the integration runs.
+    #[test]
+    fn an_enabled_key_left_in_a_block_is_refused() {
+        let toml = crate_test_settings_str().replace(
+            "[integration.prebid]",
+            "[integration.prebid]\nenabled = false",
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("should reject a leftover enabled key");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[integration.prebid]") && rendered.contains("enabled"),
+            "should name the block and the key: {rendered}"
+        );
+        assert!(
+            rendered.contains("[integration] provider"),
+            "should say what switches an integration on instead: {rendered}"
+        );
+    }
+
+    /// Naming one integration twice is a mistake rather than a way of running
+    /// it twice, so it is refused.
+    #[test]
+    fn naming_an_integration_twice_is_refused() {
+        let toml = crate_test_settings_str().replace(
+            "provider = [\"prebid\"]",
+            "provider = [\"prebid\", \"prebid\"]",
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("should reject a repeated id");
+
+        assert!(
+            format!("{error:?}").contains("more than once"),
+            "should report the repeated id: {error:?}"
+        );
+    }
+
+    /// The table this release removed is refused with the move spelled out,
+    /// rather than with a bare unknown-field error.
+    #[test]
+    fn the_removed_integrations_table_is_refused_with_directions() {
+        let toml = crate_test_settings_str().replace("[integration]", "[integrations]");
+
+        let error = Settings::from_toml(&toml).expect_err("should reject the removed table");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[integration.<id>]") && rendered.contains("[integration] provider"),
+            "should say where the blocks moved: {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "should point at the migration: {rendered}"
+        );
+    }
+
+    /// The same refusal reaches a configuration blob, which is the shape the
+    /// runtime loads rather than TOML.
+    #[test]
+    fn json_settings_refuse_the_removed_integrations_table() {
+        let mut value = serde_json::to_value(create_test_settings())
+            .expect("should serialize the test settings fixture to JSON");
+        let settings = value
+            .as_object_mut()
+            .expect("settings should serialize as an object");
+        let integration = settings
+            .remove("integration")
+            .expect("the fixture should serialize its integration table");
+        settings.insert("integrations".to_owned(), integration);
+
+        let error =
+            Settings::from_json_value(value).expect_err("should reject the removed table in JSON");
+
+        assert!(
+            format!("{error:?}").contains("[integration] provider"),
+            "should say where the blocks moved: {error:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_settings_for_a_named_integration_fail_registry_startup() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "gpt",
                 &json!({
-                    "enabled": true,
                     "script_url": "not a url",
                 }),
             )

@@ -20,6 +20,9 @@ pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 /// Default config-store key containing the Trusted Server app-config blob.
 pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
 
+/// Id of the one integration whose blocks carry secret references.
+const DATADOME_INTEGRATION_ID: &str = "datadome";
+
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
 ///
 /// Secret references are resolved after envelope verification and before
@@ -87,15 +90,26 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         }
     }
 
+    // An integration runs when `[integration] provider` names it, so that list
+    // decides whether DataDome's secrets are live. A block for an integration
+    // the list does not name is refused once the settings are deserialized,
+    // and clearing its references here means that refusal is what an operator
+    // sees rather than a secret lookup failing first.
+    let datadome_runs = data
+        .pointer("/integration/provider")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|provider| {
+            provider
+                .iter()
+                .any(|id| id.as_str() == Some(DATADOME_INTEGRATION_ID))
+        });
     let Some(datadome) = data
-        .pointer_mut("/integrations/datadome")
+        .pointer_mut("/integration/datadome")
         .and_then(serde_json::Value::as_object_mut)
     else {
         return;
     };
-    let integration_enabled =
-        datadome.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
-    let protection_enabled = integration_enabled
+    let protection_enabled = datadome_runs
         && datadome
             .get("enable_protection")
             .and_then(serde_json::Value::as_bool)
@@ -264,7 +278,7 @@ mod tests {
             .expect("should have enabled Prebid config");
         prebid.client_side_bidders = vec!["exampleBidder".to_string()];
         settings
-            .integrations
+            .integration
             .insert_config("prebid", &prebid)
             .expect("should replace Prebid config");
         settings
@@ -295,11 +309,10 @@ mod tests {
     fn didomi_geo_query_parameters_survive_blob_round_trip() {
         let mut original = test_settings();
         original
-            .integrations
+            .integration
             .insert_config(
                 "didomi",
                 &DidomiIntegrationConfig {
-                    enabled: true,
                     geo_query_parameters: true,
                     proxy_path: None,
                     sdk_origin: "https://sdk.example.com".to_string(),
@@ -329,11 +342,10 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("tinybird-token-key".to_string()));
         original
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "enable_protection": true,
                     "server_side_key_secret_name": "datadome-server-key",
                     "protection_test_bypass": {
@@ -627,11 +639,10 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("unused-tinybird-key".to_string()));
         original
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "enable_protection": false,
                     "server_side_key_secret_name": "unused-datadome-key",
                     "protection_test_bypass": {
@@ -668,36 +679,40 @@ mod tests {
         );
     }
 
+    /// A block for an integration `[integration] provider` does not name is
+    /// refused, and its secret references are dropped before resolution, so
+    /// the operator reads the block's own fault rather than a secret-store
+    /// failure that follows from it.
     #[test]
-    fn omitted_datadome_enabled_does_not_resolve_stale_protection_references() {
+    fn an_unnamed_datadome_block_is_refused_without_resolving_its_secrets() {
         let mut original = test_settings();
-        original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "unused-datadome-key",
-                    "protection_test_bypass": {
-                        "enabled": true,
-                        "credential_secret_name": "unused-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure disabled DataDome references");
+        original.integration.insert(
+            "datadome".to_owned(),
+            serde_json::json!({
+                "enable_protection": true,
+                "server_side_key_secret_name": "unused-datadome-key",
+                "protection_test_bypass": {
+                    "enabled": true,
+                    "credential_secret_name": "unused-bypass-key",
+                },
+            }),
+        );
 
-        let reconstructed = settings_from_config_blob(
+        let error = settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
         )
-        .expect("should skip stale DataDome protection references");
+        .expect_err("should refuse a block nothing on the provider list names");
+        let rendered = format!("{error:?}");
 
         assert!(
-            reconstructed
-                .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-                .expect("should parse disabled DataDome config")
-                .is_none()
+            rendered.contains("[integration.datadome]") && rendered.contains("provider"),
+            "should name the block and the list: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unused-datadome-key"),
+            "should not have tried to resolve the stale secret reference: {rendered}"
         );
     }
 
