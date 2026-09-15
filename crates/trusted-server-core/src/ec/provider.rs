@@ -131,7 +131,7 @@ pub const HMAC_PROVIDER_KEY: &str = "hmac";
 /// arm when the host-signal provider becomes a module of its own.
 pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
 
-/// The configuration name of the client-fixed demonstration provider.
+/// The configuration name of the `client_fixed` demonstration provider.
 ///
 /// An ordinary name in the same open-ended namespace as [`HMAC_PROVIDER_KEY`].
 /// The resolution in [`build_provider`] matches it, as does its startup
@@ -146,7 +146,18 @@ pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
 /// The name is spelled here whether or not the provider is compiled in,
 /// because a build without it still has to recognize the name to reject the
 /// selection at startup rather than at the first request.
-pub const CLIENT_FIXED_PROVIDER_KEY: &str = "client-fixed";
+pub const CLIENT_FIXED_PROVIDER_KEY: &str = "client_fixed";
+
+/// The name the demonstration provider was selected by before it was renamed
+/// under the rule that every name an operator types into configuration is
+/// `snake_case`.
+///
+/// `check_named_provider_configuration` refuses it at startup with a message
+/// naming [`CLIENT_FIXED_PROVIDER_KEY`], so a deployment still configured with
+/// the old spelling stops there and the operator is told what to write
+/// instead, rather than being told to add an `[ec.providers.client-fixed]`
+/// block for a provider that needs none.
+const RETIRED_CLIENT_FIXED_PROVIDER_KEY: &str = "client-fixed";
 
 /// The provider names core supplies itself.
 ///
@@ -1164,7 +1175,7 @@ fn resolve_named_provider(
         )));
     }
 
-    // The client-fixed demonstration provider takes no configuration block and
+    // The `client_fixed` demonstration provider takes no configuration block and
     // no services, so it is built whenever it is selected. A fixed shared word
     // is not an identity, so it is compiled only into test and demonstration
     // builds and a build without it refuses the name rather than substituting
@@ -1175,7 +1186,7 @@ fn resolve_named_provider(
         return Ok(Box::new(ClientFixedProvider));
         #[cfg(not(any(test, feature = "client-fixed-demo")))]
         return Err(Report::new(TrustedServerError::EdgeCookie {
-            message: "The client-fixed demo Edge Cookie provider is not compiled into this \
+            message: "The `client_fixed` demo Edge Cookie provider is not compiled into this \
                       build. It is for demonstration and testing only; enable the \
                       trusted-server-core `client-fixed-demo` cargo feature to use it"
                 .to_owned(),
@@ -1202,11 +1213,15 @@ fn resolve_named_provider(
 /// configuration validation does not ask the settings whether a
 /// `[ec.providers.<name>]` block is present. Whether a name needs a block is
 /// the resolution's knowledge, not the settings', because a provider built from
-/// nothing (the client-fixed demonstration provider) is configured correctly
+/// nothing (the `client_fixed` demonstration provider) is configured correctly
 /// with no block at all, while a build that does not compile that provider in
 /// cannot honor the name however it is configured. Both arms live here beside
 /// the resolution they belong to, and both go with it when these providers
 /// become modules.
+///
+/// The provider's old name, [`RETIRED_CLIENT_FIXED_PROVIDER_KEY`], is refused
+/// here in every build, so an operator whose configuration still carries it is
+/// told the name to write instead.
 ///
 /// Whether the host supplies a capability a provider needs is not answerable
 /// from configuration, so it is not asked here. [`ensure_provider_available`]
@@ -1214,13 +1229,27 @@ fn resolve_named_provider(
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError::Configuration`] when the name is not compiled
-/// into this build, or when it needs an `[ec.providers.<name>]` block that is
-/// absent.
+/// Returns [`TrustedServerError::Configuration`] when the name is the old
+/// `client-fixed` spelling, when the name is not compiled into this build, or
+/// when it needs an `[ec.providers.<name>]` block that is absent.
 pub(crate) fn check_named_provider_configuration(
     key: &str,
     ec: &Ec,
 ) -> Result<(), Report<TrustedServerError>> {
+    // The old spelling of the demonstration provider's name is refused before
+    // any other question is asked, and in every build. An `[ec.providers.*]`
+    // block written under the old name therefore cannot make that name look
+    // like a vendor provider's, and an operator gets the same answer whether
+    // or not this build compiles the demonstration provider in.
+    if key == RETIRED_CLIENT_FIXED_PROVIDER_KEY {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "[ec] provider = \"client-fixed\" is no longer accepted. The \
+                      demonstration provider is now named \"client_fixed\", so set [ec] \
+                      provider = \"client_fixed\" instead"
+                .to_owned(),
+        }));
+    }
+
     // The one name built from nothing, so a block lookup would reject the
     // correctly configured case, and the one name a production build does not
     // supply at all, which no amount of configuration can fix. Rejecting it
@@ -1231,7 +1260,7 @@ pub(crate) fn check_named_provider_configuration(
         return Ok(());
         #[cfg(not(any(test, feature = "client-fixed-demo")))]
         return Err(Report::new(TrustedServerError::Configuration {
-            message: "[ec] provider = \"client-fixed\" selects the demonstration provider, \
+            message: "[ec] provider = \"client_fixed\" selects the demonstration provider, \
                       which is not compiled into this build. Enable the trusted-server-core \
                       `client-fixed-demo` cargo feature for demonstrations"
                 .to_owned(),
@@ -2089,7 +2118,7 @@ mod tests {
             .expect("should generate");
         assert!(
             generated.id.is_none(),
-            "client-fixed should defer in generate, deriving no edge identifier"
+            "`client_fixed` should defer in generate, deriving no edge identifier"
         );
     }
 
@@ -2132,7 +2161,7 @@ mod tests {
             ClientFixedProvider
                 .required_permissions()
                 .contains(Permission::StoreOnDevice),
-            "client-fixed writes a cookie, so it requires necessary.operations.storage"
+            "`client_fixed` writes a cookie, so it requires necessary.operations.storage"
         );
     }
 
@@ -2424,16 +2453,70 @@ mod tests {
         };
 
         ec.validate_provider_selection()
-            .expect("client-fixed should validate with no configuration block");
+            .expect("`client_fixed` should validate with no configuration block");
 
         let built = build_provider(&ec, None, None)
-            .expect("client-fixed should build with no configuration and no services")
-            .expect("client-fixed should yield a provider");
+            .expect("`client_fixed` should build with no configuration and no services")
+            .expect("`client_fixed` should yield a provider");
         assert_eq!(
             built.id(),
             CLIENT_FIXED_PROVIDER_KEY,
             "the built provider should be the one the selector names"
         );
+    }
+
+    #[test]
+    fn the_old_client_fixed_spelling_fails_at_startup_and_names_the_new_one() {
+        // The demonstration provider was renamed to `client_fixed` under the
+        // rule that every name an operator types into configuration is
+        // `snake_case`. A deployment still configured with the old spelling
+        // has to stop when settings load, which every adapter does before it
+        // serves a request, and the error has to name the spelling to write
+        // instead.
+        let selecting = |selector: &str| {
+            let toml = crate::test_support::tests::crate_test_settings_str()
+                .replace("[ec.providers.hmac]", "")
+                .replace("passphrase = \"test-secret-key-32-bytes-minimum\"", "")
+                .replace("provider = \"hmac\"", &format!("provider = \"{selector}\""));
+            assert!(
+                toml.contains(&format!("provider = \"{selector}\""))
+                    && !toml.contains("[ec.providers.hmac]")
+                    && !toml.contains("passphrase"),
+                "the test configuration should select `{selector}` and carry no provider block"
+            );
+            toml
+        };
+
+        let old = selecting(RETIRED_CLIENT_FIXED_PROVIDER_KEY);
+        let err = crate::settings::Settings::from_toml(&old)
+            .expect_err("the old spelling should fail when settings load");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "the old spelling should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            err.to_string().contains(CLIENT_FIXED_PROVIDER_KEY),
+            "the error should name `client_fixed`, got: {err}"
+        );
+
+        // A block configured under the old name does not let it through as a
+        // vendor provider, because the old spelling is refused before any
+        // block is looked for.
+        let old_with_block = format!("{old}\n[ec.providers.client-fixed]\nsetting = \"x\"\n");
+        let err = crate::settings::Settings::from_toml(&old_with_block)
+            .expect_err("a block under the old name should not make the old name valid");
+        assert!(
+            err.to_string().contains(CLIENT_FIXED_PROVIDER_KEY),
+            "the error should still name `client_fixed`, got: {err}"
+        );
+
+        // The same configuration written with the new spelling loads.
+        crate::settings::Settings::from_toml(&selecting(CLIENT_FIXED_PROVIDER_KEY))
+            .expect("the `client_fixed` spelling should load with no provider block");
     }
 
     #[test]

@@ -362,7 +362,7 @@ deployment selects an implementation and the core stays neutral:
 
 | Capability            | Trait                                    | Selector            | Built-in (core)                         | Vendor / host crates         |
 | --------------------- | ---------------------------------------- | ------------------- | --------------------------------------- | ---------------------------- |
-| Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
+| Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client_fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
 | Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
 | Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
 | Permission signals    | `PermissionSignalProvider` (`permission_signal/mod.rs`) | `[permission_signal] sources` (an ordered list) | None, and with no provider every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
