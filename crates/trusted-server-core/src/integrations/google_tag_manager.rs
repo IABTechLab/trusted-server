@@ -3068,7 +3068,7 @@ proxy_secret = "test-secret"
 [ec]
 provider = "hmac"
 
-[ec.providers.hmac]
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integration]
@@ -3108,7 +3108,7 @@ proxy_secret = "test-secret"
 [ec]
 provider = "hmac"
 
-[ec.providers.hmac]
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integration.google_tag_manager]

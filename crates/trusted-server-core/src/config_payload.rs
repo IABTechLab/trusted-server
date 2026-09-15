@@ -142,13 +142,17 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::provider::{HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::{
+        crate_test_settings_str, hmac_passphrase, select_hmac_provider,
+        select_host_signals_provider,
+    };
 
     fn test_settings() -> Settings {
         let mut settings =
@@ -210,6 +214,7 @@ mod tests {
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
                 "host-signals-passphrase-key" => "resolved-host-signals-passphrase-32-bytes-ok",
+                "labeled-passphrase-key" => "resolved-labeled-passphrase-32-bytes",
                 _ => key,
             };
             Ok(value.as_bytes().to_vec())
@@ -505,6 +510,38 @@ mod tests {
     }
 
     #[test]
+    fn a_labeled_hmac_block_resolves_its_passphrase_from_the_secret_store() {
+        // `secret_fields` can only list fixed paths, so a block under a label
+        // of the operator's choosing is found by reading the configuration.
+        // Without that, the key name would reach settings as the passphrase.
+        let mut data =
+            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        data["ec"] = serde_json::json!({
+            "provider": "primary",
+            "primary": {
+                "implementation": "hmac",
+                "passphrase": "labeled-passphrase-key",
+            },
+        });
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the labeled block's passphrase");
+
+        let written =
+            serde_json::to_value(&reconstructed).expect("should serialize the loaded settings");
+        assert_eq!(
+            written["ec"]["primary"]["passphrase"], "resolved-labeled-passphrase-32-bytes",
+            "should replace the key name with the value from the secret store"
+        );
+    }
+
+    #[test]
     fn omitted_s3_secret_references_resolve_default_store_keys() {
         let mut original = test_settings();
         let mut route = ProxyAssetRoute::new(
@@ -759,9 +796,11 @@ mod tests {
         let mut original = test_settings();
         original.publisher.proxy_secret =
             Redacted::new("12345678901234567890123456789012".to_string());
-        original.ec.providers.hmac = Some(crate::settings::HmacProviderConfig {
-            passphrase: Redacted::new("12345678901234567890123456789012".to_string()),
-        });
+        select_hmac_provider(
+            &mut original.ec,
+            HMAC_PROVIDER_KEY,
+            "12345678901234567890123456789012",
+        );
         original.handlers[0].password = Redacted::new("true".to_string());
 
         let reconstructed =
@@ -773,22 +812,8 @@ mod tests {
             "numeric-looking proxy secret should remain a string"
         );
         assert_eq!(
-            reconstructed
-                .ec
-                .providers
-                .hmac
-                .as_ref()
-                .expect("should reconstruct the hmac provider")
-                .passphrase
-                .expose(),
-            original
-                .ec
-                .providers
-                .hmac
-                .as_ref()
-                .expect("should keep the hmac provider")
-                .passphrase
-                .expose(),
+            hmac_passphrase(&reconstructed.ec, HMAC_PROVIDER_KEY),
+            hmac_passphrase(&original.ec, HMAC_PROVIDER_KEY),
             "numeric-looking passphrase should remain a string"
         );
         assert_eq!(
@@ -830,13 +855,7 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
-        settings
-            .ec
-            .providers
-            .hmac
-            .as_mut()
-            .expect("should configure the hmac provider")
-            .passphrase = Redacted::new("short_key".to_owned());
+        select_hmac_provider(&mut settings.ec, HMAC_PROVIDER_KEY, "short_key");
 
         let err = load_settings(&envelope_json(&settings))
             .expect_err("should reject a short resolved passphrase");
@@ -854,27 +873,21 @@ mod tests {
     #[test]
     fn resolves_the_host_signals_passphrase_from_the_mapped_store() {
         let mut original = test_settings();
-        original.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
-            "host-signals",
-        ));
-        original.ec.providers.hmac = None;
-        original.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
-            passphrase: Redacted::new("host-signals-passphrase-key".to_string()),
-        });
+        select_host_signals_provider(&mut original.ec, "host-signals-passphrase-key");
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
         )
-        .expect("should resolve the host-signals passphrase from the mapped store");
+        .expect("should resolve the host_signals passphrase from the mapped store");
 
         assert_eq!(
             reconstructed
                 .ec
-                .providers
-                .host_signals
-                .as_ref()
+                .provider_blocks
+                .get(HOST_SIGNALS_PROVIDER_KEY)
+                .and_then(crate::settings::EcProviderBlock::host_signals_settings)
                 .map(|config| config.passphrase.expose().as_str()),
             Some("resolved-host-signals-passphrase-32-bytes-ok")
         );
@@ -883,16 +896,10 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_a_short_resolved_host_signals_passphrase() {
         let mut settings = test_settings();
-        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
-            "host-signals",
-        ));
-        settings.ec.providers.hmac = None;
-        settings.ec.providers.host_signals = Some(crate::settings::HostSignalsProviderConfig {
-            passphrase: Redacted::new("short_key".to_owned()),
-        });
+        select_host_signals_provider(&mut settings.ec, "short_key");
 
         let err = load_settings(&envelope_json(&settings))
-            .expect_err("should reject a short resolved host-signals passphrase");
+            .expect_err("should reject a short resolved host_signals passphrase");
 
         assert!(
             err.to_string().contains("short_passphrase"),

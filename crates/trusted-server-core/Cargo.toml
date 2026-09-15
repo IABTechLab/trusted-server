@@ -61,7 +61,7 @@ getrandom = { workspace = true, features = ["js"] }
 uuid = { workspace = true, features = ["js"] }
 
 [features]
-# Compiles in the client-fixed demonstration Edge Cookie provider. Off by
+# Compiles in the `client_fixed` demonstration Edge Cookie provider. Off by
 # default so production builds cannot select a fixed shared word as identity.
 client-fixed-demo = []
 default = []

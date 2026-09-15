@@ -197,7 +197,7 @@ pub(crate) struct AppState {
     /// `None` for a deployment that selects no provider, and for one whose
     /// provider must be resolved per request.
     pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
-    /// The permission signal providers `[permission_signal] sources` selects
+    /// The permission signal providers `[permission_signal] provider` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
@@ -1726,7 +1726,7 @@ mod tests {
                 [ec]
                 provider = "hmac"
 
-                [ec.providers.hmac]
+                [ec.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [geo]
@@ -1802,7 +1802,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
@@ -2291,7 +2291,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
@@ -2969,7 +2969,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
@@ -3404,7 +3404,7 @@ mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]

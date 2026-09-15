@@ -235,7 +235,7 @@ mod tests {
                 [ec]
                 provider = "hmac"
 
-                [ec.providers.hmac]
+                [ec.hmac]
                 passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )

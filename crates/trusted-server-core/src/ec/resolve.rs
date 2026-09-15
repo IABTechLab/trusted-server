@@ -358,7 +358,7 @@ mod tests {
         settings
     }
 
-    // The fixed word shared by the client-fixed provider and its page script.
+    // The fixed word shared by the `client_fixed` provider and its page script.
     const FIXED_WORD: &str = "an-ec";
 
     fn post(body: &str) -> Request<EdgeBody> {

@@ -541,7 +541,7 @@ mod tests {
             // the absence of a selected provider can withhold it.
             let mut settings = create_test_settings();
             settings.ec.provider = None;
-            settings.ec.providers.hmac = None;
+            settings.ec.provider_blocks.clear();
 
             let refused = testlight_integration()
                 .handle(

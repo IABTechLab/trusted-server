@@ -75,7 +75,7 @@ TOML file.
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `ec.providers.hmac.passphrase` (when `ec.provider = "hmac"`)
+- `ec.hmac.passphrase` (when `ec.provider = "hmac"`)
 
 ---
 
@@ -154,7 +154,7 @@ Failed to generate EC ID: HMAC error
 [ec]
 provider = "hmac"
 
-[ec.providers.hmac]
+[ec.hmac]
 passphrase = "ec_passphrase"
 ```
 
@@ -163,7 +163,7 @@ passphrase = "ec_passphrase"
 
 ```bash
 TRUSTED_SERVER__EC__PROVIDER=hmac
-TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 ```
 
 3. Provision a high-entropy value of at least 32 characters under

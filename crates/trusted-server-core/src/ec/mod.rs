@@ -1578,7 +1578,7 @@ pub(crate) mod tests {
         // as absent, so a stateless deployment never uses or egresses it.
         let mut stateless = create_test_settings();
         stateless.ec.provider = None;
-        stateless.ec.providers.hmac = None;
+        stateless.ec.provider_blocks.clear();
         let ec_without = EcContext::read_from_request(&stateless, &req, &noop_services())
             .expect("should read EC context");
         assert_eq!(
@@ -1687,7 +1687,7 @@ pub(crate) mod tests {
     #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for ServerOpaqueProvider {
         fn id(&self) -> &'static str {
-            "server-opaque"
+            "server_opaque"
         }
 
         fn code(&self) -> ProviderCode {
@@ -1722,7 +1722,7 @@ pub(crate) mod tests {
         const OPAQUE: &str = "t0so~Opaque_EC_Value_MixedCase_123";
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("server-opaque"));
+        settings.ec.provider = Some(EcProviderSelection::from("server_opaque"));
         let services = noop_services_with_ec_provider(Arc::new(ServerOpaqueProvider));
         let graph = KvIdentityGraph::in_memory("test-ec-store");
 
@@ -2056,7 +2056,7 @@ pub(crate) mod tests {
     #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for HeaderSettingProvider {
         fn id(&self) -> &'static str {
-            "header-setting"
+            "header_setting"
         }
 
         fn code(&self) -> ProviderCode {
@@ -2095,7 +2095,7 @@ pub(crate) mod tests {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("header-setting"));
+        settings.ec.provider = Some(EcProviderSelection::from("header_setting"));
         let services = noop_services_with_ec_provider(Arc::new(provider));
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
@@ -2128,7 +2128,7 @@ pub(crate) mod tests {
         let err =
             outcome.expect_err("a managed cookie effect should make generation return an error");
         assert!(
-            err.to_string().contains("header-setting"),
+            err.to_string().contains("header_setting"),
             "the error should name the provider, got: {err}"
         );
 

@@ -146,6 +146,9 @@ impl<'a> SignalInput<'a> {
 pub trait PermissionSignalProvider: Send + Sync {
     /// Stable identifier, used in configuration, in logs, and by a peer
     /// looking this provider up through [`SignalInput::ask`].
+    ///
+    /// Written in `snake_case`, lowercase words joined by underscores, for
+    /// example `gpp_sale_opt_out`.
     fn id(&self) -> &'static str;
 
     /// How this provider would amend `permission` for this request.
@@ -314,7 +317,7 @@ pub(crate) fn select(
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Permission signal provider `{name}` is named more than once in \
-                     [permission_signal] sources. Each provider runs once, at one place \
+                     [permission_signal] provider. Each provider runs once, at one place \
                      in the order"
                 ),
             }));
@@ -373,16 +376,16 @@ pub fn build_permission_signal_providers(
     settings: &Settings,
     available: &[Arc<dyn PermissionSignalProvider>],
 ) -> Result<Arc<[Arc<dyn PermissionSignalProvider>]>, Report<TrustedServerError>> {
-    let configured = settings.permission_signal.sources.as_deref();
+    let configured = settings.permission_signal.provider.as_deref();
     let selected = select(available, configured)?;
     match configured {
         None => log::info!(
             "Permission signals: acting on every provider this build offers, [{}], no \
-             [permission_signal] sources configured",
+             [permission_signal] provider configured",
             ids(&selected).join(", ")
         ),
         Some([]) => log::info!(
-            "Permission signals: acting on no provider, [permission_signal] sources is \
+            "Permission signals: acting on no provider, [permission_signal] provider is \
              empty, so every permission stays at its country and region baseline"
         ),
         Some(_) => log::info!(
@@ -394,7 +397,7 @@ pub fn build_permission_signal_providers(
     if !left_out.is_empty() {
         log::warn!(
             "Permission signals: not acting on [{}], which are not in [permission_signal] \
-             sources. A signal this deployment does not act on is read from the request \
+             provider. A signal this deployment does not act on is read from the request \
              and then ignored",
             left_out.join(", ")
         );
@@ -875,8 +878,8 @@ mod tests {
     fn four() -> Vec<Arc<dyn PermissionSignalProvider>> {
         vec![
             fixed("gpc", ConsentSignal::Neutral),
-            fixed("gpp-sale-opt-out", ConsentSignal::Neutral),
-            fixed("us-privacy", ConsentSignal::Neutral),
+            fixed("gpp_sale_opt_out", ConsentSignal::Neutral),
+            fixed("us_privacy", ConsentSignal::Neutral),
             fixed("tcf", ConsentSignal::Neutral),
         ]
     }
@@ -886,7 +889,7 @@ mod tests {
         let selected = select(&four(), None).expect("should accept no configuration");
         assert_eq!(
             ids(&selected),
-            vec!["gpc", "gpp-sale-opt-out", "us-privacy", "tcf"],
+            vec!["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"],
             "a publisher who configures nothing acts on every scheme the build knows, so \
              one is never ignored because they forgot to list it"
         );
@@ -894,11 +897,11 @@ mod tests {
 
     #[test]
     fn the_configured_order_is_the_order_they_run_in() {
-        let reversed = names(&["tcf", "us-privacy", "gpp-sale-opt-out", "gpc"]);
+        let reversed = names(&["tcf", "us_privacy", "gpp_sale_opt_out", "gpc"]);
         let selected = select(&four(), Some(&reversed)).expect("should accept known names");
         assert_eq!(
             ids(&selected),
-            vec!["tcf", "us-privacy", "gpp-sale-opt-out", "gpc"],
+            vec!["tcf", "us_privacy", "gpp_sale_opt_out", "gpc"],
             "the list is the order, not merely the membership"
         );
     }
@@ -923,7 +926,7 @@ mod tests {
         };
         let message = format!("{error:?}");
         assert!(
-            message.contains("not-a-provider") && message.contains("gpc, gpp-sale-opt-out"),
+            message.contains("not-a-provider") && message.contains("gpc, gpp_sale_opt_out"),
             "the refusal names the bad entry and what is available: {message}"
         );
     }
@@ -944,7 +947,7 @@ mod tests {
         let configured = names(&["gpc", "tcf"]);
         assert_eq!(
             omitted(&four(), Some(&configured)),
-            vec!["gpp-sale-opt-out", "us-privacy"],
+            vec!["gpp_sale_opt_out", "us_privacy"],
             "the providers the list leaves out are reported in the offered order"
         );
         assert!(

@@ -3156,7 +3156,7 @@ mod tests {
             registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "selecting the client-fixed provider should inject its demo page script"
+            "selecting the `client_fixed` provider should inject its demo page script"
         );
     }
 
@@ -3202,7 +3202,7 @@ mod tests {
             !registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "the demo page script should not ship unless the client-fixed provider is selected"
+            "the demo page script should not ship unless the `client_fixed` provider is selected"
         );
     }
 

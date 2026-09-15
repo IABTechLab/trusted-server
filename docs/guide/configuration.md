@@ -608,19 +608,25 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 | Field                     | Type           | Required | Description                                                                                                                                                                                                                                    |
 | ------------------------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provider`                | String or null | No       | Name of the active Edge Cookie provider: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or a provider an integration supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration provider needs the `client-fixed-demo` build feature |
+| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                            |
 | `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                |
 | `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                     |
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                            |
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                |
 | `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                |
 
+Each provider that has settings is configured in its own `[ec.<name>]` table, and the `provider` selector names which table is active. A table may set `implementation = "<id>"` to say which provider it configures, which makes the table name a label of your choosing, so `provider = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in provider under a name that means something to your deployment. Provider names and implementation ids are `snake_case`.
+
+A provider has a table only when it has settings of its own. Both providers that derive an identifier at the edge take a passphrase, so selecting `hmac` or `host_signals` without its table fails at startup, while the `client_fixed` demonstration provider needs no table at all. A table the selector does not name also fails at startup, so a stale table cannot sit unnoticed.
+
 `ec_store`, `partners` and the cluster thresholds are settings of the job
 rather than of one provider, so they sit directly in `[ec]` whichever provider
 is selected.
 
-The selected `provider` must have the `[ec.<name>]` table it needs. Selecting a
-provider with no table, naming a provider this build does not have, or leaving
-a table the selector does not name, all fail at startup.
+A provider an integration supplies also needs that integration named in
+`[integration] provider`.
+
+### `[ec.hmac]`
 
 A provider an integration supplies also needs that integration named in
 `[integration] provider`.
@@ -686,7 +692,7 @@ These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environ
 
 **Purpose**: Names the active Edge Cookie provider. Omit to run statelessly with no Edge Cookie.
 
-**Validation**: Application startup fails if the selected name has no `[ec.<name>]` table where it needs one, names a provider this build does not have, or leaves a table the selector does not name. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
+**Validation**: Application startup fails if the name is not `snake_case`, if it names a key the `[ec]` section reads as its own setting, if the selected provider has no `[ec.<name>]` table where it needs one, if it names a provider this build does not have, or if a table the selector does not name is configured. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
 
 #### `hmac.passphrase`
 
@@ -2380,6 +2386,12 @@ from the file, and startup checks the rest and runs the first set again.
 
 **Demand, ad server and bidder routes**:
 
+- `provider`, when set, is `snake_case` and has the `[ec.<name>]` table its
+  implementation needs, and no unselected table is left configured, or startup
+  fails
+- The `hmac.passphrase` key name is non-empty at push time, the resolved
+  passphrase is at least 32 bytes at runtime, and a known placeholder value is
+  rejected after resolution
 - The complete auction plan compiles from `[demand]`, `[adserver]` and
   `[auction.bidders]`, so an unselected table, a name that is not snake_case,
   an implementation this build does not have, a bad endpoint, an out-of-range

@@ -249,8 +249,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::ec::generation::generate_ec_id as generate_canonical_ec_id;
+    use crate::ec::provider::HMAC_PROVIDER_KEY;
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, hmac_passphrase};
 
     #[tokio::test]
     async fn test_generate_ec_id_matches_canonical_generator_for_ipv6() {
@@ -267,13 +268,7 @@ mod tests {
             .await
             .expect("should generate EC ID via edge_cookie")
             .expect("should configure the hmac provider in test settings");
-        let passphrase = settings
-            .ec
-            .providers
-            .hmac
-            .as_ref()
-            .map(|hmac| hmac.passphrase.expose().as_str())
-            .unwrap_or("");
+        let passphrase = hmac_passphrase(&settings.ec, HMAC_PROVIDER_KEY);
         let id_canonical = generate_canonical_ec_id(passphrase, &normalize_ip(ip))
             .expect("should generate EC ID via canonical generator");
 

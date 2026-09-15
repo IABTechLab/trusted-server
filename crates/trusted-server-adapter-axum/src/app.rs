@@ -817,7 +817,7 @@ mod tests {
         [ec]
         provider = "acme"
 
-        [ec.providers.acme]
+        [ec.acme]
         endpoint = "https://ec.acme.example.com"
 
         # An Edge Cookie provider is configured, so single-jurisdiction

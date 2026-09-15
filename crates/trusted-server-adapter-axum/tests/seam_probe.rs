@@ -471,7 +471,7 @@ fn ec_selector_naming_a_module_resolves_that_modules_provider() {
             [ec]
             provider = "seam_probe"
 
-            [ec.providers.seam_probe]
+            [ec.seam_probe]
         "#,
     );
 
@@ -501,7 +501,7 @@ fn ec_selector_naming_a_module_starts_the_adapter() {
             [ec]
             provider = "seam_probe"
 
-            [ec.providers.seam_probe]
+            [ec.seam_probe]
         "#,
     );
 
@@ -555,7 +555,7 @@ async fn ec_provider_generates_an_identifier_with_the_modules_prefix() {
             [ec]
             provider = "seam_probe"
 
-            [ec.providers.seam_probe]
+            [ec.seam_probe]
         "#,
     );
 
