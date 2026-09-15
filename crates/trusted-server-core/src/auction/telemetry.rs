@@ -127,11 +127,6 @@ pub struct AuctionObservationContext {
     /// `Some(false)` — a dashboard that reads absence as "not shareable" will be wrong for
     /// every `/auction` row.
     pub origin_cache_shareable: Option<bool>,
-    /// Why the template cache declined, when it did.
-    ///
-    /// The triage field: a zero hit rate cannot be told apart from an origin
-    /// misconfiguration without it.
-    pub template_cache_bypass_reason: Option<String>,
     started_at: Instant,
 }
 
@@ -199,7 +194,6 @@ impl AuctionObservationContext {
             consent_present: !consent.is_empty(),
             slot_count,
             origin_cache_shareable: None,
-            template_cache_bypass_reason: None,
             started_at: Instant::now(),
         }
     }
@@ -207,11 +201,6 @@ impl AuctionObservationContext {
     /// Record whether the origin readthrough gate admitted this request.
     pub fn set_origin_cache_shareable(&mut self, shareable: bool) {
         self.origin_cache_shareable = Some(shareable);
-    }
-
-    /// Record why the template cache declined.
-    pub fn set_template_cache_bypass_reason(&mut self, reason: &str) {
-        self.template_cache_bypass_reason = Some(reason.to_owned());
     }
 
     /// Return elapsed milliseconds since the observation was created.
@@ -236,7 +225,6 @@ impl AuctionObservationContext {
             consent_present: false,
             slot_count,
             origin_cache_shareable: None,
-            template_cache_bypass_reason: None,
             started_at: Instant::now(),
         }
     }
@@ -371,8 +359,6 @@ pub struct AuctionEventRow {
     /// Absent is not the same as `0` — see
     /// [`AuctionObservationContext::origin_cache_shareable`].
     pub origin_cache_shareable: Option<u8>,
-    /// Why the template cache declined, when it did.
-    pub template_cache_bypass_reason: Option<String>,
 }
 
 impl AuctionEventRow {
@@ -412,7 +398,6 @@ impl AuctionEventRow {
             ad_domain: None,
             ad_id: None,
             origin_cache_shareable: observation.origin_cache_shareable.map(u8::from),
-            template_cache_bypass_reason: observation.template_cache_bypass_reason.clone(),
         }
     }
 }
@@ -1003,7 +988,6 @@ mod tests {
     fn summary_row_carries_cache_outcomes_from_the_observation() {
         let mut observation = test_observation();
         observation.set_origin_cache_shareable(false);
-        observation.set_template_cache_bypass_reason("origin response carries Set-Cookie");
 
         let mut rows = Vec::new();
         push_summary(
@@ -1018,10 +1002,6 @@ mod tests {
 
         let row = rows.first().expect("should emit one summary row");
         assert_eq!(row.origin_cache_shareable, Some(0));
-        assert_eq!(
-            row.template_cache_bypass_reason.as_deref(),
-            Some("origin response carries Set-Cookie")
-        );
     }
 
     #[test]
@@ -1043,7 +1023,6 @@ mod tests {
             row.origin_cache_shareable, None,
             "an unmeasured source must be distinguishable from a measured miss"
         );
-        assert_eq!(row.template_cache_bypass_reason, None);
     }
 
     #[test]
@@ -1054,16 +1033,10 @@ mod tests {
             observation.origin_cache_shareable, None,
             "a freshly built observation should not claim a cache outcome"
         );
-        assert_eq!(observation.template_cache_bypass_reason, None);
 
         observation.set_origin_cache_shareable(true);
-        observation.set_template_cache_bypass_reason("request carried Cookie");
 
         assert_eq!(observation.origin_cache_shareable, Some(true));
-        assert_eq!(
-            observation.template_cache_bypass_reason.as_deref(),
-            Some("request carried Cookie")
-        );
     }
 
     fn test_request(id: &str) -> AuctionRequest {

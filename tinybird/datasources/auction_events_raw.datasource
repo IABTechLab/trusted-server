@@ -36,7 +36,6 @@ SCHEMA >
   `ad_domain` Nullable(String),
   `ad_id` Nullable(String),
   `origin_cache_shareable` Nullable(UInt8),
-  `template_cache_bypass_reason` LowCardinality(Nullable(String)),
   `event_date` Date DEFAULT toDate(event_ts)
 
 ENGINE "MergeTree"

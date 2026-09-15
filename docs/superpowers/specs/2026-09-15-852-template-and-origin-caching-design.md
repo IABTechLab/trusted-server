@@ -553,8 +553,12 @@ already flows to Tinybird with `publisher_domain` and `page_path`:
   the path this whole issue exists to improve. `hit` was reachable and `miss-stored` was
   not, so the column would have made hit rate compute as roughly 100%. The
   `x-ts-template-cache` header still carries all nine states per response.
-- `template_cache_bypass_reason: Option<String>` — the `TemplateCacheBypassReason` display
-  string, or `None` when there was no bypass
+- ~~`template_cache_bypass_reason`~~ — **moved to successor issue B during implementation.**
+  It diagnoses the _template_ cache's refusals, which is #1009's feature, not this issue's.
+  Readthrough has no refusal reasons TS controls — that is the response-side gap — so this
+  column says nothing about the change #852 makes. Instrumenting a spike belongs with
+  promoting it out of spike status. Deriving it also required new code: the variants that
+  matter are structurally unreachable at the existing site, per the note below.
 - `origin_cache_shareable: Option<bool>` — whether `origin_response_is_shareable` was true,
   i.e. whether the readthrough gate let this request use the readthrough cache
 
@@ -571,7 +575,10 @@ uninterpretable.
 
 This is the spec's own trim, reached by the code rather than by the approval gate.
 
-**The reason has two sources, and only one of them exists today.** `template_cache_ttl`
+The scope line this settles: each issue instruments its own change. `origin_cache_shareable`
+measures what #852 changes; the bypass reason measures what #1009 built.
+
+**Retained for issue B — the reason has two sources, and only one of them exists today.** `template_cache_ttl`
 (`publisher.rs:6129`) returns `Result<Duration, TemplateCacheBypassReason>`, but it runs inside
 `template_cache_reservation.and_then(...)` (`:4775`), and a reservation exists only when
 `template_cache_key` was built — which is `request_can_use_shared_template.then(...)` (`:4370`).
@@ -737,7 +744,12 @@ deserves its own review:
   `:5860`, `:11025`, `response_privacy.rs:71`), and four shipped #1009 design docs still read
   "Approved for implementation". Editorial; the distinctions those comments draw must survive
   verbatim in substance.
-- **Issue B — promote the template cache out of spike status.** 30 comment sites across six
+- **Issue B — promote the template cache out of spike status, and instrument it.** Carries
+  the `template_cache_bypass_reason` telemetry column moved out of #852: it diagnoses the
+  template cache's refusals, and the variants that matter (`InlineMode`, `AuthorizedRequest`,
+  `CookieForwarded`) are structurally unreachable from `template_cache_ttl`, so it needs a
+  request-side derivation alongside `template_cache_key`. Note a template-cache hit/miss
+  column is **not** available — see the Observability section for why. 30 comment sites across six
   files, but not editorial: three unsettled design decisions sit underneath. The "spike-grade
   choice, not a production one" `Vary`-keying caveat (`platform/template_cache.rs:230`), whose
   drift guard runs only on the cold path — a hit returns before the origin fetch, so a stored

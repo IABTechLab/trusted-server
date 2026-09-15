@@ -16,29 +16,26 @@ Adding a field means changing three things together: the struct in
 `datasources/auction_events_raw.datasource`, and every row in
 `fixtures/auction_events_raw.ndjson`.
 
-## Reading the cache-outcome columns
+## Reading `origin_cache_shareable`
 
-Two columns report how the caches treated a request: `origin_cache_shareable` and
-`template_cache_bypass_reason`. Both have caveats that will silently produce wrong numbers
-if a query ignores them.
+Reports whether the origin readthrough gate admitted a request — whether Trusted Server
+allowed the platform cache to serve this page rather than forcing an origin fetch. Two
+caveats, both of which silently produce wrong numbers if a query ignores them.
 
 ### The denominator is ad-serving pageviews, not all requests
 
-A summary row is emitted only when an auction runs. A request that bypasses the template
-cache *because* the ad stack did not run — a bot, a prefetch, a consent-denied reader, a
-page with no matched slot, or any traffic while a kill switch is off — produces **no row at
-all**.
+A summary row is emitted only when an auction runs. A request that never reaches the ad
+stack — a bot, a prefetch, a consent-denied reader, a page with no matched slot, or any
+traffic while a kill switch is off — produces **no row at all**.
 
-So a rate computed from these columns is a rate over ad-serving pageviews. It is not a
-site-wide cache hit rate, and it cannot be compared against one.
+So a rate computed from this column is a rate over ad-serving pageviews. It is not a
+site-wide figure and cannot be compared against one.
 
 ### `NULL` is "not measured", not "false"
 
-`AuctionObservationContext` is shared with the `/auction` API source, where neither column
-is populated because that path makes no cache decision. Those rows carry `NULL`.
-
-A query that reads `NULL` as "not shareable" or as a cache miss will be wrong for that whole
-source class. Filter on the source before computing anything:
+`AuctionObservationContext` is shared with the `/auction` API source, which makes no cache
+decision and leaves the column `NULL`. A query that reads `NULL` as "not shareable" will be
+wrong for that whole source class. Filter on the source first:
 
 ```sql
 SELECT countIf(origin_cache_shareable = 1) / count() AS shareable_rate
@@ -50,11 +47,11 @@ WHERE event_kind = 'summary'
 
 ### There is no template-cache hit/miss column
 
-Deliberately. The store outcome is not knowable when the telemetry row is emitted: the
-auction is collected during body streaming, which takes the observation and sends the batch,
-and the template is only stored afterwards. `hit` was reachable and `miss-stored` was not,
-which would have made hit rate compute as roughly 100%.
+Deliberately, and it cannot be added without restructuring when telemetry is emitted. The
+store outcome is not knowable when the row is sent: the auction is collected during body
+streaming, which takes the observation and emits the batch, and the template is only stored
+afterwards. `hit` was reachable and `miss-stored` was not, which would have made hit rate
+compute as roughly 100%.
 
-For per-response debugging the `x-ts-template-cache` response header still reports all nine
-states. For the aggregate question, `template_cache_bypass_reason` tells you *why* the cache
-was not used, which is the actionable half.
+For debugging one request, the `x-ts-template-cache` response header still reports all nine
+states.
