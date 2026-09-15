@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
+import { GPT_BOOTSTRAP_PATH } from '../../fixtures/paths';
 
 type TestWindow = Window & {
   googletag?: unknown;
@@ -148,10 +148,7 @@ describe('installSpaAuctionHook', () => {
       };
 
       if (implementation === 'bootstrap') {
-        const bootstrap = readFileSync(
-          resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
-          'utf8'
-        );
+        const bootstrap = readFileSync(GPT_BOOTSTRAP_PATH, 'utf8');
         window.eval(bootstrap);
       }
       await importGptModule();
