@@ -1,6 +1,8 @@
 #[cfg(test)]
 pub mod tests {
-    use crate::settings::Settings;
+    use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY};
+    use crate::redacted::Redacted;
+    use crate::settings::{Ec, EcProviderBlock, HmacProviderConfig, Settings};
 
     #[must_use]
     pub fn crate_test_settings_str() -> String {
@@ -35,7 +37,7 @@ pub mod tests {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -43,6 +45,26 @@ pub mod tests {
             secret_store_id = "test-secret-store-id"
             "#
         .to_owned()
+    }
+
+    /// The crate test configuration with its whole `[ec]` section replaced by
+    /// `ec_section`, which carries its own `[ec]` header and any provider
+    /// blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded TOML configuration no longer has an `[ec]`
+    /// section followed by a `[request_signing]` section.
+    #[must_use]
+    pub fn crate_test_settings_str_with_ec_section(ec_section: &str) -> String {
+        let base = crate_test_settings_str();
+        let (before, rest) = base
+            .split_once("[ec]")
+            .expect("should find the [ec] section in the test settings");
+        let (_, after) = rest
+            .split_once("[request_signing]")
+            .expect("should find the [request_signing] section in the test settings");
+        format!("{before}{ec_section}\n\n[request_signing]{after}")
     }
 
     #[must_use]
@@ -56,6 +78,39 @@ pub mod tests {
         let mut settings = Settings::from_toml(&toml_str).expect("Invalid config");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    /// Selects the built-in HMAC provider under `name` with `passphrase`,
+    /// replacing whatever Edge Cookie provider the settings carried.
+    ///
+    /// A `name` other than `hmac` is a label, so the block names the
+    /// implementation it configures.
+    pub fn select_hmac_provider(ec: &mut Ec, name: &str, passphrase: &str) {
+        let mut block = EcProviderBlock::from(HmacProviderConfig {
+            passphrase: Redacted::new(passphrase.to_owned()),
+        });
+        if name != HMAC_PROVIDER_KEY {
+            block.implementation = Some(HMAC_PROVIDER_KEY.to_owned());
+        }
+        ec.provider = Some(EcProviderSelection::from(name));
+        ec.provider_blocks.clear();
+        ec.provider_blocks.insert(name.to_owned(), block);
+    }
+
+    /// The passphrase the block `name` holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` has no block, or if its block configures another
+    /// provider.
+    #[must_use]
+    pub fn hmac_passphrase<'a>(ec: &'a Ec, name: &str) -> &'a str {
+        ec.provider_blocks
+            .get(name)
+            .and_then(EcProviderBlock::hmac_settings)
+            .unwrap_or_else(|| panic!("settings should configure the hmac provider under `{name}`"))
+            .passphrase
+            .expose()
     }
 
     /// A valid EC ID in `{64-hex}.{6-alnum}` format for use in tests.

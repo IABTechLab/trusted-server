@@ -38,7 +38,7 @@ fn test_router() -> RouterService {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
@@ -90,7 +90,7 @@ fn make_router() -> RouterService {
             [ec]
             provider = "hmac"
 
-            [ec.providers.hmac]
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
@@ -687,8 +687,8 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 // ---------------------------------------------------------------------------
 
 /// Test settings selecting a vendor Edge Cookie provider this adapter does not
-/// inject, with the `[ec.providers.<key>]` block configuration validation
-/// requires. `acme` is a fictional vendor key.
+/// inject, with the `[ec.acme]` block that provider's settings live in.
+/// `acme` is a fictional vendor key.
 const UNINJECTED_PROVIDER_TOML: &str = r#"
     [[handlers]]
     path = "^/_ts/admin"
@@ -704,17 +704,18 @@ const UNINJECTED_PROVIDER_TOML: &str = r#"
     [ec]
     provider = "acme"
 
-    [ec.providers.acme]
+    [ec.acme]
     endpoint = "https://ec.acme.example.com"
 "#;
 
 /// A provider selection this adapter can never supply must fail while the
 /// application state is built, before any request is served.
 ///
-/// Configuration validation accepts this pair (the `[ec.providers.acme]` block
-/// is present), and this adapter injects no vendor Edge Cookie provider, so only
-/// the composition root can catch it. Without the startup check the deployment
-/// would come up and answer every request.
+/// Configuration validation accepts this selection, because only the adapter
+/// that injects a provider knows what that provider needs, and this adapter
+/// injects no vendor Edge Cookie provider, so only the composition root can
+/// catch it. Without the startup check the deployment would come up and answer
+/// every request.
 #[test]
 fn selecting_a_provider_this_adapter_cannot_supply_fails_at_startup() {
     let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
