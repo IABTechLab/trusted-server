@@ -272,8 +272,10 @@ fn observation_cache_fields_default_to_absent_and_round_trip() {
 }
 ```
 
-Build the context with `AuctionObservationContext::from_parts(...)` inline if no
-`test_observation()` helper exists in this module.
+There is **no** `test_observation()` helper in `telemetry.rs`'s test module — add one, because
+Tasks 2 and 3 both need it and they must build the context identically. Follow the existing
+pattern at `telemetry.rs:1032-1052`: `EcContext::new_for_test(None, ConsentContext::default())`
+then `AuctionObservationContext::from_parts(...)`.
 
 - [ ] **Step 2: Run to verify it fails**
 
