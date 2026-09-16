@@ -4106,6 +4106,24 @@ pub(crate) fn origin_response_is_shareable(inputs: SharedRequestInputs) -> bool 
 ///
 /// The two extra conditions say whether this pipeline can assemble one, not whether the
 /// origin's bytes may be shared — see [`SharedRequestInputs`].
+/// Apply the origin fetch's cache intent.
+///
+/// Both publisher-origin fetch paths call this rather than deciding for themselves. They
+/// are alternatives for the same fetch — one inside the EC-preload fan-out, one in the
+/// branch taken when that did not fire — so a condition written twice could drift and make
+/// readthrough eligibility depend on whether EC preload happened, which is not a property
+/// of the origin response at all.
+fn apply_origin_cache_intent(
+    request: PlatformHttpRequest,
+    origin_response_is_shareable: bool,
+) -> PlatformHttpRequest {
+    if origin_response_is_shareable {
+        request
+    } else {
+        request.with_cache_bypass()
+    }
+}
+
 pub(crate) fn request_can_use_shared_template(
     inputs: SharedRequestInputs,
     assembly_mode_is_esi: bool,
@@ -4470,9 +4488,11 @@ pub async fn handle_publisher_request(
         })?;
         let mut platform_request =
             PlatformHttpRequest::new(origin_req, backend_name.clone()).with_stream_response();
-        if should_run_ad_stack {
-            platform_request = platform_request.with_cache_bypass();
-        }
+        // Bypass only what cannot be shared. `should_run_ad_stack` used to decide this,
+        // which asked the wrong question: whether this request runs an auction says
+        // nothing about whether the *origin's* response may be held in a shared cache.
+        platform_request =
+            apply_origin_cache_intent(platform_request, origin_response_is_shareable);
         pending_origin = Some(
             services
                 .http_client()
@@ -4774,9 +4794,11 @@ pub async fn handle_publisher_request(
         if services.http_client().supports_streaming_responses() {
             platform_request = platform_request.with_stream_response();
         }
-        if should_run_ad_stack {
-            platform_request = platform_request.with_cache_bypass();
-        }
+        // Bypass only what cannot be shared. `should_run_ad_stack` used to decide this,
+        // which asked the wrong question: whether this request runs an auction says
+        // nothing about whether the *origin's* response may be held in a shared cache.
+        platform_request =
+            apply_origin_cache_intent(platform_request, origin_response_is_shareable);
         services.http_client().send(platform_request).await
     };
     let mut response = match origin_result {
@@ -9883,6 +9905,133 @@ mod tests {
             );
         }
 
+        #[test]
+        fn both_origin_fetch_paths_share_one_cache_decision() {
+            // Guards the divergence rather than one of its symptoms. The two fetch paths
+            // are alternatives for the same request, and a test can only reach the
+            // EC-preload one with a valid signed EC id, so the protection here is that
+            // neither path decides for itself: both call this, and this is pure.
+            let shareable = apply_origin_cache_intent(
+                PlatformHttpRequest::new(
+                    HttpRequest::builder()
+                        .body(EdgeBody::empty())
+                        .expect("should build request"),
+                    "backend",
+                ),
+                true,
+            );
+            let unshareable = apply_origin_cache_intent(
+                PlatformHttpRequest::new(
+                    HttpRequest::builder()
+                        .body(EdgeBody::empty())
+                        .expect("should build request"),
+                    "backend",
+                ),
+                false,
+            );
+
+            assert_eq!(shareable.cache_intent, PlatformCacheIntent::Default);
+            assert_eq!(unshareable.cache_intent, PlatformCacheIntent::Bypass);
+        }
+
+        #[tokio::test]
+        async fn a_shareable_navigation_no_longer_forces_an_origin_miss() {
+            // The point of issue #852. A cookieless, ad-serving navigation used to set
+            // pass on every origin fetch, which measured at ~485ms of a 773ms TTFB.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "a shareable navigation must not force a MISS"
+            );
+        }
+
+        #[tokio::test]
+        async fn unshareable_requests_still_bypass() {
+            // Each of these is a distinct reason the origin response cannot be held in a
+            // shared cache, and each must reach the same decision on its own.
+            for (label, request) in [
+                ("cookie", navigation_request_with_cookie("ts-ec=abc")),
+                ("authorization", {
+                    let mut request = navigation_request();
+                    request.headers_mut().insert(
+                        header::AUTHORIZATION,
+                        HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+                    );
+                    request
+                }),
+                ("non-GET", {
+                    let mut request = navigation_request();
+                    *request.method_mut() = Method::POST;
+                    request
+                }),
+                ("conditional", {
+                    let mut request = navigation_request();
+                    request
+                        .headers_mut()
+                        .insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"tag\""));
+                    request
+                }),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_mode("esi"));
+                queue_shareable_html(&stub);
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Bypass],
+                    "a {label}-bearing request must bypass the shared cache"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_request_that_skips_the_ad_stack_is_still_judged_on_shareability() {
+            // The tightening half, and the term that left the condition. A prefetch runs
+            // no auction, so it used to skip the bypass; whether an auction runs says
+            // nothing about whether the origin's response may be shared.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, {
+                let mut request = prefetch_navigation_request();
+                request
+                    .headers_mut()
+                    .insert(header::COOKIE, HeaderValue::from_static("ts-ec=abc"));
+                request
+            })
+            .await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
+                "an ad-stack opt-out that is also unshareable must still bypass"
+            );
+        }
+
         #[tokio::test]
         async fn navigation_records_whether_the_origin_response_was_shareable() {
             let stub = Arc::new(StubHttpClient::new());
@@ -10264,8 +10413,9 @@ mod tests {
             );
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Bypass],
-                "should bypass platform caching for the cold origin fetch"
+                vec![PlatformCacheIntent::Default],
+                "a shareable cold fetch must stop forcing a MISS — this is the ~485ms \
+                 that issue #852 exists to recover"
             );
         }
 
@@ -14518,8 +14668,9 @@ mod tests {
             // Assert
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
-                "publisher navigation without matched slots should use the default cache mode"
+                vec![PlatformCacheIntent::Bypass],
+                "a Range/If-Range request is not shareable, so it now bypasses where it \
+                 previously did not",
             );
             let recorded_requests = stub.recorded_request_headers();
             let outbound_headers = recorded_requests
@@ -14623,8 +14774,10 @@ mod tests {
             // Assert
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
-                "disabled server-side ad templates should not bypass the origin cache"
+                vec![PlatformCacheIntent::Bypass],
+                "the conditional request headers make this unshareable, so it bypasses \
+                 regardless of whether ad templates are enabled — the bypass no longer \
+                 tracks the ad stack"
             );
             assert_eq!(
                 response_head
@@ -15157,8 +15310,9 @@ mod tests {
             }
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
-                "noneligible publisher navigation should use the default cache mode"
+                vec![PlatformCacheIntent::Bypass],
+                "a conditional navigation is not shareable, so it now bypasses where it \
+                 previously did not"
             );
             let recorded_requests = stub.recorded_request_headers();
             let outbound_headers = recorded_requests
