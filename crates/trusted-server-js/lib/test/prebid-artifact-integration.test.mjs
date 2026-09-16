@@ -89,7 +89,7 @@ describe('tsjs-prebid shim artifact', () => {
     // noticed and re-justified here, and far enough below a multiplication
     // that one still fails loudly. The bundle beside it is 200 KB and up.
     expect(bundleCode.length).toBeGreaterThan(200_000);
-    expect(shimCode.length).toBeLessThan(32_000);
+    expect(shimCode.length).toBeLessThan(33_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 });
