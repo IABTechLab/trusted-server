@@ -378,10 +378,7 @@ mod tests {
 
     #[test]
     fn clap_parses_rewrite_host_as_a_bool() {
-        assert!(
-            !parse_args(&["ts", "--insecure"]).rewrite_host,
-            "absent --rewrite-host is false"
-        );
+        assert!(!base_args().rewrite_host, "absent --rewrite-host is false");
         assert!(
             parse_args(&["ts", "--rewrite-host"]).rewrite_host,
             "present --rewrite-host is true"

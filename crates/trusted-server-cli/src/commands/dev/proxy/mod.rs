@@ -78,7 +78,7 @@ async fn finish_interrupted_run<Restore, Stop, Drain>(
 
 /// Default `--listen` address, shared with the `config` tests so they cannot
 /// silently drift from the real default.
-pub const DEFAULT_LISTEN: &str = "127.0.0.1:18080";
+pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:18080";
 
 /// `ts dev proxy [OPTIONS]` — see the design spec §4.
 #[derive(Debug, clap::Args)]
