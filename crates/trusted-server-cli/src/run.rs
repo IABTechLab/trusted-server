@@ -44,7 +44,7 @@ enum Command {
     Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
-    /// Local developer tools (e.g. the macOS-only production-hostname proxy).
+    /// Local developer tools (e.g. the macOS/Linux production-hostname proxy).
     #[command(subcommand)]
     Dev(crate::commands::dev::DevCommand),
 }

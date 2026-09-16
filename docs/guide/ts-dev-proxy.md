@@ -35,10 +35,13 @@ Fastly service. Local only, developer-facing.
 
 ## Install and run
 
-`ts dev proxy` is a subcommand of the `ts` CLI, and is **macOS-only** — its
-dependencies are scoped to macOS, so the command is not present in the CLI on
-other platforms. On macOS, install (or update) the `ts` binary from the
-repository root (see [the CLI guide](./cli.md#install-from-source) for details):
+`ts dev proxy` supports macOS and Linux. Linux automation supports native
+Chrome/Chromium and Firefox. Safari is macOS-only; Windows, Snap and Flatpak
+automation are unsupported. Linux commands never use root, change system trust,
+or change desktop-wide proxy settings.
+
+Install or update the `ts` binary from the repository root. See
+[the CLI guide](./cli.md#install-from-source) for details.
 
 ```bash
 cargo install-cli
@@ -88,10 +91,11 @@ Connection options — `--rewrite-host`, `--basic-auth`/`--basic-auth-file`,
 ```bash
 ts dev proxy \
   --map www.example-publisher.com=trusted-server-example.edgecompute.app \
-  --launch chrome,firefox,safari
+  --launch chrome,firefox
 ```
 
-`--launch` takes a comma list (`chrome`, `firefox`, `safari`) or `all`. When
+`--launch` takes a comma list (`chrome`, `firefox`, or `safari` on macOS) or `all`.
+On Linux, `all` selects Chrome and Firefox; explicit `safari` is rejected. When
 omitted the proxy runs without opening any browser. With multiple `--map` rules,
 every mapping is proxied, but `--launch` opens only the first rule's `FROM`
 hostname — navigate to the others manually.
@@ -139,13 +143,56 @@ This adds the CA to the macOS login keychain (no `sudo` required; prompts for
 your login password). Chrome and Safari both consult the macOS keychain and
 will trust the proxy's certificates immediately.
 
+### Trust the CA on Linux (Chrome and Chromium)
+
+Install NSS tools yourself if `certutil` is missing. Package names are
+`libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora, and `nss` on Arch.
+The CLI never installs packages.
+
+```bash
+ts dev proxy ca install
+ts dev proxy --map www.example.com=staging.example.com --launch chrome
+```
+
+`ca install` changes only your shared NSS database, not the system CA bundle.
+Native Chrome/Chromium M146 and newer use
+`$XDG_DATA_HOME/pki/nssdb`, or `~/.local/share/pki/nssdb` when XDG is unset or
+empty. Without a legacy directory, `ca install` rejects a relative
+`XDG_DATA_HOME`; unset it or use an absolute path. An existing `~/.pki/nssdb` takes precedence. If both directories exist,
+only the legacy directory is selected. The command prints the exact destination.
+Restart browsers after trust changes.
+
+A temporary `--user-data-dir` does **not** isolate Chrome's CA trust. NSS trust
+also affects other native Chrome/Chromium profiles for your user. The CLI records
+every managed destination and certificate identity in `managed-nss-trust.json`
+beside the CA, so uninstall still visits previous destinations after XDG or legacy
+path selection changes. Keep this record and use the same `--ca-dir` when removing
+trust. Do not move or edit the NSS stores or journal while trust is installed.
+
+On Linux the default CA directory is
+`$XDG_DATA_HOME/trusted-server/dev-proxy`, or
+`~/.local/share/trusted-server/dev-proxy`. An absolute `XDG_DATA_HOME` also overrides
+the CA location on macOS. Print the PEM path with `ts dev proxy ca path`.
+Manual clients need no persistent browser trust:
+
+```bash
+curl --cacert "$(ts dev proxy ca path)" --proxy http://127.0.0.1:18080 https://www.example.com
+```
+
+Chrome discovery tries `google-chrome`, `google-chrome-stable`, `chromium`, then
+`chromium-browser` on PATH. Firefox requires native `firefox` on PATH. Discovery
+skips known Snap/Flatpak executable paths but does not inspect shell wrappers.
+A launcher such as `/usr/bin/chromium` can still start a packaged browser. Confirm
+that the selected launcher uses a native installation; Snap/Flatpak wrappers are
+unsupported and may not honor the supplied profile or trust configuration.
+
 ### Trust the CA in Firefox
 
 Firefox does not reliably consult the macOS login keychain. When you use
 `--launch firefox`, the proxy imports the CA into the temporary Firefox profile's
 NSS database using `certutil`. `certutil` is not built into macOS — install it
-with `brew install nss`; without it the proxy prints a warning and Firefox opens
-with certificate errors. If you are pointing an existing Firefox profile at the
+with `brew install nss`, or the Linux package listed above. If import fails,
+the proxy prints an error and skips Firefox launch. If you are pointing an existing Firefox profile at the
 proxy manually, run:
 
 ```bash
@@ -161,7 +208,8 @@ certutil -A -n "Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION"
 ts dev proxy ca uninstall
 ```
 
-This removes the CA from the macOS keychain. Run it when you are finished —
+This removes managed trust from the macOS login keychain or recorded Linux NSS
+databases. Run it when you are finished, because
 the CA is trusted for ~10 years and its key sits on disk.
 
 ### Security note
@@ -179,7 +227,7 @@ must be treated like a credential:
 
 ```bash
 ts dev proxy ca path        # print the CA certificate path
-ts dev proxy ca install     # trust the CA (macOS login keychain)
+ts dev proxy ca install     # trust the CA (login keychain or user NSS)
 ts dev proxy ca uninstall   # remove the CA from the trust store
 ts dev proxy ca regenerate  # generate a new CA (invalidates prior trust)
 ```
@@ -187,12 +235,24 @@ ts dev proxy ca regenerate  # generate a new CA (invalidates prior trust)
 `ca path` and `ca install` generate the CA if it does not exist yet, so they
 work on a freshly cloned machine before the proxy has been run.
 
-`ca regenerate` first removes the previously-installed CA from the macOS keychain
-(revoking its trust) before generating fresh key material, so an exfiltrated old
-key is no longer accepted. If the keychain removal can't be confirmed it aborts
-without touching the on-disk key, so the stored CA still matches OS trust — remove
-the old CA manually in Keychain Access, then retry. Run `ca install` afterward to
-trust the new CA.
+`ca regenerate` first removes managed persistent trust, then generates fresh
+key material. Missing tools, failed queries or deletions, malformed journals,
+and certificate identity conflicts abort rotation without changing the old CA
+files. Fix the reported failure and retry; do not delete the journal to bypass it.
+Run `ca install` afterward to trust the new CA.
+
+Close launched browsers and stop running proxies **before rotating**. Removal does
+not revoke manually imported copies, already-running Firefox temporary profiles,
+or CA material already held by a running proxy. Remove external imports yourself.
+A CA-directory lock serializes CA commands and initial loading. A second lock in
+each shared NSS directory serializes `ts` trust changes across different CA
+directories. Neither lock controls external browser or `certutil` writers.
+
+All generated dev CAs share a subject name. NSS exports all certificates with a
+matching subject even when queried by nickname, so Linux `ca install` rejects a
+different same-subject certificate before import. Remove the first CA using its
+original `--ca-dir`, or resolve an existing manual import, before installing a CA
+from another directory. Reinstalling the identical certificate is supported.
 
 ## Host header behavior
 
@@ -295,17 +355,18 @@ Options:
                                 trusted-server/dev-proxy on macOS]
 ```
 
-The tool is flags-only; there are no environment variable overrides. The
+Proxy routing is flags-only. CA and Linux NSS paths honor HOME and absolute
+XDG_DATA_HOME as described above. The
 `[COMMAND]` slot is the `ca` subcommand — see
 [CA companion commands](#ca-companion-commands).
 
 ## Browser details
 
-| Browser | How the proxy is configured                                                                                                                                                                                                 | CA trust                                        |
-| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| Chrome  | Temp `--user-data-dir`; `--proxy-server="https=127.0.0.1:<port>"` (HTTPS only — plain HTTP goes direct)                                                                                                                     | macOS login keychain via `ca install`           |
-| Firefox | Temp profile with `user.js` setting `network.proxy.ssl` (HTTPS only — `network.proxy.http` is unset so plain HTTP goes direct)                                                                                              | CA imported into the profile's NSS DB at launch |
-| Safari  | System PAC at `http://127.0.0.1:<port>/proxy.pac` via `networksetup` on the active network service, scoped to the configured `FROM` hosts; then opens Safari at the first rule's `FROM` URL; prior setting restored on exit | macOS login keychain via `ca install`           |
+| Browser | How the proxy is configured                                                                                                                                                                                                 | CA trust                                                |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| Chrome  | Temp `--user-data-dir`; `--proxy-server="https=127.0.0.1:<port>"` (HTTPS only — plain HTTP goes direct)                                                                                                                     | macOS login keychain or Linux user NSS via `ca install` |
+| Firefox | Temp profile with `user.js` setting `network.proxy.ssl` (HTTPS only — `network.proxy.http` is unset so plain HTTP goes direct)                                                                                              | CA imported into the profile's NSS DB at launch         |
+| Safari  | System PAC at `http://127.0.0.1:<port>/proxy.pac` via `networksetup` on the active network service, scoped to the configured `FROM` hosts; then opens Safari at the first rule's `FROM` URL; prior setting restored on exit | macOS login keychain via `ca install`                   |
 
 Unlike Chrome/Firefox (which run in a throwaway profile), Safari uses your
 **system** proxy settings, so `--launch safari` sets the macOS auto-proxy on the
@@ -340,3 +401,21 @@ it never includes request URLs, headers, credentials, or certificate contents.
 | Browser shows an untrusted-certificate warning | The dev CA is not trusted in the browser.                                                                                                                                                   | Run `ts dev proxy ca install` for Chrome and Safari. For Firefox, use `--launch firefox` (auto-imports when `certutil` is installed — `brew install nss`) or run `certutil` manually (see above). After `ca regenerate`, re-trust with `ca install`. |
 | Listen address already in use                  | Another process holds port 18080.                                                                                                                                                           | Pass `--listen 127.0.0.1:18081` (or another free port).                                                                                                                                                                                              |
 | `--listen` rejected as non-loopback            | A non-loopback address was given without the required flag.                                                                                                                                 | Add `--allow-non-loopback`.                                                                                                                                                                                                                          |
+
+## Isolated Linux browser proof
+
+After `cargo build_cli_linux`, run the disposable browser check from the repository
+root. It requires an installed native Chrome/Chromium and `certutil`, but never
+changes your real HOME, profiles, CA, or NSS databases.
+
+```bash
+python3 scripts/test-linux-dev-proxy-browser.py \
+  --browser chromium --layout xdg --logs /tmp/ts-browser-proof
+```
+
+Repeat with `--layout default` and `--layout legacy` to check path selection.
+The check uses browser HTTPS through the proxy to a local HTTP fixture. It verifies
+missing trust fails, installed trust loads, revoked trust fails after restart,
+and plain HTTP bypasses a stopped proxy. It never disables the browser sandbox or
+bypasses certificate errors. This check does not prove Firefox or packaged-browser
+support.
