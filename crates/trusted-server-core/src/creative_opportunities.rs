@@ -345,6 +345,10 @@ pub struct CreativeOpportunitiesConfig {
     /// assertion is caught whenever the origin is honest about it, and this only widens
     /// the window where the origin personalizes *silently*.
     ///
+    /// Verify rather than assume: `ts origin probe-shareability` compares the origin's
+    /// responses with and without a representative cookie jar and answers exactly this
+    /// question. See the configuration guide's template-cache section.
+    ///
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,

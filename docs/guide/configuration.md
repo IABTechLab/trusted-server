@@ -1992,6 +1992,83 @@ manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
 counts and response integrity, and executes the generated GPT module against
 the served seam to require a real `defineSlot` call.
 
+### Origin readthrough caching
+
+`origin_readthrough_enabled` controls a **different cache** from everything above.
+The template cache stores Trusted Server's own transformed HTML. Readthrough is the
+platform's own cache sitting in front of the publisher origin, and it stores the
+origin's bytes.
+
+```toml
+[creative_opportunities]
+# Default false. Enable only after `ts origin probe-shareability` passes on every
+# axis and every verdict.
+origin_readthrough_enabled = true
+```
+
+Left at the default, every publisher-origin fetch is forced to bypass that cache,
+which is the behaviour shipped before this setting existed. Setting it to `true`
+stops forcing a miss for requests judged shareable: a `GET` with a `Host`, no
+`Authorization`, no disqualifying cookie, and no remaining conditional or range
+semantics.
+
+#### This cache has far weaker guarantees than the template cache
+
+Read this before enabling it. The template cache refuses storage on inspection of
+the origin's _response_ — `Set-Cookie`, a CSP nonce, missing positive freshness, an
+uncovered `Vary`, and the rest of the list above. **Readthrough has none of those
+refusals**, and cannot: the decision is made before the origin replies, and no
+post-response hook is reachable on the Fastly adapter.
+
+What that means concretely, for each refusal the template cache performs:
+
+| Template-cache refusal      | Covered on readthrough?                           |
+| --------------------------- | ------------------------------------------------- |
+| No positive freshness       | **No** — probe verdict only                       |
+| Origin `Set-Cookie`         | **No** — probe verdict only                       |
+| Response CSP nonce          | **No** — probe verdict only                       |
+| Origin marks it unshareable | Yes — the platform honours `private` / `no-store` |
+| Non-`200` status            | Yes — the platform honours status                 |
+| Uncovered `Vary`            | Yes — the platform keys on the origin's `Vary`    |
+| Not HTML                    | Not applicable; readthrough caches per origin     |
+
+Every row marked **No** is an accepted risk carried by the operator, not by the
+code. An origin that personalises HTML without saying so in its headers can
+cross-serve one reader's page to another, including session fixation through a
+cached `Set-Cookie`. That last case is the sharpest: readthrough admits requests
+carrying _no_ cookie, which is exactly the first-time visitor an origin issues a
+session cookie to.
+
+#### Enablement
+
+1. Run `ts origin probe-shareability --url <representative URLs>`, passing
+   `--cookie` for any publisher cookie a real reader carries.
+2. **Every axis and every verdict must pass.** Do not enable on a partial pass.
+   The probe is the only control on this path.
+3. Read the probe's stated limits. It runs from one client address, so
+   personalisation keyed on the reader's IP — geo, rate class — is invisible to
+   it, as are `Accept-Language` and client-hint variants it does not vary.
+4. Set `origin_readthrough_enabled = true` and push the configuration.
+5. Watch the `origin_cache_shareable` breakdown in auction telemetry. It records
+   the predicate on every row, so it shows how much traffic the gate admits — and,
+   before you enable it, how much it _would_ admit.
+6. Confirm the origin's own hit rate and page correctness before widening to more
+   URLs.
+
+#### Rollback
+
+1. Set `origin_readthrough_enabled = false` and push. This takes effect on the
+   next request with no deploy, and is the real rollback.
+2. **Objects already stored are not purgeable by this service.** `ts cache purge`
+   and the admin endpoint cover the template cache (`ts-template`) only. Whether
+   readthrough objects can be tagged for purge has not been verified against a
+   real Fastly service, so no tagging is applied and no purge command claims to
+   reach them. After flipping the flag, already-stored objects age out on the
+   origin's own TTL; shorten that at the origin if you need them gone sooner.
+
+Step 2 is the reason to treat enablement as one-way for the duration of the
+origin's TTL, and to widen URL coverage slowly.
+
 ### `gam_unit_path` templating
 
 `gam_unit_path` is a template. A publisher whose ad unit varies by site section
