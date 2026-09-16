@@ -2039,6 +2039,16 @@ cached `Set-Cookie`. That last case is the sharpest: readthrough admits requests
 carrying _no_ cookie, which is exactly the first-time visitor an origin issues a
 session cookie to.
 
+#### You cannot verify this locally
+
+Viceroy does not implement the readthrough cache. Measured with the gate enabled, the
+request judged shareable, and a stub origin answering `Cache-Control: public, max-age=60`
+with no `Set-Cookie`, two identical navigations still produced two origin fetches. The
+local harness can therefore show the _decision_ this gate makes, and never its effect.
+
+The first evidence either way comes from a deployed service. Treat any local timing as
+saying nothing about this setting.
+
 #### Enablement
 
 1. Run `ts origin probe-shareability --url <representative URLs>`, passing

@@ -10092,7 +10092,16 @@ mod tests {
         #[tokio::test]
         async fn a_shareable_navigation_no_longer_forces_an_origin_miss() {
             // The point of issue #852. A cookieless, ad-serving navigation used to set
-            // pass on every origin fetch, which measured at ~485ms of a 773ms TTFB.
+            // pass on every origin fetch, so every pageview paid a full origin round
+            // trip.
+            //
+            // This asserts the *intent* recorded on the outbound request, not a cache
+            // hit, because a hit is not observable here. Measured under Viceroy 0.17 with
+            // the gate enabled, the request judged shareable, and an origin responding
+            // `Cache-Control: public, max-age=60` with no `Set-Cookie`: two identical
+            // navigations still produced two origin fetches. Viceroy does not implement
+            // the readthrough cache, so the saving this gate exists for cannot be
+            // demonstrated locally in any form — only the decision that enables it.
             let stub = Arc::new(StubHttpClient::new());
             let services = services_with_cache_and_telemetry(
                 Arc::clone(&stub),
@@ -10631,8 +10640,8 @@ mod tests {
             assert_eq!(
                 stub.recorded_cache_intents(),
                 vec![PlatformCacheIntent::Default],
-                "a shareable cold fetch must stop forcing a MISS — this is the ~485ms \
-                 that issue #852 exists to recover"
+                "a shareable cold fetch must stop forcing a MISS — the origin round \
+                 trip issue #852 exists to take off the hot path"
             );
         }
 
