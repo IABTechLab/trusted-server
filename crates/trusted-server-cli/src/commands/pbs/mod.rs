@@ -18,7 +18,7 @@ use serde_json::Value;
 use aws::AwsCli;
 use config::Deployment;
 
-/// Arguments for the experimental `ts pbs` namespace.
+/// Arguments for the experimental `ts prebid server` namespace.
 #[derive(Debug, Args)]
 pub(crate) struct PbsArgs {
     /// Emit a nonsecret JSON report instead of a human summary.

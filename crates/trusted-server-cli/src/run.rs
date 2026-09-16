@@ -37,8 +37,6 @@ enum Command {
     Deploy(DeployArgs),
     /// Probe a deployed version until it reports healthy.
     Healthcheck(HealthcheckArgs),
-    /// Experimental self-hosted Prebid Server configuration and AWS operations.
-    Pbs(PbsArgs),
     /// Trusted Server Prebid commands.
     Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
@@ -77,8 +75,10 @@ struct PrebidArgs {
 
 #[derive(Debug, Subcommand)]
 enum PrebidCommand {
-    /// Generate a local external Prebid bundle and update config metadata.
-    Bundle(PrebidBundleArgs),
+    /// Generate a local external Prebid client bundle and update config metadata.
+    Client(PrebidBundleArgs),
+    /// Configure and operate a self-hosted Prebid Server deployment.
+    Server(PbsArgs),
 }
 
 /// Process-level outcome for commands that distinguish drift from tool errors.
@@ -146,19 +146,17 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Healthcheck(args) => {
             edgezero_cli::run_healthcheck(&args).map(|()| RunOutcome::Success)
         }
-        Command::Pbs(args) => pbs::run(&args)
-            .map(|()| RunOutcome::Success)
-            .map_err(|error| error.current_context().to_string()),
-        Command::Prebid(prebid) => {
-            let mut generator = NpmPrebidBundleGenerator;
-            let mut stdout = std::io::stdout();
-            let mut stderr = std::io::stderr();
-            match prebid.command {
-                PrebidCommand::Bundle(args) => {
-                    run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
-                        .map(|()| RunOutcome::Success)
-                }
+        Command::Prebid(prebid) => match prebid.command {
+            PrebidCommand::Client(args) => {
+                let mut generator = NpmPrebidBundleGenerator;
+                let mut stdout = std::io::stdout();
+                let mut stderr = std::io::stderr();
+                run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
+                    .map(|()| RunOutcome::Success)
             }
+            PrebidCommand::Server(args) => pbs::run(&args)
+                .map(|()| RunOutcome::Success)
+                .map_err(|error| error.current_context().to_string()),
         }
         Command::Provision(args) => {
             edgezero_cli::run_provision(&args).map(|()| RunOutcome::Success)
@@ -194,30 +192,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_pbs_inspect() {
+    fn parses_prebid_server_inspect() {
         assert!(
             Args::try_parse_from([
                 "ts",
-                "pbs",
+                "prebid",
+                "server",
                 "inspect",
                 "--config",
                 "trusted-server.toml",
-                "--json"
+                "--json",
             ])
             .is_ok(),
-            "should accept the standalone PBS command namespace"
+            "should accept PBS commands under the Prebid namespace"
         );
     }
 
     #[test]
-    fn pbs_rejects_ambiguous_secret_inputs_and_unimplemented_commands() {
+    fn prebid_server_rejects_ambiguous_secret_inputs_and_unimplemented_commands() {
         for arguments in [
-            vec!["ts", "pbs", "deploy"],
-            vec!["ts", "pbs", "rollback", "--release", "example"],
-            vec!["ts", "pbs", "check"],
+            vec!["ts", "prebid", "server", "deploy"],
+            vec!["ts", "prebid", "server", "rollback", "--release", "example"],
+            vec!["ts", "prebid", "server", "check"],
             vec![
                 "ts",
-                "pbs",
+                "prebid",
+                "server",
                 "secrets",
                 "set",
                 "examplebidder",
@@ -229,7 +229,8 @@ mod tests {
             ],
             vec![
                 "ts",
-                "pbs",
+                "prebid",
+                "server",
                 "secrets",
                 "set",
                 "examplebidder",
@@ -250,16 +251,17 @@ mod tests {
         assert!(
             Args::try_parse_from([
                 "ts",
-                "pbs",
+                "prebid",
+                "server",
                 "check",
                 "--deployment",
                 "deployment.yaml",
-                "--json"
+                "--json",
             ])
             .is_ok()
         );
         assert!(
-            Args::try_parse_from(["ts", "prebid", "bundle", "--config", "trusted-server.toml"])
+            Args::try_parse_from(["ts", "prebid", "client", "--config", "trusted-server.toml"])
                 .is_ok()
         );
     }
@@ -1111,22 +1113,24 @@ mod tests {
     }
 
     #[test]
-    fn prebid_bundle_defaults_match_spec() {
-        let args = parse(&["ts", "prebid", "bundle"]);
+    fn prebid_client_defaults_match_spec() {
+        let args = parse(&["ts", "prebid", "client"]);
         let Command::Prebid(prebid) = args.command else {
             panic!("expected prebid command");
         };
-        let PrebidCommand::Bundle(bundle) = prebid.command;
-        assert_eq!(bundle.config, PathBuf::from("trusted-server.toml"));
-        assert_eq!(bundle.out, PathBuf::from("dist/prebid"));
+        let PrebidCommand::Client(client) = prebid.command else {
+            panic!("expected prebid client command");
+        };
+        assert_eq!(client.config, PathBuf::from("trusted-server.toml"));
+        assert_eq!(client.out, PathBuf::from("dist/prebid"));
     }
 
     #[test]
-    fn prebid_bundle_accepts_custom_paths() {
+    fn prebid_client_accepts_custom_paths() {
         let args = parse(&[
             "ts",
             "prebid",
-            "bundle",
+            "client",
             "--config",
             "publisher.toml",
             "--out",
@@ -1135,14 +1139,16 @@ mod tests {
         let Command::Prebid(prebid) = args.command else {
             panic!("expected prebid command");
         };
-        let PrebidCommand::Bundle(bundle) = prebid.command;
-        assert_eq!(bundle.config, PathBuf::from("publisher.toml"));
-        assert_eq!(bundle.out, PathBuf::from("build/prebid"));
+        let PrebidCommand::Client(client) = prebid.command else {
+            panic!("expected prebid client command");
+        };
+        assert_eq!(client.config, PathBuf::from("publisher.toml"));
+        assert_eq!(client.out, PathBuf::from("build/prebid"));
     }
 
     #[test]
-    fn prebid_bundle_does_not_accept_adapter_option() {
-        let error = Args::try_parse_from(["ts", "prebid", "bundle", "--adapter", "fastly"])
+    fn prebid_client_does_not_accept_adapter_option() {
+        let error = Args::try_parse_from(["ts", "prebid", "client", "--adapter", "fastly"])
             .expect_err("should reject prebid adapter option");
         assert!(
             error.to_string().contains("unexpected argument")

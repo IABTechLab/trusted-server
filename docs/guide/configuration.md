@@ -1348,9 +1348,9 @@ overrides, and notification suppression belong under `[auction]`.
 | `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
 | `external_bundle_url`                | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
 | `external_bundle_sha256` / `*_sri`   | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid bundle`                           |
-| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid bundle`                          |
-| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid bundle`                        |
+| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid client`                           |
+| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid client`                          |
+| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid client`                        |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in

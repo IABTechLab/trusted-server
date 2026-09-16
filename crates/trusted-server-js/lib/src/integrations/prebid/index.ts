@@ -1669,7 +1669,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
             'Prebid bundle. Add its exact Prebid module stem to ' +
             '[integrations.prebid.bundle.modules].bidder in trusted-server.toml and ' +
-            'rebuild it with `ts prebid bundle`.'
+            'rebuild it with `ts prebid client`.'
         );
       }
     }

@@ -55,7 +55,7 @@ Present one recommended design and only alternatives that resolve a real tradeof
 - Each selected AWS service, its requirement, and whether to reuse or create it.
 - Capacity assumptions, cost drivers and estimate date, accepted limitations, and blockers.
 - Runtime, infrastructure, secret, and traffic-control ownership.
-- Use the experimental `ts pbs` commands for supported local checks, secret writes, and EC2 status. Record the selected YAML/secret delivery path and unsupported operations explicitly. Deployment, rollback, and other runtime support need a separately approved implementation; avoid competing wrappers for implemented commands.
+- Use the experimental `ts prebid server` commands for supported local checks, secret writes, and EC2 status. Record the selected YAML/secret delivery path and unsupported operations explicitly. Deployment, rollback, and other runtime support need a separately approved implementation; avoid competing wrappers for implemented commands.
 - Target files and checks, with cloud-dependent checks separated from local checks.
 
 Ask the user to approve the architecture, assumptions, target files, and accepted limitations. Approval to generate files is not approval to execute them. Reopen approval if later findings change topology, cost commitments, or ownership.
@@ -66,7 +66,7 @@ Done when the user explicitly approves the design and file scope. If blockers re
 
 Read [file generation and validation](references/file-generation.md). Follow existing repository conventions and generate only artifacts used by the selected design. Keep the decision record in the deployment plan; reference it from the runbook rather than repeating it.
 
-Read the [PBS CLI usage and descriptor schema](../../../crates/trusted-server-cli/README.md) before generating inputs consumed by `ts pbs`. Its current descriptor supports EC2/Compose only. Keep other architecture choices available, but mark their CLI integration deferred rather than generating unsupported fields.
+Read the [PBS CLI usage and descriptor schema](../../../crates/trusted-server-cli/README.md) before generating inputs consumed by `ts prebid server`. Its current descriptor supports EC2/Compose only. Keep other architecture choices available, but mark their CLI integration deferred rather than generating unsupported fields.
 
 Verify version-specific PBS fields and adapter bindings against the selected release. Verify AWS/Terraform behavior and pricing against current primary documentation. Record source links, versions, and verification dates in the deployment plan. Unavailable evidence remains a named blocker; do not invent image digests, configuration keys, prices, or benchmark results.
 
