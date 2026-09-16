@@ -47,7 +47,7 @@ mod tests {
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const VICEROY_SECRET_STORE_MAPPING_KEY: &str =
-        "EDGEZERO__SERVICES__0000000000000000000000__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME";
+        "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME";
 
     #[test]
     fn local_fastly_config_defines_runtime_kv_stores() {
@@ -74,7 +74,7 @@ mod tests {
     }
 
     #[test]
-    fn local_fastly_secret_store_mapping_is_service_scoped() {
+    fn local_fastly_secret_store_mapping_is_canonical() {
         for (name, config) in [
             ("fastly.toml", FASTLY_CONFIG),
             ("Viceroy integration template", VICEROY_TEMPLATE),
@@ -87,13 +87,7 @@ mod tests {
             assert_eq!(
                 runtime_env[VICEROY_SECRET_STORE_MAPPING_KEY].as_str(),
                 Some("ts_secrets"),
-                "{name} should scope the secret-store mapping to Viceroy's service ID"
-            );
-            assert!(
-                runtime_env
-                    .get("EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME")
-                    .is_none(),
-                "{name} should not define the ignored unscoped secret-store mapping"
+                "{name} should define the canonical secret-store mapping"
             );
         }
     }
