@@ -40,6 +40,15 @@ pub struct ProbeShareabilityArgs {
     #[arg(long = "vary-header")]
     pub vary_header: Vec<String>,
 
+    /// Cookie every request carries, as `name=value`, to get past a bot wall.
+    ///
+    /// Distinct from `--cookie`: this one is sent on *every* arm including the baseline,
+    /// because without it a protected origin answers each arm with a challenge page and
+    /// the probe would report on those instead of on the origin. It is not part of what
+    /// the cookie axis varies.
+    #[arg(long = "admission-cookie")]
+    pub admission_cookie: Option<String>,
+
     /// Emit JSON instead of a human-readable report.
     #[arg(long)]
     pub json: bool,
@@ -65,7 +74,21 @@ fn run_probe(args: &ProbeShareabilityArgs, out: &mut impl std::io::Write) -> Cli
         }
     }
 
-    let report = probe::probe_urls(&args.url, args.repeat, &args.cookie, &args.vary_header)?;
+    if let Some(cookie) = args.admission_cookie.as_deref()
+        && !cookie.contains('=')
+    {
+        return crate::error::cli_error(format!(
+            "--admission-cookie expects name=value, got {cookie:?}"
+        ));
+    }
+
+    let report = probe::probe_urls(
+        &args.url,
+        args.repeat,
+        &args.cookie,
+        &args.vary_header,
+        args.admission_cookie.as_deref(),
+    )?;
 
     let rendered = if args.json {
         serde_json::to_string_pretty(&report)

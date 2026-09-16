@@ -27,6 +27,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One fetch's result, reduced to what the probe judges.
 struct Fetched {
+    status: u16,
     body: Vec<u8>,
     headers: HashMap<String, Vec<String>>,
 }
@@ -58,6 +59,7 @@ pub(crate) fn probe_urls(
     repeat: u32,
     extra_cookies: &[String],
     vary_headers: &[String],
+    admission_cookie: Option<&str>,
 ) -> CliResult<ProbeReport> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -77,7 +79,17 @@ pub(crate) fn probe_urls(
 
         let mut reports = Vec::with_capacity(urls.len());
         for url in urls {
-            reports.push(probe_one(&client, url, repeat, extra_cookies, vary_headers).await?);
+            reports.push(
+                probe_one(
+                    &client,
+                    url,
+                    repeat,
+                    extra_cookies,
+                    vary_headers,
+                    admission_cookie,
+                )
+                .await?,
+            );
         }
         Ok(ProbeReport { urls: reports })
     })
@@ -89,14 +101,32 @@ async fn probe_one(
     repeat: u32,
     extra_cookies: &[String],
     vary_headers: &[String],
+    admission_cookie: Option<&str>,
 ) -> CliResult<UrlReport> {
-    let cookie_jar = cookie_header(extra_cookies);
+    let cookie_jar = cookie_header(extra_cookies, admission_cookie);
 
-    // Baseline: bare request, also the left arm of every axis below.
-    let baseline = fetch(client, url, &[]).await?;
+    // Baseline: the admission cookie and nothing else, and the left arm of every axis
+    // below. It carries that cookie because without it a bot-protected origin answers
+    // every arm with a challenge page, and the probe would then compare two challenge
+    // pages and report on those instead of on the origin.
+    let baseline = fetch(client, url, &[], admission_cookie).await?;
+
+    // A challenge page is not the origin. Judging one produces a confident verdict about
+    // content the origin never served — in practice a false FAIL that reads exactly like a
+    // real one, which is worse than no answer.
+    if baseline.status != 200 {
+        return cli_error(format!(
+            "{url} answered {} rather than 200, so there is nothing to judge.\n\
+             A bot wall or redirect returns a page the origin did not compose, and every \
+             verdict below it would describe that page.\n\
+             Pass a session cookie that reaches real content with \
+             --admission-cookie 'name=value'.",
+            baseline.status
+        ));
+    }
 
     let mut axes = Vec::new();
-    axes.push(self_identity_axis(client, url, &baseline, repeat).await?);
+    axes.push(self_identity_axis(client, url, &baseline, repeat, admission_cookie).await?);
     axes.push(
         compare_axis(
             client,
@@ -107,6 +137,7 @@ async fn probe_one(
             Arm {
                 headers: &[("cookie", cookie_jar.as_str())],
             },
+            admission_cookie,
         )
         .await?,
     );
@@ -120,6 +151,7 @@ async fn probe_one(
             Arm {
                 headers: &[("accept-encoding", "gzip")],
             },
+            admission_cookie,
         )
         .await?,
     );
@@ -133,10 +165,11 @@ async fn probe_one(
             Arm {
                 headers: &[("user-agent", MOBILE_USER_AGENT)],
             },
+            admission_cookie,
         )
         .await?,
     );
-    axes.push(rsc_axis(client, url, &baseline, vary_headers).await?);
+    axes.push(rsc_axis(client, url, &baseline, vary_headers, admission_cookie).await?);
 
     let verdicts = judge_headers(&baseline, &axes);
 
@@ -157,9 +190,10 @@ async fn self_identity_axis(
     url: &str,
     baseline: &Fetched,
     repeat: u32,
+    admission_cookie: Option<&str>,
 ) -> CliResult<AxisResult> {
     for _ in 0..repeat.max(1) {
-        let again = fetch(client, url, &[]).await?;
+        let again = fetch(client, url, &[], admission_cookie).await?;
         if let Some(difference) = first_difference(&baseline.body, &again.body) {
             return Ok(AxisResult {
                 name: "self-identity".to_owned(),
@@ -184,6 +218,7 @@ async fn rsc_axis(
     url: &str,
     baseline: &Fetched,
     vary_headers: &[String],
+    admission_cookie: Option<&str>,
 ) -> CliResult<AxisResult> {
     let mut headers: Vec<(&str, &str)> = vec![("rsc", "1")];
     for name in vary_headers {
@@ -201,7 +236,7 @@ async fn rsc_axis(
         }
     );
 
-    let varied = fetch(client, url, &headers).await?;
+    let varied = fetch(client, url, &headers, admission_cookie).await?;
     Ok(AxisResult {
         name: "rsc".to_owned(),
         description,
@@ -216,8 +251,9 @@ async fn compare_axis(
     name: &str,
     description: &str,
     arm: Arm<'_>,
+    admission_cookie: Option<&str>,
 ) -> CliResult<AxisResult> {
-    let varied = fetch(client, url, arm.headers).await?;
+    let varied = fetch(client, url, arm.headers, admission_cookie).await?;
     Ok(AxisResult {
         name: name.to_owned(),
         description: description.to_owned(),
@@ -397,8 +433,14 @@ fn has_positive_freshness(value: &str) -> bool {
     })
 }
 
-fn cookie_header(extra: &[String]) -> String {
-    let mut parts: Vec<String> = TS_COOKIES.iter().map(|pair| (*pair).to_owned()).collect();
+/// The cookie arm's jar: the admission cookie plus the cookies a repeat visitor carries.
+///
+/// The admission cookie is included so this arm differs from the baseline by the *added*
+/// cookies only. Without it the axis would also be varying whether the request is admitted
+/// at all, which is not a question about personalization.
+fn cookie_header(extra: &[String], admission_cookie: Option<&str>) -> String {
+    let mut parts: Vec<String> = admission_cookie.into_iter().map(str::to_owned).collect();
+    parts.extend(TS_COOKIES.iter().map(|pair| (*pair).to_owned()));
     parts.extend(extra.iter().cloned());
     parts.join("; ")
 }
@@ -407,6 +449,7 @@ async fn fetch(
     client: &reqwest::Client,
     url: &str,
     headers: &[(&str, &str)],
+    admission_cookie: Option<&str>,
 ) -> CliResult<Fetched> {
     // Resolved into one map before the request is built, because `RequestBuilder::header`
     // *appends*. Layering an arm's override on top of a default would send the header
@@ -418,6 +461,12 @@ async fn fetch(
         // changes what the origin may compress.
         ("accept-encoding", "identity"),
     ];
+    // Seeded before the arm's own headers so an arm that sets `cookie` replaces it rather
+    // than duplicating it — every arm must be admitted, but only the cookie arm varies
+    // what else it carries.
+    if let Some(cookie) = admission_cookie {
+        resolved.push(("cookie", cookie));
+    }
     for (name, value) in headers {
         match resolved
             .iter_mut()
@@ -437,6 +486,7 @@ async fn fetch(
         Ok(response) => response,
         Err(error) => return cli_error(format!("could not reach {url}: {error}")),
     };
+    let status = response.status().as_u16();
 
     let mut collected: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in response.headers() {
@@ -453,6 +503,7 @@ async fn fetch(
     };
 
     Ok(Fetched {
+        status,
         body,
         headers: collected,
     })
@@ -471,6 +522,7 @@ mod tests {
                 .push((*value).to_owned());
         }
         Fetched {
+            status: 200,
             body: b"<html></html>".to_vec(),
             headers: collected,
         }
@@ -575,8 +627,17 @@ mod tests {
 
     #[test]
     fn cookie_header_carries_the_cookies_a_repeat_visitor_has() {
-        let header = cookie_header(&["publisher_session=1".to_owned()]);
+        let header = cookie_header(&["publisher_session=1".to_owned()], None);
         assert!(header.contains("ts-ec="), "TS sets its own identity cookie");
         assert!(header.contains("publisher_session=1"));
+    }
+
+    #[test]
+    fn the_cookie_arm_keeps_the_admission_cookie() {
+        // Otherwise the cookie axis would vary two things at once: the added cookies, and
+        // whether the request is admitted past the bot wall at all.
+        let header = cookie_header(&[], Some("datadome=abc"));
+        assert!(header.contains("datadome=abc"));
+        assert!(header.contains("ts-ec="));
     }
 }

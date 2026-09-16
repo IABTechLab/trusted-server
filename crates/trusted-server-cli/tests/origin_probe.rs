@@ -121,6 +121,7 @@ fn json_args(server: &FixtureServer) -> ProbeShareabilityArgs {
         repeat: 1,
         cookie: Vec::new(),
         vary_header: Vec::new(),
+        admission_cookie: None,
         json: true,
     }
 }
@@ -463,4 +464,60 @@ fn an_age_of_zero_is_not_treated_as_a_cache_hit() {
 
     assert!(ok, "{}", report.render_text());
     assert!(verdict(&report, "fronting-cache").passed);
+}
+
+#[test]
+fn a_bot_wall_aborts_the_probe_instead_of_judging_the_challenge_page() {
+    // Measured against a real protected origin: the baseline arm was answered with a
+    // challenge page, and every verdict then described that page rather than the origin —
+    // a confident FAIL on an origin that sends `max-age=60` with no `Set-Cookie`.
+    let server = FixtureServer::start(|request| {
+        if request
+            .header("cookie")
+            .is_some_and(|c| c.contains("admit=1"))
+        {
+            FixtureResponse::html("<html>real content</html>")
+                .with_header("cache-control", "public, max-age=300")
+        } else {
+            FixtureResponse::html("<html>are you a robot</html>").with_status(403)
+        }
+    });
+
+    let mut out = Vec::new();
+    let outcome = run(
+        OriginCommand::ProbeShareability(json_args(&server)),
+        &mut out,
+    );
+
+    let error = outcome.expect_err("a challenge page must not be judged");
+    let message = error.to_string();
+    assert!(
+        message.contains("403") && message.contains("admission-cookie"),
+        "the error must name the status and how to get past it, got: {message}"
+    );
+}
+
+#[test]
+fn an_admission_cookie_lets_the_probe_reach_real_content() {
+    let server = FixtureServer::start(|request| {
+        if request
+            .header("cookie")
+            .is_some_and(|c| c.contains("admit=1"))
+        {
+            FixtureResponse::html("<html>real content</html>")
+                .with_header("cache-control", "public, max-age=300")
+        } else {
+            FixtureResponse::html("<html>are you a robot</html>").with_status(403)
+        }
+    });
+
+    let mut args = json_args(&server);
+    args.admission_cookie = Some("admit=1".to_owned());
+    let (ok, report) = probe(&server, args);
+
+    assert!(
+        ok,
+        "with the wall passed, the origin's own headers decide: {}",
+        report.render_text()
+    );
 }
