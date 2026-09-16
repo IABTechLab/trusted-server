@@ -612,7 +612,7 @@ describe('GPT GAM attribution bundle fallback', () => {
       expect(typeof win.tsjs?.adInit).toBe('function');
       expect(typeof win.tsjs?.scheduleInitialAdInit).toBe('function');
       expect(win.tsjs?.spaHookInstalled).toBe(true);
-      expect(addEventListenerSpy).toHaveBeenCalledWith('popstate', expect.any(Function));
+      expect(addEventListenerSpy).toHaveBeenCalledWith('popstate', expect.any(Function), true);
       expect(addEventListenerSpy).toHaveBeenCalledWith('load', expect.any(Function));
       expect(addEventListenerSpy).toHaveBeenCalledWith('message', expect.any(Function));
       if (setConfig) {
