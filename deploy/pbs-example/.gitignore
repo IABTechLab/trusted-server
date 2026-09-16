@@ -1,0 +1,14 @@
+# Terraform working data and local state
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Saved plans can contain provider-returned metadata
+*.tfplan
+
+# Local inputs and crash output
+*.auto.tfvars
+*.tfvars
+crash.log
+crash.*.log

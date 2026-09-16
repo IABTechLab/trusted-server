@@ -1,0 +1,15 @@
+services:
+  pbs:
+    image: prebid/prebid-server@sha256:f0fee9caab93e14e9988b376c2c5371412628b7de1eca7a663bf203c4dd530a7
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ${PBS_SECRET_ENV_FILE:-/run/pbs/secrets/examplebidder.env}
+    volumes:
+      - ${PBS_CONFIG_FILE:-./pbs.yaml}:/etc/config/pbs.yaml:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

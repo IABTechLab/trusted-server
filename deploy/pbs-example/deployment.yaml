@@ -1,0 +1,22 @@
+# Fictional local-check descriptor. Replace all account, profile, secret, and instance IDs before authorized use.
+schema_version: 1
+environment: example
+runtime: ec2-compose
+aws:
+  account_id: '123456789012'
+  profile: pbs-example
+pbs:
+  config: runtime/pbs.yaml
+  image: prebid/prebid-server@sha256:f0fee9caab93e14e9988b376c2c5371412628b7de1eca7a663bf203c4dd530a7
+  bindings: runtime/secret-bindings.json
+regions:
+  us-east-1:
+    instance_ids:
+      - i-0123456789abcde01
+      - i-0123456789abcde02
+    overrides: runtime/regions/east.yaml
+  us-west-2:
+    instance_ids:
+      - i-0fedcba9876543210
+      - i-0fedcba9876543211
+    overrides: runtime/regions/west.yaml
