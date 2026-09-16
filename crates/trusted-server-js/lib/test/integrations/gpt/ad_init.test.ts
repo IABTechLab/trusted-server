@@ -1,11 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-import { resolve } from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
+import { GPT_BOOTSTRAP_PATH } from '../../fixtures/paths';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 import {
   APS_PREBID_CREATIVE_RUNNER_URL,
@@ -120,20 +119,7 @@ type TestWindow = Omit<Window, 'tsjs'> & {
 };
 
 async function runGptBootstrapWithGoogleTag(googletag: object): Promise<void> {
-  const bootstrapUrl = new URL(
-    '../../../../../trusted-server-core/src/integrations/gpt_bootstrap.js',
-    import.meta.url
-  );
-  const urlPath = decodeURIComponent(bootstrapUrl.pathname);
-  let bootstrapPath: string;
-  if (urlPath.startsWith('/@fs/')) {
-    bootstrapPath = urlPath.slice('/@fs'.length);
-  } else if (bootstrapUrl.protocol === 'file:') {
-    bootstrapPath = urlPath;
-  } else {
-    bootstrapPath = path.resolve(process.cwd(), `.${urlPath}`);
-  }
-  const bootstrap = await readFile(bootstrapPath, 'utf8');
+  const bootstrap = await readFile(GPT_BOOTSTRAP_PATH, 'utf8');
   const runBootstrap = new Function('window', 'googletag', bootstrap) as (
     window: Window,
     googletag: object
@@ -145,10 +131,7 @@ type HandoffImplementation = 'bootstrap' | 'bundle';
 
 async function installHandoff(implementation: HandoffImplementation): Promise<void> {
   if (implementation === 'bootstrap') {
-    const bootstrap = readFileSync(
-      resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
-      'utf8'
-    );
+    const bootstrap = readFileSync(GPT_BOOTSTRAP_PATH, 'utf8');
     window.eval(bootstrap);
     return;
   }
@@ -201,10 +184,7 @@ function appendResponsiveSlotElement(
 }
 
 function runGptBootstrap(): void {
-  const bootstrap = readFileSync(
-    resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
-    'utf8'
-  );
+  const bootstrap = readFileSync(GPT_BOOTSTRAP_PATH, 'utf8');
   window.eval(bootstrap);
 }
 
@@ -1150,10 +1130,7 @@ describe('installTsAdInit', () => {
       gptSlotHandoffs: { 'div-ts-fallback': handoff },
     };
 
-    const bootstrap = readFileSync(
-      resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
-      'utf8'
-    );
+    const bootstrap = readFileSync(GPT_BOOTSTRAP_PATH, 'utf8');
     window.eval(bootstrap);
 
     expect(() =>

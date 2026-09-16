@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
-import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
+import { GPT_BOOTSTRAP_PATH } from '../../fixtures/paths';
 
 /**
  * Executable coverage for the edge-injected `gpt_bootstrap.js` — the
@@ -12,15 +12,8 @@ import type { TsjsApi } from '../../../src/core/types';
  * `crates/trusted-server-core/src/integrations/gpt_bootstrap.js` and is
  * evaluated here verbatim, so the degradation path (fallback `adInit` and
  * fallback `scheduleInitialAdInit`) is executed, not string-matched.
- *
- * Vitest runs with the lib directory as cwd (the vitest.config.ts root), so
- * the bootstrap is resolved relative to it rather than via import.meta.url,
- * which the jsdom environment rewrites to a non-file scheme.
  */
-const BOOTSTRAP_SOURCE = readFileSync(
-  path.resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
-  'utf8'
-);
+const BOOTSTRAP_SOURCE = readFileSync(GPT_BOOTSTRAP_PATH, 'utf8');
 
 // The command queue the bootstrap pushes into: a real array once GPT has
 // loaded, or the bare `push`-only stub GPT installs before then.
