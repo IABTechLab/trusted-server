@@ -189,8 +189,13 @@ impl TemplateCacheKey {
 ///
 /// The digest is over exact bytes, so spellings that name the same page must be reduced to
 /// one form or a purge silently misses. Normalized: scheme and host case, a default port,
-/// one trailing slash, and an empty query. **Not** normalized: the query itself, since a
-/// different query is a different page.
+/// one trailing slash, an empty query, and the *order* of the query parameters. **Not**
+/// normalized: the parameters themselves, since a different query is a different page.
+///
+/// Parameter order is normalized because a reader reaching `?a=1&b=2` and one reaching
+/// `?b=2&a=1` are on the same page, and both orderings can be cached as separate entries.
+/// Leaving them as separate purge handles would let a purge report success while a stale
+/// entry for the other ordering survived — the failure direction that matters here.
 ///
 /// A URL that cannot be parsed is hashed as given. An operator typo then purges nothing,
 /// which is the same outcome as a correct URL that was never cached, and is preferable to
@@ -217,7 +222,18 @@ fn canonical_reader_url(url: &str) -> String {
     };
     let path = parsed.path().trim_end_matches('/');
     let query = match parsed.query() {
-        Some(query) if !query.is_empty() => format!("?{query}"),
+        Some(query) if !query.is_empty() => {
+            // Sorted on the raw pairs rather than decoded ones, so percent-encoded values
+            // stay byte-exact. Empty pairs are dropped, which folds `?a=1&&b=2` onto
+            // `?a=1&b=2`; that over-purges by one spelling, which is the safe direction.
+            let mut pairs: Vec<&str> = query.split('&').filter(|pair| !pair.is_empty()).collect();
+            pairs.sort_unstable();
+            if pairs.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", pairs.join("&"))
+            }
+        }
         _ => String::new(),
     };
     format!("{scheme}://{host}{port}{path}{query}")
@@ -1120,6 +1136,10 @@ mod tests {
                 "https://example.com/article?",
                 "https://example.com/article",
             ),
+            (
+                "https://example.com/article?a=1&b=2",
+                "https://example.com/article?b=2&a=1",
+            ),
         ] {
             assert_eq!(
                 reader_url_surrogate_key(a),
@@ -1144,6 +1164,57 @@ mod tests {
             reader_url_surrogate_key("https://example.com/a"),
             reader_url_surrogate_key("https://other.example/a"),
             "two hosts are two pages"
+        );
+    }
+
+    #[test]
+    fn query_parameter_order_does_not_split_one_page_into_two_purge_handles() {
+        // Both orderings can be cached as separate entries, because the cache key is built
+        // from the path exactly as the reader sent it. They must still share one purge
+        // handle, or purging the ordering the operator happened to type would leave the
+        // other serving stale content while reporting success.
+        for (a, b) in [
+            (
+                "https://example.com/a?one=1&two=2&three=3",
+                "https://example.com/a?three=3&one=1&two=2",
+            ),
+            // A repeated parameter is order-independent the same way.
+            (
+                "https://example.com/a?tag=x&tag=y",
+                "https://example.com/a?tag=y&tag=x",
+            ),
+            // A valueless parameter still sorts.
+            (
+                "https://example.com/a?debug&page=2",
+                "https://example.com/a?page=2&debug",
+            ),
+        ] {
+            assert_eq!(
+                reader_url_surrogate_key(a),
+                reader_url_surrogate_key(b),
+                "{a} and {b} are the same page in a different spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn sorting_the_query_does_not_merge_pages_that_genuinely_differ() {
+        // Sorting must collapse orderings only. If it also collapsed differing values or
+        // a dropped parameter, a purge would reach entries it was never asked to touch.
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a?x=1&y=2"),
+            reader_url_surrogate_key("https://example.com/a?x=2&y=1"),
+            "swapping which parameter holds which value is a different page"
+        );
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a?x=1&y=2"),
+            reader_url_surrogate_key("https://example.com/a?x=1"),
+            "dropping a parameter is a different page"
+        );
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a?tag=x&tag=y"),
+            reader_url_surrogate_key("https://example.com/a?tag=x"),
+            "a repeated parameter must not be deduplicated into a single one"
         );
     }
 
