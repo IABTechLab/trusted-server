@@ -12,9 +12,7 @@
 //! under `fastly compute serve`, `cargo test-fastly` and the parity suite. It is also
 //! silently dead whenever the origin request is in pass mode, and its closure bounds
 //! (`Fn + Send + Sync`) are incompatible with a platform layer that is `!Send` by
-//! construction. Recorded in the spike plan's Task 3 Step 4 so nobody re-proposes it.
-//!
-//! Spike-only. Remove with the spike.
+//! construction. Recorded here so nobody re-proposes it.
 
 use fastly::cache::core::{CacheKey, Found, Transaction};
 use std::io::Write as _;

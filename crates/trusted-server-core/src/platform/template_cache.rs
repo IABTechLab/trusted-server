@@ -1,21 +1,23 @@
-//! The shared transformed-template cache for the #1009 ESI validation spike.
+//! The shared transformed-template cache.
 //!
 //! Three caches are in play and conflating them is what produced the original wrong
 //! conclusion in the design doc, so this module names which one it is:
 //!
-//! | Cache | Contents                          | Owner                          |
-//! | ----- | --------------------------------- | ------------------------------ |
-//! | C1    | raw origin bytes                  | Fastly read-through. Not this. |
-//! | Template cache | post-`lol_html`, pre-assembly     | **This module.**       |
-//! | Final response | final per-user assembled response | **Must never exist.** |
+//! | Cache                | Contents                          | Owner                          |
+//! | -------------------- | --------------------------------- | ------------------------------ |
+//! | Origin readthrough   | raw origin bytes                  | The platform. Not this module. |
+//! | Template cache       | post-`lol_html`, pre-assembly     | **This module.**               |
+//! | Assembled response   | final per-user assembled response | **Must never exist.**          |
+//!
+//! The origin readthrough cache is gated separately by
+//! `creative_opportunities.origin_readthrough_enabled` (issue #852). The two are
+//! independent: one can be on while the other is off.
 //!
 //! The template cache holds a *shared template*: no per-user bytes, and no decisions that depend on
 //! the request. What may and may not live in it is
 //! [§6.7 of the design doc](../../../../docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md),
 //! and the invariant is enforced by the rendered-document byte-identity tests in
 //! `publisher`.
-//!
-//! Spike-only. Remove with the spike.
 
 use core::fmt;
 use std::collections::HashSet;
@@ -290,8 +292,8 @@ pub const REPLAYABLE_POLICY_HEADERS: &[&str] = &[
 /// Without this carve-out, the ordinary declaration sent by any compressing origin reads
 /// as an uncovered gap and disqualifies the response, so **the template cache would never store anything
 /// against a real origin** unless the operator redundantly listed a header the transform
-/// already normalizes. Found by review before it could make the spike measure a hit rate
-/// of approximately zero and read that as a result.
+/// already normalizes. Found by review before it could drive the hit rate to
+/// approximately zero and have that read as a measurement rather than a bug.
 const STRUCTURALLY_COVERED: &[&str] = &["accept-encoding"];
 
 /// Request headers to include in the cache key, and where the list comes from.
@@ -312,10 +314,17 @@ const STRUCTURALLY_COVERED: &[&str] = &["accept-encoding"];
 /// 3. **Store the list alongside** and re-key on mismatch. Same cost as (2) plus
 ///    complexity.
 ///
-/// (1) is chosen for the spike because Step A already measured the origin's actual
-/// `Vary`, the origin response is checked for drift before storage, and the configured
-/// template-cache ceiling bounds how long a newly introduced mismatch can survive.
-/// **This is a spike-grade choice, not a production one** — see the drift guard below.
+/// (1) is chosen, and it holds for production because the drift it risks **fails
+/// closed**: before storage the origin's actual `Vary` is compared against this list, and
+/// an uncovered name refuses the template
+/// (`TemplateCacheBypassReason::VaryNotCovered`, which carries the offending names so a
+/// stale config is identifiable from one log line). A configuration that falls behind the
+/// origin therefore costs hit rate, not correctness — the cache stops storing rather than
+/// serving the wrong representation. The configured ceiling additionally bounds how long
+/// an already-stored entry can outlive a change.
+///
+/// Revisit (2) if operators find the configured list burdensome in practice; the reason to
+/// prefer (1) is the extra lookup on every request, not a limitation of the guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarySpec {
     /// Header names, lowercased, in a fixed order.
@@ -1322,8 +1331,8 @@ mod tests {
     fn a_key_field_counts_as_coverage_without_being_configured() {
         // The failure this prevents is silent and total: every compressing origin sends
         // `Vary: Accept-Encoding`, so treating it as a gap means the cache never stores
-        // anything, and a spike measuring hit rate would report ~0 and look like a
-        // finding rather than a bug.
+        // anything, and the resulting ~0 hit rate would read as a finding rather than a
+        // bug.
         let spec = VarySpec::new([]);
 
         assert!(

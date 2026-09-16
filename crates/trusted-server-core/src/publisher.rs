@@ -1459,7 +1459,7 @@ pub enum PublisherResponse {
     /// byte, which measured ~100x worse TTFB than doing nothing. The finalizer owns the
     /// `Arc`s a `'static` stream needs.
     ///
-    /// Spike-only, for the #1009 ESI validation.
+    /// Used only by the shared-template assembly modes, which are opt-in per deployment.
     AssembleTemplate {
         /// Response with every header already set. `Content-Length` must stay absent:
         /// the assembled length is unknown until bids resolve.
@@ -1579,7 +1579,7 @@ pub struct OwnedProcessResponseParams {
     /// presence *is* the decision — there is no second place that could disagree with
     /// the gate, and no way to reach the store without having passed it.
     ///
-    /// Spike-only, for the #1009 ESI validation.
+    /// Used only by the shared-template assembly modes, which are opt-in per deployment.
     pub(crate) template_cache_key: Option<AuthorizedTemplateStore>,
     /// Slot definitions for the `</body>` seam under a shared mode, as JSON.
     ///
@@ -2161,7 +2161,7 @@ impl core::error::Error for SeamError {}
 /// Returns an error if the stored metadata cannot be rendered as header values, which
 /// would mean a corrupt entry.
 ///
-/// Spike-only, for the #1009 ESI validation.
+/// Used only by the shared-template assembly modes, which are opt-in per deployment.
 fn build_cached_template_response(
     entry: &crate::platform::TemplateEntry,
     reader_compression: Compression,
@@ -2215,7 +2215,7 @@ fn build_cached_template_response(
 /// service, not a broken one, and the whole point of the template cache is that the response is
 /// reproducible without it.
 ///
-/// Spike-only, for the #1009 ESI validation.
+/// Used only by the shared-template assembly modes, which are opt-in per deployment.
 async fn store_template_if_authorized(
     params: &mut OwnedProcessResponseParams,
     bytes: &[u8],
@@ -2293,10 +2293,10 @@ pub async fn publisher_response_into_streaming_response(
     // Deliberately keyed on the store authorization rather than on the assembly mode:
     // a shared-mode response the gate rejected has nothing to store, so it keeps
     // streaming. `Inline` — the shipped path — never reaches this branch at all, which
-    // is the point. The spike cannot regress production latency by construction.
+    // is the point: the shared-template path cannot regress the default by construction.
     //
     // The cost is that a template cache *miss* buffers. That is the right trade: misses are already
-    // paying an origin fetch and a full transform, and what the spike measures is the
+    // paying an origin fetch and a full transform, and the case that matters is the
     // hit, where there is no origin fetch to stream from in the first place.
     if matches!(
         &publisher_response,
@@ -5801,7 +5801,7 @@ fn match_renderable_slots(
 /// rejects nothing on its own. Every safety condition is the caller's to enforce,
 /// so they are enumerated here rather than left implicit.
 ///
-/// Spike-only, for the #1009 ESI validation.
+/// Used only by the shared-template assembly modes, which are opt-in per deployment.
 #[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
 pub(crate) enum TemplateCacheBypassReason {
     /// Not a shared-template mode; there is no template cache object to write.
@@ -6102,7 +6102,7 @@ fn surrogate_control_freshness(
             match name.as_str() {
                 // Deliberately not `cache_policy::cache_control_headers_are_private_or_no_store`:
                 // this gate additionally treats `no-cache` as non-shareable, because "revalidate
-                // before reuse" is correct for an HTTP cache and too permissive for a spike-owned
+                // before reuse" is correct for an HTTP cache and too permissive for a TS-owned
                 // one. Consolidating the two would loosen this gate rather than tidy it.
                 "private" | "no-store" | "no-cache" => {
                     return Err(TemplateCacheBypassReason::OriginNotShareable);
@@ -9036,7 +9036,7 @@ mod tests {
 
     mod page_bids_format_tests {
         //! Page-bids is a JSON API. The old executable fragment was part of the removed
-        //! parser-based spike and must not remain as an accidental public surface.
+        //! parser-based path and must not remain as an accidental public surface.
 
         use super::*;
 
@@ -12142,7 +12142,7 @@ mod tests {
             // The converse, and the failure mode a fingerprint fix can introduce:
             // over-invalidating is as total as under-invalidating. A fingerprint that
             // moves between two equal configurations is a cache that never hits, which
-            // the spike would report as "no measurable benefit" rather than as a bug.
+            // this would read as "no measurable benefit" rather than as a bug.
             //
             // The two `Settings` are parsed independently, so their `[integrations]`
             // maps iterate in different orders — which is what exercises the sort.
@@ -12217,7 +12217,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_declared_cookie_independent_origin_lets_repeat_visitors_share() {
-            // The opt-in. Without it the spike can only ever measure first-ever page
+            // The opt-in. Without it the cache can only ever serve first-ever page
             // views, which is not the population the issue cares about.
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());

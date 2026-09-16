@@ -191,7 +191,9 @@ fn derive_section(path: &str, section_root: &str, section_segment: usize) -> Str
 /// `</body>` and the root document is therefore uncacheable. `Esi` stores a
 /// request-neutral shared template and fills its per-request byte seam at the edge.
 ///
-/// Spike-only, for the #1009 ESI validation. Remove with the spike.
+/// Defaults to `Inline`. `Esi` is opt-in per deployment and is verified by the
+/// `template-cache-local-test.sh` harness plus the rendered-document byte-identity
+/// tests; it is not a trial mode, but it is also not the default.
 ///
 /// # Why the template must be request-neutral
 ///
@@ -299,9 +301,10 @@ pub struct CreativeOpportunitiesConfig {
     /// `Option` rather than a bare enum, and `skip_serializing_if`, deliberately:
     /// these structs use `deny_unknown_fields`, so a pushed key makes an older
     /// binary fail configuration load. Keeping it absent when unset means a
-    /// deployment that never sets it stays rollback-compatible.
+    /// deployment that never sets it stays rollback-compatible. That reasoning applies
+    /// to every optional field in this struct.
     ///
-    /// Spike-only. See [`AssemblyMode`].
+    /// See [`AssemblyMode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly_mode: Option<AssemblyMode>,
     /// Request headers the origin varies on, which the shared-template cache key must
@@ -318,7 +321,7 @@ pub struct CreativeOpportunitiesConfig {
     /// deployment that has not stated what its origin varies on from gaining a shared
     /// cache by omission.
     ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_vary: Option<Vec<String>>,
     /// Maximum time a reader-neutral transformed template may remain in the shared template cache.
@@ -328,7 +331,7 @@ pub struct CreativeOpportunitiesConfig {
     /// the origin's remaining edge freshness and this value. Defaults to 60 seconds
     /// and may be configured from 1 second through 1 day.
     ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_max_age_seconds: Option<u32>,
     /// Operator assertion that the origin's HTML does not depend on request cookies.
@@ -349,7 +352,7 @@ pub struct CreativeOpportunitiesConfig {
     /// responses with and without a representative cookie jar and answers exactly this
     /// question. See the configuration guide's template-cache section.
     ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
     /// Whether this origin's responses may be held in the platform's shared readthrough
@@ -2286,7 +2289,7 @@ mod tests {
         assert_eq!(
             config.template_cache_max_age(),
             std::time::Duration::from_secs(60),
-            "an absent ceiling must preserve the spike's existing lifetime"
+            "an absent ceiling must preserve the existing lifetime"
         );
         let serialized = toml::to_string(&config).expect("should serialize");
 
