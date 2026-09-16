@@ -6969,6 +6969,41 @@ mod tests {
         }
     }
 
+    /// The two conditions that make template caching stricter than plain shareability.
+    ///
+    /// Pinned against hardcoded expectations rather than against the predicate's own
+    /// formula. `template_eligibility_implies_origin_shareability` compares the function
+    /// with a restatement of its body, so it catches a wrong combinator but would not
+    /// notice either of these terms being dropped — both sides of that equality would drop
+    /// it together.
+    #[test]
+    fn esi_mode_and_reader_support_are_each_necessary_for_template_eligibility() {
+        assert!(
+            request_can_use_shared_template(all_shareable(), true, true),
+            "should be eligible when every condition passes"
+        );
+
+        assert!(
+            !request_can_use_shared_template(all_shareable(), false, true),
+            "a shared template is assembled by ESI, so a non-ESI request must not read one"
+        );
+        assert!(
+            !request_can_use_shared_template(all_shareable(), true, false),
+            "a reader that cannot assemble the seam must not be served an unassembled template"
+        );
+        assert!(
+            !request_can_use_shared_template(
+                SharedRequestInputs {
+                    cookie_disqualifies: true,
+                    ..all_shareable()
+                },
+                true,
+                true
+            ),
+            "template eligibility must never outlive origin shareability"
+        );
+    }
+
     #[test]
     fn request_head_snapshot_preserves_downstream_shape_without_body() {
         let request = Request::builder()
