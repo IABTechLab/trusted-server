@@ -4128,14 +4128,24 @@ fn apply_origin_cache_intent(
 
 /// Whether this request may additionally use a shared *template*.
 ///
-/// The two extra conditions say whether this pipeline can assemble one, not whether the
-/// origin's bytes may be shared — see [`SharedRequestInputs`].
+/// The extra conditions say whether this pipeline can assemble one, and whether this
+/// reader may be served one — not whether the origin's bytes may be shared, which is
+/// [`origin_response_is_shareable`].
+///
+/// `reader_requires_origin` is read from the request *before* conditional and range
+/// headers are stripped. A reader who asked for a range or a revalidation must reach the
+/// origin, whatever is subsequently asked on their behalf; stripping changes what the
+/// origin is asked, not what the reader wanted.
 pub(crate) fn request_can_use_shared_template(
     inputs: SharedRequestInputs,
     assembly_mode_is_esi: bool,
     reader_supports_assembly: bool,
+    reader_requires_origin: bool,
 ) -> bool {
-    origin_response_is_shareable(inputs) && assembly_mode_is_esi && reader_supports_assembly
+    origin_response_is_shareable(inputs)
+        && assembly_mode_is_esi
+        && reader_supports_assembly
+        && !reader_requires_origin
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -4373,7 +4383,11 @@ pub async fn handle_publisher_request(
     let datadome_suppression_requires_origin = suppress_datadome_client_side_tag;
     let datadome_suppression_requires_full_body =
         suppress_datadome_client_side_tag && is_html_document_request(&req);
-    let request_requires_origin = request_bypasses_template_cache(req.headers())
+    // The reader's own request semantics, read before any stripping. A reader who asked
+    // for a range or a conditional response must not be handed a full document
+    // synthesized from a template shared with other readers, whatever the origin is then
+    // asked for on their behalf.
+    let reader_requires_origin = request_bypasses_template_cache(req.headers())
         || gpt_diagnostics.requires_private_no_store()
         || datadome_suppression_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
@@ -4389,6 +4403,20 @@ pub async fn handle_publisher_request(
         // no executable injected tag, so retain their validators and ranges.
         strip_conditional_and_range_headers(&mut req);
     }
+
+    // Computed *after* the strip above, deliberately. These conditions ask whether the
+    // origin's response can be shared, and the origin only ever sees the request as it
+    // stands here. Judging the pre-strip headers marked a repeat visitor's `If-None-Match`
+    // navigation unshareable even though the origin was about to be asked an
+    // unconditional question and return a full document — losing readthrough for exactly
+    // the repeat-visit population this work targets, with nothing gained.
+    //
+    // The strip removes four headers; this predicate tests six plus `Cache-Control`
+    // request directives, so `If-Match`, `If-Unmodified-Since` and a `no-store` reader
+    // still disqualify, stripped or not.
+    let request_requires_origin = request_bypasses_template_cache(req.headers())
+        || gpt_diagnostics.requires_private_no_store()
+        || datadome_suppression_requires_origin;
 
     let method_is_cacheable = req.method() == Method::GET;
     let shared_request_inputs = SharedRequestInputs {
@@ -4411,6 +4439,7 @@ pub async fn handle_publisher_request(
         shared_request_inputs,
         matches!(assembly_mode, AssemblyMode::Esi),
         reader_supports_assembly,
+        reader_requires_origin,
     );
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode. This
@@ -4447,7 +4476,7 @@ pub async fn handle_publisher_request(
             req.method()
         );
     }
-    if request_requires_origin && matches!(assembly_mode, AssemblyMode::Esi) {
+    if reader_requires_origin && matches!(assembly_mode, AssemblyMode::Esi) {
         log::debug!("template_cache bypass: request cache semantics or diagnostics require origin");
     }
     let template_cache_key =
@@ -6933,7 +6962,7 @@ mod tests {
 
     #[test]
     fn template_eligibility_implies_origin_shareability() {
-        for bits in 0u8..128 {
+        for bits in 0u16..256 {
             let inputs = SharedRequestInputs {
                 method_is_cacheable: bits & 1 != 0,
                 host_present: bits & 2 != 0,
@@ -6943,10 +6972,15 @@ mod tests {
             };
             let is_esi = bits & 32 != 0;
             let reader_supports_assembly = bits & 64 != 0;
+            let reader_requires_origin = bits & 128 != 0;
 
             let shareable = origin_response_is_shareable(inputs);
-            let template =
-                request_can_use_shared_template(inputs, is_esi, reader_supports_assembly);
+            let template = request_can_use_shared_template(
+                inputs,
+                is_esi,
+                reader_supports_assembly,
+                reader_requires_origin,
+            );
 
             assert!(
                 !template || shareable,
@@ -6954,9 +6988,9 @@ mod tests {
             );
             assert_eq!(
                 template,
-                shareable && is_esi && reader_supports_assembly,
-                "template eligibility must be the shared base plus the two template conditions, \
-                 input bits {bits}"
+                shareable && is_esi && reader_supports_assembly && !reader_requires_origin,
+                "template eligibility must be the shared base plus the three template \
+                 conditions, input bits {bits}"
             );
         }
     }
@@ -7022,16 +7056,16 @@ mod tests {
     #[test]
     fn esi_mode_and_reader_support_are_each_necessary_for_template_eligibility() {
         assert!(
-            request_can_use_shared_template(all_shareable(), true, true),
+            request_can_use_shared_template(all_shareable(), true, true, false),
             "should be eligible when every condition passes"
         );
 
         assert!(
-            !request_can_use_shared_template(all_shareable(), false, true),
+            !request_can_use_shared_template(all_shareable(), false, true, false),
             "a shared template is assembled by ESI, so a non-ESI request must not read one"
         );
         assert!(
-            !request_can_use_shared_template(all_shareable(), true, false),
+            !request_can_use_shared_template(all_shareable(), true, false, false),
             "a reader that cannot assemble the seam must not be served an unassembled template"
         );
         assert!(
@@ -7041,9 +7075,15 @@ mod tests {
                     ..all_shareable()
                 },
                 true,
-                true
+                true,
+                false
             ),
             "template eligibility must never outlive origin shareability"
+        );
+        assert!(
+            !request_can_use_shared_template(all_shareable(), true, true, true),
+            "a reader who asked for a range or a revalidation must reach the origin, not be \
+             served a document synthesized from a template shared with other readers"
         );
     }
 
@@ -10068,6 +10108,68 @@ mod tests {
                 stub.recorded_cache_intents(),
                 vec![PlatformCacheIntent::Default],
                 "a shareable navigation must not force a MISS"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_repeat_visitor_revalidating_still_gets_readthrough() {
+            // The conditional headers are stripped before the origin is asked, so it
+            // returns a full document that is shareable like any other. Judging the
+            // pre-strip request marked this unshareable and cost readthrough for exactly
+            // the repeat-visit population the change targets.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::IF_NONE_MATCH,
+                HeaderValue::from_static("\"cached\""),
+            );
+
+            let _ = run(&settings, &services, request).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "a stripped conditional navigation asks the origin an unconditional \
+                 question, so its answer is shareable"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reader_asking_for_a_range_is_not_served_a_shared_template() {
+            // The other half, and the invariant that caught an over-broad first attempt:
+            // stripping changes what the origin is asked, not what the reader wanted.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            // Warm a template with a plain navigation.
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            let mut request = navigation_request();
+            request
+                .headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-31"));
+            let _ = run(&settings, &services, request).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents().len(),
+                2,
+                "the range request must reach the origin rather than be answered from the \
+                 warm shared template"
             );
         }
 
