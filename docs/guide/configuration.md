@@ -1349,6 +1349,7 @@ overrides, and notification suppression belong under `[auction]`.
 | `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
 | `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
 | `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                              |
+| `managed_user_ids`                    | Array[Table]  | `[]`                                                                   | Prebid User ID modules Trusted Server installs and keeps installed (see below) |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
@@ -1365,6 +1366,15 @@ debug = false
 client_side_bidders = ["example-browser"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 script_patterns = ["/prebid.js", "/prebid.min.js"]
+
+[[integrations.prebid.managed_user_ids]]
+name = "sharedId"
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie"
+name = "_sharedid"
+expires = 15
+refresh_in_seconds = 1800
 
 [proxy]
 allowed_domains = ["assets.example.com"]
@@ -1409,6 +1419,46 @@ env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
 Environment overlays only replace existing scalar leaves. Keep
 `client_side_bidders`, provider profile tables, bidder-parameter overrides, and
 rules in TOML, then validate and push the edited file.
+
+**Managed User ID modules**:
+
+Each `[[integrations.prebid.managed_user_ids]]` entry names a Prebid
+`userSync.userIds` module that Trusted Server installs on the page and
+reinstates whenever publisher JavaScript replaces the User ID configuration.
+Trusted Server does not interpret module-specific fields; every registered
+module uses the same vendor-neutral surface. The managed `name` must match a
+`configNames` entry in the checked-in `user_id_modules.json` registry:
+
+| Field                        | Type    | Default                        | Description                                                                          |
+| ---------------------------- | ------- | ------------------------------ | ------------------------------------------------------------------------------------ |
+| `name`                       | String  | Required                       | Prebid `userSync.userIds` entry name, for example `sharedId`. Unique across entries  |
+| `params`                     | Table   | `{}`                           | Module-specific parameters, forwarded to Prebid unchanged                            |
+| `storage.type`               | String  | `cookie`                       | Browser storage: `cookie` or `html5`                                                 |
+| `storage.name`               | String  | Required when `storage` exists | Cookie or local-storage key the module reads and writes                              |
+| `storage.expires`            | Integer | Prebid's own default           | Storage lifetime in days; must be at least 1. Any per-module ceiling is the module's |
+| `storage.refresh_in_seconds` | Integer | Prebid's own default           | Seconds before the module may refresh the stored value; must be at least 1           |
+
+The module must be present in the built bundle. Name it under
+`[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
+generator's default preset. `ts prebid bundle` resolves each managed `name`
+through the checked-in `user_id_modules.json` registry, rejects unknown names,
+ambiguous names, and two names that resolve to the same module, and confirms the
+required modules in the newly generated
+manifest. A failure identifies the managed name or required module and does not
+update the configured bundle hash or SRI. The browser diagnostic remains a
+fallback for externally hosted, stale, or modified bundles. Trusted Server core
+does not interpret module-specific `params`; it forwards them to Prebid.js
+unchanged.
+
+Persisting a resolved ID into the Edge Cookie identity graph additionally
+requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
+module's OpenRTB EID source.
+
+`managed_user_ids` is an array of tables, so it cannot be set through a
+`TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves
+the published TOML already declares. See
+[Managed User ID modules](/guide/integrations/prebid#managed-user-id-modules)
+for consent, timing, privacy, degraded behavior, and validation guidance.
 
 **Script Pattern Matching**:
 
