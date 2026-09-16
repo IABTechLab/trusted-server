@@ -121,6 +121,61 @@ curl -X POST https://edge.example.com/auction \
   -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
 
+#### PBS stored-request intent
+
+The reserved `trustedServer` bid accepts `storedRequest` inside `params`, beside
+`bidderParams` and `zone`. It does not accept provider IDs, endpoints, or stored IDs.
+Bidder keys still resolve through the server's `[auction.bidders]` routes.
+
+| `params.storedRequest` | PBS behavior                                                                                                                                                                                                         |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false`                | Disable stored fallback for this slot on every PBS provider. Usable inline demand still runs.                                                                                                                        |
+| `true`                 | Permit stored fallback using the slot `code` as the stored impression ID. Usable inline params take precedence within each provider.                                                                                 |
+| Omitted                | Preserve legacy inference for existing callers and server-generated opportunities. Missing, `null`, or empty `bidderParams` permits stored demand; routed empty bidder objects also retain fallback after overrides. |
+
+`storedRequest: null` is invalid, as are strings, numbers, arrays, and objects.
+An invalid value rejects the whole envelope, including its inline params and zone,
+and increments the malformed-envelope diagnostic. Independent valid direct bidder
+entries and eligible non-PBS providers still run; this is not whole-request HTTP
+rejection. An absent or empty `bids` list also retains legacy stored inference.
+
+PBS applies provider-local overrides before checking inline demand. If no usable
+inline params remain, it uses stored demand only when permitted, otherwise it
+omits the impression. If none remain, it makes no PBS request. Eligible APS and
+standard providers are unaffected.
+
+A generated envelope that should not request PBS stored demand:
+
+```json
+{
+  "bidder": "trustedServer",
+  "params": { "bidderParams": {}, "storedRequest": false }
+}
+```
+
+An intentional stored request, posted to `https://edge.example.com/auction`:
+
+```json
+{
+  "adUnits": [
+    {
+      "code": "homepage-banner",
+      "mediaTypes": { "banner": { "sizes": [[728, 90]] } },
+      "bids": [
+        {
+          "bidder": "trustedServer",
+          "params": { "bidderParams": {}, "storedRequest": true }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Stored demand retains existing PBS fanout. Each participating PBS instance must
+have the requested slot-code ID. This filtering does not prevent errors from
+unrelated invalid bidder params. See [deployment ordering](/guide/integrations/prebid#stored-intent-deployment).
+
 ---
 
 ## Edge Cookie Endpoints
