@@ -58,6 +58,15 @@ runs:
         target: wasm32-wasip1
         cache-shared-key: cargo-${{ runner.os }}
 
+    - name: Set up sccache
+      uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Configure sccache for Rust
+      shell: bash
+      run: |
+        echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
     - name: Cache Viceroy binary
       if: ${{ inputs.install-viceroy == 'true' }}
       id: cache-viceroy
