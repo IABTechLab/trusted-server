@@ -450,6 +450,8 @@ impl EcPartner {
         "sharedid-internal-token-32-bytes",
         "inttest-api-key-1-32-bytes-minimum",
         "inttest2-api-key-2-32-bytes-minimum",
+        "partner_api_token",
+        "partner_ts_pull_token",
     ];
 
     /// Returns `true` if `api_token` matches a known placeholder value
@@ -3089,6 +3091,16 @@ impl Settings {
             {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
             }
+            if partner
+                .ts_pull_token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
+                insecure_fields.push(format!(
+                    "ec.partners[{}].ts_pull_token",
+                    partner.source_domain
+                ));
+            }
         }
         for handler in &self.handlers {
             if Handler::is_placeholder_password(handler.password.expose()) {
@@ -5403,6 +5415,85 @@ source_domain = "partner.example.com"
         assert!(
             format!("{err:?}").contains("handlers"),
             "error should mention handler password field"
+        );
+    }
+
+    fn test_partner_with_pull_token(ts_pull_token: &str) -> EcPartner {
+        EcPartner {
+            name: "Test Partner".to_owned(),
+            source_domain: "partner.example.com".to_owned(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: false,
+            api_token: None,
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: true,
+            pull_sync_url: Some("https://partner.example.com/sync".to_owned()),
+            pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
+        }
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_partner_pull_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_pull_token("partner_ts_pull_token")];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner pull token");
+        assert!(
+            format!("{err:?}").contains("ec.partners[partner.example.com].ts_pull_token"),
+            "error should mention the partner pull token field"
+        );
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_allows_realistic_partner_pull_token() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_pull_token(
+            "unit-test-realistic-pull-sync-token-32-bytes-min",
+        )];
+
+        settings
+            .reject_placeholder_secrets()
+            .expect("should accept a realistic partner pull token");
+    }
+
+    /// Guards against the placeholder lists drifting away from the example config
+    /// Example value shipped in `trusted-server.example.toml` must be recognized
+    /// as a placeholder
+    #[test]
+    fn example_toml_partner_secret_examples_are_recognized_placeholders() {
+        const EXAMPLE_TOML: &str = include_str!("../../../trusted-server.example.toml");
+        const EXAMPLE_PARTNER_KEYS: &[&str] = &["api_token", "ts_pull_token"];
+        let pattern = format!(
+            r#"(?m)^\s*#?\s*(?:{})\s*=\s*"([^"]+)""#,
+            EXAMPLE_PARTNER_KEYS.join("|")
+        );
+        let example_value =
+            Regex::new(&pattern).expect("should compile example partner secret regex");
+
+        let mut checked_any = false;
+        for capture in example_value.captures_iter(EXAMPLE_TOML) {
+            checked_any = true;
+            let value = &capture[1];
+            assert!(
+                EcPartner::is_placeholder_api_token(value),
+                "example config partner secret '{value}' should be a recognized placeholder \
+                 — add it to EcPartner::API_TOKEN_PLACEHOLDERS"
+            );
+        }
+        assert!(
+            checked_any,
+            "should have found at least one partner secret example value in the template"
         );
     }
 
