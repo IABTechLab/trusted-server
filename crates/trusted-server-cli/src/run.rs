@@ -29,6 +29,9 @@ enum Command {
     Auth(AuthArgs),
     /// Build the project for a target adapter.
     Build(BuildArgs),
+    /// Shared template cache commands.
+    #[command(subcommand)]
+    Cache(crate::commands::cache::CacheCommand),
     /// Trusted Server app-config commands.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -130,6 +133,11 @@ fn dispatch(args: Args) -> Result<(), String> {
         Command::Rollback(args) => edgezero_cli::run_rollback(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),
         Command::Dev(command) => crate::commands::dev::run(command),
+        Command::Cache(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::cache::run(command, &mut out)
+        }
         Command::Origin(command) => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();

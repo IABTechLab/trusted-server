@@ -21,8 +21,12 @@ use std::thread::JoinHandle;
 
 /// One request as the fixture saw it.
 pub struct FixtureRequest {
+    /// Request method, uppercased as sent.
+    pub method: String,
     /// Request target, for example `/article`.
     pub path: String,
+    /// Request body, empty when none was sent.
+    pub body: Vec<u8>,
     /// Header names lowercased; every instance kept, in arrival order.
     pub headers: HashMap<String, Vec<String>>,
     /// How many requests this server had already answered, starting at 0.
@@ -227,7 +231,9 @@ fn read_request(stream: &TcpStream, request_index: u64) -> Option<FixtureRequest
     if reader.read_line(&mut request_line).ok()? == 0 {
         return None;
     }
-    let path = request_line.split_whitespace().nth(1)?.to_owned();
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next()?.to_owned();
+    let path = request_parts.next()?.to_owned();
 
     let mut headers = HashMap::new();
     let mut content_length = 0usize;
@@ -250,14 +256,17 @@ fn read_request(stream: &TcpStream, request_index: u64) -> Option<FixtureRequest
         }
     }
 
-    // Drain any body so the client is not left writing into a closed socket.
-    if content_length > 0 {
-        let mut body = vec![0u8; content_length];
-        let _ = reader.read_exact(&mut body);
+    // Read any body, which also drains it so the client is not left writing into a closed
+    // socket.
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 && reader.read_exact(&mut body).is_err() {
+        body.clear();
     }
 
     Some(FixtureRequest {
+        method,
         path,
+        body,
         headers,
         request_index,
     })

@@ -64,7 +64,7 @@ pub(crate) fn probe_urls(
         .build()
         .map_err(|error| format!("failed to build the Tokio runtime for the probe: {error}"))?;
 
-    install_crypto_provider();
+    crate::tls::install_crypto_provider();
 
     runtime.block_on(async {
         let client = reqwest::Client::builder()
@@ -81,20 +81,6 @@ pub(crate) fn probe_urls(
         }
         Ok(ProbeReport { urls: reports })
     })
-}
-
-/// Install the process-level rustls provider the HTTP client needs.
-///
-/// This crate's `reqwest` is built with a `-no-provider` rustls feature on purpose: it
-/// already links `aws-lc-rs` through `reqwest` 0.13, and letting `reqwest` 0.12 pull `ring`
-/// as well would compile two providers, which makes rustls's default ambiguous and panics
-/// the dev proxy. The cost of that choice is that somebody must install the default, and
-/// for the probe that is here.
-///
-/// Idempotent: a second call returns `Err` because one is already installed, which is not
-/// a failure.
-fn install_crypto_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 async fn probe_one(
