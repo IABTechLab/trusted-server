@@ -521,3 +521,55 @@ fn an_admission_cookie_lets_the_probe_reach_real_content() {
         report.render_text()
     );
 }
+
+#[test]
+fn an_axis_the_origin_declares_in_vary_is_not_a_failure() {
+    // Measured against a real origin: it declared `Vary: accept-encoding, rsc` and varied
+    // on both, exactly as it should, and the probe failed it for doing so. A declared
+    // signal is part of the cache key, so each value gets its own stored object.
+    let server = FixtureServer::start(|request| {
+        let gzip = request
+            .header("accept-encoding")
+            .is_some_and(|value| value.contains("gzip"));
+        FixtureResponse::html(if gzip {
+            "<html>compressed variant</html>"
+        } else {
+            "<html>identity variant</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+        .with_header("vary", "Accept-Encoding")
+    });
+
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(
+        ok,
+        "an origin that declares what it varies on must pass: {}",
+        report.render_text()
+    );
+    let axis = axis(&report, "accept-encoding");
+    assert!(axis.differs(), "the arms did differ");
+    assert!(axis.passed(), "but the origin declared it, so it is keyed");
+}
+
+#[test]
+fn an_undeclared_varying_axis_still_fails() {
+    // The safety half: the same variance without the declaration is what gets cross-served.
+    let server = FixtureServer::start(|request| {
+        let gzip = request
+            .header("accept-encoding")
+            .is_some_and(|value| value.contains("gzip"));
+        FixtureResponse::html(if gzip {
+            "<html>compressed variant</html>"
+        } else {
+            "<html>identity variant</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+    });
+
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok);
+    assert!(!axis(&report, "accept-encoding").passed());
+    assert!(!verdict(&report, "vary-coverage").passed);
+}

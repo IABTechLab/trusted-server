@@ -22,19 +22,36 @@ pub struct Difference {
 /// One comparison between two fetches that differ in exactly one request signal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxisResult {
-    /// Axis name, as printed.
+    /// Axis name, which is also the request header this axis varies.
     pub name: String,
     /// What the two arms varied.
     pub description: String,
     /// `None` when the arms matched.
     pub difference: Option<Difference>,
+    /// Whether the origin declares this axis's header in its `Vary`.
+    ///
+    /// A declared signal is part of the cache key, so the platform stores a separate
+    /// object per value and a difference between the arms is correct behaviour rather
+    /// than a hazard. Undeclared variance is the hazard, and the `vary-coverage` verdict
+    /// is what reports it.
+    #[serde(default)]
+    pub covered_by_vary: bool,
 }
 
 impl AxisResult {
-    /// Whether this axis passed.
+    /// Whether the two arms returned different bytes, before asking whether that is safe.
+    #[must_use]
+    pub fn differs(&self) -> bool {
+        self.difference.is_some()
+    }
+
+    /// Whether this axis is safe.
+    ///
+    /// A difference on a signal the origin declares in `Vary` is keyed by the cache, so it
+    /// passes. An undeclared one does not.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.difference.is_none()
+        !self.differs() || self.covered_by_vary
     }
 }
 
@@ -95,6 +112,11 @@ impl ProbeReport {
                     None => {
                         out.push_str(&format!("  PASS  {:<16} {}\n", axis.name, axis.description))
                     }
+                    Some(_) if axis.covered_by_vary => out.push_str(&format!(
+                        "  PASS  {:<16} {} — differs, but the origin declares it in \
+                         Vary, so the cache keys on it\n",
+                        axis.name, axis.description
+                    )),
                     Some(difference) => {
                         out.push_str(&format!(
                             "  FAIL  {:<16} {} — differs at byte {}\n",
@@ -198,6 +220,7 @@ mod tests {
             name: name.to_owned(),
             description: "test".to_owned(),
             difference,
+            covered_by_vary: false,
         }
     }
 

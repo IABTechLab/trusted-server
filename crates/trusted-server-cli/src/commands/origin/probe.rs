@@ -171,6 +171,7 @@ async fn probe_one(
     );
     axes.push(rsc_axis(client, url, &baseline, vary_headers, admission_cookie).await?);
 
+    mark_axes_covered_by_vary(&baseline, &mut axes);
     let verdicts = judge_headers(&baseline, &axes);
 
     Ok(UrlReport {
@@ -178,6 +179,35 @@ async fn probe_one(
         axes,
         verdicts,
     })
+}
+
+/// Record whether the origin declares each axis's header in `Vary`.
+///
+/// A declared signal is part of the platform's cache key, so each value gets its own
+/// stored object and a difference between the arms is correct behaviour rather than a
+/// hazard. Without this, every origin that honestly declares `Vary: Accept-Encoding` —
+/// which is most of them — failed that axis for doing the right thing, and an origin
+/// declaring `Vary: rsc` failed the RSC axis the same way.
+///
+/// Self-identity is excluded: it varies no request signal, so no `Vary` can key it, and a
+/// page unstable against itself cannot be shared however it is keyed.
+fn mark_axes_covered_by_vary(baseline: &Fetched, axes: &mut [AxisResult]) {
+    let declared: Vec<String> = baseline
+        .all("vary")
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    for axis in axes.iter_mut() {
+        if axis.name == "self-identity" {
+            continue;
+        }
+        axis.covered_by_vary = declared
+            .iter()
+            .any(|declared| *declared == axis.name || declared == "*");
+    }
 }
 
 /// An origin that is not stable against itself cannot be shared on any axis.
@@ -199,6 +229,7 @@ async fn self_identity_axis(
                 name: "self-identity".to_owned(),
                 description: format!("the same request {} times", repeat.max(1) + 1),
                 difference: Some(difference),
+                covered_by_vary: false,
             });
         }
     }
@@ -206,6 +237,7 @@ async fn self_identity_axis(
         name: "self-identity".to_owned(),
         description: format!("the same request {} times", repeat.max(1) + 1),
         difference: None,
+        covered_by_vary: false,
     })
 }
 
@@ -241,6 +273,7 @@ async fn rsc_axis(
         name: "rsc".to_owned(),
         description,
         difference: first_difference(&baseline.body, &varied.body),
+        covered_by_vary: false,
     })
 }
 
@@ -258,6 +291,7 @@ async fn compare_axis(
         name: name.to_owned(),
         description: description.to_owned(),
         difference: first_difference(&baseline.body, &varied.body),
+        covered_by_vary: false,
     })
 }
 
@@ -393,7 +427,9 @@ fn vary_coverage_verdict(baseline: &Fetched, axes: &[AxisResult]) -> VerdictResu
 
     let uncovered: Vec<&str> = axes
         .iter()
-        .filter(|axis| !axis.passed())
+        // The raw observation, not `passed()`: `passed()` forgives a declared signal, and
+        // this verdict is what decides whether it is declared.
+        .filter(|axis| axis.differs())
         .map(|axis| axis.name.as_str())
         // Self-identity is not a request signal, so `Vary` cannot cover it.
         .filter(|name| *name != "self-identity")
@@ -537,6 +573,7 @@ mod tests {
                 left: "a".to_owned(),
                 right: "b".to_owned(),
             }),
+            covered_by_vary: false,
         }
     }
 
