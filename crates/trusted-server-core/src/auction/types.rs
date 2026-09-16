@@ -146,7 +146,14 @@ pub struct SiteInfo {
 pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
     pub request: &'a Request<EdgeBody>,
+    /// Exact logical provider budget used by auction policy and payloads.
     pub timeout_ms: u32,
+    /// Canonical backend transport timeout used for provider registration.
+    ///
+    /// This can be lower than `timeout_ms` on runtimes whose backend names
+    /// encode timers. Providers that register a backend should use this value
+    /// for transport timers while retaining `timeout_ms` for logical policy.
+    pub transport_timeout_ms: u32,
     /// Provider responses from the bidding phase, used by mediators.
     /// This is `None` for regular bidders and `Some` when calling a mediator.
     pub provider_responses: Option<&'a [AuctionResponse]>,
@@ -243,8 +250,11 @@ pub struct Bid {
     pub creative: Option<String>,
     /// Advertiser domain
     pub adomain: Option<Vec<String>>,
-    /// Bidder/seat identifier
+    /// Browser-facing delivery bidder code.
     pub bidder: String,
+    /// Exact valid upstream `seatbid.seat`, independent of delivery identity.
+    #[serde(skip)]
+    pub returned_seat: Option<String>,
     /// Width of creative
     pub width: u32,
     /// Height of creative
@@ -409,6 +419,7 @@ mod tests {
             creative: None,
             adomain: None,
             bidder: bidder.to_owned(),
+            returned_seat: None,
             width: 300,
             height: 250,
             nurl: None,
@@ -533,6 +544,20 @@ mod tests {
     }
 
     #[test]
+    fn returned_seat_is_internal_and_not_serialized() {
+        let mut bid = make_bid("aps");
+        bid.returned_seat = Some("upstream-seat".to_string());
+
+        let serialized = serde_json::to_value(&bid).expect("should serialize bid");
+        assert!(
+            serialized.get("returned_seat").is_none(),
+            "returned seat must not change client/debug wire shapes"
+        );
+        let decoded: Bid = serde_json::from_value(serialized).expect("should deserialize bid");
+        assert!(decoded.returned_seat.is_none());
+    }
+
+    #[test]
     fn bid_with_cache_fields_round_trips_through_json() {
         let bid = Bid {
             slot_id: "atf".to_string(),
@@ -541,6 +566,7 @@ mod tests {
             creative: None,
             adomain: None,
             bidder: "thetradedesk".to_string(),
+            returned_seat: None,
             width: 300,
             height: 250,
             nurl: None,
@@ -647,6 +673,7 @@ mod tests {
             creative: None,
             adomain: None,
             bidder: "kargo".to_string(),
+            returned_seat: None,
             width: 300,
             height: 250,
             nurl: None,
