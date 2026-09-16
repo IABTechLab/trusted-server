@@ -372,3 +372,45 @@ fn a_malformed_cookie_argument_is_rejected_before_any_fetch() {
         "argument validation should happen before the origin is touched"
     );
 }
+
+#[test]
+fn an_axis_override_replaces_the_default_header_rather_than_appending_to_it() {
+    // `RequestBuilder::header` appends. If an arm's override is layered on top of the
+    // default, the origin receives the header twice, and one that reads the first instance
+    // never sees the override — the axis then compares two identical responses and passes
+    // an origin it never actually varied.
+    let server = FixtureServer::start(|request| {
+        FixtureResponse::html(format!(
+            "<html>ua={} ae={}</html>",
+            request.header_count("user-agent"),
+            request.header_count("accept-encoding")
+        ))
+        .with_header("cache-control", "public, max-age=300")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(
+        ok,
+        "every arm must send exactly one user-agent and one accept-encoding: {}",
+        report.render_text()
+    );
+}
+
+#[test]
+fn a_later_private_directive_is_not_hidden_by_an_earlier_permissive_one() {
+    // A proxy in front of the origin can append its own Cache-Control rather than
+    // replacing the origin's. Judging only the first instance would store a private
+    // response in a shared cache.
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("cache-control", "private")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok, "a private response must not be declared shareable");
+    assert!(
+        !verdict(&report, "freshness").passed,
+        "the freshness verdict must read every Cache-Control instance, not just the first"
+    );
+}

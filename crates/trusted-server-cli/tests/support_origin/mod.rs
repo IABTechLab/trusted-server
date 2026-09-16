@@ -23,19 +23,32 @@ use std::thread::JoinHandle;
 pub struct FixtureRequest {
     /// Request target, for example `/article`.
     pub path: String,
-    /// Header names lowercased; values as sent.
-    pub headers: HashMap<String, String>,
+    /// Header names lowercased; every instance kept, in arrival order.
+    pub headers: HashMap<String, Vec<String>>,
     /// How many requests this server had already answered, starting at 0.
     pub request_index: u64,
 }
 
 impl FixtureRequest {
-    /// Value of a header, matched case-insensitively.
+    /// First value of a header, matched case-insensitively.
+    ///
+    /// First and not last on purpose: a duplicated request header is resolved differently
+    /// by different origins, and the ones that read the first instance are the ones a
+    /// probe arm can fail to reach. Modelling that here keeps the axis tests honest.
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .get(&name.to_ascii_lowercase())
+            .and_then(|values| values.first())
             .map(String::as_str)
+    }
+
+    /// How many times a header was sent, matched case-insensitively.
+    #[must_use]
+    pub fn header_count(&self, name: &str) -> usize {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map_or(0, Vec::len)
     }
 
     /// Whether a cookie with this name was sent.
@@ -233,7 +246,7 @@ fn read_request(stream: &TcpStream, request_index: u64) -> Option<FixtureRequest
             if name == "content-length" {
                 content_length = value.parse().unwrap_or(0);
             }
-            headers.insert(name, value);
+            headers.entry(name).or_insert_with(Vec::new).push(value);
         }
     }
 

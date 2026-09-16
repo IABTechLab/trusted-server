@@ -32,13 +32,11 @@ struct Fetched {
 }
 
 impl Fetched {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .get(name)
-            .and_then(|values| values.first())
-            .map(String::as_str)
-    }
-
+    /// Every instance of a header, in arrival order.
+    ///
+    /// The only accessor on purpose. A first-instance-only variant reads as if it returns
+    /// "the" value, which is wrong for any field a proxy can append to: judging a response
+    /// on the origin's `Cache-Control` while a later `private` goes unread is a false pass.
     fn all(&self, name: &str) -> &[String] {
         self.headers.get(name).map_or(&[], Vec::as_slice)
     }
@@ -255,12 +253,15 @@ fn judge_headers(baseline: &Fetched, axes: &[AxisResult]) -> Vec<VerdictResult> 
 /// an origin that declares no freshness would be stored on a platform default instead of
 /// being declined.
 fn freshness_verdict(baseline: &Fetched) -> VerdictResult {
-    let cache_control = baseline.header("cache-control").unwrap_or_default();
-    let surrogate = baseline.header("surrogate-control").unwrap_or_default();
-    let positive = [cache_control, surrogate]
+    // Every instance, not just the first. A field may arrive as several lines — a proxy
+    // that appends `Cache-Control: private` after the origin's `public, max-age=300` is
+    // the case that matters, and reading only the first line would pass it.
+    let cache_control = baseline.all("cache-control").join(", ");
+    let surrogate = baseline.all("surrogate-control").join(", ");
+    let positive = [&cache_control, &surrogate]
         .iter()
         .any(|value| has_positive_freshness(value));
-    let forbids = [cache_control, surrogate].iter().any(|value| {
+    let forbids = [&cache_control, &surrogate].iter().any(|value| {
         let lowered = value.to_ascii_lowercase();
         lowered.contains("no-store") || lowered.contains("private")
     });
@@ -372,11 +373,28 @@ async fn fetch(
     url: &str,
     headers: &[(&str, &str)],
 ) -> CliResult<Fetched> {
-    let mut request = client.get(url).header("user-agent", DESKTOP_USER_AGENT);
-    // Identity unless an arm overrides it, so the encoding axis is the only thing that
-    // changes what the origin may compress.
-    request = request.header("accept-encoding", "identity");
+    // Resolved into one map before the request is built, because `RequestBuilder::header`
+    // *appends*. Layering an arm's override on top of a default would send the header
+    // twice, and an origin that reads the first instance would never see the override —
+    // silently turning the user-agent and accept-encoding axes into no-ops that pass.
+    let mut resolved: Vec<(&str, &str)> = vec![
+        ("user-agent", DESKTOP_USER_AGENT),
+        // Identity unless an arm overrides it, so the encoding axis is the only thing that
+        // changes what the origin may compress.
+        ("accept-encoding", "identity"),
+    ];
     for (name, value) in headers {
+        match resolved
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+        {
+            Some(slot) => slot.1 = value,
+            None => resolved.push((*name, *value)),
+        }
+    }
+
+    let mut request = client.get(url);
+    for (name, value) in &resolved {
         request = request.header(*name, *value);
     }
 
