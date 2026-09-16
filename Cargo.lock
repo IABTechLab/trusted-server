@@ -5519,6 +5519,7 @@ dependencies = [
 name = "trusted-server-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "derive_more",
