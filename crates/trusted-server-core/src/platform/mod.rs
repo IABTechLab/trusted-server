@@ -53,8 +53,8 @@ pub use backend_naming::{
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
-    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSelectResult, UnavailableHttpClient,
+    PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
 };
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,

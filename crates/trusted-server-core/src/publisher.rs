@@ -6876,6 +6876,7 @@ mod tests {
     use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::types::AuctionResponse;
     use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+    use crate::platform::PlatformCacheIntent;
 
     /// Every shared condition passing, as the base for single-condition negations.
     fn all_shareable() -> SharedRequestInputs {
@@ -7135,7 +7136,7 @@ mod tests {
         lookups: usize,
         http_calls_at_lookup: usize,
         stream_flags: Vec<bool>,
-        cache_bypass_flags: Vec<bool>,
+        cache_intents: Vec<PlatformCacheIntent>,
         body_is_stream: bool,
         request_rewritten: bool,
         response_is_private: bool,
@@ -7392,7 +7393,7 @@ mod tests {
             lookups: lookups.load(Ordering::SeqCst),
             http_calls_at_lookup: http_calls_at_lookup.load(Ordering::SeqCst),
             stream_flags: http.recorded_stream_response_flags(),
-            cache_bypass_flags: http.recorded_cache_bypass_flags(),
+            cache_intents: http.recorded_cache_intents(),
             body_is_stream,
             request_rewritten,
             response_is_private,
@@ -7415,8 +7416,8 @@ mod tests {
         );
         assert_eq!(outcome.stream_flags, vec![true]);
         assert_eq!(
-            outcome.cache_bypass_flags,
-            vec![true],
+            outcome.cache_intents,
+            vec![PlatformCacheIntent::Bypass],
             "pending publisher origin request should bypass platform caching"
         );
         assert!(
@@ -10262,8 +10263,8 @@ mod tests {
                 "should preserve streaming on the cold origin fetch"
             );
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![true],
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
                 "should bypass platform caching for the cold origin fetch"
             );
         }
@@ -14416,8 +14417,8 @@ mod tests {
 
             // Assert
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![true],
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
                 "eligible publisher navigation should bypass the platform cache"
             );
             let recorded_requests = stub.recorded_request_headers();
@@ -14516,8 +14517,8 @@ mod tests {
 
             // Assert
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![false],
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
                 "publisher navigation without matched slots should use the default cache mode"
             );
             let recorded_requests = stub.recorded_request_headers();
@@ -14621,8 +14622,8 @@ mod tests {
 
             // Assert
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![false],
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
                 "disabled server-side ad templates should not bypass the origin cache"
             );
             assert_eq!(
@@ -15155,8 +15156,8 @@ mod tests {
                 );
             }
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![false],
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
                 "noneligible publisher navigation should use the default cache mode"
             );
             let recorded_requests = stub.recorded_request_headers();
