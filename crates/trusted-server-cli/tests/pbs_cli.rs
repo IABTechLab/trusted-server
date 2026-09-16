@@ -12,6 +12,10 @@ use tempfile::TempDir;
 const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
 
 fn fixture() -> TempDir {
+    assert!(
+        which::which("python3").is_ok(),
+        "pbs_cli tests need python3 on PATH for the fake AWS executable"
+    );
     let dir = tempfile::tempdir().expect("should create fixture directory");
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/pbs");
     for name in ["deployment.yaml", "pbs.yaml", "east.yaml", "bindings.json"] {
@@ -217,6 +221,10 @@ fn aws_errors_never_forward_provider_stderr_and_cleanup_payloads() {
         .expect("should run CLI");
     assert_eq!(output.status.code(), Some(2));
     assert_no_secret(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outcome uncertain"),
+        "should warn that the write may have succeeded"
+    );
     assert_payload_cleanup(dir.path());
 }
 

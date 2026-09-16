@@ -8,7 +8,8 @@ use super::{Output, PbsError, Result};
 ///
 /// # Errors
 /// Rejects missing instance targets, wrong accounts, and failed identity verification.
-/// Resource-query failures are included as unknown in a partial report with a failing exit status.
+/// Identity failures abort the entire report. Resource-query failures are included as unknown in a
+/// partial report with a failing exit status.
 pub(super) fn status(deployment: &Deployment, aws: &dyn Aws) -> Result<Output> {
     if deployment
         .regions

@@ -75,10 +75,21 @@ impl Aws for AwsCli {
         // Closing removes the temporary payload, including on every earlier error path via Drop.
         drop(payload);
         if !output.status.success() {
-            return Err(Report::new(PbsError::Aws(operation)));
+            let message = if operation == "put-secret-value" {
+                "write outcome uncertain; retain the request token and retry identical input"
+            } else {
+                operation
+            };
+            return Err(Report::new(PbsError::Aws(message)));
         }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|_| Report::new(PbsError::Aws("invalid JSON response")))
+        serde_json::from_slice(&output.stdout).map_err(|_| {
+            let message = if operation == "put-secret-value" {
+                "write response invalid; outcome uncertain, retain the request token"
+            } else {
+                "invalid JSON response"
+            };
+            Report::new(PbsError::Aws(message))
+        })
     }
 }
 

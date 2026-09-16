@@ -88,13 +88,16 @@ fn bidder_list<'de, D: Deserializer<'de>>(
             } else {
                 vec![text]
             };
-            parts
+            Ok(parts
                 .into_iter()
                 .map(|part| {
-                    serde_json::from_str(&format!("\"{}\"", part.replace('"', "\\\"")))
-                        .map_err(serde::de::Error::custom)
+                    let json = format!("\"{}\"", part.replace('"', "\\\""));
+                    match serde_json::from_str(&json) {
+                        Ok(value) => value,
+                        Err(_) => part.to_owned(),
+                    }
                 })
-                .collect()
+                .collect())
         }
         _ => Err(serde::de::Error::custom(
             "expected bidder list, indexed map, or list string",
@@ -249,12 +252,37 @@ user_id_modules = ["sharedIdSystem"]
     }
 
     #[test]
+    fn invalid_list_identifier_reports_identifier_error() {
+        let file = tempfile::NamedTempFile::new().expect("should create config");
+        fs::write(
+            file.path(),
+            r#"
+[integrations.prebid]
+bidders = 'examplebidder\'
+"#,
+        )
+        .expect("should write config");
+
+        let error = inspect(file.path())
+            .err()
+            .expect("should reject invalid identifier");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid bidder or identity-module identifier"),
+            "should report identifier validation: {error}"
+        );
+    }
+
+    #[test]
     fn accepts_the_runtime_bidder_list_encodings() {
         for input in [
             "['examplebidder', 'otherbidder']",
             "'examplebidder,otherbidder'",
             "'[examplebidder, otherbidder]'",
             "'[\"examplebidder\", \"otherbidder\"]'",
+            "'example\\u0062idder,otherbidder'",
             "{ '10' = 'otherbidder', '2' = 'examplebidder' }",
         ] {
             let text = format!(
