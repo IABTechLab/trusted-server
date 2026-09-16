@@ -414,3 +414,53 @@ fn a_later_private_directive_is_not_hidden_by_an_earlier_permissive_one() {
         "the freshness verdict must read every Cache-Control instance, not just the first"
     );
 }
+
+#[test]
+fn a_response_served_from_a_fronting_cache_is_not_declared_shareable() {
+    // Every axis compares two fetches. A cache in front of the origin can answer both from
+    // one object, so the axes agree and say nothing about the origin behind it.
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("age", "42")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok, "a cached answer is not evidence about the origin");
+    assert!(!verdict(&report, "fronting-cache").passed);
+    assert!(
+        report.urls[0]
+            .axes
+            .iter()
+            .all(trusted_server_cli::commands::origin::report::AxisResult::passed),
+        "the axes agreeing is exactly the symptom, so the verdict must be what fails"
+    );
+}
+
+#[test]
+fn a_vendor_cache_hit_header_is_caught_even_without_an_age() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("x-cache", "HIT")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok);
+    assert!(!verdict(&report, "fronting-cache").passed);
+}
+
+#[test]
+fn an_age_of_zero_is_not_treated_as_a_cache_hit() {
+    // A conforming cache on a miss sends `Age: 0`. Failing that would make the probe
+    // unusable against any origin that reports age at all.
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("age", "0")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(ok, "{}", report.render_text());
+    assert!(verdict(&report, "fronting-cache").passed);
+}

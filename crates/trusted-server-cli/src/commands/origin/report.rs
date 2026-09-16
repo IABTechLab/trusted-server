@@ -132,7 +132,14 @@ impl ProbeReport {
 pub const LIMITS: &str = "\nLimits of this result:\n  \
      - Runs from one client address, so origin personalization keyed on the forwarded\n    \
        client IP (geo, rate-class) is undetectable here.\n  \
-     - Covers the URLs sampled, not the origin as a whole.\n";
+     - Covers the URLs sampled, not the origin as a whole.\n  \
+     - Sends synthetic cookies. An origin that personalizes only for a genuine\n    \
+       authenticated session shows no difference unless you pass that session's\n    \
+       cookies with --cookie.\n  \
+     - Varies only the signals it has axes for. Accept-Language, Referer and client\n    \
+       hints are never varied, so locale-based personalization would not be seen.\n  \
+     - Compares a handful of back-to-back requests, so variation on a slower cycle\n    \
+       (an hourly rotation, a low-frequency experiment bucket) can fall between them.\n";
 
 /// First byte at which two bodies diverge, with a short escaped window from each.
 ///

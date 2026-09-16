@@ -242,11 +242,60 @@ async fn compare_axis(
 /// The four response-header checks, all blocking.
 fn judge_headers(baseline: &Fetched, axes: &[AxisResult]) -> Vec<VerdictResult> {
     vec![
+        fronting_cache_verdict(baseline),
         freshness_verdict(baseline),
         set_cookie_verdict(baseline),
         csp_nonce_verdict(baseline),
         vary_coverage_verdict(baseline, axes),
     ]
+}
+
+/// Every axis compares two responses. A cache between this tool and the origin can answer
+/// both from one stored object, so all five axes read identical and the report goes green
+/// on an origin that personalizes freely on a miss. That is the one failure that invalidates
+/// the whole run at once, so it is judged before anything else.
+///
+/// Detected rather than defeated. Busting the cache would need a query parameter or a
+/// `no-cache` request header, and both change what the origin is asked for — the first
+/// changes the cache key and the page identity, the second can change the origin's own
+/// caching behaviour and with it the freshness verdict. Perturbing the measurement to
+/// rescue it would make a green result mean less, not more. Probe the origin directly.
+fn fronting_cache_verdict(baseline: &Fetched) -> VerdictResult {
+    // `Age` is the one every conforming shared cache must send, and a positive value is
+    // proof this response was stored. The vendor headers catch caches that omit it.
+    let age = baseline
+        .all("age")
+        .iter()
+        .filter_map(|value| value.trim().parse::<u64>().ok())
+        .max();
+    let served_from_cache = age.is_some_and(|seconds| seconds > 0);
+
+    const HIT_INDICATORS: &[&str] = &["x-cache", "cf-cache-status", "x-cache-status"];
+    let vendor_hit = HIT_INDICATORS.iter().find(|name| {
+        baseline
+            .all(name)
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains("hit"))
+    });
+
+    let detail = match (served_from_cache, vendor_hit) {
+        (true, _) => format!(
+            "a cache answered this request (age: {}s), so every axis may be comparing one \
+             stored object with itself",
+            age.unwrap_or_default()
+        ),
+        (false, Some(name)) => format!(
+            "a cache answered this request ({name} reports a hit), so every axis may be \
+             comparing one stored object with itself"
+        ),
+        (false, None) => "no cache reported serving this response".to_owned(),
+    };
+
+    VerdictResult {
+        name: "fronting-cache".to_owned(),
+        passed: !served_from_cache && vendor_hit.is_none(),
+        detail,
+    }
 }
 
 /// Readthrough has no equivalent of the template cache's `NoPositiveFreshness` refusal, so
