@@ -1856,9 +1856,12 @@ TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 
 ### Shared template assembly (`assembly_mode = "esi"`)
 
-This configuration is an experimental validation spike scoped to
-[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
-not a settled production cache interface.
+`inline` remains the default. `esi` is opt-in per deployment, covered by the
+`template-cache-local-test.sh` harness and by rendered-document byte-identity tests, and
+originated in
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009).
+Enable it deliberately and verify with the harness first; the keys below are the safety
+contract that makes it safe to do so.
 
 `assembly_mode` controls how initial-page slot and bid state is delivered:
 
@@ -1976,15 +1979,26 @@ The two headers together are the reliable verification signal. Timing alone can
 vary with the origin, auction, compression, browser connection reuse, and local
 proxy buffering.
 
+> **Upgrade note.** This release adds `/_ts/admin/cache/purge` to the admin endpoints
+> startup validation covers. A configuration whose `[[handlers]]` enumerate admin paths
+> individually, rather than using the `^/_ts/admin` prefix, fails to start until that path
+> is covered too. The failure is at startup and explicit, not at request time.
+
 Rollback must preserve configuration compatibility:
 
 1. Change `assembly_mode` to `inline` and deploy/push that configuration.
 2. Before rolling back to a binary that predates these fields, remove
-   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
-   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
-   use `deny_unknown_fields` and intentionally reject unknown keys.
-3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
-   tooling, or wait for the bounded origin-derived lifetime to expire.
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`,
+   `origin_is_cookie_independent`, and `origin_readthrough_enabled`, then push the
+   cleaned configuration. Older binaries use `deny_unknown_fields` and intentionally
+   reject unknown keys. Removing `origin_readthrough_enabled` matters even when rolling
+   it back: setting it to `false` serializes it into the blob, so a binary that predates
+   it then rejects the whole configuration and every request fails.
+3. Purge the template cache with `ts cache purge --service <url> --all`, or
+   `--page <url>` for a single reader-facing URL. The admin endpoint
+   `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
+   the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
+   works.
 
 Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary

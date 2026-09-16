@@ -337,11 +337,11 @@ price_granularity = "dense"
 # only if your SSPs need more headroom and analytics confirm the DCL slip is OK.
 auction_timeout_ms = 500
 #
-# Initial-page delivery mode (spike/experimental). `inline` is the default and
-# current production behaviour; `esi` is an opt-in Fastly Core Cache experiment
-# storing an inert comment in a shared, reader-neutral template cache. See
-# docs/guide/configuration.md before enabling. This and the three cache-safety
-# keys below belong in this [creative_opportunities] table.
+# Initial-page delivery mode. `inline` is the default and current production
+# behaviour; `esi` is opt-in per deployment and stores an inert comment in a
+# shared, reader-neutral template cache. See docs/guide/configuration.md and run
+# scripts/template-cache-local-test.sh esi before enabling. This and the four
+# cache keys below belong in this [creative_opportunities] table.
 # assembly_mode = "inline"
 # Request headers (besides Accept-Encoding) the origin may name in Vary. Every
 # emitted Vary name must be covered here or template storage is refused. Never

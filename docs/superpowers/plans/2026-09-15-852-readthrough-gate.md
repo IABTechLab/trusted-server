@@ -241,7 +241,9 @@ fn ineligible_requests_carry_no_surrogate_key() {
 2. **Every axis and every verdict must pass.** Do not enable on a partial pass. The probe is the
    only control — the gate is decided before the origin responds, so none of the template cache's
    response-side refusals apply to this path.
-3. Set `origin_is_cookie_independent = true`.
+3. Set `origin_readthrough_enabled = true`. (Drafted as `origin_is_cookie_independent`; that
+   flag only ever applies to cookie-_bearing_ requests, so it could not gate readthrough, which
+   admits cookieless ones. A separate flag shipped.)
 4. Watch the `origin_cache_shareable` breakdown from part 1. (`template_cache_bypass_reason` was
    designed alongside it and cut as out of scope for #852 — do not reach for it here.)
 5. Confirm hit rate before widening to more URLs.
@@ -250,7 +252,7 @@ fn ineligible_requests_carry_no_surrogate_key() {
 
 Two levers, in order of speed:
 
-1. **Config:** set `origin_is_cookie_independent = false`. Takes effect on the next request; no
+1. **Config:** set `origin_readthrough_enabled = false`. Takes effect on the next request; no
    deploy. This is the real rollback.
 2. **Purge:** `ts cache purge --all` or the admin endpoint.
 

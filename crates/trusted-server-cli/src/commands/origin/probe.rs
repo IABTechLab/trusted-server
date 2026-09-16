@@ -201,7 +201,18 @@ fn mark_axes_covered_by_vary(baseline: &Fetched, axes: &mut [AxisResult]) {
         .collect();
 
     for axis in axes.iter_mut() {
-        if axis.name == "self-identity" {
+        // Self-identity varies no request signal, so no `Vary` can key it, and a page
+        // unstable against itself cannot be shared however it is keyed.
+        //
+        // Cookie is excluded for a different reason. `Vary: Cookie` would be keyed by a
+        // conforming cache, so it is not unsafe — but this axis answers "does the origin
+        // ignore cookies", and an origin declaring `Vary: Cookie` is saying the opposite.
+        // Passing it would print a green verdict whose own closing line reads "Do not
+        // enable origin_is_cookie_independent", and would contradict the template cache,
+        // which refuses `Vary: Cookie` outright at runtime
+        // (`TemplateCacheBypassReason::VaryCookie`). A near-zero hit rate is also not a
+        // result worth telling an operator to go and configure.
+        if axis.name == "self-identity" || axis.name == "cookie" {
             continue;
         }
         axis.covered_by_vary = declared

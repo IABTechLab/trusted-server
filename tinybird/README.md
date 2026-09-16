@@ -20,10 +20,12 @@ Adding a field means changing three things together: the struct in
 
 Reports whether a request's origin response **would be** eligible to share between readers.
 
-**It is not yet an outcome.** No readthrough gate consumes the predicate — every ad-serving
-request still forces an origin fetch. The column exists so the gate's reach is measurable
-from the deploy that ships it, and until then it answers "how much traffic would the gate
-admit", not "how much did it admit".
+**It is a predicate, not an outcome.** It records whether a request *would* be eligible,
+not whether anything was cached. A row with `1` still forced an origin fetch unless the
+operator had set `creative_opportunities.origin_readthrough_enabled` (default `false`), and
+even then the platform stores nothing if the origin's own `Cache-Control` refuses. So it
+answers "how much traffic would the gate admit", and only in combination with that setting
+does it bound "how much did it admit".
 
 Three caveats, each of which silently produces wrong numbers if a query ignores it.
 

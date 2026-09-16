@@ -372,8 +372,12 @@ pub struct CreativeOpportunitiesConfig {
     /// `Cache-Control` plus an operator's verification, so enabling it must be a
     /// deliberate act rather than a consequence of deploying.
     ///
-    /// Verify with `ts origin probe-shareability` before setting this. Rollback is a
-    /// config flip plus a purge of the `ts-origin` surrogate key.
+    /// Verify with `ts origin probe-shareability` before setting this.
+    ///
+    /// Rollback is the config flip alone, and it is not retroactive: readthrough objects
+    /// carry no surrogate key, so neither `ts cache purge` nor the admin endpoint can
+    /// reach them — those cover the template cache only. Already-stored objects age out
+    /// on the origin's TTL. Treat enablement as one-way for that long.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_readthrough_enabled: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.

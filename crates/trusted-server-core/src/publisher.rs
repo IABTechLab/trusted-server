@@ -1724,12 +1724,12 @@ pub async fn buffer_publisher_response_async(
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
             let bytes = output.into_inner();
-            // Cache taxonomy for this path: C1 is the raw origin/read-through cache,
-            // the template cache stores processed reader-neutral HTML, and C3 would be
+            // Cache taxonomy for this path: the origin readthrough cache is the raw origin/read-through cache,
+            // the template cache stores processed reader-neutral HTML, and an assembled-response cache would be
             // a forbidden cache of the final per-user assembled response.
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
-            // Swapping these two lines would create the forbidden C3 leak.
+            // Swapping these two lines would create the forbidden an assembled-response cache leak.
             // Read before the store: `store_template_if_authorized` *takes* the key so a
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
@@ -2151,7 +2151,7 @@ impl core::error::Error for SeamError {}
 /// the publisher path stamps `private, no-store` and strips validators. Omitting it
 /// here does not fall back to a safe default — it emits HTML with no `Cache-Control` at
 /// all, which is heuristically cacheable by browsers and intermediaries. That is a
-/// forbidden C3 cache of a final per-user assembled response.
+/// forbidden an assembled-response cache cache of a final per-user assembled response.
 ///
 /// Asserting the absence of `public`/`s-maxage`/`Surrogate-Control` would not have
 /// caught it. Nothing was present to forbid.
@@ -5990,8 +5990,8 @@ impl TemplateCachePolicy {
 /// the most serious one that applies.
 ///
 /// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
-/// §6.6 for why the C1 raw-origin/read-through cache, the reader-neutral template cache, and
-/// the forbidden C3 final assembled-response cache are distinct.
+/// §6.6 for why the the origin readthrough cache raw-origin/read-through cache, the reader-neutral template cache, and
+/// the forbidden an assembled-response cache final assembled-response cache are distinct.
 #[cfg(test)]
 pub(crate) fn template_cache_bypass_reason(
     mode: AssemblyMode,
@@ -11738,7 +11738,7 @@ mod tests {
         #[tokio::test]
         async fn the_cached_template_holds_the_marker_and_never_the_bids() {
             // Store the reader-neutral template before assembling the final per-user
-            // response, which must never enter the forbidden C3 cache. If
+            // response, which must never enter the forbidden an assembled-response cache cache. If
             // these were swapped, the cache would hold one visitor's bids and serve them
             // to the next — and every test above would still pass, because the served
             // page would look correct.

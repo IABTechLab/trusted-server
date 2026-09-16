@@ -573,3 +573,29 @@ fn an_undeclared_varying_axis_still_fails() {
     assert!(!axis(&report, "accept-encoding").passed());
     assert!(!verdict(&report, "vary-coverage").passed);
 }
+
+#[test]
+fn vary_cookie_does_not_excuse_the_cookie_axis() {
+    // `Vary: Cookie` is keyed by a conforming cache, so it is not unsafe — but this axis
+    // answers "does the origin ignore cookies", and the origin is saying it does not.
+    // Passing would print a green verdict whose closing line says not to enable the flag,
+    // and would contradict the template cache, which refuses `Vary: Cookie` at runtime.
+    let server = FixtureServer::start(|request| {
+        let signed_in = request.has_cookie("ts-ec");
+        FixtureResponse::html(if signed_in {
+            "<html>signed in</html>"
+        } else {
+            "<html>anonymous</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+        .with_header("vary", "Cookie")
+    });
+
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(
+        !ok,
+        "a cookie-varying origin must not read as cookie-independent"
+    );
+    assert!(!axis(&report, "cookie").passed());
+}
