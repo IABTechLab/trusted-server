@@ -303,8 +303,13 @@ pub async fn handle_auction(
     // EC and both KV and partner stores are available. Gate the read on a
     // present registry: without one, `resolve_auction_eids` yields no
     // server-side EIDs, so the snapshot would be an unused billable KV read.
+    // The row is read under the owning provider's canonical form of the
+    // identifier, the key it is stored under, rather than under the identifier
+    // as issued.
     let auction_kv_snapshot = match (kv, ec_id.as_deref(), registry) {
-        (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+        (Some(graph), Some(_), Some(_)) => ec_context
+            .ec_kv_key()
+            .map_or(EcKvSnapshot::NotRead, |kv_key| graph.load_snapshot(&kv_key)),
         _ => EcKvSnapshot::NotRead,
     };
     // Hand the loaded row to the request context so response finalization —
@@ -451,7 +456,13 @@ pub(crate) fn resolve_auction_eids(
 
     let ec_id = ec_context.ec_value()?;
 
-    let Some(entry) = snapshot.entry_for(ec_id) else {
+    // Callers read the snapshot under the identity-graph key, the owning
+    // provider's canonical form of the identifier, so the entry is looked up
+    // under that key rather than under the identifier as issued.
+    let Some(entry) = ec_context
+        .kv_key_for(ec_id)
+        .and_then(|kv_key| snapshot.entry_for(&kv_key))
+    else {
         return Some(Vec::new());
     };
 
@@ -624,6 +635,7 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
@@ -793,6 +805,85 @@ mod tests {
             stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
             Some("shared-cookie-id"),
             "the sharedId update must still be ingested from the shared snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_endpoint_loads_the_row_under_the_canonical_key() {
+        // The identity graph stores a row under the owning provider's
+        // canonical form of the identifier. Loaded and resolved under the
+        // identifier as issued, a provider whose canonical form differs from
+        // the cookie value found no row, so the auction carried no server-side
+        // EIDs and the context kept a snapshot bound to the wrong key.
+        let settings = create_test_settings();
+        let had_eids = Arc::new(std::sync::Mutex::new(None));
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            had_eids: Arc::clone(&had_eids),
+        }));
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("ssp.example.com")])
+            .expect("should build partner registry");
+        let graph = KvIdentityGraph::in_memory("canonical-auction-store");
+        graph
+            .create(
+                CANONICAL_KV_KEY,
+                &crate::ec::kv_types::KvEntry::minimal(
+                    "ssp.example.com",
+                    "partner-uid-123",
+                    1_741_824_000,
+                ),
+            )
+            .expect("should seed the row under the canonical key");
+        let mut ec_context =
+            make_ec_context(Jurisdiction::NonRegulated, Some(CANONICAL_COOKIE_VALUE))
+                .with_provider_for_test(Arc::new(CanonicalizingProvider));
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // The capturing provider records whether the request carried EIDs and
+        // then fails its launch, which is all this test needs. The request
+        // carries no client EIDs, so any EID it records came from the graph.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        assert!(
+            ec_context
+                .kv_snapshot()
+                .entry_for(CANONICAL_KV_KEY)
+                .is_some(),
+            "the endpoint should load the row stored under the canonical key"
+        );
+        assert_eq!(
+            *had_eids.lock().expect("should lock captured eids"),
+            Some(true),
+            "the auction should carry the canonical row's partner ID as an EID"
         );
     }
 
