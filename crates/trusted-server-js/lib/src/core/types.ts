@@ -451,7 +451,9 @@ export type FirstImpressionPhase = 'auctioning' | 'delivery_pending' | 'requeste
 export interface FirstImpressionPublisherAuction {
   token: string;
   adUnitCode: string;
+  phase: 'auctioning' | 'delivery_pending';
   expiresAt: number;
+  adIds: string[];
   suppressDelivery: boolean;
 }
 

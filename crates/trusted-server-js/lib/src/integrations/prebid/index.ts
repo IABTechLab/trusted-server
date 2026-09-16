@@ -17,6 +17,7 @@ import {
   consumePublisherFirstImpressionDelivery,
   FIRST_IMPRESSION_LEASE_MS,
   firstImpressionClaim,
+  markPublisherFirstImpressionDeliveryPending,
   registerPublisherFirstImpressionAuctions,
   releasePublisherFirstImpressionAuction,
   resolveFirstImpressionElement,
@@ -1626,6 +1627,13 @@ function registerPendingPublisherBids(
       retainUntilContextChange,
       firstImpressionToken,
     });
+    if (firstImpressionToken && window.tsjs) {
+      markPublisherFirstImpressionDeliveryPending(
+        window.tsjs,
+        firstImpressionToken,
+        responseAdIds.get(adUnitCode) ?? []
+      );
+    }
   }
 
   for (const [adUnitCode, adIds] of responseAdIds) {
@@ -1705,7 +1713,7 @@ function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliver
           )
           .map((pending) => [pending.registrationId, pending] as const)
       ).values(),
-    ];
+    ].sort((left, right) => left.registrationId - right.registrationId);
     const pendingCode = pendingCodeCandidates.length === 1 ? pendingCodeCandidates[0] : undefined;
     const pending = pendingBid ?? pendingCode;
     if (!pending) {
@@ -2581,6 +2589,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         if (completed) return;
         completed = true;
         if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
+
         // The publisher refresh itself started before this asynchronous auction.
         // Reconcile its per-slot token only when the callback is ready to issue
         // GPT: TS may have won an already-overlapping first impression while the
