@@ -60,16 +60,6 @@ resource "aws_iam_role_policy" "runtime" {
         ]
         Resource = [for secret in aws_secretsmanager_secret.bidder : secret.arn]
       },
-      {
-        Sid    = "WriteRuntimeLogs"
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogStream",
-          "logs:DescribeLogStreams",
-          "logs:PutLogEvents",
-        ]
-        Resource = "${aws_cloudwatch_log_group.runtime.arn}:*"
-      },
       ], var.secrets_kms_key_arn == null ? [] : [{
         Sid      = "DecryptBidderSecrets"
         Effect   = "Allow"

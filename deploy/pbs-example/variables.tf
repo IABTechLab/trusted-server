@@ -39,6 +39,17 @@ variable "east_certificate_arn" {
   }
 }
 
+variable "east_secrets_kms_key_arn" {
+  description = "Optional us-east-1 customer-managed KMS key ARN for bidder secrets. Null uses the regional Secrets Manager service key."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.east_secrets_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:us-east-1:${var.aws_account_id}:key/.+$", var.east_secrets_kms_key_arn))
+    error_message = "east_secrets_kms_key_arn must be a KMS key ARN in us-east-1 and the declared AWS account."
+  }
+}
+
 variable "east_vpc_cidr" {
   description = "CIDR block for the us-east-1 VPC."
   type        = string
@@ -62,17 +73,6 @@ variable "instance_type" {
   default     = "c7i.large"
 }
 
-variable "log_retention_days" {
-  description = "CloudWatch log retention for each regional runtime log group."
-  type        = number
-  default     = 14
-
-  validation {
-    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
-    error_message = "log_retention_days must be a supported CloudWatch Logs retention period."
-  }
-}
-
 variable "pbs_hostname" {
   description = "Shared HTTPS hostname returned by Route 53 latency records."
   type        = string
@@ -87,12 +87,6 @@ variable "pbs_hostname" {
 variable "route53_zone_id" {
   description = "Existing Route 53 public hosted zone ID that owns pbs_hostname."
   type        = string
-}
-
-variable "secrets_kms_key_arn" {
-  description = "Optional customer-managed KMS key ARN for bidder secrets. Null uses the Secrets Manager service key."
-  type        = string
-  default     = null
 }
 
 variable "tags" {
@@ -129,6 +123,17 @@ variable "west_certificate_arn" {
   validation {
     condition     = can(regex("^arn:aws[a-z-]*:acm:us-west-2:[0-9]{12}:certificate/.+$", var.west_certificate_arn))
     error_message = "west_certificate_arn must be an ACM certificate ARN in us-west-2."
+  }
+}
+
+variable "west_secrets_kms_key_arn" {
+  description = "Optional us-west-2 customer-managed KMS key ARN for bidder secrets. Null uses the regional Secrets Manager service key."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.west_secrets_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:us-west-2:${var.aws_account_id}:key/.+$", var.west_secrets_kms_key_arn))
+    error_message = "west_secrets_kms_key_arn must be a KMS key ARN in us-west-2 and the declared AWS account."
   }
 }
 

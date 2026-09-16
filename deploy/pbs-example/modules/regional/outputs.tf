@@ -13,6 +13,11 @@ output "instance_ids" {
   value       = { for availability_zone, instance in aws_instance.pbs : availability_zone => instance.id }
 }
 
+output "nat_eip_addresses" {
+  description = "Stable NAT gateway egress addresses keyed by Availability Zone for bidder allowlists."
+  value       = { for availability_zone, eip in aws_eip.nat : availability_zone => eip.public_ip }
+}
+
 output "private_subnet_ids" {
   description = "Private subnet IDs keyed by Availability Zone."
   value       = { for availability_zone, subnet in aws_subnet.private : availability_zone => subnet.id }

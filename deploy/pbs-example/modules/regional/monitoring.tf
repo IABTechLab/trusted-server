@@ -1,12 +1,3 @@
-resource "aws_cloudwatch_log_group" "runtime" {
-  name              = "/pbs-example/${var.region}"
-  retention_in_days = var.log_retention_days
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-runtime"
-  })
-}
-
 resource "aws_cloudwatch_metric_alarm" "instance_cpu" {
   for_each = aws_instance.pbs
 
