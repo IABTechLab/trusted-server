@@ -4102,10 +4102,6 @@ pub(crate) fn origin_response_is_shareable(inputs: SharedRequestInputs) -> bool 
         && !inputs.request_requires_origin
 }
 
-/// Whether this request may additionally use a shared *template*.
-///
-/// The two extra conditions say whether this pipeline can assemble one, not whether the
-/// origin's bytes may be shared — see [`SharedRequestInputs`].
 /// Apply the origin fetch's cache intent.
 ///
 /// Both publisher-origin fetch paths call this rather than deciding for themselves. They
@@ -4115,15 +4111,25 @@ pub(crate) fn origin_response_is_shareable(inputs: SharedRequestInputs) -> bool 
 /// of the origin response at all.
 fn apply_origin_cache_intent(
     request: PlatformHttpRequest,
+    readthrough_enabled: bool,
     origin_response_is_shareable: bool,
 ) -> PlatformHttpRequest {
-    if origin_response_is_shareable {
+    // Two separate questions, deliberately not folded into one.
+    // `origin_response_is_shareable` is a property of the request; `readthrough_enabled`
+    // is an operator's assertion about the origin. The predicate is recorded on telemetry
+    // either way, so an operator can see how much traffic the gate *would* admit before
+    // turning it on.
+    if readthrough_enabled && origin_response_is_shareable {
         request
     } else {
         request.with_cache_bypass()
     }
 }
 
+/// Whether this request may additionally use a shared *template*.
+///
+/// The two extra conditions say whether this pipeline can assemble one, not whether the
+/// origin's bytes may be shared — see [`SharedRequestInputs`].
 pub(crate) fn request_can_use_shared_template(
     inputs: SharedRequestInputs,
     assembly_mode_is_esi: bool,
@@ -4393,6 +4399,14 @@ pub async fn handle_publisher_request(
         request_requires_origin,
     };
     let origin_response_is_shareable = origin_response_is_shareable(shared_request_inputs);
+    // Readthrough is off unless an operator turns it on. Unlike the cookie flag, which
+    // only ever applies to cookie-bearing requests, this gate would otherwise admit every
+    // cookieless request the moment this code deploys — and cookieless first-time visitors
+    // are exactly the readers an origin issues a session cookie to.
+    let origin_readthrough_enabled = settings
+        .creative_opportunities
+        .as_ref()
+        .is_some_and(CreativeOpportunitiesConfig::origin_readthrough_enabled);
     let request_can_use_shared_template = request_can_use_shared_template(
         shared_request_inputs,
         matches!(assembly_mode, AssemblyMode::Esi),
@@ -4491,8 +4505,11 @@ pub async fn handle_publisher_request(
         // Bypass only what cannot be shared. `should_run_ad_stack` used to decide this,
         // which asked the wrong question: whether this request runs an auction says
         // nothing about whether the *origin's* response may be held in a shared cache.
-        platform_request =
-            apply_origin_cache_intent(platform_request, origin_response_is_shareable);
+        platform_request = apply_origin_cache_intent(
+            platform_request,
+            origin_readthrough_enabled,
+            origin_response_is_shareable,
+        );
         pending_origin = Some(
             services
                 .http_client()
@@ -4797,8 +4814,11 @@ pub async fn handle_publisher_request(
         // Bypass only what cannot be shared. `should_run_ad_stack` used to decide this,
         // which asked the wrong question: whether this request runs an auction says
         // nothing about whether the *origin's* response may be held in a shared cache.
-        platform_request =
-            apply_origin_cache_intent(platform_request, origin_response_is_shareable);
+        platform_request = apply_origin_cache_intent(
+            platform_request,
+            origin_readthrough_enabled,
+            origin_response_is_shareable,
+        );
         services.http_client().send(platform_request).await
     };
     let mut response = match origin_result {
@@ -9476,6 +9496,20 @@ mod tests {
             settings
         }
 
+        /// Settings with the readthrough opt-in turned on.
+        ///
+        /// A separate helper rather than a default, because the flag being off by default
+        /// is the property that keeps this change inert until an operator asks for it.
+        fn settings_with_readthrough_enabled(mode: &str) -> Settings {
+            let mut settings = settings_with_mode(mode);
+            settings
+                .creative_opportunities
+                .as_mut()
+                .expect("settings_with_mode should configure creative opportunities")
+                .origin_readthrough_enabled = Some(true);
+            settings
+        }
+
         fn settings_with_mode_and_template_cache_max_age(mode: &str, seconds: u32) -> Settings {
             let mut settings = settings_with_mode(mode);
             settings
@@ -9905,33 +9939,114 @@ mod tests {
             );
         }
 
+        /// Drive `handle_publisher_request` through the **EC-preload** fetch path.
+        ///
+        /// `run_with_orchestrator` passes `kv: None` and no EC id, so
+        /// `should_preload_ec_snapshot` is false for every other test in this file and the
+        /// first of the two origin-fetch call sites is never exercised. Supplying both
+        /// reaches it.
+        async fn run_through_ec_preload(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) {
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let kv = crate::ec::kv::KvIdentityGraph::in_memory("test-store");
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(Some("test-ec-id".to_owned()), consent);
+
+            let _ = handle_publisher_request(
+                settings,
+                services,
+                Some(&kv),
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+        }
+
+        #[tokio::test]
+        async fn the_ec_preload_fetch_path_applies_the_same_cache_gate() {
+            // The call site a naive revert missed. Reverting only this one previously
+            // passed all 2,697 tests; this is the behavioral cover for it.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            stub.set_pending_streaming_responses_supported(true);
+            let settings = Arc::new(settings_with_readthrough_enabled("inline"));
+            queue_shareable_html(&stub);
+
+            run_through_ec_preload(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "the EC-preload path must honor the gate, not decide for itself"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_ec_preload_fetch_path_still_bypasses_when_readthrough_is_off() {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            stub.set_pending_streaming_responses_supported(true);
+            let settings = Arc::new(settings_with_mode("inline"));
+            queue_shareable_html(&stub);
+
+            run_through_ec_preload(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
+                "the opt-in must gate both fetch paths, not only the non-preload one"
+            );
+        }
+
         #[test]
         fn both_origin_fetch_paths_share_one_cache_decision() {
             // Guards the divergence rather than one of its symptoms. The two fetch paths
             // are alternatives for the same request, and a test can only reach the
             // EC-preload one with a valid signed EC id, so the protection here is that
             // neither path decides for itself: both call this, and this is pure.
-            let shareable = apply_origin_cache_intent(
-                PlatformHttpRequest::new(
-                    HttpRequest::builder()
-                        .body(EdgeBody::empty())
-                        .expect("should build request"),
-                    "backend",
-                ),
-                true,
-            );
-            let unshareable = apply_origin_cache_intent(
-                PlatformHttpRequest::new(
-                    HttpRequest::builder()
-                        .body(EdgeBody::empty())
-                        .expect("should build request"),
-                    "backend",
-                ),
-                false,
-            );
+            let intent = |readthrough_enabled, shareable| {
+                apply_origin_cache_intent(
+                    PlatformHttpRequest::new(
+                        HttpRequest::builder()
+                            .body(EdgeBody::empty())
+                            .expect("should build request"),
+                        "backend",
+                    ),
+                    readthrough_enabled,
+                    shareable,
+                )
+                .cache_intent
+            };
 
-            assert_eq!(shareable.cache_intent, PlatformCacheIntent::Default);
-            assert_eq!(unshareable.cache_intent, PlatformCacheIntent::Bypass);
+            assert_eq!(intent(true, true), PlatformCacheIntent::Default);
+            assert_eq!(intent(true, false), PlatformCacheIntent::Bypass);
+            assert_eq!(
+                intent(false, true),
+                PlatformCacheIntent::Bypass,
+                "a shareable request must still bypass while readthrough is switched off"
+            );
+            assert_eq!(intent(false, false), PlatformCacheIntent::Bypass);
         }
 
         #[tokio::test]
@@ -9944,7 +10059,7 @@ mod tests {
                 Arc::new(MemoryTemplateCache::default()),
                 Arc::new(RecordingTelemetrySink::default()),
             );
-            let settings = Arc::new(settings_with_mode("esi"));
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
             queue_shareable_html(&stub);
 
             let _ = run(&settings, &services, navigation_request()).await;
@@ -10320,7 +10435,7 @@ mod tests {
             stub.set_streaming_responses_supported(true);
             stub.set_pending_streaming_responses_supported(true);
             let cache = Arc::new(MemoryTemplateCache::default());
-            let settings = Arc::new(settings_with_mode("esi"));
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             let lookups = Arc::new(AtomicUsize::new(0));
             let http_calls_at_lookup = Arc::new(AtomicUsize::new(0));
@@ -13768,6 +13883,7 @@ mod tests {
                 template_cache_vary: None,
                 template_cache_max_age_seconds: None,
                 origin_is_cookie_independent: None,
+                origin_readthrough_enabled: None,
                 section_segment: None,
                 slot: vec![slot()],
             });
@@ -19213,6 +19329,7 @@ mod tests {
                 template_cache_vary: None,
                 template_cache_max_age_seconds: None,
                 origin_is_cookie_independent: None,
+                origin_readthrough_enabled: None,
                 section_segment: None,
                 slot: Vec::new(),
             }

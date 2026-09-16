@@ -348,6 +348,27 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
+    /// Whether this origin's responses may be held in the platform's shared readthrough
+    /// cache.
+    ///
+    /// Unset or `false` forces every publisher-origin fetch to bypass that cache, which
+    /// is today's shipped behavior. Setting `true` stops forcing a MISS for requests that
+    /// are judged shareable — the latency this exists to recover, and the only change on
+    /// this path with cross-reader blast radius.
+    ///
+    /// **This flag is the whole opt-in.** Unlike
+    /// [`Self::origin_is_cookie_independent`], which only ever applies to cookie-bearing
+    /// requests, readthrough admits *cookieless* requests — first-time visitors, which is
+    /// exactly when an origin issues a session cookie. There is no response-side guard on
+    /// this path: the decision is made before the origin replies, and no post-response
+    /// hook is reachable on the Fastly adapter. Safety therefore rests on the origin's own
+    /// `Cache-Control` plus an operator's verification, so enabling it must be a
+    /// deliberate act rather than a consequence of deploying.
+    ///
+    /// Verify with `ts origin probe-shareability` before setting this. Rollback is a
+    /// config flip plus a purge of the `ts-origin` surrogate key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_readthrough_enabled: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
@@ -368,6 +389,15 @@ impl CreativeOpportunitiesConfig {
     #[must_use]
     pub fn origin_is_cookie_independent(&self) -> bool {
         self.origin_is_cookie_independent.unwrap_or(false)
+    }
+
+    /// Whether the origin's responses may enter the platform's shared readthrough cache.
+    ///
+    /// Defaults to `false`: the conservative reading, and the one that preserves today's
+    /// shipped behavior for every deployment that does not ask for the change.
+    #[must_use]
+    pub fn origin_readthrough_enabled(&self) -> bool {
+        self.origin_readthrough_enabled.unwrap_or(false)
     }
 
     /// Headers the cache key covers, per operator config.
@@ -1355,6 +1385,7 @@ mod tests {
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
             origin_is_cookie_independent: None,
+            origin_readthrough_enabled: None,
             section_segment: None,
             slot: vec![slot],
         }
@@ -1757,6 +1788,7 @@ mod tests {
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
             origin_is_cookie_independent: None,
+            origin_readthrough_enabled: None,
             section_segment: None,
             slot: Vec::new(),
         };
