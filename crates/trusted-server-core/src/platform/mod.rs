@@ -70,7 +70,7 @@ pub use template_cache::{
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
     TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
     TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
-    VaryHeaderValues, VarySpec,
+    VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
