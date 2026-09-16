@@ -1,6 +1,6 @@
 # Trusted Server CLI: experimental PBS commands
 
-`ts pbs` manages local configuration inputs and a small set of AWS operations for self-hosted Prebid Server Go. It is separate from `ts prebid bundle`, which builds browser JavaScript, and from the existing Trusted Server `ts config` and `ts deploy` commands.
+`ts prebid server` manages local configuration inputs and a small set of AWS operations for self-hosted Prebid Server Go. It sits beside `ts prebid client`, which builds browser JavaScript, and remains separate from the existing Trusted Server `ts config` and `ts deploy` commands.
 
 The namespace is experimental and is being evaluated in PR review. There is no separate binary or crate.
 
@@ -10,9 +10,9 @@ Use this branch's executable, not an older installed `ts`:
 
 ```bash
 cargo build_cli_linux
-cargo run_cli_linux pbs --help
-cargo run_cli_linux pbs inspect --config trusted-server.example.toml --json
-cargo run_cli_linux pbs check --deployment crates/trusted-server-cli/examples/pbs/deployment.yaml
+cargo run_cli_linux prebid server --help
+cargo run_cli_linux prebid server inspect --config trusted-server.example.toml --json
+cargo run_cli_linux prebid server check --deployment crates/trusted-server-cli/examples/pbs/deployment.yaml
 ```
 
 On macOS use `build_cli_macos` and `run_cli_macos`. The examples contain fictional resource identifiers, a fictional image digest, and a fictional adapter binding. They exercise local checks only and must not be used as real deployment settings.
@@ -21,12 +21,12 @@ On macOS use `build_cli_macos` and `run_cli_macos`. The examples contain fiction
 
 | Command                                                             | What it does                                                                                                        | Access                        |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| `ts pbs inspect --config <file>`                                    | Reports selected local Prebid fields, classifies bidder lists, and marks host-secret requirements unresolved        | Local read-only               |
-| `ts pbs check --deployment <file>`                                  | Validates schema, targets, binding metadata, and deterministic regional YAML merging                                | Local read-only               |
-| `ts pbs secrets set <bidder> --deployment <file> --region <region>` | Writes a complete JSON value to an existing, declared Secrets Manager secret after identity and confirmation checks | AWS reads and one value write |
-| `ts pbs status --deployment <file>`                                 | Reports EC2 instance state and infrastructure health for the explicitly listed instances                            | AWS reads                     |
+| `ts prebid server inspect --config <file>`                                    | Reports selected local Prebid fields, classifies bidder lists, and marks host-secret requirements unresolved        | Local read-only               |
+| `ts prebid server check --deployment <file>`                                  | Validates schema, targets, binding metadata, and deterministic regional YAML merging                                | Local read-only               |
+| `ts prebid server secrets set <bidder> --deployment <file> --region <region>` | Writes a complete JSON value to an existing, declared Secrets Manager secret after identity and confirmation checks | AWS reads and one value write |
+| `ts prebid server status --deployment <file>`                                 | Reports EC2 instance state and infrastructure health for the explicitly listed instances                            | AWS reads                     |
 
-Add `--json` anywhere under `ts pbs` for a machine-readable report. Errors and operator notices go to stderr; failures exit with code 2. A partial status report still appears on stdout, with `complete: false` and exit code 2.
+Add `--json` anywhere under `ts prebid server` for a machine-readable report. Errors and operator notices go to stderr; failures exit with code 2. A partial status report still appears on stdout, with `complete: false` and exit code 2.
 
 Not implemented: container deployment, rollback, runtime secret injection, caller updates, Terraform execution, ECS status, or PBS application health checks. `status` always reports the installed release and consumed secret versions as unknown. EC2 health is not PBS readiness.
 
@@ -74,7 +74,7 @@ The command verifies the account through STS, describes the exact declared secre
 For approved automation, supply a file or stdin, `--yes`, and a stable UUID identifying the logical write:
 
 ```bash
-ts pbs secrets set examplebidder \
+ts prebid server secrets set examplebidder \
   --deployment /secure/path/deployment.yaml \
   --region us-east-1 \
   --file /secure/path/credential.json \
@@ -94,7 +94,7 @@ A successful write reports its version identifier. It does not create secret met
 
 These commands do not adopt the existing sandbox's Terraform state, edit its files, or change its IAM roles. A descriptor must reference resources the operator has explicitly approved. The sandbox currently bootstraps runtime files through Terraform user data and has no runtime secret loader. Writing a secret therefore does not make that sandbox consume it.
 
-Deployment and rollback require a separately approved move to versioned runtime releases. Until that exists, `ts pbs` has no deployment or rollback subcommands and the skill must not promise them.
+Deployment and rollback require a separately approved move to versioned runtime releases. Until that exists, `ts prebid server` has no deployment or rollback subcommands and the skill must not promise them.
 
 ## Verification
 

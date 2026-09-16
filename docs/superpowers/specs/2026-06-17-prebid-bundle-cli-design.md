@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-17
 **Status:** Implemented
-**Scope:** `ts prebid bundle` local external Prebid bundle generation
+**Scope:** `ts prebid client` local external Prebid bundle generation
 **Related context:**
 
 - `docs/superpowers/specs/2026-05-28-external-prebid-first-party-proxy-design.md`
@@ -18,7 +18,7 @@ Add a Trusted Server-specific CLI command for generating the external Prebid
 browser bundle used by the first-party Prebid proxy flow:
 
 ```bash
-ts prebid bundle
+ts prebid client
 ```
 
 The command should make the existing external bundle generation path ergonomic for
@@ -43,7 +43,7 @@ proxy spec:
 
 ## 2. Non-goals
 
-The initial `ts prebid bundle` command does **not** do any of the following:
+The initial `ts prebid client` command does **not** do any of the following:
 
 - upload generated bundles to an asset host or CDN;
 - infer or construct the public `external_bundle_url`;
@@ -63,7 +63,7 @@ The initial `ts prebid bundle` command does **not** do any of the following:
 ## 3. Command surface
 
 ```bash
-ts prebid bundle [--config <path>] [--out <dir>]
+ts prebid client [--config <path>] [--out <dir>]
 ```
 
 Defaults:
@@ -77,13 +77,13 @@ Examples:
 
 ```bash
 # Generate from trusted-server.toml into dist/prebid
-ts prebid bundle
+ts prebid client
 
 # Generate from a draft config
-ts prebid bundle --config ./publisher-a.trusted-server.toml
+ts prebid client --config ./publisher-a.trusted-server.toml
 
 # Generate into a custom local directory
-ts prebid bundle --out ./build/prebid
+ts prebid client --out ./build/prebid
 ```
 
 Successful output should be concise and actionable, for example:
@@ -159,7 +159,7 @@ bundle URL's host and any HTTPS redirect targets.
 
 ## 5. Config update behavior
 
-After a successful local bundle build, `ts prebid bundle` must read the generated
+After a successful local bundle build, `ts prebid client` must read the generated
 `manifest.json` and update the same `trusted-server.toml` file with:
 
 ```toml
@@ -235,7 +235,7 @@ The manifest schema remains unchanged:
 
 ## 7. Dependency and environment handling
 
-`ts prebid bundle` should fail fast with actionable diagnostics when local JS
+`ts prebid client` should fail fast with actionable diagnostics when local JS
 build prerequisites are missing.
 
 Minimum checks before shelling out:
@@ -249,7 +249,7 @@ If `node_modules` is missing, the command must not run dependency installation.
 It should fail with an instruction like:
 
 ```text
-Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid bundle`.
+Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid client`.
 ```
 
 Errors from the JS generator, including unknown adapter names or unknown User ID
@@ -261,7 +261,7 @@ and stderr enough for debugging.
 
 ## 8. Config loading and validation
 
-`ts prebid bundle` should not require full production config validity. It is a
+`ts prebid client` should not require full production config validity. It is a
 local artifact-generation command, and operators may run it before the config is
 ready for `ts config validate` or `ts config push`.
 
@@ -289,7 +289,7 @@ This spec extends the `ts` product CLI command surface with a new Trusted
 Server-specific command group:
 
 ```text
-ts prebid bundle
+ts prebid client
 ```
 
 The resulting CLI command enum should conceptually become:
@@ -297,7 +297,7 @@ The resulting CLI command enum should conceptually become:
 ```text
 ts audit ...
 ts config ...
-ts prebid bundle ...
+ts prebid client ...
 ts auth ...
 ts provision ...
 ts serve ...
@@ -305,7 +305,7 @@ ts build ...
 ts deploy ...
 ```
 
-`ts prebid bundle` is similar to `ts audit` and `ts config` in that it owns
+`ts prebid client` is similar to `ts audit` and `ts config` in that it owns
 Trusted Server behavior directly. It is unlike `ts build` / `ts deploy`, which
 are EdgeZero lifecycle delegates.
 
@@ -316,12 +316,12 @@ are EdgeZero lifecycle delegates.
 ### CLI argument parsing
 
 - Add `Command::Prebid(PrebidArgs)`.
-- Add `PrebidCommand::Bundle(PrebidBundleArgs)`.
+- Add `PrebidCommand::Client(PrebidBundleArgs)`.
 - Add options:
   - `--config <path>` defaulting to `trusted-server.toml`;
   - `--out <dir>` defaulting to `dist/prebid`.
 - Add parser tests for defaults and custom paths.
-- Reject `--adapter` for `ts prebid bundle`.
+- Reject `--adapter` for `ts prebid client`.
 
 ### CLI implementation
 
@@ -353,11 +353,11 @@ User ID module names, hashing bundle bytes, and writing `manifest.json`.
 
 ### CLI parser tests
 
-- `ts prebid bundle` parses with defaults:
+- `ts prebid client` parses with defaults:
   - config: `trusted-server.toml`
   - out: `dist/prebid`
-- `ts prebid bundle --config publisher.toml --out build/prebid` parses custom paths.
-- `ts prebid bundle --adapter fastly` is rejected.
+- `ts prebid client --config publisher.toml --out build/prebid` parses custom paths.
+- `ts prebid client --adapter fastly` is rejected.
 
 ### Unit tests
 
@@ -389,7 +389,7 @@ cd crates/trusted-server-js/lib
 npm ci
 cd ../../..
 
-ts prebid bundle
+ts prebid client
 ls dist/prebid
 rg 'external_bundle_sha256|external_bundle_sri' trusted-server.toml
 ```

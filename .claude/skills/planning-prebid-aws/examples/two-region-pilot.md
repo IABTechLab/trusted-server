@@ -43,7 +43,7 @@ File generation starts after architecture-changing questions and target paths ar
 
 ## Configuration and operator walkthroughs
 
-The experimental `ts pbs` CLI implements local inspection/checks, secret value writes, and EC2 infrastructure status. The release, runtime delivery, and rollback scenarios below remain acceptance criteria for a future approved implementation, not executed deployment evidence. Consult the [current command contract](../references/configuration-and-secrets.md#operator-command-contract) before documenting an invocation.
+The experimental `ts prebid server` CLI implements local inspection/checks, secret value writes, and EC2 infrastructure status. The release, runtime delivery, and rollback scenarios below remain acceptance criteria for a future approved implementation, not executed deployment evidence. Consult the [current command contract](../references/configuration-and-secrets.md#operator-command-contract) before documenting an invocation.
 
 | Input or task                                                             | Expected behavior                                                                                                                                                     |
 | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

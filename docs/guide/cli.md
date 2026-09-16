@@ -241,7 +241,7 @@ APIs.
 
 ## Generate an external Prebid bundle
 
-`ts prebid bundle` builds the local external Prebid browser bundle configured in
+`ts prebid client` builds the local external Prebid browser bundle configured in
 `trusted-server.toml`.
 
 ```toml
@@ -255,7 +255,7 @@ Run the command after installing JS dependencies:
 ```bash
 cd crates/trusted-server-js/lib && npm ci
 cd ../../..
-ts prebid bundle
+ts prebid client
 ```
 
 By default, generated artifacts are written to `dist/prebid/`, and the command
@@ -268,8 +268,8 @@ asset URL, and include that host (plus any redirect targets) in
 Use custom paths when needed:
 
 ```bash
-ts prebid bundle --config publisher-a.toml --out build/prebid
+ts prebid client --config publisher-a.toml --out build/prebid
 ```
 
-`ts prebid bundle` is local-only. It has no `--adapter` option and does not
+`ts prebid client` is local-only. It has no `--adapter` option and does not
 upload, provision, deploy, or push config.

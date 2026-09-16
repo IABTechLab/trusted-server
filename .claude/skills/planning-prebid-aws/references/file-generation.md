@@ -13,7 +13,7 @@ Generate files only after the design and target paths are approved. Use the repo
 | Runtime inputs             | `runtime/`                                   | Resolved PBS configuration, regional inputs, optional stored requests, image/release manifest; Git owns nonsecret content                                             |
 | Standalone-host runtime    | `runtime/compose.yaml`, `runtime/Caddyfile`  | Compose/Caddy and boot service only for the approved host profile                                                                                                     |
 | Managed-container runtime  | Existing ECS release/task-definition layout  | Task resource limits, health, logs, secrets references, service rollout settings; explicit Terraform/deployer ownership                                               |
-| Operator interface         | Existing `ts pbs` CLI and approved CI layout | CLI descriptor and documented invocations; any missing release stages need separate implementation approval                                                           |
+| Operator interface         | Existing `ts prebid server` CLI and approved CI layout | CLI descriptor and documented invocations; any missing release stages need separate implementation approval                                                           |
 | Runbook                    | `docs/pbs-runbook.md`                        | Preconditions, operator commands, rollout/recovery/rotation/teardown procedures and deferred tests                                                                    |
 
 Each generated artifact must have a consumer. Add ignore rules for local credentials, runtime secret files, `.terraform`, state files, saved plans, and generated sensitive output. Track nonsecret examples. Use `example.com` hostnames and visibly fictional identifiers in examples.
@@ -26,7 +26,7 @@ For the deployment descriptor, resolved PBS YAML, secret bindings, runtime deliv
 
 Use the target-selection and approval contract in [operator commands](configuration-and-secrets.md#operator-command-contract), including descriptor-based interactive use and explicit automation inputs. New CI deployment jobs must remain inactive and approval-gated. File generation must not trigger existing auto-apply or deployment jobs; inspect those triggers before editing their watched paths.
 
-The current `ts pbs` CLI does not implement deployment or rollback. For a separately approved deployment implementation, implement or explicitly defer each release stage:
+The current `ts prebid server` CLI does not implement deployment or rollback. For a separately approved deployment implementation, implement or explicitly defer each release stage:
 
 1. Serialize competing deployments to the same target.
 2. Retrieve and verify an immutable release, image availability, and required secrets before replacing working capacity.

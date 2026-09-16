@@ -9,7 +9,7 @@ Server's Prebid refresh auctions without suppressing the corresponding GAM refre
 
 - Do not change publisher source, slot div IDs, or GAM configuration.
 - Do not edit `dist` output, minified assets, or an externally hosted Prebid bundle
-  by hand. `build-prebid-external.mjs`/`ts prebid bundle` are the supported build
+  by hand. `build-prebid-external.mjs`/`ts prebid client` are the supported build
   path.
 - The mechanism is literal, case-sensitive GAM-path suffix matching; it is not a
   size-based rule and does not add a div-ID fallback.

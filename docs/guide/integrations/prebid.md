@@ -87,7 +87,7 @@ provider = "pbs-main"
 | `external_bundle_url`                | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains`   |
 | `external_bundle_sha256`             | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                   |
 | `external_bundle_sri`                | `None`                                                                 | Optional SRI metadata                                                               |
-| `bundle.adapters`                    | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                           |
+| `bundle.adapters`                    | Required for `ts prebid client`                                        | Browser bidder adapters compiled into the external bundle                           |
 | `bundle.user_id_modules`             | Generator preset                                                       | Browser User ID modules compiled into the external bundle                           |
 
 ### Server provider options
@@ -140,11 +140,11 @@ and a `prebid-server` provider can exist independently from browser injection.
 
 ## External Bundle Generation
 
-Use `ts prebid bundle` to build the publisher-specific browser bundle from
+Use `ts prebid client` to build the publisher-specific browser bundle from
 `[integrations.prebid.bundle]` selections:
 
 ```bash
-ts prebid bundle
+ts prebid client
 ```
 
 The command writes generated artifacts to `dist/prebid/` by default and updates

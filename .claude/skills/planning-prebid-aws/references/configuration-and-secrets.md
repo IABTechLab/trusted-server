@@ -1,6 +1,6 @@
 # Configuration, secrets, and operator workflow
 
-Use this reference for Trusted Server configuration discovery, the experimental `ts pbs` operator commands, and proposed runtime delivery. The current commands are implemented in `crates/trusted-server-cli`; deployment and rollback remain design work. Their existence does not authorize cloud operations. Read the [CLI usage and schema](../../../../crates/trusted-server-cli/README.md) before generating its input files or documenting invocations.
+Use this reference for Trusted Server configuration discovery, the experimental `ts prebid server` operator commands, and proposed runtime delivery. The current commands are implemented in `crates/trusted-server-cli`; deployment and rollback remain design work. Their existence does not authorize cloud operations. Read the [CLI usage and schema](../../../../crates/trusted-server-cli/README.md) before generating its input files or documenting invocations.
 
 ## Discover requirements from Trusted Server
 
@@ -24,7 +24,7 @@ Before asking questions the repository can answer:
 | `bundle.adapters`, identity modules                   | Browser bundle capabilities and identity questions, not proof of server-side use                     |
 | Relevant privacy, format, and stored-request settings | Identify dependencies that need confirmation from the caller/request path                            |
 
-Use `ts pbs inspect --config <selected-path>` for redacted local discovery. It reports explicit values without expanding defaults or proving host-secret requirements. Resolve schema defaults and adapter metadata separately, recording unsupported details as unresolved rather than fetching credentials or inventing mappings. Read config without invoking commands that publish or rewrite it. Leave `trusted-server.toml` unchanged. Propose caller endpoint/account changes separately after integration approval; discovery must not activate bidders, publish configuration, or change traffic.
+Use `ts prebid server inspect --config <selected-path>` for redacted local discovery. It reports explicit values without expanding defaults or proving host-secret requirements. Resolve schema defaults and adapter metadata separately, recording unsupported details as unresolved rather than fetching credentials or inventing mappings. Read config without invoking commands that publish or rewrite it. Leave `trusted-server.toml` unchanged. Propose caller endpoint/account changes separately after integration approval; discovery must not activate bidders, publish configuration, or change traffic.
 
 Done when the selected source and its limits are recorded, every observed bidder is classified, and missing inputs remain visible rather than filled from examples.
 
@@ -73,16 +73,16 @@ Never package or log secret values. Treat container inspection and debug output 
 
 ## Operator command contract
 
-Use `ts pbs` instead of generating deployment-local wrappers for these implemented operations. Keep existing `ts config`, `ts deploy`, and `ts prebid bundle` behavior unchanged.
+Use `ts prebid server` instead of generating deployment-local wrappers for these implemented operations. Keep existing `ts config`, `ts deploy`, and `ts prebid client` behavior unchanged.
 
 | Command                                                             | Current result and boundary                                                                                                                                     |
 | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ts pbs inspect --config <path>`                                    | Local discovery with unresolved requirements; no source changes or secret retrieval                                                                             |
-| `ts pbs check --deployment <path>`                                  | Local schema, binding, and regional merge checks; no AWS calls, upstream PBS schema validation, or startup proof                                                |
-| `ts pbs secrets set <bidder> --deployment <path> --region <region>` | Authorized complete-value write to an existing declared secret; hidden terminal or file/stdin input, account/confirmation checks, and retry UUID; no deployment |
-| `ts pbs status --deployment <path>`                                 | Authorized EC2 infrastructure reads for declared instances; PBS health, installed release, and consumed secret versions stay unknown                            |
+| `ts prebid server inspect --config <path>`                                    | Local discovery with unresolved requirements; no source changes or secret retrieval                                                                             |
+| `ts prebid server check --deployment <path>`                                  | Local schema, binding, and regional merge checks; no AWS calls, upstream PBS schema validation, or startup proof                                                |
+| `ts prebid server secrets set <bidder> --deployment <path> --region <region>` | Authorized complete-value write to an existing declared secret; hidden terminal or file/stdin input, account/confirmation checks, and retry UUID; no deployment |
+| `ts prebid server status --deployment <path>`                                 | Authorized EC2 infrastructure reads for declared instances; PBS health, installed release, and consumed secret versions stay unknown                            |
 
-There are no `ts pbs deploy` or `ts pbs rollback` subcommands. Versioned release delivery, runtime injection, and release-aware status need separate implementation and approval. Do not present the future release contract as a working command. Current descriptors accept only `ec2-compose`; an ECS design requires another approved implementation rather than a fabricated descriptor.
+There are no `ts prebid server deploy` or `ts prebid server rollback` subcommands. Versioned release delivery, runtime injection, and release-aware status need separate implementation and approval. Do not present the future release contract as a working command. Current descriptors accept only `ec2-compose`; an ECS design requires another approved implementation rather than a fabricated descriptor.
 
 Read targets from the deployment descriptor. Allow an explicit deployment selection; if selection is ambiguous, stop. Before cloud operations, display environment/account/regions and verify authenticated account identity against the descriptor. Require deliberate regional scope for mutations rather than silently changing every region or defaulting to production. Local commands do not authenticate. Cloud read commands must not retrieve credential values merely to report status.
 

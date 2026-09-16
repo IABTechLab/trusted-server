@@ -306,8 +306,9 @@ fn read_yaml(path: &Path) -> Result<Value> {
 fn decode_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let value = read_yaml(path)?;
     validate_yaml(&value)?;
-    serde_yaml_ng::from_value(value)
-        .map_err(|_| invalid("unsupported deployment/binding schema; see ts pbs documentation"))
+    serde_yaml_ng::from_value(value).map_err(|_| {
+        invalid("unsupported deployment/binding schema; see ts prebid server documentation")
+    })
 }
 
 /// Require plain string-keyed data: YAML tags and merge keys obscure the effective configuration.

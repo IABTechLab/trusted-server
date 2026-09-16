@@ -86,7 +86,8 @@ fn command(dir: &Path) -> Command {
 fn secret_command(dir: &Path) -> Command {
     let mut command = command(dir);
     command.args([
-        "pbs",
+        "prebid",
+        "server",
         "secrets",
         "set",
         "examplebidder",
@@ -126,7 +127,7 @@ fn local_commands_never_execute_aws_and_preserve_the_source() {
     let toml = "[integrations.prebid]\nenabled=false\nbidders=['examplebidder']\naccount_id='DUMMY_SECRET'\n";
     fs::write(dir.path().join("trusted-server.toml"), toml).expect("should write TOML");
     let output = command(dir.path())
-        .args(["pbs", "inspect", "--json"])
+        .args(["prebid", "server", "inspect", "--json"])
         .output()
         .expect("should run CLI");
     assert!(output.status.success());
@@ -138,7 +139,14 @@ fn local_commands_never_execute_aws_and_preserve_the_source() {
         toml
     );
     let output = command(dir.path())
-        .args(["pbs", "check", "--deployment", "deployment.yaml", "--json"])
+        .args([
+            "prebid",
+            "server",
+            "check",
+            "--deployment",
+            "deployment.yaml",
+            "--json",
+        ])
         .output()
         .expect("should run checks");
     assert!(
@@ -241,7 +249,14 @@ fn enabled_cli_history_and_wrong_accounts_block_writes() {
 fn incomplete_status_returns_json_and_nonzero_exit() {
     let dir = fixture();
     let output = command(dir.path())
-        .args(["pbs", "status", "--deployment", "deployment.yaml", "--json"])
+        .args([
+            "prebid",
+            "server",
+            "status",
+            "--deployment",
+            "deployment.yaml",
+            "--json",
+        ])
         .output()
         .expect("should run status");
     assert_eq!(output.status.code(), Some(2));
