@@ -39,6 +39,7 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
 | Viceroy     | 0.17.0 (from `.tool-versions`)           |
 | Wasmtime    | 44.0.1 (from `.tool-versions`)           |
+| AWS CLI     | 2.36.45 (from `.tool-versions`)          |
 
 ---
 

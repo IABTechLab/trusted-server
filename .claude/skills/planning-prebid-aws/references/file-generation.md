@@ -53,7 +53,7 @@ Run applicable checks on the generated paths, recording exact commands and resul
 | Area              | Check                                                                                                                                                                              |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Terraform         | Follow [Terraform local checks](terraform.md#tests-and-safe-local-checks), including inspected, explicitly selected mocked tests                                                   |
-| Runtime structure | Parse YAML/JSON, verify manifest paths/checksums, and render deterministic overrides twice                                                                                         |
+| Runtime structure | Parse YAML/JSON, verify manifest paths/checksums, and validate regional override structure                                                                                         |
 | Compose branch    | `docker compose --env-file <dummy-env> -f <compose-path> config --quiet` and dummy-value round-trip checks                                                                         |
 | Operator tool     | Language syntax/lint and [configuration/secrets contract tests](configuration-and-secrets.md#rotation-and-recovery), plus failed-release and interrupted/repeated invocation tests |
 | PBS behavior      | Approved isolated container startup and smoke fixture against controlled bidder responses, if a suitable local runtime is available                                                |

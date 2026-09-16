@@ -2,6 +2,9 @@
 
 **Design:** `docs/superpowers/specs/2026-07-24-prebid-refresh-gam-path-opt-out-design.md`
 
+> **Update (2026-09-16):** The `ts prebid bundle` command referenced in this
+> plan was later renamed to `ts prebid client`.
+
 **Goal:** Let operators exclude selected GAM ad-unit-path suffixes from Trusted
 Server's Prebid refresh auctions without suppressing the corresponding GAM refresh.
 
@@ -9,7 +12,7 @@ Server's Prebid refresh auctions without suppressing the corresponding GAM refre
 
 - Do not change publisher source, slot div IDs, or GAM configuration.
 - Do not edit `dist` output, minified assets, or an externally hosted Prebid bundle
-  by hand. `build-prebid-external.mjs`/`ts prebid client` are the supported build
+  by hand. `build-prebid-external.mjs`/`ts prebid bundle` are the supported build
   path.
 - The mechanism is literal, case-sensitive GAM-path suffix matching; it is not a
   size-based rule and does not add a div-ID fallback.

@@ -98,10 +98,14 @@ impl Deployment {
             pbs,
             regions,
         } = descriptor;
+        if !valid_profile(&aws.profile) {
+            return Err(invalid(
+                "AWS profile must use 1-128 letters, digits, periods, underscores, or hyphens",
+            ));
+        }
         if schema_version != 1
             || !identifier(&environment)
             || !valid_account(&aws.account_id)
-            || !identifier(&aws.profile)
             || regions.is_empty()
             || !pinned_image(&pbs.image)
         {
@@ -232,6 +236,14 @@ impl Deployment {
 
 pub(super) fn valid_account(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_profile(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn valid_region(value: &str) -> bool {
@@ -373,16 +385,10 @@ pub(super) fn invalid(message: &'static str) -> Report<PbsError> {
 /// Report structural validation only, withholding resolved YAML values.
 ///
 /// # Errors
-/// Returns an error if deterministic rendering fails.
+/// Returns an error if resolved YAML cannot be serialized.
 pub(super) fn check(deployment: &Deployment) -> Result<Output> {
     for value in deployment.rendered.values() {
-        let rendered = serde_yaml_ng::to_string(value)
-            .map_err(|_| invalid("cannot serialize resolved YAML"))?;
-        let second = serde_yaml_ng::to_string(value)
-            .map_err(|_| invalid("cannot serialize resolved YAML"))?;
-        if rendered != second {
-            return Err(invalid("regional rendering was not deterministic"));
-        }
+        serde_yaml_ng::to_string(value).map_err(|_| invalid("cannot serialize resolved YAML"))?;
     }
     Ok(Output {
         failure: None,
@@ -446,6 +452,31 @@ pub(super) mod tests {
         assert_eq!(
             check(&deployment).expect("should validate").data["aws_validation"],
             "not_run"
+        );
+    }
+
+    #[test]
+    fn accepts_dotted_aws_profiles_and_reports_invalid_profiles() {
+        let (_dir, path) = fixture();
+        let descriptor = fs::read_to_string(&path).expect("should read descriptor");
+        fs::write(
+            &path,
+            descriptor.replace("profile: pbs-sandbox", "profile: pbs.sandbox"),
+        )
+        .expect("should write dotted profile");
+        Deployment::load(&path).expect("should accept dotted AWS profile");
+
+        fs::write(
+            &path,
+            descriptor.replace("profile: pbs-sandbox", "profile: pbs sandbox"),
+        )
+        .expect("should write invalid profile");
+        let error = Deployment::load(&path)
+            .err()
+            .expect("should reject invalid AWS profile");
+        assert!(
+            error.to_string().contains("AWS profile"),
+            "should identify the invalid field: {error}"
         );
     }
 

@@ -109,7 +109,7 @@ pub(super) fn set(
     aws: &dyn Aws,
     interaction: &mut dyn Interaction,
 ) -> Result<Output> {
-    if args.yes && args.request_token.is_none() || args.stdin && !args.yes {
+    if (args.yes && args.request_token.is_none()) || (args.stdin && !args.yes) {
         return Err(invalid(
             "noninteractive writes require --yes and --request-token",
         ));

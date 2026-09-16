@@ -22,7 +22,7 @@ On macOS use `build_cli_macos` and `run_cli_macos`. The examples contain fiction
 | Command                                                             | What it does                                                                                                        | Access                        |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
 | `ts prebid server inspect --config <file>`                                    | Reports selected local Prebid fields, classifies bidder lists, and marks host-secret requirements unresolved        | Local read-only               |
-| `ts prebid server check --deployment <file>`                                  | Validates schema, targets, binding metadata, and deterministic regional YAML merging                                | Local read-only               |
+| `ts prebid server check --deployment <file>`                                  | Validates schema, targets, binding metadata, and regional YAML merging                                              | Local read-only               |
 | `ts prebid server secrets set <bidder> --deployment <file> --region <region>` | Writes a complete JSON value to an existing, declared Secrets Manager secret after identity and confirmation checks | AWS reads and one value write |
 | `ts prebid server status --deployment <file>`                                 | Reports EC2 instance state and infrastructure health for the explicitly listed instances                            | AWS reads                     |
 
@@ -45,7 +45,7 @@ See [deployment.yaml](examples/pbs/deployment.yaml), [PBS YAML](examples/pbs/pbs
 Version 1 requires:
 
 - `schema_version: 1`, an explicit environment, and `runtime: ec2-compose`.
-- An explicit 12-digit AWS account ID and AWS CLI profile. Environment/profile/bidder identifiers use letters, digits, underscores, and hyphens.
+- An explicit 12-digit AWS account ID and AWS CLI profile. Environment and bidder identifiers use letters, digits, underscores, and hyphens. Profile names may also use periods.
 - A digest-pinned PBS image and a baseline YAML path.
 - A nonempty region map with optional override paths and explicit EC2 instance IDs for `status`.
 - An optional binding-file path. Omit it when no host secrets are needed.
