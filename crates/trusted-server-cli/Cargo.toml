@@ -33,13 +33,8 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
 
-# `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
-# automation via `networksetup`, and a native TLS / networking stack. Scoping
-# these dependencies to macOS keeps unsupported targets (notably the
-# repo-default `wasm32-wasip1` from `.cargo/config.toml`) from trying to build
-# `tokio`, `ring`, or `aws-lc-sys` for a target they do not support; on those
-# targets the `dev` subcommand is simply absent.
-[target.'cfg(target_os = "macos")'.dependencies]
+# The shared proxy engine supports macOS and Linux only.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
 derive_more = { workspace = true }
@@ -58,7 +53,11 @@ tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Exact NSS subject identity checks; already used transitively by rcgen.
+[target.'cfg(target_os = "linux")'.dependencies]
+x509-parser = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 

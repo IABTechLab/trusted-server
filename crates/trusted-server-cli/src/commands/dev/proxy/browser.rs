@@ -1,11 +1,10 @@
-//! Browser launch/config, PAC generation, and CA trust commands (spec §9, §7.3).
+//! Browser launch/config and PAC generation (spec §9).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
 
 use super::ProxyError;
-use super::ca::CA_COMMON_NAME;
 use super::config::{Browser, ResolvedConfig};
 use super::rewrite::RuleTable;
 use crate::output;
@@ -58,95 +57,6 @@ fn proxy_connect_ip(listen: SocketAddr) -> IpAddr {
         IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
         other => other,
-    }
-}
-
-/// Path to the macOS login keychain — the single trust location this tool
-/// installs into and uninstalls from, so both operations target the same store.
-#[cfg(target_os = "macos")]
-fn login_keychain() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/Library/Keychains/login.keychain-db")
-}
-
-/// Adds the CA certificate to the macOS login keychain (spec §7.3).
-///
-/// On non-macOS systems, or if the `security` command fails, prints manual
-/// instructions via [`crate::output`]. Never panics.
-pub fn ca_install(cert_path: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        let keychain = login_keychain();
-        let status = Command::new("security")
-            .args(["add-trusted-cert", "-r", "trustRoot", "-k", &keychain])
-            .arg(cert_path)
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                output::info("CA added to the login keychain");
-            }
-            _ => output::warn(&format!(
-                "could not auto-install; run manually: security add-trusted-cert -r trustRoot -k {} {}",
-                shell_quote(&keychain),
-                shell_quote(&cert_path.display().to_string())
-            )),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    output::info(&format!(
-        "add this CA to your OS trust store manually: {}",
-        cert_path.display()
-    ));
-}
-
-/// Removes the dev CA from the macOS login keychain (spec §7.3).
-///
-/// Returns `true` when the CA is confirmed absent afterward (removed, or never
-/// installed), and `false` when a removal may have failed and old trust could
-/// remain — in which case it warns loudly. There can be more than one entry with
-/// the CA's common name after repeated installs, so it deletes until none are
-/// found. On non-macOS systems, prints a manual note and returns `true`. Never
-/// panics.
-#[must_use]
-pub fn ca_uninstall() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        // Scope both queries to the same login keychain `ca_install` trusts into,
-        // so we don't fail on (or delete) a matching cert in another keychain and
-        // we operate on exactly the trust location this tool manages.
-        let keychain = login_keychain();
-        // Delete every login-keychain entry matching the CA's CN; stop when none remain.
-        for _ in 0..16 {
-            let present = Command::new("security")
-                .args(["find-certificate", "-c", CA_COMMON_NAME, &keychain])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !present {
-                output::info(
-                    "CA is not present in the login keychain (removed or never installed)",
-                );
-                return true;
-            }
-            let deleted = Command::new("security")
-                .args(["delete-certificate", "-c", CA_COMMON_NAME, &keychain])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !deleted {
-                break;
-            }
-        }
-        output::warn(
-            "could not fully remove the dev CA from the keychain; it may still be trusted — \
-             remove it manually via Keychain Access to revoke trust",
-        );
-        false
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        output::info("remove the dev CA from your OS trust store manually");
-        true
     }
 }
 
@@ -286,17 +196,18 @@ fn launch_chrome(cfg: &ResolvedConfig) {
         return;
     };
 
-    let mut cmd = chrome_command();
-    cmd.args([
-        "--no-first-run",
-        "--no-default-browser-check",
-        &format!("--user-data-dir={}", tmpdir.path().display()),
-        &format!("--proxy-server={proxy_arg}"),
-    ]);
-
-    if let Some(rule) = cfg.rules.0.first() {
-        cmd.arg(format!("https://{}", rule.from));
-    }
+    let Some(mut cmd) = chrome_command() else {
+        output::warn(
+            "Chrome: no native launcher found; tried google-chrome, google-chrome-stable, chromium, chromium-browser. Snap/Flatpak automation is unsupported.",
+        );
+        return;
+    };
+    configure_chrome(
+        &mut cmd,
+        tmpdir.path(),
+        &proxy_arg,
+        cfg.rules.0.first().map(|rule| rule.from.as_str()),
+    );
 
     match cmd.spawn() {
         Ok(mut child) => {
@@ -317,21 +228,58 @@ fn launch_chrome(cfg: &ResolvedConfig) {
     }
 }
 
-/// Returns the platform Chrome/Chromium command.
-fn chrome_command() -> Command {
+fn configure_chrome(cmd: &mut Command, profile: &Path, proxy: &str, first_host: Option<&str>) {
+    cmd.args([
+        "--no-first-run",
+        "--no-default-browser-check",
+        &format!("--user-data-dir={}", profile.display()),
+        &format!("--proxy-server={proxy}"),
+    ]);
+    if let Some(host) = first_host {
+        cmd.arg(format!("https://{host}"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+const CHROME_LAUNCHERS: &[&str] = &[
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+];
+
+/// Discovers launchers in stable order, skipping known Snap/Flatpak paths.
+/// Shell wrappers are not classified; callers must use native installations.
+#[cfg(target_os = "linux")]
+fn find_native_browser(
+    candidates: &[&str],
+    lookup: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<Command> {
+    candidates
+        .iter()
+        .filter_map(|name| lookup(name))
+        .find(|path| {
+            !path
+                .components()
+                .any(|part| matches!(part.as_os_str().to_str(), Some("snap" | "flatpak")))
+        })
+        .map(Command::new)
+}
+
+fn chrome_command() -> Option<Command> {
     #[cfg(target_os = "macos")]
     {
-        let app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-        Command::new(app)
+        Some(Command::new(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ))
     }
     #[cfg(target_os = "linux")]
     {
-        // Linux: the `google-chrome` launcher (unreached on the macOS-only build).
-        Command::new("google-chrome")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        Command::new("chrome")
+        find_native_browser(CHROME_LAUNCHERS, |name| {
+            which::which(name)
+                .ok()
+                .and_then(|path| path.canonicalize().ok())
+        })
     }
 }
 
@@ -351,11 +299,7 @@ fn launch_firefox(cfg: &ResolvedConfig) {
         return;
     };
 
-    let user_js = format!(
-        "user_pref(\"network.proxy.type\", 1);\n\
-         user_pref(\"network.proxy.ssl\", \"{host}\");\n\
-         user_pref(\"network.proxy.ssl_port\", {port});\n"
-    );
+    let user_js = firefox_preferences(cfg.listen);
 
     if let Err(err) = std::fs::write(tmpdir.path().join("user.js"), &user_js) {
         output::warn(&format!(
@@ -366,51 +310,25 @@ fn launch_firefox(cfg: &ResolvedConfig) {
         return;
     }
 
-    // Import the CA into the profile's NSS DB via certutil. A freshly-created
-    // profile has no NSS DB, and `certutil -A` against an empty dir fails with
-    // SEC_ERROR_BAD_DATABASE — so first initialise an empty modern (`sql:`) DB,
-    // then import into it. If certutil is missing or fails, Firefox would launch
-    // with no CA trust, so warn with the exact manual commands instead of
-    // silently continuing.
     let cert_path = super::ca::CertAuthority::cert_path(&cfg.ca_dir);
-    if cert_path.exists() {
-        let cert = cert_path.to_string_lossy();
-        let db = format!("sql:{}", tmpdir.path().to_string_lossy());
-        // Best-effort DB init; the -A import below is the step we check.
-        let _ = Command::new("certutil")
-            .args(["-N", "--empty-password", "-d", &db])
-            .status();
-        let certutil = Command::new("certutil")
-            .args([
-                "-A",
-                "-n",
-                CA_COMMON_NAME,
-                "-t",
-                "CT,,",
-                "-i",
-                &cert,
-                "-d",
-                &db,
-            ])
-            .status();
-        if !matches!(certutil, Ok(ref s) if s.success()) {
-            output::warn(&format!(
-                "Firefox: could not import the dev CA into the profile (certutil missing or \
-                 failed); HTTPS to proxied hosts will fail until you trust it. Run: \
-                 certutil -N --empty-password -d {db_q} && \
-                 certutil -A -n \"{CA_COMMON_NAME}\" -t \"CT,,\" -i {cert_q} -d {db_q}",
-                db_q = shell_quote(&db),
-                cert_q = shell_quote(&cert),
-            ));
-        }
+    if let Err(err) = super::trust::import_firefox(tmpdir.path(), &cert_path) {
+        output::warn(&format!(
+            "Firefox: could not configure CA trust: {err:?}; skipping launch"
+        ));
+        return;
     }
 
-    let mut cmd = firefox_command();
-    cmd.args(["-profile", &tmpdir.path().to_string_lossy(), "--no-remote"]);
-
-    if let Some(rule) = cfg.rules.0.first() {
-        cmd.arg(format!("https://{}", rule.from));
-    }
+    let Some(mut cmd) = firefox_command() else {
+        output::warn(
+            "Firefox: native firefox not found on PATH. Snap/Flatpak automation is unsupported.",
+        );
+        return;
+    };
+    configure_firefox(
+        &mut cmd,
+        tmpdir.path(),
+        cfg.rules.0.first().map(|rule| rule.from.as_str()),
+    );
 
     match cmd.spawn() {
         Ok(mut child) => {
@@ -431,16 +349,38 @@ fn launch_firefox(cfg: &ResolvedConfig) {
     }
 }
 
+fn firefox_preferences(listen: SocketAddr) -> String {
+    let host = proxy_connect_host(listen);
+    let port = listen.port();
+    format!(
+        "user_pref(\"network.proxy.type\", 1);\n\
+         user_pref(\"network.proxy.ssl\", \"{host}\");\n\
+         user_pref(\"network.proxy.ssl_port\", {port});\n"
+    )
+}
+
+fn configure_firefox(cmd: &mut Command, profile: &Path, first_host: Option<&str>) {
+    cmd.arg("-profile").arg(profile).arg("--no-remote");
+    if let Some(host) = first_host {
+        cmd.arg(format!("https://{host}"));
+    }
+}
+
 /// Returns the platform Firefox command.
-fn firefox_command() -> Command {
+fn firefox_command() -> Option<Command> {
     #[cfg(target_os = "macos")]
     {
-        let app = "/Applications/Firefox.app/Contents/MacOS/firefox";
-        Command::new(app)
+        Some(Command::new(
+            "/Applications/Firefox.app/Contents/MacOS/firefox",
+        ))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        Command::new("firefox")
+        find_native_browser(&["firefox"], |name| {
+            which::which(name)
+                .ok()
+                .and_then(|path| path.canonicalize().ok())
+        })
     }
 }
 
@@ -753,6 +693,79 @@ mod tests {
     }
 
     #[test]
+    fn chrome_arguments_preserve_https_only_proxy_and_first_navigation() {
+        let mut command = Command::new("test-browser");
+        configure_chrome(
+            &mut command,
+            Path::new("/tmp/profile"),
+            "https=[::1]:19000",
+            Some("www.example.com"),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--user-data-dir=/tmp/profile",
+                "--proxy-server=https=[::1]:19000",
+                "https://www.example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn firefox_arguments_and_preferences_keep_http_direct() {
+        let prefs = firefox_preferences("127.0.0.2:19000".parse().expect("should parse address"));
+        assert_eq!(
+            prefs,
+            "user_pref(\"network.proxy.type\", 1);\nuser_pref(\"network.proxy.ssl\", \"127.0.0.2\");\nuser_pref(\"network.proxy.ssl_port\", 19000);\n"
+        );
+        let mut command = Command::new("test-firefox");
+        configure_firefox(
+            &mut command,
+            Path::new("/tmp/profile"),
+            Some("www.example.com"),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-profile",
+                "/tmp/profile",
+                "--no-remote",
+                "https://www.example.com"
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_discovery_order_variants_missing_and_packaged_paths() {
+        for candidate in CHROME_LAUNCHERS {
+            let found = find_native_browser(CHROME_LAUNCHERS, |name| {
+                (name == *candidate).then(|| std::path::PathBuf::from(format!("/usr/bin/{name}")))
+            });
+            assert!(found.is_some(), "should discover {candidate}");
+        }
+        let found = find_native_browser(CHROME_LAUNCHERS, |name| {
+            Some(std::path::PathBuf::from(format!("/usr/bin/{name}")))
+        })
+        .expect("should discover first launcher");
+        assert_eq!(found.get_program(), "/usr/bin/google-chrome");
+        assert!(find_native_browser(CHROME_LAUNCHERS, |_| None).is_none());
+        assert!(
+            find_native_browser(CHROME_LAUNCHERS, |_| Some("/snap/bin/chromium".into())).is_none()
+        );
+    }
+
+    #[test]
     fn shell_quote_wraps_and_escapes() {
         // Metacharacters (`&`, space, `?`) are neutralized by single-quoting.
         assert_eq!(
@@ -886,6 +899,7 @@ mod tests {
         restore_system_proxy_if_pending(dir.path(), false);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn restore_system_proxy_if_pending_removes_file_with_empty_service() {
         let dir = tempfile::tempdir().expect("should create temp dir");
@@ -898,6 +912,19 @@ mod tests {
         assert!(
             !restore_path.exists(),
             "restore file should be removed after failed parse"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_restore_leaves_files_untouched() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().join(SAFARI_RESTORE_FILE);
+        std::fs::write(&path, "unchanged").expect("should write state");
+        restore_system_proxy_if_pending(dir.path(), false);
+        assert_eq!(
+            std::fs::read_to_string(path).expect("should read state"),
+            "unchanged"
         );
     }
 
