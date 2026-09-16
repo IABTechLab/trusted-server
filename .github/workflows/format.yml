@@ -149,9 +149,9 @@ jobs:
       - name: Run Prettier (check)
         run: npm run format
 
+      - name: Build with VitePress (fails on dead links)
+        run: npm run build
+
       - name: Run Prettier (check) — root Markdown
         working-directory: .
         run: docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md"
-
-      - name: Build with VitePress (fails on dead links)
-        run: npm run build
