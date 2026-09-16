@@ -5,8 +5,13 @@
 **Goal:** Give the operator the two things the readthrough gate depends on — evidence that an
 origin is safe to share, and a way to purge what gets cached.
 
+> **Status: Sections A and B complete; Sections C and D not started.** The checkboxes below
+> track this. Section A shipped one axis and one verdict more than this plan describes — the RSC
+> axis, and a blocking `fronting-cache` verdict added after review found that a cache in front of
+> the origin can answer every axis from one stored object and turn the whole run green.
+
 **Architecture:** A new `ts origin probe-shareability` command that compares origin responses
-across four axes and reports four response-header verdicts, all blocking. Plus a purge surface in
+across five axes and reports five response-header verdicts, all blocking. Plus a purge surface in
 two halves: a reader-facing surrogate key attached at template-cache insert, and two consumers of
 it — an authenticated admin endpoint and a CLI command.
 
@@ -63,7 +68,7 @@ The CLI's existing HTTP stack (`hyper`, `rustls`, `tokio` with `net`) is under
 block has `tokio` **without** `net` and no HTTP client. CI runs the CLI suite on Linux as well as
 macOS, so the probe needs a client in the portable block.
 
-- [ ] **Step 1: Add the dependency**
+- [x] **Step 1: Add the dependency**
 
 In `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`:
 
@@ -75,7 +80,7 @@ reqwest = { workspace = true }
 `features = ["json", "rustls-tls"]` (root `Cargo.toml:93`), already in `Cargo.lock`, and already
 built natively by the Axum adapter and the integration-tests crate. No new TLS backend is linked.
 
-- [ ] **Step 2: Verify both targets still build**
+- [x] **Step 2: Verify both targets still build**
 
 Run: `cargo check-fastly` — expected clean (the CLI is not in this alias; this confirms nothing
 leaked into the wasm build).
@@ -83,7 +88,7 @@ leaked into the wasm build).
 Run: `cargo check --package trusted-server-cli --target $(rustc -vV | sed -n 's/^host: //p')` —
 expected clean.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/trusted-server-cli/Cargo.toml Cargo.lock
@@ -104,7 +109,7 @@ The only existing fixture server is reachable solely from `tests/proxy_e2e.rs`, 
 PR #823: a browser opens several sockets including request-less preconnects, and the one-accept
 server lost the race. The probe opens N connections by design via `--repeat`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -118,12 +123,12 @@ fn fixture_server_answers_repeated_requests() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test --package trusted-server-cli --target $(rustc -vV | sed -n 's/^host: //p') fixture_server_answers`
 Expected: FAIL — `FixtureServer` not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 A `std::net::TcpListener` on port 0 in a spawned thread, looping on `accept()` until a shutdown
 flag is set, answering each connection from a caller-supplied closure. Expose `url(path)` built
@@ -131,11 +136,11 @@ from `local_addr()`. Plain `std::net` and `std::thread` — no async runtime, so
 target the CLI tests run on. The response builder needs to set arbitrary status, headers, and
 body, since later tasks assert on `Vary`, `Set-Cookie`, `Cache-Control` and CSP.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run the same command. Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/trusted-server-cli/tests/support/
@@ -149,7 +154,7 @@ several connections by design."
 
 **Files:** `crates/trusted-server-cli/src/run.rs`, `crates/trusted-server-cli/src/commands/origin/`
 
-- [ ] **Step 1: Add the command**
+- [x] **Step 1: Add the command**
 
 Follow the `audit` and `dev` pattern — TS-local, not delegated to `edgezero_cli`. Add an `Origin`
 variant with a `#[command(subcommand)] OriginCommand`, one variant `ProbeShareability`, and args:
@@ -173,19 +178,19 @@ pub(crate) struct ProbeShareabilityArgs {
 
 Dispatch it in `run()`'s `match` alongside the existing arms.
 
-- [ ] **Step 2: Verify it is reachable**
+- [x] **Step 2: Verify it is reachable**
 
 Run: `cargo run --package trusted-server-cli --target $(rustc -vV | sed -n 's/^host: //p') -- origin probe-shareability --help`
 Expected: the help text renders.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/trusted-server-cli/src/run.rs crates/trusted-server-cli/src/commands/
 git commit -m "Add the ts origin probe-shareability command skeleton"
 ```
 
-## Task A4: Implement the four comparison axes
+## Task A4: Implement the five comparison axes
 
 **Files:** `crates/trusted-server-cli/src/commands/origin/`
 
@@ -212,7 +217,7 @@ an HTML navigation. Recorded in the #1009 measurement findings as a risk nobody 
 Drive this axis from the operator's configured `template_cache_vary` list rather than a fixed set,
 since the varying headers are publisher-specific.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 One test per axis against the fixture server, each asserting the axis reports a difference when
 the fixture varies on that input and reports identical when it does not. For the
@@ -223,21 +228,21 @@ Plus one test that a non-self-identical origin (fixture returns a counter in the
 self-identity axis — that is the most common real-world failure and must not be reported as a
 cookie problem.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `./scripts/test-cli.sh` (or the explicit host-triple command). Expected: FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Report per axis: identical or differing, and on difference the byte offset of the first
 divergence plus a short context window from each side. Keep the window small and escape it — it
 is publisher HTML and may be large or binary-ish.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/trusted-server-cli/src/commands/origin/
@@ -248,7 +253,7 @@ cannot be shared on any axis, and reporting that as a cookie failure would
 send the operator after the wrong thing."
 ```
 
-## Task A5: Implement the four response-header verdicts
+## Task A5: Implement the five response-header verdicts
 
 **Files:** `crates/trusted-server-cli/src/commands/origin/`
 
@@ -259,17 +264,17 @@ send the operator after the wrong thing."
 | No CSP `nonce`            | CSP contains `'nonce-`                                    | A shared nonce silently defeats the origin's own XSS defence. Template cache refuses at `:6117`                                             |
 | `Vary` coverage           | a varying axis is not named in `Vary`                     | Readthrough keys on URL plus origin `Vary` only                                                                                             |
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 One per verdict, fixture-driven. The `Vary`-coverage test is the interesting one: a fixture that
 varies on `User-Agent` **and** declares `Vary: User-Agent` must pass, while the same fixture
 without the declaration must fail.
 
-- [ ] **Step 2–4: Run, implement, run**
+- [x] **Step 2–4: Run, implement, run**
 
 Same loop as A4.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/trusted-server-cli/src/commands/origin/
@@ -282,7 +287,7 @@ template cache's response-side refusals are reachable there."
 
 ## Task A6: Output, exit code, and stated limits
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -292,7 +297,7 @@ fn probe_exits_non_zero_when_any_verdict_fails() { /* fixture sets Set-Cookie */
 fn probe_json_output_names_every_axis_and_verdict() { /* --json shape */ }
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 Human-readable by default; `--json` for CI. **Non-zero exit on any blocking failure**, so it can
 gate a deploy.
@@ -303,7 +308,7 @@ Print the limits every run, not only on failure:
   rate-class) is **undetectable** by this tool.
 - The verdict covers the sampled URLs only, not the origin as a whole.
 
-- [ ] **Step 3: Run, then commit**
+- [x] **Step 3: Run, then commit**
 
 ```bash
 git add crates/trusted-server-cli/src/commands/origin/
@@ -325,7 +330,7 @@ A clean result on one URL from one IP is not a statement about the origin."
 and **no path field**. Without one, a "reader-facing" key would have to be reconstructed from the
 origin path, which is the coupling this section exists to remove.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -350,14 +355,14 @@ fn reader_facing_key_ignores_origin_rewriting() {
 }
 ```
 
-- [ ] **Step 2–4:** run (fails), add `pub request_path: String` populated from the **pre-rewrite**
+- [x] **Step 2–4:** run (fails), add `pub request_path: String` populated from the **pre-rewrite**
       request at `publisher.rs:4370`, run again.
 
 Note `to_cache_key()` must include `request_path` in its canonical input, since it changes the
 emitted bytes. Bump `TEMPLATE_SCHEMA_VERSION` — the version table at `template_cache.rs:30-36`
 documents why, and a missed bump reads yesterday's template against today's key shape.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ## Task B2: Extract `url_surrogate_key` and define canonicalization
 
@@ -368,7 +373,7 @@ documents why, and a missed bump reads yesterday's template against today's key 
 load-bearing. Both the endpoint and the CLI must hash the same string as insert, or a purge
 returns 200 and invalidates nothing — the worst failure mode on an incident path.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -396,7 +401,7 @@ fn reader_url_canonicalization_is_stable_across_operator_spellings() {
 Decide and document the query-string rule explicitly: a query is **significant** (different query,
 different page) but an empty `?` is not.
 
-- [ ] **Step 2–4:** run, implement `pub fn reader_url_surrogate_key(url: &str) -> String` as a free
+- [x] **Step 2–4:** run, implement `pub fn reader_url_surrogate_key(url: &str) -> String` as a free
       function with `TemplateCacheKey::reader_url_surrogate_key()` delegating to it, run again.
 
 Use a distinct prefix, `ts-template-readerurl-`, and assert in the existing surrogate-key test
@@ -404,10 +409,10 @@ that it never collides with `ts-template-url-`. Without the distinct prefix the 
 can alias when a staging edge host equals the configured origin host — over-purge rather than a
 read leak, but a purge reporting success against an unrelated object.
 
-- [ ] **Step 5:** add it to `surrogate_keys()` (`:138`) so it is attached at insert. The `Vec`
+- [x] **Step 5:** add it to `surrogate_keys()` (`:138`) so it is attached at insert. The `Vec`
       already exists; an extra entry is free.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ## Task B3: Add `purge_url_surrogate_key` to the platform trait
 
@@ -421,14 +426,14 @@ Implementors: `UnavailableTemplateCache` (`template_cache.rs:698`),
 doubles at `publisher.rs:8843` and `:9112`. The doubles are spelled
 `impl crate::platform::PlatformTemplateCache`, which a naive grep misses.
 
-- [ ] **Step 1–4:** test on the Fastly impl and the null object, add
+- [x] **Step 1–4:** test on the Fastly impl and the null object, add
       `async fn purge_url_surrogate_key(&self, key: &str) -> Result<(), TemplateCacheError>`,
       implement across all five, run.
 
 `UnavailableTemplateCache` must **not** silently succeed — a no-op purge reporting success is
 worse than an error. Return the same unsupported signal the endpoint turns into a 501.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ---
 

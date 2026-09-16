@@ -354,9 +354,15 @@ between readthrough and cross-serving, so its verdicts are blocking and its outp
 | **Cookie**            | Bare vs. representative TS + publisher cookie jar | The `origin_is_cookie_independent` question                                                                                                                                                                                                                                                            |
 | **`Accept-Encoding`** | `gzip` vs. `identity`, compared after decode      | `STRUCTURALLY_COVERED = ["accept-encoding"]` (`platform/template_cache.rs:207`) assumes encoding variants differ only by content coding. Its own doc says operators "must leave ESI disabled if an origin changes document semantics instead" — an obligation shipped in prose with no way to check it |
 | **`User-Agent`**      | Desktop vs. mobile UA                             | An origin serving distinct mobile or prerendered HTML without `Vary: User-Agent` is cross-served, since readthrough keys on URL plus origin `Vary` only                                                                                                                                                |
+| **RSC**               | Bare vs. an `RSC` flight-fetch header             | RSC fetches already flow through the readthrough cache while HTML navigations are passed, so removing the bypass puts both representations under one cache key for the first time. An origin that varies on these without declaring it can serve a flight payload to an HTML navigation                |
 
 ### Response-header verdicts, all blocking
 
+- **No fronting cache.** A positive `Age` or a vendor hit header means a cache answered for the
+  origin, so every axis may have compared one stored object with itself and the whole run says
+  nothing. Judged first. Detected rather than defeated: cache-busting would change either the
+  cache key or the origin's own caching behaviour, and perturbing the measurement to rescue it
+  would make a green result mean less.
 - **Positive shared freshness.** No positive `Cache-Control`/`Surrogate-Control` freshness means
   readthrough must not be enabled.
 - **No `Set-Cookie`.** Per the response-side gap, this is the session-fixation vector and there is no runtime guard.
@@ -711,7 +717,7 @@ tooling to observe and reverse it:
    migration. (Two further fields were scoped out during implementation: see Observability.) The migration must reach Tinybird **before the code
    deploys**, which in a single PR is a deploy-ordering constraint on the release, not on the
    merge.
-3. **Probe** — the `reqwest` dependency, the loop-accept fixture server, four axes and four
+3. **Probe** — the `reqwest` dependency, the loop-accept fixture server, five axes and five
    response-header verdicts.
 4. **Purge plumbing and endpoint** — the `request_path` field, the reader-facing surrogate key
    with canonicalization, the `url_surrogate_key` extraction, the trait change, four route
@@ -809,19 +815,27 @@ cannot stream and `MAX_PLATFORM_RESPONSE_BODY_BYTES` applies (`adapter-fastly/sr
 Relevant to issue B's promotion decision and to the streaming work; noted so the interaction is
 not rediscovered later.
 
-**Observability is the largest refactor here and is not in #852.** Turning `AuctionObservationContext`
-from an immutable snapshot into a mutable accumulator, plus a 35-column schema migration with
-quarantine risk, sits close to AGENTS.md's "no large refactors without approval". It needs
-explicit approval before the work starts. If that approval is withheld, the trim is to keep
-`origin_cache_shareable` alone. (Implementation reached that state anyway: `template_cache_state`
-proved unreachable and `template_cache_bypass_reason` was scoped out to issue B.)
+**Observability is not in #852's text, and shipped in its trimmed form.** _Resolved — this is no
+longer an open approval question._ As drafted it was the largest refactor here: three fields, a
+mutable accumulator, and a 35-column migration with quarantine risk, close enough to AGENTS.md's
+"no large refactors without approval" to need asking. What shipped is the fallback this section
+already named — `origin_cache_shareable` alone, one field, one setter, one nullable column.
+`template_cache_state` proved structurally unreachable and `template_cache_bypass_reason` was
+scoped out to issue B as a template-cache diagnostic rather than a #852 one.
+
+The one field earns its place on relevance: it _is_ `origin_response_is_shareable`, the predicate
+#852 introduces, not adjacent instrumentation. It also has to land ahead of the gate rather than
+with it — its purpose is to answer "how much traffic would the gate admit" before anyone flips it,
+and shipping it alongside the gate would destroy that baseline. Given the response-side gap leaves
+an operator's config flag and a one-off probe run as the only runtime controls, going into the
+first production window blind is the worse trade.
 
 ## What closes #852
 
 All five work items landed, and specifically:
 
 - The rollback staging verdict recorded, with the runbook matching it.
-- Probe green against the harness fixture origin on all four axes and all four response-header
+- Probe green against the harness fixture origin on all five axes and all five response-header
   verdicts.
 - `origin_cache_shareable` confirmed present on Tinybird rows from a staging deploy, with no
   quarantine.

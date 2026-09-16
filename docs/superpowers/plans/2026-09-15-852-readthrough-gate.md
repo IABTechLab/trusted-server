@@ -242,7 +242,8 @@ fn ineligible_requests_carry_no_surrogate_key() {
    only control — the gate is decided before the origin responds, so none of the template cache's
    response-side refusals apply to this path.
 3. Set `origin_is_cookie_independent = true`.
-4. Watch the `template_cache_bypass_reason` and `origin_cache_shareable` breakdown from part 1.
+4. Watch the `origin_cache_shareable` breakdown from part 1. (`template_cache_bypass_reason` was
+   designed alongside it and cut as out of scope for #852 — do not reach for it here.)
 5. Confirm hit rate before widening to more URLs.
 
 - [ ] **Step 2: Write the rollback procedure, honestly**

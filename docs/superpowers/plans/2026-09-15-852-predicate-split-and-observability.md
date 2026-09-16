@@ -6,6 +6,21 @@
 one, and report both caches' outcomes on the existing auction telemetry row, so the later
 readthrough change is measurable from its first deploy.
 
+> **Status: complete, in a trimmed form this document does not describe.**
+>
+> This plan was written for **three** telemetry fields. One shipped: `origin_cache_shareable`.
+>
+> - `template_cache_state` was dropped as **structurally unreachable** — telemetry emits during
+>   body streaming, before the template is stored, so the terminal state does not exist yet at
+>   the only point that could record it. See Task 9.
+> - `template_cache_bypass_reason` was dropped as **out of scope**: it diagnoses the template
+>   cache, which belongs to #1009, not to #852.
+>
+> Everything below that says "three fields", "3 nullable columns" or names either dropped field
+> — including Task 0's trim instruction, which names the opposite field from the one that was
+> actually cut, and the code blocks in Tasks 2 and 3 — is superseded by that trim. The task
+> bodies are kept as the record of what was planned. The code is the record of what was built.
+
 **Architecture:** One pure refactor, one small piece of new derivation, and three new nullable
 telemetry fields. The refactor extracts both predicates into pure functions and splits them,
 changing no behavior. The new derivation produces a structured reason for the **request-side**
@@ -73,10 +88,10 @@ The spec's Open risks section flags this work specifically:
 > 35-column schema migration with quarantine risk, sits close to AGENTS.md's "no large refactors
 > without approval". It needs explicit approval before PR 1.
 
-- [ ] **Step 1: Get explicit approval before writing code.** Tasks 2 and 4 are exactly the
+- [x] **Step 1: Get explicit approval before writing code.** Tasks 2 and 4 are exactly the
       refactor and the migration named above.
 
-- [ ] **Step 2: If approval is withheld, take the trim instead of abandoning the PR.** The spec's
+- [x] **Step 2: If approval is withheld, take the trim instead of abandoning the PR.** The spec's
       trim is to drop `template_cache_state` — it is already on the `x-ts-template-cache` response
       header — and keep `template_cache_bypass_reason` and `origin_cache_shareable`, which carry
       the triage. Concretely that means: **skip Task 9 entirely**, and drop the
@@ -84,7 +99,7 @@ The spec's Open risks section flags this work specifically:
       datasource column, fixture key). Everything else is unchanged. Task 9 is also the most
       intricate task in the plan, so the trimmed form is substantially cheaper.
 
-- [ ] **Step 3: Record which form you are building** in the PR description, so a reviewer does not
+- [x] **Step 3: Record which form you are building** in the PR description, so a reviewer does not
       read a missing `template_cache_state` as an oversight.
 
 ---
@@ -99,7 +114,7 @@ re-types the boolean expression guards nothing — it passes even if the refacto
 - Modify: `crates/trusted-server-core/src/publisher.rs:4325-4331`
 - Test: same file, `#[cfg(test)]`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -159,12 +174,12 @@ fn every_shared_input_is_necessary_for_shareability() {
 
 The second test is the one that actually catches a mistyped refactor.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test-fastly -- publisher::tests::template_eligibility_implies --nocapture`
 Expected: FAIL — `SharedRequestInputs` not found.
 
-- [ ] **Step 3: Add the type and functions**
+- [x] **Step 3: Add the type and functions**
 
 Above `handle_publisher_request`, add:
 
@@ -201,7 +216,7 @@ pub(crate) fn request_can_use_shared_template(
 }
 ```
 
-- [ ] **Step 4: Replace the inline expression**
+- [x] **Step 4: Replace the inline expression**
 
 At `publisher.rs:4325-4331`, replace the `let request_can_use_shared_template = …` binding with:
 
@@ -224,7 +239,7 @@ At `publisher.rs:4325-4331`, replace the `let request_can_use_shared_template = 
 If shadowing a function name with a local trips clippy, rename the locals to
 `origin_is_shareable` / `can_use_shared_template` and update their use sites.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run: `cargo test-fastly`
 Expected: PASS, no newly failing tests. (The alias already names all four wasm packages; an
@@ -235,7 +250,7 @@ Run: `cargo clippy-fastly`
 Expected: no warnings. `origin_response_is_shareable` is unused until Task 6; if clippy objects,
 land Task 6 before committing rather than adding an allow.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/trusted-server-core/src/publisher.rs
@@ -258,7 +273,7 @@ rather than a re-typed copy of the expression. Behavior is unchanged."
 
 - Modify: `crates/trusted-server-core/src/auction/telemetry.rs` — struct `:99`, `from_parts` `:158`, `from_auction_request` `:130`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -287,12 +302,12 @@ Tasks 2 and 3 both need it and they must build the context identically. Follow t
 pattern at `telemetry.rs:1032-1052`: `EcContext::new_for_test(None, ConsentContext::default())`
 then `AuctionObservationContext::from_parts(...)`.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test-fastly -- auction::telemetry::tests::observation_cache_fields --nocapture`
 Expected: FAIL — no field `origin_cache_shareable`.
 
-- [ ] **Step 3: Add the fields and setters**
+- [x] **Step 3: Add the fields and setters**
 
 Add to `AuctionObservationContext` after `slot_count`, before the private `started_at`:
 
@@ -311,18 +326,18 @@ struct literal; it delegates to `Self::from_parts(...)` at `:146`. Add
 `set_origin_cache_shareable(&mut self, bool)`, `set_template_cache_state(&mut self, &str)`,
 `set_template_cache_bypass_reason(&mut self, &str)`.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test-fastly -- auction::telemetry::tests::observation_cache_fields --nocapture`
 Expected: PASS.
 
-- [ ] **Step 5: Confirm no other construction sites break**
+- [x] **Step 5: Confirm no other construction sites break**
 
 Run: `cargo check-fastly`
 Expected: clean. `publisher.rs:6597` and `:18127` are `from_parts` _calls_, not struct literals,
 so this step is normally a no-op — it exists to catch a literal construction added since.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/trusted-server-core/src/auction/telemetry.rs
@@ -342,7 +357,7 @@ Three absent-by-default fields and their setters. Nothing writes them yet."
 `AuctionTerminalStatus` is declared at `telemetry.rs:49`; check the variant spelling there.
 `push_summary` is at `:661`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -394,12 +409,12 @@ fn rows_omit_cache_outcomes_when_the_observation_has_none() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test-fastly -- auction::telemetry::tests::summary_row_carries_cache --nocapture`
 Expected: FAIL — no field on `AuctionEventRow`.
 
-- [ ] **Step 3: Add the fields and wire `base()`**
+- [x] **Step 3: Add the fields and wire `base()`**
 
 Add to `AuctionEventRow` after `ad_id`, using `u8` not `bool` to match the existing `is_mobile` /
 `gdpr_applies` ClickHouse convention:
@@ -428,12 +443,12 @@ them too — three nullable columns, and no per-row joins in the dashboard.
 auction telemetry summary row". Widening to `base()` is defensible but multiplies the emitted
 payload across every row kind, so it should be a stated choice rather than a silent one.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test-fastly -- auction::telemetry::tests --nocapture`
 Expected: PASS.
 
-- [ ] **Step 5: Confirm the NDJSON shape**
+- [x] **Step 5: Confirm the NDJSON shape**
 
 Run: `cargo test-fastly -- auction::telemetry::tests --nocapture 2>&1 | tail -20`
 
@@ -441,7 +456,7 @@ Run: `cargo test-fastly -- auction::telemetry::tests --nocapture 2>&1 | tail -20
 new key is **always** on the wire including as `null`. That is what makes Task 4 mandatory
 and ordered before deploy.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/trusted-server-core/src/auction/telemetry.rs
@@ -459,7 +474,7 @@ declare them before this ships or rows land in quarantine."
 
 - Modify: `tinybird/datasources/auction_events_raw.datasource`, `tinybird/fixtures/auction_events_raw.ndjson`
 
-- [ ] **Step 1: Add the columns**
+- [x] **Step 1: Add the columns**
 
 In `SCHEMA >`, after `ad_id` and **before** `event_date`:
 
@@ -471,7 +486,7 @@ In `SCHEMA >`, after `ad_id` and **before** `event_date`:
 string columns have 9 and 16 possible values respectively (`TemplateCacheResponseState` at `:94`,
 `TemplateCacheBypassReason` at `:5673`), so dictionary encoding is right for both. Do not touch `ENGINE_SORTING_KEY` or the TTL.
 
-- [ ] **Step 2: Update every fixture row**
+- [x] **Step 2: Update every fixture row**
 
 ```bash
 python3 - <<'PY'
@@ -491,7 +506,7 @@ p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 PY
 ```
 
-- [ ] **Step 3: Verify the fixture matches the schema**
+- [x] **Step 3: Verify the fixture matches the schema**
 
 ```bash
 python3 - <<'PY'
@@ -514,14 +529,14 @@ verifier above will trip on row 0 until that is fixed. Add `"user_agent": null` 
 Step 2 script (it is a legitimate nullable column), and note in the commit that it was missing
 beforehand — do not let the implementer chase it as damage from this change.
 
-- [ ] **Step 4: Cross-check the Rust struct against the columns**
+- [x] **Step 4: Cross-check the Rust struct against the columns**
 
 Read the `AuctionEventRow` field list (`telemetry.rs:277`) and confirm every field name appears
 in the datasource column list. Do this by eye against the struct — a `grep -c "pub "` over the
 file counts fields across every struct in it and is not a usable check. A mismatch is the
 quarantine bug and is silent at runtime.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tinybird/datasources/auction_events_raw.datasource tinybird/fixtures/auction_events_raw.ndjson
@@ -543,7 +558,7 @@ cache. This task is why those tasks are not blocked on scaffolding invented mid-
 
 - Modify: `crates/trusted-server-core/src/publisher.rs` — the `template_cache_end_to_end_tests` module (8984–12336)
 
-- [ ] **Step 1: Add the combined builder**
+- [x] **Step 1: Add the combined builder**
 
 In `template_cache_end_to_end_tests`, alongside the existing `services()`:
 
@@ -578,7 +593,7 @@ coercion — `mod tests` uses the fully-qualified path at `:18078` and does not 
 The builder method for the sink is exactly `.auction_telemetry_sink(...)`, confirmed against
 `services_with_telemetry` (`:13719`).
 
-- [ ] **Step 2: Add a summary-row accessor**
+- [x] **Step 2: Add a summary-row accessor**
 
 `RecordingTelemetrySink` has **no accessor** — it is
 `#[derive(Default)] struct RecordingTelemetrySink { batches: Mutex<Vec<AuctionEventBatch>> }`
@@ -600,7 +615,7 @@ The builder method for the sink is exactly `.auction_telemetry_sink(...)`, confi
 `AuctionEventBatch::rows()` returns `&[AuctionEventRow]` (`telemetry.rs:401`), so the
 `flat_map` typechecks and `next_back()` is available on both slice-iterator layers.
 
-- [ ] **Step 3: Add settings that emit a summary row**
+- [x] **Step 3: Add settings that emit a summary row**
 
 `run()` takes `&Arc<Settings>` (`:9471`), not `&Settings`. Both settings helpers below must
 return `Arc<Settings>` — existing tests wrap at the call site (`:9601`); returning the `Arc` from
@@ -624,7 +639,7 @@ Add a cookie-bearing request builder alongside the existing `navigation_request(
         }
 ```
 
-- [ ] **Step 4: Prove the harness works before relying on it**
+- [x] **Step 4: Prove the harness works before relying on it**
 
 ```rust
         #[tokio::test]
@@ -650,7 +665,7 @@ Run: `cargo test-fastly -- template_cache_end_to_end_tests::harness_emits_a_summ
 Expected: PASS. If it fails, fix the harness here — do not carry a broken harness into Task 6,
 where the failure will look like a wiring bug.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/trusted-server-core/src/publisher.rs
@@ -680,7 +695,7 @@ a binding that does not exist yet". The binding does exist: `origin_response_is_
 at `:4325`, construction is at `:4461`, and a setter immediately after it works. Amend the spec
 rather than following it here.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
         #[tokio::test]
@@ -705,12 +720,12 @@ rather than following it here.
         }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test-fastly -- template_cache_end_to_end_tests::navigation_records_whether --nocapture`
 Expected: FAIL — `origin_cache_shareable` is `None`.
 
-- [ ] **Step 3: Set the field**
+- [x] **Step 3: Set the field**
 
 Change the binding at `:4461` to `let mut observation = …` and add immediately after it:
 
@@ -718,18 +733,18 @@ Change the binding at `:4461` to `let mut observation = …` and add immediately
         observation.set_origin_cache_shareable(origin_response_is_shareable);
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test-fastly -- template_cache_end_to_end_tests::navigation_records_whether --nocapture`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full module**
+- [x] **Step 5: Run the full module**
 
 Run: `cargo test-fastly`
 Expected: PASS. Run the whole module — Viceroy aborts on first panic, so a single-test run hides
 later failures.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/trusted-server-core/src/publisher.rs
@@ -779,7 +794,7 @@ discoverable from the Rust doc comments.
   such page exists, add the caveats next to the datasource in `tinybird/` as a README rather than
   inventing a new docs page.
 
-- [ ] **Step 1: Write both gaps**
+- [x] **Step 1: Write both gaps**
   1. **The denominator is ad-serving pageviews, not all requests.** A summary row is emitted only
      when an auction runs, so a request that bypasses the template cache _because_ the ad stack did
      not run — bot, prefetch, kill-switched, consent-denied — produces no row at all.
@@ -788,11 +803,11 @@ discoverable from the Rust doc comments.
      `None` as "miss" will be wrong for that whole source class. Filter on
      `auction_source = 'initial_navigation'` before computing any rate.
 
-- [ ] **Step 2: Format**
+- [x] **Step 2: Format**
 
 Run: `cd docs && ./node_modules/.bin/prettier --check <the file you edited>`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add <the file you edited>
@@ -810,7 +825,7 @@ rather than a cache miss. Both are silent misreadings otherwise."
 
 ## Final verification
 
-- [ ] **Full gate set**
+- [x] **Full gate set**
 
 ```bash
 cargo fmt --all -- --check
@@ -821,7 +836,7 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --
 cd docs && npm run format && cd ..
 ```
 
-- [ ] **Confirm the change is confined to the expected files**
+- [x] **Confirm the change is confined to the expected files**
 
 ```bash
 git diff main --stat
@@ -837,7 +852,7 @@ This check confirms _which files changed_, nothing more. Behavior neutrality of 
 rests on Task 1's `every_shared_input_is_necessary_for_shareability` test and on Task 1 Step 5 —
 any template-cache test changing outcome means the refactor was not neutral.
 
-- [ ] **Apply the Tinybird migration before deploying**
+- [x] **Apply the Tinybird migration before deploying**
 
 This is a deploy-ordering constraint, not a commit-ordering one — the PR merges atomically.
 Owner: whoever runs the deploy. Apply the datasource change to Tinybird first, then deploy the
