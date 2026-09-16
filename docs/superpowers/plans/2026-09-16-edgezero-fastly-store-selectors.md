@@ -25,6 +25,7 @@
 ### Task 1: Create the Tracking Issue
 
 **Files:**
+
 - No repository files.
 
 - [ ] **Step 1: Draft the issue**
@@ -51,6 +52,7 @@ Expected: GitHub prints the new issue URL. Save its issue number for the pull re
 ### Task 2: Regress Canonical Viceroy Selectors
 
 **Files:**
+
 - Modify: `crates/trusted-server-integration-tests/tests/common/config.rs:48`
 - Modify: `fastly.toml:74`
 - Modify: `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml:86`
@@ -112,6 +114,7 @@ git commit -m "Use canonical Fastly secret store selectors"
 ### Task 3: Consume the EdgeZero PR Branch
 
 **Files:**
+
 - Modify: `Cargo.toml:59`
 - Modify: `Cargo.lock`
 
@@ -170,6 +173,7 @@ were necessary.
 ### Task 4: Align Operator Documentation
 
 **Files:**
+
 - Modify: `docs/guide/fastly.md:264`
 - Modify: `docs/guide/cli.md:115`
 
@@ -224,6 +228,7 @@ git commit -m "Document deploy-time Fastly store selection"
 ### Task 5: Verify the Complete Change
 
 **Files:**
+
 - Verify all modified files.
 
 - [ ] **Step 1: Run formatting checks**
@@ -298,6 +303,7 @@ clean after final commits.
 ### Task 6: Publish the Pull Request
 
 **Files:**
+
 - No additional repository files.
 
 - [ ] **Step 1: Push the isolated branch**

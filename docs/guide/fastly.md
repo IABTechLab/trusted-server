@@ -267,25 +267,33 @@ Trusted Server keeps static app-config credentials under logical store ID
 as `ts_secrets`. Request-signing private keys remain in their separate,
 runtime-managed store.
 
-Set the physical mapping before provisioning:
+Set the physical mapping in the selected deployment environment before
+provisioning and deploying:
 
 ```bash
 export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ts provision --adapter fastly
 ```
 
-Provisioning creates or reuses the physical store and persists this runtime
-mapping in Fastly Config Store `edgezero_runtime_env`, scoped to the current
-Fastly service:
+Provisioning creates or reuses the physical store and the
+`edgezero_runtime_env` Config Store, but does not write environment selectors.
+Deployment copies the selected environment's declared store selectors into
+`edgezero_runtime_env` under their canonical names:
 
 ```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
+EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ```
 
-The runtime ignores legacy unscoped entries. The Fastly service must link both
-`ts_secrets` and `edgezero_runtime_env` to the active service version. The
-custom streaming entry point reads the service-scoped mapping before loading
-app config, so every startup and reload resolves static credentials from
+There is no Fastly service ID in the environment variable name. Each GitHub
+Environment or deploy process uses the same canonical names and may select
+different physical resources. A production deploy reconciles its selectors
+into `edgezero_runtime_env`. A staged deploy creates a per-service staging twin,
+applies the staging environment's selectors, links every selected physical
+store to the staged version, and links the twin under the name
+`edgezero_runtime_env`. Selected resources must already exist before deployment.
+
+The custom streaming entry point reads the deployed mapping before loading app
+config, so every startup and reload resolves static credentials from
 `ts_secrets` while the portable manifest continues to declare
 `trusted_server_secrets`.
 

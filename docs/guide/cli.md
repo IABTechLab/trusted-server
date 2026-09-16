@@ -125,8 +125,9 @@ ts deploy --adapter fastly --service-id <service-id> --staging
 ts deploy --adapter fastly -- --comment "release"
 ```
 
-A staged deploy only redirects the staged version's config selector at the
-`<logical-store-id>_staging` key — it does not copy the production config blob
+A staged deploy selects the physical Config Store from the staging environment
+and points the staged version's config selector at the
+`<logical-store-id>_staging` key. It does not copy the production config blob
 there. Push the staged config before probing the staged version:
 
 ```bash
@@ -134,15 +135,19 @@ ts config push --adapter fastly --staging
 ts config diff --adapter fastly --staging
 ```
 
-The staged version resolves its app-config key through the version-linked
-`edgezero_runtime_env` store. After `ts config push --staging`, the staged
-binary reads `<logical-store-id>_staging` while the active production version
-continues to read the production key.
+The staged version resolves its app-config key through a staging selector store
+linked under the name `edgezero_runtime_env`. Production and staging may select
+the same physical Config Store or different stores. After
+`ts config push --staging`, the staged binary reads
+`<logical-store-id>_staging` in the store selected by the staging environment,
+while the active production version continues to read its production key and
+store.
 
 `--staging` on `config push` / `config diff` writes and compares the
-`<logical-store-id>_staging` key in the same store. It is mutually exclusive
-with `--key`: the staging key is derived from the store's logical id, so an
-explicit key would be written where nothing reads it.
+`<logical-store-id>_staging` key in the physical store selected by the staging
+environment. It is mutually exclusive with `--key`: the staging key is derived
+from the store's logical id, so an explicit key would be written where nothing
+reads it.
 
 Inspect and verify deployments with the deploy lifecycle commands. All three are
 Fastly-only — the axum, cloudflare, and spin adapters reject them:
