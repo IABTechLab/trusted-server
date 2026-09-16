@@ -1,11 +1,16 @@
 # Terraform working data and local state
 .terraform/
+/modules/**/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 .terraform.tfstate.lock.info
 
 # Saved plans can contain provider-returned metadata
 *.tfplan
+
+# Generated operator inputs
+/deployment.generated.yaml
+/runtime/secret-bindings.generated.json
 
 # Local inputs and crash output
 *.auto.tfvars

@@ -28,11 +28,6 @@ variable "instance_type" {
   type        = string
 }
 
-variable "log_retention_days" {
-  description = "CloudWatch Logs retention period."
-  type        = number
-}
-
 variable "name" {
   description = "Stable name prefix for regional resources."
   type        = string
@@ -47,11 +42,6 @@ variable "pbs_port" {
     condition     = var.pbs_port >= 1 && var.pbs_port <= 65535
     error_message = "pbs_port must be a valid TCP port."
   }
-}
-
-variable "region" {
-  description = "AWS region represented by this module instance."
-  type        = string
 }
 
 variable "secrets_kms_key_arn" {
