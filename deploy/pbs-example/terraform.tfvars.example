@@ -1,0 +1,14 @@
+# Fictional local example values. Do not use these identifiers for AWS access.
+aws_account_id = "123456789012"
+aws_profile    = "pbs-example"
+
+east_ami_id          = "ami-0123456789abcdef0"
+east_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-1111-4111-8111-111111111111"
+west_ami_id          = "ami-0fedcba9876543210"
+west_certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/22222222-2222-4222-8222-222222222222"
+
+# Existing hosted-zone ID in the fictional example account.
+route53_zone_id = "Z00000000000000000000"
+
+# Replace with the actual egress ranges approved for Trusted Server.
+trusted_server_cidr_blocks = ["203.0.113.0/24"]
