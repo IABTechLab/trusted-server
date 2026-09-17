@@ -14,7 +14,7 @@
 
 - `Cargo.toml`: select the EdgeZero PR 381 branch for all EdgeZero crates.
 - `Cargo.lock`: lock all EdgeZero packages to the branch revision.
-- `crates/trusted-server-adapter-fastly/src/main.rs`, `crates/trusted-server-adapter-fastly/src/app.rs`: open stores by logical ID and derive the config key from Fastly's staging signal instead of reading `edgezero_runtime_env`.
+- `crates/trusted-server-adapter-fastly/src/main.rs`, `crates/trusted-server-adapter-fastly/src/app.rs`: open stores and the config entry by logical ID instead of reading `edgezero_runtime_env`.
 - `fastly.toml`: expose the local Viceroy secret store under its logical ID and drop the runtime selector store.
 - `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml`, `scripts/template-cache-local-test.sh`: keep generated Viceroy configurations aligned with the root Fastly configuration.
 - `crates/trusted-server-integration-tests/tests/common/config.rs`: regress the logical-ID store exposure in both Viceroy configurations.
@@ -131,11 +131,10 @@ compiler failure, make only the call-site changes required by that error and add
 a focused parsing or behavior test before the production edit.
 
 The branch head removes `edgezero_adapter_fastly::runtime_env_config`. Replace
-`RuntimeStoreConfig::from_env` with `RuntimeStoreConfig::for_target(staging)`:
-open `trusted_server_config` and `trusted_server_secrets` by logical ID and
-derive the config key with `EnvConfig::store_key_for_target`. Both entry points
-pass `fastly::compute_runtime::is_staging()`. Cover the production and staging
-keys with unit tests in `app.rs`.
+`RuntimeStoreConfig::from_env` with `RuntimeStoreConfig::logical()`: open
+`trusted_server_config` and `trusted_server_secrets` by logical ID and read
+the config entry under `trusted_server_config` for every target. Cover the
+logical IDs and key with a unit test in `app.rs`.
 
 - [ ] **Step 3: Verify the lockfile revision is consistent**
 
@@ -193,11 +192,10 @@ contract:
 
 - [ ] **Step 2: Update staging CLI guidance**
 
-Clarify that `ts config push --staging` writes the staging key into the physical
-Config Store selected by the staging environment, and that the staged binary
-reads `<logical-store-id>_staging` because Fastly reports it as staged, not
-because of a stored selector. State that production and staging may select the
-same or different physical stores.
+Clarify that `ts config push --staging` writes the logical key into the
+physical Config Store selected by the staging environment, and that the staged
+binary reads the same `<logical-store-id>` key there. State that production and
+staging may select the same or different physical stores.
 
 - [ ] **Step 3: Check for stale service-scoped guidance**
 

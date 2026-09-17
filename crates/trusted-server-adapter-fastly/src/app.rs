@@ -92,14 +92,12 @@ use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
-use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use fastly::compute_runtime;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -162,20 +160,17 @@ pub(crate) struct RuntimeStoreConfig {
 }
 
 impl RuntimeStoreConfig {
-    /// Store bindings for the running Fastly publication target.
+    /// Store bindings for the Fastly runtime.
     ///
     /// Fastly Compute has no process environment. `EdgeZero` links each selected
     /// physical store to the service version under its logical ID, so the
-    /// runtime opens stores by logical ID and derives the config entry key from
-    /// the target alone: production reads `<id>`, staging reads `<id>_staging`.
-    pub(crate) fn for_target(staging: bool) -> Self {
+    /// runtime opens stores by logical ID and reads the config entry under
+    /// that same ID for every publication target. Staging isolation comes from
+    /// linking a different physical store, never from a different key.
+    pub(crate) fn logical() -> Self {
         Self {
             config_store_name: StoreName::from(DEFAULT_CONFIG_STORE_ID),
-            config_key: EnvConfig::default().store_key_for_target(
-                "config",
-                DEFAULT_CONFIG_STORE_ID,
-                staging,
-            ),
+            config_key: DEFAULT_CONFIG_STORE_ID.to_owned(),
             secret_store_name: StoreName::from(DEFAULT_SECRET_STORE_ID),
         }
     }
@@ -1353,7 +1348,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let stores = RuntimeStoreConfig::for_target(compute_runtime::is_staging());
+        let stores = RuntimeStoreConfig::logical();
         Self::router_with_state(&stores).0
     }
 
@@ -1463,17 +1458,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_store_config_reads_the_staging_config_key_on_staging() {
-        let stores = RuntimeStoreConfig::for_target(true);
-
-        assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
-        assert_eq!(stores.config_key, "trusted_server_config_staging");
-        assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
-    }
-
-    #[test]
-    fn runtime_store_config_opens_logical_store_ids_in_production() {
-        let stores = RuntimeStoreConfig::for_target(false);
+    fn runtime_store_config_opens_logical_store_ids_and_key() {
+        let stores = RuntimeStoreConfig::logical();
 
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");

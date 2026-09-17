@@ -131,29 +131,29 @@ ts deploy --adapter fastly --service-id <service-id> --application-release <rele
 
 A staged deploy selects the physical Config Store from the staging environment
 and links it to the staged version under the logical store ID. The staged
-runtime reads the `<logical-store-id>_staging` key from that store. It does not
-copy the production config blob there. Push the staged config before probing
-the staged version:
+runtime reads the `<logical-store-id>` key from that store. It does not copy
+the production config blob there. Push the staged config before probing the
+staged version:
 
 ```bash
 ts config push --adapter fastly --staging
 ts config diff --adapter fastly --staging
 ```
 
-Config keys are deterministic on Fastly: production reads `<logical-store-id>`,
-staging reads `<logical-store-id>_staging`, and local Viceroy reads the
-production key. The binary decides which key to read from Fastly's staging
-signal, not from a stored selector. Production and staging may select the same
-physical Config Store or different stores. After `ts config push --staging`,
-the staged binary reads `<logical-store-id>_staging` in the store selected by
-the staging environment, while the active production version continues to read
-its production key and store.
+The config key is fixed on Fastly: production, staging, and local Viceroy all
+read `<logical-store-id>`. Staging isolation comes from the physical store the
+staging environment selects with `EDGEZERO__STORES__CONFIG__<ID>__NAME`, never
+from a different key. Production and staging may select the same physical
+Config Store or different stores. After `ts config push --staging`, the staged
+binary reads `<logical-store-id>` in the store selected by the staging
+environment, while the active production version continues to read the same
+key in its own store.
 
 `--staging` on `config push` / `config diff` writes and compares the
-`<logical-store-id>_staging` key in the physical store selected by the staging
-environment. It is mutually exclusive with `--key`: the staging key is derived
-from the store's logical id, so an explicit key would be written where nothing
-reads it.
+`<logical-store-id>` key in the physical store selected by the staging
+environment. It is mutually exclusive with `--key`: Fastly accepts only the
+logical store ID as the key for every target, so an explicit key would be
+written where nothing reads it.
 
 Inspect and verify deployments with the deploy lifecycle commands. All three are
 Fastly-only — the axum, cloudflare, and spin adapters reject them:

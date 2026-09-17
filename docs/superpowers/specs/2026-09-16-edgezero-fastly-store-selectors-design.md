@@ -27,9 +27,9 @@ the release tag that contains the merged change.
 
 The Fastly entry point will stop reading `edgezero_runtime_env`. It will open
 the config and secret stores by their logical IDs, `trusted_server_config` and
-`trusted_server_secrets`, and derive the config entry key from Fastly's staging
-signal through EdgeZero's target-key rule: production reads
-`trusted_server_config`, staging reads `trusted_server_config_staging`.
+`trusted_server_secrets`, and read the config entry under
+`trusted_server_config` for every target. Staging isolation comes from the
+physical store the staging environment selects, not from a different key.
 
 Local Viceroy configuration will expose the secret store under the logical ID
 `trusted_server_secrets` and drop the `edgezero_runtime_env` Config Store, so

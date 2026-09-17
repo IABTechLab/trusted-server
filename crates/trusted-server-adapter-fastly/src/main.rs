@@ -8,7 +8,6 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
 use error_stack::Report;
-use fastly::compute_runtime;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
@@ -89,7 +88,7 @@ fn main() {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest) {
-    let runtime_stores = RuntimeStoreConfig::for_target(compute_runtime::is_staging());
+    let runtime_stores = RuntimeStoreConfig::logical();
 
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
