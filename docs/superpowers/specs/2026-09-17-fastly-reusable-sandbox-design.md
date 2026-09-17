@@ -55,7 +55,21 @@ Two properties of this path block naive reuse.
 
 ## Dependencies
 
-The workspace pins EdgeZero at `277544c431c1ab9bafa14a45d5f35975b5587e97` on `feat/reusable-app-lifecycle`.
+The workspace pins EdgeZero at `76c59b440fb35d1317dcb3fa8c1172161e3f5309` on
+`feat/reusable-app-lifecycle`. (It briefly sat at `277544c4` on the same
+branch; that revision carried the CLI and Cloudflare fixes but no lifecycle
+module.)
+
+That revision adds `edgezero_adapter_fastly::lifecycle`, which this adapter
+now uses instead of its own equivalents. The framework owns lazy
+successful-only retention, the callback count, the initialization-attempt
+count, the one-time setup guard, and the serving wrappers. The sections below
+describe the design as originally implemented; where they name a local
+mechanism such as `logger_installed`, `resolve_app` or a hand-rolled
+`Serve::run_with_context`, that mechanism has since been replaced by
+`Sandbox::setup_once`, `Sandbox::initialize`, and
+`lifecycle::serve_custom` / `run_custom`. What stays application-owned is
+unchanged.
 
 The pin is **not** for the `Serve` re-export: that type comes from the
 already-pinned `fastly 0.12.1` SDK, and EdgeZero's own contract says not to

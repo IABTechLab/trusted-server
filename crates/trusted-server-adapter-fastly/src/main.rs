@@ -51,7 +51,7 @@ use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use crate::sandbox::{Sandbox, SandboxCounters, ServeMode};
+use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics};
 
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
@@ -85,16 +85,26 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
 /// come from the runtime environment before the SDK serving loop is entered;
 /// an unconfigured or partially configured sandbox stays single-request.
 fn main() {
-    let mut sandbox = Sandbox::default();
-
     let (mode, diagnostics) = serve_mode();
+
+    // Held outside the sandbox: `serve_custom` owns the `Sandbox` and exposes
+    // no slot for application state that is not the retained payload.
+    let mut startup = StartupDiagnostics::default();
     for message in diagnostics {
-        sandbox.defer_diagnostic(message);
+        startup.push(message);
     }
 
     match mode {
-        ServeMode::Single => handle_request(FastlyRequest::from_client(), &mut sandbox),
-        ServeMode::Reuse(limits) => serve_loop(limits, &mut sandbox),
+        ServeMode::Single => {
+            // `run_custom` completes the callback's SDK result exactly once.
+            // The callback sends its own response and returns `()`, so there
+            // is no error for the SDK to turn into a second response.
+            let Ok(()) = edgezero_adapter_fastly::lifecycle::run_custom(
+                FastlyRequest::from_client(),
+                |request, sandbox: &mut Sandbox| handle_request(request, sandbox, &mut startup),
+            );
+        }
+        ServeMode::Reuse(limits) => serve_loop(limits, startup),
     }
 }
 
@@ -103,25 +113,36 @@ fn main() {
 /// Only compiled with the `reusable-sandbox` feature; [`serve_mode`] can never
 /// return [`ServeMode::Reuse`] without it.
 #[cfg(feature = "reusable-sandbox")]
-fn serve_loop(limits: crate::sandbox::SandboxLimits, sandbox: &mut Sandbox) {
-    let summary = fastly::http::serve::Serve::new()
-        .with_max_requests(limits.max_requests)
-        .with_max_lifetime(limits.max_lifetime)
-        .with_timeout(limits.timeout)
-        .run_with_context(handle_request, sandbox);
+fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnostics) {
+    // `serve_custom` owns the `Sandbox` and drops it when serving ends, so the
+    // retirement line reports the last values the callback observed rather
+    // than reading the sandbox afterwards. These are snapshots of the
+    // framework's counters, not counters of our own.
+    let mut last_requests = 0_u64;
+    let mut last_attempts = 0_u64;
 
-    // `handle_request` sends its own response and returns `()`, so the SDK has
-    // no terminal error to report. The summary is still worth a line: it is the
-    // only place the sandbox's own view of its request count is visible.
+    let summary = edgezero_adapter_fastly::lifecycle::serve_custom(
+        fastly::http::serve::Serve::new()
+            .with_max_requests(limits.max_requests)
+            .with_max_lifetime(limits.max_lifetime)
+            .with_timeout(limits.timeout),
+        |request, sandbox: &mut Sandbox| {
+            last_requests = sandbox.requests();
+            last_attempts = sandbox.initialization_attempts();
+            handle_request(request, sandbox, &mut startup);
+        },
+    );
+
     log::info!(
-        "sandbox retiring after {} request(s), {} build(s)",
+        "sandbox retiring after {} attempted callback(s), {} observed, {} build attempt(s)",
         summary.requests(),
-        sandbox.builds()
+        last_requests,
+        last_attempts
     );
 }
 
 #[cfg(not(feature = "reusable-sandbox"))]
-fn serve_loop(_limits: crate::sandbox::SandboxLimits, _sandbox: &mut Sandbox) {
+fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnostics) {
     unreachable!("serve_mode never selects reuse without the reusable-sandbox feature")
 }
 
@@ -135,8 +156,10 @@ fn serve_loop(_limits: crate::sandbox::SandboxLimits, _sandbox: &mut Sandbox) {
 /// reused sandbox the SDK refuses to wait for the next request until the
 /// current one is complete, so a missed send stalls the loop rather than
 /// merely dropping one response.
-fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox) {
-    let ordinal = sandbox.begin_request();
+fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut StartupDiagnostics) {
+    // The framework counts the callback before invoking it, including early
+    // returns, so this is already this request's 1-based ordinal.
+    let ordinal = sandbox.requests();
 
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
     if let Some(response) = health_response(&req) {
@@ -144,7 +167,12 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox) {
         return;
     }
 
-    sandbox.ensure_logger();
+    // Marked complete only once installation succeeds, so a failed install is
+    // retried on a later callback. `setup_once` rolls nothing back, so that is
+    // only correct because `init_logger` is harmless to repeat — see its docs.
+    if sandbox.setup_once(crate::logging::init_logger).is_ok() {
+        startup.flush();
+    }
 
     // Correlation is request-local and never retained. `FASTLY_TRACE_ID` names
     // the sandbox, not the request, so it is not used here. The id rides on the
@@ -170,7 +198,7 @@ fn sandbox_metrics_response(sandbox: &Sandbox, ordinal: u64) -> FastlyResponse {
         "instance": instance_id(),
         "ordinal": ordinal,
         "requests": sandbox.requests(),
-        "builds": sandbox.builds(),
+        "builds": sandbox.initialization_attempts(),
     });
 
     FastlyResponse::from_status(fastly::http::StatusCode::OK)
@@ -329,19 +357,27 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Build lazily, once per sandbox. Reached only past the health, JA4, and
     // counters short-circuits, so none of those pays for construction.
     //
-    // A failed build is deliberately not retained: it yields an error router
-    // with no state, which serves this request and is dropped, so a transient
-    // config-store failure cannot pin the sandbox into permanent error mode.
-    // The next request retries construction.
-    let failed_build =
-        sandbox.resolve_app(|| TrustedServerApp::build_app_with_state(&runtime_stores));
+    // `initialize` builds only when the sandbox is empty, retains only
+    // success, and returns the error unchanged. A failed build hands back its
+    // error router as the error payload: that serves this request and is then
+    // dropped, so a transient config-store failure cannot pin the sandbox into
+    // permanent error mode, and the next callback retries construction.
+    let failed_build = sandbox
+        .initialize(|| {
+            let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
+            match state {
+                Some(state) => Ok(RetainedApp { app, state }),
+                None => Err(app),
+            }
+        })
+        .err();
 
     let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
-        match (failed_build.as_ref(), sandbox.retained_app()) {
+        match (failed_build.as_ref(), sandbox.state()) {
             (Some(app), _) => (app, None),
             (None, Some(retained)) => (&retained.app, Some(Arc::clone(&retained.state))),
             (None, None) => {
-                log::error!("no application available after build");
+                log::error!("no application available after initialization");
                 FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
                     .with_body_text_plain("Internal Server Error")
                     .send_to_client();

@@ -407,3 +407,92 @@ harness cannot reproduce.
 - No latency A/B/C was rerun at this revision. Build-count and correctness
   were re-observed; comparative latency was not, and the earlier figures are
   not offered as evidence for this revision.
+
+---
+
+# Adoption of EdgeZero's lifecycle module (`76c59b44`)
+
+The pin moved from `277544c4` to
+`76c59b440fb35d1317dcb3fa8c1172161e3f5309` on `feat/reusable-app-lifecycle`,
+which adds `edgezero_adapter_fastly::lifecycle`. This is an adoption, not a
+repin: the local lifecycle mechanics were deleted and replaced.
+
+Everything below was observed **fresh at this revision**. No earlier latency
+figure is offered as evidence for it, and no comparative A/B/C was rerun.
+
+## Local implementations removed
+
+| Removed                                                                                              | Replaced by                                                  |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| local `struct Sandbox` (`logger_installed`, `requests`, `builds`, `pending_diagnostics`, `retained`) | `lifecycle::Sandbox<RetainedApp>`                            |
+| `resolve_app`, `retain_app`, `retained_app`                                                          | `Sandbox::initialize`                                        |
+| `ensure_logger` + `logger_installed` guard                                                           | `Sandbox::setup_once`                                        |
+| `begin_request` / `record_build` / `requests` / `builds`                                             | `Sandbox::requests()` / `Sandbox::initialization_attempts()` |
+| `Serve::new()…run_with_context(…)` glue                                                              | `lifecycle::serve_custom` and `lifecycle::run_custom`        |
+
+`logging::init_logger` now returns `Result<(), String>` instead of panicking on
+the install path, so `setup_once` marks setup complete only after a successful
+install and a failed install stays eligible for retry.
+
+`serve_app` is **not** used: its response conversion buffers streams.
+
+## Still application-owned
+
+Feature gate, kill switch, limit parsing and safe fallback; settings retention
+and refresh policy; health, JA4 and metrics routing; fresh per-request
+metadata, handles, services, extensions, bodies and correlation ids; raw
+request conversion and router dispatch; response-extension finalization;
+progressive streaming; duplicate `Set-Cookie`; post-send work; per-document
+rewrite-buffer isolation.
+
+One new local type: `StartupDiagnostics`, holding messages produced by limit
+resolution before any logger exists. It cannot live in the framework `Sandbox`,
+which `serve_custom` owns and which has no slot for application state other
+than the retained payload, so it is threaded through the callback.
+
+## Runtime observations at `76c59b44`
+
+Viceroy 0.17.0, Fastly SDK 0.12.1, service id `0000000000000000000000`.
+Artifacts: arm A `sha256:4bfa7e6007c1dc1deef1…`, arm C
+`sha256:2c6319b7833a80a9f33d…`.
+
+| Check                                                    | Result                                                                                                                                                                                                                                                                        |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Feature off stays single-request, with limits configured | **pass** — 6 requests, 6 distinct instances, ordinal 1 each                                                                                                                                                                                                                   |
+| Lazy start, build once, reuse                            | **pass** — 6 requests on one instance, `builds=1`                                                                                                                                                                                                                             |
+| Probes do not construct                                  | **pass** — `/health`, `/_ts/debug/sandbox`, `/_ts/debug/ja4` served at ordinals 1–3; the first workload request at ordinal 4 still reported `builds=1`. The framework counts probe callbacks as requests, which is why the ordinal advances while the attempt count does not. |
+| Failed initialization retried, never retained            | **pass** — 5 requests, 5 build attempts                                                                                                                                                                                                                                       |
+| Request isolation                                        | **pass** — 4 requests × 4 distinct markers, none appeared in another response                                                                                                                                                                                                 |
+| Duplicate `Set-Cookie` and finalization                  | **pass** — both cookies and the finalized cache header on every request of a reused sandbox                                                                                                                                                                                   |
+| Progressive delivery                                     | **pass** — first byte 0.155–0.167 s against ~2.16 s total                                                                                                                                                                                                                     |
+| Post-commit failure, then a successful request           | **pass** — two aborted requests each produced exactly one status line, then ordinal 3 succeeded with `builds=1` on the same sandbox                                                                                                                                           |
+
+Post-commit failures logged with full attribution, distinct per request:
+
+```
+streaming failed [instance=…0000 ordinal=1 request=…0000]
+streaming failed [instance=…0000 ordinal=2 request=…0001]
+```
+
+## EdgeZero's compatibility suite at this revision
+
+`./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime`
+→ **exit 0** at `76c59b4`, including the `custom-*` arms and
+`custom-initialization`.
+
+## Limitations
+
+- **Same-sandbox config-store recovery stays unit-level.** Viceroy's config and
+  secret stores are fixed for a guest's lifetime, so an initialization failure
+  persists for that whole sandbox and fail → success → reuse cannot be driven
+  end to end locally. It is covered by
+  `sandbox::tests::a_failed_build_is_retried_and_a_later_success_is_retained`,
+  which drives `Sandbox::initialize` with an injected builder and asserts the
+  third call does not rebuild.
+- **macOS only.** Linux is CI-only; cross-compiling locally fails because
+  `aws-lc-sys` needs a Linux C toolchain that is not installed. No claim is
+  made that Linux CI passed.
+- Long-lived memory behaviour and deployed eviction remain unverified.
+- Six requests per sandbox remains a local Viceroy observation.
+- Correctness used mock origins on `127.0.0.1`.
+- No comparative latency was rerun at this revision.

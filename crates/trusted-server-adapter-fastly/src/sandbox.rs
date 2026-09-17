@@ -49,119 +49,49 @@ pub(crate) const SANDBOX_METRICS_PATH: &str = "/_ts/debug/sandbox";
 /// has no instance identity and cannot claim observed reuse.
 pub(crate) const INSTANCE_ID_UNAVAILABLE: &str = "unavailable";
 
-/// Per-sandbox state carried across requests by the entry point.
+/// Per-sandbox state, owned by `edgezero_adapter_fastly::lifecycle::Sandbox`.
 ///
-/// Holds the logger guard, the measurement counters, and the retained
-/// application. Never request identity and never native handles: those stay
-/// request-scoped.
-#[derive(Default)]
-pub(crate) struct Sandbox {
-    logger_installed: bool,
-    requests: u64,
-    builds: u64,
-    pending_diagnostics: Vec<String>,
-    retained: Option<RetainedApp>,
-}
+/// The framework owns lazy successful-only retention, the callback count, the
+/// initialization-attempt count, and the one-time setup guard. This alias
+/// names the application-specific payload it retains.
+pub(crate) type Sandbox = edgezero_adapter_fastly::lifecycle::Sandbox<RetainedApp>;
 
-/// A successfully built application, kept for the life of the sandbox.
+/// The application state a retained sandbox carries.
 ///
-/// Only ever holds a build that produced state. A failed build yields an
-/// error router with no state, which serves its own request and is dropped;
-/// retaining it would pin the sandbox into permanent error mode.
+/// Only ever reachable after a successful build: a failed build returns the
+/// error router as the `initialize` error instead, so it is served for the
+/// current request and dropped rather than retained.
 pub(crate) struct RetainedApp {
     pub(crate) app: App,
     pub(crate) state: Arc<AppState>,
 }
 
-impl Sandbox {
-    /// Installs the global logger on first use.
-    ///
-    /// [`crate::logging::init_logger`] panics when a global logger is already
-    /// installed, which a reused sandbox would otherwise do on its second
-    /// request. The guard is owned here rather than inside the logger so that
-    /// ownership of the one-time initialization is visible at the entry point.
-    pub(crate) fn ensure_logger(&mut self) {
-        if self.logger_installed {
-            return;
-        }
-        crate::logging::init_logger();
-        self.logger_installed = true;
+/// Startup diagnostics held until a logger exists.
+///
+/// Limit resolution runs in `main`, before any logger is installed, so its
+/// messages are collected here and flushed by the first callback that
+/// installs logging. This is callback-local state rather than sandbox state:
+/// `serve_custom` owns the `Sandbox` and exposes no slot for it.
+#[derive(Debug, Default)]
+pub(crate) struct StartupDiagnostics(Vec<String>);
 
-        // Startup limit resolution runs in `main`, before any logger exists,
-        // so its diagnostics are held here and emitted once there is somewhere
-        // for them to go. Dropping them would hide the reason reuse is off.
-        for message in self.pending_diagnostics.drain(..) {
+impl StartupDiagnostics {
+    /// Records a message for emission once a logger exists.
+    pub(crate) fn push(&mut self, message: impl Into<String>) {
+        self.0.push(message.into());
+    }
+
+    /// Emits and clears everything held so far.
+    pub(crate) fn flush(&mut self) {
+        for message in self.0.drain(..) {
             log::info!("{message}");
         }
     }
 
-    /// Records a startup diagnostic for emission once the logger is installed.
-    pub(crate) fn defer_diagnostic(&mut self, message: impl Into<String>) {
-        self.pending_diagnostics.push(message.into());
-    }
-
-    /// Records the start of a request and returns its 1-based ordinal.
-    pub(crate) fn begin_request(&mut self) -> u64 {
-        self.requests = self.requests.saturating_add(1);
-        self.requests
-    }
-
-    /// Records that the application was constructed in this sandbox.
-    pub(crate) fn record_build(&mut self) {
-        self.builds = self.builds.saturating_add(1);
-    }
-
-    /// Number of requests this sandbox has begun.
-    #[cfg(any(feature = "reusable-sandbox", test))]
-    pub(crate) fn requests(&self) -> u64 {
-        self.requests
-    }
-
-    /// Number of application builds this sandbox has performed.
-    pub(crate) fn builds(&self) -> u64 {
-        self.builds
-    }
-
-    /// The retained application, if one has been built and kept.
-    pub(crate) fn retained_app(&self) -> Option<&RetainedApp> {
-        self.retained.as_ref()
-    }
-
-    /// Retains a successfully built application for later requests.
-    pub(crate) fn retain_app(&mut self, app: App, state: Arc<AppState>) {
-        self.retained = Some(RetainedApp { app, state });
-    }
-
-    /// Resolves the application for this request, building it if needed.
-    ///
-    /// This is the whole build/reuse/retry decision, in one place so it can be
-    /// exercised with an injected builder rather than re-implemented by tests.
-    ///
-    /// Returns `None` when the caller should use [`Self::retained_app`], and
-    /// `Some(app)` when the build failed: that value is an error router with
-    /// no state, which serves the current request and is then dropped.
-    /// Retaining it would pin the sandbox into permanent error mode, so the
-    /// next request calls `build` again.
-    ///
-    /// `build` is not called at all once an application is retained.
-    pub(crate) fn resolve_app<F>(&mut self, build: F) -> Option<App>
-    where
-        F: FnOnce() -> (App, Option<Arc<AppState>>),
-    {
-        if self.retained.is_some() {
-            return None;
-        }
-
-        let (app, state) = build();
-        self.record_build();
-
-        match state {
-            Some(state) => {
-                self.retain_app(app, state);
-                None
-            }
-            None => Some(app),
-        }
+    /// Whether anything is still waiting to be emitted.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -191,7 +121,7 @@ impl SandboxCounters {
             .filter(|settings| metrics_enabled(settings))
             .map(|_| Self {
                 ordinal,
-                builds: sandbox.builds(),
+                builds: sandbox.initialization_attempts(),
                 request_id: request_id.to_owned(),
             })
     }
@@ -482,31 +412,39 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_installs_the_logger_once_then_reuses_it() {
+    fn setup_runs_once_on_success_and_retries_after_failure() {
         let mut sandbox = Sandbox::default();
-        sandbox.defer_diagnostic("startup note");
+        let attempts = Cell::new(0_u32);
 
-        // First request: really installs the global logger.
-        sandbox.ensure_logger();
-        assert!(
-            sandbox.logger_installed,
-            "the first request should install the logger"
-        );
-        assert!(
-            sandbox.pending_diagnostics.is_empty(),
-            "installation should flush the deferred startup diagnostics"
+        // A failed install must leave setup eligible for retry.
+        let failed = sandbox.setup_once(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), &str>("install failed")
+        });
+        assert_eq!(
+            failed.err(),
+            Some("install failed"),
+            "the error should surface"
         );
 
-        // Second request in the same sandbox. Without the guard this reaches
-        // `fern`'s `apply()` a second time and panics, which is the failure
-        // this test exists to catch.
-        sandbox.ensure_logger();
-        sandbox.ensure_logger();
+        // The retry runs, because setup was never marked complete.
+        sandbox
+            .setup_once(|| {
+                attempts.set(attempts.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .expect("the retry should succeed");
+        assert_eq!(attempts.get(), 2, "a failed install should be retried");
 
-        assert!(
-            sandbox.logger_installed,
-            "the guard should stay set across requests"
-        );
+        // Once successful, it never runs again. Reinstalling the global logger
+        // panics inside `fern`, which is the failure this guards.
+        sandbox
+            .setup_once(|| -> Result<(), &str> {
+                attempts.set(attempts.get() + 1);
+                panic!("setup must not run again after success")
+            })
+            .expect("a completed setup should be skipped");
+        assert_eq!(attempts.get(), 2, "setup should stay complete");
     }
 
     /// Minimal settings sufficient to build real application state.
@@ -536,6 +474,15 @@ mod tests {
     fn test_state() -> Arc<AppState> {
         crate::app::build_state_from_settings(test_settings())
             .expect("should build sandbox test state")
+    }
+
+    /// A real `RetainedApp`, so retention is exercised against the type the
+    /// entry point actually keeps rather than a stand-in.
+    fn test_retained() -> RetainedApp {
+        RetainedApp {
+            app: test_app(),
+            state: test_state(),
+        }
     }
 
     /// An empty but real `App`.
@@ -651,25 +598,22 @@ mod tests {
     }
 
     #[test]
-    fn deferred_diagnostics_survive_until_the_logger_exists() {
-        let mut sandbox = Sandbox::default();
-        sandbox.defer_diagnostic("reuse declined");
+    fn deferred_diagnostics_are_held_until_flushed() {
+        let mut startup = StartupDiagnostics::default();
+        startup.push("reuse declined");
 
         assert_eq!(
-            sandbox.pending_diagnostics.len(),
+            startup.pending(),
             1,
             "startup runs before the logger, so the message must be held"
         );
 
-        // Simulates `ensure_logger` past the point of installation; calling it
-        // for real would install a global logger and break sibling tests.
-        sandbox.logger_installed = true;
-        let drained: Vec<String> = sandbox.pending_diagnostics.drain(..).collect();
+        startup.flush();
 
         assert_eq!(
-            drained,
-            vec!["reuse declined".to_owned()],
-            "the held diagnostic should be emitted, not dropped"
+            startup.pending(),
+            0,
+            "flushing should emit and clear everything held"
         );
     }
 
@@ -678,13 +622,13 @@ mod tests {
         let sandbox = Sandbox::default();
 
         assert!(
-            sandbox.retained_app().is_none(),
+            sandbox.state().is_none(),
             "construction must be lazy so the health probe never pays for it"
         );
         assert_eq!(
-            sandbox.builds(),
+            sandbox.initialization_attempts(),
             0,
-            "a sandbox that has served nothing should report no builds"
+            "a sandbox that has served nothing should report no build attempts"
         );
     }
 
@@ -693,24 +637,21 @@ mod tests {
         let mut sandbox = Sandbox::default();
         let builds = Cell::new(0_u32);
 
-        // First request builds through the production decision.
-        let transient = sandbox.resolve_app(|| {
-            builds.set(builds.get() + 1);
-            (test_app(), Some(test_state()))
-        });
-        assert!(transient.is_none(), "a successful build should be retained");
+        sandbox
+            .initialize(|| {
+                builds.set(builds.get() + 1);
+                Ok::<_, &str>(test_retained())
+            })
+            .expect("the first build should succeed");
         assert_eq!(builds.get(), 1, "the first request should build");
 
-        // Later requests must not call the builder at all.
-        for ordinal in 2..=4 {
-            let transient = sandbox.resolve_app(|| {
-                builds.set(builds.get() + 1);
-                panic!("request {ordinal} must not rebuild a retained application")
-            });
-            assert!(
-                transient.is_none(),
-                "request {ordinal} should use the retained application"
-            );
+        for attempt in 2..=4_u32 {
+            sandbox
+                .initialize(|| -> Result<RetainedApp, &str> {
+                    builds.set(builds.get() + 1);
+                    panic!("request {attempt} must not rebuild a retained application")
+                })
+                .expect("a retained application should be reused");
         }
 
         assert_eq!(
@@ -718,7 +659,11 @@ mod tests {
             1,
             "four requests should cost exactly one build; that is the whole point"
         );
-        assert_eq!(sandbox.builds(), 1, "the counter should agree");
+        assert_eq!(
+            sandbox.initialization_attempts(),
+            1,
+            "the framework counter should agree"
+        );
     }
 
     #[test]
@@ -726,45 +671,42 @@ mod tests {
         let mut sandbox = Sandbox::default();
         let builds = Cell::new(0_u32);
 
-        // Request 1: the build fails. `build_app_with_state` returns an error
-        // router with no state, which is what `None` models here.
-        let transient = sandbox.resolve_app(|| {
+        // Request 1: the build fails. The error payload stands in for the
+        // error router `build_app_with_state` returns when state is `None`.
+        let failed = sandbox.initialize(|| {
             builds.set(builds.get() + 1);
-            (test_app(), None)
+            Err::<RetainedApp, &str>("error router")
         });
-        assert!(
-            transient.is_some(),
+        assert_eq!(
+            failed.err(),
+            Some("error router"),
             "a failed build must be handed back for this request only"
         );
         assert!(
-            sandbox.retained_app().is_none(),
+            sandbox.state().is_none(),
             "a failed build must not be retained"
         );
 
-        // Request 2: the build succeeds. This is the recovery step, and it is
-        // only reachable because the failure was not retained.
-        let transient = sandbox.resolve_app(|| {
-            builds.set(builds.get() + 1);
-            (test_app(), Some(test_state()))
-        });
+        // Request 2: the retry succeeds. Only reachable because the failure
+        // was not retained.
+        sandbox
+            .initialize(|| {
+                builds.set(builds.get() + 1);
+                Ok::<_, &str>(test_retained())
+            })
+            .expect("the retry should succeed");
         assert!(
-            transient.is_none(),
-            "the retry should succeed and be retained"
-        );
-        assert!(
-            sandbox.retained_app().is_some(),
+            sandbox.state().is_some(),
             "the recovered application should be retained"
         );
 
         // Request 3: recovery is durable — no further build.
-        let transient = sandbox.resolve_app(|| {
-            builds.set(builds.get() + 1);
-            panic!("a recovered application must not be rebuilt")
-        });
-        assert!(
-            transient.is_none(),
-            "request 3 should reuse the recovered app"
-        );
+        sandbox
+            .initialize(|| -> Result<RetainedApp, &str> {
+                builds.set(builds.get() + 1);
+                panic!("a recovered application must not be rebuilt")
+            })
+            .expect("request 3 should reuse the recovered app");
 
         assert_eq!(
             builds.get(),
@@ -772,7 +714,7 @@ mod tests {
             "one failed build plus one successful build, then reuse"
         );
         assert_eq!(
-            sandbox.builds(),
+            sandbox.initialization_attempts(),
             2,
             "both attempts should be counted so a retry loop stays visible"
         );
@@ -808,23 +750,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ordinals_increase_and_builds_count_separately() {
-        let mut sandbox = Sandbox::default();
-
-        assert_eq!(
-            sandbox.begin_request(),
-            1,
-            "first request should be ordinal 1"
-        );
-        sandbox.record_build();
-        assert_eq!(sandbox.begin_request(), 2, "ordinals should increase");
-
-        assert_eq!(sandbox.requests(), 2, "should have begun two requests");
-        assert_eq!(
-            sandbox.builds(),
-            1,
-            "a reused sandbox should report fewer builds than requests"
-        );
-    }
+    // Request ordinals and build attempts are counted by
+    // `edgezero_adapter_fastly::lifecycle::Sandbox` itself, incremented in its
+    // private per-callback hook. They are exercised through `serve_custom` /
+    // `run_custom` at runtime and covered by the framework's own tests, so
+    // there is nothing left here to unit test.
 }
