@@ -345,7 +345,7 @@ function sizeFacts(cycle: GptDiagnosticsRequestCycle): string[] {
     fillSize
       ? `GPT-reported size ${formatSizes([fillSize])}`
       : cycle.size?.[0] === 1 && cycle.size[1] === 1
-        ? 'GPT-reported size: 1×1 placeholder hidden'
+        ? 'GPT-reported size: placeholder hidden'
         : 'GPT-reported size: Not observed',
     cycle.observedSlotSize
       ? `Size filled ${formatSizes([cycle.observedSlotSize])} · Measured outer slot size`
