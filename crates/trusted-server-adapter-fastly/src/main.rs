@@ -333,15 +333,8 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // with no state, which serves this request and is dropped, so a transient
     // config-store failure cannot pin the sandbox into permanent error mode.
     // The next request retries construction.
-    let mut failed_build = None;
-    if sandbox.retained_app().is_none() {
-        let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
-        sandbox.record_build();
-        match state {
-            Some(state) => sandbox.retain_app(app, state),
-            None => failed_build = Some(app),
-        }
-    }
+    let failed_build =
+        sandbox.resolve_app(|| TrustedServerApp::build_app_with_state(&runtime_stores));
 
     let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
         match (failed_build.as_ref(), sandbox.retained_app()) {

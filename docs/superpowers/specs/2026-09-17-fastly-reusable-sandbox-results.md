@@ -58,6 +58,24 @@ viceroy serve -C fastly.toml --addr 127.0.0.1:7676 <arm>.wasm
 ts dev sandbox-probe --path /.well-known/trusted-server.json --requests 8
 ```
 
+### Resource-measurement provenance
+
+The reuse, build-count and latency figures come from the commits in the table
+above. The vCPU and heap figures do **not**: those headers were added later, in
+`f51ba6f51`, so they were collected from a separate build of that revision with
+`--features reusable-sandbox`.
+
+`ts dev sandbox-probe` does not report the resource headers. They were read
+directly:
+
+```bash
+curl -s -o /dev/null -D - http://127.0.0.1:7676/<path> \
+  | grep -iE 'x-ts-sandbox-(vcpu-ms|heap-mib|ordinal|builds|instance)'
+```
+
+The latency experiment was not rerun on `f51ba6f51`; adding two header writes
+is not expected to move it, but that is an assumption, not a measurement.
+
 ## Reuse
 
 Reuse was observed in B and C. Each sandbox served **6 requests** before a new
@@ -118,9 +136,14 @@ Derived figures, each stated as what it actually is:
 - **Warm C versus A: 11.7×** (A p50 3.546 / C reused p50 0.302), a saving of
   ~3.24 ms at p50. This compares a _reused_ request against the baseline and is
   not the whole-workload improvement.
-- **Whole-workload improvement: ~3.9×.** Averaged across a full six-request
-  sandbox, C is ~0.90 ms against A's 3.55 ms p50, because one request in six
-  still pays the build.
+- **Observed aggregate: ~4.15×** (A mean 3.872 / C mean 0.934). Both are sample
+  means over the same 24 observations per arm, so this is a like-for-like
+  aggregate rather than a mix of statistics. The sample is small and local;
+  treat the ratio as indicative.
+- **Modelled amortization, stated separately:** across a full six-request
+  sandbox where one request in six pays the build, C would average
+  (3.883 + 5 × 0.302) / 6 ≈ 0.90 ms. This is a model built from the two C
+  subsets, not an observed aggregate, and it is not the figure above.
 
 ### Route selection matters
 
@@ -133,18 +156,33 @@ route. Any repeat of this measurement must choose the route deliberately.
 ## CPU and memory
 
 Both counters are supported under Viceroy and were read per request from one
-retained sandbox:
+retained sandbox.
 
-| Request (ordinal) | cumulative vCPU ms | heap MiB |
-| ----------------- | ------------------ | -------- |
-| 1 (builds)        | 17                 | 4        |
-| 2                 | 18                 | 4        |
-| 3                 | 21                 | 4        |
-| 4                 | 23                 | 4        |
+**These are pre-send cumulative samples, not complete per-request costs.** Both
+counters are read as the counters are attached to the response, which is before
+headers commit, therefore before streaming and before post-send work such as
+pull sync. Consequently:
 
-vCPU is cumulative per sandbox: ~17 ms through the first request including
-construction, then ~1–3 ms per reused request. Heap held at 4 MiB across four
-requests.
+- The first sample excludes the remainder of the first request's work.
+- A difference between consecutive samples contains the previous request's tail
+  plus the current request's work up to commitment. It is not that request's
+  cost.
+- `heap_memory_snapshot_mib` reports the guest's linear memory including some
+  host-managed buffering, rounded to MiB. It is not strictly Rust heap usage.
+
+The sampling is still useful as a shape, with those caveats:
+
+| Request (ordinal) | cumulative vCPU ms (pre-send) | heap MiB (pre-send) |
+| ----------------- | ----------------------------- | ------------------- |
+| 1 (builds)        | 17                            | 4                   |
+| 2                 | 18                            | 4                   |
+| 3                 | 21                            | 4                   |
+| 4                 | 23                            | 4                   |
+
+vCPU is cumulative per sandbox: ~17 ms measured at the first request's
+commitment point, which includes construction, then ~1–3 ms of additional
+cumulative time per reused request measured at the same point. Heap read 4 MiB
+at every sample.
 
 Four requests is far too short a span to say anything about memory stability.
 Long-lived memory behaviour remains **unverified**.
@@ -202,14 +240,19 @@ and performed **five builds** (`sandbox retiring after 5 request(s), 5
 build(s)`). The failure is therefore not retained and construction is retried
 on every request.
 
-This does **not** demonstrate recovery. Recovery additionally requires a
-_successful_ build after a failure in the same sandbox, which is not locally
-reproducible: Viceroy's config and secret stores are fixed for a guest's
-lifetime, so a build that fails once fails for that whole sandbox. Recovery is
-covered at unit level by
-`sandbox::tests::a_failed_build_is_not_retained_and_still_counts`, which drives
-one `Sandbox` through a failed build and then a successful one and asserts the
-second is retained and both are counted.
+This does **not** demonstrate recovery end to end. Recovery additionally
+requires a _successful_ build after a failure in the same sandbox, which is not
+locally reproducible: Viceroy's config and secret stores are fixed for a
+guest's lifetime, so a build that fails once fails for that whole sandbox.
+
+Recovery is covered at unit level by
+`sandbox::tests::a_failed_build_is_retried_and_a_later_success_is_retained`,
+which drives the production decision (`Sandbox::resolve_app`) with an injected
+builder: fail, then succeed, then a third request that fails the test if the
+builder is called again. An earlier version of this test drove the `Sandbox`
+API by hand and would have passed even if the production decision were broken;
+it was replaced. Both the reuse and recovery tests were checked against
+deliberate mutations of `resolve_app` and fail as intended.
 
 Note: counters are absent on the failure path, because they are gated on
 settings and settings are what failed. Evidence there comes from the log.

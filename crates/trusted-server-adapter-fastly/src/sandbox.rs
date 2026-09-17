@@ -51,8 +51,9 @@ pub(crate) const INSTANCE_ID_UNAVAILABLE: &str = "unavailable";
 
 /// Per-sandbox state carried across requests by the entry point.
 ///
-/// Everything here is either a one-time guard or a counter. No request
-/// identity, no native handles, no application state.
+/// Holds the logger guard, the measurement counters, and the retained
+/// application. Never request identity and never native handles: those stay
+/// request-scoped.
 #[derive(Default)]
 pub(crate) struct Sandbox {
     logger_installed: bool,
@@ -129,6 +130,38 @@ impl Sandbox {
     /// Retains a successfully built application for later requests.
     pub(crate) fn retain_app(&mut self, app: App, state: Arc<AppState>) {
         self.retained = Some(RetainedApp { app, state });
+    }
+
+    /// Resolves the application for this request, building it if needed.
+    ///
+    /// This is the whole build/reuse/retry decision, in one place so it can be
+    /// exercised with an injected builder rather than re-implemented by tests.
+    ///
+    /// Returns `None` when the caller should use [`Self::retained_app`], and
+    /// `Some(app)` when the build failed: that value is an error router with
+    /// no state, which serves the current request and is then dropped.
+    /// Retaining it would pin the sandbox into permanent error mode, so the
+    /// next request calls `build` again.
+    ///
+    /// `build` is not called at all once an application is retained.
+    pub(crate) fn resolve_app<F>(&mut self, build: F) -> Option<App>
+    where
+        F: FnOnce() -> (App, Option<Arc<AppState>>),
+    {
+        if self.retained.is_some() {
+            return None;
+        }
+
+        let (app, state) = build();
+        self.record_build();
+
+        match state {
+            Some(state) => {
+                self.retain_app(app, state);
+                None
+            }
+            None => Some(app),
+        }
     }
 }
 
@@ -339,6 +372,8 @@ pub(crate) fn read_raw_limits() -> (RawLimits, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -654,69 +689,92 @@ mod tests {
     }
 
     #[test]
-    fn a_retained_application_is_reused_across_requests() {
+    fn a_retained_application_is_reused_without_rebuilding() {
         let mut sandbox = Sandbox::default();
-        // First request builds.
-        assert_eq!(sandbox.begin_request(), 1, "first request is ordinal 1");
-        assert!(
-            sandbox.retained_app().is_none(),
-            "nothing is retained before the first build"
-        );
-        sandbox.record_build();
-        sandbox.retain_app(test_app(), test_state());
+        let builds = Cell::new(0_u32);
 
-        // Later requests reuse it.
-        for expected_ordinal in 2..=4 {
-            assert_eq!(
-                sandbox.begin_request(),
-                expected_ordinal,
-                "ordinals should keep increasing"
-            );
+        // First request builds through the production decision.
+        let transient = sandbox.resolve_app(|| {
+            builds.set(builds.get() + 1);
+            (test_app(), Some(test_state()))
+        });
+        assert!(transient.is_none(), "a successful build should be retained");
+        assert_eq!(builds.get(), 1, "the first request should build");
+
+        // Later requests must not call the builder at all.
+        for ordinal in 2..=4 {
+            let transient = sandbox.resolve_app(|| {
+                builds.set(builds.get() + 1);
+                panic!("request {ordinal} must not rebuild a retained application")
+            });
             assert!(
-                sandbox.retained_app().is_some(),
-                "request {expected_ordinal} should find the retained application"
+                transient.is_none(),
+                "request {ordinal} should use the retained application"
             );
         }
 
-        assert_eq!(sandbox.requests(), 4, "should have served four requests");
         assert_eq!(
-            sandbox.builds(),
+            builds.get(),
             1,
             "four requests should cost exactly one build; that is the whole point"
         );
+        assert_eq!(sandbox.builds(), 1, "the counter should agree");
     }
 
     #[test]
-    fn a_failed_build_is_not_retained_and_still_counts() {
+    fn a_failed_build_is_retried_and_a_later_success_is_retained() {
         let mut sandbox = Sandbox::default();
+        let builds = Cell::new(0_u32);
 
-        // A failed build produces an error router with no state, so nothing is
-        // handed to `retain_app`. Retaining it would serve errors for the rest
-        // of the sandbox's life.
-        sandbox.record_build();
-
+        // Request 1: the build fails. `build_app_with_state` returns an error
+        // router with no state, which is what `None` models here.
+        let transient = sandbox.resolve_app(|| {
+            builds.set(builds.get() + 1);
+            (test_app(), None)
+        });
+        assert!(
+            transient.is_some(),
+            "a failed build must be handed back for this request only"
+        );
         assert!(
             sandbox.retained_app().is_none(),
-            "a failed build must leave the sandbox ready to retry"
-        );
-        assert_eq!(
-            sandbox.builds(),
-            1,
-            "the attempt still counts, so a retry loop is visible in the counters"
+            "a failed build must not be retained"
         );
 
-        // The next request retries and succeeds.
-        sandbox.record_build();
-        sandbox.retain_app(test_app(), test_state());
-
+        // Request 2: the build succeeds. This is the recovery step, and it is
+        // only reachable because the failure was not retained.
+        let transient = sandbox.resolve_app(|| {
+            builds.set(builds.get() + 1);
+            (test_app(), Some(test_state()))
+        });
+        assert!(
+            transient.is_none(),
+            "the retry should succeed and be retained"
+        );
         assert!(
             sandbox.retained_app().is_some(),
-            "a later successful build should be retained"
+            "the recovered application should be retained"
+        );
+
+        // Request 3: recovery is durable — no further build.
+        let transient = sandbox.resolve_app(|| {
+            builds.set(builds.get() + 1);
+            panic!("a recovered application must not be rebuilt")
+        });
+        assert!(
+            transient.is_none(),
+            "request 3 should reuse the recovered app"
+        );
+
+        assert_eq!(
+            builds.get(),
+            2,
+            "one failed build plus one successful build, then reuse"
         );
         assert_eq!(
             sandbox.builds(),
             2,
-            "both the failed attempt and the successful build should be counted"
+            "both attempts should be counted so a retry loop stays visible"
         );
     }
 
