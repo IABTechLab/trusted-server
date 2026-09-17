@@ -2,6 +2,8 @@ import { log } from '../../core/log';
 import type {
   AuctionSlot,
   AuctionBidData,
+  AuctionDiagnosticsData,
+  GptDiagnosticsAuctionFacts,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsTrustedServerOpportunity,
   GptSlotHandoff,
@@ -63,6 +65,24 @@ function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedSer
   const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
 
   return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
+}
+
+function diagnosticsAuctionFacts(
+  generation: number,
+  auctionDiagnostics: AuctionDiagnosticsData | undefined,
+  bid: AuctionBidData
+): GptDiagnosticsAuctionFacts {
+  const isSpaAuction = generation > 0;
+  const winner =
+    isNonEmptyString(bid.hb_bidder) && isNonEmptyString(bid.hb_pb)
+      ? { bidder: bid.hb_bidder, priceBucket: bid.hb_pb }
+      : undefined;
+
+  return {
+    auctionType: isSpaAuction ? 'trusted_server' : 'ssat',
+    ...(winner ? { winner } : {}),
+    ...(auctionDiagnostics ? { serverTimings: auctionDiagnostics } : {}),
+  };
 }
 
 // ------------------------------------------------------------------
@@ -712,12 +732,16 @@ function installInitialLoadDetector(ts: TsjsApi): void {
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    initialAuctionDiagnostics?: AuctionDiagnosticsData
   ) {
     if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
     ts.initialAdInitScheduled = true;
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    if (initialAuctionDiagnostics !== undefined) {
+      ts.auctionDiagnostics = initialAuctionDiagnostics;
+    }
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
       ts.adInit?.();
@@ -949,6 +973,7 @@ export function installTsAdInit(): void {
     // first act and stands down rather than applying this invocation's
     // slots/bids to the newer route's DOM and double-requesting it.
     const generation = ts.navGeneration ?? 0;
+    const auctionDiagnostics = ts.auctionDiagnostics ? { ...ts.auctionDiagnostics } : undefined;
     const g = (window as GptWindow).googletag;
     if (!g) return;
     const warnedResolutionFailures = new Set<string>();
@@ -1084,12 +1109,14 @@ export function installTsAdInit(): void {
         try {
           const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
+          const auctionFacts = diagnosticsAuctionFacts(generation, auctionDiagnostics, bid);
           ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
             gptSlot,
             slot.id,
             opportunity,
             bid.hb_auction_id,
-            requestedSlotSizes
+            requestedSlotSizes,
+            auctionFacts
           );
         } catch {
           // Diagnostics must not alter ad delivery.
@@ -1193,6 +1220,7 @@ export function installTsAdInit(): void {
 interface PageBidsResponse {
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
+  auctionDiagnostics?: AuctionDiagnosticsData;
 }
 
 /** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
@@ -1398,6 +1426,9 @@ export function installSpaAuctionHook(): void {
     if (path === currentPath) return;
     currentPath = path;
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
+    // Server timings belong to the route that produced them. Clear them before
+    // page-bids starts so failure or supersession cannot relabel stale offsets.
+    ts.auctionDiagnostics = undefined;
     // A route change invalidates hydration aliases before the new route's
     // publisher can define a same-prefix slot while page-bids is in flight.
     for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {
@@ -1424,6 +1455,7 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
+      ts.auctionDiagnostics = data.auctionDiagnostics;
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;

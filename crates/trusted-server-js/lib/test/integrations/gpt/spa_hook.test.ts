@@ -513,9 +513,13 @@ describe('installSpaAuctionHook', () => {
     const ts = (window as TestWindow).tsjs!;
     const adInit = vi.fn();
     ts.adInit = adInit;
+    ts.auctionDiagnostics = { auctionResolvedMs: 84 };
 
     history.pushState({}, '', '/first');
+    expect(ts.auctionDiagnostics).toBeUndefined();
+    ts.auctionDiagnostics = { auctionResolvedMs: 40 };
     history.pushState({}, '', '/second');
+    expect(ts.auctionDiagnostics).toBeUndefined();
     await flushAsync();
 
     expect(ts.adSlots).toEqual([{ id: 'newer', div_id: 'div-newer' }]);
@@ -539,13 +543,16 @@ describe('installSpaAuctionHook', () => {
     installSpaAuctionHook();
     const ts = (window as TestWindow).tsjs!;
     ts.adSlots = [{ id: 'existing' } as never];
+    ts.auctionDiagnostics = { auctionResolvedMs: 84 };
     const adInit = vi.fn();
     ts.adInit = adInit;
 
     history.pushState({}, '', '/error-page');
+    expect(ts.auctionDiagnostics).toBeUndefined();
     await flushAsync();
 
     expect(ts.adSlots).toEqual([{ id: 'existing' }]);
+    expect(ts.auctionDiagnostics).toBeUndefined();
     expect(adInit).not.toHaveBeenCalled();
   });
 

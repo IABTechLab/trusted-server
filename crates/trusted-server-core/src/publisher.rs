@@ -3163,6 +3163,44 @@ fn request_origin(scheme: &str, host: &str) -> String {
 /// JSON for every non-empty map; `serde_json::from_str` failed and `unwrap_or_default()`
 /// turned the failure into `{}`. Shared modes therefore served **zero bids**, silently,
 /// on every request that had any. Every fixture had empty bids, so nothing caught it.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserAuctionDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auction_dispatched_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auction_resolved_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auction_committed_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auction_wait_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auction_wait_placement: Option<&'static str>,
+}
+
+const fn auction_wait_placement_wire(placement: AuctionWaitPlacement) -> &'static str {
+    match placement {
+        AuctionWaitPlacement::PreHeader => "pre_header",
+        AuctionWaitPlacement::InStream => "in_stream",
+    }
+}
+
+impl BrowserAuctionDiagnostics {
+    fn from_request_timings(timings: &RequestTimings) -> Option<Self> {
+        let snapshot = timings.snapshot();
+        snapshot.auction_dispatched_ms?;
+        Some(Self {
+            auction_dispatched_ms: snapshot.auction_dispatched_ms,
+            auction_resolved_ms: snapshot.auction_resolved_ms,
+            auction_committed_ms: snapshot.auction_committed_ms,
+            auction_wait_ms: snapshot.auction_wait_ms,
+            auction_wait_placement: snapshot
+                .auction_wait_placement
+                .map(auction_wait_placement_wire),
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct AdBidsState {
     /// Rendered bids `<script>`. Shared with the HTML processor's `</body>` handler,
@@ -3173,6 +3211,10 @@ pub(crate) struct AdBidsState {
     bids: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
     /// Optional per-request diagnostics emitted before either bids-script shape.
     debug_prefix: Arc<Mutex<String>>,
+    /// Server auction facts handed to the generation-guarded client scheduler.
+    auction_diagnostics: Arc<Mutex<Option<BrowserAuctionDiagnostics>>>,
+    /// Whether this request activated the private diagnostics module.
+    diagnostics_active: bool,
 }
 
 #[cfg(test)]
@@ -3187,6 +3229,13 @@ impl AdBidsState {
 }
 
 impl AdBidsState {
+    fn with_diagnostics(diagnostics_active: bool) -> Self {
+        Self {
+            diagnostics_active,
+            ..Self::default()
+        }
+    }
+
     /// The cell the HTML processor reads at the `</body>` seam.
     pub(crate) fn script_cell(&self) -> &Arc<Mutex<Option<String>>> {
         &self.script
@@ -3195,9 +3244,36 @@ impl AdBidsState {
     /// Record one auction result, rendering the script from the same map that is
     /// stored, so the two representations cannot drift.
     fn set(&self, bid_map: serde_json::Map<String, serde_json::Value>) {
-        let bids_script = build_bids_script(&bid_map);
+        let auction_diagnostics = self
+            .auction_diagnostics
+            .lock()
+            .expect("should lock auction diagnostics")
+            .clone();
+        let bids_script =
+            build_bids_script_with_diagnostics(&bid_map, auction_diagnostics.as_ref());
         *self.script.lock().expect("should lock bid script") = Some(bids_script);
         *self.bids.lock().expect("should lock bid map") = bid_map;
+    }
+
+    /// Attach server auction facts to the rendered bid script.
+    ///
+    /// This rebuilds the script cell, so callers must run it before
+    /// [`Self::prepend_to_script`] to preserve an existing debug prefix.
+    fn set_auction_diagnostics(&self, timings: &RequestTimings) {
+        if !self.diagnostics_active {
+            return;
+        }
+        let Some(diagnostics) = BrowserAuctionDiagnostics::from_request_timings(timings) else {
+            return;
+        };
+        let bids = self.bids();
+        *self.script.lock().expect("should lock bid script") = Some(
+            build_bids_script_with_diagnostics(&bids, Some(&diagnostics)),
+        );
+        *self
+            .auction_diagnostics
+            .lock()
+            .expect("should lock auction diagnostics") = Some(diagnostics);
     }
 
     /// The structured bids the shared-template seam splices into the marker.
@@ -3210,7 +3286,16 @@ impl AdBidsState {
 
     /// Build the shared-template seam, retaining the same debug prefix as inline.
     fn build_seam_script(&self, slots_json: &str) -> String {
-        let seam = build_seam_script(slots_json, &self.bids());
+        let auction_diagnostics = self
+            .auction_diagnostics
+            .lock()
+            .expect("should lock auction diagnostics")
+            .clone();
+        let seam = build_seam_script_with_diagnostics(
+            slots_json,
+            &self.bids(),
+            auction_diagnostics.as_ref(),
+        );
         let prefix = self
             .debug_prefix
             .lock()
@@ -4014,6 +4099,9 @@ async fn collect_non_html_auction(
     // T0-anchored timeline mark (spec section 18): winning bids are in page
     // state, available to the response pipeline.
     params.timings.mark_auction_committed();
+    params
+        .ad_bids_state
+        .set_auction_diagnostics(&params.timings);
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -4082,6 +4170,7 @@ async fn collect_stream_auction(
     // T0-anchored timeline mark (spec section 18): winning bids are in page
     // state, available to the response pipeline.
     timings.mark_auction_committed();
+    ad_bids_state.set_auction_diagnostics(timings);
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -4335,7 +4424,7 @@ pub async fn handle_publisher_request(
         .and_then(|co| co.auction_timeout_ms)
         .unwrap_or(settings.auction.timeout_ms);
 
-    let ad_bids_state = AdBidsState::default();
+    let ad_bids_state = AdBidsState::with_diagnostics(gpt_diagnostics.active());
 
     let price_granularity = settings
         .creative_opportunities
@@ -5580,6 +5669,13 @@ pub(crate) fn build_bid_map_with_auction_id(
 /// The JSON is embedded via `JSON.parse(…)` so the browser parser never sees
 /// raw `</script>` sequences inside the string.
 pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Value>) -> String {
+    build_bids_script_with_diagnostics(bid_map, None)
+}
+
+fn build_bids_script_with_diagnostics(
+    bid_map: &serde_json::Map<String, serde_json::Value>,
+    auction_diagnostics: Option<&BrowserAuctionDiagnostics>,
+) -> String {
     let json = serde_json::to_string(bid_map)
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
@@ -5614,6 +5710,23 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // payload. Only when no scheduler exists at all (GPT integration active
     // without its head bootstrap — not an expected deployment) does the script
     // fall back to a plain assignment, where no SPA hook exists to race with.
+    if let Some(auction_diagnostics) = auction_diagnostics {
+        let diagnostics = serde_json::to_string(auction_diagnostics)
+            .expect("BrowserAuctionDiagnostics should serialize");
+        return format!(
+            "<script>(function(){{\
+var t=window.tsjs=window.tsjs||{{}};\
+var b=JSON.parse(\"{}\");\
+var d=JSON.parse(\"{}\");\
+var s=t.scheduleInitialAdInit;\
+if(typeof s===\"function\")s(b,void 0,d);\
+else{{t.bids=b;t.auctionDiagnostics=d;}}\
+}})();</script>",
+            escaped,
+            html_escape_for_script(&diagnostics)
+        );
+    }
+
     format!(
         "<script>(function(){{\
 var t=window.tsjs=window.tsjs||{{}};\
@@ -5645,15 +5758,43 @@ else t.bids=b;\
 ///
 /// Slots are applied before bids inside the scheduler, because the scheduler may fire
 /// `adInit` and `adInit` reads `ts.adSlots`.
+#[cfg(test)]
 pub(crate) fn build_seam_script(
     slots_json: &str,
     bid_map: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    build_seam_script_with_diagnostics(slots_json, bid_map, None)
+}
+
+fn build_seam_script_with_diagnostics(
+    slots_json: &str,
+    bid_map: &serde_json::Map<String, serde_json::Value>,
+    auction_diagnostics: Option<&BrowserAuctionDiagnostics>,
 ) -> String {
     // The local test script probes the minified `var a=JSON.parse`,
     // `var b=JSON.parse`, and `s(b,a)` literals below. Update the harness with any
     // semantically equivalent rewrite so its black-box checks keep matching output.
     let bids = serde_json::to_string(bid_map)
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
+    if let Some(auction_diagnostics) = auction_diagnostics {
+        let diagnostics = serde_json::to_string(auction_diagnostics)
+            .expect("BrowserAuctionDiagnostics should serialize");
+        return format!(
+            "<script>(function(){{\
+var t=window.tsjs=window.tsjs||{{}};\
+var a=JSON.parse(\"{}\");\
+var b=JSON.parse(\"{}\");\
+var d=JSON.parse(\"{}\");\
+var s=t.scheduleInitialAdInit;\
+if(typeof s===\"function\")s(b,a,d);\
+else{{t.adSlots=a;t.bids=b;t.auctionDiagnostics=d;}}\
+}})();</script>",
+            html_escape_for_script(slots_json),
+            html_escape_for_script(&bids),
+            html_escape_for_script(&diagnostics)
+        );
+    }
+
     format!(
         "<script>(function(){{\
 var t=window.tsjs=window.tsjs||{{}};\
@@ -6538,7 +6679,7 @@ pub async fn handle_page_bids(
     kv: Option<&KvIdentityGraph>,
     auction: AuctionDispatch<'_>,
     ec_context: &mut EcContext,
-    req: Request<EdgeBody>,
+    mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Same defaulted-handle rule as `handle_publisher_request`: a request
     // without the extension records into a collector nothing reads.
@@ -6547,6 +6688,12 @@ pub async fn handle_page_bids(
         .get::<RequestTimings>()
         .cloned()
         .unwrap_or_default();
+
+    // Adapter fallbacks prepare this before routing. Keep this idempotent call as
+    // a direct-handler safety net and retain the session decision after the
+    // private activation cookie is stripped.
+    let gpt_diagnostics =
+        crate::integrations::gpt_diagnostics::prepare_request(settings, &mut req)?;
 
     // CSRF-style gate: refuse cross-site invocations before any other work —
     // including the not-configured 404 below, which would otherwise tell a
@@ -6695,6 +6842,7 @@ pub async fn handle_page_bids(
     // unchanged) but skip the live auction, matching the existing behavior.
     let ad_stack_enabled = ad_templates_enabled && auction_enabled && consent_allows_auction;
 
+    let mut auction_diagnostics = None;
     let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
     } else {
@@ -6767,13 +6915,31 @@ pub async fn handle_page_bids(
                 services,
             };
             timings.mark_auction_dispatched();
-            match auction
+            let result = auction
                 .orchestrator
                 .run_auction(&auction_request, &auction_context)
-                .await
-            {
+                .await;
+            timings.mark_auction_resolved();
+            match result {
                 Ok(result) => {
-                    timings.mark_auction_resolved();
+                    // A successful result proves at least one pending or immediate
+                    // provider outcome. Failures can occur before any request leaves
+                    // the edge, so they must not fabricate dispatch timing evidence.
+                    if gpt_diagnostics.browser_session_active() {
+                        let timing_snapshot = timings.snapshot();
+                        auction_diagnostics = Some(BrowserAuctionDiagnostics {
+                            auction_dispatched_ms: timing_snapshot.auction_dispatched_ms,
+                            auction_resolved_ms: timing_snapshot.auction_resolved_ms,
+                            auction_committed_ms: None,
+                            auction_wait_ms: timing_snapshot
+                                .auction_resolved_ms
+                                .zip(timing_snapshot.auction_dispatched_ms)
+                                .map(|(resolved, dispatched)| resolved.saturating_sub(dispatched)),
+                            auction_wait_placement: Some(auction_wait_placement_wire(
+                                AuctionWaitPlacement::PreHeader,
+                            )),
+                        });
+                    }
                     let winning_bids = result.winning_bids.clone();
                     let auction_id = diagnostics_auction_id(settings);
                     let bid_map = build_bid_map_with_auction_id(
@@ -6786,6 +6952,9 @@ pub async fn handle_page_bids(
                     );
                     // Targeting is available to the response pipeline.
                     timings.mark_auction_committed();
+                    if let Some(diagnostics) = auction_diagnostics.as_mut() {
+                        diagnostics.auction_committed_ms = timings.snapshot().auction_committed_ms;
+                    }
                     let delivered_winner_slots = bid_map.keys().cloned().collect();
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
@@ -6801,7 +6970,6 @@ pub async fn handle_page_bids(
                     (winning_bids, Some(bid_map))
                 }
                 Err(e) => {
-                    timings.mark_auction_resolved();
                     log::warn!("page-bids auction failed: {e:?}");
                     let elapsed_ms = observation.elapsed_ms();
                     emit_auction_events_best_effort_lazy(services, || {
@@ -6871,10 +7039,18 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let body = serde_json::json!({
-        "slots": slots_json,
-        "bids": bid_map,
-    });
+    let body = if let Some(auction_diagnostics) = auction_diagnostics {
+        serde_json::json!({
+            "slots": slots_json,
+            "bids": bid_map,
+            "auctionDiagnostics": auction_diagnostics,
+        })
+    } else {
+        serde_json::json!({
+            "slots": slots_json,
+            "bids": bid_map,
+        })
+    };
     let body = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
         message: "Failed to serialize page-bids response".to_string(),
     })?;
@@ -18932,8 +19108,10 @@ mod tests {
         };
         use crate::http_util::RequestInfo;
         use crate::price_bucket::PriceGranularity;
+        use crate::request_timing::{AuctionWaitPlacement, RequestTimings};
         use crate::settings::Settings;
         use std::collections::HashMap;
+        use std::time::Duration;
 
         // Default settings are enough for the creative boundary: the sanitize
         // pass needs no config, and `rewrite_creative_html` only signs URLs it
@@ -20263,6 +20441,53 @@ mod tests {
         }
 
         #[test]
+        fn active_diagnostics_hands_auction_timing_to_the_generation_guarded_scheduler() {
+            let timings = RequestTimings::new();
+            timings.mark_auction_dispatched();
+            timings.record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(12));
+            timings.mark_auction_resolved();
+            timings.mark_auction_committed();
+            let state = AdBidsState::with_diagnostics(true);
+            state.set(serde_json::Map::new());
+
+            state.set_auction_diagnostics(&timings);
+
+            let script = state
+                .script_cell()
+                .lock()
+                .expect("should lock bid script")
+                .clone()
+                .expect("should render bid script");
+            assert!(script.contains("s(b,void 0,d)"));
+            assert!(script.contains("auctionDispatchedMs"));
+            assert!(script.contains("auctionResolvedMs"));
+            assert!(script.contains("auctionCommittedMs"));
+            assert!(script.contains("auctionWaitMs"));
+            assert!(script.contains("in_stream"));
+        }
+
+        #[test]
+        fn inactive_diagnostics_omits_auction_timing_from_the_bid_script() {
+            let timings = RequestTimings::new();
+            timings.mark_auction_dispatched();
+            timings.mark_auction_resolved();
+            timings.mark_auction_committed();
+            let state = AdBidsState::default();
+            state.set(serde_json::Map::new());
+
+            state.set_auction_diagnostics(&timings);
+
+            let script = state
+                .script_cell()
+                .lock()
+                .expect("should lock bid script")
+                .clone()
+                .expect("should render bid script");
+            assert!(!script.contains("auctionDiagnostics"));
+            assert!(!script.contains("auctionDispatchedMs"));
+        }
+
+        #[test]
         fn bids_script_defers_ad_init_until_after_hydration() {
             let mut map = serde_json::Map::new();
             map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
@@ -20710,6 +20935,12 @@ mod tests {
             make_page_bids_request_on(PAGE_BIDS_PATH, path)
         }
 
+        fn make_active_page_bids_request(path: &str) -> Request<EdgeBody> {
+            let mut req = make_page_bids_request(path);
+            set_test_header(&mut req, "cookie", "__Host-ts-console=1");
+            req
+        }
+
         #[tokio::test]
         async fn page_bids_format_absent_or_json_returns_json() {
             let settings = settings_with_co();
@@ -20833,6 +21064,30 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn active_page_bids_omits_timings_when_no_provider_dispatches() {
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec!["missing-provider".to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+            let body = run_page_bids_consent_allowed(
+                &settings,
+                &orchestrator,
+                &article_slot(),
+                make_active_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert!(
+                body.get("auctionDiagnostics").is_none(),
+                "a failed launch must not fabricate auction dispatch timings"
+            );
+        }
+
+        #[tokio::test]
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
             settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
@@ -20842,6 +21097,7 @@ mod tests {
                 .expect("should enable diagnostics");
             let slots = article_slot();
             let winning_stub = Arc::new(StubHttpClient::new());
+            winning_stub.push_response(200, b"winner".to_vec());
             winning_stub.push_response(200, b"winner".to_vec());
             let winning_services = build_services_with_http_client(
                 Arc::clone(&winning_stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -20867,7 +21123,7 @@ mod tests {
                     registry: None,
                 },
                 &mut ec_context,
-                make_page_bids_request("/2024/01/my-article/"),
+                make_active_page_bids_request("/2024/01/my-article/"),
             )
             .await
             .expect("should return winning page-bids response");
@@ -20892,6 +21148,29 @@ mod tests {
                 .as_str()
                 .expect("page-bids should expose an auction ID on the winner")
                 .to_string();
+            let auction_diagnostics = winning_body["auctionDiagnostics"]
+                .as_object()
+                .expect("an active session should expose page-bids auction diagnostics");
+            let timing = |field| {
+                auction_diagnostics
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| panic!("page-bids diagnostics should include {field}"))
+            };
+            let dispatched_ms = timing("auctionDispatchedMs");
+            let resolved_ms = timing("auctionResolvedMs");
+            let committed_ms = timing("auctionCommittedMs");
+            let wait_ms = timing("auctionWaitMs");
+            assert!(
+                dispatched_ms <= resolved_ms && resolved_ms <= committed_ms,
+                "page-bids auction milestones should be monotonic"
+            );
+            assert_eq!(
+                wait_ms,
+                resolved_ms.saturating_sub(dispatched_ms),
+                "auction wait should exclude page-bids pre-dispatch work"
+            );
+            assert_eq!(auction_diagnostics["auctionWaitPlacement"], "pre_header");
             assert!(
                 winning_auction_id.starts_with("ts-auc-"),
                 "page-bids should expose a freshly minted diagnostics token, got `{winning_auction_id}`"
@@ -20903,6 +21182,32 @@ mod tests {
             assert!(
                 !winning_auction_id.contains("page-auction-example-123"),
                 "browser-visible auction ID must not embed the EC ID"
+            );
+
+            let inactive_winning_response = handle_page_bids(
+                &settings,
+                &winning_services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &winning_orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &mut ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return inactive winning page-bids response");
+            let inactive_winning_body: serde_json::Value = serde_json::from_slice(
+                &inactive_winning_response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read inactive winning page-bids response body"),
+            )
+            .expect("should serialize inactive winning page-bids response as JSON");
+            assert!(
+                inactive_winning_body.get("auctionDiagnostics").is_none(),
+                "an inactive session should not receive successful auction diagnostics"
             );
 
             let no_winner_stub = Arc::new(StubHttpClient::new());
@@ -20940,6 +21245,10 @@ mod tests {
                     .expect("page-bids should return a bids object")
                     .is_empty(),
                 "page-bids should not fabricate auction metadata without a winner"
+            );
+            assert!(
+                no_winner_body.get("auctionDiagnostics").is_none(),
+                "an inactive session should not receive page-bids auction diagnostics"
             );
         }
 
