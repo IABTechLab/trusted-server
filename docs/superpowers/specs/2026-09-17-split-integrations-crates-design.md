@@ -41,7 +41,7 @@ Runtime order will come exclusively from TOML declaration order. The config
 push and config-store representation will preserve that order explicitly;
 filesystem discovery order will never affect execution. For auction providers,
 that order is also operational priority: it controls launch and response order,
-mediator input order, and equal-price tie-breaking.
+mediator input order, and local equal-price tie-breaking.
 
 This design intentionally changes the auction configuration introduced by PR
 #1016 while preserving that work's compiled-plan and runtime guarantees. It
@@ -289,6 +289,11 @@ concrete integration.
 JavaScript-only `creative` remains valid without a Rust directory. Rust-only
 integrations remain valid without a browser directory.
 
+`creative` is the sole fixed, non-configurable browser prelude in this design;
+it is runtime support rather than an operator integration. Directory discovery
+may build other JavaScript-only assets, but `[integrations]` cannot activate one
+unless a Rust definition with that ID registers its browser-module capability.
+
 ## Dependency Direction
 
 The Cargo dependency graph is one-way:
@@ -365,8 +370,8 @@ No EdgeZero source change or new host service is required.
 
 `trusted-server-integrations/build.rs` scans immediate directories under
 `src/`. A directory containing `mod.rs` is a concrete integration whose stable
-ID is the directory name. IDs must use the existing integration ID grammar and
-must be unique.
+ID is the directory name. IDs must parse as the `IntegrationId` defined by this
+design and must be unique.
 
 The build script generates module declarations and a definition catalog. Its
 lexical sorting makes generated source reproducible but has no runtime ordering
@@ -428,6 +433,13 @@ APS
 ├── JavaScript renderer module
 └── OpenRTB profile capability
 ```
+
+Capability multiplicity is explicit. Collection capabilities such as routes
+and rewriters may register multiple entries. Single-valued capabilities such as
+an OpenRTB profile or mediator may appear at most once per integration
+definition; duplicate registration fails composition. Because provider tables
+have no profile discriminator, an integration that owns
+`auction.providers` must register exactly one OpenRTB profile capability.
 
 The OpenRTB profile boundary has three stages:
 
@@ -636,8 +648,9 @@ The contract is:
    afterward.
 9. Auction provider launch, response, and mediator-input order follows the
    flattened plan. With the existing strict-greater-than price comparison, the
-   first configured provider retains an equal-price tie. Providers later in the
-   sequence receive the remaining shared auction budget after earlier launches.
+   first configured provider retains an equal-price tie during local winner
+   selection. Providers later in the sequence receive the remaining shared
+   auction budget after earlier launches.
 
 Inline-table and dotted-key shorthand may not define an integration parent or
 provider parent. Requiring ordinary table headers makes activation, ownership,
@@ -875,8 +888,9 @@ provider-ID order to qualified configuration order. It preserves:
 - OpenRTB request, response, routing, timeout, notification, and response
   admission behavior.
 - Auction price comparison, mediation protocol, renderer descriptors, and
-  telemetry schema. Provider response order and an equal-price winner may
-  change when configuration order differs from the old lexical order.
+  telemetry schema. Provider response order and a locally selected equal-price
+  winner may change when configuration order differs from the old lexical
+  order.
 - Existing provider identity fields, with values migrated from local IDs such
   as `pbs-main` to qualified IDs such as `prebid.pbs-main`.
 - Cache privacy and full-buffer decisions.
@@ -964,8 +978,8 @@ two active integration or provider inventories.
 - Local and qualified provider IDs enforce their separate grammars and bounds.
 - Multiple provider instances under APS, Prebid, and standard OpenRTB compile
   with stable qualified identities.
-- Provider launch, response, mediator-input, and equal-price tie order follows
-  integration then local-provider declaration order.
+- Provider launch, response, mediator-input, and local equal-price tie order
+  follows integration then local-provider declaration order.
 
 ### Capability and behavior parity tests
 
