@@ -496,3 +496,15 @@ streaming failed [instance=…0000 ordinal=2 request=…0001]
 - Six requests per sandbox remains a local Viceroy observation.
 - Correctness used mock origins on `127.0.0.1`.
 - No comparative latency was rerun at this revision.
+
+## Follow-ups
+
+- **`sandbox::scoped_key` duplicates EdgeZero's private key format.**
+  `service_scoped_runtime_env_key` is private at `76c59b44`, and
+  `runtime_env_keys` is a closed allowlist that drops any key outside it, so
+  the adapter builds the service-scoped key itself. A public EdgeZero
+  key-construction or lookup helper would remove the duplication. The working
+  implementation stays until such an API exists; the `TS__SANDBOX__*` suffixes
+  and the limit-validation policy remain application-owned regardless.
+- **The pin is an unmerged branch revision.** Move to a release tag once one
+  contains `76c59b44`.

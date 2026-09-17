@@ -52,6 +52,10 @@ use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_g
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics};
+// Only the reuse path builds a serving loop, so the retirement snapshots have
+// no consumer in the default build.
+#[cfg(feature = "reusable-sandbox")]
+use crate::sandbox::RetirementCounters;
 
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
@@ -115,11 +119,10 @@ fn main() {
 #[cfg(feature = "reusable-sandbox")]
 fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnostics) {
     // `serve_custom` owns the `Sandbox` and drops it when serving ends, so the
-    // retirement line reports the last values the callback observed rather
-    // than reading the sandbox afterwards. These are snapshots of the
-    // framework's counters, not counters of our own.
-    let mut last_requests = 0_u64;
-    let mut last_attempts = 0_u64;
+    // retirement line reports snapshots taken while it was still borrowed.
+    // `RetirementCounters` reads the attempt count on the way out, so a build
+    // performed by the final callback is included.
+    let mut counters = RetirementCounters::default();
 
     let summary = edgezero_adapter_fastly::lifecycle::serve_custom(
         fastly::http::serve::Serve::new()
@@ -127,17 +130,17 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
             .with_max_lifetime(limits.max_lifetime)
             .with_timeout(limits.timeout),
         |request, sandbox: &mut Sandbox| {
-            last_requests = sandbox.requests();
-            last_attempts = sandbox.initialization_attempts();
-            handle_request(request, sandbox, &mut startup);
+            counters.observe(sandbox, |sandbox| {
+                handle_request(request, sandbox, &mut startup);
+            });
         },
     );
 
     log::info!(
         "sandbox retiring after {} attempted callback(s), {} observed, {} build attempt(s)",
         summary.requests(),
-        last_requests,
-        last_attempts
+        counters.requests(),
+        counters.attempts()
     );
 }
 

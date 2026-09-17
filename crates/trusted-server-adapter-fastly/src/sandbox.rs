@@ -95,6 +95,51 @@ impl StartupDiagnostics {
     }
 }
 
+/// Snapshots of the framework's counters, taken around one callback.
+///
+/// `serve_custom` owns the [`Sandbox`] and drops it when serving ends, so the
+/// retirement line cannot read it afterwards. These are snapshots of
+/// `EdgeZero`'s counters taken while the sandbox is still borrowed; nothing here
+/// increments anything.
+///
+/// The two are read at different points on purpose. The framework increments
+/// its callback count *before* invoking the callback, so `requests` is correct
+/// on entry. Initialization happens *during* the callback, so `attempts` must
+/// be read on the way out. The count itself is never lost — it lives in the
+/// sandbox until serving ends — but a snapshot taken on entry is stale by the
+/// time the final callback finishes, so a build it performed goes unreported.
+#[cfg(any(feature = "reusable-sandbox", test))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetirementCounters {
+    requests: u64,
+    attempts: u64,
+}
+
+#[cfg(any(feature = "reusable-sandbox", test))]
+impl RetirementCounters {
+    /// Runs one callback against `sandbox`, capturing counters around it.
+    pub(crate) fn observe<R>(
+        &mut self,
+        sandbox: &mut Sandbox,
+        callback: impl FnOnce(&mut Sandbox) -> R,
+    ) -> R {
+        self.requests = sandbox.requests();
+        let outcome = callback(sandbox);
+        self.attempts = sandbox.initialization_attempts();
+        outcome
+    }
+
+    /// Callback count observed on entry to the last callback.
+    pub(crate) fn requests(&self) -> u64 {
+        self.requests
+    }
+
+    /// Initialization attempts observed on exit from the last callback.
+    pub(crate) fn attempts(&self) -> u64 {
+        self.attempts
+    }
+}
+
 /// Counter values captured for one response.
 ///
 /// An owned snapshot rather than a borrow of [`Sandbox`], so attaching counters
@@ -207,6 +252,12 @@ const KEY_TIMEOUT_MS: &str = "TS__SANDBOX__TIMEOUT_MS";
 /// `EdgeZero`'s own `service_scoped_runtime_env_key` is private, so the shape is
 /// reproduced here. It must stay identical to the one `edgezero provision`
 /// writes.
+///
+/// Follow-up: a public `EdgeZero` key-construction or lookup helper would let
+/// this duplication go. Until such an API exists this implementation stays, so
+/// the key shape has exactly one definition on our side. The `TS__SANDBOX__*`
+/// suffixes and the limit-validation policy in [`resolve_mode`] are
+/// application-owned either way and would not move.
 #[cfg(any(feature = "reusable-sandbox", test))]
 fn scoped_key(service_id: &str, suffix: &str) -> String {
     format!("EDGEZERO__SERVICES__{service_id}__{suffix}")
@@ -717,6 +768,91 @@ mod tests {
             sandbox.initialization_attempts(),
             2,
             "both attempts should be counted so a retry loop stays visible"
+        );
+    }
+
+    /// Drives the real reporting path: the same `observe` that `serve_loop`
+    /// wraps every callback in. A build performed by the FINAL callback must
+    /// appear in the retirement snapshot; reading the attempt count on entry
+    /// instead of on exit silently loses it.
+    #[test]
+    fn retirement_counters_include_a_build_from_the_final_callback() {
+        let mut sandbox = Sandbox::default();
+        let mut counters = RetirementCounters::default();
+
+        // Callback 1 builds nothing, so nothing is attempted yet.
+        counters.observe(&mut sandbox, |_sandbox| {});
+        assert_eq!(
+            counters.attempts(),
+            0,
+            "a callback that never initializes should report no attempts"
+        );
+
+        // Callback 2 succeeds. The build happens DURING this callback, so it
+        // only shows up if the count is read on the way out.
+        counters.observe(&mut sandbox, |sandbox| {
+            sandbox
+                .initialize(|| Ok::<_, &str>(test_retained()))
+                .expect("the build should succeed");
+        });
+        assert_eq!(
+            counters.attempts(),
+            1,
+            "a successful build on the final callback must be reported"
+        );
+    }
+
+    #[test]
+    fn retirement_counters_include_a_failed_build_from_the_final_callback() {
+        let mut sandbox = Sandbox::default();
+        let mut counters = RetirementCounters::default();
+
+        // The application state is not retained, but the attempt itself stays
+        // in `initialization_attempts()` until the sandbox is dropped. What a
+        // stale snapshot loses is the report, not the count.
+        counters.observe(&mut sandbox, |sandbox| {
+            let failed = sandbox.initialize(|| Err::<RetainedApp, &str>("error router"));
+            assert_eq!(
+                failed.err(),
+                Some("error router"),
+                "the failed build should be handed back"
+            );
+        });
+
+        assert_eq!(
+            counters.attempts(),
+            1,
+            "a failed build on the final callback must still be reported"
+        );
+        assert!(
+            sandbox.state().is_none(),
+            "a failed build must not be retained"
+        );
+    }
+
+    #[test]
+    fn retirement_counters_report_the_ordinal_observed_on_entry() {
+        let mut sandbox = Sandbox::default();
+        let mut counters = RetirementCounters::default();
+
+        // This covers snapshot copying only: that `observe` reports whatever
+        // the framework counter says rather than deriving a value of its own.
+        // That EdgeZero increments before invoking the callback is the
+        // framework's behaviour, covered by its tests and by runtime
+        // observation, not by this test — `requests()` advances only through
+        // `serve_custom` / `run_custom`, so a direct `observe` sees zero.
+        counters.observe(&mut sandbox, |sandbox| {
+            assert_eq!(
+                sandbox.requests(),
+                0,
+                "no callback has been dispatched through the framework here"
+            );
+        });
+
+        assert_eq!(
+            counters.requests(),
+            0,
+            "the snapshot should mirror the framework counter, not a local one"
         );
     }
 
