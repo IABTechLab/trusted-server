@@ -335,7 +335,7 @@ where
 /// That helper resolves a closed allowlist — adapter host and port, logging
 /// settings, and per-store `__NAME`/`__KEY` selectors — and silently drops
 /// everything else, so a sandbox key routed through it would always read as
-/// absent and reuse would never engage.
+/// absent and reuse would never engage. Still true at the pinned revision.
 ///
 /// Uses [`fastly::ConfigStore::try_get`], never `get`: `get` panics on a
 /// lookup error, and this runs in `main` before the health probe, so a panic

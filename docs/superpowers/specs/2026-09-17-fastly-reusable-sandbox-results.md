@@ -274,3 +274,136 @@ settings and settings are what failed. Evidence there comes from the log.
   correctness must hold for a cold sandbox on every request.
 - Named-endpoint log delivery was not separated from echoed stdout in these
   runs.
+
+---
+
+# Re-verification against EdgeZero `277544c4`
+
+The workspace repinned EdgeZero from `v0.0.8` to
+`277544c431c1ab9bafa14a45d5f35975b5587e97` on `feat/reusable-app-lifecycle`.
+Everything below was observed **fresh against that revision**. None of the
+latency numbers earlier in this document are carried over as evidence for it.
+
+## Dependency diff
+
+All six workspace entries moved `tag = "v0.0.8"` →
+`rev = "277544c431c1ab9bafa14a45d5f35975b5587e97"`:
+`edgezero-adapter-{axum,cloudflare,fastly,spin}`, `edgezero-cli`,
+`edgezero-core`.
+
+`Cargo.lock`: 16 changed lines, all of them the `source =` field of the eight
+edgezero packages. **Zero unrelated dependency changes.** Exactly one distinct
+edgezero source resolves, and no `v0.0.8` reference survives in either file.
+
+### Why repin at all
+
+Not for the `Serve` re-export — the contract explicitly says not to, and
+`Serve` comes from the already-pinned `fastly 0.12.1` SDK. The repin is for:
+
+- `edgezero-cli`: push/diff validation scoped to the selected adapter.
+- `edgezero-adapter-spin`: secret references redacted from diagnostics.
+- `edgezero-adapter-cloudflare`: duplicate response headers preserved.
+
+Every change to `edgezero-core` across the range (`app.rs`, `app_config.rs`,
+`router.rs`) is **test-only**, and the `edgezero-adapter-fastly` change is
+purely additive. No runtime behaviour we depend on moved.
+
+### Local code removed: none
+
+The contract permits removing local code only where a public EdgeZero API now
+provides equivalent behaviour. At this revision
+`service_scoped_runtime_env_key` is still private and `runtime_env_keys` is
+still a closed allowlist, so `sandbox::scoped_key` and
+`sandbox::read_raw_limits` remain necessary. Swapping the `Serve` import for
+the re-export would be an import change, not a removal, and the contract
+advises against it. Nothing qualified.
+
+## CLI verification (synthetic values only)
+
+Using the synthetic secret reference `Bad-Ref-01`, which violates Spin's
+naming rule. No real `.env` value was used, printed, or copied.
+
+| Check                                                | Result                                                         |
+| ---------------------------------------------------- | -------------------------------------------------------------- |
+| Fastly push not blocked by unrelated Spin validation | **pass** — `config push --adapter fastly --local` exits 0      |
+| Standalone validation still checks declared adapters | **pass** — `config validate` exits 2 and reports the violation |
+| Spin error omits original and normalized values      | **pass** — neither `Bad-Ref-01` nor `bad-ref-01` appears       |
+
+## Runtime compatibility, observed fresh
+
+Viceroy 0.17.0, Fastly SDK 0.12.1, service id `0000000000000000000000`.
+Artifacts: arm A `sha256:041e0ca413e01fe5aa4bed06…`, arm C
+`sha256:fa6af70c6e01643182f251fe…`.
+
+| Contract requirement                                     | Result                                                                                                                                                 |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Default stays single-request, reuse opt-in               | **pass** — feature off gave 6 distinct instances, ordinal 1 each, _with limits configured in the store_                                                |
+| Health/debug probes bypass construction                  | **pass** — `/health`, `/_ts/debug/sandbox`, `/_ts/debug/ja4` served at ordinals 1–3; the first workload request at ordinal 4 still reported `builds=1` |
+| Observed reuse retains one successful build              | **pass** — 6 requests on one instance, `builds=1`; ~6.3 ms cold vs ~0.27–0.38 ms reused                                                                |
+| Failed initialization stays retryable                    | **pass** — 5 requests, 5 build attempts, never retained                                                                                                |
+| Fail → success → reuse through the production decision   | **unit level only** (see gaps)                                                                                                                         |
+| Request/document state isolated                          | **pass** — 4 requests × 4 distinct markers, no marker appeared in any other response                                                                   |
+| Delayed chunks reach the client before origin completion | **pass** — first byte 0.168–0.186 s against 2.17–2.19 s total, on ordinals 1–4 of one sandbox                                                          |
+| Duplicate `Set-Cookie` and finalization survive          | **pass** — both cookies on every request of a reused sandbox, finalization headers present                                                             |
+| Post-commit failure never causes a second response       | **pass** — see below                                                                                                                                   |
+
+### Post-commit failure, in detail
+
+Against a raw-socket origin that commits headers, sends one chunk, then resets
+(`SO_LINGER` 0): three consecutive aborted requests on **one** sandbox each
+produced exactly one status line (`200`, 1034 bytes) with no second response
+appended, and each logged with full attribution:
+
+```
+ERROR EdgeZero streaming failed [instance=…0000 ordinal=1 request=…0000]
+ERROR EdgeZero streaming failed [instance=…0000 ordinal=2 request=…0001]
+ERROR EdgeZero streaming failed [instance=…0000 ordinal=3 request=…0002]
+```
+
+A normal request afterwards on that same sandbox succeeded at ordinal 4 with
+`builds=1`, so a post-commitment failure neither double-responds nor discards
+the retained application.
+
+An earlier attempt using a graceful close did **not** exercise this path: the
+guest blocked on an origin that never terminated, and each request landed on a
+fresh sandbox. Only a true reset reaches the error branch.
+
+## EdgeZero's own compatibility suite
+
+The contract requires running it against the adopted checkout:
+
+```sh
+./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime
+```
+
+**Exit 0** at `277544c4`, including the `custom-*` arms that exercise the same
+custom-lifecycle shape this adapter uses. Its `custom-initialization` scenario
+shows one guest (`18d6143588bb14d8-e548-1`) reaching `construction_rounds: 0`
+and continuing to serve ordinals 4 and 5 — the in-guest recovery our own
+harness cannot reproduce.
+
+## Remaining gaps
+
+- **Fail → success → reuse in one guest is unit-level only for this
+  application.** Viceroy's config and secret stores are fixed for a guest's
+  lifetime, so an initialization failure persists for that whole sandbox.
+  EdgeZero's fixture reproduces it because its fixture app injects the failure
+  itself. Ours is covered by
+  `sandbox::tests::a_failed_build_is_retried_and_a_later_success_is_retained`,
+  driving the production `resolve_app` decision.
+- **Linux CI verification is separate.** Everything here is macOS. Cross-
+  compiling to `x86_64-unknown-linux-gnu` locally fails because `aws-lc-sys`
+  needs a Linux C toolchain that is not installed, so Linux remains CI-only.
+- **Long-lived memory behaviour and deployed eviction: still unverified.**
+- **Six requests per sandbox remains a local Viceroy observation**, not a
+  demonstrated universal ceiling.
+- Correctness used mock origins on `127.0.0.1`; the real publisher origin's
+  bot wall blocks the paths under test.
+- **The pin is a branch revision, not a release tag.** `277544c4` lives on
+  `feat/reusable-app-lifecycle`, which is unmerged. It is correctly pinned by
+  SHA so the build is reproducible, but the workspace should move to whichever
+  released tag contains this revision once that branch merges, rather than
+  sitting on an unmerged feature branch.
+- No latency A/B/C was rerun at this revision. Build-count and correctness
+  were re-observed; comparative latency was not, and the earlier figures are
+  not offered as evidence for this revision.

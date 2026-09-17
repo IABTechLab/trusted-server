@@ -55,7 +55,15 @@ Two properties of this path block naive reuse.
 
 ## Dependencies
 
-No EdgeZero version change. The workspace pin stays at `v0.0.8`.
+The workspace pins EdgeZero at `277544c431c1ab9bafa14a45d5f35975b5587e97` on `feat/reusable-app-lifecycle`.
+
+The pin is **not** for the `Serve` re-export: that type comes from the
+already-pinned `fastly 0.12.1` SDK, and EdgeZero's own contract says not to
+repin merely to swap the import. It is for the CLI fixes at that revision
+(push/diff validation scoped to the selected adapter, and secret-reference
+redaction in Spin diagnostics) and the Cloudflare duplicate-header fix. Every
+`edgezero-core` and `edgezero-core::router` change across the range is test
+only, so no runtime behaviour we depend on moved.
 
 `Serve`, `ServeSummary`, and `HandlerResult` all come from `fastly 0.12.1`,
 which is already resolved in `Cargo.lock`. EdgeZero PR #379 re-exports only
@@ -63,8 +71,8 @@ which is already resolved in `Cargo.lock`. EdgeZero PR #379 re-exports only
 `serve_app_with_request_extensions`.
 
 Those helpers are unusable here, but not because of header handling: EdgeZero's
-`to_fastly_response` uses `append_header` (v0.0.8
-`crates/edgezero-adapter-fastly/src/response.rs:28`), so duplicate `Set-Cookie`
+`to_fastly_response` uses `append_header`
+(`crates/edgezero-adapter-fastly/src/response.rs`), so duplicate `Set-Cookie`
 values survive that conversion. The disqualifying part is that the same
 function drains `Body::Stream` into a buffered `fastly::Body` before sending,
 which ends progressive streaming, and that the helper path leaves no place for
@@ -310,8 +318,9 @@ EDGEZERO__SERVICES__<sid>__TS__SANDBOX__TIMEOUT_MS
 ```
 
 **These keys cannot be read through `runtime_env_config`.** That function
-resolves a closed allowlist built by `runtime_env_keys` (edgezero v0.0.8,
-`crates/edgezero-adapter-fastly/src/lib.rs:265-290`): `EDGEZERO__ADAPTER__HOST`
+resolves a closed allowlist built by `runtime_env_keys`
+(`crates/edgezero-adapter-fastly/src/lib.rs`, still closed at the pinned
+revision): `EDGEZERO__ADAPTER__HOST`
 and `__PORT`, four `EDGEZERO__LOGGING__*` keys, and per-store
 `EDGEZERO__STORES__{CONFIG,KV,SECRETS}__<ID>__NAME` / `__KEY`. Every other key
 is dropped, so an `EnvConfig` lookup for a sandbox key always returns `None`.
@@ -322,9 +331,10 @@ path, and pass every test listed below while never enabling reuse.
 The adapter opens the store itself instead:
 
 - Open `edgezero_adapter_fastly::RUNTIME_ENV_STORE_NAME` (a public const,
-  `lib.rs:49`) directly with `fastly::ConfigStore::try_open`.
+  in `edgezero-adapter-fastly`) directly with `fastly::ConfigStore::try_open`.
 - Build the scoped key from `fastly::compute_runtime::service_id()`, because
-  edgezero's `service_scoped_runtime_env_key` (`lib.rs:113`) is private.
+  edgezero's `service_scoped_runtime_env_key` is private, at the pinned
+  revision as well as at `v0.0.8`.
 - If the store is absent, or the open fails, or `service_id()` returns an empty
   string: log once and use single-request operation. (`service_id()` returns
   `&'static str` and cannot itself fail, so empty is the only reachable
