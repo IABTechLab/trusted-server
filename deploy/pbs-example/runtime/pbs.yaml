@@ -1,0 +1,11 @@
+# PBS Go v4.7.0 baseline. Verify every field against the pinned release before deployment.
+external_url: https://pbs.example.com
+host: 0.0.0.0
+port: 8000
+status_response: ok
+auction_timeouts_ms:
+  default: 1000
+  max: 1200
+stored_requests_timeout_ms: 100
+gdpr:
+  default_value: "1"

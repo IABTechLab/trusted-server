@@ -377,10 +377,10 @@ impl IntegrationConfig for LegacyPrebidServerConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrebidBundleBuildConfig {
-    /// Prebid.js bidder adapters included by `ts prebid bundle`.
+    /// Prebid.js bidder adapters included by `ts prebid client`.
     #[serde(default)]
     pub adapters: Vec<String>,
-    /// Optional Prebid.js user ID modules included by `ts prebid bundle`.
+    /// Optional Prebid.js user ID modules included by `ts prebid client`.
     #[serde(default)]
     pub user_id_modules: Option<Vec<String>>,
 }
