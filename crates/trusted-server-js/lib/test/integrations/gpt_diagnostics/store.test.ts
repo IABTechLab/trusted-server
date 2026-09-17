@@ -662,9 +662,7 @@ describe('GptDiagnosticsStore', () => {
       const slot = fakeSlot('path-slot');
 
       if (direct !== undefined) {
-        store.recordTrustedServerOpportunity(slot, 'auction-slot', direct, undefined, undefined, {
-          auctionType: 'ssat',
-        });
+        store.recordTrustedServerOpportunity(slot, 'auction-slot', direct);
       }
       if (prebid) store.recordPrebidRefresh([slot]);
       if (publisher) store.recordPublisherRefresh([slot]);

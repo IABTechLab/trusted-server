@@ -332,8 +332,7 @@ describe('installTsAdInit', () => {
         'atf_sidebar_ad',
         expectedOpportunity,
         undefined,
-        undefined,
-        { auctionType: 'ssat' }
+        undefined
       );
     }
   );
@@ -455,8 +454,7 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      formats,
-      { auctionType: 'ssat' }
+      formats
     );
   });
 
@@ -482,8 +480,7 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      formats,
-      { auctionType: 'ssat' }
+      formats
     );
   });
 
@@ -523,8 +520,7 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      undefined,
-      { auctionType: 'ssat' }
+      undefined
     );
   });
 
