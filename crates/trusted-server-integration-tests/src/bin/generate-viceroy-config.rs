@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use edgezero_core::blob_envelope::BlobEnvelope;
-use trusted_server_core::{config::validate_settings_for_deploy, settings::Settings};
+use trusted_server_core::config::TrustedServerAppConfig;
 
 const GENERATED_AT: &str = "2026-06-23T00:00:00Z";
 const GENERATED_STORES_MARKER: &str = "        # GENERATED_TRUSTED_SERVER_CONFIG_STORES";
@@ -114,15 +114,16 @@ fn build_app_config_envelope(
     app_config_toml: &str,
     origin_url: Option<&str>,
 ) -> Result<String, DynError> {
-    let mut settings = Settings::from_toml(app_config_toml)
-        .map_err(|report| error_box(format!("invalid Trusted Server app config: {report:?}")))?;
+    let app_config: TrustedServerAppConfig = toml::from_str(app_config_toml)
+        .map_err(|error| error_box(format!("invalid Trusted Server app config: {error}")))?;
+    let mut settings = app_config.into_settings();
     if let Some(origin_url) = origin_url {
         settings.publisher.origin_url = origin_url.to_string();
     }
-    validate_settings_for_deploy(&settings)
+    let app_config = TrustedServerAppConfig::new(settings)
         .map_err(|report| error_box(format!("invalid Trusted Server app config: {report:?}")))?;
 
-    let data = serde_json::to_value(&settings).map_err(|error| {
+    let data = serde_json::to_value(&app_config).map_err(|error| {
         error_box(format!(
             "failed to serialize Trusted Server app config to JSON: {error}"
         ))
@@ -161,10 +162,70 @@ fn error_box(message: impl Into<String>) -> DynError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use error_stack::Report;
+    use std::collections::HashMap;
     use trusted_server_core::config_payload::settings_from_config_blob;
+    use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
 
     const TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.integration.toml");
+
+    struct IntegrationSecretStore {
+        values: HashMap<String, Vec<u8>>,
+    }
+
+    impl PlatformSecretStore for IntegrationSecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            self.values
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Report::new(PlatformError::SecretStore))
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    fn integration_secret_store() -> IntegrationSecretStore {
+        IntegrationSecretStore {
+            values: HashMap::from([
+                (
+                    "integration_admin_password".to_owned(),
+                    b"integration-admin-password-32-bytes-ok".to_vec(),
+                ),
+                (
+                    "integration_proxy_secret".to_owned(),
+                    b"integration-test-proxy-secret-32-bytes-ok".to_vec(),
+                ),
+                (
+                    "integration_ec_passphrase".to_owned(),
+                    b"integration-test-ec-secret-padded-32".to_vec(),
+                ),
+                (
+                    "integration_partner_token_alpha".to_owned(),
+                    b"integration-test-token-alpha-32-bytes-ok".to_vec(),
+                ),
+                (
+                    "integration_partner_token_bravo".to_owned(),
+                    b"integration-test-token-bravo-32-bytes-ok".to_vec(),
+                ),
+            ]),
+        }
+    }
 
     #[test]
     fn parse_args_does_not_require_removed_rollout_switch() {
@@ -253,7 +314,12 @@ mod tests {
     fn generated_blob_verifies_and_applies_origin_override() {
         let envelope = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"))
             .expect("should build envelope");
-        let settings = settings_from_config_blob(&envelope).expect("should verify blob");
+        let settings = settings_from_config_blob(
+            &envelope,
+            &integration_secret_store(),
+            &StoreName::from("trusted_server_secrets"),
+        )
+        .expect("should verify blob");
 
         assert_eq!(
             settings.publisher.origin_url, "http://127.0.0.1:9999",
@@ -266,6 +332,19 @@ mod tests {
         let result = build_app_config_envelope("not valid toml", None);
 
         assert!(result.is_err(), "should reject invalid app config");
+    }
+
+    #[test]
+    fn invalid_non_secret_app_config_fails_before_envelope_generation() {
+        let invalid = APP_CONFIG.replace("domain = \"localhost\"", "domain = \"invalid/domain\"");
+
+        let err = build_app_config_envelope(&invalid, None)
+            .expect_err("should reject invalid non-secret config before creating an envelope");
+
+        assert!(
+            err.to_string().contains("invalid_publisher_domain"),
+            "error should identify the structural validation failure: {err}"
+        );
     }
 
     #[test]

@@ -66,6 +66,7 @@ pub mod request_timing;
 pub mod response_privacy;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;
+pub mod secret_resolution;
 pub mod settings;
 pub mod settings_data;
 pub mod storage;

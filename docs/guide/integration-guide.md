@@ -308,22 +308,33 @@ Prebid applies the same steps outlined above with a few notable patterns:
 ```toml
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid.example/openrtb2/auction"
 timeout_ms = 1200
-bidders = ["equativ", "sampleBidder"]
-external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+client_side_bidders = ["example-browser"]
+external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 # external_bundle_sha256 = "..."
 # external_bundle_sri = "sha384-..."
 # script_patterns = ["/static/prebid/*"]
 
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.bidders.example-server]
+provider = "pbs-main"
+
 [proxy]
-allowed_domains = ["assets.example"]
+allowed_domains = ["assets.example.com"]
 ```
 
 The `proxy.allowed_domains` entry is required for `external_bundle_url` and must
 cover the bundle host plus any HTTPS redirect targets used by that host.
 
-Tests or scaffolding can inject configs by calling `settings.integrations.insert_config("prebid", &serde_json::json!({...}))`, the same helper that other integrations use.
+Browser integration tests can inject `[integrations.prebid]` settings with the
+same registry helper as other integrations. Server provider and bidder behavior
+must be constructed from the compiled auction plan rather than integration-owned
+endpoint or bidder fields.
 
 **2. Routes Owned by the Integration**
 

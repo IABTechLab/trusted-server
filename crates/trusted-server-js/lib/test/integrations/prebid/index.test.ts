@@ -44,7 +44,7 @@ interface InjectedPrebidTestConfig {
   accountId?: string;
   timeout?: number;
   debug?: boolean;
-  bidders?: string[];
+  serverSideBidders?: string[];
   clientSideBidders?: string[];
   excludedGamAdUnitPathSuffixes?: unknown;
 }
@@ -317,6 +317,7 @@ describe('prebid/auctionBidsToPrebidBids', () => {
         bidderCode: 'aps',
         ad: '',
         trustedServerRenderer: renderer,
+        meta: expect.objectContaining({ trustedServerRenderer: renderer }),
       })
     );
   });
@@ -439,23 +440,24 @@ describe('prebid/installPrebidNpm', () => {
     );
   });
 
-  it('registers accepted APS descriptors under Prebid generated ad IDs', () => {
+  it('registers normalized APS descriptors at bidAccepted under Prebid generated ad IDs', () => {
     installPrebidNpm();
 
-    const bidResponseListener = mockOnEvent.mock.calls.find(
-      ([eventName]) => eventName === 'bidResponse'
+    const bidAcceptedListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidAccepted'
     )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
-    expect(bidResponseListener).toBeTypeOf('function');
+    expect(bidAcceptedListener).toBeTypeOf('function');
 
     const renderer = apsRenderer();
-    bidResponseListener!({
+    const normalizedBid: Record<string, unknown> = {
       adapterCode: 'trustedServer',
       bidderCode: 'aps',
       adId: 'prebid-generated-ad-id',
       adUnitCode: 'div-aps',
       ttl: 300,
-      trustedServerRenderer: renderer,
-    });
+      meta: { trustedServerRenderer: renderer },
+    };
+    bidAcceptedListener!(normalizedBid);
 
     const entry = testWindow.tsjs?.apsPrebidRenderers?.['prebid-generated-ad-id'];
     expect(entry).toEqual(
@@ -467,11 +469,31 @@ describe('prebid/installPrebidNpm', () => {
       })
     );
 
+    expect(normalizedBid).not.toHaveProperty('trustedServerRenderer');
+    expect(normalizedBid['meta']).not.toHaveProperty('trustedServerRenderer');
     entry?.markUsed();
     expect(mockMarkWinningBidAsUsed).toHaveBeenCalledWith({
       adId: 'prebid-generated-ad-id',
       events: true,
     });
+  });
+
+  it('keeps bidResponse as a top-level renderer compatibility fallback', () => {
+    installPrebidNpm();
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    const renderer = apsRenderer();
+
+    bidResponseListener!({
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'fallback-ad-id',
+      adUnitCode: 'div-aps',
+      trustedServerRenderer: renderer,
+    });
+
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['fallback-ad-id']?.renderer).toEqual(renderer);
   });
 
   it('makes failed APS renderer registrations ineligible when zero-CPM bids are allowed', () => {
@@ -488,7 +510,7 @@ describe('prebid/installPrebidNpm', () => {
       adUnitCode: 'div-aps',
       ttl: 300,
       cpm: 1.23,
-      trustedServerRenderer: { ...apsRenderer(), aaxResponse: 'invalid' },
+      meta: { trustedServerRenderer: { ...apsRenderer(), aaxResponse: 'invalid' } },
     };
     bidResponseListener!(malformedBid);
     bidResponseListener!({
@@ -502,11 +524,33 @@ describe('prebid/installPrebidNpm', () => {
     expect(testWindow.tsjs?.apsPrebidRenderers?.['malformed-ad-id']).toBeUndefined();
     expect(testWindow.tsjs?.apsPrebidRenderers?.['foreign-ad-id']).toBeUndefined();
     expect(malformedBid).not.toHaveProperty('trustedServerRenderer');
+    expect(malformedBid['meta']).not.toHaveProperty('trustedServerRenderer');
     // Prebid's allowZeroCpmBids path still requires cpm >= 0.
     expect(malformedBid['cpm']).toBe(-1);
     expect(warnSpy).toHaveBeenCalledWith(
       '[tsjs-prebid] rejected APS renderer capability that failed registration'
     );
+  });
+
+  it('falls back to the meta APS renderer when the top-level carrier is null', () => {
+    installPrebidNpm();
+
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    expect(bidResponseListener).toBeTypeOf('function');
+
+    const renderer = apsRenderer();
+    bidResponseListener!({
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'null-carrier-ad-id',
+      adUnitCode: 'div-aps',
+      trustedServerRenderer: null,
+      meta: { trustedServerRenderer: renderer },
+    });
+
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['null-carrier-ad-id']?.renderer).toEqual(renderer);
   });
 
   it('registers APS renderer via meta when Prebid strips the custom top-level field', () => {
@@ -1132,6 +1176,12 @@ describe('prebid/installPrebidNpm', () => {
   });
 
   describe('requestBids shim', () => {
+    beforeEach(() => {
+      testWindow.__tsjs_prebid = {
+        serverSideBidders: ['appnexus', 'rubicon', 'kargo', 'openx'],
+      };
+    });
+
     it('preserves publisher ts adserverTargeting while adding trustedServer settings', () => {
       const publisherTargeting = [{ key: 'ts', val: () => 'publisher-value' }];
       mockPbjs.bidderSettings = {
@@ -1195,26 +1245,84 @@ describe('prebid/installPrebidNpm', () => {
       expect(tsCount).toBe(1);
     });
 
-    it('captures per-bidder params on trustedServer bid', () => {
+    it('folds only authoritative routes across mixed client, PBS, APS, and standard demand', () => {
+      testWindow.__tsjs_prebid = {
+        serverSideBidders: ['pbsRoute', 'standardRoute'],
+        clientSideBidders: ['exampleBrowser'],
+      };
       const pbjs = installPrebidNpm();
 
       const adUnits = [
         {
           bids: [
-            { bidder: 'appnexus', params: { placementId: 123 } },
-            { bidder: 'rubicon', params: { accountId: 'abc' } },
+            { bidder: 'exampleBrowser', params: { placement: 'browser' } },
+            { bidder: 'pbsRoute', params: { placement: 'pbs' } },
+            { bidder: 'aps', params: { slot: 'aps' } },
+            { bidder: 'standardRoute', params: { placement: 'standard' } },
+            { bidder: 'pbs-provider-id', params: { forbidden: true } },
           ],
         },
       ];
       pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
 
       const trustedServerBid = adUnits[0].bids.find((b: TestBid) => b.bidder === 'trustedServer');
-      expect(trustedServerBid).toBeDefined();
-      expect(trustedServerBid.params.bidderParams).toEqual({
-        appnexus: { placementId: 123 },
-        rubicon: { accountId: 'abc' },
+      expect(trustedServerBid?.params?.bidderParams).toEqual({
+        pbsRoute: { placement: 'pbs' },
+        standardRoute: { placement: 'standard' },
       });
-      expect(adUnits[0].bids.map((b: TestBid) => b.bidder)).toEqual(['trustedServer']);
+      expect(adUnits[0].bids.map((b: TestBid) => b.bidder)).toEqual([
+        'exampleBrowser',
+        'aps',
+        'pbs-provider-id',
+        'trustedServer',
+      ]);
+    });
+
+    it('preserves prototype-named server-side bidders as owned JSON properties', () => {
+      testWindow.__tsjs_prebid = { serverSideBidders: ['__proto__'] };
+      const pbjs = installPrebidNpm();
+      const adUnits = [
+        {
+          bids: [{ bidder: '__proto__', params: { placement: 'server-owned' } }],
+        },
+      ];
+
+      pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
+
+      const trustedServerBid = adUnits[0].bids.find((bid) => bid.bidder === 'trustedServer');
+      const bidderParams = trustedServerBid?.params?.bidderParams as Record<string, unknown>;
+      expect(Object.prototype.hasOwnProperty.call(bidderParams, '__proto__')).toBe(true);
+      expect(bidderParams['__proto__']).toEqual({ placement: 'server-owned' });
+      expect(JSON.parse(JSON.stringify(bidderParams))).toEqual(
+        Object.fromEntries([['__proto__', { placement: 'server-owned' }]])
+      );
+      expect(adUnits[0].bids.map((bid) => bid.bidder)).toEqual(['trustedServer']);
+    });
+
+    it('does not let returned bidder aliases or APS renderer aliases affect folding', () => {
+      testWindow.__tsjs_prebid = { serverSideBidders: ['configuredRoute'] };
+      const pbjs = installPrebidNpm();
+      const adUnits = [
+        {
+          bids: [
+            { bidder: 'configuredRoute', params: { placement: 1 } },
+            { bidder: 'alternateReturnedSeat', params: { placement: 2 } },
+            { bidder: 'apsRendererAlias', params: { placement: 3 } },
+          ],
+        },
+      ];
+
+      pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
+
+      const trustedServerBid = adUnits[0].bids.find((bid) => bid.bidder === 'trustedServer');
+      expect(trustedServerBid?.params?.bidderParams).toEqual({
+        configuredRoute: { placement: 1 },
+      });
+      expect(adUnits[0].bids.map((bid) => bid.bidder)).toEqual([
+        'alternateReturnedSeat',
+        'apsRendererAlias',
+        'trustedServer',
+      ]);
     });
 
     it('preserves captured bidder params when requestBids runs twice on the same ad unit', () => {
@@ -1263,6 +1371,21 @@ describe('prebid/installPrebidNpm', () => {
       ] as TestAdUnit[];
 
       expect(() => pbjs.requestBids({ adUnits } as unknown as RequestBidsArg)).not.toThrow();
+
+      expect(adUnits[0].bids).toEqual([{ bidder: 'trustedServer', params: { bidderParams: {} } }]);
+    });
+
+    it('preserves the empty stored-request envelope on initial and repeated requests', () => {
+      const pbjs = installPrebidNpm();
+      const adUnits = [
+        {
+          code: 'stored-slot',
+          bids: [{ bidder: 'trustedServer', params: { bidderParams: {} } }],
+        },
+      ];
+
+      pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
+      pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
 
       expect(adUnits[0].bids).toEqual([{ bidder: 'trustedServer', params: { bidderParams: {} } }]);
     });
@@ -1431,6 +1554,18 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
     );
   });
 
+  it('keeps browser timeout and debug independent from multiple PBS routes', () => {
+    testWindow.__tsjs_prebid = {
+      timeout: 1750,
+      debug: false,
+      serverSideBidders: ['pbsPrimaryRoute', 'pbsSecondaryRoute'],
+    };
+
+    installPrebidNpm();
+
+    expect(mockSetConfig).toHaveBeenCalledWith({ debug: false, bidderTimeout: 1750 });
+  });
+
   it('explicit config overrides server-injected values', () => {
     testWindow.__tsjs_prebid = { timeout: 1500, debug: true };
 
@@ -1458,7 +1593,9 @@ describe('prebid/installRefreshHandler', () => {
     mockPbjs.setTargetingForGPTAsync = undefined;
     testWindow.tsjs = undefined;
     delete testWindow.googletag;
-    delete testWindow.__tsjs_prebid;
+    testWindow.__tsjs_prebid = {
+      serverSideBidders: ['appnexus', 'rubicon', 'kargo', 'openx', 'exampleServer'],
+    };
   });
 
   afterEach(() => {
@@ -1629,8 +1766,11 @@ describe('prebid/installRefreshHandler', () => {
     mockPbjs.setTargetingForGPTAsync = undefined;
   });
 
-  it('includes configured client-side bidders in refresh ad units', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+  it('includes every browser-owned bidder in refresh ad units', () => {
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon'],
+      serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
+    };
     // Original publisher ad unit carries a client-side rubicon bid.
     mockPbjs.adUnits = [
       {
@@ -1638,6 +1778,7 @@ describe('prebid/installRefreshHandler', () => {
         bids: [
           { bidder: 'trustedServer', params: {} },
           { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+          { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
         ],
       },
     ];
@@ -1677,6 +1818,7 @@ describe('prebid/installRefreshHandler', () => {
             bids: [
               { bidder: 'trustedServer', params: { zone: 'homepage' } },
               { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+              { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
             ],
           }),
         ],
@@ -1751,7 +1893,10 @@ describe('prebid/installRefreshHandler', () => {
     // publisher's Prebid ad unit is keyed by the inner div_id. The synthetic
     // refresh code stays the GPT element id (so GPT can match it), while params
     // and client-side bids are recovered from the injected div_id candidate.
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon'],
+      serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
+    };
     mockPbjs.adUnits = [
       {
         code: 'div-ad-x',
@@ -2484,7 +2629,9 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     (window as unknown as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle =
       DEFAULT_BUNDLE_MANIFEST;
     mockPbjs.setTargetingForGPTAsync = undefined;
-    delete testWindow.__tsjs_prebid;
+    testWindow.__tsjs_prebid = {
+      serverSideBidders: ['exampleServer', 'exampleFallback'],
+    };
     testWindow.tsjs = undefined;
     delete testWindow.googletag;
   });
@@ -2851,7 +2998,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
   });
 
   it('recovers inline params, ordered client bids, and zone when pbjs.adUnits is empty', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['exampleBrowser'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['exampleBrowser'],
+      serverSideBidders: ['exampleServer', 'appnexus'],
+    };
     const runtimeInstance = 'example-runtime-instance';
     const code = `example-slot-${runtimeInstance}`;
     const slot = {
@@ -2902,8 +3052,47 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     });
   });
 
+  it('preserves unowned browser bidders in snapshot-backed refreshes', () => {
+    testWindow.__tsjs_prebid = { serverSideBidders: ['exampleServer'] };
+    const code = 'example-unowned-browser-bidder-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code,
+          bids: [
+            { bidder: 'exampleServer', params: { placement: 'server' } },
+            { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
+          ],
+        },
+      ],
+    } as unknown as RequestBidsArg);
+
+    pubads.refresh([slot]);
+
+    expect(mockPbjs.adUnits).toEqual([]);
+    expect(refreshAdUnitFromLastRequest().bids).toEqual([
+      {
+        bidder: 'trustedServer',
+        params: { bidderParams: { exampleServer: { placement: 'server' } } },
+      },
+      { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
+    ]);
+  });
+
   it('isolates nested bidder-param objects and arrays from later publisher mutation', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['exampleBrowser'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['exampleBrowser'],
+      serverSideBidders: ['exampleServer', 'appnexus'],
+    };
     const code = 'example-nested-params-slot';
     const slot = {
       getSlotElementId: () => code,
@@ -3076,7 +3265,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
   });
 
   it('prefers a rich live unit when a fresh same-code request overwrites the snapshot with empty bids', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['exampleBrowser'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['exampleBrowser'],
+      serverSideBidders: ['exampleServer', 'appnexus'],
+    };
     const code = 'example-live-rich-slot';
     const slot = {
       getSlotElementId: () => code,
@@ -3106,6 +3298,51 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       },
       { bidder: 'exampleBrowser', params: { placement: 'live-browser' } },
     ]);
+  });
+
+  it('filters unowned stored bidder params before snapshot, reuse, and refresh recovery', () => {
+    testWindow.__tsjs_prebid = { serverSideBidders: ['exampleServer'] };
+    const code = 'example-stored-envelope-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+    const adUnits = [
+      {
+        code,
+        bids: [
+          {
+            bidder: 'trustedServer',
+            params: {
+              bidderParams: {
+                exampleServer: { placement: 'authoritative' },
+                pbsProviderId: { placement: 'provider' },
+                returnedSeatAlias: { placement: 'alias' },
+              },
+            },
+          },
+        ],
+      },
+    ];
+
+    pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
+    expect(adUnits[0].bids[0].params?.bidderParams).toEqual({
+      exampleServer: { placement: 'authoritative' },
+    });
+
+    pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
+    expect(adUnits[0].bids[0].params?.bidderParams).toEqual({
+      exampleServer: { placement: 'authoritative' },
+    });
+
+    pubads.refresh([slot]);
+    expect(refreshAdUnitFromLastRequest().bids[0].params?.bidderParams).toEqual({
+      exampleServer: { placement: 'authoritative' },
+    });
   });
 
   it('does not resurrect an older snapshot when the live unit is intentionally empty', () => {
@@ -4092,7 +4329,10 @@ describe('prebid/client-side bidders', () => {
   });
 
   it('excludes client-side bidders from trustedServer bidderParams', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon'],
+      serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
+    };
 
     const pbjs = installPrebidNpm();
 
@@ -4117,7 +4357,10 @@ describe('prebid/client-side bidders', () => {
   });
 
   it('preserves client-side bidder bids as standalone entries', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon'],
+      serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
+    };
 
     const pbjs = installPrebidNpm();
 
@@ -4139,7 +4382,10 @@ describe('prebid/client-side bidders', () => {
   });
 
   it('handles multiple client-side bidders', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon', 'openx'],
+      serverSideBidders: ['appnexus', 'exampleServer'],
+    };
 
     const pbjs = installPrebidNpm();
 
@@ -4166,8 +4412,8 @@ describe('prebid/client-side bidders', () => {
     expect(adUnits[0].bids.find((b: TestBid) => b.bidder === 'appnexus')).toBeUndefined();
   });
 
-  it('behaves normally when no client-side bidders are configured', () => {
-    // No __tsjs_prebid at all — all bidders go server-side
+  it('leaves all unowned bidders in browser demand when no routes are configured', () => {
+    testWindow.__tsjs_prebid = { serverSideBidders: [] };
     const pbjs = installPrebidNpm();
 
     const adUnits = [
@@ -4181,14 +4427,19 @@ describe('prebid/client-side bidders', () => {
     pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
 
     const tsBid = adUnits[0].bids.find((b: TestBid) => b.bidder === 'trustedServer') as TestBid;
-    expect(tsBid.params.bidderParams).toEqual({
-      appnexus: { placementId: 123 },
-      rubicon: { accountId: 'abc' },
-    });
+    expect(tsBid.params?.bidderParams).toEqual({});
+    expect(adUnits[0].bids.map((bid) => bid.bidder)).toEqual([
+      'appnexus',
+      'rubicon',
+      'trustedServer',
+    ]);
   });
 
   it('behaves normally when client-side bidders list is empty', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: [] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: [],
+      serverSideBidders: ['appnexus', 'rubicon'],
+    };
 
     const pbjs = installPrebidNpm();
 
@@ -4210,7 +4461,10 @@ describe('prebid/client-side bidders', () => {
   });
 
   it('still injects trustedServer when all bidders are client-side', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon', 'appnexus'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon', 'appnexus'],
+      serverSideBidders: ['openx', 'exampleServer'],
+    };
 
     const pbjs = installPrebidNpm();
 
@@ -4237,7 +4491,10 @@ describe('prebid/client-side bidders', () => {
       adapters: ['rubicon'],
       bidderCodes: ['rubicon'],
     };
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon', 'openx'],
+      serverSideBidders: ['appnexus', 'exampleServer'],
+    };
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -4281,7 +4538,10 @@ describe('prebid/client-side bidders', () => {
       adapters: ['adf'],
       bidderCodes: ['adf', 'adform', 'adformOpenRTB'],
     };
-    testWindow.__tsjs_prebid = { clientSideBidders: ['adform'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['adform'],
+      serverSideBidders: ['appnexus', 'exampleServer'],
+    };
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -4306,7 +4566,10 @@ describe('prebid/client-side bidders', () => {
       adapters: ['a1Media'],
       bidderCodes: ['a1media'],
     };
-    testWindow.__tsjs_prebid = { clientSideBidders: ['a1Media'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['a1Media'],
+      serverSideBidders: ['appnexus', 'exampleServer'],
+    };
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -4328,7 +4591,10 @@ describe('prebid/client-side bidders', () => {
   it('treats a malformed manifest as unstamped instead of throwing', () => {
     // The manifest is a plain window global any page script can overwrite.
     testWindow.__tsjs_prebid_bundle = { adapters: 'rubicon', userIdModules: 42 };
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon'],
+      serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
+    };
 
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -4345,7 +4611,10 @@ describe('prebid/client-side bidders', () => {
 
   it('warns when the external bundle stamped no adapter manifest', () => {
     delete testWindow.__tsjs_prebid_bundle;
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon'],
+      serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
+    };
 
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -4361,7 +4630,10 @@ describe('prebid/client-side bidders', () => {
   });
 
   it('does not log errors when all client-side bidders have adapters', () => {
-    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    testWindow.__tsjs_prebid = {
+      clientSideBidders: ['rubicon'],
+      serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
+    };
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 

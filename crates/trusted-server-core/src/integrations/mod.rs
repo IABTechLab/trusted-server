@@ -296,14 +296,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
             build: js_asset_proxy::register,
         },
         IntegrationBuilder {
-            id: "aps",
-            build: aps::register,
-        },
-        IntegrationBuilder {
-            id: "prebid",
-            build: prebid::register,
-        },
-        IntegrationBuilder {
             id: "testlight",
             build: testlight::register,
         },

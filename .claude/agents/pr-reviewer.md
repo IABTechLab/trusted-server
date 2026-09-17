@@ -411,7 +411,7 @@ if [ -n "$NUMBER" ]; then
     # to distinguish pending/no-output from command failures.
     #
     # Query the *full* check set — not `--required`. Branch protection's
-    # required list in this repo omits gates that CLAUDE.md still treats as PR
+    # required list in this repo omits gates that AGENTS.md still treats as PR
     # gates (e.g. `Analyze (rust)`, `vitest`, CodeQL, browser/integration
     # tests), so a `--required`-only query can report clean CI while one of
     # those failed and hide a real regression.
@@ -460,7 +460,7 @@ Classify CI by `bucket`, not by the `gh pr checks` exit code, over the
   in step 8a's "Cross-cutting / body-level findings" section. This applies to
   **any** failed check, not just required ones — a failed non-required gate
   (`vitest`, `Analyze (rust)`, integration tests, CodeQL) is still a real
-  regression CLAUDE.md treats as a PR gate. Note in the finding whether the
+  regression AGENTS.md treats as a PR gate. Note in the finding whether the
   check name appears in `$required_names` (merge-blocking under branch
   protection) or not (a failing gate branch protection doesn't enforce). That
   finding feeds the verdict rules below, so a PR with any failed CI cannot fall
@@ -501,7 +501,7 @@ For each changed file, evaluate:
 - No Tokio or runtime-specific deps in `crates/trusted-server-core`
 - Fastly-specific APIs only in `crates/trusted-server-adapter-fastly`
 
-#### Convention compliance (from CLAUDE.md)
+#### Convention compliance (from AGENTS.md)
 
 - `expect("should ...")` instead of `unwrap()` in production code
 - `error-stack` (`Report<E>`) with `derive_more::Display` for errors (not thiserror/anyhow)
@@ -921,7 +921,7 @@ pure-renaming suggestions don't need that disclaimer.
 
 The targeted preflight above narrows clippy to the touched adapter. That's
 deliberately cheap so verification stays fast for one-line edits. But
-CLAUDE.md's required CI gates include the full target-matched clippy alias
+AGENTS.md's required CI gates include the full target-matched clippy alias
 chain, all four adapter test aliases, and the cross-adapter parity suite, and
 the targeted run won't catch issues that appear only under another adapter's
 target or feature set, in `--tests`, or in a downstream crate. Use the full
@@ -946,7 +946,7 @@ gate when **any** of these is true:
 ```
 
 **JS/TS suggestions** (run from the package root in a subshell so the
-worktree's cwd is unaffected). CLAUDE.md's JS-side build pipeline also runs
+worktree's cwd is unaffected). AGENTS.md's JS-side build pipeline also runs
 `node build-all.mjs` to re-bundle the per-integration IIFEs; skipping it
 means a suggestion that edits `src/integrations/*/index.ts` could compile
 under `vitest` but break the runtime bundle the Rust crate `include_str!`s
