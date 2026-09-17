@@ -40,14 +40,22 @@ Cover these topics, skipping already confirmed answers:
 - Operations: fixed headroom versus automatic scaling, budget ceiling, owner and backup, existing CI and AWS platform, regions, DNS, network restrictions, and bidder IP allowlists.
 - Security: permitted callers/publishers, public or private access, data residency, retention, and the privacy policy owner.
 - Auction behavior: caller, bidder set, formats, consent and identity, account settings, stored requests, and cache dependencies. Read [Prebid Go requirements](references/prebid-go.md) before resolving these inputs.
+- Outbound bidder connectivity: for each bidder and region, choose public/NAT egress, an internal RTB Fabric link, or an RTB Fabric outbound external link. If RTB Fabric is a candidate, read [RTB Fabric connectivity](references/rtb-fabric.md) before asking the conditional questions. Record partner participation, gateway and link ownership, PBS endpoint mapping, regional support, quotas, timeout, cost, fallback, and monitoring.
+
+When RTB Fabric is a candidate, ask these questions in related groups:
+
+1. Which bidders participate in RTB Fabric, in which regions, and which partner provides each responder gateway ID? Who accepts and owns each link?
+2. For each participating bidder, should PBS use an internal Fabric link or an outbound external link? What remains on NAT egress, and what is the explicit behavior when a Fabric link is pending, unavailable, or over quota?
+3. Which pinned PBS Go release and adapter configuration own the endpoint mapping? Who approves link creation, partner acceptance, configuration rollout, and endpoint changes?
+4. What peak transactions per second, payload sizes, bidder deadlines, regional failover load, and monthly volume should size each link and compare Fabric cost with NAT?
 
 Translate "production ready" into measurable availability, security, capacity, and recovery requirements. Scaling and availability are separate decisions. Offer a measurement plan for unknown traffic rather than inventing capacity.
 
-Done when every topic is confirmed, explicitly inapplicable, or recorded as an unresolved blocker. Continue a provisional design around unknowns, but pause affected file generation until architecture-changing decisions are approved.
+Done when every topic is confirmed, explicitly inapplicable, or recorded as an unresolved blocker. For an RTB Fabric branch, every participating bidder and region has a selected path, partner owner, endpoint mapping, quota and timeout check, cost assumption, fallback, and monitoring owner. Continue a provisional design around unknowns, but pause affected file generation until architecture-changing decisions are approved.
 
 ## 3. Recommend and obtain approval
 
-Read [architecture decisions](references/architecture.md). For Terraform state/authentication decisions and HCL generation, read [Terraform guidance](references/terraform.md). For a two-region standalone-host pilot, consult [the worked example](examples/two-region-pilot.md); its values remain conditional.
+Read [architecture decisions](references/architecture.md). If the interview selected RTB Fabric, also read [RTB Fabric connectivity](references/rtb-fabric.md). For Terraform state/authentication decisions and HCL generation, read [Terraform guidance](references/terraform.md). For a two-region standalone-host pilot, consult [the worked example](examples/two-region-pilot.md); its values remain conditional.
 
 Present one recommended design and only alternatives that resolve a real tradeoff. Include:
 
@@ -68,7 +76,7 @@ Read [file generation and validation](references/file-generation.md). Follow exi
 
 Read the [PBS CLI usage and descriptor schema](../../../crates/trusted-server-cli/README.md) before generating inputs consumed by `ts prebid server`. Its current descriptor supports EC2/Compose only. Keep other architecture choices available, but mark their CLI integration deferred rather than generating unsupported fields.
 
-Verify version-specific PBS fields and adapter bindings against the selected release. Verify AWS/Terraform behavior and pricing against current primary documentation. Record source links, versions, and verification dates in the deployment plan. Unavailable evidence remains a named blocker; do not invent image digests, configuration keys, prices, or benchmark results.
+Verify version-specific PBS fields and adapter bindings against the selected release. For an approved RTB Fabric branch, reread [RTB Fabric connectivity](references/rtb-fabric.md) and keep partner acceptance, link activation, and any unsupported CLI integration visible as separate work. Verify AWS/Terraform behavior and pricing against current primary documentation. Record source links, versions, and verification dates in the deployment plan. Unavailable evidence remains a named blocker; do not invent image digests, configuration keys, prices, or benchmark results.
 
 Done when every approved artifact exists, has a named owner and check, and every unresolved input is visible and prevents unsafe use where applicable. Every generated operator command must have documented inputs, access requirements, output, failure behavior, and a recovery action; proposing command names alone is not implementation.
 
