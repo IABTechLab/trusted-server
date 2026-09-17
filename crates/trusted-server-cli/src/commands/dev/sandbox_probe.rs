@@ -94,6 +94,15 @@ pub fn run(args: &SandboxProbeArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to start async runtime: {e}"))?;
 
     let (observations, ending) = runtime.block_on(collect(args))?;
+
+    // A transport error invalidates the run, so say so on stderr as well as
+    // in the report: a caller piping stdout to a file should still see it.
+    if let Ending::TransportError(reason) = &ending {
+        crate::output::warn(&format!(
+            "measurement run is unreliable, observations may be incomplete: {reason}"
+        ));
+    }
+
     crate::output::info(report(&observations, &ending).trim_end());
     Ok(())
 }
