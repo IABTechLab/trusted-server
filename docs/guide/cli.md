@@ -118,30 +118,36 @@ deploy. Adapter passthrough arguments must now follow a `--` separator; unknown
 flags before `--` (including the renamed-away `--stage`) are rejected at parse
 time rather than forwarded. This is a change: passthrough args previously
 worked without the separator, so existing runbooks and CI jobs that pass
-adapter flags directly need the `--` added:
+adapter flags directly need the `--` added. Trusted Server declares Config, KV,
+and Secret Stores, so EdgeZero treats every Fastly deploy as managed and
+requires a verified application release root via `--application-release`; a
+bare `ts deploy --adapter fastly` without a release is accepted only for
+store-free applications:
 
 ```bash
-ts deploy --adapter fastly --service-id <service-id> --staging
-ts deploy --adapter fastly -- --comment "release"
+ts deploy --adapter fastly --service-id <service-id> --application-release <release-root> --staging
+ts deploy --adapter fastly --service-id <service-id> --application-release <release-root> -- --comment "release"
 ```
 
 A staged deploy selects the physical Config Store from the staging environment
-and points the staged version's config selector at the
-`<logical-store-id>_staging` key. It does not copy the production config blob
-there. Push the staged config before probing the staged version:
+and links it to the staged version under the logical store ID. The staged
+runtime reads the `<logical-store-id>_staging` key from that store. It does not
+copy the production config blob there. Push the staged config before probing
+the staged version:
 
 ```bash
 ts config push --adapter fastly --staging
 ts config diff --adapter fastly --staging
 ```
 
-The staged version resolves its app-config key through a staging selector store
-linked under the name `edgezero_runtime_env`. Production and staging may select
-the same physical Config Store or different stores. After
-`ts config push --staging`, the staged binary reads
-`<logical-store-id>_staging` in the store selected by the staging environment,
-while the active production version continues to read its production key and
-store.
+Config keys are deterministic on Fastly: production reads `<logical-store-id>`,
+staging reads `<logical-store-id>_staging`, and local Viceroy reads the
+production key. The binary decides which key to read from Fastly's staging
+signal, not from a stored selector. Production and staging may select the same
+physical Config Store or different stores. After `ts config push --staging`,
+the staged binary reads `<logical-store-id>_staging` in the store selected by
+the staging environment, while the active production version continues to read
+its production key and store.
 
 `--staging` on `config push` / `config diff` writes and compares the
 `<logical-store-id>_staging` key in the physical store selected by the staging

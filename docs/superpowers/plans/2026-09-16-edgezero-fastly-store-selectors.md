@@ -4,7 +4,7 @@
 
 **Goal:** Restore Trusted Server staging deployments by consuming EdgeZero PR 381's canonical Fastly store-selector behavior and removing the superseded service-scoped configuration.
 
-**Architecture:** Pin every EdgeZero workspace dependency to the upstream PR branch so the CLI and adapters share one revision. Keep Trusted Server's strict runtime secret resolution, while changing local Viceroy configuration, its regression test, and operator guidance to use canonical `EDGEZERO__STORES__...` selectors that EdgeZero applies during deployment.
+**Architecture:** Pin every EdgeZero workspace dependency to the upstream PR branch so the CLI and adapters share one revision. Keep Trusted Server's strict runtime secret resolution, while moving the Fastly entry point, local Viceroy configuration, its regression test, and operator guidance to the logical-ID store model: EdgeZero links each physical store selected by a canonical `EDGEZERO__STORES__...` deployment selector under its logical ID, and the runtime opens stores by that ID.
 
 **Tech Stack:** Rust 1.95, Cargo Git dependencies, Fastly Compute/Viceroy TOML configuration, Markdown documentation, GitHub CLI.
 
@@ -14,9 +14,10 @@
 
 - `Cargo.toml`: select the EdgeZero PR 381 branch for all EdgeZero crates.
 - `Cargo.lock`: lock all EdgeZero packages to the branch revision.
-- `fastly.toml`: use the canonical local Viceroy secret-store selector.
-- `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml`: keep generated Viceroy integration configurations aligned with the root Fastly configuration.
-- `crates/trusted-server-integration-tests/tests/common/config.rs`: regress the canonical selector in both Viceroy configurations.
+- `crates/trusted-server-adapter-fastly/src/main.rs`, `crates/trusted-server-adapter-fastly/src/app.rs`: open stores by logical ID and derive the config key from Fastly's staging signal instead of reading `edgezero_runtime_env`.
+- `fastly.toml`: expose the local Viceroy secret store under its logical ID and drop the runtime selector store.
+- `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml`, `scripts/template-cache-local-test.sh`: keep generated Viceroy configurations aligned with the root Fastly configuration.
+- `crates/trusted-server-integration-tests/tests/common/config.rs`: regress the logical-ID store exposure in both Viceroy configurations.
 - `docs/guide/fastly.md`: explain deploy-time canonical selector handling and physical store linking.
 - `docs/guide/cli.md`: explain staging Config Store selection under the restored EdgeZero deployment model.
 - `docs/superpowers/specs/2026-09-16-edgezero-fastly-store-selectors-design.md`: approved design, already committed.
@@ -49,54 +50,42 @@ gh issue create --repo IABTechLab/trusted-server --title "Align Fastly staging s
 
 Expected: GitHub prints the new issue URL. Save its issue number for the pull request body.
 
-### Task 2: Regress Canonical Viceroy Selectors
+### Task 2: Expose Viceroy Stores Under Their Logical IDs
 
 **Files:**
 
 - Modify: `crates/trusted-server-integration-tests/tests/common/config.rs:48`
-- Modify: `fastly.toml:74`
-- Modify: `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml:86`
+- Modify: `fastly.toml:56`
+- Modify: `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml:69`
+- Modify: `scripts/template-cache-local-test.sh:372`
 
 - [ ] **Step 1: Change the regression test first**
 
-Rename `local_fastly_secret_store_mapping_is_service_scoped` to
-`local_fastly_secret_store_mapping_is_canonical`. Replace the service-scoped
-constant with:
-
-```rust
-const VICEROY_SECRET_STORE_MAPPING_KEY: &str =
-    "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME";
-```
-
-Assert that both parsed configurations map that key to `ts_secrets`. Remove the
-assertion that rejects the canonical key. Keep assertion messages focused on the
-canonical selector contract.
+Replace `local_fastly_secret_store_mapping_is_service_scoped` with
+`local_fastly_secret_store_is_exposed_under_its_logical_id`. Assert that both
+parsed configurations define `[[local_server.secret_stores.trusted_server_secrets]]`
+and define no `edgezero_runtime_env` Config Store. Point the starter secret
+reference test at the logical ID as well.
 
 - [ ] **Step 2: Run the focused test and verify it fails**
 
 Run from `crates/trusted-server-integration-tests` using the host target:
 
 ```bash
-cargo test --test integration local_fastly_secret_store_mapping_is_canonical --target aarch64-apple-darwin
+cargo test --test integration local_fastly --target aarch64-apple-darwin
 ```
 
-Expected: FAIL because both TOML files still contain the service-scoped key.
+Expected: FAIL because both TOML files still name the store `ts_secrets` and
+still define `edgezero_runtime_env`.
 
-- [ ] **Step 3: Update the two Viceroy configurations**
+- [ ] **Step 3: Update the Viceroy configurations**
 
-In both TOML files replace:
-
-```text
-EDGEZERO__SERVICES__0000000000000000000000__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME
-```
-
-with:
-
-```text
-EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME
-```
-
-Adjust the nearby root `fastly.toml` comment to call this a canonical selector.
+In `fastly.toml`, the Viceroy template, and the template-cache script rename
+`[[local_server.secret_stores.ts_secrets]]` to
+`[[local_server.secret_stores.trusted_server_secrets]]`. Remove the
+`[local_server.config_stores.edgezero_runtime_env]` table and its contents from
+`fastly.toml` and the template. Adjust the nearby root `fastly.toml` comment to
+say Viceroy exposes the store under its logical ID.
 
 - [ ] **Step 4: Run the focused test and verify it passes**
 
@@ -107,8 +96,8 @@ Expected: PASS.
 - [ ] **Step 5: Commit the regression and fixtures**
 
 ```bash
-git add fastly.toml crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml crates/trusted-server-integration-tests/tests/common/config.rs
-git commit -m "Use canonical Fastly secret store selectors"
+git add fastly.toml scripts/template-cache-local-test.sh crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml crates/trusted-server-integration-tests/tests/common/config.rs
+git commit -m "Expose Viceroy stores under their logical IDs"
 ```
 
 ### Task 3: Consume the EdgeZero PR Branch
@@ -117,6 +106,8 @@ git commit -m "Use canonical Fastly secret store selectors"
 
 - Modify: `Cargo.toml:59`
 - Modify: `Cargo.lock`
+- Modify: `crates/trusted-server-adapter-fastly/src/main.rs:92`
+- Modify: `crates/trusted-server-adapter-fastly/src/app.rs:158`
 
 - [ ] **Step 1: Select the upstream branch consistently**
 
@@ -138,6 +129,13 @@ Expected: Cargo fetches the branch, locks every EdgeZero package to the same Git
 revision, and the Trusted Server CLI compiles. If upstream API changes cause a
 compiler failure, make only the call-site changes required by that error and add
 a focused parsing or behavior test before the production edit.
+
+The branch head removes `edgezero_adapter_fastly::runtime_env_config`. Replace
+`RuntimeStoreConfig::from_env` with `RuntimeStoreConfig::for_target(staging)`:
+open `trusted_server_config` and `trusted_server_secrets` by logical ID and
+derive the config key with `EnvConfig::store_key_for_target`. Both entry points
+pass `fastly::compute_runtime::is_staging()`. Cover the production and staging
+keys with unit tests in `app.rs`.
 
 - [ ] **Step 3: Verify the lockfile revision is consistent**
 
@@ -163,7 +161,7 @@ Expected: all non-ignored tests pass.
 - [ ] **Step 5: Commit the dependency update**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/trusted-server-cli
+git add Cargo.toml Cargo.lock crates/trusted-server-adapter-fastly crates/trusted-server-cli
 git commit -m "Consume canonical EdgeZero deployment selectors"
 ```
 
@@ -183,27 +181,30 @@ Keep the canonical export example. Replace the statements that provisioning
 persists a service-scoped key and that unscoped keys are ignored with the PR 381
 contract:
 
-- provisioning creates/reuses resources and the `edgezero_runtime_env` store;
-- deployment copies canonical selectors from its selected environment;
-- production reconciles them into its runtime store;
-- staging applies its selected physical stores to a per-service staging twin and
-  links those resources to the staged version;
+- provisioning creates/reuses the physical store;
+- a managed deployment reads canonical selectors from its selected environment
+  and links each selected physical store to the target version under its
+  logical ID;
+- the runtime opens stores by logical ID; nothing is stored in
+  `edgezero_runtime_env`;
+- staging links its selected physical stores into only the staged version;
 - canonical environment-variable names contain no service ID;
 - the selected physical resources must already exist.
 
 - [ ] **Step 2: Update staging CLI guidance**
 
 Clarify that `ts config push --staging` writes the staging key into the physical
-Config Store selected by the staging environment, and `ts deploy --staging`
-links a staging selector store that points at that key. State that production and
-staging may select the same or different physical stores.
+Config Store selected by the staging environment, and that the staged binary
+reads `<logical-store-id>_staging` because Fastly reports it as staged, not
+because of a stored selector. State that production and staging may select the
+same or different physical stores.
 
 - [ ] **Step 3: Check for stale service-scoped guidance**
 
 Run:
 
 ```bash
-rg -n 'EDGEZERO__SERVICES__|service-scoped mapping|ignored unscoped' fastly.toml docs crates/trusted-server-integration-tests --glob '!docs/superpowers/**'
+rg -n 'EDGEZERO__SERVICES__|service-scoped mapping|ignored unscoped|edgezero_runtime_env' fastly.toml docs crates/trusted-server-integration-tests --glob '!docs/superpowers/**'
 ```
 
 Expected: no matches outside archived design material.
@@ -259,7 +260,7 @@ cargo test-axum
 cargo test-cloudflare
 cargo test-spin
 ./scripts/test-cli.sh
-cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test integration local_fastly_secret_store_mapping_is_canonical
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test integration local_fastly
 cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
 ```
 

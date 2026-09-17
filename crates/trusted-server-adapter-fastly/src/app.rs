@@ -90,7 +90,6 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::env_config::EnvConfig;
@@ -100,6 +99,7 @@ use edgezero_core::http::{
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
+use fastly::compute_runtime;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -162,11 +162,21 @@ pub(crate) struct RuntimeStoreConfig {
 }
 
 impl RuntimeStoreConfig {
-    pub(crate) fn from_env(env: &EnvConfig) -> Self {
+    /// Store bindings for the running Fastly publication target.
+    ///
+    /// Fastly Compute has no process environment. `EdgeZero` links each selected
+    /// physical store to the service version under its logical ID, so the
+    /// runtime opens stores by logical ID and derives the config entry key from
+    /// the target alone: production reads `<id>`, staging reads `<id>_staging`.
+    pub(crate) fn for_target(staging: bool) -> Self {
         Self {
-            config_store_name: StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID)),
-            config_key: env.store_key("config", DEFAULT_CONFIG_STORE_ID),
-            secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
+            config_store_name: StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            config_key: EnvConfig::default().store_key_for_target(
+                "config",
+                DEFAULT_CONFIG_STORE_ID,
+                staging,
+            ),
+            secret_store_name: StoreName::from(DEFAULT_SECRET_STORE_ID),
         }
     }
 }
@@ -1343,8 +1353,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let runtime_env = runtime_env_config(Self::stores());
-        let stores = RuntimeStoreConfig::from_env(&runtime_env);
+        let stores = RuntimeStoreConfig::for_target(compute_runtime::is_staging());
         Self::router_with_state(&stores).0
     }
 
@@ -1385,7 +1394,6 @@ mod tests {
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::env_config::EnvConfig;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::params::PathParams;
@@ -1455,32 +1463,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_store_config_maps_logical_store_names_and_config_key() {
-        let env = EnvConfig::from_vars([
-            (
-                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
-                "physical_config",
-            ),
-            (
-                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
-                "active_config",
-            ),
-            (
-                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
-                "ts_secrets",
-            ),
-        ]);
+    fn runtime_store_config_reads_the_staging_config_key_on_staging() {
+        let stores = RuntimeStoreConfig::for_target(true);
 
-        let stores = RuntimeStoreConfig::from_env(&env);
-
-        assert_eq!(stores.config_store_name.as_ref(), "physical_config");
-        assert_eq!(stores.config_key, "active_config");
-        assert_eq!(stores.secret_store_name.as_ref(), "ts_secrets");
+        assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
+        assert_eq!(stores.config_key, "trusted_server_config_staging");
+        assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
     }
 
     #[test]
-    fn runtime_store_config_uses_logical_defaults_without_overrides() {
-        let stores = RuntimeStoreConfig::from_env(&EnvConfig::default());
+    fn runtime_store_config_opens_logical_store_ids_in_production() {
+        let stores = RuntimeStoreConfig::for_target(false);
 
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");

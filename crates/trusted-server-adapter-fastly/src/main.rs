@@ -2,14 +2,13 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
-use edgezero_adapter_fastly::runtime_env_config;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
 use error_stack::Report;
+use fastly::compute_runtime;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
@@ -90,8 +89,7 @@ fn main() {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest) {
-    let runtime_env = runtime_env_config(TrustedServerApp::stores());
-    let runtime_stores = RuntimeStoreConfig::from_env(&runtime_env);
+    let runtime_stores = RuntimeStoreConfig::for_target(compute_runtime::is_staging());
 
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
