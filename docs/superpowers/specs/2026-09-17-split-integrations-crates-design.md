@@ -295,7 +295,8 @@ The rules are:
 3. `trusted-server-integrations` links Rust definitions with generated browser
    modules from `trusted-server-integrations-js`.
 4. Integration TypeScript may use the explicit browser-core API, but browser
-   core never imports a concrete integration.
+   core never imports a concrete integration and integration bundles never
+   embed a private copy of stateful browser-core modules.
 5. Every adapter and the CLI uses the same composition and validation entry
    points from `trusted-server-integrations`.
 6. No adapter reconstructs a concrete catalog or imports `aps`, `prebid`, or
@@ -525,16 +526,20 @@ The contract is:
    JavaScript-only `creative` prelude second, and configured integration modules
    afterward.
 
-The TOML parser must capture order directly. `IntegrationSettings` may not use
-`HashMap` or another unordered representation.
+Trusted Server must capture source-level table order before the EdgeZero
+configuration path reduces TOML to a semantic value. This source-aware stage
+also enforces the explicit-parent rule. Every entry point that accepts TOML,
+including local settings loading and CLI validation or push, uses that stage.
+`IntegrationSettings` may not use `HashMap` or another unordered
+representation.
 
 ### Config-store representation
 
 JSON object member order is not an ordering contract. Config push therefore
-converts the operator tables into an explicit ordered sequence in the signed
-blob envelope. Nested provider maps are likewise encoded with explicit
-sequence order. Runtime loading reconstructs ordered settings from those
-sequences and never infers order from JSON object iteration.
+converts the operator tables into an explicit ordered sequence in the
+hash-verified blob envelope. Nested provider maps are likewise encoded with
+explicit sequence order. Runtime loading reconstructs ordered settings from
+those sequences and never infers order from JSON object iteration.
 
 Conceptually, the stored representation carries:
 
@@ -568,7 +573,7 @@ explicit and covered by compatibility tests across:
 ```text
 trusted-server.toml
   → typed CLI configuration
-  → signed blob envelope
+  → hash-verified blob envelope
   → config store
   → runtime Settings
   → registry, JavaScript lists, and AuctionPlan
@@ -581,9 +586,12 @@ integration owns the typed schema and validation for its full configuration,
 including its provider instances.
 
 The generated definition catalog supplies integration parsing, validation,
-secret metadata, and capability construction to both runtime startup and the
-CLI. `config validate`, `config diff`, and `config push` must use the same
-catalog as the adapters.
+secret metadata, pre-resolution handling for conditionally active secrets, and
+capability construction to both runtime startup and the CLI. For example,
+DataDome's inactive secret references are filtered by its definition before
+the shared secret resolver runs; core's config-payload code does not retain a
+DataDome-specific JSON path. `config validate`, `config diff`, and
+`config push` must use the same catalog as the adapters.
 
 Validation fails for:
 
@@ -638,6 +646,11 @@ registered hook; core preserves the current buffering and cache behavior.
 The annotation represents only the existing shared-versus-request-private
 decision. It is not a general policy or permissions system.
 
+DataDome's tag-suppression and other integration-private request state stays
+owned by DataDome and moves with the implementation. It may use neutral opaque
+request/document state, but it is not folded into the response-sharing
+annotation or exposed as a core vendor-specific field.
+
 ### Request preparation and response finalization
 
 GPT diagnostics currently has direct preparation calls in adapters and core
@@ -653,6 +666,13 @@ introduced.
 
 `trusted-server-js` builds only the neutral core IIFE and exposes a narrow API
 for integration registration and module combination.
+
+The core IIFE initializes exactly one stateful registration object on the
+Trusted Server browser namespace before any integration IIFE runs. Integration
+bundles consume that object through an external runtime shim and type-only
+browser-core declarations; their bundler must not inline the stateful registry
+implementation. Artifact tests prove that a renderer registered by an
+integration IIFE is visible to the already-loaded core IIFE.
 
 `trusted-server-integrations-js` builds integration IIFEs. Immediate modules
 are concatenated in the ordering contract above. Deferred and standalone
