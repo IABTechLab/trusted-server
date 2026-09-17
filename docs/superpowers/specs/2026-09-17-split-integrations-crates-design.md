@@ -39,7 +39,9 @@ creative policy, and mediator selection.
 
 Runtime order will come exclusively from TOML declaration order. The config
 push and config-store representation will preserve that order explicitly;
-filesystem discovery order will never affect execution.
+filesystem discovery order will never affect execution. For auction providers,
+that order is also operational priority: it controls launch and response order,
+mediator input order, and equal-price tie-breaking.
 
 This design intentionally changes the auction configuration introduced by PR
 #1016 while preserving that work's compiled-plan and runtime guarantees. It
@@ -112,17 +114,23 @@ configured provider instance from the OpenRTB profile implementation it uses.
 This design preserves those runtime guarantees:
 
 - Multiple configured instances may use one integration implementation.
-- Qualified provider IDs remain the stable identity shared by bidder routing,
-  backend correlation, diagnostics, and telemetry.
+- One validated provider identity remains shared by bidder routing, backend
+  correlation, diagnostics, and telemetry; this design changes its serialized
+  value from a local ID to a qualified ID.
 - One validated plan remains authoritative across every adapter and runtime
   consumer.
 - The generic OpenRTB transport remains shared.
 - Existing routing, timeout, notification, response admission, mediation, and
-  telemetry attribution behavior remains unchanged.
+  telemetry attribution behavior remains unchanged except where provider order
+  is observable.
 
 This design changes the configuration location and identity spelling. Provider
 instances move below their owning integration, and cross-integration references
-use a qualified `<integration>.<instance>` identifier.
+use a qualified `<integration>.<instance>` identifier. It also intentionally
+changes deterministic provider priority from lexical provider-ID order to
+operator declaration order. The pricing algorithm is unchanged, but the first
+configured provider retains an equal-price tie and later providers receive the
+remaining shared auction budget after earlier providers launch.
 
 ### PR #1084
 
@@ -153,7 +161,9 @@ a stable third-party SDK or independent release boundary.
    lifecycle imports from core.
 7. Make `[integrations]` the single ordered inventory for concrete integration
    configuration, including auction providers.
-8. Preserve the runtime behavior and compiled-plan guarantees of PR #1016.
+8. Preserve the runtime behavior and compiled-plan guarantees of PR #1016,
+   except that deterministic provider priority moves from lexical ID order to
+   configuration order.
 9. Make core compile without depending on either integrations crate.
 10. Keep all integrations statically linked; no runtime loading is introduced.
 
@@ -170,9 +180,10 @@ This design does not introduce:
 - Identity, EC, geo, device, or permission-signal provider systems.
 - A jurisdiction or permission-policy redesign.
 - Client-cycle EC resolution or provider-code allocation.
-- EdgeZero lifecycle, host-evidence, store, or adapter changes.
-- New auction protocols, bidding behavior, ranking, notification behavior, or
-  telemetry semantics.
+- Upstream EdgeZero lifecycle, host-evidence, store, or adapter changes.
+- New auction protocols, pricing algorithms, notification policies, or
+  telemetry schemas. Configuration order intentionally replaces lexical
+  provider-ID order wherever deterministic provider priority is observable.
 - A reorganization of CLI audit detection that is unrelated to configuration
   validation and composition.
 
@@ -194,6 +205,10 @@ The following terms are distinct:
 - **Auction provider instance:** one named endpoint and policy configuration
   below an integration, such as `aps.main`. Multiple instances may use the same
   integration implementation.
+- **Local provider ID:** the provider name within one integration, such as
+  `main`.
+- **Qualified provider ID:** the strong, globally unique pair of an integration
+  ID and local provider ID, serialized as `<integration>.<local-provider>`.
 - **Integration registry:** core runtime state containing the enabled page,
   request, response, and browser capabilities in configuration order.
 - **Auction plan:** core runtime state containing the validated configured
@@ -302,6 +317,48 @@ The rules are:
 6. No adapter reconstructs a concrete catalog or imports `aps`, `prebid`, or
    another integration module directly.
 
+### Application composition ownership
+
+`trusted-server-integrations` is the application composition root, not only a
+directory of implementations. It owns:
+
+- `TrustedServerAppConfig`, the typed operator-facing app-config root used by
+  the CLI.
+- Source-aware TOML structure validation and ordered integration
+  deserialization.
+- Aggregation of core and integration secret metadata.
+- Integration-owned preprocessing for conditionally active secrets.
+- Catalog-aware validation and capability construction.
+- The public runtime entry points that load a config-store blob and return one
+  composed runtime value.
+
+That runtime value, conceptually `TrustedServerComposition`, contains the
+validated neutral `Settings`, one `Arc<AuctionPlan>`, and one
+`IntegrationRegistry`. Adapters consume this value; they do not separately
+compile the auction plan or rebuild the integration registry.
+
+Core retains neutral config-store access, Fastly chunk reconstruction, blob
+envelope verification, secret-resolution primitives, global settings types,
+and auction-plan compilation. Those helpers accept or return neutral data and
+never call the concrete catalog. The integration crate calls them in this
+order:
+
+```text
+config-store bytes
+  → core chunk reconstruction and envelope verification
+  → integration-owned inactive-secret preprocessing
+  → aggregated core + integration secret resolution
+  → catalog-aware config validation
+  → core AuctionPlan compilation
+  → core IntegrationRegistry construction from typed registrations
+  → TrustedServerComposition
+```
+
+The CLI imports `TrustedServerAppConfig` and its config command wrappers from
+`trusted-server-integrations`. Each wrapper performs the source-aware pre-pass
+before delegating storage and diff mechanics to EdgeZero's typed CLI functions.
+No EdgeZero source change or new host service is required.
+
 ## Directory Discovery
 
 ### Rust
@@ -372,17 +429,34 @@ APS
 └── OpenRTB profile capability
 ```
 
-The OpenRTB profile contract replaces the closed
-`CompiledOpenRtbProfile::{Aps, PrebidServer, ...}` dependency. It supplies the
-profile-owned operations required by the existing generic engine, including
-typed configuration compilation, request specialization, response parsing,
-diagnostics, and renderer information. Core invokes the contract without
-matching on vendor variants or importing integration types.
+The OpenRTB profile boundary has three stages:
 
-Compilation returns an `Arc`-backed trait object representing one immutable
-compiled profile. The auction plan stores that object beside the common
-provider settings, and the generic OpenRTB engine calls its typed methods. No
-`Any` downcast or vendor-keyed side table is used.
+1. `OpenRtbProfileDefinition` is the catalog-level capability. It supplies the
+   stable profile ID, default timeout policy, typed configuration compiler,
+   endpoint canonicalization and validation, and supported routing policy.
+2. `CompiledOpenRtbProfile` is an object-safe, `Send + Sync` immutable profile
+   stored as an `Arc` in each provider plan. It exposes only neutral routing
+   facts and prepares one provider exchange from neutral auction input.
+3. `PreparedOpenRtbExchange` contains the finalized outbound request plus a
+   boxed, object-safe response parser bound to that exact provider and request.
+   The parser owns any request-local APS, Prebid, or standard parsing state and
+   consumes itself when parsing the response.
+
+The prepared exchange lets the core engine retain shared backend registration,
+transport, deadlines, notification policy, normalized response handling, and
+telemetry. The profile owns request specialization, profile-specific headers,
+debug capture, response parsing, diagnostics, and renderer descriptors.
+
+Neutral routing policy replaces checks such as `is_prebid_server`. It expresses
+only behaviors the generic router needs, including whether `all_eligible` is
+allowed, whether trusted stored-request demand is recognized, and how bidder
+parameters are admitted. Endpoint policy likewise replaces string comparisons
+against profile IDs.
+
+No stage returns `Any`, requires a downcast, or indexes a vendor-keyed side
+table. Because the response parser is created by the same profile object that
+prepares the request, state from one provider instance cannot be supplied to
+another accidentally.
 
 The standard OpenRTB implementation is registered by the built-in `openrtb`
 integration. APS and Prebid register their implementations from their own
@@ -409,9 +483,20 @@ At startup or deploy validation:
 7. Resolve typed browser modules and construct the neutral integration
    registry.
 
-An absent integration is inactive. An explicitly disabled integration is
-validated but contributes no runtime capabilities. Configuration cannot
-activate APS through an auction plan while omitting `[integrations.aps]`.
+An absent integration is inactive. Every explicit parent integration table must
+contain `enabled = true` or `enabled = false`; there is no integration-specific
+default. An explicitly disabled integration may retain its settings and provider
+instances but contributes no runtime capabilities or providers. Configuration
+cannot activate APS through an auction plan while omitting
+`[integrations.aps]`, and bidder or mediator references to a disabled
+integration fail validation.
+
+Disabled configuration still receives structural validation: unknown fields,
+wrong types, duplicate IDs, and invalid values that are present fail. Missing
+active-only required values and inactive secret references do not fail until
+the integration is enabled. This permits operators to turn off an integration
+without deleting prepared configuration while preventing disabled behavior from
+leaking into the runtime plan.
 
 The four adapters and CLI share this path. Runtime and deploy validation cannot
 use different catalogs or integration schemas.
@@ -422,6 +507,8 @@ use different catalogs or integration schemas.
 
 `[integrations]` is the single concrete integration inventory. No `type` field
 is added; the table key resolves the statically compiled definition.
+The `enabled` field is mandatory on every parent integration table, including
+the built-in `openrtb` integration.
 
 ```toml
 [integrations.prebid]
@@ -494,6 +581,25 @@ The qualified value is the provider identity used by the compiled plan,
 backend correlation, diagnostics, and telemetry. The local provider name may
 repeat under different integrations without collision.
 
+Provider identity uses three strong types rather than broadening the existing
+local identifier:
+
+- `IntegrationId` matches `^[a-z][a-z0-9_]{0,62}$`. The underscore permits the
+  existing Rust module IDs such as `adserver_mock`; dots are forbidden.
+- `LocalProviderId` retains the current
+  `^[a-z][a-z0-9-]{0,62}$` grammar; dots are forbidden.
+- `QualifiedProviderId` stores an `IntegrationId` and `LocalProviderId`, parses
+  exactly one dot separator, and has a maximum serialized length of 127 ASCII
+  bytes.
+
+`QualifiedProviderId` is the type used by bidder routes, provider plans,
+backend discriminators, auction responses, diagnostics, and telemetry. Its
+canonical `Display` and serde representation is `<integration>.<local>`. No
+consumer reconstructs it with string concatenation, truncates it, or treats a
+local provider ID as globally unique. Adapter target validation continues to
+predict and reject backend-name collisions using the complete qualified
+identity.
+
 The mediator selects an enabled integration that registered a mediator
 capability. Its settings remain under that integration:
 
@@ -511,27 +617,48 @@ priority controls runtime order.
 
 The contract is:
 
-1. Integration order is the first explicit declaration order of parent
+1. Integration order is the explicit declaration order of parent
    `[integrations.<id>]` tables.
-2. Each integration must have an explicit parent table; a nested auction table
-   cannot implicitly create or position it.
-3. Provider order is declaration order under that integration's
-   `auction.providers` map.
-4. Disabled integrations contribute nothing; remaining integrations keep their
+2. Each parent integration table must appear before any descendant table. A
+   nested auction or provider table cannot implicitly create or position an
+   integration.
+3. Provider order is the explicit declaration order of
+   `[integrations.<id>.auction.providers.<provider>]` tables. Each provider
+   parent must appear before descendant tables such as `notifications`.
+4. Every parent integration table contains an explicit `enabled` value.
+5. Disabled integrations contribute nothing; remaining integrations keep their
    relative order.
-5. The flattened auction plan orders providers first by owning integration and
+6. The flattened auction plan orders providers first by owning integration and
    then by local provider declaration.
-6. Hook and immediate/deferred JavaScript lists retain integration order.
-7. Browser output is neutral browser core first, the existing fixed
+7. Hook and immediate/deferred JavaScript lists retain integration order.
+8. Browser output is neutral browser core first, the existing fixed
    JavaScript-only `creative` prelude second, and configured integration modules
    afterward.
+9. Auction provider launch, response, and mediator-input order follows the
+   flattened plan. With the existing strict-greater-than price comparison, the
+   first configured provider retains an equal-price tie. Providers later in the
+   sequence receive the remaining shared auction budget after earlier launches.
 
-Trusted Server must capture source-level table order before the EdgeZero
-configuration path reduces TOML to a semantic value. This source-aware stage
-also enforces the explicit-parent rule. Every entry point that accepts TOML,
-including local settings loading and CLI validation or push, uses that stage.
-`IntegrationSettings` may not use `HashMap` or another unordered
-representation.
+Inline-table and dotted-key shorthand may not define an integration parent or
+provider parent. Requiring ordinary table headers makes activation, ownership,
+and order visible in one form and lets the pre-pass produce targeted errors.
+
+The workspace enables the `preserve_order` feature on its single resolved
+`toml` package, so Cargo feature unification makes EdgeZero's `toml::Value`
+maps order-preserving too. `IntegrationSettings` and provider collections use
+ordered sequence-backed types, never `HashMap` or `BTreeMap`.
+
+Before typed deserialization, `trusted-server-integrations` parses the source
+with `toml_edit`. This source-aware pre-pass rejects descendant-before-parent
+declarations, missing explicit parent tables, and missing `enabled` fields. It
+then permits the existing EdgeZero scalar environment overlay; overlays may
+replace values but may not create, remove, or reorder integration or provider
+tables.
+
+Every entry point that accepts TOML uses this pre-pass, including local loading
+and the Trusted Server wrappers around CLI validate, diff, and push. EdgeZero's
+typed mechanics remain responsible for overlay, validation invocation, diff,
+envelope construction, consent, and store writes after the pre-pass succeeds.
 
 ### Config-store representation
 
@@ -567,7 +694,14 @@ Conceptually, the stored representation carries:
 }
 ```
 
-The exact private Rust types may differ, but the serialized order must be
+`TrustedServerAppConfig` uses custom serde at this boundary: deserialization
+accepts the operator TOML table shape after the source pre-pass, while
+serialization emits the explicit integration and provider sequences above for
+the blob envelope. Runtime loading accepts only the new stored sequence shape;
+an old blob containing an integration object map fails with migration guidance
+rather than relying on JSON member order.
+
+The private Rust type names may differ, but the serialized order must be
 explicit and covered by compatibility tests across:
 
 ```text
@@ -585,20 +719,26 @@ Core retains global settings and auction-orchestration validation. Each
 integration owns the typed schema and validation for its full configuration,
 including its provider instances.
 
-The generated definition catalog supplies integration parsing, validation,
-secret metadata, pre-resolution handling for conditionally active secrets, and
-capability construction to both runtime startup and the CLI. For example,
-DataDome's inactive secret references are filtered by its definition before
-the shared secret resolver runs; core's config-payload code does not retain a
-DataDome-specific JSON path. `config validate`, `config diff`, and
-`config push` must use the same catalog as the adapters.
+`TrustedServerAppConfig` and the generated definition catalog live in
+`trusted-server-integrations`. The catalog supplies integration parsing,
+validation, secret metadata, pre-resolution handling for conditionally active
+secrets, and capability construction to both runtime startup and the CLI. Core
+exposes its non-integration secret metadata through a neutral helper; the
+composition root combines it with catalog metadata.
+
+For example, DataDome's inactive secret references are filtered by its
+definition before the shared secret resolver runs; core's config-payload code
+does not retain a DataDome-specific JSON path. Config-store loading, `config
+validate`, `config diff`, and `config push` use the same catalog and composition
+functions as the adapters.
 
 Validation fails for:
 
 - An unknown integration ID.
+- A parent integration table with a missing or non-boolean `enabled` field.
 - Integration configuration not accepted by its owner.
-- A nested provider table without an explicit parent integration table.
-- Auction providers on an explicitly disabled integration.
+- A descendant integration or provider table declared before its explicit
+  parent.
 - Duplicate local provider IDs or duplicate qualified provider identities.
 - A bidder route to an unknown, disabled, or incompatible provider.
 - A selected mediator whose integration is absent, disabled, or lacks the
@@ -607,9 +747,12 @@ Validation fails for:
 - A referenced browser module absent from the generated browser catalog.
 - An unsupported capability combination.
 
-A globally disabled auction may retain otherwise valid enabled integration and
-provider configuration so operators can prepare configuration before enabling
-the auction.
+A disabled integration may retain structurally valid provider configuration;
+those providers are not added to the plan. A globally disabled auction may
+likewise retain otherwise valid enabled integration and provider configuration
+so operators can prepare configuration before enabling the auction. References
+from bidder routing or mediator selection to a disabled integration still fail,
+even when the global auction is disabled.
 
 ## Configuration Migration
 
@@ -721,15 +864,19 @@ contract requires it.
 ## Compatibility Contract
 
 The change intentionally does not preserve operator configuration or config
-blob shape. It does preserve:
+blob shape. It also intentionally changes provider priority from lexical local
+provider-ID order to qualified configuration order. It preserves:
 
 - Integration IDs.
 - Existing routes and endpoint behavior.
 - Existing integration hook behavior, now ordered by configuration.
-- Auction plan compilation semantics after configuration normalization.
+- Auction plan compilation semantics after configuration normalization, except
+  for the documented provider-priority source.
 - OpenRTB request, response, routing, timeout, notification, and response
   admission behavior.
-- Auction ranking, mediation, renderer descriptors, and telemetry semantics.
+- Auction price comparison, mediation protocol, renderer descriptors, and
+  telemetry schema. Provider response order and an equal-price winner may
+  change when configuration order differs from the old lexical order.
 - Existing provider identity fields, with values migrated from local IDs such
   as `pbs-main` to qualified IDs such as `prebid.pbs-main`.
 - Cache privacy and full-buffer decisions.
@@ -738,6 +885,23 @@ blob shape. It does preserve:
 Bundle hashes and cache-busting URLs may change because browser sources are
 rebuilt in different crates. The server must emit URLs matching the new
 embedded hashes; bundle hashes are not a stable public contract.
+
+## Delivery Scope
+
+This is one architecture design but not one undifferentiated refactor. It has
+four reviewable workstreams:
+
+1. Neutral Rust capability and lifecycle contracts.
+2. Browser-core separation and `trusted-server-integrations-js`.
+3. Concrete Rust extraction and application composition ownership.
+4. Ordered configuration, provider identity, and auction-profile migration.
+
+The implementation plan must give each workstream its own verification
+checkpoint and keep behavior-preserving moves separate from intentional config
+and ordering changes. Intermediate commits may add unused neutral contracts or
+new crates, but no merged state may have two active catalogs, two provider
+inventories, or adapter-specific composition paths. This scope does not include
+the external plugin ecosystem proposed by PR #1084.
 
 ## Migration Sequence
 
@@ -751,12 +915,16 @@ two active integration or provider inventories.
 3. Create `trusted-server-integrations`, add directory discovery, and move all
    fifteen current Rust implementation units.
 4. Replace closed APS and Prebid profile variants with registered OpenRTB
-   profile behavior and add the built-in `openrtb` integration.
-5. Move all integration-specific configuration, validation, and secret metadata
-   into integration definitions.
-6. Change operator and stored configuration to the ordered integration-owned
-   provider model.
-7. Rewire the CLI and all adapters to the single composition entry point.
+   profile and prepared-exchange behavior, and add the built-in `openrtb`
+   integration.
+5. Move `TrustedServerAppConfig`, all integration-specific configuration,
+   validation, inactive-secret preprocessing, and secret metadata into the
+   integrations crate.
+6. Add the TOML source pre-pass, order-preserving maps, explicit stored
+   sequences, strong qualified provider IDs, and the breaking
+   integration-owned provider schema.
+7. Rewire the CLI and all adapters to the single composition entry point that
+   returns settings, plan, and registry together.
 8. Remove the old concrete directories, fixed builder/profile tables,
    validation lists, and `[auction.providers]` schema.
 9. Update examples, fixtures, operator documentation, and migration errors.
@@ -778,17 +946,26 @@ two active integration or provider inventories.
 
 - TOML parent-table order becomes `IntegrationSettings` order.
 - Nested provider declaration order is retained.
+- A parent integration or provider table declared after one of its descendants
+  fails before typed deserialization.
+- Missing `enabled` fails; omitted integration tables remain inactive.
 - TOML-to-envelope-to-runtime round trips preserve both orders byte-for-byte at
   the sequence level.
 - Config-store loading produces the same registry, JavaScript, and provider
   order that the CLI validated.
-- Disabled integrations are skipped without reordering enabled neighbors.
-- Nested-only, unknown, disabled-with-provider, and mixed old/new configurations
-  fail with actionable messages.
+- Disabled integrations may retain valid provider settings, contribute no
+  providers or capabilities, and do not reorder enabled neighbors.
+- Bidder and mediator references to disabled integrations fail, including while
+  the global auction is disabled.
+- Nested-only, unknown, missing-enabled, descendant-before-parent, and mixed
+  old/new configurations fail with actionable messages.
 - Qualified provider references resolve correctly and reject missing or
   incompatible targets.
+- Local and qualified provider IDs enforce their separate grammars and bounds.
 - Multiple provider instances under APS, Prebid, and standard OpenRTB compile
   with stable qualified identities.
+- Provider launch, response, mediator-input, and equal-price tie order follows
+  integration then local-provider declaration order.
 
 ### Capability and behavior parity tests
 
@@ -801,9 +978,12 @@ two active integration or provider inventories.
 - GPT diagnostics preparation, bootstrap injection, finalization, and caching
   remain unchanged on every adapter path.
 - APS and Prebid request construction, transport, parsing, response admission,
-  and auction results remain equivalent to PR #1016 behavior.
+  and auction results remain equivalent to PR #1016 behavior except for the
+  documented provider-priority change.
+- Prepared response parsers consume profile-owned request state without `Any`,
+  downcasts, vendor enums, or cross-provider state reuse.
 - Bidder routing, backend naming, notification suppression, telemetry identity,
-  and mediator behavior remain equivalent.
+  and mediator behavior remain equivalent apart from documented ordering.
 
 ### Browser tests
 
@@ -847,22 +1027,33 @@ and parity tests around each boundary.
 TOML order can be lost through unordered Rust maps or JSON objects.
 
 Mitigation: use ordered in-memory types and explicit sequences in the
-hash-verified blob. Test the complete push/store/load path rather than only the
-TOML parser.
+hash-verified blob, enable `toml/preserve_order`, and reject
+descendant-before-parent source declarations with the `toml_edit` pre-pass.
+Test the complete push/store/load path rather than only the TOML parser.
+
+### Configuration order silently changes auction priority
+
+Provider order affects launch budget, mediator input, response order, and equal
+price ties. Treating it as cosmetic would make operator edits surprising.
+
+Mitigation: define configuration order as operational priority, document the
+change from PR #1016's lexical order, and test each observable consequence.
 
 ### Hidden reverse dependencies
 
 Concrete integrations use core-private helpers and vendor-specific enum arms.
 
 Mitigation: move owned helpers outward, replace vendor matches with the narrow
-typed capability contract, and review every new core public item.
+typed capability and prepared-exchange contracts, and review every new core
+public item.
 
 ### Divergent validation paths
 
 CLI validation and adapter startup could use different catalogs or schemas.
 
 Mitigation: both call the same generated composition API. No secondary
-validation inventory is allowed.
+validation inventory is allowed. Adapters receive the already composed
+settings, plan, and registry rather than reconstructing any of them.
 
 ### Stale or incorrectly ordered browser artifacts
 
@@ -891,15 +1082,24 @@ The change is complete when:
 8. `[integrations]` is the only concrete integration and auction-provider
    inventory.
 9. Configuration and provider ordering survive config push and runtime loading
-   exactly.
+   exactly and define the documented auction priority.
 10. The old `[auction.providers]` schema is rejected with targeted migration
     guidance.
-11. The compiled auction plan retains PR #1016 behavior after normalization.
+11. The compiled auction plan retains PR #1016 behavior after normalization,
+    except for the explicit change from lexical to configuration-order provider
+    priority.
 12. Browser core imports no concrete integration, and APS rendering works
     through registration.
-13. The CLI and all adapters use the same generated composition and validation
-    path.
-14. The full repository verification gates pass.
+13. `TrustedServerAppConfig`, integration secret handling, and final runtime
+    composition are owned by `trusted-server-integrations`; core has no concrete
+    config or loader dependency.
+14. The CLI and all adapters use the same generated composition and validation
+    path and receive one settings/plan/registry composition.
+15. OpenRTB request-local state crosses the transport boundary through a
+    prepared response parser without `Any` or vendor enum variants in core.
+16. Explicit `enabled`, parent-before-descendant, disabled-retention, local-ID,
+    and qualified-ID rules have end-to-end tests.
+17. The full repository verification gates pass.
 
 ## Deferred Work
 
@@ -911,5 +1111,5 @@ The following require separate designs and real consumers:
 - Identity, EC, geo, device, and permission-signal providers.
 - Permission and jurisdiction policy changes.
 - Non-OpenRTB auction provider factories.
-- EdgeZero composition and host-service changes.
+- Upstream EdgeZero composition and host-service changes.
 - Moving CLI audit detection metadata into integration directories.
