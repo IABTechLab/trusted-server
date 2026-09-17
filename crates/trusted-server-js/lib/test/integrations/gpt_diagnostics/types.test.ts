@@ -81,6 +81,8 @@ describe('GPT diagnostics public types', () => {
     expectTypeOf<keyof GptDiagnosticsRecorder>().toEqualTypeOf<
       | 'recordTrustedServerOpportunity'
       | 'recordPrebidRefresh'
+      | 'recordPrebidAuction'
+      | 'recordPrebidWin'
       | 'recordTrustedServerCreativeRequest'
       | 'recordTrustedServerCreativeResponse'
       | 'recordTrustedServerCreativeFailure'

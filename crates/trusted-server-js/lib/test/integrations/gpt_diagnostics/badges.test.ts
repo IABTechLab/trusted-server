@@ -116,6 +116,54 @@ describe('GptDiagnosticsBadgeManager', () => {
     manager.destroy();
   });
 
+  it('renders an accessible request-scoped control and activates its exact request', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const element = document.createElement('div');
+    document.body.append(element);
+    vi.spyOn(element, 'getBoundingClientRect').mockReturnValue(rectangle(10, 100, 300, 250));
+    const observedSlot = slot('accessible');
+    store.recordSlotRequested(observedSlot);
+    store.recordSlotRequested(observedSlot);
+    bindings.set(1, { status: 'bound' }, element, true);
+    const activate = vi.fn();
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+      onActivate: activate,
+    });
+    manager.setLayer(layer);
+    runFrame(frames);
+
+    const badge = layer.querySelector<HTMLButtonElement>('.tsgd-badge');
+    expect(badge).toBeInstanceOf(HTMLButtonElement);
+    expect(badge?.textContent).toContain('Ad #1 · Request #2');
+    expect(badge?.getAttribute('aria-label')).toBe(
+      'Open diagnostics for Ad #1, Request #2: Pending'
+    );
+    badge?.click();
+    expect(activate).toHaveBeenCalledWith(1, 2);
+
+    badge?.focus();
+    store.recordSlotRequested(observedSlot);
+    runFrame(frames);
+    const updatedBadge = layer.querySelector<HTMLButtonElement>('.tsgd-badge');
+    expect(updatedBadge).toBe(badge);
+    expect(document.activeElement).toBe(badge);
+    expect(updatedBadge?.textContent).toContain('Ad #1 · Request #3');
+    updatedBadge?.click();
+    expect(activate).toHaveBeenLastCalledWith(1, 3);
+
+    const highlight = document.createElement('div');
+    highlight.className = 'tsgd-highlight';
+    layer.append(highlight);
+    manager.update();
+    expect(layer.querySelector('.tsgd-highlight')).toBe(highlight);
+    manager.destroy();
+  });
+
   it('labels the delivery state the store derived rather than raw timestamps', () => {
     // The store owns the delivery ladder; a badge that re-derived it from these
     // timestamps could contradict the panel and the export.
@@ -378,6 +426,8 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(firstBadge.style.left).toBe('100px');
     expect(firstBadge.style.top).toBe('112px');
     expect(firstBadge.style.maxWidth).toBe('260px');
+    firstBadge.focus();
+    expect(document.activeElement).toBe(firstBadge);
 
     currentRectangle = rectangle(220, 260, 300, 250);
     window.dispatchEvent(new Event('scroll'));
@@ -385,6 +435,8 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(frames).toHaveLength(1);
     runFrame(frames);
     const movedBadge = layer.querySelector<HTMLElement>('.tsgd-badge')!;
+    expect(movedBadge).toBe(firstBadge);
+    expect(document.activeElement).toBe(firstBadge);
     expect(movedBadge.style.left).toBe('220px');
     expect(movedBadge.style.top).toBe('252px');
     expect(element.getAttributeNames().map((name) => [name, element.getAttribute(name)])).toEqual(
