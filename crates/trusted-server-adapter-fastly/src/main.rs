@@ -201,6 +201,8 @@ fn attach_sandbox_counters(response: &mut HttpResponse, counters: &SandboxCounte
             sandbox::HEADER_SANDBOX_REQUEST_ID,
             counters.request_id.clone(),
         ),
+        (sandbox::HEADER_SANDBOX_VCPU_MS, vcpu_ms()),
+        (sandbox::HEADER_SANDBOX_HEAP_MIB, heap_mib()),
     ] {
         match edgezero_core::http::HeaderValue::from_str(&value) {
             Ok(value) => {
@@ -238,10 +240,30 @@ fn serve_mode() -> (ServeMode, Vec<String>) {
 /// is reported rather than synthesized, so a measurement run cannot silently
 /// claim reuse it never observed.
 fn instance_id() -> String {
-    std::env::var("FASTLY_TRACE_ID")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| sandbox::INSTANCE_ID_UNAVAILABLE.to_owned())
+    // The SDK documents this as the per-sandbox identifier; on wasm32-wasip1
+    // it resolves to `FASTLY_TRACE_ID`, which is why that value must never be
+    // used as a request id.
+    let id = fastly::compute_runtime::sandbox_id();
+    if id.is_empty() {
+        return sandbox::INSTANCE_ID_UNAVAILABLE.to_owned();
+    }
+    id.to_owned()
+}
+
+/// Cumulative guest vCPU milliseconds, or a marker when unsupported.
+fn vcpu_ms() -> String {
+    fastly::compute_runtime::elapsed_vcpu_ms().map_or_else(
+        |_| sandbox::COUNTER_UNSUPPORTED.to_owned(),
+        |v| v.to_string(),
+    )
+}
+
+/// Guest heap snapshot in MiB, or a marker when unsupported.
+fn heap_mib() -> String {
+    fastly::compute_runtime::heap_memory_snapshot_mib().map_or_else(
+        |_| sandbox::COUNTER_UNSUPPORTED.to_owned(),
+        |v| v.to_string(),
+    )
 }
 
 /// Handles a request through the `EdgeZero` router path.

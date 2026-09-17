@@ -28,6 +28,17 @@ pub(crate) const HEADER_SANDBOX_BUILDS: &str = "x-ts-sandbox-builds";
 /// Header carrying the per-request correlation id.
 pub(crate) const HEADER_SANDBOX_REQUEST_ID: &str = "x-ts-sandbox-request-id";
 
+/// Header carrying cumulative guest vCPU milliseconds, where supported.
+pub(crate) const HEADER_SANDBOX_VCPU_MS: &str = "x-ts-sandbox-vcpu-ms";
+
+/// Header carrying the guest heap snapshot in MiB, where supported.
+pub(crate) const HEADER_SANDBOX_HEAP_MIB: &str = "x-ts-sandbox-heap-mib";
+
+/// Value reported when a runtime counter is not supported by the host.
+///
+/// Distinguished from a zero reading: unsupported is not the same as idle.
+pub(crate) const COUNTER_UNSUPPORTED: &str = "unsupported";
+
 /// Path of the counters snapshot endpoint.
 #[cfg(any(feature = "reusable-sandbox", test))]
 pub(crate) const SANDBOX_METRICS_PATH: &str = "/_ts/debug/sandbox";
