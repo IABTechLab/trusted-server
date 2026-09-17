@@ -585,8 +585,9 @@ streamed. No allocation in the hot path beyond the one `Arc` at entry, the
 
 ## 18. Auction timeline offsets (follow-up increment)
 
-Status: spec amendment for a follow-up PR; not part of the initial implementation
-(#1074). Builds only on machinery that spec sections 5, 9, and 10 already define.
+Status: spec amendment written ahead of implementation, then implemented in the
+same PR on top of the initial implementation (#1074). Builds only on machinery
+that spec sections 5, 9, and 10 already define.
 
 ### Problem
 
