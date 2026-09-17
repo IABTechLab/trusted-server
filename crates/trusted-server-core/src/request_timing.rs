@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, Response};
+use uuid::Uuid;
 // `std::time::Instant::now()` panics on `wasm32-unknown-unknown` (the
 // Cloudflare adapter's target); `web_time` re-exports std's `Instant` on
 // every other target.
@@ -113,6 +114,22 @@ struct Inner {
     /// Response body size in bytes, set via
     /// [`RequestTimings::set_resp_bytes`].
     resp_bytes: Option<u64>,
+    /// Elapsed time at the first
+    /// [`RequestTimings::mark_auction_dispatched`] call.
+    auction_dispatched: Option<Duration>,
+    /// Elapsed time at the first
+    /// [`RequestTimings::mark_auction_resolved`] call.
+    auction_resolved: Option<Duration>,
+    /// Elapsed time at the first
+    /// [`RequestTimings::mark_auction_committed`] call.
+    auction_committed: Option<Duration>,
+    /// Telemetry auction UUID recorded by the first
+    /// [`RequestTimings::set_auction_id`] call; joins the access row to the
+    /// per-bidder auction dataset. Set when the auction observation is
+    /// built, so it is present even for an auction that was skipped or
+    /// failed to dispatch, matching the row those outcomes emit to
+    /// `auction_events_raw`.
+    auction_id: Option<Uuid>,
 }
 
 /// Per-request phase timing collector.
@@ -135,6 +152,10 @@ impl RequestTimings {
             request_elapsed: None,
             auction_wait_placement: None,
             resp_bytes: None,
+            auction_dispatched: None,
+            auction_resolved: None,
+            auction_committed: None,
+            auction_id: None,
         })))
     }
 
@@ -231,6 +252,101 @@ impl RequestTimings {
         }
     }
 
+    /// Records the telemetry auction id, the first time this is called.
+    ///
+    /// Called where the auction observation is built, which happens on every
+    /// auction-eligible request regardless of outcome, so the access row can
+    /// be joined to the `auction_events_raw` row even when the auction was
+    /// skipped or failed to dispatch. Kept separate from
+    /// [`RequestTimings::mark_auction_dispatched`] so a dropped dispatch
+    /// sample cannot also lose the join key. Subsequent calls are no-ops
+    /// (first call wins). Drops the sample silently on lock contention; a
+    /// poisoned lock is recovered.
+    pub fn set_auction_id(&self, auction_id: Uuid) {
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if inner.auction_id.is_none() {
+            inner.auction_id = Some(auction_id);
+        }
+    }
+
+    /// Stamps the elapsed time since `t0` as the auction dispatch offset,
+    /// the first time this is called.
+    ///
+    /// Called where the bid requests leave the edge. A skipped auction and a
+    /// failed dispatch never stamp it, so a null dispatch offset alongside a
+    /// non-null `auction_id` means an auction was attempted but no bid
+    /// request went out. Subsequent calls are no-ops (first call wins).
+    /// Drops the sample silently on lock contention; a poisoned lock is
+    /// recovered.
+    pub fn mark_auction_dispatched(&self) {
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if inner.auction_dispatched.is_none() {
+            inner.auction_dispatched = Some(inner.t0.elapsed());
+        }
+    }
+
+    /// Stamps the elapsed time since `t0` as the auction resolve offset (the
+    /// final bid returned or the auction timed out), the first time this is
+    /// called.
+    ///
+    /// Stays `None` when a dispatched auction is abandoned before collection
+    /// (origin error, bodiless response, reader disconnect), so a non-null
+    /// dispatch offset with a null resolve offset is the "dispatched, never
+    /// collected" case rather than "no auction ran". Subsequent calls are
+    /// no-ops (first call wins). Drops the sample silently on lock
+    /// contention; a poisoned lock is recovered.
+    pub fn mark_auction_resolved(&self) {
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if inner.auction_resolved.is_none() {
+            inner.auction_resolved = Some(inner.t0.elapsed());
+        }
+    }
+
+    /// Stamps the elapsed time since `t0` as the auction commit offset
+    /// (winning bids available to the response pipeline), the first time
+    /// this is called.
+    ///
+    /// Subsequent calls are no-ops (first call wins). Drops the sample
+    /// silently on lock contention; a poisoned lock is recovered.
+    pub fn mark_auction_committed(&self) {
+        let mut inner = match self.0.try_lock() {
+            Ok(guard) => guard,
+            // Poisoning is recoverable here: the guarded data are plain
+            // counters with no invariant a panic can break, so recording
+            // keeps working for the rest of the request instead of going
+            // silently dark. Contention still drops the one sample.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if inner.auction_committed.is_none() {
+            inner.auction_committed = Some(inner.t0.elapsed());
+        }
+    }
+
     /// Records the response body size in bytes.
     ///
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
@@ -300,6 +416,10 @@ impl RequestTimings {
             stream_ms: duration_ms(inner.phases[Phase::Stream.index()]),
             auction_wait_placement: inner.auction_wait_placement,
             resp_bytes: inner.resp_bytes,
+            auction_dispatched_ms: duration_ms(inner.auction_dispatched),
+            auction_resolved_ms: duration_ms(inner.auction_resolved),
+            auction_committed_ms: duration_ms(inner.auction_committed),
+            auction_id: inner.auction_id,
         }
     }
 }
@@ -422,6 +542,23 @@ pub struct TimingSnapshot {
     /// Response body size in bytes, set via
     /// [`RequestTimings::set_resp_bytes`].
     pub resp_bytes: Option<u64>,
+    /// T0 offset at which the auction dispatched (bid requests left the
+    /// edge). `None` when no bid request went out, which covers both "no
+    /// auction was attempted" and "the auction was skipped or failed to
+    /// dispatch" — `auction_id` separates the two.
+    pub auction_dispatched_ms: Option<u32>,
+    /// T0 offset at which the auction resolved (final bid or timeout).
+    /// `None` when the milestone was never reached, including a dispatched
+    /// auction abandoned before collection.
+    pub auction_resolved_ms: Option<u32>,
+    /// T0 offset at which winning bids became available to the response
+    /// pipeline. `None` when the milestone was never reached.
+    pub auction_committed_ms: Option<u32>,
+    /// Telemetry auction UUID joining this row to the auction dataset.
+    /// `None` only when no auction was attempted at all; an attempted
+    /// auction carries the id whatever its outcome, matching the row it
+    /// emits to `auction_events_raw`.
+    pub auction_id: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -472,6 +609,87 @@ mod tests {
             header_bearing,
             HEADER_PHASES.to_vec(),
             "should render every header-bearing phase, in declaration order"
+        );
+    }
+
+    #[test]
+    fn auction_marks_are_first_call_wins_and_snapshot_maps_them() {
+        let timings = RequestTimings::new();
+        timings.set_auction_id(uuid::uuid!("11111111-1111-1111-1111-111111111111"));
+        timings.mark_auction_dispatched();
+        timings.mark_auction_resolved();
+        timings.mark_auction_committed();
+        let first = timings.snapshot();
+
+        // Sleep so a restamp would land on a different millisecond: without
+        // it both stamps fall in the same millisecond and an equality
+        // assertion would hold even under last-call-wins.
+        std::thread::sleep(Duration::from_millis(5));
+        timings.set_auction_id(uuid::uuid!("22222222-2222-2222-2222-222222222222"));
+        timings.mark_auction_dispatched();
+        timings.mark_auction_resolved();
+        timings.mark_auction_committed();
+
+        let second = timings.snapshot();
+        assert_eq!(
+            second.auction_dispatched_ms, first.auction_dispatched_ms,
+            "should not restamp the dispatch offset"
+        );
+        assert_eq!(
+            second.auction_resolved_ms, first.auction_resolved_ms,
+            "should not restamp the resolve offset"
+        );
+        assert_eq!(
+            second.auction_committed_ms, first.auction_committed_ms,
+            "should not restamp the commit offset"
+        );
+        assert_eq!(
+            second.auction_id,
+            Some(uuid::uuid!("11111111-1111-1111-1111-111111111111")),
+            "should keep the first-recorded auction id"
+        );
+    }
+
+    #[test]
+    fn auction_id_survives_a_dropped_dispatch_mark() {
+        // The join key is stamped where the observation is built, so an
+        // auction that is skipped or fails to dispatch still carries the id
+        // that its `auction_events_raw` row was emitted under.
+        let timings = RequestTimings::new();
+        timings.set_auction_id(uuid::uuid!("44444444-4444-4444-4444-444444444444"));
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_id,
+            Some(uuid::uuid!("44444444-4444-4444-4444-444444444444")),
+            "should carry the join key without a dispatch mark"
+        );
+        assert_eq!(
+            snapshot.auction_dispatched_ms, None,
+            "should leave the dispatch offset null when nothing was sent"
+        );
+    }
+
+    #[test]
+    fn snapshot_without_auction_marks_yields_none_for_all_offsets() {
+        let timings = RequestTimings::new();
+        timings.mark_headers_ready();
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_dispatched_ms, None,
+            "should stay None when no auction dispatched"
+        );
+        assert_eq!(
+            snapshot.auction_resolved_ms, None,
+            "should stay None when no auction resolved"
+        );
+        assert_eq!(
+            snapshot.auction_committed_ms, None,
+            "should stay None when no auction committed"
+        );
+        assert_eq!(
+            snapshot.auction_id, None,
+            "should carry no auction id when no auction ran"
         );
     }
 
