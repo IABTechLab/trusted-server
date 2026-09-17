@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::fmt;
 
-use edgezero_core::http::{Request as EdgeRequest, Response as EdgeResponse};
+use edgezero_core::http::{Method, Request as EdgeRequest, Response as EdgeResponse};
 use error_stack::Report;
 
 use super::PlatformError;
@@ -126,6 +126,8 @@ impl PlatformResponse {
 pub struct PlatformPendingRequest {
     inner: Box<dyn Any>,
     backend_name: Option<String>,
+    stream_response: bool,
+    request_method: Option<Method>,
 }
 
 impl PlatformPendingRequest {
@@ -138,6 +140,8 @@ impl PlatformPendingRequest {
         Self {
             inner: Box::new(inner),
             backend_name: None,
+            stream_response: false,
+            request_method: None,
         }
     }
 
@@ -154,6 +158,26 @@ impl PlatformPendingRequest {
         self.backend_name.as_deref()
     }
 
+    /// Retain response-conversion metadata for direct single-handle waits.
+    #[must_use]
+    pub fn with_response_handling(mut self, stream_response: bool, request_method: Method) -> Self {
+        self.stream_response = stream_response;
+        self.request_method = Some(request_method);
+        self
+    }
+
+    /// Whether completion must preserve the response body as a stream.
+    #[must_use]
+    pub fn stream_response(&self) -> bool {
+        self.stream_response
+    }
+
+    /// Method of the originating request, when retained by the adapter.
+    #[must_use]
+    pub fn request_method(&self) -> Option<&Method> {
+        self.request_method.as_ref()
+    }
+
     /// Recover the adapter-specific pending request type.
     ///
     /// # Errors
@@ -167,6 +191,8 @@ impl PlatformPendingRequest {
         let Self {
             inner,
             backend_name,
+            stream_response,
+            request_method,
         } = self;
 
         match inner.downcast::<T>() {
@@ -174,6 +200,8 @@ impl PlatformPendingRequest {
             Err(inner) => Err(Self {
                 inner,
                 backend_name,
+                stream_response,
+                request_method,
             }),
         }
     }
@@ -183,6 +211,8 @@ impl fmt::Debug for PlatformPendingRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlatformPendingRequest")
             .field("backend_name", &self.backend_name)
+            .field("stream_response", &self.stream_response)
+            .field("request_method", &self.request_method)
             .finish()
     }
 }
@@ -298,6 +328,17 @@ pub trait PlatformHttpClient: Send + Sync {
     /// default `false` so callers do not request a contract the adapter will
     /// reject or silently buffer.
     fn supports_streaming_responses(&self) -> bool {
+        false
+    }
+
+    /// Whether a request started by [`send_async`](Self::send_async) can be
+    /// completed directly by [`wait`](Self::wait) while preserving a streamed
+    /// response body.
+    ///
+    /// Supporting adapters must override `wait` with direct single-handle
+    /// completion. A pending request marked for streaming must never be passed
+    /// to [`select`](Self::select), whose fan-out contract remains buffered.
+    fn supports_pending_streaming_responses(&self) -> bool {
         false
     }
 

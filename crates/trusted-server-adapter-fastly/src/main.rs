@@ -5,8 +5,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
+use edgezero_adapter_fastly::runtime_env_config;
+use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
@@ -38,6 +41,7 @@ use trusted_server_core::publisher::TemplateCacheResponseState;
 use trusted_server_core::request_timing::{Phase, RequestTimings, append_server_timing_if_private};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::settings_data::config_store_name;
 
 mod app;
 mod backend;
@@ -58,18 +62,15 @@ use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_g
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
-const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
-
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
-fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
-    let store = EdgeZeroFastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
-        fastly::Error::msg(format!(
-            "failed to open config store `{TRUSTED_SERVER_CONFIG_STORE}`: {e}"
-        ))
+fn open_trusted_server_config_store(env: &EnvConfig) -> Result<ConfigStoreHandle, fastly::Error> {
+    let store_name = config_store_name(env);
+    let store = EdgeZeroFastlyConfigStore::try_open(store_name.as_ref()).map_err(|e| {
+        fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
@@ -97,16 +98,17 @@ fn main() {
     }
 
     logging::init_logger();
-    edgezero_main(req);
+    let env = runtime_env_config(TrustedServerApp::stores());
+    edgezero_main(req, &env);
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest) {
+fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match load_settings_from_config_store() {
+        match load_settings_from_config_store(env) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
             }
@@ -127,7 +129,7 @@ fn edgezero_main(mut req: FastlyRequest) {
 
     let (config_store, app, app_state) = {
         let _appbuild = timings.span(Phase::AppBuild);
-        let config_store = match open_trusted_server_config_store() {
+        let config_store = match open_trusted_server_config_store(env) {
             Ok(cs) => cs,
             Err(e) => {
                 log::error!("failed to open config store: {e}");
@@ -137,7 +139,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                 return;
             }
         };
-        let (app, app_state) = TrustedServerApp::build_app_with_state();
+        let (app, app_state) = TrustedServerApp::build_app_with_state(env);
         (config_store, app, app_state)
     };
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
@@ -251,7 +253,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                 &timings,
             );
         } else {
-            match load_settings_from_config_store() {
+            match load_settings_from_config_store(env) {
                 Ok(settings) => {
                     apply_entry_point_finalize_headers(
                         &settings,
@@ -272,9 +274,9 @@ fn edgezero_main(mut req: FastlyRequest) {
         policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
-    if let Some(ec_state) = ec_state {
+    if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &ec_state, &mut response, &timings) {
+            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response, &timings) {
                 Ok(partner_registry) => {
                     let outcome = send_edgezero_response(
                         response,
@@ -288,8 +290,16 @@ fn edgezero_main(mut req: FastlyRequest) {
                             access_telemetry_enabled,
                         },
                     );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
-                    emit_access_telemetry_after_send(settings, &outcome, &timings);
+                    run_post_send_steps(
+                        || {
+                            run_edgezero_pull_sync_after_send(
+                                settings,
+                                &partner_registry,
+                                &ec_state,
+                            )
+                        },
+                        || emit_access_telemetry_after_send(settings, &outcome, &timings),
+                    );
                     return;
                 }
                 Err(e) => {
@@ -299,10 +309,14 @@ fn edgezero_main(mut req: FastlyRequest) {
                 }
             }
         } else {
-            match load_settings_from_config_store() {
+            match load_settings_from_config_store(env) {
                 Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response, &timings)
-                    {
+                    match apply_edgezero_ec_finalize(
+                        &settings,
+                        &mut ec_state,
+                        &mut response,
+                        &timings,
+                    ) {
                         Ok(partner_registry) => {
                             let outcome = send_edgezero_response(
                                 response,
@@ -316,12 +330,16 @@ fn edgezero_main(mut req: FastlyRequest) {
                                     access_telemetry_enabled,
                                 },
                             );
-                            run_edgezero_pull_sync_after_send(
-                                &settings,
-                                &partner_registry,
-                                &ec_state,
+                            run_post_send_steps(
+                                || {
+                                    run_edgezero_pull_sync_after_send(
+                                        &settings,
+                                        &partner_registry,
+                                        &ec_state,
+                                    );
+                                },
+                                || emit_access_telemetry_after_send(&settings, &outcome, &timings),
                             );
-                            emit_access_telemetry_after_send(&settings, &outcome, &timings);
                             return;
                         }
                         Err(e) => {
@@ -402,18 +420,14 @@ fn apply_entry_point_finalize_headers(
     // router-level 404/405 for an unregistered method), so `geo_state` may
     // still be `NotAttempted` even after a fresh lookup just ran above.
     // Write the resolved outcome back so the access-telemetry snapshot built
-    // later in `send_edgezero_response` sees what was actually looked up,
-    // not the stale carried-in state.
-    let resolved_state = match &geo_info {
-        Some(info) => GeoLookupState::Resolved(info.clone()),
-        None => GeoLookupState::Attempted,
-    };
-    response.extensions_mut().insert(resolved_state);
+    // later in `send_edgezero_response` sees what was actually looked up;
+    // 401 handling lives in the shared helper.
+    middleware::write_back_geo_lookup_state(response, geo_info.as_ref());
 }
 
 fn apply_edgezero_ec_finalize(
     settings: &Settings,
-    ec_state: &EcFinalizeState,
+    ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
     timings: &RequestTimings,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
@@ -425,7 +439,7 @@ fn apply_edgezero_ec_finalize(
     };
     ec_finalize_response(
         settings,
-        &ec_state.ec_context,
+        &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
         ec_state.eids_cookie.as_deref(),
@@ -445,6 +459,19 @@ fn run_edgezero_pull_sync_after_send(
     {
         run_pull_sync_after_send(settings, partner_registry, &context, &ec_state.services);
     }
+}
+
+/// Runs the post-send steps in their contract order: EC identity pull-sync
+/// first, then access-telemetry emission.
+///
+/// Every `edgezero_main` site that has both steps routes through this
+/// function, so the ordering is owned in exactly one place and the
+/// sequence test can instrument it; `request_elapsed` is already stamped
+/// before either step because `send_edgezero_response` stamps it before
+/// returning.
+fn run_post_send_steps(pull_sync: impl FnOnce(), emit_access_telemetry: impl FnOnce()) {
+    pull_sync();
+    emit_access_telemetry();
 }
 
 /// Builds and emits the access-telemetry row for one delivered response,
@@ -997,6 +1024,8 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use base64::Engine as _;
     use edgezero_core::body::Body as EdgeBody;
@@ -1449,7 +1478,7 @@ mod tests {
             "the pre-seeded ts-ec cookie should be recognized"
         );
 
-        let ec_state = EcFinalizeState {
+        let mut ec_state = EcFinalizeState {
             ec_context,
             use_finalize_kv: true,
             eids_cookie: Some(eids_cookie),
@@ -1468,7 +1497,7 @@ mod tests {
         // response.into_parts() inside send_edgezero_response) renders the
         // header. Calling both directly exercises exactly this order without
         // requiring a live Fastly client connection.
-        apply_edgezero_ec_finalize(&settings, &ec_state, &mut response, &timings)
+        apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response, &timings)
             .expect("should finalize EC response");
         apply_server_timing_header(&mut response, &timings, true);
 
@@ -1727,13 +1756,13 @@ mod tests {
     }
 
     #[test]
-    fn request_elapsed_is_stamped_when_send_returns() {
-        // `edgezero_main`'s post-send ordering (pull-sync before telemetry)
-        // is a source-order invariant with no injectable seam, so this test
-        // deliberately proves only the leg that has one: by the time
-        // `send_edgezero_response` returns, `request_elapsed` is already
-        // stamped, so everything `edgezero_main` runs afterwards (pull-sync,
-        // telemetry emission) is excluded from `request_elapsed_ms`.
+    fn post_send_order_is_elapsed_then_pull_sync_then_telemetry() {
+        // The full contract sequence, instrumented through the real seams:
+        // `send_edgezero_response` stamps `request_elapsed` before
+        // returning, and `run_post_send_steps` (which every production
+        // site with both steps routes through) owns pull-sync-then-
+        // telemetry ordering.
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let timings = RequestTimings::new();
         let response = response_builder()
             .body(EdgeBody::from("ok"))
@@ -1751,14 +1780,36 @@ mod tests {
                 access_telemetry_enabled: true,
             },
         );
-
         assert!(
             timings.snapshot().request_elapsed_ms.is_some(),
-            "request_elapsed should be stamped by the time send returns"
+            "request_elapsed should be stamped before any post-send step runs"
         );
         assert!(
             outcome.snapshot.is_some(),
             "the access snapshot should exist for the enabled context"
+        );
+
+        let pull_log = Arc::clone(&log);
+        let emit_log = Arc::clone(&log);
+        run_post_send_steps(
+            move || {
+                pull_log
+                    .lock()
+                    .expect("should lock order log")
+                    .push("pull_sync")
+            },
+            move || {
+                emit_log
+                    .lock()
+                    .expect("should lock order log")
+                    .push("telemetry")
+            },
+        );
+
+        assert_eq!(
+            *log.lock().expect("should lock order log"),
+            vec!["pull_sync", "telemetry"],
+            "pull-sync must dispatch before telemetry emits"
         );
     }
 }

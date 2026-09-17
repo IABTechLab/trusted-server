@@ -819,7 +819,8 @@ plus the coarse template; the freeze point consumes the extension (no `RouteClas
 column in `NAMED_ROUTES`, no reconstruction from a handler enum). Also in this task:
 make `TemplateCacheResponseState` a typed response extension in `publisher.rs`, set
 at every point that writes `x-ts-template-cache` so header and extension cannot
-drift; the row reads the extension. The snapshot is built unconditionally in
+drift; the row reads the extension. The snapshot is built (when access
+telemetry is enabled) in
 `send_edgezero_response` right after `mark_headers_ready()` and returned inside
 `DeliveryOutcome` (add field `pub snapshot: AccessTelemetrySnapshot`).
 

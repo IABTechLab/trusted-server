@@ -85,7 +85,7 @@ auction wait, buffered mode ..... auction_wait_ms    (row only; pre-header in th
   |
 send_edgezero_response, immediately before into_parts():
   mark_headers_ready() snapshot (unconditional)
-  build AccessTelemetrySnapshot (unconditional)
+  build AccessTelemetrySnapshot (only when tinybird.access_enabled)
   append Server-Timing header (flag-gated, only on conclusively private responses)
   |
 headers committed; body streams
@@ -125,9 +125,11 @@ New module `crates/trusted-server-core/src/request_timing.rs`.
 - Sharing: `RequestTimings` is a cheap-clone handle, `Arc<Mutex<Inner>>`. It crosses
   three boundaries: adapter entry to core handlers, the streaming body closure (records
   body-phase spans after the response object has been handed off), and the adapter's
-  post-send emission read. Access is exclusively `try_lock()`: a contended or
-  poisoned lock drops the sample immediately rather than waiting, so recording can
-  never delay a request.
+  post-send emission read. Access is exclusively `try_lock()`: a contended lock
+  drops the one sample rather than waiting, so recording can never delay a
+  request, and a poisoned lock is recovered (the guarded data are plain counters
+  with no invariant a panic can break) so one panic cannot silence the rest of
+  the request's timing.
 - Recording API: `timings.record(Phase::Geo, dur)` and a scope guard
   `timings.span(Phase::Origin)` that records on drop. Guards use saturating duration
   math; a non-monotonic reading records zero rather than panicking. The auction-wait
@@ -214,7 +216,8 @@ marks middleware finalization, not header commitment, and must not be treated as
 timing boundary.
 
 At the freeze point, in order: `mark_headers_ready()` (unconditional), the
-`AccessTelemetrySnapshot` build (unconditional, section 10), then, gated on
+`AccessTelemetrySnapshot` build (gated on `tinybird.access_enabled`,
+section 10), then, gated on
 `observability.server_timing_enabled`, append one `Server-Timing` header from
 `server_timing_value()`. Append semantics, never insert: an origin-supplied
 Server-Timing survives, and the fronting delivery layer's own entries (`time-elapsed`,
@@ -290,12 +293,16 @@ and user-generated content (search terms, usernames, emails in slugs). Replaced 
   restricted to a bounded allowlisted charset, plus `/*` when deeper (for example
   `/news/*`). The auction-telemetry normalizer is explicitly not sufficient here: it
   redacts long tokens but preserves short identifiers and arbitrary slugs.
-- Rejection is whole-segment, never truncation: a segment is dropped to `/other/*`
-  when it fails the charset allowlist, exceeds 32 characters, carries more than 7
-  ASCII digits, or is the only segment in the path. Depth is what makes a first
-  segment a section name: single-segment paths are documents (WordPress
-  `/%postname%/` puts every article at depth 1), so they reject wholesale, root
-  landing pages included. The character allowlist alone does not bound identity (`[a-z0-9_-]`
+- Publisher templates come from an operator-configured allowlist of section names
+  (`observability.route_sections`, default empty), not from the request: a path
+  whose first segment matches an allowlist entry and that has at least one further
+  segment emits `/{section}/*` (the lowercased allowlist entry itself); everything
+  else emits `/other/*`, and the root path emits `/`. This replaces the earlier
+  shape heuristics (charset, length, digit bounds), which review showed cannot
+  bound identity: depth-2 first segments are usernames on `/{username}/posts`
+  shapes, and single-segment paths are documents under `/%postname%/` permalinks.
+  With the allowlist, the emitted value set is fixed by configuration, so no
+  request-derived byte ever reaches the row. The character allowlist alone does not bound identity (`[a-z0-9_-]`
   is exactly the alphabet of UUIDs, hex ids, and reset tokens), and a truncated
   prefix of any of those is still identifying, so the length and digit bounds reject
   the segment outright.
@@ -328,8 +335,15 @@ ClickHouse sorting keys cannot contain nullable columns):
 `template_cache_state`  LowCardinality(String),      -- from the typed response extension, not the public header
 `country`               LowCardinality(String),
 `ts_version`            LowCardinality(String),
-`pop`                   LowCardinality(String)       -- FASTLY_POP, 'unknown' when absent
+`pop`                   LowCardinality(String),      -- FASTLY_POP, 'unknown' when absent
+`auction_dispatched_ms` Nullable(UInt32),            -- section 18
+`auction_resolved_ms`   Nullable(UInt32),            -- section 18
+`auction_committed_ms`  Nullable(UInt32),            -- section 18
+`auction_id`            Nullable(UUID)               -- section 18; join key to auction_events_raw
 ```
+
+The four auction columns are specified in section 18; they are listed here so
+this block stays the single canonical column list.
 
 The matched route pattern does not survive dispatch today, so a typed
 `RouteMetadata` response extension carries `route_class` and `route_template`: each
@@ -364,7 +378,9 @@ ships as a versioned replacement datasource with a cutover, not an in-place edit
 
 ## 10. Emission mechanics
 
-- `AccessTelemetrySnapshot`: built unconditionally at the freeze point, before
+- `AccessTelemetrySnapshot`: built at the freeze point when
+  `tinybird.access_enabled` is set (revised in review from the original
+  unconditional build, so a disabled deployment pays nothing here), before
   `into_parts()` consumes the response. It captures method, status, route metadata
   (from the `RouteMetadata` extension), and typed dimension states (`env`,
   `template_cache_state`, geo country). It exists because nothing else survives to
@@ -589,33 +605,51 @@ That leaves three questions unanswerable today:
 3. At what request-relative time were the results committed toward GAM?
 
 These are the overlap-proof questions. A client-side wrapper cannot dispatch until
-the browser boots (t≈3000ms on measured prospect pages); the server-side auction
+the browser boots (t~3000ms on measured prospect pages); the server-side auction
 dispatches while the origin fetch is in flight. Proving that requires all
 milestones on one clock.
 
 ### Design
 
-Three first-call-wins marks on `RequestTimings`, in the style of
-`mark_headers_ready()`, each storing `Option<Duration>` since T0:
+One first-call-wins id setter and three first-call-wins marks on
+`RequestTimings`, in the style of `mark_headers_ready()`, each mark storing
+`Option<Duration>` since T0:
 
-| Mark                        | Recorded at                                                                                                     | Meaning                                                            |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `mark_auction_dispatched()` | immediately before `orchestrator.dispatch_auction` returns control to the caller (`publisher.rs` dispatch site) | bid requests have left the edge                                    |
-| `mark_auction_resolved()`   | immediately after `collect_dispatched_auction` returns, both collect sites                                      | final bid returned or auction timed out; terminal either way       |
-| `mark_auction_committed()`  | immediately after `write_bids_to_state` returns, both call sites                                                | winning bids are in page state, available to the response pipeline |
+| Call                        | Recorded at                                                                  | Meaning                                               |
+| --------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `set_auction_id()`          | where the `AuctionObservationContext` is built, on all three auction sources | the join key to `auction_events_raw` for this request |
+| `mark_auction_dispatched()` | where the bid requests leave the edge                                        | bid requests have left the edge                       |
+| `mark_auction_resolved()`   | where the auction returns, terminal on success, failure, or timeout          | final bid returned or auction timed out               |
+| `mark_auction_committed()`  | where winning bids become available to the response pipeline                 | targeting is committed                                |
+
+All three auction sources are instrumented, because all three emit rows to
+`auction_events_raw` and all three emit an access row:
+
+| Source              | Route            | Dispatch / resolve bracket   | Commit                     |
+| ------------------- | ---------------- | ---------------------------- | -------------------------- |
+| `InitialNavigation` | publisher HTML   | `dispatch_auction` / collect | `write_bids_to_state`      |
+| `SpaNavigation`     | `/_ts/page-bids` | `run_auction`                | bid map built              |
+| `AuctionApi`        | `POST /auction`  | `run_auction`                | OpenRTB response converted |
 
 Notes on the definitions:
 
-- "Committed toward GAM" is defined as `write_bids_to_state` returning: the common
-  point in buffered and streaming modes where targeting becomes part of the
-  response. TS never calls GAM server-side; the browser's GPT call carries the
-  targeting, and that half of the timeline belongs to client-side measurement.
-  The edge proves when targeting was available; the client proves when GAM saw it.
-- First-call-wins on all three marks. A request produces at most one publisher-path
-  auction today; if a second auction ever occurs in one request, the row describes
-  the first and the auction dataset still carries both in full.
-- Same locking and failure model as every other `RequestTimings` write: `try_lock`,
-  drop on contention, saturating conversion at serialization.
+- "Committed toward GAM" is defined as the point where targeting becomes part of
+  the response: `write_bids_to_state` returning on the navigation path, the bid
+  map on page-bids, the converted OpenRTB response on `/auction`. TS never calls
+  GAM server-side; the browser's GPT call carries the targeting, and that half of
+  the timeline belongs to client-side measurement. The edge proves when targeting
+  was available; the client proves when GAM saw it.
+- The id is set separately from the dispatch mark, and earlier. Every auction
+  outcome emits an `auction_events_raw` row under that id, including skipped and
+  dispatch-failed auctions, so stamping the id at dispatch would leave exactly
+  those rows unjoinable. It also means a dropped dispatch sample cannot take the
+  join key with it.
+- First-call-wins on the id and all three marks. A request produces at most one
+  auction today; if a second ever occurs in one request, the row describes the
+  first and the auction dataset still carries both in full.
+- Same locking and failure model as every other `RequestTimings` write:
+  `try_lock`, drop on contention, poisoned lock recovered, saturating conversion
+  at serialization.
 
 ### Row changes
 
@@ -626,17 +660,33 @@ Four additive columns on `access_logs_raw`, all populated from the
 `auction_dispatched_ms`  Nullable(UInt32),  `json:$.auction_dispatched_ms`
 `auction_resolved_ms`    Nullable(UInt32),  `json:$.auction_resolved_ms`
 `auction_committed_ms`   Nullable(UInt32),  `json:$.auction_committed_ms`
-`auction_id`             String,            `json:$.auction_id`
+`auction_id`             Nullable(UUID),    `json:$.auction_id`
 ```
 
-- The three offsets are null when no auction ran (the common case: assets, EC
-  endpoints, auction-disabled deployments). Null means "no auction", never "zero".
+Null on an offset means "this milestone was not reached", not "no auction ran".
+`auction_id` is what separates the cases, and the two read together:
+
+| `auction_id` | `dispatched` | `resolved` | Meaning                                                     |
+| ------------ | ------------ | ---------- | ----------------------------------------------------------- |
+| null         | null         | null       | no auction was attempted (assets, EC endpoints, disabled)   |
+| set          | null         | null       | attempted, then skipped or failed to dispatch               |
+| set          | set          | null       | dispatched, never collected (origin error, 304, disconnect) |
+| set          | set          | set        | ran to completion or timed out                              |
+
+The third row is the case worth watching: bid requests went out and the response
+they were for never used them. It is distinguishable now, where before it was
+indistinguishable from "no auction".
+
 - `auction_id` is the telemetry auction UUID already present on every
   `auction_events_raw` row, carried onto the access row as the join key between
-  the T0 timeline and per-bidder detail. Sentinel `none` when no auction ran,
-  matching the non-nullable-dimension convention of section 9. It is a random
+  the T0 timeline and per-bidder detail. It is `Nullable(UUID)` rather than a
+  String with a sentinel so it joins natively against `auction_events_raw`
+  .`auction_id`, which is `UUID`: a String column would make the join a type
+  error, and casting a `'none'` sentinel through `toUUID` throws. It is a random
   UUID, not identity-bearing; unbounded cardinality is accepted for the same
-  reason it is accepted in the auction dataset.
+  reason it is accepted in the auction dataset. It is not in the sorting key, so
+  the section 9 non-nullable-dimension rule (which exists because ClickHouse
+  sorting keys cannot contain nullable columns) does not apply to it.
 - Schema evolution is additive with JSONPaths on every new column and
   `FORWARD_QUERY` carrying the existing columns, per the deployed datasource's
   established evolution path. Verified with `tb --cloud deploy --check` before
@@ -651,21 +701,59 @@ t=0 ......... request entry
 t=D ......... auction_dispatched_ms      (bids out; origin fetch typically in flight)
 t=R ......... auction_resolved_ms        (R - D ~ auction duration; join auction_id
                                           for the per-bidder long pole)
-t=C ......... auction_committed_ms       (targeting in page state)
-t=H ......... time_elapsed_ms            (headers committed)
+t=C ......... auction_committed_ms       (targeting available to the response)
 ```
+
+`time_elapsed_ms` (t=H, headers committed) does **not** belong at the end of that
+ladder, and where it lands depends on `body_mode`:
+
+- Buffered (`auction_wait_placement = 'pre_header'`): H comes after C. The auction
+  is collected before the response headers are built, so D < R < C < H.
+- Streamed (`auction_wait_placement = 'in_stream'`): H comes **before** R and C.
+  `mark_headers_ready` is stamped at the terminal layer before the lazy body is
+  polled, while the collect happens at the `</body>` seam inside that body. So
+  D < H < R < C is the normal ordering for a streamed HTML page.
+
+A sanity filter of the form `auction_committed_ms <= time_elapsed_ms` therefore
+discards every valid streamed row. Slice by `body_mode` before comparing the
+auction marks against H at all.
 
 Derivations the dashboard can add without schema help: auction duration on the
 request clock (`R - D`), commit latency (`C - R`), and overlap ratio (share of
-`R - D` that ran concurrently with `ts-origin`). `auction_wait_ms` keeps its
-existing meaning (blocked time only) and is now interpretable next to the
-timeline: `R - D` minus `auction_wait_ms` approximates how much of the auction
-was absorbed by work the request needed anyway.
+`R - D` that ran concurrently with `ts-origin`). `C - R` is whole-millisecond
+like every other column here, and on the navigation path it brackets
+`write_bids_to_state`, whose cost is per-winning-bid creative processing
+(sanitize, first-party URL rewrite, signing, with `rewrite_creatives` on by
+default). Expect 0 on light auctions and non-zero as creative count and size
+grow; it is not a restatement of `R`. `auction_wait_ms` keeps its existing
+meaning (blocked time only) and is now interpretable next to the timeline:
+`R - D` minus `auction_wait_ms` approximates how much of the auction was
+absorbed by work the request needed anyway.
+
+Joining to per-bidder detail, now that both sides are `UUID`:
+
+```sql
+SELECT a.auction_id, a.auction_resolved_ms - a.auction_dispatched_ms AS edge_window,
+       e.provider, e.provider_response_time_ms
+FROM access_logs_raw a
+INNER JOIN auction_events_raw e ON a.auction_id = e.auction_id
+WHERE a.auction_id IS NOT NULL AND e.event_kind = 'provider_call'
+```
+
+One caveat on reconciling the two clocks: D is stamped where dispatch returns to
+the caller, while the auction dataset's `total_time_ms` and
+`provider_response_time_ms` start inside the orchestrator's launch loop. So
+`R - D` is the post-launch window and can read slightly smaller than a joined
+per-provider time. Treat `R - D` as the request-clock cost of the auction, and
+the auction dataset as the authority on per-bidder duration.
 
 ### Scope
 
-- Fastly emits; Axum, Cloudflare, and Spin collect the marks but do not emit,
-  matching section 8a adapter semantics.
+- Fastly emits. Axum attaches a collector and records the marks but does not
+  emit them. Cloudflare and Spin attach no collector at all: `handle_publisher_request`
+  falls back to `RequestTimings::default()`, so the marks land in a throwaway
+  handle and are dropped with it. That is pre-existing for every phase, not new
+  to these marks, and it matches section 8a adapter semantics.
 - No header emission for any of these values: they are post-hoc analysis fields,
   and two of the three are typically unknown at the header freeze point in
   streaming mode.

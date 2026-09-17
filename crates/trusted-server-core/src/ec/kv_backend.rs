@@ -122,6 +122,126 @@ pub(crate) mod test_support {
 
     use super::*;
 
+    /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
+    /// so tests can prove exactly how many reads a flow performs.
+    pub(crate) struct CountingEcKv {
+        inner: InMemoryEcKv,
+        lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingEcKv {
+        pub(crate) fn new(
+            name: impl Into<String>,
+            lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner: InMemoryEcKv::new(name),
+                lookups,
+            }
+        }
+    }
+
+    impl EcKvStore for CountingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.lookup(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// [`EcKvStore`] wrapper that models an eventually-consistent point read.
+    ///
+    /// The first `stale_lookups` calls to [`EcKvStore::lookup`] report the key
+    /// absent while [`EcKvStore::count_keys_with_prefix`] — the list API, which
+    /// reads the primary data source — still sees it. Writes reach the inner
+    /// store, so a test can assert what actually persisted.
+    ///
+    /// With `list_fails` set, the list API errors instead, modelling a store
+    /// that can neither find the key nor prove it absent.
+    pub(crate) struct StaleLookupEcKv {
+        inner: InMemoryEcKv,
+        stale_lookups_remaining: Mutex<u32>,
+        list_fails: bool,
+    }
+
+    impl StaleLookupEcKv {
+        pub(crate) fn new(name: impl Into<String>, stale_lookups: u32, list_fails: bool) -> Self {
+            Self {
+                inner: InMemoryEcKv::new(name),
+                stale_lookups_remaining: Mutex::new(stale_lookups),
+                list_fails,
+            }
+        }
+    }
+
+    impl EcKvStore for StaleLookupEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            let mut remaining = self
+                .stale_lookups_remaining
+                .lock()
+                .expect("should lock stale-lookup counter");
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(None);
+            }
+            self.inner.lookup(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            if self.list_fails {
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.inner.store_name().to_owned(),
+                    message: "list unavailable".to_owned(),
+                }));
+            }
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
     /// In-memory [`EcKvStore`] with generation tracking for CAS tests.
     pub(crate) struct InMemoryEcKv {
         name: String,

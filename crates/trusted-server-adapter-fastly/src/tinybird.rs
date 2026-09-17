@@ -326,8 +326,13 @@ fn build_access_events_request(
 pub(crate) async fn emit_access_event(
     client: &dyn PlatformHttpClient,
     target: &TinybirdEventsTarget,
-    row: String,
+    mut row: String,
 ) -> Result<(), Report<TrustedServerError>> {
+    // Match the auction sink's NDJSON framing: every row is
+    // newline-terminated, and the terminator counts toward the body limit.
+    if !row.ends_with('\n') {
+        row.push('\n');
+    }
     let body_len = row.len();
     if body_len > target.max_body_bytes {
         return Err(Report::new(TrustedServerError::Proxy {
@@ -354,8 +359,11 @@ pub(crate) async fn emit_access_event(
         backend_name
     );
 
+    // The response body is never consumed, so stream it: buffered
+    // conversion on Fastly materializes the body before the size limit is
+    // enforced, which a chunked response could abuse.
     let response = client
-        .send(PlatformHttpRequest::new(request, backend_name))
+        .send(PlatformHttpRequest::new(request, backend_name).with_stream_response())
         .await
         .change_context(TrustedServerError::Proxy {
             message: "failed to send Tinybird access telemetry request".to_owned(),
@@ -490,6 +498,7 @@ mod tests {
         uri: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+        stream_response: bool,
     }
 
     /// Records outbound requests and, for [`PlatformHttpClient::send`] (the
@@ -515,6 +524,7 @@ mod tests {
 
         fn record(&self, request: PlatformHttpRequest) {
             let backend_name = request.backend_name;
+            let stream_response = request.stream_response;
             let (parts, body) = request.request.into_parts();
             let headers = parts
                 .headers
@@ -532,6 +542,7 @@ mod tests {
                 uri: parts.uri.to_string(),
                 headers,
                 body: body.into_bytes().unwrap_or_default().to_vec(),
+                stream_response,
             };
             self.requests
                 .lock()
@@ -949,10 +960,15 @@ mod tests {
             header_value(&requests[0].headers, header::AUTHORIZATION.as_str()),
             Some("Bearer test-tinybird-access-append-token")
         );
+        let body = std::str::from_utf8(&requests[0].body).expect("should record utf8 body");
         assert_eq!(
-            std::str::from_utf8(&requests[0].body).expect("should record utf8 body"),
-            row,
-            "should send the row verbatim as the request body"
+            body,
+            format!("{row}\n"),
+            "should send newline-delimited JSON, matching the auction sink's framing"
+        );
+        assert!(
+            requests[0].stream_response,
+            "should stream the Tinybird response: the body is never consumed"
         );
     }
 

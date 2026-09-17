@@ -9,13 +9,15 @@
 //! [`append_server_timing_if_private`](trusted_server_core::request_timing::append_server_timing_if_private).
 //!
 //! This wraps *outside* `RouterService` rather than registering as
-//! `RouterBuilder::middleware`. A router-generated 404/405 short-circuits
-//! `RouterInner::dispatch` before its middleware chain ever runs, so
-//! middleware never sees those responses. By the time a response reaches
-//! this layer -- after `RouterService::oneshot` inside
-//! `EdgeZeroAxumService::call` has already converted any dispatch error into
-//! a plain response -- every response is covered uniformly, router-generated
-//! or not.
+//! `RouterBuilder::middleware` because the tower boundary is the terminal
+//! freeze point: by the time a response reaches this layer -- after
+//! `RouterService::oneshot` inside `EdgeZeroAxumService::call` has
+//! converted any dispatch error into a plain response -- every response is
+//! covered uniformly regardless of how routing produced it, and the
+//! position survives future routing changes. (In this application's router
+//! a catch-all fallback spans every path and publisher method, so
+//! router-generated 404/405s that bypass middleware are close to
+//! unreachable today; the outer position does not depend on them.)
 //!
 //! `/health` is excluded by path match before a
 //! [`RequestTimings`](trusted_server_core::request_timing::RequestTimings)
@@ -160,6 +162,72 @@ mod tests {
             !server_timing.contains("ts-appbuild"),
             "the Axum dev server builds state once at startup, so there is no \
              per-request app-build interval to render: {server_timing}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_suppresses_header_when_flag_is_off() {
+        let router = RouterService::builder()
+            .get("/private", |_ctx: RequestContext| async {
+                private_ok_response()
+            })
+            .build();
+        let mut service = TimingService::new(EdgeZeroAxumService::new(router), false);
+
+        let request = Request::builder()
+            .uri("/private")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        assert!(
+            header(&response, "server-timing").is_none(),
+            "should not emit server-timing when server_timing_enabled is false"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_round_trips_phase_timings_recorded_in_the_handler() {
+        // The collector crosses the adapter boundary as a request extension;
+        // this pins the round trip end to end: a phase recorded inside a
+        // core-style handler must come back out in the rendered header, so
+        // a future adapter conversion that drops request extensions fails
+        // here instead of silently losing every phase.
+        let router = RouterService::builder()
+            .get("/private", |ctx: RequestContext| async move {
+                if let Some(timings) = ctx.request().extensions().get::<RequestTimings>() {
+                    timings.record(
+                        trusted_server_core::request_timing::Phase::Filter,
+                        std::time::Duration::from_millis(7),
+                    );
+                }
+                private_ok_response()
+            })
+            .build();
+        let mut service = TimingService::new(EdgeZeroAxumService::new(router), true);
+
+        let request = Request::builder()
+            .uri("/private")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        let server_timing = header(&response, "server-timing").expect("should emit header");
+        assert!(
+            server_timing.contains("ts-filter;dur=7.0"),
+            "a phase recorded in the handler should survive the adapter round trip: {server_timing}"
         );
     }
 
