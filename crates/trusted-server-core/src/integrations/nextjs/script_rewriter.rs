@@ -1,9 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use error_stack::Report;
 use regex::{Regex, escape};
 
 use crate::error::TrustedServerError;
+use crate::integrations::ScriptTextAccumulator;
 use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
@@ -14,14 +15,6 @@ use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 pub(super) struct NextJsNextDataRewriter {
     config: Arc<NextJsIntegrationConfig>,
     rewriter: UrlRewriter,
-    /// Accumulates text fragments when `lol_html` splits a text node across
-    /// chunk boundaries. Drained on `is_last_in_text_node`.
-    ///
-    /// Uses `Mutex` to satisfy the `Sync` bound on `IntegrationScriptRewriter`.
-    /// The pipeline is single-threaded (`lol_html::HtmlRewriter` is `!Send`),
-    /// so the lock is uncontended. `lol_html` delivers text chunks sequentially
-    /// per element — the buffer is always empty when a new element's text begins.
-    accumulated_text: Mutex<String>,
 }
 
 impl NextJsNextDataRewriter {
@@ -31,7 +24,6 @@ impl NextJsNextDataRewriter {
         Ok(Self {
             rewriter: UrlRewriter::new(&config.rewrite_attributes)?,
             config,
-            accumulated_text: Mutex::new(String::new()),
         })
     }
 
@@ -74,10 +66,12 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
             return ScriptRewriteAction::keep();
         }
 
-        let mut buf = self
-            .accumulated_text
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Per document, never per registry: a registry-lifetime buffer would
+        // carry one document's partial script into the next.
+        let accumulator = ctx
+            .document_state
+            .get_or_insert_with(NEXTJS_INTEGRATION_ID, ScriptTextAccumulator::default);
+        let mut buf = accumulator.buffer();
 
         if !ctx.is_last_in_text_node {
             // Intermediate fragment — accumulate and suppress output.
@@ -95,7 +89,7 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
         // accumulated text via Replace — intermediate fragments were already
         // removed from lol_html's output via RemoveNode.
         buf.push_str(content);
-        let full_content = std::mem::take(&mut *buf);
+        let full_content = std::mem::take::<String>(&mut buf);
         let action = self.rewrite_structured(&full_content, ctx);
         if matches!(action, ScriptRewriteAction::Keep) {
             return ScriptRewriteAction::replace(full_content);
@@ -242,6 +236,53 @@ mod tests {
             is_last_in_text_node: true,
             document_state,
         }
+    }
+
+    #[test]
+    fn an_interrupted_document_leaves_no_residue_for_the_next_document() {
+        // One rewriter serves every document the registry serves, so both
+        // documents below share it and only the document state differs. With
+        // the buffer owned by the rewriter this test fails: document two
+        // emits document one's payload.
+        let rewriter = NextJsNextDataRewriter::new(test_config())
+            .expect("should build Next.js structured rewriter");
+
+        // Document one: cut off before its final fragment arrives.
+        let first_document = IntegrationDocumentState::default();
+        let interrupted = IntegrationScriptContext {
+            is_last_in_text_node: false,
+            ..ctx("script#__NEXT_DATA__", &first_document)
+        };
+        let secret = r#"{"props":{"pageProps":{"sessionToken":"SESSION-ONE-SECRET","href":"#;
+
+        let action = rewriter.rewrite(secret, &interrupted);
+        assert_eq!(
+            action,
+            ScriptRewriteAction::RemoveNode,
+            "the partial fragment should be withheld, which is what strands it"
+        );
+
+        // Document two: fresh document state, same rewriter.
+        let second_document = IntegrationDocumentState::default();
+        let fresh = ctx("script#__NEXT_DATA__", &second_document);
+        let benign = r#"{"props":{"pageProps":{"href":"https://origin.example.com/reviews"}}}"#;
+
+        let action = rewriter.rewrite(benign, &fresh);
+
+        let emitted = match action {
+            ScriptRewriteAction::Replace(value) => value,
+            ScriptRewriteAction::Keep => benign.to_owned(),
+            other => panic!("expected the second document to be emitted, got {other:?}"),
+        };
+
+        assert!(
+            !emitted.contains("SESSION-ONE-SECRET"),
+            "the interrupted document's content must not reach the next document, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("ts.example.com"),
+            "the second document should still be rewritten correctly, got: {emitted}"
+        );
     }
 
     #[test]
