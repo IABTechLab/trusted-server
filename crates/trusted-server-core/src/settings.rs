@@ -2548,6 +2548,31 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Expose the reusable-sandbox counters endpoint at `GET /_ts/debug/sandbox`
+    /// and attach the same counters to workload responses.
+    ///
+    /// The counters are the guest-instance identifier, the request ordinal
+    /// within that instance, the application build count, and the request
+    /// correlation id. They carry no settings, secrets, or request content.
+    ///
+    /// Independent of the adapter's `reusable-sandbox` Cargo feature by design:
+    /// the feature decides whether a `Serve` loop exists, this flag decides
+    /// whether counters are emitted. Keeping them separate is what lets the
+    /// feature-off baseline be measured on the same channel as the reuse arms.
+    ///
+    /// Skipped from serialization while false: [`DebugConfig`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed. A blob with it enabled requires restoring a
+    /// compatible blob before rolling back, the same trade
+    /// [`DebugConfig::auction_html_comment_options`] makes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_metrics_enabled: bool,
+}
+
+/// Serde predicate for omitting `false` flags from serialized config blobs.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
@@ -3684,6 +3709,57 @@ mod tests {
     use serde_json::json;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    /// `DebugConfig` denies unknown fields, so a binary built before
+    /// `sandbox_metrics_enabled` existed must still accept a default blob.
+    /// That only holds while the flag is skipped during serialization.
+    #[test]
+    fn default_debug_config_omits_sandbox_metrics_for_rollback() {
+        let serialized =
+            serde_json::to_value(DebugConfig::default()).expect("should serialize debug config");
+
+        assert!(
+            serialized.get("sandbox_metrics_enabled").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_sandbox_metrics_serializes_and_round_trips() {
+        let config = DebugConfig {
+            sandbox_metrics_enabled: true,
+            ..DebugConfig::default()
+        };
+
+        let serialized = serde_json::to_value(&config).expect("should serialize debug config");
+        assert_eq!(
+            serialized.get("sandbox_metrics_enabled"),
+            Some(&json!(true)),
+            "an enabled flag must be written so the setting survives a round trip"
+        );
+
+        let restored: DebugConfig =
+            serde_json::from_value(serialized).expect("should deserialize debug config");
+        assert!(
+            restored.sandbox_metrics_enabled,
+            "the flag should survive a round trip"
+        );
+    }
+
+    #[test]
+    fn debug_config_accepts_a_blob_without_the_sandbox_field() {
+        let restored: DebugConfig = serde_json::from_value(json!({"ja4_endpoint_enabled": true}))
+            .expect("should deserialize a blob written before the field existed");
+
+        assert!(
+            restored.ja4_endpoint_enabled,
+            "existing fields should still load"
+        );
+        assert!(
+            !restored.sandbox_metrics_enabled,
+            "an absent flag should default to off"
+        );
+    }
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
