@@ -846,8 +846,9 @@ and parity tests around each boundary.
 
 TOML order can be lost through unordered Rust maps or JSON objects.
 
-Mitigation: use ordered in-memory types and explicit sequences in the signed
-blob. Test the complete push/store/load path rather than only the TOML parser.
+Mitigation: use ordered in-memory types and explicit sequences in the
+hash-verified blob. Test the complete push/store/load path rather than only the
+TOML parser.
 
 ### Hidden reverse dependencies
 
