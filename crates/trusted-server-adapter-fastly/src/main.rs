@@ -44,7 +44,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, load_settings_from_config_store,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp,
+    load_settings_from_config_store,
 };
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
@@ -303,8 +304,36 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
             }
         };
 
-    let (app, app_state) = TrustedServerApp::build_app_with_state(&runtime_stores);
-    sandbox.record_build();
+    // Build lazily, once per sandbox. Reached only past the health, JA4, and
+    // counters short-circuits, so none of those pays for construction.
+    //
+    // A failed build is deliberately not retained: it yields an error router
+    // with no state, which serves this request and is dropped, so a transient
+    // config-store failure cannot pin the sandbox into permanent error mode.
+    // The next request retries construction.
+    let mut failed_build = None;
+    if sandbox.retained_app().is_none() {
+        let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
+        sandbox.record_build();
+        match state {
+            Some(state) => sandbox.retain_app(app, state),
+            None => failed_build = Some(app),
+        }
+    }
+
+    let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
+        match (failed_build.as_ref(), sandbox.retained_app()) {
+            (Some(app), _) => (app, None),
+            (None, Some(retained)) => (&retained.app, Some(Arc::clone(&retained.state))),
+            (None, None) => {
+                log::error!("no application available after build");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+                return;
+            }
+        };
+
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
     let counters =
         SandboxCounters::capture(sandbox, ordinal, request_id, settings_snapshot.as_deref());

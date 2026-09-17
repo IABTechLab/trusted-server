@@ -5,13 +5,16 @@
 //! several. This module owns the opt-in decision, the bounds, and the
 //! per-sandbox bookkeeping the entry point carries across requests.
 //!
-//! Nothing here retains application state. [`Sandbox`] holds a logger guard and
-//! measurement counters only; the retained application arrives in a later
-//! change.
+//! [`Sandbox`] owns the state the entry point carries across requests: the
+//! logger guard, the measurement counters, and the retained application.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use edgezero_core::app::App;
 use trusted_server_core::settings::Settings;
+
+use crate::app::AppState;
 
 /// Header carrying the guest-instance identifier.
 pub(crate) const HEADER_SANDBOX_INSTANCE: &str = "x-ts-sandbox-instance";
@@ -39,12 +42,23 @@ pub(crate) const INSTANCE_ID_UNAVAILABLE: &str = "unavailable";
 ///
 /// Everything here is either a one-time guard or a counter. No request
 /// identity, no native handles, no application state.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Sandbox {
     logger_installed: bool,
     requests: u64,
     builds: u64,
     pending_diagnostics: Vec<String>,
+    retained: Option<RetainedApp>,
+}
+
+/// A successfully built application, kept for the life of the sandbox.
+///
+/// Only ever holds a build that produced state. A failed build yields an
+/// error router with no state, which serves its own request and is dropped;
+/// retaining it would pin the sandbox into permanent error mode.
+pub(crate) struct RetainedApp {
+    pub(crate) app: App,
+    pub(crate) state: Arc<AppState>,
 }
 
 impl Sandbox {
@@ -94,6 +108,16 @@ impl Sandbox {
     /// Number of application builds this sandbox has performed.
     pub(crate) fn builds(&self) -> u64 {
         self.builds
+    }
+
+    /// The retained application, if one has been built and kept.
+    pub(crate) fn retained_app(&self) -> Option<&RetainedApp> {
+        self.retained.as_ref()
+    }
+
+    /// Retains a successfully built application for later requests.
+    pub(crate) fn retain_app(&mut self, app: App, state: Arc<AppState>) {
+        self.retained = Some(RetainedApp { app, state });
     }
 }
 
@@ -439,6 +463,43 @@ mod tests {
         );
     }
 
+    /// Minimal settings sufficient to build real application state.
+    fn test_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example"
+            cookie_domain = ".test-publisher.example"
+            origin_url = "https://origin.test-publisher.example"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse sandbox test settings")
+    }
+
+    /// A real `AppState`, so retention is exercised against the type the
+    /// entry point actually keeps rather than a stand-in.
+    fn test_state() -> Arc<AppState> {
+        crate::app::build_state_from_settings(test_settings())
+            .expect("should build sandbox test state")
+    }
+
+    /// An empty but real `App`.
+    fn test_app() -> App {
+        App::with_name(
+            edgezero_core::router::RouterService::builder().build(),
+            "sandbox-test",
+        )
+    }
+
     /// Stand-in for `fastly::config_store::LookupError`, which cannot be
     /// constructed outside the SDK.
     #[derive(Debug, derive_more::Display)]
@@ -563,6 +624,88 @@ mod tests {
             drained,
             vec!["reuse declined".to_owned()],
             "the held diagnostic should be emitted, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_starts_with_no_retained_application() {
+        let sandbox = Sandbox::default();
+
+        assert!(
+            sandbox.retained_app().is_none(),
+            "construction must be lazy so the health probe never pays for it"
+        );
+        assert_eq!(
+            sandbox.builds(),
+            0,
+            "a sandbox that has served nothing should report no builds"
+        );
+    }
+
+    #[test]
+    fn a_retained_application_is_reused_across_requests() {
+        let mut sandbox = Sandbox::default();
+        // First request builds.
+        assert_eq!(sandbox.begin_request(), 1, "first request is ordinal 1");
+        assert!(
+            sandbox.retained_app().is_none(),
+            "nothing is retained before the first build"
+        );
+        sandbox.record_build();
+        sandbox.retain_app(test_app(), test_state());
+
+        // Later requests reuse it.
+        for expected_ordinal in 2..=4 {
+            assert_eq!(
+                sandbox.begin_request(),
+                expected_ordinal,
+                "ordinals should keep increasing"
+            );
+            assert!(
+                sandbox.retained_app().is_some(),
+                "request {expected_ordinal} should find the retained application"
+            );
+        }
+
+        assert_eq!(sandbox.requests(), 4, "should have served four requests");
+        assert_eq!(
+            sandbox.builds(),
+            1,
+            "four requests should cost exactly one build; that is the whole point"
+        );
+    }
+
+    #[test]
+    fn a_failed_build_is_not_retained_and_still_counts() {
+        let mut sandbox = Sandbox::default();
+
+        // A failed build produces an error router with no state, so nothing is
+        // handed to `retain_app`. Retaining it would serve errors for the rest
+        // of the sandbox's life.
+        sandbox.record_build();
+
+        assert!(
+            sandbox.retained_app().is_none(),
+            "a failed build must leave the sandbox ready to retry"
+        );
+        assert_eq!(
+            sandbox.builds(),
+            1,
+            "the attempt still counts, so a retry loop is visible in the counters"
+        );
+
+        // The next request retries and succeeds.
+        sandbox.record_build();
+        sandbox.retain_app(test_app(), test_state());
+
+        assert!(
+            sandbox.retained_app().is_some(),
+            "a later successful build should be retained"
+        );
+        assert_eq!(
+            sandbox.builds(),
+            2,
+            "both the failed attempt and the successful build should be counted"
         );
     }
 
