@@ -40,7 +40,11 @@ pub(crate) const HEADER_SANDBOX_HEAP_MIB: &str = "x-ts-sandbox-heap-mib";
 pub(crate) const COUNTER_UNSUPPORTED: &str = "unsupported";
 
 /// Path of the counters snapshot endpoint.
-#[cfg(any(feature = "reusable-sandbox", test))]
+///
+/// Gated on the feature alone, not `any(feature, test)`: its only caller is
+/// the feature-gated short-circuit, so a `test` arm would make it dead code
+/// in a feature-off test build.
+#[cfg(feature = "reusable-sandbox")]
 pub(crate) const SANDBOX_METRICS_PATH: &str = "/_ts/debug/sandbox";
 
 /// Label used when the runtime reports no usable guest-instance identifier.

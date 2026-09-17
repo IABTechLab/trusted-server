@@ -195,7 +195,7 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
 /// not necessarily the sandbox that served any preceding workload request, so
 /// reuse is established from the counters attached to workload responses
 /// rather than from polling this.
-#[cfg(any(feature = "reusable-sandbox", test))]
+#[cfg(feature = "reusable-sandbox")]
 fn sandbox_metrics_response(sandbox: &Sandbox, ordinal: u64) -> FastlyResponse {
     let body = serde_json::json!({
         "instance": instance_id(),
