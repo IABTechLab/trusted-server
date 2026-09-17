@@ -2248,8 +2248,9 @@ mod tests {
             .to_str()
             .expect("should render set-cookie as utf-8");
         assert_eq!(
-            set_cookie, "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax",
-            "tester cookie should use publisher.cookie_domain"
+            set_cookie,
+            "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=2592000",
+            "tester cookie should use publisher.cookie_domain and persist across browser restarts"
         );
     }
 
