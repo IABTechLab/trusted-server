@@ -16,8 +16,8 @@ pub fn module_bundle(id: &str) -> Option<&'static str> {
 /// Return all available module IDs, in discovery order (core first).
 #[must_use]
 #[inline]
-pub fn all_module_ids() -> Vec<&'static str> {
-    TSJS_MODULES.iter().map(|module| module.id).collect()
+pub const fn all_module_ids() -> &'static [&'static str] {
+    &ALL_MODULE_IDS
 }
 
 /// Concatenate core + the requested integration modules into a single JS string.

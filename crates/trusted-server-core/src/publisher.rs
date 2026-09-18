@@ -608,7 +608,8 @@ fn parse_single_module_filename(filename: &str) -> Option<&'static str> {
         .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
 
     trusted_server_js::all_module_ids()
-        .into_iter()
+        .iter()
+        .copied()
         .find(|&id| id == stem)
 }
 
@@ -1967,7 +1968,7 @@ fn template_fingerprint(settings: &Settings) -> String {
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(
-        trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
+        trusted_server_js::concatenated_hash(trusted_server_js::all_module_ids()).as_bytes(),
     );
     // `serde_json::Value` uses a sorted object map without `preserve_order`, making
     // independently deserialized HashMaps canonical before they are serialized again.
