@@ -424,13 +424,15 @@ fn creative_config(
     document: &str,
     path: &std::path::Path,
 ) -> CliResult<Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig>> {
-    // Plain `format!`, not `report_error`: the top-level `[ts]` printer already
-    // logs whatever is returned here, and this message embeds a multi-line
-    // `toml::de::Error`, so logging it here too would print the whole block
-    // twice. The guidance leads so the parse error can trail unbroken.
+    // Parser messages can quote literal secrets from the operator's config.
+    // Keep the path and location, but never include the source or error text.
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
+        let location = error
+            .span()
+            .map(|span| format!(" at byte offset {}", span.start))
+            .unwrap_or_default();
         format!(
-            "failed to parse {} before generating slots; fix the TOML syntax and re-run:\n{error}",
+            "failed to parse {}{location} before generating slots; fix the TOML syntax and re-run",
             path.display()
         )
     })?;
@@ -439,11 +441,13 @@ fn creative_config(
     };
     match section.try_into() {
         Ok(config) => Ok(Some(config)),
-        Err(error) => cli_error(format!(
+        // Deserialization errors can also quote invalid values, even though
+        // this conversion has no original TOML source attached.
+        Err(_) => cli_error(
             "failed to read the existing `[creative_opportunities]` section, so generating \
-             slots would discard the configured ones: {error}. Fix the section (or delete it) \
-             and re-run"
-        )),
+             slots would discard the configured ones. Fix the section (or delete it) \
+             and re-run",
+        ),
     }
 }
 
@@ -520,9 +524,14 @@ mod tests {
             "error should name the config file it could not parse, got {error}"
         );
         assert!(
-            error.contains("fix the TOML syntax and re-run:\n"),
-            "the guidance should lead so the multi-line parse error trails it, got {error}"
+            error.contains("fix the TOML syntax and re-run"),
+            "should retain repair guidance, got {error}"
         );
+        assert!(
+            error.contains("byte offset"),
+            "should retain parser location"
+        );
+        assert!(!error.contains('\n'), "should not include a source excerpt");
     }
 
     #[test]

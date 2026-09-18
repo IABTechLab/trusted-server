@@ -616,9 +616,10 @@ async fn collect_open_page(
         )),
     }
 
-    // All settle phases share one clock. Navigation has its own timeout;
-    // scrolling also consumes the remaining settle budget. Read GPT before
-    // metadata so unrelated evidence extraction cannot starve stabilization.
+    // Settle phases share one clock, with a minimum allowance for GPT's dwell.
+    // Navigation has its own timeout; scrolling consumes the settle budget.
+    // Read GPT before metadata so extraction cannot starve its polling. DOM and
+    // network evidence consequently reflect the page after the GPT wait.
     let settle_start = std::time::Instant::now();
     if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
         warnings.push(
@@ -660,13 +661,15 @@ async fn collect_open_page(
     // `getSlots()` snapshot instead and can observe a half-registered registry.
     // `ts audit page` also takes a snapshot, but reports what it saw rather
     // than generating config from it.
-    let gpt_slots = collect_stable_gpt_slots(
-        page,
-        settings.settle_quiet,
+    // Initial settling and scrolling can exhaust the shared budget. Leave
+    // enough time for an already-stable registry to establish and finish a
+    // dwell; later changes can still exhaust this bounded allowance.
+    let gpt_budget = gpt_polling_budget(
         settings.settle_max.saturating_sub(settle_start.elapsed()),
-        &mut warnings,
-    )
-    .await;
+        settings.settle_quiet,
+    );
+    let gpt_slots =
+        collect_stable_gpt_slots(page, settings.settle_quiet, gpt_budget, &mut warnings).await;
 
     match timeout(CDP_OPERATION_TIMEOUT, page.frames()).await {
         Ok(Ok(frames)) if frames.len() > 1 => warnings.push(format!(
@@ -683,6 +686,17 @@ async fn collect_open_page(
         .map_err(|_| "timed out reading final page URL".to_string())?
         .map_err(|error| format!("failed to read final page URL: {error}"))?
         .ok_or("browser page URL was empty after navigation")?;
+    // Browser error pages and about:blank have opaque origins. They are failed
+    // collections, not evidence of a cross-origin HTTP redirect. Keep the URL
+    // out of the diagnostic because it may contain operator credentials.
+    let parsed_final_url = Url::parse(&final_url)
+        .map_err(|_| "browser returned an invalid final page URL".to_string())?;
+    if !matches!(parsed_final_url.scheme(), "http" | "https") {
+        return Err(
+            "browser navigation did not produce an HTTP(S) page; check the browser proxy, network connectivity, and TLS settings"
+                .to_string(),
+        );
+    }
     let page_title = timeout(CDP_OPERATION_TIMEOUT, page.get_title())
         .await
         .map_err(|_| "timed out reading page title".to_string())?
@@ -1012,6 +1026,15 @@ fn gpt_registry_reading(
     }
 }
 
+/// Allocates time to establish a repeated reading and complete its dwell.
+///
+/// The first repeat starts the dwell after one poll interval. A second interval
+/// leaves slack before the deadline, which is checked before reading again.
+/// Slow browser reads or later registry changes can still exhaust this budget.
+fn gpt_polling_budget(remaining: Duration, dwell_target: Duration) -> Duration {
+    remaining.max(dwell_target.saturating_add(2 * SETTLE_POLL_INTERVAL))
+}
+
 /// Reads GPT until a non-empty registry holds still for `dwell_target`, or
 /// until `budget` expires.
 ///
@@ -1019,8 +1042,9 @@ fn gpt_registry_reading(
 /// batching, consent-gated definitions, lazy slots), so two consecutive reads
 /// can both observe the same burst and miss the next. Requiring the reading to
 /// repeat for a dwell window mirrors [`wait_for_page_settle`], and taking both
-/// the dwell from the operator's quiet flag and the remaining shared settle
-/// budget keeps this phase under the same `--settle-max-ms` control. An
+/// the dwell from the operator's quiet flag and the budget from the remaining
+/// shared allowance, floored at the quiet window plus two poll intervals,
+/// bounds this phase. An
 /// in-flight read may overrun the budget by its own bound. Even an exhausted
 /// budget takes one snapshot; two consecutive empty polls end the wait early.
 ///
@@ -1407,10 +1431,25 @@ mod tests {
         pubads: function () {
           return {
             getSlots: function () {
+              // The budget-floor test observes read count, independently of
+              // the real timer exercised by the other fixture users.
+              if (location.hash === '#poll-driven') {
+                if (!armed) {
+                  armed = true
+                  return [firstSlot]
+                }
+                return [firstSlot, secondSlot]
+              }
               if (!armed) {
                 armed = true
                 slots = [firstSlot]
-                setTimeout(function () { slots = [firstSlot, secondSlot] }, 400)
+                setTimeout(function () {
+                  slots = [firstSlot, secondSlot]
+                  document.body.dataset.gptBatch = 'second'
+                  var script = document.createElement('script')
+                  script.src = '/late-evidence.js'
+                  document.head.appendChild(script)
+                }, 400)
               }
               return slots
             },
@@ -1671,6 +1710,80 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_allows_an_unchanging_registry_to_finish_its_dwell() {
+        for quiet_ms in [0, 100, 250, 600, 1000, 3000] {
+            let dwell = Duration::from_millis(quiet_ms);
+            let budget = gpt_polling_budget(Duration::ZERO, dwell);
+            let expected = vec![gpt_slot("/123/header", "ad-header")];
+            let mut warnings = Vec::new();
+            let mut reads = 0;
+            let start = tokio::time::Instant::now();
+
+            let slots = poll_gpt_registry(
+                || {
+                    reads += 1;
+                    std::future::ready(Ok(expected.clone()))
+                },
+                dwell,
+                budget,
+                &mut warnings,
+            )
+            .await;
+
+            assert_eq!(slots, expected, "should retain the stable registry");
+            assert!(
+                warnings.is_empty(),
+                "should finish a stable dwell at quiet={quiet_ms}: {warnings:?}"
+            );
+            assert!(reads >= 2, "should confirm stability with another read");
+            assert!(
+                start.elapsed() < budget,
+                "should complete before the polling deadline"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_still_warns_when_a_later_batch_cannot_finish_its_dwell() {
+        let first = vec![gpt_slot("/123/first", "ad-first")];
+        let mut latest = first.clone();
+        latest.push(gpt_slot("/123/second", "ad-second"));
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+        let dwell = Duration::from_millis(600);
+        let budget = gpt_polling_budget(Duration::ZERO, dwell);
+        let start = tokio::time::Instant::now();
+
+        let slots = poll_gpt_registry(
+            || {
+                reads += 1;
+                std::future::ready(Ok(if reads == 1 {
+                    first.clone()
+                } else {
+                    latest.clone()
+                }))
+            },
+            dwell,
+            budget,
+            &mut warnings,
+        )
+        .await;
+
+        assert_eq!(slots, latest, "should retain the latest batch");
+        assert_eq!(
+            start.elapsed(),
+            budget,
+            "should stop at the polling deadline"
+        );
+        assert_eq!(reads, 5, "should continue polling through the floor");
+        assert_eq!(warnings.len(), 1, "should warn about the incomplete dwell");
+        assert!(
+            warnings[0].contains("within the 1100ms budget"),
+            "should report the actual allowance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn registry_poll_stops_after_two_empty_readings() {
         let mut reads = 0;
         let mut warnings = Vec::new();
@@ -1695,6 +1808,45 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "should leave the empty-state diagnostic to the caller"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_poll_quiet_window_budget_captures_late_batch_as_partial() {
+        let first = vec![gpt_slot("/123/first", "ad-first")];
+        let mut latest = first.clone();
+        latest.push(gpt_slot("/123/second", "ad-second"));
+        let start = tokio::time::Instant::now();
+        let mut reads = 0;
+        let mut warnings = Vec::new();
+
+        let slots = poll_gpt_registry(
+            || {
+                reads += 1;
+                let slots = if start.elapsed() >= Duration::from_millis(400) {
+                    latest.clone()
+                } else {
+                    first.clone()
+                };
+                std::future::ready(Ok(slots))
+            },
+            Duration::from_millis(600),
+            Duration::from_millis(600),
+            &mut warnings,
+        )
+        .await;
+
+        assert_eq!(slots, latest, "should capture the second batch");
+        assert_eq!(reads, 3, "should poll beyond the first snapshot");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(600),
+            "should respect the polling budget"
+        );
+        assert_eq!(warnings.len(), 1, "should report incomplete stabilization");
+        assert!(
+            warnings[0].contains("within the 600ms budget"),
+            "should name the exhausted budget"
         );
     }
 
@@ -2099,13 +2251,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
-    fn exhausted_page_settle_budget_still_collects_one_gpt_snapshot() {
+    fn exhausted_page_settle_budget_still_polls_gpt_registry() {
         if !browser_fixture_available() {
             return;
         }
 
         for scroll in [false, true] {
             let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
+            let mut url = fixture.url().clone();
+            // A second read exposes the second batch without racing a browser
+            // timer against the polling deadline on busy runners.
+            url.set_fragment(Some("poll-driven"));
             // A quiet window equal to the maximum cannot finish inside that
             // maximum, so the initial settle spends the entire shared budget.
             let options = GenerateBrowserOpts {
@@ -2116,20 +2272,27 @@ mod tests {
             let collected = BrowserAuditCollector::default()
                 .with_browser_options(&options)
                 .with_scroll(scroll)
-                .collect_page(fixture.url(), &[])
-                .expect("should collect a snapshot after the shared budget expires");
+                .collect_page(&url, &[])
+                .expect("should poll the registry after the shared budget expires");
 
             assert_eq!(
                 collected.gpt_slots,
-                [gpt_slot("/123/first-batch", "ad-first-batch-0")],
-                "should take one snapshot without restarting the GPT budget (scroll={scroll})"
+                [
+                    gpt_slot("/123/first-batch", "ad-first-batch-0"),
+                    CollectedGptSlot {
+                        gam_unit_path: "/123/second-batch".to_string(),
+                        div_id: "ad-second-batch-0".to_string(),
+                        sizes: vec![(728, 90)],
+                    },
+                ],
+                "should collect the later batch within the minimum polling allowance (scroll={scroll})"
             );
             assert!(
                 collected
                     .warnings
                     .iter()
-                    .any(|warning| warning.contains("within the 0ms budget")),
-                "should report exhausted remaining GPT budget (scroll={scroll})"
+                    .any(|warning| warning.contains("within the 1100ms budget")),
+                "should report partial evidence when the later batch cannot finish its dwell (scroll={scroll})"
             );
             assert_eq!(
                 collected.warnings.iter().any(|warning| {
@@ -2217,6 +2380,26 @@ mod tests {
                 },
             ],
             "the dwell window should outlast a gap between registration bursts"
+        );
+        assert!(
+            collected.html.contains("data-gpt-batch=\"second\""),
+            "should capture DOM changes made during GPT polling"
+        );
+        assert!(
+            collected.script_tags.iter().any(|script| {
+                script
+                    .src
+                    .as_deref()
+                    .is_some_and(|src| src.ends_with("/late-evidence.js"))
+            }),
+            "should capture scripts added during GPT polling"
+        );
+        assert!(
+            collected
+                .network_requests
+                .iter()
+                .any(|request| request.url.ends_with("/late-evidence.js")),
+            "should capture network evidence from during GPT polling"
         );
     }
 
