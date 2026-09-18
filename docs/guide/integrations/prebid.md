@@ -86,26 +86,26 @@ provider = "pbs-main"
 
 ### Browser configuration options
 
-| Field                                           | Default                                                                | Ownership and behavior                                                                             |
-| ----------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `enabled`                                       | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider                |
-| `account_id`                                    | `None`                                                                 | Optional browser-injected account value                                                            |
-| `timeout_ms`                                    | `1000`                                                                 | Browser Prebid.js timeout only                                                                     |
-| `debug`                                         | `false`                                                                | Browser Prebid.js debug only                                                                       |
-| `client_side_bidders`                           | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                                   |
-| `excluded_gam_ad_unit_path_suffixes`            | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                                          |
-| `script_patterns`                               | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                                |
-| `external_bundle_url`                           | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains`                  |
-| `external_bundle_sha256`                        | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                                  |
-| `external_bundle_sri`                           | `None`                                                                 | Optional SRI metadata                                                                              |
-| `bundle.adapters`                               | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                                          |
-| `bundle.user_id_modules`                        | Generator preset                                                       | Browser User ID modules compiled into the external bundle                                          |
-| `managed_user_ids[].name`                       | Required                                                               | Prebid `userSync.userIds` entry name Trusted Server installs and reinstates; unique across entries |
-| `managed_user_ids[].params`                     | `{}`                                                                   | Module-specific parameters, forwarded to Prebid.js unchanged                                       |
-| `managed_user_ids[].storage.type`               | `cookie`                                                               | Browser storage for the module value: `cookie` or `html5`                                          |
-| `managed_user_ids[].storage.name`               | Required when `storage` exists                                         | Cookie or local-storage key the module reads and writes                                            |
-| `managed_user_ids[].storage.expires`            | Prebid default                                                         | Storage lifetime in days; at least 1. Any per-module ceiling is the module own                     |
-| `managed_user_ids[].storage.refresh_in_seconds` | Prebid default                                                         | Seconds before the module may refresh the stored value; at least 1                                 |
+| Field                                           | Default                                                                | Ownership and behavior                                                              |
+| ----------------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `enabled`                                       | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider |
+| `account_id`                                    | `None`                                                                 | Optional browser-injected account value                                             |
+| `timeout_ms`                                    | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
+| `debug`                                         | `false`                                                                | Browser Prebid.js debug only                                                        |
+| `client_side_bidders`                           | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                    |
+| `excluded_gam_ad_unit_path_suffixes`            | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                           |
+| `script_patterns`                               | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                 |
+| `external_bundle_url`                           | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains`   |
+| `external_bundle_sha256`                        | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                   |
+| `external_bundle_sri`                           | `None`                                                                 | Optional SRI metadata                                                               |
+| `bundle.adapters`                               | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                           |
+| `bundle.user_id_modules`                        | Generator preset                                                       | Browser User ID modules compiled into the external bundle                           |
+| `managed_user_ids[].name`                       | Required                                                               | Prebid `userSync.userIds` entry Trusted Server installs and keeps installed         |
+| `managed_user_ids[].params`                     | `{}`                                                                   | Module-specific parameters, forwarded to Prebid.js unchanged                        |
+| `managed_user_ids[].storage.type`               | `cookie`                                                               | Browser storage for the module's value: `cookie` or `html5`                         |
+| `managed_user_ids[].storage.name`               | Required when `storage` exists                                         | Cookie or local-storage key the module reads and writes                             |
+| `managed_user_ids[].storage.expires`            | Prebid's own default                                                   | Storage lifetime in days; at least 1. Any per-module ceiling is the module's own    |
+| `managed_user_ids[].storage.refresh_in_seconds` | Prebid's own default                                                   | Seconds before the module may refresh the stored value; at least 1                  |
 
 ### Server provider options
 
@@ -141,56 +141,19 @@ The typed `profile_config` fields are:
 Every server-side bidder code comes from `[auction.bidders.<code>]`; the browser
 integration has no server bidder list. The validated route keys are injected as
 `serverSideBidders`. On initial and refresh auctions, only matching publisher
-bids are folded into the `trustedServer.params.bidderParams` envelope. Configured
+bids are folded into the `trustedServer.bidderParams` envelope. Configured
 `client_side_bidders` and other unowned demand remain native browser bids. Both
 paths compete in the same Prebid.js auction.
 
 The reserved `trustedServer` envelope cannot select a provider or endpoint. Its
 nested bidder keys resolve through `[auction.bidders]`, and one envelope accepts
 at most 128 bidder entries. The optional `zone` fact is limited to 256 UTF-8
-bytes. `params.storedRequest` controls PBS stored fallback: `false` disables it,
-`true` permits it, and omission preserves legacy inference. `null` and non-boolean
-values are invalid and reject the complete envelope. Usable inline params take
-precedence after provider-local overrides. See the [wire contract](/guide/api-reference#pbs-stored-request-intent).
-
-TSJS sets `storedRequest: false` on every newly synthesized envelope, including
-those carrying inline candidates. Existing publisher-authored envelopes retain
-`true`, `false`, or omission on repeated requests. Refresh uses live ad-unit intent
-when available and an immutable request snapshot otherwise, using the same code
-and container-ID lookup as bidder params. Invalid authored values remain intact
-for server validation. An unrecovered refresh defaults to `false`; it does not
-invent a PBS stored lookup just to invoke eligible APS or standard providers.
+bytes. Missing, `null`, or empty `bidderParams` invokes Prebid stored-request
+routing; malformed envelopes do not.
 
 Browser `timeout_ms`/`debug` never inherit a server provider timeout or profile
 debug value. Enabling the browser integration does not create a server provider,
 and a `prebid-server` provider can exist independently from browser injection.
-
-### Stored intent deployment
-
-Deploy server admission support before distributing the TSJS bundle that emits
-`storedRequest`. The pre-fix configuration-first router from #1016 rejects unknown
-envelope fields. Sending new JS to an old server can discard valid inline envelope
-demand as well as fail to solve the unwanted stored lookup.
-
-Rust artifacts embed the generated JS bundles through
-`crates/trusted-server-js/build.rs` and `include_str!`. A normal full build couples
-server support and JS emission; they are not independently published artifacts.
-
-1. Prepare a server-support-only build that retains the old JS emission behavior.
-   Deploy it to every serving instance and verify admission of `true` and `false`
-   alongside valid inline demand.
-2. Only after that verification, distribute the full build containing the new JS.
-   Account for serving instances, browser caches, and any external bundle that
-   still embeds an older shim. If the release process cannot produce the first
-   build, resolve that release mechanism before rollout.
-3. After new JS reaches browsers or caches, do not roll back to a server that
-   rejects `storedRequest`. Keep compatible admission until those clients can
-   safely be served again. Rolling back JS alone does not remove cached clients.
-
-Omission remains supported in this change. Removing legacy inference requires a
-separate migration: inventory direct callers and server-generated opportunities,
-migrate them to explicit intent, account for cached clients, and approve a
-versioned contract change. There is no time-based expiry in this fix.
 
 ## External Bundle Generation
 
@@ -231,14 +194,84 @@ rolling it out broadly.
 When managed User IDs are configured and the page exposes a callable
 `window.__tcfapi`, the Trusted Server shim activates Prebid's standard IAB GDPR
 collector by adding only `consentManagement.gdpr.cmpApi = "iab"`. It does not
-set a timeout or force `defaultGdprScope`. An existing publisher-owned `gdpr`
-value always wins, sibling consent settings are preserved, and pages without a
-TCF API are unchanged. If queued or late publisher configuration later supplies
-its own `gdpr` value, the shim first deactivates the collector it created so the
-old IAB listener cannot overwrite the publisher's consent state. Ownership
-transfers once; the automatic collector is not re-enabled afterward. A delayed
-first CMP response is also ignored after transfer and removes its listener when
-the CMP finally supplies the listener ID.
+set a timeout or force `defaultGdprScope`. An existing publisher-owned
+configuration always wins, sibling consent settings are preserved, and pages
+without a TCF API are unchanged. If queued or late publisher configuration later
+takes ownership, the shim first deactivates the collector it created so the old
+IAB listener cannot overwrite the publisher's consent state. Ownership transfers
+once; the automatic collector is not re-enabled afterward. A delayed first CMP
+response is also ignored after transfer and removes its listener when the CMP
+finally supplies the listener ID.
+
+Publisher ownership follows Prebid's own rule for reading `consentManagement`:
+a truthy `gdpr`, `usp`, or `gpp` selects the namespaced shape, and any other
+non-empty object is read as a legacy top-level TCF configuration such as
+`{ cmpApi: "static", consentData: ... }`. The shim recognizes both, so it never
+appends a `gdpr` namespace that would demote a publisher's legacy settings, and
+when a publisher merge uses the legacy shape the retired namespace is removed
+rather than left behind as a disabled TCF module.
+
+### CMP discovery timing
+
+TCF activation reads `window.__tcfapi` once, so a CMP that installs itself after
+the deferred shim runs would otherwise leave managed modules seeded with
+Prebid's GDPR handler disabled — the module fires its vendor request with no TCF
+parameters, and no later reconfiguration can recall it. Managed entries
+therefore stay out of every configuration Prebid sees until consent discovery
+concludes:
+
+| Event                                              | Result                                                         |
+| -------------------------------------------------- | -------------------------------------------------------------- |
+| A CMP returns a settled TCF result                 | The collector activates and managed entries seed               |
+| A CMP is callable but has not answered yet         | Managed entries stay deferred; the shim awaits a result        |
+| A CMP installs `window.__tcfapi` later             | Its first settled result activates the collector, then seeding |
+| The publisher supplies TCF configuration           | Managed entries seed under the publisher's policy              |
+| No CMP or publisher TCF configuration is available | Auctions proceed with managed entries deferred                 |
+
+An auction does not establish that TCF does not apply. Discovery remains open
+across auctions, including when the CMP property cannot be watched. Publisher
+`setConfig`, `mergeConfig`, and auction calls recheck whether a settled CMP
+result or publisher-owned TCF configuration is now available. Until then,
+publisher configuration passes through without adding managed entries. Once
+ready, managed entries are merged onto the effective configuration. Pages
+without a CMP must supply their own explicit Prebid TCF policy to enable managed
+IDs.
+
+### A settled CMP result, not a callable API
+
+A callable `__tcfapi` is not a consent decision. Prebid's own GDPR handler gives
+up after its default ten-second timeout and then proceeds with null consent and
+`gdprApplies: false`, which `tcfControl` cannot distinguish from a user outside
+GDPR scope. A managed module seeded on a callable-but-silent CMP would therefore
+contact its vendor and write its identity storage with no jurisdiction result
+and no consent behind it.
+
+Automatic TCF activation is Trusted Server's own configuration, so it fails
+closed. The shim subscribes to the CMP with `addEventListener` and seeds managed
+entries only once the result is settled:
+
+| CMP result                                   | Terminal | Managed entries |
+| -------------------------------------------- | -------- | --------------- |
+| `gdprApplies: false`                         | Yes      | Seeded          |
+| `eventStatus: "tcloaded"`                    | Yes      | Seeded          |
+| `eventStatus: "useractioncomplete"`          | Yes      | Seeded          |
+| `eventStatus: "cmpuishown"`                  | No       | Deferred        |
+| No response, or the CMP refuses the listener | No       | Deferred        |
+
+A settled result that denies consent still seeds the managed entry; `tcfControl`
+then blocks the vendor call and the storage write, which is the enforcement path
+this integration relies on. A CMP that recovers later — the user completes its
+UI, or a delayed first response arrives — activates the managed entries at that
+point, with `userSync.autoRefresh` briefly enabled so Prebid initializes modules
+added after its first pass.
+
+This scope is deliberately narrow. It applies only to the automatic TCF
+collector that Trusted Server configures for its own managed modules. A
+publisher-owned `consentManagement` configuration carries the publisher's own
+timeout posture, and Prebid's standard timeout semantics continue to govern
+publisher bidders, analytics, and every other controlled activity on the page.
+The tradeoff is that a CMP which never settles leaves managed identity
+unresolved for the page lifetime. Auctions are unaffected.
 
 ## Debug Mode
 
@@ -601,8 +634,12 @@ The module must be present in the built bundle. Name it under
 preset, which covers the commonly used modules.
 
 `ts prebid bundle` resolves every managed `name` through the checked-in
-`user_id_modules.json` registry. An unknown name, or a name that maps to more
-than one module, fails before bundle generation. After generation, the command
+`user_id_modules.json` registry. An unknown name, a name that maps to more than
+one module, or two managed names that resolve to the same module — `sharedId`
+and `pubCommonId` both select `sharedIdSystem`, for example — fail before bundle
+generation. Prebid registers one submodule for a module's name and each of its
+aliases and then selects the first matching entry, so a shared module would
+silently drop one managed configuration. After generation, the command
 reads the new manifest and confirms that every resolved module is present. A
 missing module reports both the managed name and required module and leaves the
 existing bundle hash and SRI unchanged.
@@ -652,10 +689,11 @@ The generated bundle carries Prebid's `tcfControl` module alongside the
 `consentManagement*` modules. That pairing is what makes the TCF signal
 enforceable: `consentManagement*` retrieves the consent data, while `tcfControl`
 registers activity controls that act on it. For managed User IDs, the shim
-activates the collector when `window.__tcfapi` is callable and the publisher has
-not already supplied a `consentManagement.gdpr` value. Under pinned Prebid's
-defaults, a later publisher `gdpr` value takes ownership after the shim removes
-its automatically registered IAB listener. Purpose 1 and LiveRamp's GVL vendor
+activates the collector once CMP discovery concludes and the publisher has not
+already supplied a TCF configuration in either the namespaced or the legacy
+shape. Under pinned Prebid's defaults, later publisher consent configuration
+takes ownership after the shim removes its automatically registered IAB
+listener. Purpose 1 and LiveRamp's GVL vendor
 consent (vendor 97) gate IdentityLink resolution and storage. Purpose 3 has no
 standalone default rule. Purpose 4 controls user-provided-data activity, but
 denying it alone does not block IdentityLink resolution or storage.
@@ -671,7 +709,13 @@ When entries are configured, Trusted Server owns one deterministic entry per
 configured `name` for publisher configuration applied through the public
 `pbjs.setConfig` and `pbjs.mergeConfig` APIs. Other publisher-configured User ID
 entries are preserved, but calls through those APIs that add, remove, or replace
-a managed name are normalized back to the operator-managed values. This is a
+a managed name are normalized back to the operator-managed values. Ownership
+follows Prebid's own matching rule rather than exact string equality: Prebid
+resolves a `userSync.userIds` entry to a submodule on either its name or its
+alias, case-insensitively, then takes the first matching entry. A managed name
+therefore claims every spelling that resolves to the same submodule — `sharedId`
+also claims `pubCommonId` and any casing of either — because a retained
+publisher entry would otherwise sit ahead of the managed one and win. This is a
 configuration-ownership convention, not a security boundary against same-origin
 code that retained a pre-wrapper function reference or directly mutates Prebid's
 internal configuration. Including a module in a bundle is inert until a managed
@@ -721,16 +765,18 @@ server-to-server ATS API.
 
 ### Degraded behavior
 
-| Condition                                          | Result                                                                  |
-| -------------------------------------------------- | ----------------------------------------------------------------------- |
-| TCF Purpose 1 or LiveRamp vendor consent is denied | Default `tcfControl` blocks IdentityLink resolution and storage         |
-| TCF Purpose 3 or 4 alone is denied                 | Resolution/storage continues under defaults; publisher rules may differ |
-| The user opts out under a US state signal          | No LiveRamp EID is forwarded; the auction continues                     |
-| LiveRamp cannot recognize the browser              | IdentityLink yields no EID; the auction continues                       |
-| LiveRamp network resolution fails                  | The current auction continues without RampID                            |
-| The managed module is missing from the bundle      | Existing diagnostics report the missing module; auctions continue       |
-| The origin is not approved by LiveRamp             | Resolution yields no usable EID; the auction continues                  |
-| EC/KV is unavailable                               | A current-request EID can still reach `/auction`; persistence degrades  |
+| Condition                                                | Result                                                                                             |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| TCF Purpose 1 or LiveRamp vendor consent is denied       | Default `tcfControl` blocks IdentityLink resolution and storage                                    |
+| TCF Purpose 3 or 4 alone is denied                       | Resolution/storage continues under defaults; publisher rules may differ                            |
+| The user opts out under a US state signal                | No LiveRamp EID is forwarded; the auction continues                                                |
+| LiveRamp cannot recognize the browser                    | IdentityLink yields no EID; the auction continues                                                  |
+| LiveRamp network resolution fails                        | The current auction continues without RampID                                                       |
+| The managed module is missing from the bundle            | Existing diagnostics report the missing module; auctions continue                                  |
+| The origin is not approved by LiveRamp                   | Resolution yields no usable EID; the auction continues                                             |
+| EC/KV is unavailable                                     | A current-request EID can still reach `/auction`; persistence degrades                             |
+| The resolved envelope exceeds the 512-byte EID value cap | The envelope is dropped from both the `/auction` payload and EC persistence; the auction continues |
+| The CMP is callable but never returns a settled result   | The managed entry is never seeded; no vendor call, no identity storage, and the auction continues  |
 
 The TCF rows assume either the managed-ID automatic setup described above or a
 publisher-owned Prebid GDPR configuration. A CMP API and its policy remain
@@ -746,15 +792,18 @@ domain, booleans, source names, counts, and status codes:
 1. Build a bundle containing `identityLinkIdSystem` and configure a managed
    `identityLink` entry with the test Placement ID.
 2. With positive consent, confirm `idl_env` is created or refreshed.
-3. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
+3. Record the byte length of the resolved envelope — the length only, never the
+   value — and confirm it is at or below the 512-byte EID value cap. Anything
+   above it is dropped as described in the degraded-behavior table.
+4. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
    recording its value.
-4. Confirm a controlled Prebid Server request contains that source in
+5. Confirm a controlled Prebid Server request contains that source in
    `user.ext.eids`.
-5. Confirm a later request ingests the source into the configured
+6. Confirm a later request ingests the source into the configured
    `liveramp.com` EC partner.
-6. Repeat with denied consent and confirm the envelope endpoint is not called,
+7. Repeat with denied consent and confirm the envelope endpoint is not called,
    `idl_env` is not written, and no LiveRamp EID is forwarded.
-7. Repeat on an unapproved origin and confirm identity resolution degrades
+8. Repeat on an unapproved origin and confirm identity resolution degrades
    without blocking the auction.
 
 This integration forwards RampID identity envelopes through the Prebid auction

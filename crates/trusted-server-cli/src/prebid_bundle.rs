@@ -193,6 +193,13 @@ fn reject_managed_user_id_module_collisions(
     Ok(())
 }
 
+/// Resolves each managed User ID name to the registry module it addresses.
+///
+/// Prebid matches a `userSync.userIds` entry to a submodule on either its name
+/// or one of its aliases, case-insensitively, so the lookup compares that way
+/// too. An exact-match lookup would report a case variant of a registered name
+/// as unregistered instead of resolving the module it really selects, and would
+/// miss a collision between two managed names that differ only by case.
 fn resolve_managed_user_id_modules(
     managed_names: &[String],
     registry: &PrebidUserIdModuleRegistry,
@@ -204,7 +211,12 @@ fn resolve_managed_user_id_modules(
             let mut candidates = registry
                 .modules
                 .iter()
-                .filter(|entry| entry.config_names.iter().any(|name| name == config_name))
+                .filter(|entry| {
+                    entry
+                        .config_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(config_name))
+                })
                 .map(|entry| entry.module_name.clone())
                 .collect::<Vec<_>>();
             candidates.sort();
@@ -1017,6 +1029,56 @@ adapters = ["rubicon"]
                 module_name: "sharedIdSystem".to_string(),
             }],
             "should resolve an alias to its registered module"
+        );
+    }
+
+    #[test]
+    fn managed_name_resolves_a_case_variant_to_its_registered_module() {
+        let registry = PrebidUserIdModuleRegistry {
+            modules: vec![PrebidUserIdModuleRegistryEntry {
+                module_name: "identityLinkIdSystem".to_string(),
+                config_names: vec!["identityLink".to_string()],
+            }],
+        };
+        let registry_path = Path::new("user_id_modules.json");
+
+        let required = resolve_managed_user_id_modules(
+            &["IdentityLink".to_string()],
+            &registry,
+            registry_path,
+        )
+        .expect("should resolve a case variant the way Prebid would");
+
+        assert_eq!(
+            required,
+            [RequiredPrebidUserIdModule {
+                config_name: "IdentityLink".to_string(),
+                module_name: "identityLinkIdSystem".to_string(),
+            }],
+            "should keep the operator's spelling and resolve its module"
+        );
+    }
+
+    #[test]
+    fn managed_names_differing_only_by_case_are_rejected_as_a_module_collision() {
+        let registry = PrebidUserIdModuleRegistry {
+            modules: vec![PrebidUserIdModuleRegistryEntry {
+                module_name: "identityLinkIdSystem".to_string(),
+                config_names: vec!["identityLink".to_string()],
+            }],
+        };
+        let registry_path = Path::new("registry/user_id_modules.json");
+
+        let error = resolve_managed_user_id_modules(
+            &["identityLink".to_string(), "IdentityLink".to_string()],
+            &registry,
+            registry_path,
+        )
+        .expect_err("should reject two spellings of one module");
+
+        assert!(
+            error.contains("identityLinkIdSystem"),
+            "should identify the shared module rather than report an unknown name: {error}"
         );
     }
 
