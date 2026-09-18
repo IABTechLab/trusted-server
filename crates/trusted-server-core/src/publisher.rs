@@ -61,9 +61,9 @@ use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
     evaluate_ad_stack_gate,
 };
-use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
+use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
@@ -4562,6 +4562,10 @@ pub async fn handle_publisher_request(
     let eid_cookie_may_need_persistence = cookie_jar
         .as_ref()
         .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
+    // This decision also gates the concurrent origin send below. A marker skip
+    // cannot currently delay the origin behind an auction because marker
+    // validation requires a non-empty registry, and every such auction sets
+    // `auction_needs_row` and retains the preload.
     let should_preload_ec = should_preload_ec_snapshot(&EcSnapshotPreloadInput {
         is_navigation,
         is_get,
@@ -6734,6 +6738,7 @@ pub async fn handle_page_bids(
         );
         return Ok(page_bids_preflight_denied());
     }
+    ec_context.set_eid_sync_source(EidSyncSource::PageBids);
 
     // Deprecation signal for the transition alias. Evaluated after the
     // cross-site gate, so the count reflects genuine SPA clients still running a
@@ -7390,12 +7395,12 @@ mod tests {
         ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
             self.inner.insert(key, write)
         }
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
@@ -7654,8 +7659,16 @@ mod tests {
         }
     }
 
-    async fn run_marker_lookup_probe(probe: MarkerProbe, has_eid_cookie: bool) -> usize {
-        let mut settings = create_test_settings();
+    async fn run_marker_lookup_probe(
+        probe: MarkerProbe,
+        has_eid_cookie: bool,
+        has_matched_auction_slot: bool,
+    ) -> usize {
+        let mut settings = if has_matched_auction_slot {
+            scheduling_settings()
+        } else {
+            create_test_settings()
+        };
         settings.ec.partners = vec![marker_partner("ssp.example.com")];
         let registry = PartnerRegistry::from_config(&settings.ec.partners)
             .expect("should build pull partner registry");
@@ -7711,6 +7724,10 @@ mod tests {
             crate::ec::pull_sync_marker::PullSyncMarkerState::from_cookie(Some(marker)),
         );
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let slots = has_matched_auction_slot
+            .then(scheduling_slot)
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut request = navigation_request();
         if has_eid_cookie {
             request
@@ -7725,7 +7742,7 @@ mod tests {
             &mut ec_context,
             AuctionDispatch {
                 orchestrator: &orchestrator,
-                slots: &[],
+                slots: &slots,
                 registry: Some(&registry),
             },
             request,
@@ -7739,7 +7756,10 @@ mod tests {
 
     #[tokio::test]
     async fn valid_completeness_marker_skips_pull_only_snapshot_lookup() {
-        assert_eq!(run_marker_lookup_probe(MarkerProbe::Valid, false).await, 0);
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, false, false).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -7751,7 +7771,7 @@ mod tests {
             MarkerProbe::PartnerSetMismatch,
         ] {
             assert_eq!(
-                run_marker_lookup_probe(probe, false).await,
+                run_marker_lookup_probe(probe, false, false).await,
                 1,
                 "invalid marker should retain the normal preload"
             );
@@ -7760,7 +7780,18 @@ mod tests {
 
     #[tokio::test]
     async fn valid_marker_does_not_skip_eid_cookie_persistence_lookup() {
-        assert_eq!(run_marker_lookup_probe(MarkerProbe::Valid, true).await, 1);
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, true, false).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_marker_does_not_skip_auction_snapshot_lookup() {
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, false, true).await,
+            1
+        );
     }
 
     #[tokio::test]

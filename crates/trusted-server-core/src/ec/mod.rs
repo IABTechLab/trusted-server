@@ -88,7 +88,9 @@ use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
 /// Bounded request classifications that may persist browser EID cookies.
 ///
-/// Adapters assign a source only after pre-route filters allow dispatch.
+/// Adapters classify publisher navigations and `POST /auction` only after
+/// pre-route filters allow dispatch. The shared page-bids handler classifies an
+/// admitted SPA navigation, while EC finalization classifies new identities.
 /// Challenged or blocked requests remain unclassified and cannot persist EIDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
@@ -98,7 +100,10 @@ pub enum EidSyncSource {
     /// `POST /auction` request.
     #[display("auction")]
     Auction,
-    /// Request that generated a new EC identity.
+    /// Admitted `GET /_ts/page-bids` SPA navigation.
+    #[display("page_bids")]
+    PageBids,
+    /// Request that generated a new EC identity during finalization.
     #[display("new_ec")]
     NewEc,
 }
@@ -115,6 +120,9 @@ pub enum EcKvSnapshot {
     /// The store authoritatively reported that this EC ID does not exist.
     Missing { ec_id: String },
     /// Persisted entry data, optionally with a generation usable for CAS.
+    ///
+    /// A generation never authorizes a write by itself. Callers must first
+    /// enforce entry policy such as rejecting a withdrawal tombstone.
     Present {
         ec_id: String,
         entry: Box<KvEntry>,
@@ -763,12 +771,12 @@ mod tests {
             }
             self.inner.insert(key, write)
         }
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)

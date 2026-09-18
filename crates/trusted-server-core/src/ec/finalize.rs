@@ -168,6 +168,7 @@ impl EidSyncMeasurement {
                 EidCookieSyncOutcome::WrittenWithDeferredFreshness
                     | EidCookieSyncOutcome::DeferredConflict
                     | EidCookieSyncOutcome::DeferredFreshness
+                    | EidCookieSyncOutcome::DeferredStaleRead
             )),
         }
     }
@@ -1027,6 +1028,58 @@ mod tests {
     }
 
     #[test]
+    fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
+        let settings = create_test_settings();
+        let orphaned_ec = sample_ec_id("orphn2");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(orphaned_ec.clone()),
+            consent,
+            Some("192.0.2.10".to_owned()),
+        );
+        ec_context.set_recovery_eligible(true);
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::Valid { expires_at: 4_600 },
+        );
+        let mut partner = make_partner("pull.example.com");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
+        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            ec_context.ec_value(),
+            Some(orphaned_ec.as_str()),
+            "an unread snapshot should defer orphan rotation until marker expiry"
+        );
+        assert!(
+            matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead),
+            "a marker-skipped request should leave the snapshot unread"
+        );
+        assert!(
+            response.headers().get(http::header::SET_COOKIE).is_none(),
+            "bounded orphan deferral should not rewrite browser identity state"
+        );
+    }
+
+    #[test]
     fn finalize_returning_user_subresource_does_not_persist_eid_updates() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("subeid");
@@ -1066,43 +1119,49 @@ mod tests {
     }
 
     #[test]
-    fn finalize_navigation_persists_returning_user_eid_updates() {
-        let settings = create_test_settings();
-        let ec_id = sample_ec_id("naveid");
-        let graph = KvIdentityGraph::in_memory("test_store");
-        let live = KvEntry::new(
-            &granting_consent(),
-            None,
-            current_timestamp(),
-            &settings.publisher.domain,
-        );
-        graph
-            .create(&ec_id, &live)
-            .expect("should seed the live row");
-        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
-        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
-        let partners = vec![make_partner("sharedid.org")];
-        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
-        let mut response = empty_response();
+    fn finalize_navigation_routes_persist_returning_user_eid_updates() {
+        for (source, suffix, cookie_id) in [
+            (EidSyncSource::Navigation, "naveid", "navigation-cookie-id"),
+            (EidSyncSource::PageBids, "spaeid", "page-bids-cookie-id"),
+        ] {
+            let settings = create_test_settings();
+            let ec_id = sample_ec_id(suffix);
+            let graph = KvIdentityGraph::in_memory("test_store");
+            let live = KvEntry::new(
+                &granting_consent(),
+                None,
+                current_timestamp(),
+                &settings.publisher.domain,
+            );
+            graph
+                .create(&ec_id, &live)
+                .expect("should seed the live row");
+            let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+            ec_context.set_eid_sync_source(source);
+            let partners = vec![make_partner("sharedid.org")];
+            let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+            let mut response = empty_response();
 
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&graph),
-            &registry,
-            None,
-            Some("navigation-cookie-id"),
-            &mut response,
-        );
+            ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &registry,
+                None,
+                Some(cookie_id),
+                &mut response,
+            );
 
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should remain");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("navigation-cookie-id")
-        );
+            let (stored, _) = graph
+                .get(&ec_id)
+                .expect("should read store")
+                .expect("row should remain");
+            assert_eq!(
+                stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+                Some(cookie_id),
+                "{source} should persist the returning-user EID cookie"
+            );
+        }
     }
 
     #[test]
@@ -1151,6 +1210,7 @@ mod tests {
         let sources = [
             EidSyncSource::Navigation,
             EidSyncSource::Auction,
+            EidSyncSource::PageBids,
             EidSyncSource::NewEc,
         ];
         let outcomes = [
@@ -1160,6 +1220,7 @@ mod tests {
             EidCookieSyncOutcome::ConflictMatched,
             EidCookieSyncOutcome::DeferredConflict,
             EidCookieSyncOutcome::DeferredFreshness,
+            EidCookieSyncOutcome::DeferredStaleRead,
             EidCookieSyncOutcome::Missing,
             EidCookieSyncOutcome::ConsentWithdrawn,
             EidCookieSyncOutcome::Failed,
@@ -1167,7 +1228,7 @@ mod tests {
 
         assert_eq!(
             sources.map(|source| source.to_string()),
-            ["navigation", "auction", "new_ec"]
+            ["navigation", "auction", "page_bids", "new_ec"]
         );
         assert_eq!(
             outcomes.map(|outcome| outcome.to_string()),
@@ -1178,6 +1239,7 @@ mod tests {
                 "conflict_matched",
                 "deferred_conflict",
                 "deferred_freshness",
+                "deferred_stale_read",
                 "missing",
                 "consent_withdrawn",
                 "failed",
@@ -1221,6 +1283,20 @@ mod tests {
                 written: 0,
                 conflict_duplicate: 1,
                 deferred: 0,
+            }
+        );
+        assert_eq!(
+            EidSyncMeasurement::new(
+                EidSyncSource::PageBids,
+                EidCookieSyncOutcome::DeferredStaleRead,
+            ),
+            EidSyncMeasurement {
+                source: EidSyncSource::PageBids,
+                outcome: EidCookieSyncOutcome::DeferredStaleRead,
+                already_matched: 0,
+                written: 0,
+                conflict_duplicate: 0,
+                deferred: 1,
             }
         );
     }

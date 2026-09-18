@@ -925,12 +925,12 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        let is_publisher_navigation = is_navigation_request(&req);
-        if is_publisher_navigation {
+        let is_navigation = is_navigation_request(&req);
+        if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         }
-        if ec.is_real_browser
-            && is_publisher_navigation
+        let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        if is_publisher_navigation
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -942,7 +942,7 @@ async fn dispatch_fallback(
         // opportunity slots and collect dispatched bids from the lazy
         // publisher body stream. `handle_publisher_request` matches the
         // slots against the request path. The partner registry plus the
-        // EC identity-graph KV (`ec.kv_graph`) enriches the bid request with
+        // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
         match PartnerRegistry::from_config(&state.settings.ec.partners) {
@@ -964,13 +964,11 @@ async fn dispatch_fallback(
                 .await
                 {
                     Ok(pub_response) => {
-                        // Origin start succeeded on the sole publisher-
-                        // page path: authorize orphan recovery now, and
-                        // only for real-browser document navigations.
-                        // Restricting it here keeps identity rotation
-                        // within the publisher-navigation boundary —
-                        // named routes, integration proxies, and filter
-                        // short circuits never reach this point.
+                        // Origin start succeeded on the sole publisher-page
+                        // path. Authorize orphan recovery only for real-browser
+                        // document navigations so named routes, integration
+                        // proxies, and filter short circuits cannot rotate an
+                        // identity.
                         ec.ec_context.set_recovery_eligible(is_publisher_navigation);
                         publisher_response_into_streaming_response(
                             pub_response,
@@ -2444,7 +2442,7 @@ mod tests {
     fn named_route_attaches_the_table_pattern_verbatim_even_with_a_real_id_in_the_path() {
         // A named-route response must carry the route-TABLE pattern
         // (`{id}` left as a placeholder), never the caller's actual matched
-        // path segment — this is what keeps a real EC identifier out of
+        // path segment. This is what keeps a real EC identifier out of
         // access telemetry, independent of anything the row-serialization
         // layer does.
         let router = test_router();
@@ -2565,7 +2563,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_limits_returning_user_eid_sync_to_navigation_and_auction() {
+    fn dispatch_limits_returning_user_eid_sync_to_eligible_routes() {
         let router = test_router();
 
         let navigation = route(
@@ -2591,6 +2589,28 @@ mod tests {
 
         let auction = route(&router, browser_request(Method::POST, "/auction", "empty"));
         assert_eq!(eid_sync_source_of(&auction), Some(EidSyncSource::Auction));
+
+        let mut page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        let page_bids = route(&router, page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&page_bids),
+            Some(EidSyncSource::PageBids),
+            "an admitted SPA page-bids request should persist returning-user EID cookies"
+        );
+
+        let mut denied_page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        denied_page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        let denied_page_bids = route(&router, denied_page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&denied_page_bids),
+            None,
+            "a denied cross-site page-bids request must not persist EID cookies"
+        );
 
         for request in [
             browser_request(Method::GET, "/static/tsjs=prebid", "script"),
