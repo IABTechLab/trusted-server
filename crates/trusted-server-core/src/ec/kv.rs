@@ -2031,6 +2031,14 @@ mod tests {
             self.inner.insert(key, write)
         }
 
+        fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
+        }
+
         fn count_keys_with_prefix(
             &self,
             prefix: &str,
