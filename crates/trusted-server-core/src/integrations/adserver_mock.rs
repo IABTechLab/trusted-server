@@ -292,8 +292,18 @@ impl AdServerMockProvider {
                 let restored_bidder =
                     original.map_or_else(|| seat_name.to_string(), |b| b.bidder.clone());
 
-                let width = bid["w"].as_u64().unwrap_or(0) as u32;
-                let height = bid["h"].as_u64().unwrap_or(0) as u32;
+                let Some(width) = bid["w"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                    log::debug!(
+                        "adserver_mock: bid for slot '{slot_id}' has invalid width, skipping"
+                    );
+                    continue;
+                };
+                let Some(height) = bid["h"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                    log::debug!(
+                        "adserver_mock: bid for slot '{slot_id}' has invalid height, skipping"
+                    );
+                    continue;
+                };
                 if width == 0 || height == 0 {
                     log::debug!(
                         "adserver_mock: bid for slot '{slot_id}' has zero dimension ({width}×{height}), skipping"
@@ -1321,6 +1331,114 @@ mod tests {
             bid2.price, None,
             "Bid without price field should have None price"
         );
+    }
+
+    #[test]
+    fn test_parse_mediation_response_skips_oversized_dimensions() {
+        // A dimension above u32::MAX must be rejected rather than silently
+        // wrapped into a small, plausible-looking value.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let oversized_width = u64::from(u32::MAX) + 1;
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-oversized-width",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "adm": "<div>Oversized width</div>",
+                            "w": oversized_width,
+                            "h": 90,
+                        },
+                        {
+                            "id": "bid-oversized-height",
+                            "impid": "sidebar",
+                            "price": 1.25,
+                            "adm": "<div>Oversized height</div>",
+                            "w": 300,
+                            "h": oversized_width,
+                        },
+                        {
+                            "id": "bid-valid",
+                            "impid": "footer",
+                            "price": 2.00,
+                            "adm": "<div>Valid Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+
+        assert_eq!(
+            auction_response.bids.len(),
+            1,
+            "Bids with oversized w/h should be skipped, only the valid bid should remain"
+        );
+        assert_eq!(auction_response.bids[0].slot_id, "footer");
+        assert_eq!(auction_response.bids[0].width, 728);
+        assert_eq!(auction_response.bids[0].height, 90);
+    }
+
+    #[test]
+    fn test_parse_mediation_response_skips_zero_dimensions() {
+        // Zero or missing dimensions must keep their existing skip behavior.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-zero-width",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "adm": "<div>Zero width</div>",
+                            "w": 0,
+                            "h": 90,
+                        },
+                        {
+                            "id": "bid-missing-dimensions",
+                            "impid": "sidebar",
+                            "price": 1.25,
+                            "adm": "<div>Missing dimensions</div>",
+                        },
+                        {
+                            "id": "bid-valid",
+                            "impid": "footer",
+                            "price": 2.00,
+                            "adm": "<div>Valid Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+
+        assert_eq!(
+            auction_response.bids.len(),
+            1,
+            "Bids with zero or missing w/h should be skipped, only the valid bid should remain"
+        );
+        assert_eq!(auction_response.bids[0].slot_id, "footer");
     }
 
     #[test]
