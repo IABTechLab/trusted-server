@@ -45,10 +45,11 @@ use crate::settings::{IntegrationConfig, Settings};
 const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
 const SOURCEPOINT_CDN_HOST: &str = "cdn.privacy-mgmt.com";
 const SOURCEPOINT_CDN_PREFIX: &str = "/integrations/sourcepoint/cdn";
+const SOURCEPOINT_SITE_DATA_PATH: &str = "/mms/v2/get_site_data";
 
-/// Maximum response body size (5 MB) that will be read into memory for
-/// JavaScript rewriting. Responses larger than this are passed through
-/// unmodified to avoid unbounded memory consumption.
+/// Maximum input body size (5 MiB) collected for JavaScript or HTML rewriting.
+/// Declared larger bodies pass through without collection. Bodies that exceed
+/// this limit during collection return an integration error (502).
 const MAX_REWRITE_BODY_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Sourcepoint cookie names that are safe to round-trip to the upstream CDN.
@@ -609,7 +610,10 @@ impl SourcepointIntegration {
     /// is a conservative preflight — false negatives just mean we skip the
     /// `Accept-Encoding: identity` optimisation for that request.
     fn is_likely_javascript_path(path: &str) -> bool {
-        path.ends_with(".js") || path.ends_with(".mjs") || path.starts_with("/unified/")
+        path.ends_with(".js")
+            || path.ends_with(".mjs")
+            || path.starts_with("/unified/")
+            || path == SOURCEPOINT_SITE_DATA_PATH
     }
 
     /// Returns `true` when the response `Content-Type` looks like JavaScript.
@@ -650,8 +654,21 @@ impl SourcepointIntegration {
         }
     }
 
-    fn rewrite_javascript_response(&self, response: &mut Response<EdgeBody>, rewritten: String) {
+    fn rewrite_javascript_response(
+        &self,
+        response: &mut Response<EdgeBody>,
+        rewritten: String,
+        target_path: &str,
+        forwarded_cookies: bool,
+    ) {
         self.finalize_rewritten_body(response, rewritten, "application/javascript; charset=utf-8");
+
+        // Site data is a dynamic API response despite its JavaScript content
+        // type. Preserve its upstream cache policy and cookie-aware defaults.
+        if target_path == SOURCEPOINT_SITE_DATA_PATH {
+            self.apply_cache_headers(response, forwarded_cookies);
+            return;
+        }
 
         // Rewritten JavaScript bundles are static, versioned files (hashed chunk
         // names, `/unified/4.40.1/…` paths), so we apply a fixed public cache
@@ -870,9 +887,15 @@ impl IntegrationProxy for SourcepointIntegration {
             None,
         )?;
 
+        // Keep the body streaming where supported so the rewrite collector
+        // enforces its limit before the adapter buffers the entire response.
+        let mut platform_request = PlatformHttpRequest::new(proxy_req, backend_name);
+        if services.http_client().supports_streaming_responses() {
+            platform_request = platform_request.with_stream_response();
+        }
         let mut response = services
             .http_client()
-            .send(PlatformHttpRequest::new(proxy_req, backend_name))
+            .send(platform_request)
             .await
             .change_context(Self::error("Sourcepoint upstream request failed"))?
             .response;
@@ -930,27 +953,21 @@ impl IntegrationProxy for SourcepointIntegration {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
 
-            match content_length {
-                Some(len) if len > MAX_REWRITE_BODY_SIZE => {
-                    log::warn!(
-                        "Sourcepoint: response body for {path} exceeds {} bytes \
-                         (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)",
-                        MAX_REWRITE_BODY_SIZE
-                    );
-                    self.apply_cache_headers(&mut response, forwarded_cookies);
-                    return Ok(response);
-                }
-                None => {
-                    log::warn!(
-                        "Sourcepoint: no Content-Length for {path}, \
-                         skipping rewrite to avoid unbounded memory read (reason: missing_content_length)"
-                    );
-                    self.apply_cache_headers(&mut response, forwarded_cookies);
-                    return Ok(response);
-                }
-                Some(_) => {}
+            if let Some(len) = content_length
+                && len > MAX_REWRITE_BODY_SIZE
+            {
+                log::warn!(
+                    "Sourcepoint: response body for {path} exceeds {} bytes \
+                     (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)",
+                    MAX_REWRITE_BODY_SIZE
+                );
+                self.apply_cache_headers(&mut response, forwarded_cookies);
+                return Ok(response);
             }
 
+            // Content-Length is optional and advisory. Stop at the actual
+            // byte limit even when the header is absent or understates the
+            // size. Overflow discards the partial body and returns a 502.
             let (resp_parts, resp_body) = response.into_parts();
             let body_bytes = collect_response_bounded(
                 resp_body,
@@ -975,7 +992,12 @@ impl IntegrationProxy for SourcepointIntegration {
             };
             if response_is_javascript {
                 let rewritten = Self::rewrite_script_content(&body);
-                self.rewrite_javascript_response(&mut response, rewritten);
+                self.rewrite_javascript_response(
+                    &mut response,
+                    rewritten,
+                    target_path,
+                    forwarded_cookies,
+                );
             } else {
                 let rewritten = Self::rewrite_html_content(&body);
                 self.rewrite_html_response(&mut response, rewritten, forwarded_cookies);
@@ -1085,9 +1107,534 @@ impl IntegrationHeadInjector for SourcepointIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::IntoHttpResponse as _;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::platform::{
+        PlatformError, PlatformHttpClient, PlatformPendingRequest, PlatformResponse,
+        PlatformSelectResult,
+    };
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TEST_CHUNK_SIZE: usize = 8192;
+
+    struct StreamingHttpClient {
+        stub: StubHttpClient,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl StreamingHttpClient {
+        fn new() -> Self {
+            Self {
+                stub: StubHttpClient::new(),
+                reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl PlatformHttpClient for StreamingHttpClient {
+        fn supports_streaming_responses(&self) -> bool {
+            true
+        }
+
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            let mut response = self.stub.send(request).await?;
+            let body = std::mem::replace(response.response.body_mut(), EdgeBody::empty());
+            let EdgeBody::Once(bytes) = body else {
+                panic!("should receive a buffered stub body");
+            };
+            let reads = Arc::clone(&self.reads);
+            let chunks = futures::stream::unfold((bytes, 0), move |(bytes, offset)| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                let end = (offset + TEST_CHUNK_SIZE).min(bytes.len());
+                futures::future::ready(
+                    (offset < bytes.len()).then(|| (bytes.slice(offset..end), (bytes, end))),
+                )
+            });
+            *response.response.body_mut() = EdgeBody::stream(chunks);
+            Ok(response)
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            self.stub.send_async(request).await
+        }
+
+        async fn select(
+            &self,
+            pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            self.stub.select(pending_requests).await
+        }
+    }
+
+    #[test]
+    fn handle_rewrites_streamed_javascript_without_content_length() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            let client = Arc::new(StreamingHttpClient::new());
+            let input = format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
+            client.stub.push_response_with_headers(
+                200,
+                input.into_bytes(),
+                vec![("content-type", "application/javascript")],
+            );
+            let services = build_services_with_http_client(client.clone());
+
+            let response = integration
+                .handle(
+                    &settings,
+                    &services,
+                    make_req(
+                        Method::GET,
+                        "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
+                    ),
+                )
+                .await
+                .expect("should proxy JavaScript without Content-Length");
+
+            assert_eq!(
+                response
+                    .into_body()
+                    .into_bytes_bounded(1024)
+                    .await
+                    .expect("should collect JavaScript response")
+                    .as_ref(),
+                br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
+                "should rewrite a streamed CDN URL without Content-Length"
+            );
+            assert_eq!(
+                client.stub.recorded_stream_response_flags(),
+                vec![true],
+                "should request streaming before collecting the upstream body"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_rewrites_streamed_html_without_content_length() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            let client = Arc::new(StreamingHttpClient::new());
+            client.stub.push_response_with_headers(
+                200,
+                br#"<script src="/PrivacyManagerUS.js"></script><link href="/PrivacyManagerUS.css">"#.to_vec(),
+                vec![("content-type", "text/html"), ("cache-control", "no-store")],
+            );
+            let services = build_services_with_http_client(client.clone());
+
+            let response = integration
+                .handle(
+                    &settings,
+                    &services,
+                    make_req(Method::GET, "https://publisher.example.com/integrations/sourcepoint/cdn/us_pm/index.html"),
+                )
+                .await
+                .expect("should proxy HTML without Content-Length");
+
+            assert_eq!(
+                get_header_str(&response, header::CACHE_CONTROL),
+                Some("no-store"),
+                "should preserve upstream HTML cache policy"
+            );
+            assert_eq!(
+                response.into_body().into_bytes_bounded(1024).await.expect("should collect HTML response").as_ref(),
+                br#"<script src="/integrations/sourcepoint/cdn/PrivacyManagerUS.js"></script><link href="/integrations/sourcepoint/cdn/PrivacyManagerUS.css">"#,
+                "should rewrite streamed privacy-manager assets without Content-Length"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_accepts_exact_rewrite_limit_and_stops_reading_on_overflow() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            let limit = MAX_REWRITE_BODY_SIZE as usize;
+            for content_type in ["application/javascript", "text/html"] {
+                for declared_length in [None, Some("1")] {
+                    for extra_bytes in [0, 1, TEST_CHUNK_SIZE * 2] {
+                        let client = Arc::new(StreamingHttpClient::new());
+                        let mut headers = vec![("content-type", content_type)];
+                        if let Some(length) = declared_length {
+                            headers.push(("content-length", length));
+                        }
+                        client.stub.push_response_with_headers(
+                            200,
+                            vec![b' '; limit + extra_bytes],
+                            headers,
+                        );
+                        let services = build_services_with_http_client(client.clone());
+
+                        let result = integration.handle(
+                            &settings,
+                            &services,
+                            make_req(Method::GET, "https://publisher.example.com/integrations/sourcepoint/cdn/asset"),
+                        ).await;
+
+                        if extra_bytes == 0 {
+                            let response = result.expect("should accept exactly 5 MiB");
+                            assert!(
+                                response.headers().get(header::CONTENT_LENGTH).is_none(),
+                                "should remove the advisory length after rewriting"
+                            );
+                            assert_eq!(
+                                take_body_bytes(response).len(),
+                                limit,
+                                "should retain the entire body at the limit"
+                            );
+                        } else {
+                            let error =
+                                result.expect_err("should reject an oversized streamed body");
+                            assert_eq!(
+                                error.current_context().status_code(),
+                                StatusCode::BAD_GATEWAY,
+                                "should report upstream overflow as 502"
+                            );
+                            assert!(
+                                matches!(error.current_context(), TrustedServerError::Integration { integration, message } if integration == SOURCEPOINT_INTEGRATION_ID && message.contains("exceeds")),
+                                "should identify Sourcepoint response overflow"
+                            );
+                        }
+                        assert_eq!(
+                            client.reads.load(Ordering::Relaxed),
+                            limit / TEST_CHUNK_SIZE + 1,
+                            "should stop at EOF or the first overflowing chunk without draining the stream"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn handle_passes_through_declared_oversize_without_reading() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            for content_type in ["application/javascript", "text/html"] {
+                let client = Arc::new(StreamingHttpClient::new());
+                let length = (MAX_REWRITE_BODY_SIZE + 1).to_string();
+                client.stub.push_response_with_headers(
+                    200,
+                    vec![b' '; MAX_REWRITE_BODY_SIZE as usize + 1],
+                    vec![
+                        ("content-type", content_type),
+                        ("content-length", &length),
+                        ("cache-control", "no-store"),
+                    ],
+                );
+                let services = build_services_with_http_client(client.clone());
+
+                let response = integration
+                    .handle(
+                        &settings,
+                        &services,
+                        make_req(
+                            Method::GET,
+                            "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
+                        ),
+                    )
+                    .await
+                    .expect("should pass through a declared oversized response");
+
+                assert!(
+                    matches!(response.body(), EdgeBody::Stream(_)),
+                    "should retain the original stream"
+                );
+                assert_eq!(
+                    client.reads.load(Ordering::Relaxed),
+                    0,
+                    "should not poll a declared oversized body"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::CONTENT_LENGTH),
+                    Some(length.as_str()),
+                    "should preserve the pass-through length"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::CACHE_CONTROL),
+                    Some("no-store"),
+                    "should preserve upstream cache policy"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn handle_keeps_ineligible_responses_streaming() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            for (content_type, method, status, rewrite_sdk) in [
+                ("application/json", Method::GET, 200, true),
+                ("text/css", Method::GET, 200, true),
+                ("image/png", Method::GET, 200, true),
+                ("application/javascript", Method::GET, 200, false),
+                ("text/html", Method::GET, 200, false),
+                ("application/javascript", Method::HEAD, 200, true),
+                ("text/html", Method::POST, 200, true),
+                ("application/javascript", Method::GET, 206, true),
+                ("text/html", Method::GET, 404, true),
+            ] {
+                let mut cfg = config(true);
+                cfg.rewrite_sdk = rewrite_sdk;
+                let integration = SourcepointIntegration::new(Arc::new(cfg));
+                let client = Arc::new(StreamingHttpClient::new());
+                client.stub.push_response_with_headers(
+                    status,
+                    b"unchanged".to_vec(),
+                    vec![
+                        ("content-type", content_type),
+                        ("content-encoding", "gzip"),
+                        ("cache-control", "no-store"),
+                    ],
+                );
+                let services = build_services_with_http_client(client.clone());
+                let mut request = make_req(
+                    method,
+                    "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
+                );
+                set_req_header(&mut request, header::ACCEPT_ENCODING, "gzip, br");
+
+                let response = integration
+                    .handle(&settings, &services, request)
+                    .await
+                    .expect("should pass through an ineligible response");
+
+                assert!(
+                    matches!(response.body(), EdgeBody::Stream(_)),
+                    "should leave ineligible bodies streaming"
+                );
+                assert_eq!(
+                    client.reads.load(Ordering::Relaxed),
+                    0,
+                    "should not poll an ineligible body"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::CONTENT_ENCODING),
+                    Some("gzip"),
+                    "should preserve pass-through encoding"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::CACHE_CONTROL),
+                    Some("no-store"),
+                    "should preserve pass-through cache policy"
+                );
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes_bounded(1024)
+                        .await
+                        .expect("should collect pass-through body")
+                        .as_ref(),
+                    b"unchanged",
+                    "should preserve pass-through bytes"
+                );
+                assert!(
+                    client.stub.recorded_request_headers()[0]
+                        .iter()
+                        .any(|(name, value)| name == "accept-encoding" && value == "gzip, br"),
+                    "should forward the client's encoding for non-script paths"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn handle_rewrites_on_buffered_adapters_with_or_without_content_length() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            for has_length in [false, true] {
+                let client = Arc::new(StubHttpClient::new());
+                let input = format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
+                let length = input.len().to_string();
+                let mut headers = vec![
+                    ("content-type", "application/javascript"),
+                    ("content-encoding", "identity"),
+                    ("vary", "Accept-Encoding, Origin"),
+                ];
+                if has_length {
+                    headers.push(("content-length", &length));
+                }
+                client.push_response_with_headers(200, input.into_bytes(), headers);
+                let services = build_services_with_http_client(client.clone());
+
+                let response = integration
+                    .handle(
+                        &settings,
+                        &services,
+                        make_req(
+                            Method::GET,
+                            "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
+                        ),
+                    )
+                    .await
+                    .expect("should rewrite a buffered response");
+
+                assert_eq!(
+                    client.recorded_stream_response_flags(),
+                    vec![false],
+                    "should respect adapters without streaming support"
+                );
+                assert!(
+                    response.headers().get(header::CONTENT_LENGTH).is_none(),
+                    "should not forward a stale upstream length"
+                );
+                assert!(
+                    response.headers().get(header::CONTENT_ENCODING).is_none(),
+                    "should remove upstream encoding after rewriting"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::VARY),
+                    Some("Origin"),
+                    "should remove only Accept-Encoding from Vary"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::CACHE_CONTROL),
+                    Some("public, max-age=3600"),
+                    "should retain the static JavaScript cache policy"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::CONTENT_TYPE),
+                    Some("application/javascript; charset=utf-8"),
+                    "should identify rewritten JavaScript"
+                );
+                assert_eq!(
+                    take_body_bytes(response),
+                    br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
+                    "should rewrite with either header state"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn handle_site_data_requests_identity_and_preserves_dynamic_cache_policy() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            for (upstream_cache, forwarded_cookies, sets_cookie, expected_cache) in [
+                (Some("no-store"), false, false, "no-store"),
+                (
+                    Some("private, max-age=60"),
+                    true,
+                    false,
+                    "private, max-age=60",
+                ),
+                (None, true, false, "private, max-age=0"),
+                (None, false, false, "public, max-age=3600"),
+                (
+                    Some("public, max-age=3600"),
+                    false,
+                    true,
+                    "private, no-store",
+                ),
+            ] {
+                let client = Arc::new(StreamingHttpClient::new());
+                let input = format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
+                let mut headers = vec![("content-type", "application/javascript")];
+                if let Some(cache) = upstream_cache {
+                    headers.push(("cache-control", cache));
+                }
+                if sets_cookie {
+                    headers.push(("set-cookie", "consentUUID=example; Path=/"));
+                }
+                client
+                    .stub
+                    .push_response_with_headers(200, input.into_bytes(), headers);
+                let services = build_services_with_http_client(client.clone());
+                let mut request = make_req(
+                    Method::GET,
+                    "https://publisher.example.com/integrations/sourcepoint/cdn/mms/v2/get_site_data?account_id=123",
+                );
+                set_req_header(&mut request, header::ACCEPT_ENCODING, "gzip, br");
+                if forwarded_cookies {
+                    set_req_header(&mut request, header::COOKIE, "consentUUID=example");
+                }
+
+                let response = integration
+                    .handle(&settings, &services, request)
+                    .await
+                    .expect("should rewrite dynamic site data");
+
+                assert!(
+                    client.stub.recorded_request_headers()[0]
+                        .iter()
+                        .any(|(name, value)| name == "accept-encoding" && value == "identity"),
+                    "should request uncompressed site data despite its extensionless path"
+                );
+                assert_eq!(
+                    get_header_str(&response, header::CACHE_CONTROL),
+                    Some(expected_cache),
+                    "should use the dynamic endpoint's cache policy"
+                );
+                assert_eq!(
+                    take_body_bytes(response),
+                    br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
+                    "should rewrite unknown-length site data"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn handle_preserves_invalid_utf8_bytes_and_headers() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            let client = Arc::new(StreamingHttpClient::new());
+            let bytes = vec![0x1f, 0x8b, 0xff];
+            client.stub.push_response_with_headers(
+                200,
+                bytes.clone(),
+                vec![
+                    ("content-type", "application/javascript"),
+                    ("content-encoding", "gzip"),
+                    ("cache-control", "no-store"),
+                ],
+            );
+            let services = build_services_with_http_client(client);
+
+            let response = integration
+                .handle(
+                    &settings,
+                    &services,
+                    make_req(
+                        Method::GET,
+                        "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
+                    ),
+                )
+                .await
+                .expect("should retain non-UTF-8 content unchanged");
+
+            assert_eq!(
+                get_header_str(&response, header::CONTENT_ENCODING),
+                Some("gzip"),
+                "should preserve encoding when no rewrite occurs"
+            );
+            assert_eq!(
+                get_header_str(&response, header::CACHE_CONTROL),
+                Some("no-store"),
+                "should preserve cache policy when no rewrite occurs"
+            );
+            assert_eq!(
+                take_body_bytes(response),
+                bytes,
+                "should preserve invalid UTF-8 bytes"
+            );
+        });
+    }
 
     fn config(enabled: bool) -> SourcepointConfig {
         SourcepointConfig {
@@ -1437,8 +1984,11 @@ mod tests {
         assert!(SourcepointIntegration::is_likely_javascript_path(
             "/module/sourcepoint.mjs"
         ));
-        assert!(!SourcepointIntegration::is_likely_javascript_path(
+        assert!(SourcepointIntegration::is_likely_javascript_path(
             "/mms/v2/get_site_data"
+        ));
+        assert!(!SourcepointIntegration::is_likely_javascript_path(
+            "/mms/v2/get_site_data/other"
         ));
         assert!(!SourcepointIntegration::is_likely_javascript_path(
             "/consent/tcfv2"
@@ -1943,7 +2493,12 @@ mod tests {
         set_header(&mut response, header::CACHE_CONTROL, "no-store");
         *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+        integration.rewrite_javascript_response(
+            &mut response,
+            "rewritten".to_string(),
+            "/wrapper.js",
+            false,
+        );
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -1982,7 +2537,12 @@ mod tests {
         set_header(&mut response, header::CACHE_CONTROL, "public, max-age=3600");
         *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+        integration.rewrite_javascript_response(
+            &mut response,
+            "rewritten".to_string(),
+            "/wrapper.js",
+            false,
+        );
 
         assert_eq!(
             get_header_str(&response, header::CACHE_CONTROL),
@@ -2002,7 +2562,12 @@ mod tests {
         set_header(&mut response, header::VARY, "Accept-Encoding");
         *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+        integration.rewrite_javascript_response(
+            &mut response,
+            "rewritten".to_string(),
+            "/wrapper.js",
+            false,
+        );
 
         assert!(
             response.headers().get(header::VARY).is_none(),
