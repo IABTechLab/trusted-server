@@ -58,9 +58,9 @@ use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
-use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
+use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
@@ -6484,6 +6484,7 @@ pub async fn handle_page_bids(
         );
         return Ok(page_bids_preflight_denied());
     }
+    ec_context.set_eid_sync_source(EidSyncSource::PageBids);
 
     // Deprecation signal for the transition alias. Evaluated after the
     // cross-site gate, so the count reflects genuine SPA clients still running a
