@@ -309,8 +309,6 @@ impl EcContext {
             req,
             config: &settings.consent,
             geo: geo_info,
-            ec_id: None,
-            kv_store: None,
         });
 
         log::info!(
