@@ -1427,15 +1427,19 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "toml",
+ "walkdir",
 ]
 
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1463,7 +1467,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1486,7 +1490,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1515,7 +1519,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1542,7 +1546,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
  "chrono",
  "clap",
@@ -1567,7 +1571,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1598,7 +1602,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#c40ae8d0164e9adabe521bceeebd95ec492095dd"
+source = "git+https://github.com/stackpop/edgezero?branch=fix%2Ffastly-environment-store-selectors#4531aeecfb5cc7ba57997a6b907f402c90f88eed"
 dependencies = [
  "log",
  "proc-macro2",
