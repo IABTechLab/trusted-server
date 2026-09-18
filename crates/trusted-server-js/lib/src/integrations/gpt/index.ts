@@ -1759,6 +1759,9 @@ export function installSpaAuctionHook(): void {
     if (g) clearPreviousNavigationTargeting(ts, g);
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
     delete ts.firstImpression;
+    // Server timings belong to the route that produced them. Clear them before
+    // page-bids starts so failure or supersession cannot relabel stale offsets.
+    ts.auctionDiagnostics = undefined;
     // A route change invalidates hydration aliases before the new route's
     // publisher can define a same-prefix slot while page-bids is in flight.
     for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {

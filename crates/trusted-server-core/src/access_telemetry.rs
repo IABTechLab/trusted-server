@@ -220,11 +220,13 @@ pub struct AccessTelemetrySnapshot {
 ///
 /// Column names match spec section 9 exactly. Phase columns come from
 /// `timings` and serialize as JSON `null` for phases that were never
-/// recorded; every dimension column comes from `snapshot` and is a
-/// non-nullable string (callers are expected to substitute an `unknown`
-/// sentinel rather than leave a dimension empty). There is no `event_date`
-/// column: the datasource's sorting key derives the date via
-/// `toDate(event_ts)`.
+/// recorded, as do the auction timeline columns (including `auction_id`,
+/// whose datasource column is `Nullable(UUID)` so it joins natively against
+/// `auction_events_raw.auction_id`). Every dimension column comes from
+/// `snapshot` and is a non-nullable string (callers are expected to
+/// substitute an `unknown` sentinel rather than leave a dimension empty).
+/// There is no `event_date` column: the datasource's sorting key derives the
+/// date via `toDate(event_ts)`.
 #[must_use]
 pub fn access_event_row(
     snapshot: &AccessTelemetrySnapshot,
@@ -263,7 +265,7 @@ pub fn access_event_row(
         "auction_dispatched_ms": timings.auction_dispatched_ms,
         "auction_resolved_ms": timings.auction_resolved_ms,
         "auction_committed_ms": timings.auction_committed_ms,
-        "auction_id": timings.auction_id.as_deref().unwrap_or("none"),
+        "auction_id": timings.auction_id.map(|id| id.to_string()),
         "template_cache_state": snapshot.template_cache_state,
         "country": snapshot.country,
         "ts_version": snapshot.ts_version,
@@ -434,6 +436,7 @@ mod tests {
             "auction_dispatched_ms",
             "auction_resolved_ms",
             "auction_committed_ms",
+            "auction_id",
         ] {
             assert!(
                 parsed[field].is_null(),
@@ -459,9 +462,9 @@ mod tests {
             );
         }
         assert_eq!(parsed["auction_wait_placement"], "none");
-        assert_eq!(
-            parsed["auction_id"], "none",
-            "auction_id should carry the none sentinel when no auction ran"
+        assert!(
+            row.contains("\"auction_id\":null"),
+            "auction_id should serialize as an explicit null key, not be omitted: {row}"
         );
     }
 
@@ -484,7 +487,7 @@ mod tests {
             auction_dispatched_ms: Some(9),
             auction_resolved_ms: Some(10),
             auction_committed_ms: Some(11),
-            auction_id: Some("33333333-3333-3333-3333-333333333333".to_owned()),
+            auction_id: Some(uuid::uuid!("33333333-3333-3333-3333-333333333333")),
         };
         let row = access_event_row(&snapshot, &timings, 1_700_000_000_000);
         let parsed: serde_json::Value =

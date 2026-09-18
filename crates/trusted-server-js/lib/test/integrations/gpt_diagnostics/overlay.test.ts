@@ -129,7 +129,7 @@ describe('GptDiagnosticsOverlay', () => {
       undefined,
       {
         auctionType: 'ssat',
-        winner: { bidder: 'example-bidder', priceBucket: '1.20' },
+        winner: { bidder: 'example-bidder', priceBucket: '1.20', currency: 'usd' },
         serverTimings: {
           auctionDispatchedMs: 4,
           auctionResolvedMs: 84,
@@ -217,6 +217,10 @@ describe('GptDiagnosticsOverlay', () => {
     const prebidSlot = slot('prebid-slot');
     now = 50;
     store.recordPrebidRefresh([prebidSlot]);
+    store.recordPrebidAuction(prebidSlot, 'example-client-auction', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
     store.recordSlotRequested(prebidSlot);
     now = 51;
     store.recordSlotResponseReceived(prebidSlot);
@@ -274,10 +278,11 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Trusted Server auction: auction-123');
     expect(responseSentArticle).toContain('Auction evidence: SSAT: initial-page server auction');
     expect(responseSentArticle).toContain('Server auction winner: example-bidder');
-    expect(responseSentArticle).toContain('Server bid price bucket: 1.20');
-    expect(responseSentArticle).toContain('Server request start → auction dispatched 4 ms');
-    expect(responseSentArticle).toContain('Server request start → auction collected 84 ms');
-    expect(responseSentArticle).toContain('Server request start → bids ready 85 ms');
+    expect(responseSentArticle).toContain('Server bid price bucket: 1.20 USD');
+    expect(responseSentArticle).not.toContain('(currency not supplied)');
+    expect(responseSentArticle).toContain('Edge request T0 → auction dispatched 4 ms');
+    expect(responseSentArticle).toContain('Edge request T0 → auction collected 84 ms');
+    expect(responseSentArticle).toContain('Edge request T0 → bids ready 85 ms');
     expect(responseSentArticle).toContain('Auction collection wait (in stream) 80 ms');
     expect(responseSentArticle).toContain('Opportunity → request 0 ms');
     expect(responseSentArticle).toContain('Server bid available; creative source present');
@@ -303,8 +308,8 @@ describe('GptDiagnosticsOverlay', () => {
     const selectedArticle = slotArticle(root!, 'selected-slot').textContent ?? '';
     expect(selectedArticle).toContain('Request path: Multiple paths observed');
     expect(selectedArticle).toContain('Auction evidence: TS auction: SPA server auction');
-    expect(selectedArticle).toContain('Server request start → auction dispatched 0 ms');
-    expect(selectedArticle).toContain('Server request start → auction collected 40 ms');
+    expect(selectedArticle).toContain('SPA page-bids T0 → auction dispatched 0 ms');
+    expect(selectedArticle).toContain('SPA page-bids T0 → auction collected 40 ms');
     expect(selectedArticle).toContain('Server bid available; creative source incomplete');
     expect(selectedArticle).toContain('Trusted Server creative request observed at 23 ms');
     expect(selectedArticle).not.toContain('Trusted Server markup response sent');
@@ -326,6 +331,8 @@ describe('GptDiagnosticsOverlay', () => {
 
     const prebidArticle = slotArticle(root!, 'prebid-slot').textContent ?? '';
     expect(prebidArticle).toContain('Request path: Prebid refresh');
+    expect(prebidArticle).toContain('Prebid candidate price bucket: 2.40');
+    expect(prebidArticle).not.toContain('(currency not supplied)');
     expect(prebidArticle).toContain('Direct opportunity: Not observed');
     expect(prebidArticle).toContain('Delivery status unknown — required evidence was not observed');
 
@@ -509,7 +516,10 @@ describe('GptDiagnosticsOverlay', () => {
     expect(root!.textContent).toContain('GAM request → response 10 ms');
     expect(root!.textContent).toContain('GPT visibility 60%');
     expect(root!.textContent).toContain('Requesting');
-    expect(root!.textContent).toContain('Ambiguous binding');
+    expect(root!.textContent).toContain('Ambiguous binding · duplicate_dom_id');
+    expect(slotArticle(root!, 'filled-slot').textContent?.match(/Bound · Visible/g)).toHaveLength(
+      1
+    );
     expect(root!.textContent).toContain('Incomplete sequence');
     expect(slotArticle(root!, 'pending-slot').textContent).toContain(
       'Delivery evidence: Not applicable'
@@ -607,9 +617,14 @@ describe('GptDiagnosticsOverlay', () => {
     const focus = vi.spyOn(HTMLElement.prototype, 'focus');
     selected?.focus();
     const focusCallsBeforeUpdate = focus.mock.calls.length;
+    const history = root?.querySelector<HTMLDetailsElement>('.tsgd-history');
+    expect(history?.open).toBe(true);
+    if (history) history.open = false;
+
     store.recordSlotResponseReceived(observedSlot);
     runNextFrame(frames);
     expect(focus.mock.calls.length).toBeGreaterThan(focusCallsBeforeUpdate);
+    expect(root?.querySelector<HTMLDetailsElement>('.tsgd-history')?.open).toBe(false);
 
     button(root!, 'Locate on page').click();
     expect(scrollIntoView).toHaveBeenCalledWith({
@@ -669,14 +684,20 @@ describe('GptDiagnosticsOverlay', () => {
     runNextFrame(frames);
 
     const content = root!.querySelector<HTMLElement>('.tsgd-content')!;
-    const history = root!.querySelector<HTMLDetailsElement>('.tsgd-slot details')!;
+    const history = root!.querySelector<HTMLDetailsElement>('.tsgd-history')!;
+    const help = root!.querySelector<HTMLDetailsElement>('.tsgd-help')!;
+    const technical = root!.querySelector<HTMLDetailsElement>('.tsgd-technical')!;
     history.open = true;
+    help.open = true;
+    technical.open = true;
     content.scrollTop = 42;
     store.recordSlotResponseReceived(diagnosticSlot);
     runNextFrame(frames);
 
     expect(root!.textContent).toContain('Rendered (fill unknown)');
-    expect(root!.querySelector<HTMLDetailsElement>('.tsgd-slot details')?.open).toBe(true);
+    expect(root!.querySelector<HTMLDetailsElement>('.tsgd-history')?.open).toBe(true);
+    expect(root!.querySelector<HTMLDetailsElement>('.tsgd-help')?.open).toBe(true);
+    expect(root!.querySelector<HTMLDetailsElement>('.tsgd-technical')?.open).toBe(true);
     expect(root!.querySelector<HTMLElement>('.tsgd-content')?.scrollTop).toBe(42);
     overlay.destroy();
   });

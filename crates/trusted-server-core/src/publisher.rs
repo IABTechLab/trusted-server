@@ -3170,6 +3170,13 @@ struct BrowserAuctionDiagnostics {
     auction_wait_placement: Option<&'static str>,
 }
 
+const fn auction_wait_placement_wire(placement: AuctionWaitPlacement) -> &'static str {
+    match placement {
+        AuctionWaitPlacement::PreHeader => "pre_header",
+        AuctionWaitPlacement::InStream => "in_stream",
+    }
+}
+
 impl BrowserAuctionDiagnostics {
     fn from_request_timings(timings: &RequestTimings) -> Option<Self> {
         let snapshot = timings.snapshot();
@@ -3179,12 +3186,9 @@ impl BrowserAuctionDiagnostics {
             auction_resolved_ms: snapshot.auction_resolved_ms,
             auction_committed_ms: snapshot.auction_committed_ms,
             auction_wait_ms: snapshot.auction_wait_ms,
-            auction_wait_placement: snapshot.auction_wait_placement.map(
-                |placement| match placement {
-                    AuctionWaitPlacement::PreHeader => "pre_header",
-                    AuctionWaitPlacement::InStream => "in_stream",
-                },
-            ),
+            auction_wait_placement: snapshot
+                .auction_wait_placement
+                .map(auction_wait_placement_wire),
         })
     }
 }
@@ -3243,6 +3247,10 @@ impl AdBidsState {
         *self.bids.lock().expect("should lock bid map") = bid_map;
     }
 
+    /// Attach server auction facts to the rendered bid script.
+    ///
+    /// This rebuilds the script cell, so callers must run it before
+    /// [`Self::prepend_to_script`] to preserve an existing debug prefix.
     fn set_auction_diagnostics(&self, timings: &RequestTimings) {
         if !self.diagnostics_active {
             return;
@@ -4646,6 +4654,12 @@ pub async fn handle_publisher_request(
             user_agent,
             ec_context,
         );
+        // T0-anchored timeline (spec section 18): stamp the join key here
+        // rather than on dispatch, because every branch below emits an
+        // `auction_events_raw` row under this id — completed, dispatch
+        // failed, and skipped alike. Stamping it on dispatch would leave the
+        // failed and skipped rows unjoinable.
+        timings.set_auction_id(observation.auction_id);
 
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
@@ -4687,10 +4701,11 @@ pub async fn handle_publisher_request(
                 .await
             {
                 DispatchAuctionOutcome::Dispatched(dispatched) => {
-                    // T0-anchored timeline mark (spec section 18): bid
-                    // requests have left the edge. A failed dispatch never
-                    // marks, so all three auction offsets stay null for it.
-                    timings.mark_auction_dispatched(observation.auction_id.to_string());
+                    // Bid requests have left the edge. A skipped auction or a
+                    // failed dispatch never reaches this arm, so a null
+                    // dispatch offset next to a non-null `auction_id` reads as
+                    // "attempted, nothing sent".
+                    timings.mark_auction_dispatched();
                     auction_request_for_telemetry = Some(auction_request);
                     auction_observation = Some(observation);
                     Some(dispatched)
@@ -6691,8 +6706,9 @@ pub async fn handle_page_bids(
     ec_context: &mut EcContext,
     mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Adapters install the request-scoped collector before routing. Focused
-    // direct-handler tests fall back to a collector whose T0 is this entry seam.
+    // Same defaulted-handle rule as `handle_publisher_request`: adapters
+    // install the request-scoped collector before routing, and a request
+    // without the extension records into a collector nothing reads.
     let timings = req
         .extensions()
         .get::<RequestTimings>()
@@ -6870,6 +6886,11 @@ pub async fn handle_page_bids(
             user_agent,
             ec_context,
         );
+        // Same T0-anchored timeline as the navigation path (spec section 18).
+        // Stamped before dispatch so completed, failed, and skipped rows all
+        // stay joinable; this route's wait brackets the collect call rather
+        // than an origin fetch.
+        timings.set_auction_id(observation.auction_id);
         if ad_stack_enabled && !is_bot && !is_prefetch {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
@@ -6929,7 +6950,10 @@ pub async fn handle_page_bids(
                 .await
             {
                 DispatchAuctionOutcome::Dispatched(dispatched) => {
-                    timings.mark_auction_dispatched(observation.auction_id.to_string());
+                    // Reached only once bid requests have left the edge, so a
+                    // skipped auction or a failed dispatch never fabricates
+                    // dispatch timing evidence.
+                    timings.mark_auction_dispatched();
                     let wait_started = web_time::Instant::now();
                     let result = auction
                         .orchestrator
@@ -6941,6 +6965,18 @@ pub async fn handle_page_bids(
                     );
                     timings.mark_auction_resolved();
 
+                    if gpt_diagnostics.browser_session_active() {
+                        let timing_snapshot = timings.snapshot();
+                        auction_diagnostics = Some(BrowserAuctionDiagnostics {
+                            auction_dispatched_ms: timing_snapshot.auction_dispatched_ms,
+                            auction_resolved_ms: timing_snapshot.auction_resolved_ms,
+                            auction_committed_ms: None,
+                            auction_wait_ms: timing_snapshot.auction_wait_ms,
+                            auction_wait_placement: timing_snapshot
+                                .auction_wait_placement
+                                .map(auction_wait_placement_wire),
+                        });
+                    }
                     let winning_bids = result.winning_bids.clone();
                     let auction_id = diagnostics_auction_id(settings);
                     let bid_map = build_bid_map_with_auction_id(
@@ -6951,10 +6987,10 @@ pub async fn handle_page_bids(
                         settings.debug.inject_adm_for_testing,
                         auction_id.as_deref(),
                     );
+                    // Targeting is available to the response pipeline.
                     timings.mark_auction_committed();
-                    if gpt_diagnostics.browser_session_active() {
-                        auction_diagnostics =
-                            BrowserAuctionDiagnostics::from_request_timings(&timings);
+                    if let Some(diagnostics) = auction_diagnostics.as_mut() {
+                        diagnostics.auction_committed_ms = timings.snapshot().auction_committed_ms;
                     }
                     let delivered_winner_slots = bid_map.keys().cloned().collect();
                     emit_auction_events_best_effort_lazy(services, || {
@@ -18914,6 +18950,17 @@ mod tests {
             snapshot.auction_wait_ms.is_some(),
             "should record an auction wait duration"
         );
+        // The T0 marks are recorded at this same collect site, so a collect
+        // path that stops calling them fails here rather than silently
+        // emitting null columns.
+        assert!(
+            snapshot.auction_resolved_ms.is_some(),
+            "should mark the auction resolved at the streaming collect site"
+        );
+        assert!(
+            snapshot.auction_committed_ms.is_some(),
+            "should mark the auction committed at the streaming collect site"
+        );
     }
 
     #[test]
@@ -18986,6 +19033,16 @@ mod tests {
         assert!(
             snapshot.auction_wait_ms.is_some(),
             "should record an auction wait duration"
+        );
+        // Same guard as the streaming test: both collect sites must mark, or
+        // one body mode quietly reports null offsets.
+        assert!(
+            snapshot.auction_resolved_ms.is_some(),
+            "should mark the auction resolved at the buffered collect site"
+        );
+        assert!(
+            snapshot.auction_committed_ms.is_some(),
+            "should mark the auction committed at the buffered collect site"
         );
     }
 
@@ -20831,7 +20888,7 @@ mod tests {
         #[test]
         fn active_diagnostics_hands_auction_timing_to_the_generation_guarded_scheduler() {
             let timings = RequestTimings::new();
-            timings.mark_auction_dispatched("auction-test".to_string());
+            timings.mark_auction_dispatched();
             timings.record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(12));
             timings.mark_auction_resolved();
             timings.mark_auction_committed();
@@ -20857,7 +20914,7 @@ mod tests {
         #[test]
         fn inactive_diagnostics_omits_auction_timing_from_the_bid_script() {
             let timings = RequestTimings::new();
-            timings.mark_auction_dispatched("auction-test".to_string());
+            timings.mark_auction_dispatched();
             timings.mark_auction_resolved();
             timings.mark_auction_committed();
             let state = AdBidsState::default();
@@ -21551,25 +21608,28 @@ mod tests {
             let auction_diagnostics = winning_body["auctionDiagnostics"]
                 .as_object()
                 .expect("an active session should expose page-bids auction diagnostics");
-            for field in [
-                "auctionDispatchedMs",
-                "auctionResolvedMs",
-                "auctionCommittedMs",
-                "auctionWaitMs",
-            ] {
-                assert!(
-                    auction_diagnostics
-                        .get(field)
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some(),
-                    "page-bids diagnostics should include {field}"
-                );
-            }
+            let timing = |field| {
+                auction_diagnostics
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| panic!("page-bids diagnostics should include {field}"))
+            };
+            let dispatched_ms = timing("auctionDispatchedMs");
+            let resolved_ms = timing("auctionResolvedMs");
+            let committed_ms = timing("auctionCommittedMs");
+            let wait_ms = timing("auctionWaitMs");
+            assert!(
+                dispatched_ms <= resolved_ms && resolved_ms <= committed_ms,
+                "page-bids auction milestones should be monotonic"
+            );
+            assert_eq!(
+                wait_ms,
+                resolved_ms.saturating_sub(dispatched_ms),
+                "auction wait should exclude page-bids pre-dispatch work"
+            );
             assert_eq!(auction_diagnostics["auctionWaitPlacement"], "pre_header");
             assert!(
-                auction_diagnostics["auctionDispatchedMs"]
-                    .as_u64()
-                    .is_some_and(|offset| offset > 0),
+                dispatched_ms > 0,
                 "request-relative dispatch should include pre-handler preparation delay"
             );
             assert!(

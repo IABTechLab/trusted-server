@@ -140,9 +140,21 @@ describe('GptDiagnosticsBadgeManager', () => {
     const badge = layer.querySelector<HTMLButtonElement>('.tsgd-badge');
     expect(badge).toBeInstanceOf(HTMLButtonElement);
     expect(badge?.textContent).toContain('Ad #1 · Request #2');
-    expect(badge?.getAttribute('aria-label')).toContain('Ad #1, Request #2');
+    expect(badge?.getAttribute('aria-label')).toBe(
+      'Open diagnostics for Ad #1, Request #2: Pending'
+    );
     badge?.click();
     expect(activate).toHaveBeenCalledWith(1, 2);
+
+    badge?.focus();
+    store.recordSlotRequested(observedSlot);
+    runFrame(frames);
+    const updatedBadge = layer.querySelector<HTMLButtonElement>('.tsgd-badge');
+    expect(updatedBadge).toBe(badge);
+    expect(document.activeElement).toBe(badge);
+    expect(updatedBadge?.textContent).toContain('Ad #1 · Request #3');
+    updatedBadge?.click();
+    expect(activate).toHaveBeenLastCalledWith(1, 3);
 
     const highlight = document.createElement('div');
     highlight.className = 'tsgd-highlight';
@@ -414,6 +426,8 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(firstBadge.style.left).toBe('100px');
     expect(firstBadge.style.top).toBe('112px');
     expect(firstBadge.style.maxWidth).toBe('260px');
+    firstBadge.focus();
+    expect(document.activeElement).toBe(firstBadge);
 
     currentRectangle = rectangle(220, 260, 300, 250);
     window.dispatchEvent(new Event('scroll'));
@@ -421,6 +435,8 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(frames).toHaveLength(1);
     runFrame(frames);
     const movedBadge = layer.querySelector<HTMLElement>('.tsgd-badge')!;
+    expect(movedBadge).toBe(firstBadge);
+    expect(document.activeElement).toBe(firstBadge);
     expect(movedBadge.style.left).toBe('220px');
     expect(movedBadge.style.top).toBe('252px');
     expect(element.getAttributeNames().map((name) => [name, element.getAttribute(name)])).toEqual(

@@ -85,11 +85,13 @@ describe('tsjs-prebid shim artifact', () => {
 
     // A value-import of Prebid or a private rendering helper would multiply
     // the shim size. The bound sits just above the normal compact shim output,
-    // which is roughly 40 KB: tight enough that material growth has to be
-    // noticed and re-justified here, and far enough below a multiplication
-    // that one still fails loudly. The bundle beside it is 200 KB and up.
+    // which is roughly 42 KB once the LiveRamp managed integration and the GPT
+    // auction diagnostics evidence both ship: tight enough that material growth
+    // has to be noticed and re-justified here, and far enough below a
+    // multiplication that one still fails loudly. The bundle beside it is
+    // 200 KB and up.
     expect(bundleCode.length).toBeGreaterThan(200_000);
-    expect(shimCode.length).toBeLessThan(41_000);
+    expect(shimCode.length).toBeLessThan(43_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 });
