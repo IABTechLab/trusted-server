@@ -14,7 +14,8 @@
 
 ## 1. Summary
 
-Add a deployment-controlled, public, privacy-safe `GET /_ts/trace` page for a
+Add a deployment-controlled, privacy-safe `GET /_ts/trace` page, public subject
+to operator authentication rules, for a
 mobile end user who needs to reproduce an ad-rendering problem and give support
 an exportable diagnostic report. Visiting the page is read-only. The user
 intentionally enables or ends tracing with a same-origin POST action.
@@ -44,9 +45,10 @@ Issue #1050 names three required data groups:
 3. End-user cookie information.
 
 The title additionally establishes two product constraints: the experience is
-for a mobile user, and it is reached through an endpoint. A mobile user should
-not need browser developer tools, Basic Authentication, a copied trace ID, or a
-second copy of the affected page URL.
+for a mobile user, and it is reached through an endpoint. On a deployment whose
+authentication rules leave trace routes public, a mobile
+user should not need browser developer tools, credentials, a copied trace ID,
+or a second copy of the affected page URL.
 
 A standalone request cannot know what occurred in a previous document. Exact
 render evidence exists only while the publisher page is running in the browser.
@@ -117,10 +119,13 @@ diagnostic token connects those layers.
 
 ### 5.1 Public, redacted endpoint with intentional activation
 
-`/_ts/trace` is public when explicitly enabled by deployment configuration. It
-is not placed under `/_ts/admin`, because the intended user is a layperson on a
-phone and the existing Basic Authentication flow is unsuitable for that
-journey.
+`/_ts/trace` is available when explicitly enabled by deployment configuration
+and is public only when no operator authentication rule covers it. It is not
+placed under `/_ts/admin`, because the intended user is a layperson on a phone.
+Existing Basic Authentication rules still apply to every trace path, including
+assets and actions; the early dispatcher must not carve out an exemption.
+Operators offering the credential-free journey must scope authentication to
+the paths they intend to protect, for example `^/_ts/admin` (see section 12.5).
 
 Public access is safe only because both the page and export use a strict
 allowlist. The activation cookie is a feature toggle, not authentication. No
@@ -141,19 +146,51 @@ executing on the publisher origin.
 The endpoint reuses `__Host-ts-console` and the existing GPT diagnostics
 activation semantics rather than creating a second `ts-trace` session. The
 cookie remains host-only, `Secure`, `HttpOnly`, and `SameSite=Lax`.
-`POST /_ts/trace/enable` sets it with a fixed 30-minute `Max-Age` and does not
-refresh that lifetime on publisher requests; `POST /_ts/trace/end` clears it.
-Neither action accepts state-changing query parameters. The shorter endpoint
-lifetime bounds accidental private/no-store operation if a user forgets to end
-tracing; the existing technical query flow keeps its existing session-cookie
-semantics.
+Both `POST /_ts/trace/enable` and the existing `?ts_console=1` writer must
+set `Max-Age=1800` through one shared cookie policy, including when
+`trace_page_enabled` is false. This explicitly changes the technical query flow
+from a browser-session cookie to a 30-minute cookie. An explicit activation
+restarts the 30-minute lifetime; ordinary publisher requests do not refresh it.
+`POST /_ts/trace/end` and `?ts_console=0` clear the same cookie. Neither POST
+action accepts state-changing query parameters. A later query activation must
+never replace the bounded cookie with a session cookie.
 
-The new trace capture is active only when both `trace_page_enabled = true` and
-the request carries exactly one valid diagnostics cookie. The shared cookie by
+This bounds browser-managed persistence from the most recent activation by an
+updated writer, not total session duration or server-enforced authorization.
+Pre-existing session cookies carry no expiry in the request and cannot be
+retroactively aged; users with those cookies must end or re-enable diagnostics
+to adopt the new lifetime. Cookie expiry also does not unload a running page
+or clear an existing report; report expiry is defined separately in section 9.5.
+
+The base trace gate requires both `trace_page_enabled = true` and exactly one
+valid incoming diagnostics cookie, inspected before cookie sanitation.
+Publisher-document tracing additionally requires the existing effective
+`GptDiagnosticsRequestDecision.active` decision. Query disable or invalid
+directives, prefetches, bots, and other ineligible navigations therefore
+suppress document trace context, auction evidence, and browser activation even
+when an incoming cookie is valid. A query activation without an incoming valid
+cookie enables the existing console; trace capture starts on the next eligible
+reload carrying that cookie. Page-bids and `/auction` requests use the base
+configuration-plus-cookie gate without requiring a document-navigation
+decision. References below to the trace gate include the additional effective
+diagnostics decision for publisher documents. The shared cookie by
 itself continues to activate the existing TS Console but does not authorize
 trace tokens, server-auction projection, trace response extensions, or
 correlation sidecars on a deployment whose trace page is disabled. This makes
-the configuration flag the disclosure and rollback boundary.
+the configuration flag the disclosure and rollback boundary for new requests.
+
+Core exposes the evaluated document trace gate as the literal boolean
+`window.__tsjs_trace_active` before TSJS initializes on the publisher document;
+it is true only when the base gate and effective document diagnostics decision
+are both active. TSJS requires
+`window.__tsjs_trace_active === true` before minting slot tokens, retaining
+request mappings, installing trace listeners, collecting transport evidence,
+emitting sidecars, or offering the trace handoff action. Missing or non-boolean
+values mean inactive; `window.__tsjs_gpt_diagnostics_active` alone is
+insufficient. Core independently rechecks the gate on each request and never
+trusts the browser flag as authorization. Configuration changes or cookie expiry
+cannot revoke code already loaded in a document; rollback takes effect on its
+next reload, and subsequent server requests stop returning evidence immediately.
 
 ### 5.3 Browser-local, explicit handoff
 
@@ -324,7 +361,7 @@ the report.
 ```text
 GET /_ts/trace
     |
-    |-- early reserved-route classifier terminates locally
+    |-- early reserved-route classifier applies configured auth, then terminates locally
     |-- HTML explains forward reproduction; no state mutation
     v
 POST /_ts/trace/enable after explicit user action
@@ -411,7 +448,7 @@ enabled = true
 trace_page_enabled = false
 ```
 
-Rules:
+Rules (route responses below apply after configured authentication):
 
 - `trace_page_enabled = true` requires `enabled = true`; invalid combinations
   fail configuration validation.
@@ -481,9 +518,15 @@ Every adapter implements the following order:
 1. Parse the method, canonical host/origin, path, query, and bounded headers
    required for route safety.
 2. Classify an exact Trusted Server reserved path.
-3. For a trace path, terminate locally after only trace-specific validation and
-   bounded request-context inspection, including an optional read-only platform
-   geo lookup used solely for the displayed setup request.
+3. For a trace path, enforce the existing configured Basic Authentication
+   rules before any trace response, cookie mutation, body inspection, or setup
+   context projection. A matching rule challenges missing/invalid credentials
+   locally with the ordinary `401` and `WWW-Authenticate` behavior. After
+   authentication succeeds or no rule matches, apply the trace-specific
+   validation and bounded request-context inspection, including an optional
+   read-only platform geo lookup, and terminate locally. This applies to the
+   entire reserved namespace, assets, unsupported methods, and disabled routes;
+   the route statuses below authentication are never an auth exemption.
 4. For all other paths, continue through the adapter's ordinary event context,
    authentication, request filters, geo enrichment, EC/EID processing, named
    routes, auction handling, telemetry, and publisher fallback.
@@ -496,8 +539,9 @@ ordinary named-route registration alone does not satisfy this contract.
 
 After an enable or end POST succeeds, the client performs a no-store state GET.
 It claims `Tracing is on — cookie observed by server` only when that separate
-request reports active, and `Tracing is off — cookie absent on server request`
-only when it reports inactive. A mismatch or failed verification is
+request reports active, and `Tracing is off — no valid diagnostics session
+observed` only when it reports inactive. An inactive result covers absent,
+invalid, duplicate, or uninspectable cookies; it does not prove cookie absence. A mismatch or failed verification is
 `Activation unconfirmed` or `Deactivation unconfirmed` and offers an idempotent
 retry. These are server-observation statements, not proof that browser state is
 authentic: same-origin service workers can forge or suppress the whole exchange.
@@ -508,7 +552,8 @@ the uncached shell, state, and action routes being disabled; inert cached assets
 alone cannot activate tracing or access a report page.
 
 The current `?ts_console=1` and `?ts_console=0` activation flow remains
-supported for technical users. Both activation surfaces drive the same cookie
+supported for technical users with the shared 30-minute cookie policy in
+section 5.2. Both activation surfaces drive the same cookie
 and runtime; they must not create two concurrent diagnostic modes. That
 pre-existing query flow has its existing top-level-navigation activation risk;
 #1050 neither expands it to the new trace GET nor claims to remediate it.
@@ -517,8 +562,8 @@ pre-existing query flow has its existing top-level-navigation activation risk;
 
 ### 9.1 Request context
 
-The server injects one immutable `TraceRequestContextV1` into active diagnostic
-documents:
+The server injects one immutable `TraceRequestContextV1` only into documents
+that satisfy the applicable trace gate in section 5.2:
 
 ```text
 TraceRequestContextV1
@@ -546,8 +591,12 @@ The request-context envelope intentionally contains no page URL, path,
 referrer, query, or fragment. During the field-by-field trace projection,
 `GptDiagnosticsExportV1.page.origin` is retained after validation and its
 `pathname` is replaced with the literal `/[redacted]`. The trace viewer accepts
-only that literal. Version one therefore does not store or export an exact page
-path. Any future route-template policy requires a new schema and privacy review
+only that literal. The projection also omits `slotElementId` and `adUnitPath`
+from slots and `slotElementId` from callback and attribution issues, because
+these values can embed the same page path. They are not hashed or truncated.
+Numbered slots and request cycles retain grouping and exact-token correlation.
+Version one therefore does not intentionally retain an exact page path in any
+of these source fields. Any future route-template policy requires a new schema and privacy review
 because paths can contain accounts, emails, preview tokens, and other secrets.
 
 `masked_client_ip` uses a deterministic display-only mask for the current
@@ -661,13 +710,26 @@ projection sourced only from `GptDiagnosticsExportV1`. It contains:
 - `schema_version: 1` and `source_schema_version: 1`;
 - the source `capturedAt` value;
 - `page.origin` after validation and `page.pathname` fixed to `/[redacted]`;
-- field-for-field allowlisted copies of the current v1 slots, requests,
-  callback issues, attribution issues, coverage, and metadata, subject to the
-  bounds and truncation below.
+- explicit field-by-field projections of current v1 slots, requests, callback
+  issues, attribution issues, coverage, and metadata, subject to the following
+  exclusions and the bounds/truncation below.
+
+The trace schema omits the entire request-cycle `adManager` object, including
+`lineItemId`, `creativeId`, `campaignId`, `advertiserId`,
+`sourceAgnosticLineItemId`, `sourceAgnosticCreativeId`, `yieldGroupIds`, and
+`companyIds`, and omits `previousCreativeId`. Derived `responseClass` and
+`creativeChanged` facts remain eligible without their underlying identifiers.
+It also omits slot `slotElementId` and `adUnitPath` and callback/attribution
+issue `slotElementId`. These properties are forbidden in the trace schema,
+not optional passthrough fields: the builder never copies them and the viewer
+rejects a stored report that supplies them. The remaining current v1 fields
+retain their source meaning and require explicit allowlisting; future source
+fields are not inherited automatically. `trustedServerAuctionId`, when
+present, must satisfy the diagnostic auction-token contract in section 9.4.
 
 It is deliberately not named or represented as `GptDiagnosticsExportV1`,
-because the fixed pathname and trace-level bounds change the source field
-semantics. TS Console continues to own the source schema; the trace envelope
+because redaction, excluded identifiers, and trace-level bounds change the
+source field semantics. TS Console continues to own the source schema; the trace envelope
 owns its public projection and transport. The initial compatibility matrix is
 exactly `TraceReportV1`, `TraceAuctionEvidenceV1`, `TraceSlotCorrelationV1`, and
 `TraceGptDiagnosticsV1`, with the GPT projection sourced from
@@ -678,13 +740,17 @@ an additive source compatibility change and, if the public projection changes,
 a new trace-envelope version.
 
 `auction_coverage.capture_status` describes only what reached the browser
-collector: `not_observed` means no valid server-auction record arrived, not that
-no server auction ran. `partial` requires at least one retained record plus a
-projection, transport, validation, or eviction issue; `unavailable` requires no
-retained records plus a known projection, transport, or validation issue; and
+collector: `not_observed` means no valid server-auction record arrived and no
+capture issue is known, not that no server auction ran. `partial` requires at
+least one retained record plus a projection, transport, validation, or eviction
+issue; `unavailable` requires no retained records plus a known projection,
+transport, validation, or eviction issue; and
 `complete` requires at least one retained record without those capture issues.
 `correlation_unavailable` and `external_client_side_unobservable` describe
 interpretation limits and do not change an otherwise complete capture status.
+Evicting all received records therefore yields `unavailable` with
+`record_evicted`, never `not_observed`. Recompute status after both in-memory
+eviction and snapshot size truncation.
 The issue array is deduplicated, sorted in enum order, bounded to 16 values, and
 contains no error text.
 
@@ -739,24 +805,29 @@ The model has deliberately lower cardinality and sensitivity than the existing
 telemetry and OpenRTB objects:
 
 - `diagnostic_auction_id` is a fresh opaque `ts-auc-...` correlation token. When
-  trace capture is active under the two-part gate in section 5.2, it is minted
+  trace capture is active under the applicable trace gate in section 5.2, it is minted
   once when an eligible auction is observed, before dispatch, and is retained
   for zero-bid, skipped, dispatch-failed, execution-failed, and abandoned
   outcomes. It is never `AuctionRequest.id`, the telemetry UUID, a provider
   request ID, or an identifier joinable to user-bearing logs.
-- Auction and slot tokens are the fixed prefixes `ts-auc-` and `ts-slot-`
-  followed by a canonical lowercase hyphenated UUID v4. Validators reject every
-  other shape; tokens are not silently shortened or normalized.
+- Auction tokens are `ts-auc-` followed by a lowercase UUID v4 in the existing
+  producer's 32-hex-digit unhyphenated form (`Uuid::new_v4().simple()`). Slot
+  tokens are `ts-slot-` followed by a canonical lowercase hyphenated UUID v4,
+  matching `crypto.randomUUID()`. Both validators enforce UUID version 4 and
+  the RFC variant and reject every other shape. Tokens are compared verbatim,
+  never normalized during validation or correlation; no producer format change
+  is required for the existing GPT auction opportunity marker.
 - `slot_number` is a one-based ordinal over the exact post-conversion
   `AuctionRequest.slots` sequence observed by orchestration. It is display-only
   and is never used to map a response back to pre-conversion client input.
   `slot_ref` is a fresh auction-local opaque token carried with that slot. Core
   creates it for initial-navigation and SPA auctions. For a TSJS `/auction`
-  request, TSJS creates it only after `buildAdRequest` has finished grouping and
+  request, TSJS creates it only when `window.__tsjs_trace_active === true` and
+  only after `buildAdRequest` has finished grouping and
   deduplicating the final `adUnits` array, attaches it to that exact outgoing
   unit as `adUnits[].ext.trusted_server.trace_slot_ref`, and retains the
   request-scoped token-to-unit mapping. Core accepts that member only under the
-  two-part trace gate, validates and echoes the token for accepted converted
+  applicable trace gate, validates and echoes the token for accepted converted
   slots, and strips it before every provider or mediator request. A missing or
   invalid client token causes core to mint a server token with no browser
   correlation; it never changes ordinary auction acceptance. TSJS uses
@@ -812,8 +883,8 @@ correlation failed, the viewer shows `Server auction evidence unavailable` or
 
 #### 9.4.1 Live transport and correlation
 
-Evidence is transported only while `trace_page_enabled` is true and the
-diagnostics cookie is valid. Every response carrying it is terminally
+Evidence is transported only when the applicable trace gate in section 5.2
+is active, including the effective diagnostics decision for publisher documents. Every response carrying it is terminally
 `private, no-store`:
 
 ```text
@@ -836,7 +907,7 @@ object TSJS already consumes:
 AuctionSlot.ext.trusted_server.trace_slot_ref: string
 ```
 
-Core adds that optional nested member only under the two-part trace gate. It
+Core adds that optional nested member only under the applicable trace gate. It
 assigns the token while constructing the request-scoped slot definitions and
 threads the same token into the corresponding `AuctionRequest` observation, so
 neither side needs to recover the relationship from an ordinal or raw slot ID.
@@ -845,13 +916,15 @@ ordering, and bid-map keys remain unchanged. The extension is absent when the
 gate is false and is never copied into `TraceAuctionEvidenceV1` except as its
 already-allowlisted opaque `slot_ref`.
 
-TSJS accepts a slot extension only when its canonical token occurs exactly once
+When valid auction evidence is supplied, TSJS accepts a slot extension only
+when its canonical token occurs exactly once
 in both the delivered slot list and the matching auction evidence. A missing,
 malformed, duplicate, or conflicting token prevents only that sidecar join,
 adds `evidence_validation_failed` and `correlation_unavailable`, and does not
 drop, reorder, or mutate the ordinary slot or bid. TSJS reads no other extension
 property. This validation occurs before the slot is handed to the existing GPT
-initialization path.
+initialization path. An absent optional transport member does not trigger
+missing-token validation; no sidecar is emitted and no capture issue is added.
 
 The three transport call shapes are exact v1 contracts:
 
@@ -876,8 +949,9 @@ accepts only the exact optional top-level member and preserves its existing
 `slots` and `bids` behavior. These trace members never become required for a
 successful advertising response.
 
-When the existing GPT recorder consumes the matching Trusted Server opportunity
-for a concrete request cycle, it emits this trace-owned sidecar:
+For initial-navigation SSAT and SPA page-bids only, when the existing GPT
+recorder consumes the matching Trusted Server opportunity for a concrete request
+cycle, it emits this trace-owned sidecar:
 
 ```text
 TraceSlotCorrelationV1
@@ -895,6 +969,19 @@ opaque server tokens and the concrete GPT cycle are present. The current
 `GptDiagnosticsExportV1` remains unchanged and the sidecar contains no slot
 element ID or ad-unit path.
 
+Version one does not correlate either `/auction` caller to a GPT cycle. Prebid
+refresh records only `prebid_refresh` intent and has no existing token-bearing
+opportunity binding; passing its tokens through `recordTrustedServerOpportunity`
+would incorrectly introduce `trusted_server_direct` attribution. The direct
+`requestAds` caller renders outside GPT and supplies no GPT request cycle. Both
+callers retain server evidence and the request-unit mapping, but emit no
+`TraceSlotCorrelationV1`. The viewer displays API evidence independently with
+`correlation_unavailable`; this interpretation limit does not downgrade an
+otherwise complete server capture. A sidecar referencing an `auction_api`
+record is invalid in v1. A future Prebid join requires a separately designed
+association between request-unit tokens and exact GPT slot/request identities
+that preserves existing request-path attribution.
+
 - **Initial-navigation SSAT:** core builds the evidence when the split auction
   is collected at the held body tail. It injects the script-safe public model
   beside the winning-bid map before initial ad initialization; the corresponding
@@ -908,12 +995,17 @@ element ID or ad-unit path.
   `ext.trusted_server.trace_slot_ref` before triggering ad initialization. Both
   the envelope and slot extensions are absent when the trace gate is inactive.
 - **Trusted Server `/auction` API:** the existing OpenRTB response adds a
-  namespaced `ext.trusted_server.trace_auction` transport envelope only for an
-  active diagnostics request. After producing the final grouped `AdRequest`,
-  both TSJS callers assign one fresh token to each outgoing unit and retain that
-  exact request-scoped mapping. They validate the echoed evidence and record it
+  namespaced `ext.trusted_server.trace_auction` transport envelope only for a
+  request satisfying the base trace gate in section 5.2. After producing the
+  final grouped `AdRequest`,
+  both TSJS callers check `window.__tsjs_trace_active === true` before
+  assigning one fresh token to each outgoing unit and retaining that exact
+  request-scoped mapping. An inactive caller creates neither tokens nor pending
+  transport records and installs no trace-specific timeout/error hooks. Active
+  callers validate the echoed evidence and record it
   before parsing bids. A converted or skipped unit therefore cannot shift
-  another slot's correlation. The response member does not replace or expose
+  another request unit's server-evidence association. This mapping does not
+  imply a GPT-cycle join. The response member does not replace or expose
   the existing orchestrator extension, and the trace projection must not copy
   that extension's provider names, bidder names, metadata, price, creative IDs,
   domains, or markup. HTTP/transport failures with no readable response are
@@ -933,8 +1025,9 @@ transport outcome, so it removes the marker and leaves evidence `not_observed`
 rather than inventing a failure. These hooks collect only bounded categories and
 opaque tokens, never XHR error text or response bodies.
 
-The diagnostic auction token is also attached to the existing GPT opportunity
-marker, and the opaque slot token is carried through the corresponding
+For SSAT and SPA page-bids, the diagnostic auction token is also attached to
+the existing GPT opportunity marker, and the opaque slot token is carried
+through the corresponding
 winning-bid/slot initialization path. The numeric ordinal is never a
 correlation key. The viewer joins a server slot to a GPT cycle only when one validated
 `TraceSlotCorrelationV1` exactly matches both tokens and the exported
@@ -945,9 +1038,10 @@ timestamps, implicit array position, ad-unit path, or a best-effort heuristic.
 TSJS retains at most the newest 16 validated server-auction records and 128
 correlation sidecars in memory. It increments checked eviction counters for
 older records; the snapshot adds those counts to the matching truncation fields
-and emits `record_evicted` with `partial`. It performs no storage write until
+and emits `record_evicted`, with `partial` if server records remain or
+`unavailable` if none remain after snapshot truncation. It performs no storage write until
 the explicit snapshot action.
-Requests for which either side of the trace-capture gate is false do not mint
+Requests that fail the applicable trace gate do not mint
 trace tokens, build trace evidence, add response members, emit sidecars, or
 install auction-evidence listeners.
 
@@ -993,32 +1087,40 @@ failure is handled even when the report is below the application limit.
 
 Runtime limits are part of the v1 contract:
 
-| Value                                         | Limit                                                        |
-| --------------------------------------------- | ------------------------------------------------------------ |
-| Container nesting                             | 8 levels                                                     |
-| Server auctions                               | 16                                                           |
-| Slot correlations                             | 128                                                          |
-| Provider calls                                | 16 per server auction                                        |
-| Auction slots                                 | 64 per server auction                                        |
-| Auction coverage issues                       | 16                                                           |
-| Slots                                         | 64                                                           |
-| Request cycles                                | 10 per slot before total-size truncation                     |
-| Callback issues                               | 128                                                          |
-| Attribution issues                            | 128                                                          |
-| Requested slot sizes                          | 16 per cycle                                                 |
-| Ad Manager yield-group or company IDs         | 8 of each per cycle                                          |
-| Creative-failure enums                        | 16 per cycle                                                 |
-| Origin                                        | 255 UTF-8 bytes                                              |
-| GPT pathname in trace projection              | Exact literal `/[redacted]`                                  |
-| Slot element ID and ad-unit path              | 512 UTF-8 bytes each                                         |
-| Trusted Server auction ID and callback reason | 256 UTF-8 bytes each                                         |
-| Diagnostic auction ID and opaque slot ref     | 128 UTF-8 bytes each                                         |
-| Any other string                              | 128 UTF-8 bytes                                              |
-| Enum                                          | Exact documented value only                                  |
-| Identifier, sequence, or counter              | Finite safe integer from 0 through `Number.MAX_SAFE_INTEGER` |
-| Browser-relative timestamp or duration        | Finite number from 0 through `Number.MAX_SAFE_INTEGER`       |
-| Visibility percentage                         | Finite number from 0 through 100                             |
-| Slot dimension                                | Finite integer from 1 through 100,000                        |
+| Value                                           | Limit                                                        |
+| ----------------------------------------------- | ------------------------------------------------------------ |
+| Container nesting                               | 8 levels                                                     |
+| Server auctions                                 | 16                                                           |
+| Slot correlations                               | 128                                                          |
+| Provider calls                                  | 16 per server auction                                        |
+| Auction slots                                   | 64 per server auction                                        |
+| Auction coverage issues                         | 16                                                           |
+| Slots                                           | 64                                                           |
+| Request cycles                                  | 10 per slot before total-size truncation                     |
+| Callback issues                                 | 128                                                          |
+| Attribution issues                              | 128                                                          |
+| Requested slot sizes                            | 16 per cycle                                                 |
+| Creative-failure enums                          | 16 per cycle                                                 |
+| Origin                                          | 255 UTF-8 bytes                                              |
+| GPT pathname in trace projection                | Exact literal `/[redacted]`                                  |
+| Slot element ID and ad-unit path                | Forbidden, including callback/attribution issue copies       |
+| Trusted Server auction ID                       | Exact diagnostic auction-token shape                         |
+| Callback reason                                 | Exact documented value only                                  |
+| Diagnostic auction ID and opaque slot ref       | 128 UTF-8 bytes each                                         |
+| Any other string                                | 128 UTF-8 bytes                                              |
+| Enum                                            | Exact documented value only                                  |
+| Identifier, sequence, or counter                | Finite safe integer from 0 through `Number.MAX_SAFE_INTEGER` |
+| Browser-relative timestamp or duration          | Finite number from 0 through `Number.MAX_SAFE_INTEGER`       |
+| Visibility percentage                           | Finite number from 0 through 100                             |
+| Requested or selected creative dimension        | Finite integer from 1 through 100,000                        |
+| GPT-reported fill dimension (`size`)            | Finite integer from 1 through 100,000                        |
+| Observed CSS box dimension (`observedSlotSize`) | Finite integer from 0 through 100,000                        |
+
+`observedSlotSize` preserves zero dimensions, including `[0, 0]` for a
+hidden or collapsed element after a filled GPT render. Zero is a measured box
+size, not missing data or evidence of an empty GPT response; do not omit it or
+change `isEmpty`. Positive dimensions remain required for requested and
+selected creative sizes and GPT-reported fill sizes.
 
 Every accepted string must be valid Unicode and must not contain C0/C1 control
 characters or bidirectional override/isolate controls. This applies to browser
@@ -1029,8 +1131,7 @@ invalid source value rather than stringifying it. Server auctions are already
 bounded by core; the browser rejects an invalid inner model rather than
 truncating it. The builder retains the newest 16 server auctions in observation
 order, the newest 128 correlations in recorder emission order, and only the
-first documented number of GPT requested sizes, yield-group IDs, company IDs,
-and creative failure enums. It records each discard in
+first documented number of GPT requested sizes and creative failure enums. It records each discard in
 `omitted_server_auctions`, `omitted_slot_correlations`, or
 `omitted_nested_values`; strings are never silently shortened. It then measures
 the complete compact UTF-8 storage wrapper. If it exceeds 512 KiB, it removes
@@ -1180,7 +1281,9 @@ Forbidden data includes:
 - EC IDs, EIDs, bidder user IDs, provider/bidder/seat names, and consent
   strings.
 - Unmasked client IP.
-- Query strings and fragments.
+- Exact page paths, slot element IDs, ad-unit paths (including issue copies),
+  query strings, and fragments.
+- The entire GPT `adManager` identity object and `previousCreativeId`.
 - Fastly or internal request identifiers that can join to user-bearing logs.
 - Internal `AuctionRequest.id`.
 - Bid requests/responses, bid prices/currency, losing-bid payloads, provider
@@ -1233,9 +1336,11 @@ hash and a corresponding CSP change. Validated report strings enter the
 document through `textContent` or equivalent DOM properties, never `innerHTML`.
 
 The JS asset uses `application/javascript; charset=utf-8`; the CSS asset uses
-`text/css; charset=utf-8`. Both send `X-Content-Type-Options: nosniff`,
-`Cache-Control: public, max-age=31536000, immutable`, and a strong ETag derived
-from their build bytes. They accept no dynamic input. `script-src 'self'` is an
+`text/css; charset=utf-8`. Both send `X-Content-Type-Options: nosniff` and a strong ETag derived
+from their build bytes. They use
+`Cache-Control: public, max-age=31536000, immutable` only when no configured
+authentication rule covers the asset; otherwise they use `private, no-store`
+as specified in section 12.5. They accept no dynamic input. `script-src 'self'` is an
 origin-level CSP permission, not a path restriction; same-origin script
 interference remains inside the stated trust limitation.
 
@@ -1249,9 +1354,29 @@ The existing diagnostics private/no-store decision remains a load-bearing gate.
 Tests must prove that late response-header handlers cannot make traced content
 publicly cacheable.
 
+### 12.5 Operator authentication policy
+
+Trace routing preserves the existing `auth.rs` namespace contract: every
+matching operator Basic Authentication rule is enforced, including `^/_ts` or
+`^/`. Classification may run early, but does not authorize a request. Only
+authentication is factored ahead of trace handling; ordinary event, identity,
+filter, and auction processing stays outside trace routes. A challenge exposes
+no setup context, changes no cookie, and is terminally private/no-store.
+
+The credential-free mobile journey requires deployment rules that leave the
+trace namespace public. Document this beside `trace_page_enabled`; do not
+silently narrow an operator rule. On origin requests, authentication precedes
+disabled-route `404` and unsupported-method `405` responses as well. Asset
+responses covered by an authentication rule must use `private, no-store`
+instead of public immutable caching. Previously public cached inert assets may
+remain available, but contain no report data and cannot bypass the uncached
+shell or actions.
+
 ## 13. Failure handling
 
-- Disabled route: local privacy-safe `404`.
+- Configured authentication failure: local private/no-store `401` challenge
+  before trace handling, including on disabled routes.
+- Disabled route after authentication: local privacy-safe `404`.
 - Unsupported method: local `405`; never publisher fallback.
 - Rejected activation/end POST: local `403` with no state mutation.
 - Optional platform fact unavailable: omit the field and continue.
@@ -1265,9 +1390,14 @@ publicly cacheable.
 - Initial-navigation evidence cannot be injected because the body tail is not
   reached: preserve publisher delivery. Because the browser received no safe
   marker, display `not_observed` rather than claiming a known server failure.
-- Page-bids or `/auction` evidence is absent or rejected by its strict client
-  validator: parse the ordinary bid response exactly as before, discard the
-  diagnostic member, and show an unmatched/invalid-evidence coverage category.
+- A successful page-bids or `/auction` response omits the optional evidence
+  member: parse ordinary bids unchanged and add no capture issue. With no other
+  records or known capture issues, coverage is `not_observed`; absence does not
+  reset previously collected evidence or failures.
+- A supplied evidence member fails strict validation: discard that member,
+  parse ordinary bids unchanged, and add `evidence_validation_failed`. Coverage
+  is `partial` when valid records remain or `unavailable` when none remain,
+  following section 9.3.
 - TS Console capture failure: fail open for advertising and show incomplete
   coverage in diagnostics.
 - Storage unavailable or quota exceeded after a valid bounded report exists:
@@ -1306,15 +1436,24 @@ results, never a prerequisite for returning them.
   console cookie still enables the existing console but never mints trace
   tokens, builds auction evidence, adds response extensions, or emits
   correlation sidecars.
+- With a valid incoming cookie, `?ts_console=0`, invalid/duplicate directives,
+  prefetches, bots, and other ineligible navigations suppress all document trace
+  capture through the effective diagnostics decision. Query enable without a
+  cookie activates only the console until the next eligible cookie-bearing
+  reload. Page-bids and `/auction` use the base gate without navigation checks.
 - Exact reserved-route classification, canonical-path, query, method, encoded
   path, and fallback behavior.
 - Exact versioned asset routes are local and contain no dynamic data; lookalike
   asset paths never reach the publisher origin.
 - Same-origin POST validation, cross-site/missing signal rejection, cookie
-  set/clear attributes, fixed 30-minute endpoint activation without request
-  refresh, and idempotent enable/end behavior.
+  set/clear attributes, shared `Max-Age=1800` for endpoint and query activation
+  without ordinary-request refresh, and idempotent enable/end behavior. Cover
+  enable then query activation, query then enable, repeated explicit activation,
+  clearing through either surface, and the pre-existing session-cookie caveat.
 - Enable/end success requires a separate state request to observe the resulting
   cookie; failed and mismatched verification never displays confirmed state.
+  Absent, invalid, duplicate, and uninspectable cookies all report inactive,
+  with no claim that inactive proves the cookie is absent.
 - Empty-body enforcement rejects positive/invalid lengths, transfer encoding,
   the first unexpected body byte, and the two-second deadline without an
   unbounded read.
@@ -1330,7 +1469,8 @@ results, never a prerequisite for returning them.
   API call sites to the exact public source enums without using a browser hint.
 - The diagnostic auction token is minted before dispatch and remains identical
   across completed, zero-bid, skipped, failed, and abandoned evidence and the
-  corresponding browser opportunity marker. It never equals or contains the
+  corresponding SSAT/SPA browser opportunity marker. API tokens remain
+  server-evidence identifiers without GPT sidecars. No token equals or contains the
   internal auction ID or telemetry UUID.
 - Server-auction projection covers every terminal status/reason mapping,
   auction-local total duration, provider role/status/duration/count, per-slot
@@ -1350,13 +1490,15 @@ results, never a prerequisite for returning them.
   associated across grouped multi-bidder units, duplicate codes, skipped
   non-banner units, and mixed accepted/filtered inputs. Numeric ordinals are
   never used for client correlation.
-- Token tests cover canonical UUID-v4 shape, missing Web Crypto, malformed or
+- Token tests cover the existing simple auction UUID-v4 shape and hyphenated
+  slot UUID-v4 shape, exact producer-to-sidecar joins, missing Web Crypto, malformed or
   duplicate request extensions, the disabled trace gate, and proof that invalid
   tokens neither fail nor otherwise alter the ordinary auction.
 - Initial and SPA slot JSON attaches the exact
   `ext.trusted_server.trace_slot_ref` token that appears in server evidence;
-  inactive responses omit it. Missing, duplicate, conflicting, malformed, and
-  evidence-mismatched slot tokens suppress only correlation and produce the
+  inactive responses omit it. With valid matching auction evidence supplied,
+  missing, duplicate, conflicting, malformed, and evidence-mismatched slot
+  tokens suppress only correlation and produce the
   specified coverage issues without changing slot/bid order or contents.
 - Active responses remain terminally private/no-store under hostile late header
   overrides.
@@ -1369,6 +1511,11 @@ results, never a prerequisite for returning them.
 - Axum, Cloudflare, and Spin return the common route/schema with unavailable
   fields omitted.
 - Trace-route failures never fall through to publisher origin.
+- Broad `^/_ts` and `^/` authentication rules challenge every trace path
+  (shell/state/actions/assets, disabled routes, and unsupported methods); valid
+  credentials proceed to trace handling, while `^/_ts/admin` leaves trace
+  routes public. Challenges expose no context or cookie mutation, and
+  protected assets remain private/no-store.
 - GET, HEAD, state-changing POST, and unsupported methods obey the same
   lifecycle contract across adapters.
 - Every adapter omits JA4/H2 and rejects control characters or overlong platform
@@ -1377,10 +1524,19 @@ results, never a prerequisite for returning them.
 ### 14.3 JavaScript unit tests
 
 - Explicit snapshot only; no continuous `sessionStorage` writes.
+- Both TSJS auction callers require the literal `__tsjs_trace_active === true`
+  before token generation or trace collection. Cover missing/false/non-boolean
+  flags with GPT diagnostics active: no tokens, mappings, listeners, pending
+  transport records, sidecars, or handoff action are created.
 - Compact UTF-8 size measurement; exact outer/nested schema validation; unknown
   fields; per-string/array/numeric/depth caps; hostile mutation; expiry;
   future-clock skew; wall-clock rollback; replacement; clearing; and storage
   exceptions.
+- A filled GPT cycle with `observedSlotSize: [0, 0]`, `[0, 250]`, or `[300, 0]`
+  survives projection, storage validation, rendering, and export unchanged.
+  Negative, fractional, non-finite, and over-limit observed dimensions fail
+  validation; requested/selected creative and GPT fill dimensions retain their
+  positive bounds.
 - Omission counters use checked arithmetic and reject overflow.
 - Strict validation of every server-auction enum, token, numeric bound, array
   bound, nesting level, and unknown property; invalid evidence is discarded
@@ -1388,12 +1544,18 @@ results, never a prerequisite for returning them.
 - Transport envelopes require exactly one of evidence/unavailable reason;
   projection, transport, validation, eviction, correlation, and external-client
   coverage states produce the specified complete/partial/unavailable/not-observed
-  result without treating absence as proof that no auction ran.
+  result without treating absence as proof that no auction ran. A fixture that
+  receives valid evidence and then evicts every server record during size
+  truncation must yield `unavailable` with `record_evicted` and exact omission
+  counts; partial eviction remains `partial`.
+- Successful responses without an optional transport member add no validation
+  issue; malformed supplied members add `evidence_validation_failed`. Cover
+  both an empty collector and one with retained evidence or earlier failures.
 - Direct fetch failures and Prebid `interpretResponse`, `onTimeout`, and
   `onBidderError` paths consume their pending transport record exactly once;
   capped/expired records and absent hooks follow the specified `not_observed`
   behavior without retaining error text or bodies.
-- Exact-token correlation joins matching server auctions, GPT opportunities,
+- Exact-token correlation joins matching SSAT/SPA server auctions, GPT opportunities,
   and slot references; unmatched, duplicated, conflicting, missing, and
   forged tokens stay separate and produce explicit coverage states. No
   timestamp, index, or ad-unit-path heuristic is used.
@@ -1401,6 +1563,11 @@ results, never a prerequisite for returning them.
   opportunity-to-cycle binding, is capped and evicted deterministically,
   contains only opaque tokens plus runtime/request numbers, and does not alter
   `GptDiagnosticsExportV1`.
+- Prebid `/auction` evidence remains independent of its `prebid_refresh` GPT
+  cycle, and direct `requestAds` evidence remains independent of GPT. Neither
+  path emits a sidecar or introduces `trusted_server_direct`/`competing`
+  attribution. Both show `correlation_unavailable` without downgrading complete
+  server capture; supplied API sidecars are rejected by the viewer.
 - Source presentation distinguishes server-owned SSAT/page-bids/auction API
   facts from browser-observed publisher refresh, Prebid refresh, competing, and
   unattributed request paths. No fixture turns intent or a GPT fill into a
@@ -1413,7 +1580,12 @@ results, never a prerequisite for returning them.
   fixture.
 - Same-tab navigation occurs only after a successful write.
 - Viewer handles absent optional network facts and every cookie-health state.
-- Forbidden fields never enter storage or export fixtures.
+- Populate every excluded `adManager` field, `previousCreativeId`, slot
+  `slotElementId`/`adUnitPath`, and callback/attribution issue `slotElementId`
+  with distinct sentinel values, including a synthetic secret-bearing path.
+  Verify none enter trace HTML, storage, copy/share, or direct export; hostile
+  stored copies containing any excluded property are rejected. Numbered
+  slot/cycle correlation still joins after redaction.
 - Download filename and MIME type are deterministic.
 - Formatted-JSON copy and JSON-file Web Share success, rejection, absence, and
   download/copy fallback behavior.
@@ -1440,7 +1612,7 @@ results, never a prerequisite for returning them.
   transport fixtures preserve ad initialization while reporting `not_observed`.
 - `View trace results` navigates in the same tab and renders the captured
   request context and slot evidence.
-- A correlated fixture renders the chain `server auction -> GPT -> creative`,
+- A correlated SSAT/SPA fixture renders the chain `server auction -> GPT -> creative`,
   while unmatched server, client-side refresh, competing, and transport-failure
   fixtures show honest independent evidence and `Unknown` where appropriate.
 - Empty, filled, ambiguous, no-candidate, and unattributed slot states remain
@@ -1468,8 +1640,10 @@ results, never a prerequisite for returning them.
 - Inactive publisher traffic has no trace assets, storage access, listeners, or
   cache-policy change, diagnostic token generation, or trace-auction response
   extension.
-- Disabling `trace_page_enabled` removes every new capture behavior even when a
-  technical `?ts_console=1` session leaves a valid diagnostics cookie present.
+- After disabling `trace_page_enabled`, a fresh publisher load removes every
+  new capture behavior even when a technical `?ts_console=1` session leaves a
+  valid diagnostics cookie present. Already-loaded documents cannot be remotely
+  deactivated, but subsequent server responses contain no trace evidence.
 
 ### 14.5 Manual acceptance
 
@@ -1500,12 +1674,17 @@ observed`, `GPT filled/rendered`, and `Unknown` without understanding internal
 
 ## 16. Acceptance criteria
 
-1. With the feature disabled, trace-route origin requests return local `404`
-   and ordinary traffic is unchanged. Previously cached inert versioned assets
+1. With the feature disabled, trace-route origin requests that pass configured
+   authentication return local `404`
+   and ordinary requests without explicit diagnostics activation are unchanged.
+   Query activation adopts the shared cookie lifetime in section 5.2.
+   Previously cached inert versioned assets
    may remain until cache eviction, but cannot activate tracing or load a shell.
-2. A mobile user can enable tracing by opening only `/_ts/trace` and selecting
+2. On a deployment whose authentication rules leave trace routes public, a
+   mobile user can enable tracing by opening only `/_ts/trace` and selecting
    one prominent action; no target URL, credentials, or trace ID is required,
-   and a cross-site GET cannot activate tracing.
+   and a cross-site GET cannot activate tracing. Matching operator auth rules
+   remain enforced on all trace paths.
 3. The setup page accurately explains that the problem must be reproduced after
    activation.
 4. A subsequent real publisher-page reload captures redacted request context,
@@ -1552,7 +1731,8 @@ This design is one product flow, but its implementation is split into four
 independently reviewable plans and preferably four PRs:
 
 1. **Reserved route and privacy foundation:** configuration, shared early-route
-   classification, same-origin enable/end lifecycle, bounded cookie-health
+   classification with operator authentication, same-origin enable/end lifecycle,
+   shared 30-minute endpoint/query cookie policy, bounded cookie-health
    inspection, base request-context schema, projection of already populated
    `ClientInfo`/`GeoInfo` fields, response hardening, and adapter parity. Do not
    add speculative new platform fields in this change.
@@ -1593,9 +1773,11 @@ target validation and open-redirect risk, and is unsuitable for a layperson.
 
 ### Basic Authentication
 
-Rejected for the mobile end-user workflow. Authentication also would not make
-it safe to inject raw secrets into a publisher page containing third-party
-JavaScript.
+Rejected as a new mandatory prerequisite for the mobile end-user workflow.
+Existing operator authentication rules remain enforced; deployment configuration
+must leave trace routes public to offer the credential-free journey.
+Authentication also would not make it safe to inject raw secrets into a
+publisher page containing third-party JavaScript.
 
 ### Server-managed trace sessions
 
@@ -1651,6 +1833,9 @@ length, history, logging, referrer, and accidental-sharing risks.
 - `/auction` evidence requires the TSJS request to reach the same Trusted Server
   host with the active diagnostics cookie. A custom cross-origin auction
   endpoint does not inherit this trace session and is shown as unavailable.
+- Version one has no GPT correlation for `/auction`: the Prebid caller lacks
+  a token-bearing GPT binding, and direct `requestAds` renders outside GPT.
+  Their server evidence is displayed independently with correlation unavailable.
 - Exact-token correlation can remain unavailable for hidden, unresolved,
   competing, or independently initiated GPT cycles. The report preserves both
   sides instead of guessing.
