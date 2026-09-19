@@ -6,6 +6,8 @@
 
 mod support_origin;
 
+use std::io::Write as _;
+
 use support_origin::{FixtureResponse, FixtureServer};
 
 fn fetch(url: &str) -> String {
@@ -253,8 +255,6 @@ fn an_rsc_varying_origin_fails_the_rsc_axis() {
 
 #[test]
 fn gzip_and_identity_are_compared_after_decoding() {
-    use std::io::Write as _;
-
     let server = FixtureServer::start(|request| {
         let body = "<html>same document either way</html>";
         let wants_gzip = request
@@ -523,33 +523,34 @@ fn an_admission_cookie_lets_the_probe_reach_real_content() {
 }
 
 #[test]
-fn an_axis_the_origin_declares_in_vary_is_not_a_failure() {
-    // Measured against a real origin: it declared `Vary: accept-encoding, rsc` and varied
-    // on both, exactly as it should, and the probe failed it for doing so. A declared
-    // signal is part of the cache key, so each value gets its own stored object.
+fn decoded_encoding_differences_fail_even_when_vary_declares_encoding() {
     let server = FixtureServer::start(|request| {
-        let gzip = request
-            .header("accept-encoding")
-            .is_some_and(|value| value.contains("gzip"));
-        FixtureResponse::html(if gzip {
-            "<html>compressed variant</html>"
-        } else {
-            "<html>identity variant</html>"
-        })
-        .with_header("cache-control", "public, max-age=300")
-        .with_header("vary", "Accept-Encoding")
+        let mut response = FixtureResponse::html("<html>identity document</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("vary", "Accept-Encoding");
+        if request.header("accept-encoding") == Some("gzip") {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(b"<html>different document</html>")
+                .expect("should gzip the variant");
+            response = response
+                .with_header("content-encoding", "gzip")
+                .with_body(encoder.finish().expect("should finish gzip"));
+        }
+        response
     });
 
     let (ok, report) = probe(&server, json_args(&server));
 
     assert!(
-        ok,
-        "an origin that declares what it varies on must pass: {}",
-        report.render_text()
+        !ok,
+        "should reject different decoded documents for the template cache"
     );
-    let axis = axis(&report, "accept-encoding");
-    assert!(axis.differs(), "the arms did differ");
-    assert!(axis.passed(), "but the origin declared it, so it is keyed");
+    assert!(
+        !axis(&report, "accept-encoding").passed(),
+        "should keep encoding differences blocking"
+    );
 }
 
 #[test]
@@ -598,4 +599,241 @@ fn vary_cookie_does_not_excuse_the_cookie_axis() {
         "a cookie-varying origin must not read as cookie-independent"
     );
     assert!(!axis(&report, "cookie").passed());
+}
+
+#[test]
+fn every_sample_is_checked_for_unsafe_headers() {
+    for (header, value, expected_verdict) in [
+        ("x-cache", "HIT", "fronting-cache"),
+        ("set-cookie", "session=example-session", "set-cookie"),
+        ("cache-control", "private", "freshness"),
+        (
+            "content-security-policy",
+            "script-src 'nonce-example'",
+            "csp-nonce",
+        ),
+    ] {
+        for on_repeat in [true, false] {
+            let server = FixtureServer::start(move |request| {
+                let response = FixtureResponse::html("<html>stable</html>")
+                    .with_header("cache-control", "public, max-age=300");
+                let unsafe_sample = if on_repeat {
+                    request.request_index == 1
+                } else {
+                    request.header("accept-encoding") == Some("gzip")
+                };
+                if unsafe_sample {
+                    response.with_header(header, value)
+                } else {
+                    response
+                }
+            });
+
+            let (ok, report) = probe(&server, json_args(&server));
+
+            assert!(
+                !ok,
+                "should reject {header} on a later sample (repeat={on_repeat})"
+            );
+            assert!(
+                !verdict(&report, expected_verdict).passed,
+                "should report the unsafe header"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_non_success_variant_cannot_pass_with_an_identical_body() {
+    let server = FixtureServer::start(|request| {
+        FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_status(if request.header("rsc").is_some() {
+                403
+            } else {
+                200
+            })
+    });
+    let mut out = Vec::new();
+
+    let outcome = run(
+        OriginCommand::ProbeShareability(json_args(&server)),
+        &mut out,
+    );
+
+    assert!(
+        outcome.is_err(),
+        "should reject a non-200 variant even when its body matches"
+    );
+}
+
+#[test]
+fn configured_headers_are_not_excused_by_vary_rsc() {
+    let server = FixtureServer::start(|request| {
+        FixtureResponse::html(if request.header("x-layout").is_some() {
+            "<html>alternate</html>"
+        } else {
+            "<html>default</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+        .with_header("vary", "rsc")
+    });
+    let mut args = json_args(&server);
+    args.vary_header = vec!["x-layout".to_owned()];
+
+    let (ok, report) = probe(&server, args);
+
+    assert!(
+        !ok,
+        "should reject an undeclared custom signal even with Vary: rsc"
+    );
+    assert!(
+        !axis(&report, "x-layout").passed(),
+        "should identify the actual varying header"
+    );
+}
+
+#[test]
+fn a_variant_must_declare_its_own_vary_coverage() {
+    let server = FixtureServer::start(|request| {
+        if request.header("rsc").is_some() {
+            FixtureResponse::html("<html>flight</html>")
+                .with_header("cache-control", "public, max-age=300")
+        } else {
+            FixtureResponse::html("<html>document</html>")
+                .with_header("cache-control", "public, max-age=300")
+                .with_header("vary", "rsc")
+        }
+    });
+
+    let (ok, _) = probe(&server, json_args(&server));
+
+    assert!(!ok, "should require Vary coverage on both representations");
+}
+
+#[test]
+fn the_mobile_axis_reaches_a_recognizable_mobile_browser_variant() {
+    let server = FixtureServer::start(|request| {
+        let mobile = request
+            .header("user-agent")
+            .is_some_and(|agent| agent.contains("iPhone") || agent.contains("Android"));
+        FixtureResponse::html(if mobile {
+            "<html>mobile</html>"
+        } else {
+            "<html>desktop</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+    });
+
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok, "should discover undeclared mobile document variation");
+    assert!(
+        !axis(&report, "user-agent").passed(),
+        "should test a recognizable mobile browser"
+    );
+}
+
+#[test]
+fn declared_custom_signals_are_probed_independently_without_duplicate_axes() {
+    let server = FixtureServer::start(|request| {
+        FixtureResponse::html(format!(
+            "<html>rsc={} layout={}</html>",
+            request.header("rsc").unwrap_or("absent"),
+            request.header("x-layout").unwrap_or("absent")
+        ))
+        .with_header("cache-control", "public, max-age=300")
+        .with_header("vary", "rsc, x-layout")
+    });
+    let mut args = json_args(&server);
+    args.vary_header = [
+        "X-Layout",
+        "x-layout",
+        "RSC",
+        "Cookie",
+        "Accept-Encoding",
+        "User-Agent",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+
+    let (ok, report) = probe(&server, args);
+
+    assert!(
+        ok,
+        "should accept independently declared signals: {}",
+        report.render_text()
+    );
+    assert!(
+        axis(&report, "rsc").differs(),
+        "should vary RSC independently"
+    );
+    assert!(
+        axis(&report, "x-layout").differs(),
+        "should vary the configured signal independently"
+    );
+    assert_eq!(
+        server.request_count(),
+        8,
+        "should sample each signal independently and the configured header with RSC"
+    );
+}
+
+#[test]
+fn unsafe_headers_are_still_checked_after_self_identity_first_differs() {
+    let server = FixtureServer::start(|request| {
+        let response = FixtureResponse::html(format!("<html>{}</html>", request.request_index))
+            .with_header("cache-control", "public, max-age=300");
+        if request.request_index == 2 {
+            response.with_header("set-cookie", "session=example-session")
+        } else {
+            response
+        }
+    });
+    let mut args = json_args(&server);
+    args.repeat = 3;
+
+    let (ok, report) = probe(&server, args);
+
+    assert!(!ok, "should reject unstable responses");
+    assert!(
+        !axis(&report, "self-identity").passed(),
+        "should retain the first body difference"
+    );
+    assert!(
+        !verdict(&report, "set-cookie").passed,
+        "should inspect headers after the first mismatch"
+    );
+    assert_eq!(
+        server.request_count(),
+        8,
+        "should complete every requested sample"
+    );
+}
+
+#[test]
+fn configured_headers_are_also_compared_with_rsc_held_constant() {
+    let server = FixtureServer::start(|request| {
+        let variant = request.header("rsc").is_some() && request.header("x-layout").is_some();
+        FixtureResponse::html(if variant {
+            "<html>alternate flight</html>"
+        } else {
+            "<html>default</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+        .with_header("vary", "rsc")
+    });
+    let mut args = json_args(&server);
+    args.vary_header = vec!["x-layout".to_owned()];
+
+    let (ok, report) = probe(&server, args);
+
+    assert!(
+        !ok,
+        "should discover undeclared variation within an RSC representation"
+    );
+    assert!(
+        !axis(&report, "x-layout").passed(),
+        "should attribute the difference to the configured header"
+    );
 }

@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::commands::cache::{ADMIN_PASSWORD_ENVIRONMENT_VARIABLE, PurgeArgs};
 use crate::error::{CliResult, cli_error};
 
@@ -26,13 +28,21 @@ fn purge_endpoint(service: &str) -> String {
     format!("{}{PURGE_PATH}", service.trim_end_matches('/'))
 }
 
+/// The acknowledgment returned by the purge endpoint.
+#[derive(Deserialize)]
+struct PurgeAcknowledgment {
+    purged: bool,
+    scope: String,
+    surrogate_key: Option<String>,
+}
+
 /// Execute `ts cache purge`.
 ///
 /// # Errors
 ///
 /// Returns an error when no scope is given, the admin password is missing from the
 /// environment, the service cannot be reached, or the service answers with a non-success
-/// status.
+/// status, redirects, or does not acknowledge the requested purge scope.
 pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<()> {
     let body = request_body(args)?;
 
@@ -56,6 +66,7 @@ pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<(
     let (status, response_body) = runtime.block_on(async {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| format!("failed to build the HTTP client: {error}"))?;
         let response = client
@@ -67,11 +78,30 @@ pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<(
             .await
             .map_err(|error| format!("could not reach {endpoint}: {error}"))?;
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("could not read the purge acknowledgment: {error}"))?;
         Ok::<_, String>((status, text))
     })?;
 
     if status.is_success() {
+        let acknowledgment: PurgeAcknowledgment = serde_json::from_str(&response_body)
+            .map_err(|error| format!("invalid purge acknowledgment: {error}"))?;
+        let expected_scope = if args.all { "all" } else { "url" };
+        if !acknowledgment.purged || acknowledgment.scope != expected_scope {
+            return cli_error(format!(
+                "service did not acknowledge a successful {expected_scope} purge"
+            ));
+        }
+        if !args.all
+            && acknowledgment
+                .surrogate_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            return cli_error("URL purge acknowledgment is missing its surrogate key");
+        }
         writeln!(out, "{response_body}")
             .map_err(|error| format!("failed to write the purge result: {error}"))?;
         return Ok(());

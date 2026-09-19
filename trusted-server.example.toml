@@ -361,8 +361,10 @@ auction_timeout_ms = 500
 # refused.
 # origin_is_cookie_independent = false
 #
-# Lets the platform's own cache hold the publisher origin's responses, instead of
-# forcing every origin fetch to miss. A DIFFERENT cache from the template cache
+# Applies shareability checks to the platform's origin cache. Default false keeps
+# the existing policy: ad-serving requests bypass; other publisher requests use
+# the platform default. True admits shareable ad requests and bypasses unshareable
+# non-ad requests. A DIFFERENT cache from the template cache
 # above, and a weaker one: the decision is made before the origin replies, so
 # none of the template cache's response-side refusals (`Set-Cookie`, CSP nonce,
 # missing freshness) apply. `ts origin probe-shareability` must pass on every

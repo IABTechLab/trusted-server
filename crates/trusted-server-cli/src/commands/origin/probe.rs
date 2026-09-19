@@ -18,10 +18,8 @@ const TS_COOKIES: &[&str] = &[
     "ts-tester=probe",
 ];
 
-const DESKTOP_USER_AGENT: &str =
-    "FictionalBrowser/123.4 (FictionalOS 10.2; FictionalDesktop) ExampleRenderer/567.8";
-const MOBILE_USER_AGENT: &str =
-    "FictionalBrowser/123.4 (FictionalPhone; FictionalMobileOS 17.0) ExampleRenderer/567.8";
+const DESKTOP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+const MOBILE_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -125,54 +123,122 @@ async fn probe_one(
         ));
     }
 
-    let mut axes = Vec::new();
-    axes.push(self_identity_axis(client, url, &baseline, repeat, admission_cookie).await?);
-    axes.push(
-        compare_axis(
-            client,
-            url,
-            &baseline,
+    let (self_identity, repeated) =
+        self_identity_axis(client, url, &baseline, repeat, admission_cookie).await?;
+    let mut axes = vec![self_identity];
+    let mut samples: Vec<(String, Fetched)> = repeated
+        .into_iter()
+        .enumerate()
+        .map(|(index, response)| (format!("self-identity repeat {}", index + 1), response))
+        .collect();
+
+    let mut rsc_body = Vec::new();
+    for (name, description, value) in [
+        (
             "cookie",
             "bare vs. a representative cookie jar",
-            Arm {
-                headers: &[("cookie", cookie_jar.as_str())],
-            },
-            admission_cookie,
-        )
-        .await?,
-    );
-    axes.push(
-        compare_axis(
-            client,
-            url,
-            &baseline,
+            cookie_jar.as_str(),
+        ),
+        (
             "accept-encoding",
             "identity vs. gzip, compared after decoding",
-            Arm {
-                headers: &[("accept-encoding", "gzip")],
-            },
-            admission_cookie,
-        )
-        .await?,
-    );
-    axes.push(
-        compare_axis(
-            client,
-            url,
-            &baseline,
+            "gzip",
+        ),
+        (
             "user-agent",
             "desktop vs. mobile user agent",
+            MOBILE_USER_AGENT,
+        ),
+        ("rsc", "bare vs. an RSC request", "1"),
+    ] {
+        let (axis, mut response) = compare_axis(
+            client,
+            url,
+            &baseline.body,
+            name,
+            description,
             Arm {
-                headers: &[("user-agent", MOBILE_USER_AGENT)],
+                headers: &[(name, value)],
             },
             admission_cookie,
         )
-        .await?,
-    );
-    axes.push(rsc_axis(client, url, &baseline, vary_headers, admission_cookie).await?);
+        .await?;
+        if name == "rsc" {
+            rsc_body = std::mem::take(&mut response.body);
+        } else {
+            response.body = Vec::new();
+        }
+        axes.push(axis);
+        samples.push((name.to_owned(), response));
+    }
 
-    mark_axes_covered_by_vary(&baseline, &mut axes);
-    let verdicts = judge_headers(&baseline, &axes);
+    // Each configured signal needs its own comparison and Vary declaration. Combining
+    // these with RSC lets Vary: rsc hide a difference caused by an unrelated header.
+    for name in vary_headers {
+        let name = name.to_ascii_lowercase();
+        if axes.iter().any(|axis| axis.name == name) {
+            continue;
+        }
+        let description = format!("bare vs. {name}: 1");
+        let (mut axis, mut response) = compare_axis(
+            client,
+            url,
+            &baseline.body,
+            &name,
+            &description,
+            Arm {
+                headers: &[(name.as_str(), "1")],
+            },
+            admission_cookie,
+        )
+        .await?;
+        response.body = Vec::new();
+        samples.push((name.clone(), response));
+
+        // Some signals only affect flight responses. Hold RSC constant so the
+        // configured header still owns its difference and needs its own Vary entry.
+        let (rsc_axis, mut response) = compare_axis(
+            client,
+            url,
+            &rsc_body,
+            &name,
+            &description,
+            Arm {
+                headers: &[("rsc", "1"), (name.as_str(), "1")],
+            },
+            admission_cookie,
+        )
+        .await?;
+        if axis.difference.is_none() && rsc_axis.differs() {
+            axis.difference = rsc_axis.difference;
+            axis.description = format!("RSC request vs. RSC with {name}: 1");
+        }
+        response.body = Vec::new();
+        samples.push((format!("{name} with RSC"), response));
+        axes.push(axis);
+    }
+
+    let mut baseline = baseline;
+    baseline.body = Vec::new();
+    samples.insert(0, ("baseline".to_owned(), baseline));
+    mark_axes_covered_by_vary(&samples, &mut axes);
+    let mut verdicts = judge_headers(&samples[0].1, &axes);
+    for (label, sample) in &samples {
+        for checked in judge_headers(sample, &axes) {
+            if !checked.passed {
+                let verdict = verdicts
+                    .iter_mut()
+                    .find(|verdict| verdict.name == checked.name)
+                    .expect("should find every response verdict");
+                if verdict.passed {
+                    *verdict = VerdictResult {
+                        detail: format!("{label}: {}", checked.detail),
+                        ..checked
+                    };
+                }
+            }
+        }
+    }
 
     Ok(UrlReport {
         url: url.to_owned(),
@@ -181,139 +247,91 @@ async fn probe_one(
     })
 }
 
-/// Record whether the origin declares each axis's header in `Vary`.
+/// Only excuse a varying signal when every sampled response declares it.
 ///
-/// A declared signal is part of the platform's cache key, so each value gets its own
-/// stored object and a difference between the arms is correct behaviour rather than a
-/// hazard. Without this, every origin that honestly declares `Vary: Accept-Encoding` —
-/// which is most of them — failed that axis for doing the right thing, and an origin
-/// declaring `Vary: rsc` failed the RSC axis the same way.
-///
-/// Self-identity is excluded: it varies no request signal, so no `Vary` can key it, and a
-/// page unstable against itself cannot be shared however it is keyed.
-fn mark_axes_covered_by_vary(baseline: &Fetched, axes: &mut [AxisResult]) {
-    let declared: Vec<String> = baseline
-        .all("vary")
-        .iter()
-        .flat_map(|value| value.split(','))
-        .map(|name| name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty())
-        .collect();
-
-    for axis in axes.iter_mut() {
-        // Self-identity varies no request signal, so no `Vary` can key it, and a page
-        // unstable against itself cannot be shared however it is keyed.
-        //
-        // Cookie is excluded for a different reason. `Vary: Cookie` would be keyed by a
-        // conforming cache, so it is not unsafe — but this axis answers "does the origin
-        // ignore cookies", and an origin declaring `Vary: Cookie` is saying the opposite.
-        // Passing it would print a green verdict whose own closing line reads "Do not
-        // enable origin_is_cookie_independent", and would contradict the template cache,
-        // which refuses `Vary: Cookie` outright at runtime
-        // (`TemplateCacheBypassReason::VaryCookie`). A near-zero hit rate is also not a
-        // result worth telling an operator to go and configure.
-        if axis.name == "self-identity" || axis.name == "cookie" {
+/// Cookie independence and decoded encoding identity are template-cache prerequisites,
+/// regardless of Vary. Self-identity varies no request signal at all.
+fn mark_axes_covered_by_vary(samples: &[(String, Fetched)], axes: &mut [AxisResult]) {
+    for axis in axes {
+        if matches!(
+            axis.name.as_str(),
+            "self-identity" | "cookie" | "accept-encoding"
+        ) {
             continue;
         }
-        axis.covered_by_vary = declared
-            .iter()
-            .any(|declared| *declared == axis.name || declared == "*");
+        axis.covered_by_vary = samples.iter().all(|(_, response)| {
+            response
+                .all("vary")
+                .iter()
+                .flat_map(|value| value.split(','))
+                .any(|name| name.trim().eq_ignore_ascii_case(&axis.name) || name.trim() == "*")
+        });
     }
 }
 
-/// An origin that is not stable against itself cannot be shared on any axis.
-///
-/// Runs first, and is reported as its own axis, because a per-request timestamp or CSRF
-/// nonce would otherwise surface as a spurious failure on whichever axis happened to run
-/// next — sending the operator after the wrong thing.
+/// Compare every repeat, keeping the first difference and inspecting all later headers.
 async fn self_identity_axis(
     client: &reqwest::Client,
     url: &str,
     baseline: &Fetched,
     repeat: u32,
     admission_cookie: Option<&str>,
-) -> CliResult<AxisResult> {
+) -> CliResult<(AxisResult, Vec<Fetched>)> {
+    let mut difference = None;
+    let mut samples = Vec::new();
     for _ in 0..repeat.max(1) {
-        let again = fetch(client, url, &[], admission_cookie).await?;
-        if let Some(difference) = first_difference(&baseline.body, &again.body) {
-            return Ok(AxisResult {
-                name: "self-identity".to_owned(),
-                description: format!("the same request {} times", repeat.max(1) + 1),
-                difference: Some(difference),
-                covered_by_vary: false,
-            });
+        let mut again = fetch(client, url, &[], admission_cookie).await?;
+        if difference.is_none() {
+            difference = first_difference(&baseline.body, &again.body);
         }
+        // Only response metadata is needed after comparison; do not retain a page body
+        // per repeat or per variant.
+        again.body = Vec::new();
+        samples.push(again);
     }
-    Ok(AxisResult {
-        name: "self-identity".to_owned(),
-        description: format!("the same request {} times", repeat.max(1) + 1),
-        difference: None,
-        covered_by_vary: false,
-    })
-}
-
-/// RSC fetches already flow through the readthrough cache while HTML navigations are
-/// passed, so removing the bypass puts both representations under one cache key for the
-/// first time. An origin that varies on these without declaring it can serve a flight
-/// payload to an HTML navigation.
-async fn rsc_axis(
-    client: &reqwest::Client,
-    url: &str,
-    baseline: &Fetched,
-    vary_headers: &[String],
-    admission_cookie: Option<&str>,
-) -> CliResult<AxisResult> {
-    let mut headers: Vec<(&str, &str)> = vec![("rsc", "1")];
-    for name in vary_headers {
-        if name.eq_ignore_ascii_case("rsc") || name.eq_ignore_ascii_case("accept-encoding") {
-            continue;
-        }
-        headers.push((name.as_str(), "1"));
-    }
-    let description = format!(
-        "bare vs. rsc plus {}",
-        if vary_headers.is_empty() {
-            "no configured vary headers".to_owned()
-        } else {
-            vary_headers.join(", ")
-        }
-    );
-
-    let varied = fetch(client, url, &headers, admission_cookie).await?;
-    Ok(AxisResult {
-        name: "rsc".to_owned(),
-        description,
-        difference: first_difference(&baseline.body, &varied.body),
-        covered_by_vary: false,
-    })
+    Ok((
+        AxisResult {
+            name: "self-identity".to_owned(),
+            description: format!("the same request {} times", repeat.max(1) + 1),
+            difference,
+            covered_by_vary: false,
+        },
+        samples,
+    ))
 }
 
 async fn compare_axis(
     client: &reqwest::Client,
     url: &str,
-    baseline: &Fetched,
+    baseline_body: &[u8],
     name: &str,
     description: &str,
     arm: Arm<'_>,
     admission_cookie: Option<&str>,
-) -> CliResult<AxisResult> {
+) -> CliResult<(AxisResult, Fetched)> {
     let varied = fetch(client, url, arm.headers, admission_cookie).await?;
-    Ok(AxisResult {
+    let axis = AxisResult {
         name: name.to_owned(),
         description: description.to_owned(),
-        difference: first_difference(&baseline.body, &varied.body),
+        difference: first_difference(baseline_body, &varied.body),
         covered_by_vary: false,
-    })
+    };
+    Ok((axis, varied))
 }
 
-/// The four response-header checks, all blocking.
-fn judge_headers(baseline: &Fetched, axes: &[AxisResult]) -> Vec<VerdictResult> {
+/// Response checks applied to every sample, all blocking.
+fn judge_headers(response: &Fetched, axes: &[AxisResult]) -> Vec<VerdictResult> {
     vec![
-        fronting_cache_verdict(baseline),
-        freshness_verdict(baseline),
-        set_cookie_verdict(baseline),
-        csp_nonce_verdict(baseline),
-        vary_coverage_verdict(baseline, axes),
+        VerdictResult {
+            name: "status".to_owned(),
+            passed: response.status == 200,
+            detail: format!("response status: {}", response.status),
+        },
+        fronting_cache_verdict(response),
+        freshness_verdict(response),
+        set_cookie_verdict(response),
+        csp_nonce_verdict(response),
+        vary_coverage_verdict(response, axes),
     ]
 }
 

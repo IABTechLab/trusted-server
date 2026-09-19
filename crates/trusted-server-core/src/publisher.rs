@@ -4113,16 +4113,21 @@ fn apply_origin_cache_intent(
     request: PlatformHttpRequest,
     readthrough_enabled: bool,
     origin_response_is_shareable: bool,
+    should_run_ad_stack: bool,
 ) -> PlatformHttpRequest {
-    // Two separate questions, deliberately not folded into one.
-    // `origin_response_is_shareable` is a property of the request; `readthrough_enabled`
-    // is an operator's assertion about the origin. The predicate is recorded on telemetry
-    // either way, so an operator can see how much traffic the gate *would* admit before
-    // turning it on.
-    if readthrough_enabled && origin_response_is_shareable {
-        request
+    // With the opt-in disabled, preserve the existing policy: ad-serving requests
+    // bypass and other publisher requests use the platform default. Enabling the flag
+    // replaces that policy with request shareability, both widening eligible ad traffic
+    // and tightening non-ad traffic that carries disqualifying reader state.
+    let bypass = if readthrough_enabled {
+        !origin_response_is_shareable
     } else {
+        should_run_ad_stack
+    };
+    if bypass {
         request.with_cache_bypass()
+    } else {
+        request
     }
 }
 
@@ -4531,13 +4536,13 @@ pub async fn handle_publisher_request(
         })?;
         let mut platform_request =
             PlatformHttpRequest::new(origin_req, backend_name.clone()).with_stream_response();
-        // Bypass only what cannot be shared. `should_run_ad_stack` used to decide this,
-        // which asked the wrong question: whether this request runs an auction says
-        // nothing about whether the *origin's* response may be held in a shared cache.
+        // Apply the opt-in shareability policy, or preserve the existing ad-stack
+        // bypass policy when readthrough is disabled.
         platform_request = apply_origin_cache_intent(
             platform_request,
             origin_readthrough_enabled,
             origin_response_is_shareable,
+            should_run_ad_stack,
         );
         pending_origin = Some(
             services
@@ -4840,13 +4845,13 @@ pub async fn handle_publisher_request(
         if services.http_client().supports_streaming_responses() {
             platform_request = platform_request.with_stream_response();
         }
-        // Bypass only what cannot be shared. `should_run_ad_stack` used to decide this,
-        // which asked the wrong question: whether this request runs an auction says
-        // nothing about whether the *origin's* response may be held in a shared cache.
+        // Apply the opt-in shareability policy, or preserve the existing ad-stack
+        // bypass policy when readthrough is disabled.
         platform_request = apply_origin_cache_intent(
             platform_request,
             origin_readthrough_enabled,
             origin_response_is_shareable,
+            should_run_ad_stack,
         );
         services.http_client().send(platform_request).await
     };
@@ -10059,34 +10064,96 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn disabled_readthrough_preserves_non_ad_origin_caching() {
+            for without_creative_config in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services =
+                    services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+                let mut settings = settings_with_mode("inline");
+                if without_creative_config {
+                    settings.creative_opportunities = None;
+                }
+                let settings = Arc::new(settings);
+                stub.push_response_with_headers(
+                    200,
+                    b"body {}".to_vec(),
+                    vec![
+                        ("content-type", "text/css"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+                let request = HttpRequest::builder()
+                    .uri("https://ts.example.com/style.css")
+                    .header(header::HOST, "ts.example.com")
+                    .body(EdgeBody::empty())
+                    .expect("should build an asset request");
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Default],
+                    "should preserve existing subresource caching with unchanged settings"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_readthrough_preserves_non_ad_preload_caching() {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+            stub.set_pending_streaming_responses_supported(true);
+            let settings = Arc::new(settings_with_mode("inline"));
+            queue_shareable_html(&stub);
+
+            run_through_ec_preload(&settings, &services, prefetch_navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "should preserve existing non-ad caching through EC preload"
+            );
+        }
+
         #[test]
         fn both_origin_fetch_paths_share_one_cache_decision() {
             // Guards the divergence rather than one of its symptoms. The two fetch paths
             // are alternatives for the same request, and a test can only reach the
             // EC-preload one with a valid signed EC id, so the protection here is that
             // neither path decides for itself: both call this, and this is pure.
-            let intent = |readthrough_enabled, shareable| {
-                apply_origin_cache_intent(
-                    PlatformHttpRequest::new(
-                        HttpRequest::builder()
-                            .body(EdgeBody::empty())
-                            .expect("should build request"),
-                        "backend",
-                    ),
-                    readthrough_enabled,
-                    shareable,
-                )
-                .cache_intent
-            };
-
-            assert_eq!(intent(true, true), PlatformCacheIntent::Default);
-            assert_eq!(intent(true, false), PlatformCacheIntent::Bypass);
-            assert_eq!(
-                intent(false, true),
-                PlatformCacheIntent::Bypass,
-                "a shareable request must still bypass while readthrough is switched off"
-            );
-            assert_eq!(intent(false, false), PlatformCacheIntent::Bypass);
+            for readthrough_enabled in [false, true] {
+                for shareable in [false, true] {
+                    for ad_stack in [false, true] {
+                        let request = PlatformHttpRequest::new(
+                            HttpRequest::builder()
+                                .body(EdgeBody::empty())
+                                .expect("should build request"),
+                            "backend",
+                        );
+                        let expected = if if readthrough_enabled {
+                            !shareable
+                        } else {
+                            ad_stack
+                        } {
+                            PlatformCacheIntent::Bypass
+                        } else {
+                            PlatformCacheIntent::Default
+                        };
+                        assert_eq!(
+                            apply_origin_cache_intent(
+                                request,
+                                readthrough_enabled,
+                                shareable,
+                                ad_stack
+                            )
+                            .cache_intent,
+                            expected,
+                            "should preserve legacy policy unless opted in (enabled={readthrough_enabled}, shareable={shareable}, ad_stack={ad_stack})"
+                        );
+                    }
+                }
+            }
         }
 
         #[tokio::test]
@@ -10205,7 +10272,7 @@ mod tests {
                     let mut request = navigation_request();
                     request
                         .headers_mut()
-                        .insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"tag\""));
+                        .insert(header::IF_MATCH, HeaderValue::from_static("\"tag\""));
                     request
                 }),
             ] {
@@ -10215,7 +10282,7 @@ mod tests {
                     Arc::new(MemoryTemplateCache::default()),
                     Arc::new(RecordingTelemetrySink::default()),
                 );
-                let settings = Arc::new(settings_with_mode("esi"));
+                let settings = Arc::new(settings_with_readthrough_enabled("esi"));
                 queue_shareable_html(&stub);
 
                 let _ = run(&settings, &services, request).await;
@@ -10239,7 +10306,7 @@ mod tests {
                 Arc::new(MemoryTemplateCache::default()),
                 Arc::new(RecordingTelemetrySink::default()),
             );
-            let settings = Arc::new(settings_with_mode("esi"));
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
             queue_shareable_html(&stub);
 
             let _ = run(&settings, &services, {
@@ -14895,9 +14962,8 @@ mod tests {
             // Assert
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Bypass],
-                "a Range/If-Range request is not shareable, so it now bypasses where it \
-                 previously did not",
+                vec![PlatformCacheIntent::Default],
+                "should preserve platform caching for non-ad requests while readthrough is disabled",
             );
             let recorded_requests = stub.recorded_request_headers();
             let outbound_headers = recorded_requests
@@ -15001,10 +15067,8 @@ mod tests {
             // Assert
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Bypass],
-                "the conditional request headers make this unshareable, so it bypasses \
-                 regardless of whether ad templates are enabled — the bypass no longer \
-                 tracks the ad stack"
+                vec![PlatformCacheIntent::Default],
+                "should preserve platform caching with disabled ad templates and readthrough"
             );
             assert_eq!(
                 response_head
@@ -15537,9 +15601,8 @@ mod tests {
             }
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Bypass],
-                "a conditional navigation is not shareable, so it now bypasses where it \
-                 previously did not"
+                vec![PlatformCacheIntent::Default],
+                "should preserve platform revalidation for non-ad requests with readthrough disabled"
             );
             let recorded_requests = stub.recorded_request_headers();
             let outbound_headers = recorded_requests

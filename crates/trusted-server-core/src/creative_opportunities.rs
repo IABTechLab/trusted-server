@@ -358,10 +358,10 @@ pub struct CreativeOpportunitiesConfig {
     /// Whether this origin's responses may be held in the platform's shared readthrough
     /// cache.
     ///
-    /// Unset or `false` forces every publisher-origin fetch to bypass that cache, which
-    /// is today's shipped behavior. Setting `true` stops forcing a MISS for requests that
-    /// are judged shareable — the latency this exists to recover, and the only change on
-    /// this path with cross-reader blast radius.
+    /// Unset or `false` preserves the existing policy: ad-serving requests bypass the
+    /// cache, while other publisher requests retain the platform default. Setting `true`
+    /// uses request shareability instead: eligible ad-serving requests may use the cache,
+    /// and ineligible non-ad requests bypass it.
     ///
     /// **This flag is the whole opt-in.** Unlike
     /// [`Self::origin_is_cookie_independent`], which only ever applies to cookie-bearing
@@ -374,7 +374,8 @@ pub struct CreativeOpportunitiesConfig {
     ///
     /// Verify with `ts origin probe-shareability` before setting this.
     ///
-    /// Rollback is the config flip alone, and it is not retroactive: readthrough objects
+    /// Setting this back to `false` restores the existing ad-stack bypass policy, not
+    /// a global cache bypass. Rollback is not retroactive: readthrough objects
     /// carry no surrogate key, so neither `ts cache purge` nor the admin endpoint can
     /// reach them — those cover the template cache only. Already-stored objects age out
     /// on the origin's TTL. Treat enablement as one-way for that long.

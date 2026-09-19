@@ -28,12 +28,10 @@ pub struct AxisResult {
     pub description: String,
     /// `None` when the arms matched.
     pub difference: Option<Difference>,
-    /// Whether the origin declares this axis's header in its `Vary`.
+    /// Whether every sample declares this signal in `Vary` and that permits variation.
     ///
-    /// A declared signal is part of the cache key, so the platform stores a separate
-    /// object per value and a difference between the arms is correct behaviour rather
-    /// than a hazard. Undeclared variance is the hazard, and the `vary-coverage` verdict
-    /// is what reports it.
+    /// Always false for self-identity, cookie, and decoded encoding comparisons:
+    /// the template cache requires those bodies to match regardless of `Vary`.
     #[serde(default)]
     pub covered_by_vary: bool,
 }
@@ -47,8 +45,8 @@ impl AxisResult {
 
     /// Whether this axis is safe.
     ///
-    /// A difference on a signal the origin declares in `Vary` is keyed by the cache, so it
-    /// passes. An undeclared one does not.
+    /// Differences pass only when [`Self::covered_by_vary`] permits them. Cookie,
+    /// self-identity, and decoded encoding differences always fail.
     #[must_use]
     pub fn passed(&self) -> bool {
         !self.differs() || self.covered_by_vary
@@ -140,7 +138,7 @@ impl ProbeReport {
         out.push_str(if self.passed() {
             "VERDICT: shareable on the URLs sampled.\n"
         } else {
-            "VERDICT: NOT shareable. Do not enable origin_is_cookie_independent.\n"
+            "VERDICT: NOT shareable. Do not enable origin_readthrough_enabled or origin_is_cookie_independent.\n"
         });
         out.push_str(LIMITS);
         out

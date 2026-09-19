@@ -72,7 +72,7 @@ fn the_request_carries_credentials_json_and_the_expected_body() {
     // Content-Type but application/json, and authenticates on ^/_ts/admin.
     let server = FixtureServer::start(|request| {
         FixtureResponse::html(format!(
-            r#"{{"method":"{}","auth":{},"type":"{}","path":"{}"}}"#,
+            r#"{{"purged":true,"scope":"all","method":"{}","auth":{},"type":"{}","path":"{}"}}"#,
             request.method,
             request.header("authorization").is_some(),
             request.header("content-type").unwrap_or("none"),
@@ -142,7 +142,17 @@ fn a_rejected_purge_exits_non_zero_and_explains_the_status() {
 #[test]
 fn a_page_purge_sends_the_url_the_operator_typed() {
     let server = FixtureServer::start(|request| {
-        FixtureResponse::html(format!(r#"{{"received":{}}}"#, request.body.len()))
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("should parse purge body");
+        assert_eq!(
+            body,
+            serde_json::json!({"scope": "url", "url": "https://example.com/article"}),
+            "should send the requested reader URL"
+        );
+        FixtureResponse::html(
+            serde_json::json!({"purged": true, "scope": "url", "surrogate_key": "example-key"})
+                .to_string(),
+        )
     });
 
     let mut out = Vec::new();
@@ -155,4 +165,84 @@ fn a_page_purge_sends_the_url_the_operator_typed() {
     });
 
     assert_eq!(server.request_count(), 1);
+}
+
+#[test]
+fn redirects_cannot_turn_a_login_page_into_a_successful_purge() {
+    let server = FixtureServer::start(|request| {
+        if request.path == "/_ts/admin/cache/purge" {
+            FixtureResponse::html("")
+                .with_status(302)
+                .with_header("location", "/login")
+        } else {
+            FixtureResponse::html("<html>login</html>")
+        }
+    });
+    let mut out = Vec::new();
+
+    let outcome = with_password(Some("admin-pass"), || {
+        run(CacheCommand::Purge(args(&server, true, None)), &mut out)
+    });
+
+    assert!(outcome.is_err(), "should refuse a redirected purge");
+    assert!(out.is_empty(), "should print no success response");
+    assert_eq!(server.request_count(), 1, "should not follow the redirect");
+}
+
+#[test]
+fn success_requires_a_valid_acknowledgment_for_the_requested_scope() {
+    for body in [
+        "<html>login</html>".to_owned(),
+        serde_json::json!({"purged": false, "scope": "all"}).to_string(),
+        serde_json::json!({"purged": true, "scope": "url"}).to_string(),
+        serde_json::json!({"scope": "all"}).to_string(),
+    ] {
+        let server = FixtureServer::start(move |_request| FixtureResponse::html(body.clone()));
+        let mut out = Vec::new();
+
+        let outcome = with_password(Some("admin-pass"), || {
+            run(CacheCommand::Purge(args(&server, true, None)), &mut out)
+        });
+
+        assert!(
+            outcome.is_err(),
+            "should refuse a missing or mismatched purge acknowledgment"
+        );
+        assert!(out.is_empty(), "should print no success response");
+    }
+}
+
+#[test]
+fn a_url_purge_requires_a_surrogate_key_in_its_acknowledgment() {
+    for key in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!(" "),
+    ] {
+        let server = FixtureServer::start(move |_request| {
+            FixtureResponse::html(
+                serde_json::json!({
+                    "purged": true, "scope": "url", "surrogate_key": key
+                })
+                .to_string(),
+            )
+        });
+        let mut out = Vec::new();
+
+        let outcome = with_password(Some("admin-pass"), || {
+            run(
+                CacheCommand::Purge(args(&server, false, Some("https://example.com/article"))),
+                &mut out,
+            )
+        });
+
+        assert!(
+            outcome.is_err(),
+            "should require the service to name the purged URL key"
+        );
+        assert!(
+            out.is_empty(),
+            "should not print an incomplete acknowledgment as success"
+        );
+    }
 }

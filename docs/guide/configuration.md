@@ -2020,10 +2020,12 @@ origin's bytes.
 origin_readthrough_enabled = true
 ```
 
-Left at the default, every publisher-origin fetch is forced to bypass that cache,
-which is the behaviour shipped before this setting existed. Setting it to `true`
-stops forcing a miss for requests judged shareable: a `GET` with a `Host`, no
-`Authorization`, no disqualifying cookie, and no remaining conditional or range
+Left at the default, the existing caching policy is preserved: ad-serving requests
+bypass the origin cache, while other publisher requests (including ordinary assets)
+keep the platform's default caching behavior. Setting it to `true` applies request
+shareability instead: eligible ad-serving requests can use the cache, while
+ineligible non-ad requests bypass it. Eligible requests are `GET`s with a `Host`,
+no disqualifying authorization or cookie, and no remaining conditional or range
 semantics.
 
 #### This cache has far weaker guarantees than the template cache
@@ -2068,7 +2070,14 @@ saying nothing about this setting.
 1. Run `ts origin probe-shareability --url <representative URLs>`, passing
    `--cookie` for any publisher cookie a real reader carries.
 2. **Every axis and every verdict must pass.** Do not enable on a partial pass.
-   The probe is the only control on this path.
+   The probe checks status and safety headers on every sampled response, including
+   repeats. Pass `--vary-header <name>` for each additional request header to test;
+   each is varied independently, both with and without RSC. A declared `Vary` can
+   explain a user-agent, RSC,
+   or custom-header difference only when every response declares it. Cookie
+   differences and different decoded gzip/identity documents always fail, because
+   the template cache requires those representations to be identical.
+   The probe is the only response-safety control on the readthrough path.
 3. Read the probe's stated limits. It runs from one client address, so
    personalisation keyed on the reader's IP — geo, rate class — is invisible to
    it, as are `Accept-Language` and client-hint variants it does not vary.
@@ -2082,13 +2091,16 @@ saying nothing about this setting.
 #### Rollback
 
 1. Set `origin_readthrough_enabled = false` and push. This takes effect on the
-   next request with no deploy, and is the real rollback.
+   next request with no deploy and restores the previous policy: ad-serving
+   requests bypass, while non-ad traffic keeps the platform default. It does not
+   disable origin caching globally.
 2. **Objects already stored are not purgeable by this service.** `ts cache purge`
    and the admin endpoint cover the template cache (`ts-template`) only. Whether
    readthrough objects can be tagged for purge has not been verified against a
    real Fastly service, so no tagging is applied and no purge command claims to
    reach them. After flipping the flag, already-stored objects age out on the
-   origin's own TTL; shorten that at the origin if you need them gone sooner.
+   origin's own TTL and can still serve non-ad traffic. Changing the origin's TTL
+   does not shorten an already-cached object's lifetime.
 
 Step 2 is the reason to treat enablement as one-way for the duration of the
 origin's TTL, and to widen URL coverage slowly.

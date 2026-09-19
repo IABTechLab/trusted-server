@@ -35,8 +35,9 @@ pub struct ProbeShareabilityArgs {
 
     /// Request header the origin is configured to vary on, beyond `rsc`. Repeatable.
     ///
-    /// Mirror `creative_opportunities.template_cache_vary` here, since the headers a
-    /// publisher varies on are publisher-specific.
+    /// Mirror `creative_opportunities.template_cache_vary` here. Each additional header
+    /// is compared independently as absent versus `1`, both with and without RSC;
+    /// built-in axes are not repeated.
     #[arg(long = "vary-header")]
     pub vary_header: Vec<String>,
 
@@ -105,7 +106,7 @@ fn run_probe(args: &ProbeShareabilityArgs, out: &mut impl std::io::Write) -> Cli
         // The gate this probe guards is decided before the origin responds, so this
         // result is the only thing standing between it and cross-serving.
         crate::error::cli_error(
-            "origin is not safe to share: do not enable origin_is_cookie_independent",
+            "origin is not safe to share: do not enable origin_readthrough_enabled or origin_is_cookie_independent",
         )
     }
 }

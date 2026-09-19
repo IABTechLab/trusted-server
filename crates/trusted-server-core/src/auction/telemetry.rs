@@ -123,9 +123,9 @@ pub struct AuctionObservationContext {
     pub slot_count: u16,
     /// Whether this request's origin response *would be* eligible to share.
     ///
-    /// Records a predicate, not an outcome: no readthrough gate consumes it yet, so today
-    /// every ad-serving request still bypasses the platform cache regardless of this value.
-    /// It exists so the gate's reach is measurable from the deploy that ships it.
+    /// Records a predicate, not a cache hit. Ad-serving requests still bypass the
+    /// platform cache unless `origin_readthrough_enabled` is set, so this measures
+    /// the gate's potential reach before enablement as well as its eligibility afterwards.
     ///
     /// `None` on sources that do not make the decision, which is not the same as
     /// `Some(false)` — a dashboard that reads absence as "not shareable" will be wrong for
