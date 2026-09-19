@@ -11,14 +11,18 @@ import { resolveSlotElementByDivId } from '../../core/slot_element';
 import type {
   AuctionSlot,
   AuctionBidData,
+  AuctionDiagnosticsData,
+  GptDiagnosticsAuctionFacts,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsTrustedServerOpportunity,
   GptSlotHandoff,
   TsjsApi,
 } from '../../core/types';
 import {
+  APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRenderFailureReason,
   apsRendererUrl,
   dispatchApsRendering,
   consumeApsPrebidRenderer,
@@ -72,6 +76,25 @@ function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedSer
   const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
 
   return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
+}
+
+function diagnosticsAuctionFacts(
+  generation: number,
+  auctionDiagnostics: AuctionDiagnosticsData | undefined,
+  bid: AuctionBidData
+): GptDiagnosticsAuctionFacts | undefined {
+  const isSpaAuction = generation > 0;
+  const winner =
+    isNonEmptyString(bid.hb_bidder) && isNonEmptyString(bid.hb_pb)
+      ? { bidder: bid.hb_bidder, priceBucket: bid.hb_pb }
+      : undefined;
+  if (!winner && auctionDiagnostics === undefined) return undefined;
+
+  return {
+    auctionType: isSpaAuction ? 'trusted_server' : 'ssat',
+    ...(winner ? { winner } : {}),
+    ...(auctionDiagnostics ? { serverTimings: auctionDiagnostics } : {}),
+  };
 }
 
 // ------------------------------------------------------------------
@@ -320,8 +343,27 @@ function resizeCollapsedCreativeFrame(
   frame.iframe.style.width = `${width}px`;
   frame.iframe.style.height = `${height}px`;
   for (const ancestor of collapsedAncestors) {
-    ancestor.style.width = `${width}px`;
-    ancestor.style.height = `${height}px`;
+    if (hasCollapsedDimension(ancestor, 'width')) ancestor.style.width = `${width}px`;
+    if (hasCollapsedDimension(ancestor, 'height')) ancestor.style.height = `${height}px`;
+  }
+}
+
+function safelyResizeCollapsedCreativeFrame(
+  source: MessageEventSource | null,
+  frame: MessageSourceFrame,
+  width: number,
+  height: number,
+  generation: number,
+  stillOwnsCreative: () => boolean
+): void {
+  try {
+    resizeCollapsedCreativeFrame(source, frame, width, height, generation, stillOwnsCreative);
+  } catch (err) {
+    try {
+      log.warn(`[tsjs-gpt] creative shell resize failed for '${frame.root.id}'`, err);
+    } catch {
+      // Resize and logging failures must not replace successful delivery evidence.
+    }
   }
 }
 
@@ -802,12 +844,16 @@ function installInitialLoadDetector(ts: TsjsApi): void {
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    initialAuctionDiagnostics?: AuctionDiagnosticsData
   ) {
     if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
     ts.initialAdInitScheduled = true;
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    if (initialAuctionDiagnostics !== undefined) {
+      ts.auctionDiagnostics = initialAuctionDiagnostics;
+    }
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
       ts.adInit?.();
@@ -1240,6 +1286,7 @@ export function installTsAdInit(): void {
     // first act and stands down rather than applying this invocation's
     // slots/bids to the newer route's DOM and double-requesting it.
     const generation = ts.navGeneration ?? 0;
+    const auctionDiagnostics = ts.auctionDiagnostics ? { ...ts.auctionDiagnostics } : undefined;
     const g = (window as GptWindow).googletag;
     if (!g) return;
     installFirstImpressionLifecycleObservers(ts, g);
@@ -1382,13 +1429,26 @@ export function installTsAdInit(): void {
         try {
           const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
-          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-            gptSlot,
-            slot.id,
-            opportunity,
-            bid.hb_auction_id,
-            requestedSlotSizes
-          );
+          const auctionFacts = diagnosticsAuctionFacts(generation, auctionDiagnostics, bid);
+          const recorder = ts.gptDiagnosticsRecorder;
+          if (auctionFacts) {
+            recorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity,
+              bid.hb_auction_id,
+              requestedSlotSizes,
+              auctionFacts
+            );
+          } else {
+            recorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity,
+              bid.hb_auction_id,
+              requestedSlotSizes
+            );
+          }
         } catch {
           // Diagnostics must not alter ad delivery.
         }
@@ -1490,6 +1550,7 @@ export function installTsAdInit(): void {
 interface PageBidsResponse {
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
+  auctionDiagnostics?: AuctionDiagnosticsData;
 }
 
 /** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
@@ -1698,6 +1759,9 @@ export function installSpaAuctionHook(): void {
     if (g) clearPreviousNavigationTargeting(ts, g);
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
     delete ts.firstImpression;
+    // Server timings belong to the route that produced them. Clear them before
+    // page-bids starts so failure or supersession cannot relabel stale offsets.
+    ts.auctionDiagnostics = undefined;
     // A route change invalidates hydration aliases before the new route's
     // publisher can define a same-prefix slot while page-bids is in flight.
     for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {
@@ -1724,6 +1788,7 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
+      ts.auctionDiagnostics = data.auctionDiagnostics;
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;
@@ -1901,11 +1966,49 @@ function safelyRecordCreativeFailure(
   }
 }
 
+/**
+ * Open a diagnostics attempt for an APS capability handshake.
+ *
+ * The APS path runs on the publisher's own Prebid ad units, which never pass
+ * through Trusted Server slot mapping, so no creative opportunity has been
+ * recorded for them. Without one the store rejects the attempt as
+ * `creative_request_without_slot` and the request cycle stays `unknown`,
+ * leaving a blank APS render indistinguishable from a delivered one.
+ */
+function beginApsCreativeAttempt(adUnitCode: string): number | undefined {
+  try {
+    const pubads = window.googletag?.pubads?.();
+    const slot = pubads ? findGptSlotByElementId(pubads, adUnitCode) : undefined;
+    if (slot) {
+      window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+        slot,
+        adUnitCode,
+        'renderable_candidate'
+      );
+    }
+  } catch {
+    // Diagnostics must not alter creative delivery.
+  }
+  return safelyRecordCreativeRequest(adUnitCode);
+}
+
+/**
+ * A consumed APS ad ID, retained as a security tombstone.
+ *
+ * `attemptId` carries the diagnostics attempt the capability was served under so
+ * a later replay, or a failure relayed by the creative frame, is attributed to
+ * the render it belongs to.
+ */
+interface ApsConsumedTombstone {
+  expiresAt: number;
+  attemptId?: number;
+}
+
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
 const MAX_CONSUMED_PREBID_APS_IDS = 256;
 
 function pruneConsumedPrebidApsIds(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   now: number
 ): void {
   for (const [adId, consumed] of consumedIds) {
@@ -1914,7 +2017,7 @@ function pruneConsumedPrebidApsIds(
 }
 
 function hasConsumedPrebidApsIdCapacity(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string
 ): boolean {
   if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
@@ -1924,11 +2027,12 @@ function hasConsumedPrebidApsIdCapacity(
 }
 
 function recordConsumedPrebidApsId(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string,
-  expiresAt: number
+  expiresAt: number,
+  attemptId: number | undefined
 ): void {
-  consumedIds.set(adId, { expiresAt });
+  consumedIds.set(adId, { expiresAt, attemptId });
 }
 
 /**
@@ -1962,7 +2066,7 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
-  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  const consumedPrebidApsIds = new Map<string, ApsConsumedTombstone>();
   // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
   // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
   const consumedServerApsBySlot = new Map<string, string>();
@@ -1975,6 +2079,20 @@ export function installTsRenderBridge(): void {
           ? (e.data as Record<string, unknown>)
           : (JSON.parse(e.data as string) as Record<string, unknown>);
     } catch {
+      return;
+    }
+
+    // Diagnostics relayed by the APS Universal Creative frame. The creative is
+    // cross-origin, so every field is untrusted: the reason must resolve through
+    // the allowlist and the attempt comes from our own tombstone, never the
+    // message. Recording only, and it never answers the sender.
+    if (data['message'] === APS_RENDER_FAILED_MESSAGE) {
+      const failedAdId = data['adId'];
+      const reason = apsRenderFailureReason(data['reason']);
+      if (typeof failedAdId === 'string' && reason !== undefined) {
+        pruneConsumedPrebidApsIds(consumedPrebidApsIds, Date.now());
+        safelyRecordCreativeFailure(consumedPrebidApsIds.get(failedAdId)?.attemptId, reason);
+      }
       return;
     }
 
@@ -1994,6 +2112,7 @@ export function installTsRenderBridge(): void {
       // other iframe. Letting Prebid's global handler answer a foreign source
       // would expose the creative despite the slot-bound capability check.
       e.stopImmediatePropagation();
+      safelyRecordCreativeFailure(consumedPrebidAps.attemptId, 'aps_consumed_tombstone');
       return;
     }
 
@@ -2003,12 +2122,28 @@ export function installTsRenderBridge(): void {
       // Prebid handles ad IDs globally and would otherwise answer a request from
       // an unrelated iframe when this slot-bound capability rejects it.
       e.stopImmediatePropagation();
+      const attemptId = beginApsCreativeAttempt(prebidRendererEntry.adUnitCode);
       const sourceFrame = sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode);
-      if (!sourceFrame) return;
+      if (!sourceFrame) {
+        safelyRecordCreativeFailure(attemptId, 'aps_source_not_in_ad_unit');
+        return;
+      }
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
-      if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
+      if (!renderer) {
+        safelyRecordCreativeFailure(attemptId, 'aps_descriptor_fields');
+        return;
+      }
+      if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) {
+        safelyRecordCreativeFailure(attemptId, 'aps_tombstone_capacity');
+        return;
+      }
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+      recordConsumedPrebidApsId(
+        consumedPrebidApsIds,
+        adId,
+        prebidRendererEntry.expiresAt,
+        attemptId
+      );
 
       const markUsed = (): void => {
         try {
@@ -2023,11 +2158,15 @@ export function installTsRenderBridge(): void {
         source: e.source,
         trustedServer: (validatedRenderer) => {
           const rendererUrl = apsRendererUrl();
-          if (!rendererUrl) return false;
+          if (!rendererUrl) {
+            safelyRecordCreativeFailure(attemptId, 'aps_missing_renderer_url');
+            return false;
+          }
           const stillOwnsCreative = () =>
             sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode)?.iframe ===
             sourceFrame.iframe;
           if (!creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative)) {
+            safelyRecordCreativeFailure(attemptId, 'aps_source_not_in_ad_unit');
             return false;
           }
           try {
@@ -2043,19 +2182,21 @@ export function installTsRenderBridge(): void {
                 height: validatedRenderer.height,
               })
             );
-            resizeCollapsedCreativeFrame(
-              e.source,
-              sourceFrame,
-              validatedRenderer.width,
-              validatedRenderer.height,
-              generation,
-              stillOwnsCreative
-            );
-            return creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative);
+            safelyRecordCreativeResponse(attemptId);
           } catch (err) {
             log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
+            safelyRecordCreativeFailure(attemptId, 'response_post_failed');
             return false;
           }
+          safelyResizeCollapsedCreativeFrame(
+            e.source,
+            sourceFrame,
+            validatedRenderer.width,
+            validatedRenderer.height,
+            generation,
+            stillOwnsCreative
+          );
+          return creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative);
         },
       });
       if (typeof dispatched === 'boolean') {
@@ -2122,24 +2263,19 @@ export function installTsRenderBridge(): void {
                   height: validatedRenderer.height,
                 })
               );
-              resizeCollapsedCreativeFrame(
-                e.source,
-                sourceSlotFrame,
-                validatedRenderer.width,
-                validatedRenderer.height,
-                generation,
-                stillOwnsCreative
-              );
-              return creativeFrameIsCurrent(
-                e.source,
-                sourceSlotFrame,
-                generation,
-                stillOwnsCreative
-              );
             } catch (err) {
               log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
               return false;
             }
+            safelyResizeCollapsedCreativeFrame(
+              e.source,
+              sourceSlotFrame,
+              validatedRenderer.width,
+              validatedRenderer.height,
+              generation,
+              stillOwnsCreative
+            );
+            return creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative);
           },
         })
       );
@@ -2190,7 +2326,7 @@ export function installTsRenderBridge(): void {
         log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
         return;
       }
-      resizeCollapsedCreativeFrame(
+      safelyResizeCollapsedCreativeFrame(
         e.source,
         sourceSlotFrame,
         width,
@@ -2268,19 +2404,19 @@ export function installTsRenderBridge(): void {
                 height: cachedHeight,
               })
             );
-            resizeCollapsedCreativeFrame(
-              e.source,
-              sourceSlotFrame,
-              cachedWidth,
-              cachedHeight,
-              generation,
-              stillOwnsCreative
-            );
           } catch (err) {
             safelyRecordCreativeFailure(attemptId, 'response_post_failed');
             log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
             return;
           }
+          safelyResizeCollapsedCreativeFrame(
+            e.source,
+            sourceSlotFrame,
+            cachedWidth,
+            cachedHeight,
+            generation,
+            stillOwnsCreative
+          );
           if (!creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative)) {
             return;
           }

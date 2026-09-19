@@ -267,27 +267,33 @@ Trusted Server keeps static app-config credentials under logical store ID
 as `ts_secrets`. Request-signing private keys remain in their separate,
 runtime-managed store.
 
-Set the physical mapping before provisioning:
+Set the physical mapping in the selected deployment environment before
+provisioning and deploying:
 
 ```bash
 export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ts provision --adapter fastly
 ```
 
-Provisioning creates or reuses the physical store and persists this runtime
-mapping in Fastly Config Store `edgezero_runtime_env`, scoped to the current
-Fastly service:
+Provisioning creates or reuses the physical store. A managed deployment reads
+the selector from its deployment environment and links the selected physical
+store to the target service version under the logical ID
+`trusted_server_secrets`. The runtime opens the store by that logical ID; no
+selector is stored in a Config Store and no service ID appears in the variable
+name.
 
-```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
-```
+Each GitHub Environment or deploy process uses the same canonical names and may
+select different physical resources. Production and staging can therefore run
+identical package bytes against different stores. A staged deploy links the
+staging environment's selected stores into only the staged version. Selected
+resources must already exist before deployment.
 
-The runtime ignores legacy unscoped entries. The Fastly service must link both
-`ts_secrets` and `edgezero_runtime_env` to the active service version. The
-custom streaming entry point reads the service-scoped mapping before loading
-app config, so every startup and reload resolves static credentials from
-`ts_secrets` while the portable manifest continues to declare
-`trusted_server_secrets`.
+The custom streaming entry point opens `trusted_server_secrets` before loading
+app config, so every startup and reload resolves static credentials from the
+physical store linked under that ID while the portable manifest continues to
+declare `trusted_server_secrets`. Local Viceroy configuration exposes the store
+under the logical ID directly; see `[local_server.secret_stores]` in
+`fastly.toml`.
 
 Create the separate request-signing store when that feature is enabled:
 
@@ -343,7 +349,9 @@ Verify stores are linked to your active service version:
 fastly resource-link list --service-id <service-id> --version <active-version>
 ```
 
-If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version. Legacy partner/consent KV bindings can be removed once no deployment-specific tooling depends on them.
+If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version.
+
+Before upgrading a deployment that used the legacy consent store, remove `[consent].consent_store` from TOML or JSON/app-config; strict configuration loading rejects the removed field. Remove its local Viceroy fixture and active Fastly resource link as well. The old records are not read or migrated into `ec.ec_store` and must not be copied there. You may retain the old store unchanged for a defined rollback window, then delete the store and its records. Withdrawals processed after the upgrade do not actively delete retained legacy records; they remain until their original TTL expires or an operator deletes them. If a rollback uses an older release that reads the legacy store, account for those stale records and keep the rollback window short.
 
 ## Next Steps
 

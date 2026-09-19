@@ -238,6 +238,7 @@ s = replace_once(
     f'origin_url = "http://127.0.0.1:{origin_port}"',
     "publisher origin",
 )
+# The example publisher domains are reserved placeholders that validation rejects.
 s = replace_once(
     s,
     'domain = "example.com"',
@@ -250,6 +251,7 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
+
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
@@ -369,15 +371,15 @@ import sys
 
 with open(sys.argv[1], "a") as manifest:
     manifest.write('''
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "publisher_proxy_secret"
 data = "fictional-local-publisher-proxy-secret-value"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "ec_passphrase"
 data = "fictional-local-ec-passphrase-secret-value"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "handler_password"
 data = "fictional-local-handler-password-secret-value"
 ''')

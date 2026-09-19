@@ -593,6 +593,7 @@ impl PlatformHttpClient for StubHttpClient {
             .pop_front()
             .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
 
+        let stream_response = stream_response || response.stream_body;
         let edge_response = build_stub_pending_response(
             StubPendingResponse {
                 backend_name: request.backend_name,
@@ -600,7 +601,7 @@ impl PlatformHttpClient for StubHttpClient {
                 body: response.body,
                 headers: response.headers,
             },
-            stream_response || response.stream_body,
+            stream_response,
             request_is_head,
         )?;
 

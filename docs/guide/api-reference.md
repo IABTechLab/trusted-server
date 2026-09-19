@@ -121,6 +121,61 @@ curl -X POST https://edge.example.com/auction \
   -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
 
+#### PBS stored-request intent
+
+The reserved `trustedServer` bid accepts `storedRequest` inside `params`, beside
+`bidderParams` and `zone`. It does not accept provider IDs, endpoints, or stored IDs.
+Bidder keys still resolve through the server's `[auction.bidders]` routes.
+
+| `params.storedRequest` | PBS behavior                                                                                                                                                                                                         |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false`                | Disable stored fallback for this slot on every PBS provider. Usable inline demand still runs.                                                                                                                        |
+| `true`                 | Permit stored fallback using the slot `code` as the stored impression ID. Usable inline params take precedence within each provider.                                                                                 |
+| Omitted                | Preserve legacy inference for existing callers and server-generated opportunities. Missing, `null`, or empty `bidderParams` permits stored demand; routed empty bidder objects also retain fallback after overrides. |
+
+`storedRequest: null` is invalid, as are strings, numbers, arrays, and objects.
+An invalid value rejects the whole envelope, including its inline params and zone,
+and increments the malformed-envelope diagnostic. Independent valid direct bidder
+entries and eligible non-PBS providers still run; this is not whole-request HTTP
+rejection. An absent or empty `bids` list also retains legacy stored inference.
+
+PBS applies provider-local overrides before checking inline demand. If no usable
+inline params remain, it uses stored demand only when permitted, otherwise it
+omits the impression. If none remain, it makes no PBS request. Eligible APS and
+standard providers are unaffected.
+
+A generated envelope that should not request PBS stored demand:
+
+```json
+{
+  "bidder": "trustedServer",
+  "params": { "bidderParams": {}, "storedRequest": false }
+}
+```
+
+An intentional stored request, posted to `https://edge.example.com/auction`:
+
+```json
+{
+  "adUnits": [
+    {
+      "code": "homepage-banner",
+      "mediaTypes": { "banner": { "sizes": [[728, 90]] } },
+      "bids": [
+        {
+          "bidder": "trustedServer",
+          "params": { "bidderParams": {}, "storedRequest": true }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Stored demand retains existing PBS fanout. Each participating PBS instance must
+have the requested slot-code ID. This filtering does not prevent errors from
+unrelated invalid bidder params. See [deployment ordering](/guide/integrations/prebid#stored-intent-deployment).
+
 ---
 
 ## Edge Cookie Endpoints
@@ -164,9 +219,35 @@ re-evaluated within the recheck window).
 
 ### POST /\_ts/api/v1/batch-sync
 
-Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps. Valid mappings use idempotent last-write-wins semantics.
+Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps.
 
 **Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
+
+**Batch processing behavior:**
+
+- Every mapping is validated before any KV update. Validation errors retain their
+  original input index.
+- Valid mappings are grouped by normalized EC ID: only the 64-character hex
+  prefix is lowercased; the six-character suffix remains case-sensitive.
+- Groups are processed in first-valid-occurrence order, with one call to the
+  CAS-protected KV update path per distinct normalized EC ID. Within a group, the
+  last valid `partner_uid` in request order is persisted. An invalid mapping
+  never replaces a group's final UID.
+- A successful or unchanged update accepts every valid mapping in its group.
+  Missing and withdrawn EC entries reject every valid mapping in their group as
+  `ineligible`.
+- If a KV infrastructure failure occurs, every valid mapping in the failing
+  group and each unprocessed valid group is rejected as `kv_unavailable`; no
+  later group is updated. Already processed groups keep their outcomes, and
+  validation errors are preserved.
+- Each input receives exactly one outcome, so `accepted + rejected` equals the
+  number of submitted mappings. `errors` is sorted by original input index. The
+  endpoint returns `200 OK` only when all mappings are accepted; otherwise it
+  returns `207 Multi-Status`.
+
+Groupwise failure behavior is intentional: for `A(valid), B(valid), A(valid)`,
+if A's group succeeds and B's group has an infrastructure failure, both A
+mappings are accepted even though the second A appears after B in the input.
 
 **Request Body:**
 
