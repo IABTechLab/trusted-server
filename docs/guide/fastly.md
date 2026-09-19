@@ -267,27 +267,33 @@ Trusted Server keeps static app-config credentials under logical store ID
 as `ts_secrets`. Request-signing private keys remain in their separate,
 runtime-managed store.
 
-Set the physical mapping before provisioning:
+Set the physical mapping in the selected deployment environment before
+provisioning and deploying:
 
 ```bash
 export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ts provision --adapter fastly
 ```
 
-Provisioning creates or reuses the physical store and persists this runtime
-mapping in Fastly Config Store `edgezero_runtime_env`, scoped to the current
-Fastly service:
+Provisioning creates or reuses the physical store. A managed deployment reads
+the selector from its deployment environment and links the selected physical
+store to the target service version under the logical ID
+`trusted_server_secrets`. The runtime opens the store by that logical ID; no
+selector is stored in a Config Store and no service ID appears in the variable
+name.
 
-```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
-```
+Each GitHub Environment or deploy process uses the same canonical names and may
+select different physical resources. Production and staging can therefore run
+identical package bytes against different stores. A staged deploy links the
+staging environment's selected stores into only the staged version. Selected
+resources must already exist before deployment.
 
-The runtime ignores legacy unscoped entries. The Fastly service must link both
-`ts_secrets` and `edgezero_runtime_env` to the active service version. The
-custom streaming entry point reads the service-scoped mapping before loading
-app config, so every startup and reload resolves static credentials from
-`ts_secrets` while the portable manifest continues to declare
-`trusted_server_secrets`.
+The custom streaming entry point opens `trusted_server_secrets` before loading
+app config, so every startup and reload resolves static credentials from the
+physical store linked under that ID while the portable manifest continues to
+declare `trusted_server_secrets`. Local Viceroy configuration exposes the store
+under the logical ID directly; see `[local_server.secret_stores]` in
+`fastly.toml`.
 
 Create the separate request-signing store when that feature is enabled:
 

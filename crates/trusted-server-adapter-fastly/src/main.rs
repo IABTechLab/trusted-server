@@ -5,8 +5,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
-use edgezero_adapter_fastly::runtime_env_config;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
@@ -97,18 +95,18 @@ fn main() {
     }
 
     logging::init_logger();
-    let env = runtime_env_config(TrustedServerApp::stores());
-    let runtime_stores = RuntimeStoreConfig::from_env(&env);
-    edgezero_main(req, &runtime_stores);
+    edgezero_main(req);
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest, runtime_stores: &RuntimeStoreConfig) {
+fn edgezero_main(mut req: FastlyRequest) {
+    let runtime_stores = RuntimeStoreConfig::logical();
+
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match load_settings_from_config_store(runtime_stores) {
+        match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
             }
@@ -140,7 +138,7 @@ fn edgezero_main(mut req: FastlyRequest, runtime_stores: &RuntimeStoreConfig) {
                     return;
                 }
             };
-        let (app, app_state) = TrustedServerApp::build_app_with_state(runtime_stores);
+        let (app, app_state) = TrustedServerApp::build_app_with_state(&runtime_stores);
         (config_store, app, app_state)
     };
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
@@ -254,7 +252,7 @@ fn edgezero_main(mut req: FastlyRequest, runtime_stores: &RuntimeStoreConfig) {
                 &timings,
             );
         } else {
-            match load_settings_from_config_store(runtime_stores) {
+            match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
                     apply_entry_point_finalize_headers(
                         &settings,
@@ -310,7 +308,7 @@ fn edgezero_main(mut req: FastlyRequest, runtime_stores: &RuntimeStoreConfig) {
                 }
             }
         } else {
-            match load_settings_from_config_store(runtime_stores) {
+            match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(
                         &settings,

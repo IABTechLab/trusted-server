@@ -90,10 +90,8 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
-use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -144,9 +142,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{
-    DEFAULT_CONFIG_STORE_ID, config_key, config_store_name, get_settings_from_config_store,
-};
+use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -167,11 +163,18 @@ pub(crate) struct RuntimeStoreConfig {
 }
 
 impl RuntimeStoreConfig {
-    pub(crate) fn from_env(env: &EnvConfig) -> Self {
+    /// Store bindings for the Fastly runtime.
+    ///
+    /// Fastly Compute has no process environment. `EdgeZero` links each selected
+    /// physical store to the service version under its logical ID, so the
+    /// runtime opens stores by logical ID and reads the config entry under
+    /// that same ID for every publication target. Staging isolation comes from
+    /// linking a different physical store, never from a different key.
+    pub(crate) fn logical() -> Self {
         Self {
-            config_store_name: config_store_name(env),
-            config_key: config_key(env),
-            secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
+            config_store_name: StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            config_key: DEFAULT_CONFIG_STORE_ID.to_owned(),
+            secret_store_name: StoreName::from(DEFAULT_SECRET_STORE_ID),
         }
     }
 }
@@ -1467,8 +1470,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let runtime_env = runtime_env_config(Self::stores());
-        let stores = RuntimeStoreConfig::from_env(&runtime_env);
+        let stores = RuntimeStoreConfig::logical();
         Self::router_with_state(&stores).0
     }
 
@@ -1510,7 +1512,6 @@ mod tests {
     use edgezero_core::app::{Hooks as _, StoreMetadata};
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::env_config::EnvConfig;
     use edgezero_core::http::{
         HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
         response_builder,
@@ -1585,32 +1586,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_store_config_maps_logical_store_names_and_config_key() {
-        let env = EnvConfig::from_vars([
-            (
-                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
-                "physical_config",
-            ),
-            (
-                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
-                "active_config",
-            ),
-            (
-                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
-                "ts_secrets",
-            ),
-        ]);
-
-        let stores = RuntimeStoreConfig::from_env(&env);
-
-        assert_eq!(stores.config_store_name.as_ref(), "physical_config");
-        assert_eq!(stores.config_key, "active_config");
-        assert_eq!(stores.secret_store_name.as_ref(), "ts_secrets");
-    }
-
-    #[test]
-    fn runtime_store_config_uses_logical_defaults_without_overrides() {
-        let stores = RuntimeStoreConfig::from_env(&EnvConfig::default());
+    fn runtime_store_config_opens_logical_store_ids_and_key() {
+        let stores = RuntimeStoreConfig::logical();
 
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");
