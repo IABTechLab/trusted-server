@@ -34,6 +34,7 @@
 
 use std::time::Duration;
 
+mod backend_naming;
 mod error;
 mod http;
 mod image_optimizer;
@@ -45,6 +46,10 @@ pub(crate) mod test_support;
 mod traits;
 mod types;
 
+pub use backend_naming::{
+    AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
+    BackendNamingPolicy, PredictedBackend,
+};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
@@ -213,6 +218,26 @@ mod tests {
             .downcast::<u8>()
             .expect("should recover the stored pending request type");
         assert_eq!(value, 7, "should preserve the stored pending request");
+    }
+
+    #[test]
+    fn platform_pending_request_preserves_response_handling_metadata() {
+        let pending = PlatformPendingRequest::new(7_u8)
+            .with_backend_name("origin")
+            .with_response_handling(true, edgezero_core::http::Method::HEAD);
+        let pending = pending
+            .downcast::<String>()
+            .expect_err("should reject downcast to the wrong pending type");
+
+        assert!(
+            pending.stream_response(),
+            "should preserve the streaming response flag"
+        );
+        assert_eq!(
+            pending.request_method(),
+            Some(&edgezero_core::http::Method::HEAD),
+            "should preserve the originating request method"
+        );
     }
 
     #[test]
