@@ -59,6 +59,9 @@ jobs:
       - name: Run tests
         run: cargo test-fastly
 
+      - name: Run tests (reusable-sandbox feature)
+        run: cargo test-fastly-reuse
+
       - name: Run template cache ESI local harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
 

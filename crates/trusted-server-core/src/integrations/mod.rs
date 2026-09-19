@@ -36,7 +36,7 @@ pub use registry::{
     IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
     IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
     RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome, ScriptRewriteAction,
+    RequestFilterRegistryOutcome, ScriptRewriteAction, ScriptTextAccumulator,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
