@@ -55,7 +55,7 @@ Two properties of this path block naive reuse.
 
 ## Dependencies
 
-The workspace pins EdgeZero at `d0e13d2d82eb89393f3622545cd31348a1bf0f71` on
+The workspace pins EdgeZero at `c4841b609ec366ebabd3489416e2cb8c1359f61d` on
 `feat/reusable-app-lifecycle`. (It briefly sat at `277544c4` on the same
 branch; that revision carried the CLI and Cloudflare fixes but no lifecycle
 module.)
