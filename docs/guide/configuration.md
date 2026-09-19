@@ -1856,9 +1856,12 @@ TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 
 ### Shared template assembly (`assembly_mode = "esi"`)
 
-This configuration is an experimental validation spike scoped to
-[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
-not a settled production cache interface.
+`inline` remains the default. `esi` is opt-in per deployment, covered by the
+`template-cache-local-test.sh` harness and by rendered-document byte-identity tests, and
+originated in
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009).
+Enable it deliberately and verify with the harness first; the keys below are the safety
+contract that makes it safe to do so.
 
 `assembly_mode` controls how initial-page slot and bid state is delivered:
 
@@ -1976,21 +1979,135 @@ The two headers together are the reliable verification signal. Timing alone can
 vary with the origin, auction, compression, browser connection reuse, and local
 proxy buffering.
 
+> **Upgrade note.** This release adds `/_ts/admin/cache/purge` to the admin endpoints
+> startup validation covers. A configuration whose `[[handlers]]` enumerate admin paths
+> individually, rather than using the `^/_ts/admin` prefix, fails to start until that path
+> is covered too. The failure is at startup and explicit, not at request time.
+
 Rollback must preserve configuration compatibility:
 
 1. Change `assembly_mode` to `inline` and deploy/push that configuration.
 2. Before rolling back to a binary that predates these fields, remove
-   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
-   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
-   use `deny_unknown_fields` and intentionally reject unknown keys.
-3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
-   tooling, or wait for the bounded origin-derived lifetime to expire.
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`,
+   `origin_is_cookie_independent`, and `origin_readthrough_enabled`, then push the
+   cleaned configuration. Older binaries use `deny_unknown_fields` and intentionally
+   reject unknown keys. Removing `origin_readthrough_enabled` matters even when rolling
+   it back: setting it to `false` serializes it into the blob, so a binary that predates
+   it then rejects the whole configuration and every request fails.
+3. Purge the template cache with `ts cache purge --service <url> --all`, or
+   `--page <url>` for a single reader-facing URL. The admin endpoint
+   `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
+   the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
+   works.
 
 Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
 manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
 counts and response integrity, and executes the generated GPT module against
 the served seam to require a real `defineSlot` call.
+
+### Origin readthrough caching
+
+`origin_readthrough_enabled` controls a **different cache** from everything above.
+The template cache stores Trusted Server's own transformed HTML. Readthrough is the
+platform's own cache sitting in front of the publisher origin, and it stores the
+origin's bytes.
+
+```toml
+[creative_opportunities]
+# Default false. Enable only after `ts origin probe-shareability` passes on every
+# axis and every verdict.
+origin_readthrough_enabled = true
+```
+
+Left at the default, the existing caching policy is preserved: ad-serving requests
+bypass the origin cache, while other publisher requests (including ordinary assets)
+keep the platform's default caching behavior. Setting it to `true` applies request
+shareability instead: eligible ad-serving requests can use the cache, while
+ineligible non-ad requests bypass it. Eligible requests are `GET`s with a `Host`,
+no disqualifying authorization or cookie, and no remaining conditional or range
+semantics.
+
+#### This cache has far weaker guarantees than the template cache
+
+Read this before enabling it. The template cache refuses storage on inspection of
+the origin's _response_ — `Set-Cookie`, a CSP nonce, missing positive freshness, an
+uncovered `Vary`, and the rest of the list above. **Readthrough has none of those
+refusals**, and cannot: the decision is made before the origin replies, and no
+post-response hook is reachable on the Fastly adapter.
+
+What that means concretely, for each refusal the template cache performs:
+
+| Template-cache refusal      | Covered on readthrough?                           |
+| --------------------------- | ------------------------------------------------- |
+| No positive freshness       | **No** — probe verdict only                       |
+| Origin `Set-Cookie`         | **No** — probe verdict only                       |
+| Response CSP nonce          | **No** — probe verdict only                       |
+| Origin marks it unshareable | Yes — the platform honours `private` / `no-store` |
+| Non-`200` status            | Yes — the platform honours status                 |
+| Uncovered `Vary`            | Yes — the platform keys on the origin's `Vary`    |
+| Not HTML                    | Not applicable; readthrough caches per origin     |
+
+Every row marked **No** is an accepted risk carried by the operator, not by the
+code. An origin that personalises HTML without saying so in its headers can
+cross-serve one reader's page to another, including session fixation through a
+cached `Set-Cookie`. That last case is the sharpest: readthrough admits requests
+carrying _no_ cookie, which is exactly the first-time visitor an origin issues a
+session cookie to.
+
+#### You cannot verify this locally
+
+Viceroy does not implement the readthrough cache. Measured with the gate enabled, the
+request judged shareable, and a stub origin answering `Cache-Control: public, max-age=60`
+with no `Set-Cookie`, two identical navigations still produced two origin fetches. The
+local harness can therefore show the _decision_ this gate makes, and never its effect.
+
+The first evidence either way comes from a deployed service. Treat any local timing as
+saying nothing about this setting.
+
+#### Enablement
+
+1. Run `ts origin probe-shareability --url <representative URLs>`, passing
+   `--cookie` for any publisher cookie a real reader carries.
+   `--admission-cookie` runs are diagnostic only: every request carries that cookie,
+   so cookieless responses remain untested and the safety gate fails. Rerun against
+   the origin without this option before enabling caching.
+2. **Every axis and every verdict must pass.** Do not enable on a partial pass.
+   The probe checks status and safety headers on every sampled response, including
+   repeats. Any `Age` header, including `Age: 0`, blocks the verdict because a
+   fresh cached response can hide origin personalization. Pass `--vary-header <name>` for each additional request header to test;
+   each is varied independently, both with and without RSC. A declared `Vary` can
+   explain a user-agent, RSC,
+   or custom-header difference only when every response declares it. Cookie
+   differences and different decoded gzip/identity documents always fail, because
+   the template cache requires those representations to be identical.
+   The probe is the only response-safety control on the readthrough path.
+3. Read the probe's stated limits. It runs from one client address, so
+   personalisation keyed on the reader's IP — geo, rate class — is invisible to
+   it, as are `Accept-Language` and client-hint variants it does not vary.
+4. Set `origin_readthrough_enabled = true` and push the configuration.
+5. Watch the `origin_cache_shareable` breakdown in auction telemetry. It records
+   the predicate on every row, so it shows how much traffic the gate admits — and,
+   before you enable it, how much it _would_ admit.
+6. Confirm the origin's own hit rate and page correctness before widening to more
+   URLs.
+
+#### Rollback
+
+1. Set `origin_readthrough_enabled = false` and push. This takes effect on the
+   next request with no deploy and restores the previous policy: ad-serving
+   requests bypass, while non-ad traffic keeps the platform default. It does not
+   disable origin caching globally.
+2. **Objects already stored are not purgeable by this service.** `ts cache purge`
+   and the admin endpoint cover the template cache (`ts-template`) only. Whether
+   readthrough objects can be tagged for purge has not been verified against a
+   real Fastly service, so no tagging is applied and no purge command claims to
+   reach them. After flipping the flag, already-stored objects age out on the
+   origin's own TTL and can still serve non-ad traffic. Changing the origin's TTL
+   does not shorten an already-cached object's lifetime.
+
+Step 2 is the reason to treat enablement as one-way for the duration of the
+origin's TTL, and to widen URL coverage slowly.
 
 ### `gam_unit_path` templating
 

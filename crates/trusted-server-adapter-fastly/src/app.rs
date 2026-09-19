@@ -297,9 +297,9 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
-        // Spike-only (#1009). Constructed unconditionally, but only read when the
-        // assembly mode is a shared-template one — which defaults to Inline, so this
-        // is inert until an operator opts in.
+        // Constructed unconditionally, but only read when the assembly mode is a
+        // shared-template one — which defaults to Inline, so this is inert until an
+        // operator opts in.
         .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
@@ -577,6 +577,20 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
+    // An operator cache purge is not a reader request: running the EC lifecycle would
+    // attach finalization state and could ingest the operator's cookies into KV.
+    if matches!(handler, NamedRouteHandler::AdminCachePurge) {
+        let principal = trusted_server_core::auth::authenticated_username(&req);
+        let response = trusted_server_core::cache_purge::handle_cache_purge(
+            &services,
+            req,
+            principal.as_deref(),
+        )
+        .await
+        .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
     // These diagnostics are read-only. Running the normal EC lifecycle would
     // attach finalization state and could ingest request cookies into KV after
     // the handler returns, violating that contract.
@@ -651,6 +665,9 @@ async fn run_named_route(
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
             unreachable!("admin diagnostics should be handled before EC setup")
+        }
+        NamedRouteHandler::AdminCachePurge => {
+            unreachable!("cache purge should be handled before EC setup")
         }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
@@ -1094,6 +1111,7 @@ enum NamedRouteHandler {
     DeactivateKey,
     AdminEcLookup,
     AdminEidsLookup,
+    AdminCachePurge,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -1114,6 +1132,18 @@ struct NamedRoute {
     primary_methods: &'static [Method],
     handler: NamedRouteHandler,
 }
+
+/// Every method an admin route must claim to keep non-primary methods from falling
+/// through to the publisher with the `Authorization` header still attached.
+const ALL_ADMIN_METHODS: &[Method] = &[
+    Method::GET,
+    Method::POST,
+    Method::HEAD,
+    Method::OPTIONS,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+];
 
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
@@ -1145,6 +1175,15 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/keys/deactivate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
+    },
+    // Every method is claimed, not just POST. A method this route did not claim would
+    // fall through to the publisher, and `enforce_basic_auth` leaves the `Authorization`
+    // header in place, so a GET would ship the shared admin credential to the origin.
+    // The handler answers the non-POST methods with 405 itself.
+    NamedRoute {
+        path: "/_ts/admin/cache/purge",
+        primary_methods: ALL_ADMIN_METHODS,
+        handler: NamedRouteHandler::AdminCachePurge,
     },
     // Admin EC lookup: the bare route reads the EC ID from the caller's
     // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
@@ -1937,6 +1976,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cache_purge_claims_every_method_that_could_reach_the_publisher() {
+        // The guard this route exists behind. `enforce_basic_auth` authenticates on the raw
+        // path and leaves the `Authorization` header attached, so any method this route does
+        // not claim falls through to the publisher fallback carrying the shared admin
+        // credential to the origin. Asserted against the fallback list itself rather than a
+        // copy of it, so a method added there cannot quietly open a hole here.
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/cache/purge")
+            .expect("cache purge must be a named route");
+
+        for method in super::publisher_fallback_methods() {
+            assert!(
+                route.primary_methods.contains(&method),
+                "{method} /_ts/admin/cache/purge must be claimed, or it reaches the publisher \
+                 with the admin credential attached"
+            );
+        }
+        assert!(matches!(route.handler, NamedRouteHandler::AdminCachePurge));
+    }
+
+    #[test]
+    fn cache_purge_has_no_legacy_unauthenticated_alias() {
+        // The production basic-auth regex is `^/_ts/admin`. An `/admin/...` spelling would
+        // not match it, so it must not exist at all.
+        assert!(
+            !NAMED_ROUTES
+                .iter()
+                .any(|route| route.path == "/admin/cache/purge"),
+            "an /admin-prefixed alias would sit outside the basic-auth regex"
+        );
     }
 
     #[test]
@@ -2890,6 +2963,12 @@ mod tests {
                 .lock()
                 .expect("should lock entries")
                 .remove(&key.to_cache_key());
+            Ok(())
+        }
+
+        /// A no-op beyond succeeding: this double stores by cache key, so it cannot
+        /// resolve a surrogate key to entries the way the platform does.
+        async fn purge_url_surrogate_key(&self, _key: &str) -> Result<(), TemplateCacheError> {
             Ok(())
         }
 

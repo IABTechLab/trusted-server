@@ -191,7 +191,9 @@ fn derive_section(path: &str, section_root: &str, section_segment: usize) -> Str
 /// `</body>` and the root document is therefore uncacheable. `Esi` stores a
 /// request-neutral shared template and fills its per-request byte seam at the edge.
 ///
-/// Spike-only, for the #1009 ESI validation. Remove with the spike.
+/// Defaults to `Inline`. `Esi` is opt-in per deployment and is verified by the
+/// `template-cache-local-test.sh` harness plus the rendered-document byte-identity
+/// tests; it is not a trial mode, but it is also not the default.
 ///
 /// # Why the template must be request-neutral
 ///
@@ -299,9 +301,10 @@ pub struct CreativeOpportunitiesConfig {
     /// `Option` rather than a bare enum, and `skip_serializing_if`, deliberately:
     /// these structs use `deny_unknown_fields`, so a pushed key makes an older
     /// binary fail configuration load. Keeping it absent when unset means a
-    /// deployment that never sets it stays rollback-compatible.
+    /// deployment that never sets it stays rollback-compatible. That reasoning applies
+    /// to every optional field in this struct.
     ///
-    /// Spike-only. See [`AssemblyMode`].
+    /// See [`AssemblyMode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly_mode: Option<AssemblyMode>,
     /// Request headers the origin varies on, which the shared-template cache key must
@@ -318,7 +321,7 @@ pub struct CreativeOpportunitiesConfig {
     /// deployment that has not stated what its origin varies on from gaining a shared
     /// cache by omission.
     ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_vary: Option<Vec<String>>,
     /// Maximum time a reader-neutral transformed template may remain in the shared template cache.
@@ -328,7 +331,7 @@ pub struct CreativeOpportunitiesConfig {
     /// the origin's remaining edge freshness and this value. Defaults to 60 seconds
     /// and may be configured from 1 second through 1 day.
     ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_max_age_seconds: Option<u32>,
     /// Operator assertion that the origin's HTML does not depend on request cookies.
@@ -345,9 +348,39 @@ pub struct CreativeOpportunitiesConfig {
     /// assertion is caught whenever the origin is honest about it, and this only widens
     /// the window where the origin personalizes *silently*.
     ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Verify rather than assume: `ts origin probe-shareability` compares the origin's
+    /// responses with and without a representative cookie jar and answers exactly this
+    /// question. See the configuration guide's template-cache section.
+    ///
+    /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
+    /// Whether this origin's responses may be held in the platform's shared readthrough
+    /// cache.
+    ///
+    /// Unset or `false` preserves the existing policy: ad-serving requests bypass the
+    /// cache, while other publisher requests retain the platform default. Setting `true`
+    /// uses request shareability instead: eligible ad-serving requests may use the cache,
+    /// and ineligible non-ad requests bypass it.
+    ///
+    /// **This flag is the whole opt-in.** Unlike
+    /// [`Self::origin_is_cookie_independent`], which only ever applies to cookie-bearing
+    /// requests, readthrough admits *cookieless* requests — first-time visitors, which is
+    /// exactly when an origin issues a session cookie. There is no response-side guard on
+    /// this path: the decision is made before the origin replies, and no post-response
+    /// hook is reachable on the Fastly adapter. Safety therefore rests on the origin's own
+    /// `Cache-Control` plus an operator's verification, so enabling it must be a
+    /// deliberate act rather than a consequence of deploying.
+    ///
+    /// Verify with `ts origin probe-shareability` before setting this.
+    ///
+    /// Setting this back to `false` restores the existing ad-stack bypass policy, not
+    /// a global cache bypass. Rollback is not retroactive: readthrough objects
+    /// carry no surrogate key, so neither `ts cache purge` nor the admin endpoint can
+    /// reach them — those cover the template cache only. Already-stored objects age out
+    /// on the origin's TTL. Treat enablement as one-way for that long.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_readthrough_enabled: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
@@ -368,6 +401,15 @@ impl CreativeOpportunitiesConfig {
     #[must_use]
     pub fn origin_is_cookie_independent(&self) -> bool {
         self.origin_is_cookie_independent.unwrap_or(false)
+    }
+
+    /// Whether the origin's responses may enter the platform's shared readthrough cache.
+    ///
+    /// Defaults to `false`: the conservative reading, and the one that preserves today's
+    /// shipped behavior for every deployment that does not ask for the change.
+    #[must_use]
+    pub fn origin_readthrough_enabled(&self) -> bool {
+        self.origin_readthrough_enabled.unwrap_or(false)
     }
 
     /// Headers the cache key covers, per operator config.
@@ -1355,6 +1397,7 @@ mod tests {
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
             origin_is_cookie_independent: None,
+            origin_readthrough_enabled: None,
             section_segment: None,
             slot: vec![slot],
         }
@@ -1757,6 +1800,7 @@ mod tests {
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
             origin_is_cookie_independent: None,
+            origin_readthrough_enabled: None,
             section_segment: None,
             slot: Vec::new(),
         };
@@ -2250,7 +2294,7 @@ mod tests {
         assert_eq!(
             config.template_cache_max_age(),
             std::time::Duration::from_secs(60),
-            "an absent ceiling must preserve the spike's existing lifetime"
+            "an absent ceiling must preserve the existing lifetime"
         );
         let serialized = toml::to_string(&config).expect("should serialize");
 

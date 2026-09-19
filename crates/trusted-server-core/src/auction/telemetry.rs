@@ -121,6 +121,16 @@ pub struct AuctionObservationContext {
     pub consent_present: bool,
     /// Requested slot count for this candidate.
     pub slot_count: u16,
+    /// Whether this request's origin response *would be* eligible to share.
+    ///
+    /// Records a predicate, not a cache hit. Ad-serving requests still bypass the
+    /// platform cache unless `origin_readthrough_enabled` is set, so this measures
+    /// the gate's potential reach before enablement as well as its eligibility afterwards.
+    ///
+    /// `None` on sources that do not make the decision, which is not the same as
+    /// `Some(false)` — a dashboard that reads absence as "not shareable" will be wrong for
+    /// every `/auction` row.
+    pub origin_cache_shareable: Option<bool>,
     started_at: Instant,
 }
 
@@ -187,8 +197,14 @@ impl AuctionObservationContext {
             gdpr_applies: consent.gdpr_applies,
             consent_present: !consent.is_empty(),
             slot_count,
+            origin_cache_shareable: None,
             started_at: Instant::now(),
         }
+    }
+
+    /// Record whether the origin readthrough gate admitted this request.
+    pub fn set_origin_cache_shareable(&mut self, shareable: bool) {
+        self.origin_cache_shareable = Some(shareable);
     }
 
     /// Return elapsed milliseconds since the observation was created.
@@ -212,6 +228,7 @@ impl AuctionObservationContext {
             gdpr_applies: false,
             consent_present: false,
             slot_count,
+            origin_cache_shareable: None,
             started_at: Instant::now(),
         }
     }
@@ -341,6 +358,11 @@ pub struct AuctionEventRow {
     pub ad_domain: Option<String>,
     /// Creative/ad ID.
     pub ad_id: Option<String>,
+    /// `0` or `1`; absent when this source does not make the readthrough decision.
+    ///
+    /// Absent is not the same as `0` — see
+    /// [`AuctionObservationContext::origin_cache_shareable`].
+    pub origin_cache_shareable: Option<u8>,
 }
 
 impl AuctionEventRow {
@@ -379,6 +401,7 @@ impl AuctionEventRow {
             is_win: None,
             ad_domain: None,
             ad_id: None,
+            origin_cache_shareable: observation.origin_cache_shareable.map(u8::from),
         }
     }
 }
@@ -956,6 +979,69 @@ mod tests {
     use crate::auction::types::{AdFormat, AdSlot, DeviceInfo, PublisherInfo, UserInfo};
 
     use super::*;
+
+    /// A plain observation context, for tests that only care about the fields they set.
+    ///
+    /// Wraps the existing [`AuctionObservationContext::for_test`] so the cache-field tests and
+    /// the row tests build it identically.
+    fn test_observation() -> AuctionObservationContext {
+        AuctionObservationContext::for_test(AuctionSource::InitialNavigation, "/article", 1)
+    }
+
+    #[test]
+    fn summary_row_carries_cache_outcomes_from_the_observation() {
+        let mut observation = test_observation();
+        observation.set_origin_cache_shareable(false);
+
+        let mut rows = Vec::new();
+        push_summary(
+            &mut rows,
+            &observation,
+            "2026-09-15 00:00:00.000",
+            AuctionTerminalStatus::Completed,
+            None,
+            12,
+            1,
+        );
+
+        let row = rows.first().expect("should emit one summary row");
+        assert_eq!(row.origin_cache_shareable, Some(0));
+    }
+
+    #[test]
+    fn rows_omit_cache_outcomes_when_the_observation_has_none() {
+        let observation = test_observation();
+        let mut rows = Vec::new();
+        push_summary(
+            &mut rows,
+            &observation,
+            "2026-09-15 00:00:00.000",
+            AuctionTerminalStatus::Completed,
+            None,
+            12,
+            1,
+        );
+
+        let row = rows.first().expect("should emit one summary row");
+        assert_eq!(
+            row.origin_cache_shareable, None,
+            "an unmeasured source must be distinguishable from a measured miss"
+        );
+    }
+
+    #[test]
+    fn observation_cache_fields_default_to_absent_and_round_trip() {
+        let mut observation = test_observation();
+
+        assert_eq!(
+            observation.origin_cache_shareable, None,
+            "a freshly built observation should not claim a cache outcome"
+        );
+
+        observation.set_origin_cache_shareable(true);
+
+        assert_eq!(observation.origin_cache_shareable, Some(true));
+    }
 
     fn test_request(id: &str) -> AuctionRequest {
         AuctionRequest {

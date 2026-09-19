@@ -170,7 +170,7 @@ pub struct RuntimeServices {
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
-    /// per request rather than failing. Spike-only; see
+    /// per request rather than failing. See
     /// [`crate::platform::template_cache`].
     pub(crate) template_cache: Arc<dyn super::PlatformTemplateCache>,
     /// Platform-specific cold-response template assembler.
@@ -233,7 +233,7 @@ impl RuntimeServices {
         &*self.kv_store
     }
 
-    /// The shared transformed-template cache. Spike-only.
+    /// The shared transformed-template cache.
     #[must_use]
     pub fn template_cache(&self) -> &dyn super::PlatformTemplateCache {
         &*self.template_cache
@@ -297,7 +297,6 @@ impl RuntimeServices {
 
     /// Returns a clone of this instance with the template cache replaced.
     ///
-    /// Spike-only (#1009).
     #[must_use]
     pub fn with_template_cache(self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         Self {
@@ -374,7 +373,7 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the shared transformed-template cache. Spike-only.
+    /// Set the shared transformed-template cache.
     #[must_use]
     pub fn template_cache(mut self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         self.template_cache = Some(cache);

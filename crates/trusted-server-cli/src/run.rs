@@ -29,6 +29,9 @@ enum Command {
     Auth(AuthArgs),
     /// Build the project for a target adapter.
     Build(BuildArgs),
+    /// Shared template cache commands.
+    #[command(subcommand)]
+    Cache(crate::commands::cache::CacheCommand),
     /// Trusted Server app-config commands.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -47,6 +50,9 @@ enum Command {
     /// Local developer tools (e.g. the macOS-only production-hostname proxy).
     #[command(subcommand)]
     Dev(crate::commands::dev::DevCommand),
+    /// Questions about a publisher origin's behaviour.
+    #[command(subcommand)]
+    Origin(crate::commands::origin::OriginCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -127,6 +133,16 @@ fn dispatch(args: Args) -> Result<(), String> {
         Command::Rollback(args) => edgezero_cli::run_rollback(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),
         Command::Dev(command) => crate::commands::dev::run(command),
+        Command::Cache(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::cache::run(command, &mut out)
+        }
+        Command::Origin(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::origin::run(command, &mut out)
+        }
     }
 }
 

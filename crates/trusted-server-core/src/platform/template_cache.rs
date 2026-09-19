@@ -1,21 +1,23 @@
-//! The shared transformed-template cache for the #1009 ESI validation spike.
+//! The shared transformed-template cache.
 //!
 //! Three caches are in play and conflating them is what produced the original wrong
 //! conclusion in the design doc, so this module names which one it is:
 //!
-//! | Cache | Contents                          | Owner                          |
-//! | ----- | --------------------------------- | ------------------------------ |
-//! | C1    | raw origin bytes                  | Fastly read-through. Not this. |
-//! | Template cache | post-`lol_html`, pre-assembly     | **This module.**       |
-//! | Final response | final per-user assembled response | **Must never exist.** |
+//! | Cache                | Contents                          | Owner                          |
+//! | -------------------- | --------------------------------- | ------------------------------ |
+//! | Origin readthrough   | raw origin bytes                  | The platform. Not this module. |
+//! | Template cache       | post-`lol_html`, pre-assembly     | **This module.**               |
+//! | Assembled response   | final per-user assembled response | **Must never exist.**          |
+//!
+//! The origin readthrough cache is gated separately by
+//! `creative_opportunities.origin_readthrough_enabled` (issue #852). The two are
+//! independent: one can be on while the other is off.
 //!
 //! The template cache holds a *shared template*: no per-user bytes, and no decisions that depend on
 //! the request. What may and may not live in it is
 //! [§6.7 of the design doc](../../../../docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md),
 //! and the invariant is enforced by the rendered-document byte-identity tests in
 //! `publisher`.
-//!
-//! Spike-only. Remove with the spike.
 
 use core::fmt;
 use std::collections::HashSet;
@@ -34,7 +36,8 @@ use crate::creative_opportunities::AssemblyMode;
 /// | 2       | Marker became the inert comment `<!--ts-seam-bids-->`; the seam hands slots to `scheduleInitialAdInit` instead of assigning them |
 /// | 3       | Marker became `<!--ts-c2-v3-seam-7f4c9e2d-bids-->`; canonical collision-safe key, explicit origin freshness, and complete repeated document-policy metadata |
 /// | 4       | Marker is the shorter, accurate [`AD_ASSEMBLY_SEAM`](crate::publisher::AD_ASSEMBLY_SEAM) |
-pub const TEMPLATE_SCHEMA_VERSION: u32 = 4;
+/// | 5       | Key gained `request_path`, so entries from version 4 hash differently and must not be read |
+pub const TEMPLATE_SCHEMA_VERSION: u32 = 5;
 
 /// Surrogate key attached to every template so an incident can purge the template cache globally.
 pub const TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
@@ -57,6 +60,12 @@ pub struct TemplateCacheKey {
     pub request_host: String,
     /// See [`Self::request_host`].
     pub request_scheme: String,
+    /// Path and query as the **reader** addressed them, before origin rewriting.
+    ///
+    /// Distinct from [`Self::url`], which is the rewritten origin target. Kept so a purge
+    /// caller holding only the page address can derive the same key core attached at
+    /// insert — see [`Self::reader_url_surrogate_key`].
+    pub request_path: String,
     /// Publisher origin identity, including the outbound Host override. Two virtual
     /// hosts can share a connection target while producing unrelated documents.
     pub origin_identity: String,
@@ -100,6 +109,7 @@ impl TemplateCacheKey {
         );
         push(&mut canonical, self.request_scheme.as_bytes());
         push(&mut canonical, self.request_host.as_bytes());
+        push(&mut canonical, self.request_path.as_bytes());
         push(&mut canonical, self.origin_identity.as_bytes());
         push(&mut canonical, self.url.as_bytes());
         push(&mut canonical, self.template_fingerprint.as_bytes());
@@ -132,23 +142,103 @@ impl TemplateCacheKey {
     /// Surrogate keys to attach at insert, for purge-based rollback.
     ///
     /// `ts-template` purges every template at once, which is the rollback lever.
-    /// The per-URL key allows targeted invalidation. Both are needed: the broad one
-    /// for an incident, the narrow one for ordinary invalidation.
+    /// The per-URL keys allow targeted invalidation: one derived from the origin target
+    /// URI for core's own eviction of a bad entry, one derived from the reader-facing URL
+    /// for an operator or a CMS that only knows the page address.
     #[must_use]
     pub fn surrogate_keys(&self) -> Vec<String> {
         vec![
             TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY.to_string(),
             self.url_surrogate_key(),
+            self.reader_url_surrogate_key(),
         ]
     }
 
-    /// Surrogate key for every variant of this publisher URL.
+    /// Surrogate key for every variant of this publisher URL, as the origin saw it.
     ///
     /// Used to evict a malformed object without flushing unrelated article templates.
+    /// Keyed on [`Self::url`], which is the **origin-rewritten** target URI — not the
+    /// address a reader or an operator would type.
     #[must_use]
     pub fn url_surrogate_key(&self) -> String {
         format!("ts-template-url-{}", digest_hex(self.url.as_bytes()))
     }
+
+    /// Surrogate key for this page as a reader addresses it.
+    ///
+    /// Purge callers know the page URL, not the origin the request was rewritten to, and
+    /// reconstructing the latter from the former would mean reimplementing the publisher
+    /// path's rewrite in every caller. When that reimplementation drifts it does not
+    /// fail — it produces a well-formed key that matches nothing, so a purge returns
+    /// success and invalidates nothing. Keying on the reader-facing URL removes the
+    /// reimplementation instead of trying to keep it in step.
+    #[must_use]
+    pub fn reader_url_surrogate_key(&self) -> String {
+        reader_url_surrogate_key(&format!(
+            "{}://{}{}",
+            self.request_scheme, self.request_host, self.request_path
+        ))
+    }
+}
+
+/// Surrogate key for a reader-facing URL, as an operator would type it.
+///
+/// A free function because both halves of the purge path need it and neither can build a
+/// whole [`TemplateCacheKey`]: the endpoint and the CLI have a URL, not an origin identity,
+/// a template fingerprint, or the origin's `Vary` values.
+///
+/// # Canonicalization
+///
+/// The digest is over exact bytes, so spellings that name the same page must be reduced to
+/// one form or a purge silently misses. Normalized: scheme and host case, a default port,
+/// one trailing slash, an empty query, and the *order* of the query parameters. **Not**
+/// normalized: the parameters themselves, since a different query is a different page.
+///
+/// Parameter order is normalized because a reader reaching `?a=1&b=2` and one reaching
+/// `?b=2&a=1` are on the same page, and both orderings can be cached as separate entries.
+/// Leaving them as separate purge handles would let a purge report success while a stale
+/// entry for the other ordering survived — the failure direction that matters here.
+///
+/// A URL that cannot be parsed is hashed as given. An operator typo then purges nothing,
+/// which is the same outcome as a correct URL that was never cached, and is preferable to
+/// failing the command.
+#[must_use]
+pub fn reader_url_surrogate_key(url: &str) -> String {
+    format!(
+        "ts-template-readerurl-{}",
+        digest_hex(canonical_reader_url(url).as_bytes())
+    )
+}
+
+fn canonical_reader_url(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_owned();
+    };
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let port = match parsed.port() {
+        // `Url::port` already returns `None` for the scheme's default, so anything left
+        // is meaningful.
+        Some(port) => format!(":{port}"),
+        None => String::new(),
+    };
+    let path = parsed.path().trim_end_matches('/');
+    let query = match parsed.query() {
+        Some(query) if !query.is_empty() => {
+            // Sorted on the raw pairs rather than decoded ones, so percent-encoded values
+            // stay byte-exact. Empty pairs are dropped, which folds `?a=1&&b=2` onto
+            // `?a=1&b=2`; that over-purges by one spelling, which is the safe direction.
+            let mut pairs: Vec<&str> = query.split('&').filter(|pair| !pair.is_empty()).collect();
+            pairs.sort_unstable();
+            if pairs.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", pairs.join("&"))
+            }
+        }
+        _ => String::new(),
+    };
+    format!("{scheme}://{host}{port}{path}{query}")
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -202,8 +292,8 @@ pub const REPLAYABLE_POLICY_HEADERS: &[&str] = &[
 /// Without this carve-out, the ordinary declaration sent by any compressing origin reads
 /// as an uncovered gap and disqualifies the response, so **the template cache would never store anything
 /// against a real origin** unless the operator redundantly listed a header the transform
-/// already normalizes. Found by review before it could make the spike measure a hit rate
-/// of approximately zero and read that as a result.
+/// already normalizes. Found by review before it could drive the hit rate to
+/// approximately zero and have that read as a measurement rather than a bug.
 const STRUCTURALLY_COVERED: &[&str] = &["accept-encoding"];
 
 /// Request headers to include in the cache key, and where the list comes from.
@@ -224,10 +314,17 @@ const STRUCTURALLY_COVERED: &[&str] = &["accept-encoding"];
 /// 3. **Store the list alongside** and re-key on mismatch. Same cost as (2) plus
 ///    complexity.
 ///
-/// (1) is chosen for the spike because Step A already measured the origin's actual
-/// `Vary`, the origin response is checked for drift before storage, and the configured
-/// template-cache ceiling bounds how long a newly introduced mismatch can survive.
-/// **This is a spike-grade choice, not a production one** — see the drift guard below.
+/// (1) is chosen, and it holds for production because the drift it risks **fails
+/// closed**: before storage the origin's actual `Vary` is compared against this list, and
+/// an uncovered name refuses the template
+/// (`TemplateCacheBypassReason::VaryNotCovered`, which carries the offending names so a
+/// stale config is identifiable from one log line). A configuration that falls behind the
+/// origin therefore costs hit rate, not correctness — the cache stops storing rather than
+/// serving the wrong representation. The configured ceiling additionally bounds how long
+/// an already-stored entry can outlive a change.
+///
+/// Revisit (2) if operators find the configured list burdensome in practice; the reason to
+/// prefer (1) is the extra lookup on every request, not a limitation of the guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarySpec {
     /// Header names, lowercased, in a fixed order.
@@ -674,6 +771,14 @@ pub trait PlatformTemplateCache: Send + Sync {
     /// Purge every cached variant for one publisher URL.
     async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError>;
 
+    /// Purge one already-derived surrogate key.
+    ///
+    /// Exists because [`Self::purge_url`] needs a whole [`TemplateCacheKey`], which a
+    /// purge caller cannot build: an operator or a CMS webhook has a URL, not an origin
+    /// identity, a template fingerprint, or the origin's `Vary` values. Pair it with
+    /// [`reader_url_surrogate_key`].
+    async fn purge_url_surrogate_key(&self, key: &str) -> Result<(), TemplateCacheError>;
+
     /// Purge every stored template. The rollback lever.
     async fn purge_all(&self) -> Result<(), TemplateCacheError>;
 }
@@ -721,6 +826,13 @@ impl PlatformTemplateCache for UnavailableTemplateCache {
         Err(TemplateCacheError::Unsupported)
     }
 
+    /// Reports unsupported rather than succeeding. A purge surface that silently does
+    /// nothing is worse than one that refuses: an operator mid-incident would read the
+    /// success and stop looking.
+    async fn purge_url_surrogate_key(&self, _key: &str) -> Result<(), TemplateCacheError> {
+        Err(TemplateCacheError::Unsupported)
+    }
+
     async fn purge_all(&self) -> Result<(), TemplateCacheError> {
         Err(TemplateCacheError::Unsupported)
     }
@@ -737,6 +849,7 @@ mod tests {
             url: "https://example.com/news/article".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/news/article".to_string(),
             origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
             assembly_mode: AssemblyMode::Esi,
             vary_values: vec![VaryHeaderValues {
@@ -881,9 +994,9 @@ mod tests {
         let rendered = key().to_cache_key();
         assert_eq!(
             rendered,
-            "ts-template-cache-v4-54431eb4ea82644d6378717a8c3f18302fafbf739e684598da79e392b16900a6"
+            "ts-template-cache-v5-499cb43a3160fe173ffa53ea0b999658c8f2c50fbe23818ab451a59f7dc040da"
         );
-        assert!(rendered.starts_with("ts-template-cache-v4-"));
+        assert!(rendered.starts_with("ts-template-cache-v5-"));
         assert_eq!(rendered.len(), 85);
         for sensitive in ["example.com", "/news/article", "rsc", "abc123"] {
             assert!(
@@ -943,17 +1056,187 @@ mod tests {
             keys.contains(&TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY.to_string()),
             "a global purge lever is what makes rollback possible"
         );
-        assert_eq!(keys.len(), 2, "global plus per-URL");
-        assert!(
-            !keys[1].contains(char::is_whitespace),
-            "surrogate keys are space-delimited; whitespace would purge more than \
-             intended, got {:?}",
-            keys[1]
+        assert_eq!(
+            keys.len(),
+            3,
+            "global, origin-derived per-URL, and reader-facing per-URL"
         );
+        for key in keys.iter().skip(1) {
+            assert!(
+                !key.contains(char::is_whitespace),
+                "surrogate keys are space-delimited; whitespace would purge more than \
+                 intended, got {key:?}"
+            );
+            assert!(
+                !key.contains('/') && !key.contains(':'),
+                "URL punctuation must be reduced, got {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_adapter_without_a_template_cache_refuses_a_surrogate_purge() {
+        let outcome = futures::executor::block_on(
+            UnavailableTemplateCache.purge_url_surrogate_key("ts-template-readerurl-abc"),
+        );
+
         assert!(
-            !keys[1].contains('/') && !keys[1].contains(':'),
-            "URL punctuation must be reduced, got {:?}",
-            keys[1]
+            matches!(outcome, Err(TemplateCacheError::Unsupported)),
+            "a purge surface that silently does nothing is worse than one that refuses: \
+             an operator mid-incident would read the success and stop looking"
+        );
+    }
+
+    #[test]
+    fn the_reader_facing_key_ignores_origin_rewriting() {
+        // `url` is the origin-rewritten target URI, not what an operator types. Two
+        // publisher hosts behind one reader-facing page must purge together, and core's
+        // own per-URL key must stay distinct so it can still evict one bad object.
+        let mut a = key();
+        let mut b = key();
+        a.url = "https://origin-one.internal.example/article".to_string();
+        b.url = "https://origin-two.internal.example/article".to_string();
+
+        assert_eq!(
+            a.reader_url_surrogate_key(),
+            b.reader_url_surrogate_key(),
+            "the reader-facing key must not depend on which origin served the page"
+        );
+        assert_ne!(
+            a.url_surrogate_key(),
+            b.url_surrogate_key(),
+            "the origin-derived key must stay distinct; core uses it to evict one entry"
+        );
+    }
+
+    #[test]
+    fn the_reader_facing_key_uses_a_distinct_namespace() {
+        let keys = key().surrogate_keys();
+        assert_eq!(keys.len(), 3, "global, origin-derived, and reader-facing");
+        assert!(
+            keys.contains(&key().reader_url_surrogate_key()),
+            "the reader-facing key must be attached at insert or a purge cannot find it"
+        );
+        assert_ne!(
+            key().url_surrogate_key(),
+            key().reader_url_surrogate_key(),
+            "distinct prefixes keep a staging host whose edge URL equals the origin URL \
+             from aliasing the two derivations"
+        );
+    }
+
+    #[test]
+    fn reader_url_canonicalization_is_stable_across_operator_spellings() {
+        for (a, b) in [
+            (
+                "https://example.com/article",
+                "https://example.com/article/",
+            ),
+            ("https://Example.COM/article", "https://example.com/article"),
+            (
+                "https://example.com:443/article",
+                "https://example.com/article",
+            ),
+            (
+                "http://example.com:80/article",
+                "http://example.com/article",
+            ),
+            (
+                "https://example.com/article?",
+                "https://example.com/article",
+            ),
+            (
+                "https://example.com/article?a=1&b=2",
+                "https://example.com/article?b=2&a=1",
+            ),
+        ] {
+            assert_eq!(
+                reader_url_surrogate_key(a),
+                reader_url_surrogate_key(b),
+                "{a} and {b} name the same page and must purge together"
+            );
+        }
+    }
+
+    #[test]
+    fn reader_url_canonicalization_keeps_meaningful_differences() {
+        // A query selects a different page, so it must not be normalized away.
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a?page=1"),
+            reader_url_surrogate_key("https://example.com/a?page=2"),
+        );
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a"),
+            reader_url_surrogate_key("https://example.com/b"),
+        );
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a"),
+            reader_url_surrogate_key("https://other.example/a"),
+            "two hosts are two pages"
+        );
+    }
+
+    #[test]
+    fn query_parameter_order_does_not_split_one_page_into_two_purge_handles() {
+        // Both orderings can be cached as separate entries, because the cache key is built
+        // from the path exactly as the reader sent it. They must still share one purge
+        // handle, or purging the ordering the operator happened to type would leave the
+        // other serving stale content while reporting success.
+        for (a, b) in [
+            (
+                "https://example.com/a?one=1&two=2&three=3",
+                "https://example.com/a?three=3&one=1&two=2",
+            ),
+            // A repeated parameter is order-independent the same way.
+            (
+                "https://example.com/a?tag=x&tag=y",
+                "https://example.com/a?tag=y&tag=x",
+            ),
+            // A valueless parameter still sorts.
+            (
+                "https://example.com/a?debug&page=2",
+                "https://example.com/a?page=2&debug",
+            ),
+        ] {
+            assert_eq!(
+                reader_url_surrogate_key(a),
+                reader_url_surrogate_key(b),
+                "{a} and {b} are the same page in a different spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn sorting_the_query_does_not_merge_pages_that_genuinely_differ() {
+        // Sorting must collapse orderings only. If it also collapsed differing values or
+        // a dropped parameter, a purge would reach entries it was never asked to touch.
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a?x=1&y=2"),
+            reader_url_surrogate_key("https://example.com/a?x=2&y=1"),
+            "swapping which parameter holds which value is a different page"
+        );
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a?x=1&y=2"),
+            reader_url_surrogate_key("https://example.com/a?x=1"),
+            "dropping a parameter is a different page"
+        );
+        assert_ne!(
+            reader_url_surrogate_key("https://example.com/a?tag=x&tag=y"),
+            reader_url_surrogate_key("https://example.com/a?tag=x"),
+            "a repeated parameter must not be deduplicated into a single one"
+        );
+    }
+
+    #[test]
+    fn a_reader_url_that_cannot_be_parsed_still_yields_a_stable_key() {
+        // An operator typo must not panic the CLI; it should simply purge nothing.
+        assert_eq!(
+            reader_url_surrogate_key("not a url"),
+            reader_url_surrogate_key("not a url"),
+        );
+        assert_ne!(
+            reader_url_surrogate_key("not a url"),
+            reader_url_surrogate_key("https://example.com/a"),
         );
     }
 
@@ -1048,8 +1331,8 @@ mod tests {
     fn a_key_field_counts_as_coverage_without_being_configured() {
         // The failure this prevents is silent and total: every compressing origin sends
         // `Vary: Accept-Encoding`, so treating it as a gap means the cache never stores
-        // anything, and a spike measuring hit rate would report ~0 and look like a
-        // finding rather than a bug.
+        // anything, and the resulting ~0 hit rate would read as a finding rather than a
+        // bug.
         let spec = VarySpec::new([]);
 
         assert!(

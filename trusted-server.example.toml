@@ -337,11 +337,11 @@ price_granularity = "dense"
 # only if your SSPs need more headroom and analytics confirm the DCL slip is OK.
 auction_timeout_ms = 500
 #
-# Initial-page delivery mode (spike/experimental). `inline` is the default and
-# current production behaviour; `esi` is an opt-in Fastly Core Cache experiment
-# storing an inert comment in a shared, reader-neutral template cache. See
-# docs/guide/configuration.md before enabling. This and the three cache-safety
-# keys below belong in this [creative_opportunities] table.
+# Initial-page delivery mode. `inline` is the default and current production
+# behaviour; `esi` is opt-in per deployment and stores an inert comment in a
+# shared, reader-neutral template cache. See docs/guide/configuration.md and run
+# scripts/template-cache-local-test.sh esi before enabling. This and the four
+# cache keys below belong in this [creative_opportunities] table.
 # assembly_mode = "inline"
 # Request headers (besides Accept-Encoding) the origin may name in Vary. Every
 # emitted Vary name must be covered here or template storage is refused. Never
@@ -355,10 +355,22 @@ auction_timeout_ms = 500
 # Safety ceiling (seconds) for one shared template; TS uses the smaller of this
 # and the origin-authorized remaining edge freshness. Default 60; range 1-86400.
 # template_cache_max_age_seconds = 1200
-# Unsafe unless independently verified: excludes cookie-bearing requests from the
-# template cache by default. Set true only when origin HTML is byte-independent
-# of Cookie; an origin `Vary: Cookie` is still refused.
+# Unsafe unless verified with `ts origin probe-shareability`: excludes
+# cookie-bearing requests from the template cache by default. Set true only when
+# origin HTML is byte-independent of Cookie; an origin `Vary: Cookie` is still
+# refused.
 # origin_is_cookie_independent = false
+#
+# Applies shareability checks to the platform's origin cache. Default false keeps
+# the existing policy: ad-serving requests bypass; other publisher requests use
+# the platform default. True admits shareable ad requests and bypasses unshareable
+# non-ad requests. A DIFFERENT cache from the template cache
+# above, and a weaker one: the decision is made before the origin replies, so
+# none of the template cache's response-side refusals (`Set-Cookie`, CSP nonce,
+# missing freshness) apply. `ts origin probe-shareability` must pass on every
+# axis and verdict first, and objects already stored are not purgeable by this
+# service — see the configuration guide's rollback note.
+# origin_readthrough_enabled = false
 #
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id

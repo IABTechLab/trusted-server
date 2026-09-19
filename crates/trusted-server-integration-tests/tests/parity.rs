@@ -919,3 +919,69 @@ async fn legacy_admin_aliases_are_denied_locally_not_proxied() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_cache_purge_not_implemented_parity() {
+    // The template cache is Fastly-backed, so the other three adapters answer 501 rather
+    // than letting the path fall through to the publisher origin and 404 — a CMS purge
+    // webhook needs to tell "not supported here" from "no such endpoint".
+    let body = r#"{"scope":"all"}"#;
+
+    let (axum_status, _) = axum_authorized_json("POST", "/_ts/admin/cache/purge", body).await;
+    let (cf_status, _) = cf_authorized_json("POST", "/_ts/admin/cache/purge", body).await;
+    let (spin_status, _) = spin_authorized_json("POST", "/_ts/admin/cache/purge", body).await;
+
+    assert_eq!(axum_status, 501, "Axum must answer cache purge with 501");
+    assert_eq!(
+        cf_status, 501,
+        "Cloudflare must answer cache purge with 501"
+    );
+    assert_eq!(spin_status, 501, "Spin must answer cache purge with 501");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_cache_purge_unauthenticated_parity() {
+    // Guards the test above from passing for the wrong reason. Without credentials the
+    // path must 401, which proves the 501s were reached through auth rather than being
+    // the 401s of a probe that never arrived at a handler.
+    let body = r#"{"scope":"all"}"#;
+
+    let (axum_status, _) = axum_post_headers("/_ts/admin/cache/purge", body).await;
+    let (cf_status, _) = cf_post_headers("/_ts/admin/cache/purge", body).await;
+    let (spin_status, _) = spin_post_headers("/_ts/admin/cache/purge", body).await;
+
+    for (adapter, status) in [
+        ("Axum", axum_status),
+        ("Cloudflare", cf_status),
+        ("Spin", spin_status),
+    ] {
+        assert_eq!(
+            status, 401,
+            "{adapter} must require auth on the cache purge path"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_cache_purge_rejects_credential_forwarding_methods() {
+    // The guard the Fastly route exists for, asserted cross-adapter: a method the route
+    // does not claim falls through to the publisher with the Authorization header still
+    // attached. Every method must be answered locally, never forwarded.
+    for method in ["GET", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"] {
+        let (axum_status, _) = axum_authorized_json(method, "/_ts/admin/cache/purge", "").await;
+        let (cf_status, _) = cf_authorized_json(method, "/_ts/admin/cache/purge", "").await;
+        let (spin_status, _) = spin_authorized_json(method, "/_ts/admin/cache/purge", "").await;
+
+        for (adapter, status) in [
+            ("Axum", axum_status),
+            ("Cloudflare", cf_status),
+            ("Spin", spin_status),
+        ] {
+            assert_eq!(
+                status, 501,
+                "{adapter} must answer {method} locally; a fallthrough would ship the \
+                 admin credential to the origin"
+            );
+        }
+    }
+}
