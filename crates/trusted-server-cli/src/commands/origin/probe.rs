@@ -240,6 +240,17 @@ async fn probe_one(
         }
     }
 
+    if admission_cookie.is_some() {
+        verdicts.push(VerdictResult {
+            name: "cookieless-coverage".to_owned(),
+            passed: false,
+            detail: "--admission-cookie was sent on every request; cookieless responses were \
+                     not tested. This diagnostic run cannot establish cache safety. Probe \
+                     the origin without --admission-cookie before enabling caching."
+                .to_owned(),
+        });
+    }
+
     Ok(UrlReport {
         url: url.to_owned(),
         axes,
@@ -346,14 +357,10 @@ fn judge_headers(response: &Fetched, axes: &[AxisResult]) -> Vec<VerdictResult> 
 /// caching behaviour and with it the freshness verdict. Perturbing the measurement to
 /// rescue it would make a green result mean less, not more. Probe the origin directly.
 fn fronting_cache_verdict(baseline: &Fetched) -> VerdictResult {
-    // `Age` is the one every conforming shared cache must send, and a positive value is
-    // proof this response was stored. The vendor headers catch caches that omit it.
-    let age = baseline
-        .all("age")
-        .iter()
-        .filter_map(|value| value.trim().parse::<u64>().ok())
-        .max();
-    let served_from_cache = age.is_some_and(|seconds| seconds > 0);
+    // Even Age: 0 can be a fresh cache hit. Any Age field makes direct-origin
+    // evidence uncertain; malformed values must not turn that uncertainty into a pass.
+    let ages = baseline.all("age");
+    let served_from_cache = !ages.is_empty();
 
     const HIT_INDICATORS: &[&str] = &["x-cache", "cf-cache-status", "x-cache-status"];
     let vendor_hit = HIT_INDICATORS.iter().find(|name| {
@@ -365,9 +372,9 @@ fn fronting_cache_verdict(baseline: &Fetched) -> VerdictResult {
 
     let detail = match (served_from_cache, vendor_hit) {
         (true, _) => format!(
-            "a cache answered this request (age: {}s), so every axis may be comparing one \
+            "a cache may have answered this request (age: {}), so every axis may be comparing one \
              stored object with itself",
-            age.unwrap_or_default()
+            ages.join(", ")
         ),
         (false, Some(name)) => format!(
             "a cache answered this request ({name} reports a hit), so every axis may be \

@@ -2069,9 +2069,13 @@ saying nothing about this setting.
 
 1. Run `ts origin probe-shareability --url <representative URLs>`, passing
    `--cookie` for any publisher cookie a real reader carries.
+   `--admission-cookie` runs are diagnostic only: every request carries that cookie,
+   so cookieless responses remain untested and the safety gate fails. Rerun against
+   the origin without this option before enabling caching.
 2. **Every axis and every verdict must pass.** Do not enable on a partial pass.
    The probe checks status and safety headers on every sampled response, including
-   repeats. Pass `--vary-header <name>` for each additional request header to test;
+   repeats. Any `Age` header, including `Age: 0`, blocks the verdict because a
+   fresh cached response can hide origin personalization. Pass `--vary-header <name>` for each additional request header to test;
    each is varied independently, both with and without RSC. A declared `Vary` can
    explain a user-agent, RSC,
    or custom-header difference only when every response declares it. Cookie

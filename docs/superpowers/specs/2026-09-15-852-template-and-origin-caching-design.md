@@ -358,7 +358,7 @@ between readthrough and cross-serving, so its verdicts are blocking and its outp
 
 ### Response-header verdicts, all blocking
 
-- **No fronting cache.** A positive `Age` or a vendor hit header means a cache answered for the
+- **No fronting cache.** Any `Age` header (including `Age: 0`) or a vendor hit header means a cache may have answered for the
   origin, so every axis may have compared one stored object with itself and the whole run says
   nothing. Judged first. Detected rather than defeated: cache-busting would change either the
   cache key or the origin's own caching behaviour, and perturbing the measurement to rescue it

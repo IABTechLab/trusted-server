@@ -46,7 +46,9 @@ pub struct ProbeShareabilityArgs {
     /// Distinct from `--cookie`: this one is sent on *every* arm including the baseline,
     /// because without it a protected origin answers each arm with a challenge page and
     /// the probe would report on those instead of on the origin. It is not part of what
-    /// the cookie axis varies.
+    /// the cookie axis varies. These runs are diagnostic only and always fail the safety
+    /// gate because cookieless responses are untested. Rerun without this option against
+    /// the origin before enabling caching.
     #[arg(long = "admission-cookie")]
     pub admission_cookie: Option<String>,
 

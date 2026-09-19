@@ -452,9 +452,8 @@ fn a_vendor_cache_hit_header_is_caught_even_without_an_age() {
 }
 
 #[test]
-fn an_age_of_zero_is_not_treated_as_a_cache_hit() {
-    // A conforming cache on a miss sends `Age: 0`. Failing that would make the probe
-    // unusable against any origin that reports age at all.
+fn an_age_of_zero_cannot_establish_origin_shareability() {
+    // Fresh cache hits can mask origin personalization within the first second.
     let server = FixtureServer::start(|_request| {
         FixtureResponse::html("<html>stable</html>")
             .with_header("cache-control", "public, max-age=300")
@@ -462,8 +461,8 @@ fn an_age_of_zero_is_not_treated_as_a_cache_hit() {
     });
     let (ok, report) = probe(&server, json_args(&server));
 
-    assert!(ok, "{}", report.render_text());
-    assert!(verdict(&report, "fronting-cache").passed);
+    assert!(!ok, "should reject a fresh cached response");
+    assert!(!verdict(&report, "fronting-cache").passed);
 }
 
 #[test]
@@ -516,10 +515,15 @@ fn an_admission_cookie_lets_the_probe_reach_real_content() {
     let (ok, report) = probe(&server, args);
 
     assert!(
-        ok,
-        "with the wall passed, the origin's own headers decide: {}",
-        report.render_text()
+        !ok,
+        "should keep admission-only diagnostics from passing the gate"
     );
+    assert!(
+        verdict(&report, "status").passed,
+        "should reach real content"
+    );
+    assert!(!verdict(&report, "cookieless-coverage").passed);
+    assert!(report.render_text().contains("cookieless"));
 }
 
 #[test]
@@ -605,6 +609,8 @@ fn vary_cookie_does_not_excuse_the_cookie_axis() {
 fn every_sample_is_checked_for_unsafe_headers() {
     for (header, value, expected_verdict) in [
         ("x-cache", "HIT", "fronting-cache"),
+        ("age", "0", "fronting-cache"),
+        ("age", "invalid", "fronting-cache"),
         ("set-cookie", "session=example-session", "set-cookie"),
         ("cache-control", "private", "freshness"),
         (
@@ -835,5 +841,31 @@ fn configured_headers_are_also_compared_with_rsc_held_constant() {
     assert!(
         !axis(&report, "x-layout").passed(),
         "should attribute the difference to the configured header"
+    );
+}
+
+#[test]
+fn admission_cookie_cannot_hide_first_visitor_session_issuance() {
+    let server = FixtureServer::start(|request| {
+        let response = FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300");
+        if request.header("cookie").is_none() {
+            response.with_header("set-cookie", "session=example-session")
+        } else {
+            response
+        }
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+    assert!(!ok, "should reject first-visitor session issuance");
+    assert!(!verdict(&report, "set-cookie").passed);
+
+    let mut args = json_args(&server);
+    args.admission_cookie = Some("session=existing-reader".to_owned());
+    let (ok, report) = probe(&server, args);
+    assert!(!ok, "should not certify unobserved cookieless responses");
+    assert!(!verdict(&report, "cookieless-coverage").passed);
+    assert!(
+        !report.passed(),
+        "should fail the machine-readable gate too"
     );
 }
