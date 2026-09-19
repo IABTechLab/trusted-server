@@ -55,12 +55,12 @@ Two properties of this path block naive reuse.
 
 ## Dependencies
 
-The workspace pins EdgeZero at `76c59b440fb35d1317dcb3fa8c1172161e3f5309` on
+The workspace pins EdgeZero at `d0e13d2d82eb89393f3622545cd31348a1bf0f71` on
 `feat/reusable-app-lifecycle`. (It briefly sat at `277544c4` on the same
 branch; that revision carried the CLI and Cloudflare fixes but no lifecycle
 module.)
 
-That revision adds `edgezero_adapter_fastly::lifecycle`, which this adapter
+This includes `edgezero_adapter_fastly::lifecycle`, introduced at `76c59b44`, which this adapter
 now uses instead of its own equivalents. The framework owns lazy
 successful-only retention, the callback count, the initialization-attempt
 count, the one-time setup guard, and the serving wrappers. The sections below
