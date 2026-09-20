@@ -291,6 +291,19 @@ fn detect_request_scheme(
     "http".to_owned()
 }
 
+/// Returns whether an `If-None-Match` header value matches the given strong `ETag`.
+///
+/// Per RFC 7232 §3.2, `If-None-Match` is either `*` (matches any existing
+/// representation) or a comma-separated list of entity tags, each optionally
+/// prefixed with the weak marker `W/`. Comparison for `If-None-Match` is weak,
+/// so a `W/`-prefixed tag matches its strong counterpart.
+fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
+    header_value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
 /// Build a static text response with strong `ETag` and standard caching headers.
 /// Handles If-None-Match to return 304 when appropriate.
 ///
@@ -316,7 +329,7 @@ pub fn serve_static_with_etag(
         .headers()
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
-        && if_none_match == etag
+        && if_none_match_matches(if_none_match, &etag)
     {
         let mut response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
@@ -1035,6 +1048,245 @@ mod tests {
         assert!(
             is_navigation_request(&req),
             "should match text/html case-insensitively in fallback"
+        );
+    }
+
+    // if_none_match_matches / serve_static_with_etag tests
+
+    #[test]
+    fn if_none_match_matches_exact_and_wildcard() {
+        let etag = "\"sha256-abc123\"";
+        assert!(
+            if_none_match_matches(etag, etag),
+            "should match when the header is exactly the current ETag"
+        );
+        assert!(
+            if_none_match_matches("*", etag),
+            "should match on a bare wildcard"
+        );
+    }
+
+    #[test]
+    fn if_none_match_matches_weak_tag_and_rejects_mismatch() {
+        let etag = "\"sha256-abc123\"";
+        assert!(
+            if_none_match_matches(&format!("W/{etag}"), etag),
+            "should match a weak-prefixed tag against its strong counterpart"
+        );
+        assert!(
+            !if_none_match_matches("\"sha256-other\"", etag),
+            "should not match a differing tag"
+        );
+        assert!(
+            !if_none_match_matches("", etag),
+            "should not match an empty header value"
+        );
+    }
+
+    #[test]
+    fn if_none_match_matches_within_mixed_list() {
+        let etag = "\"sha256-abc123\"";
+        assert!(
+            if_none_match_matches(&format!("\"stale-1\", W/{etag}, \"stale-2\""), etag),
+            "should match a weak tag mixed in among other comma-separated tags"
+        );
+        assert!(
+            !if_none_match_matches("\"stale-1\", \"stale-2\"", etag),
+            "should not match when no tag in the list matches"
+        );
+    }
+
+    #[test]
+    fn serve_static_with_etag_returns_304_for_weak_tag_within_mixed_list() {
+        let body = "console.log('hi');";
+        let probe = serve_static_with_etag(
+            body,
+            &build_request(Method::GET, "https://example.com/tsjs"),
+            "application/javascript",
+            EdgeCacheHeader::None,
+        );
+        let etag = probe
+            .headers()
+            .get(header::ETAG)
+            .expect("should have ETag header")
+            .to_str()
+            .expect("should be valid utf8")
+            .to_owned();
+
+        let mut req = build_request(Method::GET, "https://example.com/tsjs");
+        set_header(
+            &mut req,
+            header::IF_NONE_MATCH.as_str(),
+            &format!("\"stale-1\", W/{etag}, \"stale-2\""),
+        );
+        let response =
+            serve_static_with_etag(body, &req, "application/javascript", EdgeCacheHeader::None);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "should return 304 when a weak tag is present among several comma-separated tags"
+        );
+    }
+
+    #[test]
+    fn serve_static_with_etag_returns_200_without_if_none_match() {
+        let req = build_request(Method::GET, "https://example.com/tsjs");
+        let response = serve_static_with_etag(
+            "console.log('hi');",
+            &req,
+            "application/javascript",
+            EdgeCacheHeader::None,
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should serve full body when no If-None-Match header is present"
+        );
+    }
+
+    #[test]
+    fn serve_static_with_etag_returns_304_on_exact_match() {
+        let body = "console.log('hi');";
+        let probe = serve_static_with_etag(
+            body,
+            &build_request(Method::GET, "https://example.com/tsjs"),
+            "application/javascript",
+            EdgeCacheHeader::None,
+        );
+        let etag = probe
+            .headers()
+            .get(header::ETAG)
+            .expect("should have ETag header")
+            .to_str()
+            .expect("should be valid utf8")
+            .to_owned();
+
+        let mut req = build_request(Method::GET, "https://example.com/tsjs");
+        set_header(&mut req, header::IF_NONE_MATCH.as_str(), &etag);
+        let response =
+            serve_static_with_etag(body, &req, "application/javascript", EdgeCacheHeader::None);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "should return 304 when If-None-Match exactly matches the current ETag"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .expect("should have ETag header"),
+            etag.as_str(),
+            "304 response should keep the current ETag"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::VARY)
+                .expect("should have Vary header"),
+            "Accept-Encoding",
+            "304 response should keep the Vary header"
+        );
+    }
+
+    #[test]
+    fn serve_static_with_etag_returns_304_when_etag_among_multiple_values() {
+        let body = "console.log('hi');";
+        let probe = serve_static_with_etag(
+            body,
+            &build_request(Method::GET, "https://example.com/tsjs"),
+            "application/javascript",
+            EdgeCacheHeader::None,
+        );
+        let etag = probe
+            .headers()
+            .get(header::ETAG)
+            .expect("should have ETag header")
+            .to_str()
+            .expect("should be valid utf8")
+            .to_owned();
+
+        let mut req = build_request(Method::GET, "https://example.com/tsjs");
+        set_header(
+            &mut req,
+            header::IF_NONE_MATCH.as_str(),
+            &format!("\"stale-1\", {etag}, \"stale-2\""),
+        );
+        let response =
+            serve_static_with_etag(body, &req, "application/javascript", EdgeCacheHeader::None);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "should return 304 when the current ETag is among several comma-separated tags"
+        );
+    }
+
+    #[test]
+    fn serve_static_with_etag_returns_304_for_wildcard() {
+        let body = "console.log('hi');";
+        let mut req = build_request(Method::GET, "https://example.com/tsjs");
+        set_header(&mut req, header::IF_NONE_MATCH.as_str(), "*");
+        let response =
+            serve_static_with_etag(body, &req, "application/javascript", EdgeCacheHeader::None);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "should return 304 when If-None-Match is *"
+        );
+    }
+
+    #[test]
+    fn serve_static_with_etag_returns_304_for_weak_tag() {
+        let body = "console.log('hi');";
+        let probe = serve_static_with_etag(
+            body,
+            &build_request(Method::GET, "https://example.com/tsjs"),
+            "application/javascript",
+            EdgeCacheHeader::None,
+        );
+        let etag = probe
+            .headers()
+            .get(header::ETAG)
+            .expect("should have ETag header")
+            .to_str()
+            .expect("should be valid utf8")
+            .to_owned();
+
+        let mut req = build_request(Method::GET, "https://example.com/tsjs");
+        set_header(
+            &mut req,
+            header::IF_NONE_MATCH.as_str(),
+            &format!("W/{etag}"),
+        );
+        let response =
+            serve_static_with_etag(body, &req, "application/javascript", EdgeCacheHeader::None);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "should return 304 when a weak tag matches the current strong ETag"
+        );
+    }
+
+    #[test]
+    fn serve_static_with_etag_returns_200_when_no_tags_match() {
+        let body = "console.log('hi');";
+        let mut req = build_request(Method::GET, "https://example.com/tsjs");
+        set_header(
+            &mut req,
+            header::IF_NONE_MATCH.as_str(),
+            "\"stale-1\", \"stale-2\"",
+        );
+        let response =
+            serve_static_with_etag(body, &req, "application/javascript", EdgeCacheHeader::None);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should return the full body when no tags in the list match"
         );
     }
 }
