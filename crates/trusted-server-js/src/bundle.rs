@@ -139,6 +139,16 @@ mod tests {
     }
 
     #[test]
+    fn all_module_ids_matches_generated_module_list() {
+        let from_modules: Vec<&str> = TSJS_MODULES.iter().map(|module| module.id).collect();
+        assert_eq!(
+            all_module_ids(),
+            from_modules.as_slice(),
+            "the generated ID list should match the generated module table"
+        );
+    }
+
+    #[test]
     fn generated_single_module_hashes_match_bundle_contents() {
         for id in all_module_ids() {
             let bundle = module_bundle(id).expect("should have module bundle");
