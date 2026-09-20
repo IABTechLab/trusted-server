@@ -345,7 +345,7 @@ Every PR must pass:
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 7. Docs format (`cd docs && npm run format`)
-8. Root Markdown format (`docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md"`; fix with `--write` in place of `--check`)
+8. Root Markdown format (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md"`; fix with `--write` in place of `--check`
 
 ---
 
