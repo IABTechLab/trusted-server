@@ -399,11 +399,20 @@ impl GenericOpenRtbProvider {
                 provider_id: self.provider_name().to_string(),
                 input: input.clone(),
             },
-            CompiledOpenRtbProfile::PrebidServer(_) => GenericOpenRtbParseState::Prebid {
-                provider_id: self.provider_name().to_string(),
-                auction_id: input.common_request().id.clone(),
-                input: input.clone(),
-            },
+            CompiledOpenRtbProfile::PrebidServer(_) => {
+                let sent_impression_ids = request
+                    .imp
+                    .iter()
+                    .filter_map(|impression| impression.id.as_deref())
+                    .collect::<HashSet<_>>();
+                GenericOpenRtbParseState::Prebid {
+                    provider_id: self.provider_name().to_string(),
+                    auction_id: input.common_request().id.clone(),
+                    input: input.filtered_slots(|slot| {
+                        sent_impression_ids.contains(slot.slot().id.as_str())
+                    }),
+                }
+            }
             CompiledOpenRtbProfile::Aps(_) => GenericOpenRtbParseState::Aps {
                 provider_id: self.provider_name().to_string(),
                 input: input.clone(),
