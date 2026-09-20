@@ -10,7 +10,7 @@ resource "aws_cloudwatch_metric_alarm" "instance_cpu" {
   statistic           = "Average"
   threshold           = 80
   alarm_actions       = var.alarm_actions
-  treat_missing_data  = "breaching"
+  treat_missing_data  = "missing"
 
   dimensions = {
     InstanceId = each.value.id

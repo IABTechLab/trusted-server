@@ -128,7 +128,7 @@ fn assert_payload_cleanup(dir: &Path) {
 #[test]
 fn local_commands_never_execute_aws_and_preserve_the_source() {
     let dir = fixture();
-    let toml = "[integrations.prebid]\nenabled=false\nbidders=['examplebidder']\naccount_id='DUMMY_SECRET'\n";
+    let toml = "[auction]\nenabled=true\n[auction.providers.pbs-main]\nprofile='prebid-server'\nendpoint='https://DUMMY_SECRET@pbs.example.com/openrtb2/auction'\n[auction.bidders.examplebidder]\nprovider='pbs-main'\n[integrations.prebid]\nenabled=false\naccount_id='DUMMY_SECRET'\n";
     fs::write(dir.path().join("trusted-server.toml"), toml).expect("should write TOML");
     let output = command(dir.path())
         .args(["prebid", "server", "inspect", "--json"])
@@ -138,6 +138,11 @@ fn local_commands_never_execute_aws_and_preserve_the_source() {
     assert_no_secret(&output);
     let report: Value = serde_json::from_slice(&output.stdout).expect("should emit JSON");
     assert_eq!(report["enabled_explicit"], false);
+    assert_eq!(report["server_providers"][0]["provider"], "pbs-main");
+    assert_eq!(
+        report["server_providers"][0]["server_bidder_candidates"][0]["bidder"],
+        "examplebidder"
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("trusted-server.toml")).expect("should read TOML"),
         toml

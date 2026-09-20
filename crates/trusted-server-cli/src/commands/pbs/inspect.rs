@@ -1,16 +1,74 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use error_stack::Report;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use trusted_server_core::auction_config_types::{BidderId, ProviderId};
 
 use super::{Output, PbsError, Result, identifier, read_text};
 
 /// Deliberately partial: inspecting PBS requirements must not require unrelated TS settings.
 #[derive(Default, Deserialize)]
 struct Source {
+    auction: Option<Auction>,
     #[serde(default)]
     integrations: Integrations,
+}
+
+#[derive(Default, Deserialize)]
+struct Auction {
+    enabled: Option<bool>,
+    #[serde(default)]
+    providers: BTreeMap<ProviderId, AuctionProvider>,
+    #[serde(default)]
+    bidders: BTreeMap<BidderId, AuctionBidder>,
+}
+
+#[derive(Deserialize)]
+struct AuctionProvider {
+    profile: Option<String>,
+    endpoint: Option<String>,
+    timeout_ms: Option<u32>,
+    profile_config: Option<toml::Value>,
+}
+
+impl AuctionProvider {
+    fn profile_bool(&self, key: &str) -> Option<bool> {
+        self.profile_config.as_ref()?.get(key)?.as_bool()
+    }
+
+    fn override_rule_count(&self) -> usize {
+        self.profile_config
+            .as_ref()
+            .and_then(|config| config.get("bid_param_override_rules"))
+            .and_then(toml::Value::as_array)
+            .map_or(0, Vec::len)
+    }
+}
+
+#[derive(Deserialize)]
+struct AuctionBidder {
+    provider: ProviderId,
+}
+
+#[derive(Serialize)]
+struct ServerBidderCandidate {
+    bidder: String,
+    source_key: String,
+    host_secret_requirement: &'static str,
+    partner_authorization: &'static str,
+}
+
+#[derive(Serialize)]
+struct ServerProviderReport {
+    provider: String,
+    endpoint_configured: bool,
+    timeout_ms_explicit: Option<u32>,
+    test_mode_explicit: Option<bool>,
+    debug_explicit: Option<bool>,
+    bid_param_override_rule_count: usize,
+    server_bidder_candidates: Vec<ServerBidderCandidate>,
 }
 
 #[derive(Default, Deserialize)]
@@ -21,19 +79,13 @@ struct Integrations {
 #[derive(Default, Deserialize)]
 struct Prebid {
     enabled: Option<bool>,
-    server_url: Option<String>,
     account_id: Option<String>,
     timeout_ms: Option<u32>,
-    test_mode: Option<bool>,
     debug: Option<bool>,
-    #[serde(default, deserialize_with = "bidder_list")]
-    bidders: Vec<String>,
     #[serde(default, deserialize_with = "bidder_list")]
     client_side_bidders: Vec<String>,
     #[serde(default)]
     bundle: Bundle,
-    #[serde(default)]
-    bid_param_override_rules: Vec<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -116,12 +168,13 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             "cannot parse Trusted Server TOML; source details withheld",
         ))
     })?;
-    let present = source.integrations.prebid.is_some();
+    let auction_present = source.auction.is_some();
+    let auction = source.auction.unwrap_or_default();
+    let prebid_present = source.integrations.prebid.is_some();
     let prebid = source.integrations.prebid.unwrap_or_default();
     for name in prebid
-        .bidders
+        .client_side_bidders
         .iter()
-        .chain(&prebid.client_side_bidders)
         .chain(&prebid.bundle.adapters)
         .chain(&prebid.bundle.user_id_modules)
     {
@@ -131,30 +184,69 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             )));
         }
     }
-    let requirements: Vec<_> = prebid
-        .bidders
+    let server_providers: Vec<_> = auction
+        .providers
         .iter()
-        .map(|bidder| {
-            json!({
-                "bidder": bidder,
-                "source_key": "integrations.prebid.bidders",
-                "host_secret_requirement": "unresolved",
-                "partner_authorization": "unresolved"
-            })
+        .filter(|(_, provider)| provider.profile.as_deref() == Some("prebid-server"))
+        .map(|(provider_id, provider)| {
+            let requirements: Vec<_> = auction
+                .bidders
+                .iter()
+                .filter(|(_, bidder)| &bidder.provider == provider_id)
+                .map(|(bidder_id, _)| ServerBidderCandidate {
+                    bidder: bidder_id.as_str().to_owned(),
+                    source_key: format!("auction.bidders.{}.provider", bidder_id.as_str()),
+                    host_secret_requirement: "unresolved",
+                    partner_authorization: "unresolved",
+                })
+                .collect();
+            ServerProviderReport {
+                provider: provider_id.as_str().to_owned(),
+                endpoint_configured: provider.endpoint.is_some(),
+                timeout_ms_explicit: provider.timeout_ms,
+                test_mode_explicit: provider.profile_bool("test_mode"),
+                debug_explicit: provider.profile_bool("debug"),
+                bid_param_override_rule_count: provider.override_rule_count(),
+                server_bidder_candidates: requirements,
+            }
         })
         .collect();
     let warnings = [
         "Local file only: confirm environment, remote configuration, and request-time overrides.",
         "Omitted fields/defaults are not expanded; empty candidate lists are not proof of no demand.",
-        "Disabled integrations and browser bundle adapters do not authorize PBS activation.",
+        "Disabled auctions, providers, and browser bundle adapters do not authorize PBS activation.",
         "Host secret requirements need adapter metadata verified against the selected PBS release.",
     ];
     let mut details = vec![
         format!(
-            "Prebid section present: {present}; enabled explicitly: {:?}",
+            "Auction section present: {auction_present}; enabled explicitly: {:?}",
+            auction.enabled
+        ),
+        format!(
+            "Prebid browser section present: {prebid_present}; enabled explicitly: {:?}",
             prebid.enabled
         ),
-        format!("Server bidder candidates: {}", prebid.bidders.join(", ")),
+        format!("Prebid Server providers: {}", server_providers.len()),
+    ];
+    details.extend(server_providers.iter().map(|provider| {
+        let bidders = provider
+            .server_bidder_candidates
+            .iter()
+            .map(|candidate| candidate.bidder.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Server provider {}: bidders: {}; endpoint configured: {}; timeout explicit: {:?}; test mode explicit: {:?}; debug explicit: {:?}; bid-parameter rules: {}; values withheld",
+            provider.provider,
+            bidders,
+            provider.endpoint_configured,
+            provider.timeout_ms_explicit,
+            provider.test_mode_explicit,
+            provider.debug_explicit,
+            provider.bid_param_override_rule_count
+        )
+    }));
+    details.extend([
         format!(
             "Client-side bidders: {}",
             prebid.client_side_bidders.join(", ")
@@ -163,11 +255,7 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             "Browser bundle adapters: {}",
             prebid.bundle.adapters.join(", ")
         ),
-        format!(
-            "Bid-parameter rules: {}; values withheld",
-            prebid.bid_param_override_rules.len()
-        ),
-    ];
+    ]);
     details.extend(warnings.iter().map(|warning| (*warning).to_owned()));
     Ok(Output {
         failure: None,
@@ -175,19 +263,21 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
         details,
         data: json!({
             "source": path,
-            "source_section": "integrations.prebid",
-            "section_present": present,
+            "source_sections": {
+                "server": ["auction.providers", "auction.bidders"],
+                "browser": "integrations.prebid"
+            },
+            "auction_section_present": auction_present,
+            "auction_enabled_explicit": auction.enabled,
+            "server_providers": server_providers,
+            "section_present": prebid_present,
             "enabled_explicit": prebid.enabled,
-            "server_url_configured": prebid.server_url.is_some(),
             "account_id_configured": prebid.account_id.is_some(),
             "timeout_ms_explicit": prebid.timeout_ms,
-            "test_mode_explicit": prebid.test_mode,
             "debug_explicit": prebid.debug,
-            "server_bidder_candidates": requirements,
             "client_side_bidders": prebid.client_side_bidders,
             "bundle_adapters": prebid.bundle.adapters,
             "identity_modules": prebid.bundle.user_id_modules,
-            "bid_param_override_rule_count": prebid.bid_param_override_rules.len(),
             "warnings": warnings
         }),
     })
@@ -204,38 +294,104 @@ mod tests {
         let dir = tempfile::tempdir().expect("should create temp directory");
         let path = dir.path().join("trusted-server.toml");
         let source = r#"
+[auction]
+enabled = true
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://user:NEVER_PRINT_ME@pbs.example.com/path?token=NEVER_PRINT_ME"
+timeout_ms = 900
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+test_mode = true
+bid_param_override_rules = [{ when = { bidder = "serverbidder" }, set = { placementId = "NEVER_PRINT_ME" } }]
+
+[auction.bidders.serverbidder]
+provider = "pbs-main"
+
+[auction.providers.pbs-secondary]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://NEVER_PRINT_ME@secondary.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.bidders.otherbidder]
+provider = "pbs-secondary"
+
 [integrations.prebid]
 enabled = false
-server_url = "https://user:NEVER_PRINT_ME@pbs.example.com/path?token=NEVER_PRINT_ME"
 account_id = "NEVER_PRINT_ME"
-bidders = ["serverbidder"]
 client_side_bidders = ["browserbidder"]
-[[integrations.prebid.bid_param_override_rules]]
-set = { placementId = "NEVER_PRINT_ME" }
+
 [integrations.prebid.bundle]
 adapters = ["bundlebidder"]
 user_id_modules = ["sharedIdSystem"]
 "#;
         fs::write(&path, source).expect("should write fixture");
         let report = inspect(&path).expect("should inspect config");
+        assert_eq!(report.data["auction_section_present"], true);
+        assert_eq!(report.data["auction_enabled_explicit"], true);
         assert_eq!(report.data["enabled_explicit"], false);
         assert_eq!(
-            report.data["server_bidder_candidates"][0]["bidder"],
+            report.data["server_providers"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(report.data["server_providers"][0]["provider"], "pbs-main");
+        assert_eq!(
+            report.data["server_providers"][0]["server_bidder_candidates"][0]["bidder"],
             "serverbidder"
+        );
+        assert_eq!(
+            report.data["server_providers"][1]["provider"],
+            "pbs-secondary"
+        );
+        assert_eq!(
+            report.data["server_providers"][1]["server_bidder_candidates"][0]["bidder"],
+            "otherbidder"
+        );
+        assert_eq!(
+            report.data["server_providers"][0]["server_bidder_candidates"][0]["source_key"],
+            "auction.bidders.serverbidder.provider"
+        );
+        assert_eq!(
+            report.data["server_providers"][0]["endpoint_configured"],
+            true
+        );
+        assert_eq!(
+            report.data["server_providers"][0]["timeout_ms_explicit"],
+            900
+        );
+        assert_eq!(
+            report.data["server_providers"][0]["test_mode_explicit"],
+            true
+        );
+        assert_eq!(report.data["server_providers"][0]["debug_explicit"], false);
+        assert_eq!(
+            report.data["server_providers"][0]["bid_param_override_rule_count"],
+            1
         );
         assert_eq!(report.data["client_side_bidders"][0], "browserbidder");
         assert_eq!(report.data["bundle_adapters"][0], "bundlebidder");
         assert_eq!(
-            report.data["server_bidder_candidates"][0]["host_secret_requirement"],
+            report.data["server_providers"][0]["server_bidder_candidates"][0]["host_secret_requirement"],
             "unresolved"
         );
-        for json in [false, true] {
-            let mut output = Vec::new();
-            report
-                .write(json, &mut output)
-                .expect("should render report");
-            assert!(!String::from_utf8_lossy(&output).contains("NEVER_PRINT_ME"));
-        }
+        let mut human = Vec::new();
+        report
+            .write(false, &mut human)
+            .expect("should render human report");
+        let human = String::from_utf8(human).expect("should emit UTF-8");
+        assert!(human.contains("pbs-main"));
+        assert!(human.contains("serverbidder"));
+        assert!(!human.contains("NEVER_PRINT_ME"));
+        let mut json = Vec::new();
+        report
+            .write(true, &mut json)
+            .expect("should render JSON report");
+        assert!(!String::from_utf8_lossy(&json).contains("NEVER_PRINT_ME"));
         assert_eq!(
             fs::read_to_string(path).expect("should read fixture"),
             source
@@ -258,7 +414,7 @@ user_id_modules = ["sharedIdSystem"]
             file.path(),
             r#"
 [integrations.prebid]
-bidders = 'examplebidder\'
+client_side_bidders = 'examplebidder\'
 "#,
         )
         .expect("should write config");
@@ -276,7 +432,7 @@ bidders = 'examplebidder\'
     }
 
     #[test]
-    fn accepts_the_runtime_bidder_list_encodings() {
+    fn accepts_the_runtime_browser_bidder_list_encodings() {
         for input in [
             "['examplebidder', 'otherbidder']",
             "'examplebidder,otherbidder'",
@@ -285,26 +441,13 @@ bidders = 'examplebidder\'
             "'example\\u0062idder,otherbidder'",
             "{ '10' = 'otherbidder', '2' = 'examplebidder' }",
         ] {
-            let text = format!(
-                "[integrations.prebid]\nserver_url='https://pbs.example.com'\nbidders={input}\nclient_side_bidders={input}\n"
-            );
+            let text = format!("[integrations.prebid]\nclient_side_bidders={input}\n");
             let file = tempfile::NamedTempFile::new().expect("should create config");
             fs::write(file.path(), &text).expect("should write config");
             let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
                 toml::from_str(&format!("client_side_bidders={input}"))
                     .expect("runtime should accept encoding");
             let output = inspect(file.path()).expect("inspect should accept runtime encoding");
-            let candidates: Vec<_> = output.data["server_bidder_candidates"]
-                .as_array()
-                .expect("should report candidates")
-                .iter()
-                .map(|candidate| {
-                    candidate["bidder"]
-                        .as_str()
-                        .expect("should identify bidder")
-                })
-                .collect();
-            assert_eq!(candidates, ["examplebidder", "otherbidder"]);
             assert_eq!(
                 output.data["client_side_bidders"],
                 json!(runtime.client_side_bidders)

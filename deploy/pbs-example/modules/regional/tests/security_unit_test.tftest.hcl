@@ -64,6 +64,14 @@ run "plans_private_hosts_and_scoped_ingress" {
   }
 
   assert {
+    condition = alltrue([
+      for alarm in aws_cloudwatch_metric_alarm.instance_cpu :
+      alarm.treat_missing_data == "missing"
+    ])
+    error_message = "Missing CPU samples should not trigger high-CPU alarms."
+  }
+
+  assert {
     condition     = length(jsondecode(aws_iam_role_policy.runtime.policy).Statement[0].Resource) == length(aws_secretsmanager_secret.bidder)
     error_message = "The runtime role should read only the declared bidder secrets."
   }

@@ -21,7 +21,7 @@ On macOS use `build_cli_macos` and `run_cli_macos`. The examples contain fiction
 
 | Command                                                             | What it does                                                                                                        | Access                        |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| `ts prebid server inspect --config <file>`                                    | Reports selected local Prebid fields, classifies bidder lists, and marks host-secret requirements unresolved        | Local read-only               |
+| `ts prebid server inspect --config <file>`                                    | Reports routed Prebid Server providers and bidders separately from browser Prebid fields; host-secret requirements remain unresolved | Local read-only               |
 | `ts prebid server check --deployment <file>`                                  | Validates schema, targets, binding metadata, and regional YAML merging                                              | Local read-only               |
 | `ts prebid server secrets set <bidder> --deployment <file> --region <region>` | Writes a complete JSON value to an existing, declared Secrets Manager secret after identity and confirmation checks | AWS reads and one value write |
 | `ts prebid server status --deployment <file>`                                 | Reports EC2 instance state and infrastructure health for the explicitly listed instances                            | AWS reads                     |
@@ -34,9 +34,9 @@ Not implemented: container deployment, rollback, runtime secret injection, calle
 
 ## Discovering requirements
 
-`inspect` reads exactly the chosen file and never rewrites or publishes it. It accepts the runtime's array, indexed-map, and string bidder-list encodings, array-form bundle/module lists, and reports explicitly supplied values only. It does not expand defaults, environment overrides, remote configuration, or request-time inputs. Confirm which source/environment is authoritative before relying on the report.
+`inspect` reads exactly the chosen file and never rewrites or publishes it. It discovers server demand from `[auction.providers.*]` entries using the `prebid-server` profile and bidders routed through `[auction.bidders.*]`. The JSON report groups routed bidders under each provider. Browser settings still come from `[integrations.prebid]`, including the runtime's array, indexed-map, and string encodings for `client_side_bidders`. The command reports explicitly supplied values only; it does not expand defaults, environment overrides, remote configuration, or request-time inputs. Confirm which source and environment are authoritative before relying on the report.
 
-Account identifiers, endpoint values, and bid-parameter values are withheld. Parser errors also withhold source snippets. Server-side bidders, client-side bidders, and browser bundle adapters remain separate lists; listing a bidder does not establish partner authorization or a host-secret requirement. Disabled integrations remain disabled.
+Account identifiers, endpoint values, and bid-parameter values are withheld. Parser errors also withhold source snippets. Server-side bidders, client-side bidders, and browser bundle adapters remain separate; listing a bidder does not establish partner authorization or a host-secret requirement. Disabled auctions and integrations remain disabled.
 
 ## Deployment descriptor
 

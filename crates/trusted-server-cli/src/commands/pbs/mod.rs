@@ -176,6 +176,10 @@ pub(super) fn identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn is_confirmation(input: &str) -> bool {
+    input.len() <= 16 && input.trim() == "yes"
+}
+
 /// Operator interaction is injectable so tests cannot accidentally read a terminal.
 pub(super) trait Interaction {
     /// Read a complete secret JSON object without echoing it.
@@ -216,22 +220,30 @@ impl Interaction for Terminal {
         }
         self.notice(target)?;
         self.notice("Write this secret version? Type yes to confirm:")?;
-        let line = read_bounded(
-            io::stdin()
-                .lock()
-                .lines()
-                .next()
-                .transpose()
-                .map_err(|_| Report::new(PbsError::Io("cannot read confirmation")))?
-                .unwrap_or_default()
-                .as_bytes(),
-            16,
-        )?;
-        Ok(line.trim() == "yes")
+        let line = io::stdin()
+            .lock()
+            .lines()
+            .next()
+            .transpose()
+            .map_err(|_| Report::new(PbsError::Io("cannot read confirmation")))?
+            .unwrap_or_default();
+        Ok(is_confirmation(&line))
     }
 
     fn notice(&mut self, message: &str) -> Result<()> {
         writeln!(io::stderr().lock(), "{message}")
             .map_err(|_| Report::new(PbsError::Io("cannot write operator notice")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_accepts_only_bounded_yes() {
+        assert!(is_confirmation("yes"));
+        assert!(!is_confirmation("no"));
+        assert!(!is_confirmation("yes-but-with-more-than-sixteen-bytes"));
     }
 }
