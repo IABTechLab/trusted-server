@@ -518,7 +518,12 @@ function installPrebidWinDiagnostics(): void {
     const bid = rawBid as Record<string, unknown>;
     const auctionId = typeof bid.auctionId === 'string' ? bid.auctionId : undefined;
     const adUnitCode = typeof bid.adUnitCode === 'string' ? bid.adUnitCode : undefined;
-    if (!auctionId || !adUnitCode) return;
+    if (
+      !auctionId ||
+      !adUnitCode ||
+      (bid.latestTargetedAuctionId !== undefined && bid.latestTargetedAuctionId !== auctionId)
+    )
+      return;
     const key = prebidDiagnosticKey(auctionId, adUnitCode);
     const attempt = prebidDiagnosticAttempts.get(key);
     prebidDiagnosticAttempts.delete(key);
