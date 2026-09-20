@@ -122,12 +122,23 @@ adapter flags directly need the `--` added. Trusted Server declares Config, KV,
 and Secret Stores, so EdgeZero treats every Fastly deploy as managed and
 requires a verified application release root via `--application-release`; a
 bare `ts deploy --adapter fastly` without a release is accepted only for
-store-free applications:
+store-free applications. The CLI loads `edgezero.toml` from the working
+directory unless `EDGEZERO_MANIFEST` names another file, and it rejects a
+manifest outside the release root, so select the release's own manifest:
 
 ```bash
-ts deploy --adapter fastly --service-id <service-id> --application-release <release-root> --staging
-ts deploy --adapter fastly --service-id <service-id> --application-release <release-root> -- --comment "release"
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>" --staging
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>" -- --comment "release"
 ```
+
+`<release-root>` is the extracted immutable application release that EdgeZero's
+`package-fastly-application-release` action produces from a `ts build`. The
+EdgeZero `deploy-fastly` action performs both steps, selects the manifest, and
+supplies the release root; see EdgeZero's GitHub Actions deployment guide
+(`docs/guide/deploy-github-actions.md` in the EdgeZero repository) for the
+producer and consumer workflow.
 
 A staged deploy selects the physical Config Store from the staging environment
 and links it to the staged version under the logical store ID. The staged
