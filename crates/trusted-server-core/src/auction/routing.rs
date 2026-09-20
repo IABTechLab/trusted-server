@@ -154,6 +154,13 @@ impl ProviderAuctionInput {
     pub(crate) fn slots(&self) -> &[ProviderSlotInput] {
         &self.slots
     }
+
+    /// Clone this input while retaining only slots accepted by `keep`.
+    pub(crate) fn filtered_slots(&self, mut keep: impl FnMut(&ProviderSlotInput) -> bool) -> Self {
+        let mut filtered = self.clone();
+        filtered.slots.retain(|slot| keep(slot));
+        filtered
+    }
 }
 
 /// One eligible slot with only the demand assigned to this provider.
