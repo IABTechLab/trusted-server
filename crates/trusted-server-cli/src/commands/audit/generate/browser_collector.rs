@@ -1044,9 +1044,9 @@ fn gpt_polling_budget(remaining: Duration, dwell_target: Duration) -> Duration {
 /// repeat for a dwell window mirrors [`wait_for_page_settle`], and taking both
 /// the dwell from the operator's quiet flag and the budget from the remaining
 /// shared allowance, floored at the quiet window plus two poll intervals,
-/// bounds this phase. An
-/// in-flight read may overrun the budget by its own bound. Even an exhausted
-/// budget takes one snapshot; two consecutive empty polls end the wait early.
+/// bounds this phase. An in-flight read may overrun the budget by its own
+/// bound. Even an exhausted budget takes one snapshot; two consecutive empty
+/// polls end the wait early.
 ///
 /// The latest non-empty snapshot is retained, with a warning, if registration
 /// keeps changing through the budget. An empty result stays silent and
