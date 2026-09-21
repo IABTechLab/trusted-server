@@ -508,3 +508,19 @@ streaming failed [instance=…0000 ordinal=2 request=…0001]
   and the limit-validation policy remain application-owned regardless.
 - **The pin is an unmerged branch revision.** Move to a release tag once one
   contains `76c59b44`.
+
+## Review follow-up: measurement compatibility
+
+The measurements above predate the review fixes and have not been rerun with
+them. Current builds emit workload counter headers only on responses whose
+final policy contains both `private` and `no-store`. Public and browser-cacheable
+routes keep their caching behavior and omit counters; the probe reports missing
+counters as unverified. Use an already-private/no-store workload for subsequent
+comparisons.
+
+Reuse now also requires the service-scoped `TS__SANDBOX__MAX_MEMORY_MIB` key.
+The historical three-key fixtures above must add a positive value below
+`u32::MAX` to enable reuse. The SDK checks this bound between requests, so it
+provides retirement rather than a hard per-request allocation ceiling. If the
+heap snapshot is unsupported, the sandbox retires after the callback. Deployed
+heap support, eviction and long-lived memory behavior remain unverified.

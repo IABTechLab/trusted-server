@@ -24,8 +24,8 @@ buffers out of registry-lifetime objects, without which retention is unsafe.
 See [Retained rewrite buffers](#retained-rewrite-buffers-blocking).
 
 Out of scope: Spin, Cloudflare, and Axum adapters; any other change to routing,
-auction, EC, or integration behaviour; memory-bounded retirement (see
-[Deferred](#deferred)).
+auction, EC, or integration behaviour. Memory-bounded retirement is included
+following review; it is a between-request SDK check, not an allocation ceiling.
 
 ## Current entry point
 
@@ -113,7 +113,7 @@ feature on, validated reuse limits       → Serve loop
 
 The feature-on single-request path is **not** byte-identical to the feature-off
 path: it performs the startup mode lookup, which opens a config store and reads
-three keys before the first request. It does not construct a `Serve` or enter
+four keys before the first request. It does not construct a `Serve` or enter
 its loop — it calls the handler once directly, as the code below shows. It is
 described as _single-request operation_, not as identical execution.
 
@@ -329,6 +329,7 @@ once at startup from the existing `edgezero_runtime_env` store, before
 EDGEZERO__SERVICES__<sid>__TS__SANDBOX__MAX_REQUESTS
 EDGEZERO__SERVICES__<sid>__TS__SANDBOX__MAX_LIFETIME_MS
 EDGEZERO__SERVICES__<sid>__TS__SANDBOX__TIMEOUT_MS
+EDGEZERO__SERVICES__<sid>__TS__SANDBOX__MAX_MEMORY_MIB
 ```
 
 **These keys cannot be read through `runtime_env_config`.** That function
@@ -366,10 +367,19 @@ Resolution rules:
   SDK reads `with_max_requests(0)` as _unlimited_; the application value is
   never passed through unmapped.
 - Reuse is enabled only when a finite request limit is configured **and** finite
-  lifetime and wait-timeout values are supplied. Omitted SDK limits default to
-  effectively unbounded (`Duration::MAX`), which is not an acceptable
+  lifetime, wait-timeout, and memory values are supplied. Memory is in MiB and
+  must be between `1` and `u32::MAX - 1`, inclusive; `0` is unlimited in the SDK,
+  and `u32::MAX` is its unsupported-snapshot sentinel. Omitted SDK limits default
+  to effectively unbounded (`Duration::MAX` or zero), which is not an acceptable
   production posture, so a partial configuration resolves to single-request
   operation rather than to an unbounded loop.
+
+Existing three-key configurations must add `MAX_MEMORY_MIB` before reuse can
+engage. `Serve::with_max_memory` checks heap usage after each callback and
+retires the sandbox before accepting another request if usage exceeds the
+bound. It cannot prevent the current request from exceeding the bound. An
+unsupported heap snapshot conservatively retires the sandbox; deployed snapshot
+support and memory retirement remain unverified.
 
 No default limit values are invented here. An operator who enables the feature
 without setting keys gets single-request operation.
@@ -423,6 +433,12 @@ independently of `reusable-sandbox`, by its own
 `sandbox_metrics_enabled` settings flag, so all three arms report the same
 fields through the same channel. The feature flag decides whether the _Serve
 loop_ exists; the settings flag decides whether _counters are emitted_.
+
+Workload headers are emitted only after terminal cache guards, and only when
+`Cache-Control` contains both `private` and `no-store`. Cacheable routes retain
+their existing policy and omit counters; the probe reports those observations
+as unverified. Quoted extension values containing those words do not qualify.
+This applies equally to feature-off and feature-on builds.
 
 Quantities, and how each is obtained:
 
@@ -552,10 +568,6 @@ These are stated in the results, not discovered afterwards.
 
 ## Deferred
 
-- `with_max_memory`. `heap_memory_snapshot_mib()` returns an error where the
-  guest does not support it, and `Serve` maps that error to `u32::MAX`
-  (`serve.rs:305`), which silently ends the loop. Memory-bounded retirement
-  waits until snapshot support is probed on a deployed service.
 - Strict snapshot-age enforcement (see [Freshness and rotation](#freshness-and-rotation)).
 - Amortizing the per-request Ed25519 signing-key parse, which needs its own
   measurement and its own rotation decision.

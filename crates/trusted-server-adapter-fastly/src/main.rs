@@ -13,7 +13,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
-use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -127,6 +127,7 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
     let summary = edgezero_adapter_fastly::lifecycle::serve_custom(
         fastly::http::serve::Serve::new()
             .with_max_requests(limits.max_requests)
+            .with_max_memory(limits.max_memory_mib)
             .with_max_lifetime(limits.max_lifetime)
             .with_timeout(limits.timeout),
         |request, sandbox: &mut Sandbox| {
@@ -173,8 +174,16 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // Marked complete only once installation succeeds, so a failed install is
     // retried on a later callback. `setup_once` rolls nothing back, so that is
     // only correct because `init_logger` is harmless to repeat — see its docs.
-    if sandbox.setup_once(crate::logging::init_logger).is_ok() {
-        startup.flush();
+    match sandbox.setup_once(crate::logging::init_logger) {
+        Ok(()) => startup.flush(),
+        Err(error) => {
+            // Logger installation failed, so its own error cannot rely on log.
+            // Keep startup diagnostics pending until installation succeeds.
+            #[allow(clippy::print_stderr, reason = "logger installation failed")]
+            {
+                eprintln!("logger installation failed, retrying next callback: {error}");
+            }
+        }
     }
 
     // Correlation is request-local and never retained. `FASTLY_TRACE_ID` names
@@ -213,13 +222,21 @@ fn sandbox_metrics_response(sandbox: &Sandbox, ordinal: u64) -> FastlyResponse {
         })
 }
 
-/// Attaches the sandbox counters to a workload response.
+/// Attaches sandbox counters only to private, no-store workload responses.
 ///
 /// Called before headers are committed, which on the streaming path means
 /// before `stream_to_client`. The counters therefore describe the request up
 /// to commitment and cannot report its eventual outcome; a failure after
 /// commitment is recorded in logs instead and reconciled during analysis.
 fn attach_sandbox_counters(response: &mut HttpResponse, counters: &SandboxCounters) {
+    // Per-request measurements must never be replayed from a cache. Requiring
+    // no-store also excludes browser-cacheable and field-qualified privacy.
+    if !cache_control_headers_have_directive(response.headers(), "private")
+        || !cache_control_headers_have_directive(response.headers(), "no-store")
+    {
+        return;
+    }
+
     let headers = response.headers_mut();
     for (name, value) in [
         (sandbox::HEADER_SANDBOX_INSTANCE, instance_id()),
@@ -878,6 +895,73 @@ mod tests {
         assert!(
             response.headers().get("x-ts-finalized").is_none(),
             "sentinel should not be sent to clients"
+        );
+    }
+
+    #[test]
+    fn sandbox_counters_never_appear_on_cacheable_responses() {
+        let counters = SandboxCounters {
+            ordinal: 2,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        };
+        for policy in [
+            None,
+            Some("public, s-maxage=3600"),
+            Some("private, max-age=60"),
+            Some("private=\"set-cookie\""),
+            Some("public, extension=\"private, no-store\""),
+        ] {
+            let mut response = HttpResponse::new(EdgeBody::empty());
+            if let Some(policy) = policy {
+                response.headers_mut().insert(
+                    "cache-control",
+                    HeaderValue::from_str(policy).expect("should encode cache policy"),
+                );
+            }
+            apply_terminal_response_effects(&mut response, None);
+            let original_headers = response.headers().clone();
+
+            attach_sandbox_counters(&mut response, &counters);
+
+            assert_eq!(
+                response.headers(),
+                &original_headers,
+                "should preserve cache policy and omit all counters for {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_counters_follow_final_private_no_store_policy() {
+        let counters = SandboxCounters {
+            ordinal: 2,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        };
+        let mut response = response_builder()
+            .header("cache-control", "public, s-maxage=3600")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(TerminalPrivateResponse);
+        apply_terminal_response_effects(&mut response, None);
+
+        attach_sandbox_counters(&mut response, &counters);
+
+        assert_eq!(
+            response.headers()[sandbox::HEADER_SANDBOX_REQUEST_ID],
+            "request-example",
+            "should identify this uncached request"
+        );
+        assert_eq!(
+            response.headers()[sandbox::HEADER_SANDBOX_ORDINAL],
+            "2",
+            "should report the current ordinal"
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "no-store, private",
+            "should retain terminal privacy"
         );
     }
 

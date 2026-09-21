@@ -864,12 +864,23 @@ mod tests {
         clear_ip_cidr_source_cache_for_tests();
         let mut config = config_with_protection();
         config.protection_excluded_ip_cidr_sources = vec![ProtectionIpCidrSourceConfig {
-            config_store: "datadome-ip-bypass".to_string(),
-            key: "googlebot_ips".to_string(),
+            config_store: "example-ip-bypass".to_string(),
+            key: "example_cidrs".to_string(),
         }];
+        config.protection_exclusion_rules = vec![ProtectionExclusionRuleConfig {
+            id: "example-source-rule".to_owned(),
+            enabled: true,
+            methods: Vec::new(),
+            matcher: ProtectionMatcherConfig::IpCidrSource {
+                config_store: "example-rule-store".to_owned(),
+                key: "example_cidrs".to_owned(),
+            },
+        }];
+        // Force refreshes as well as lookups to exercise replacement of entries.
+        config.protection_ip_list_cache_ttl_seconds = 0;
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
         let mut data = HashMap::new();
-        data.insert("googlebot_ips".to_string(), "203.0.113.0/24".to_string());
+        data.insert("example_cidrs".to_string(), "203.0.113.0/24".to_string());
         let services =
             build_services_with_config_and_secret(HashMapConfigStore::new(data), NoopSecretStore);
 
@@ -892,6 +903,50 @@ mod tests {
                 ..
             }
         ));
+
+        let expected_keys = HashSet::from([
+            ProtectionIpCidrSourceCacheKey {
+                config_store: "example-ip-bypass".to_owned(),
+                key: "example_cidrs".to_owned(),
+            },
+            ProtectionIpCidrSourceCacheKey {
+                config_store: "example-rule-store".to_owned(),
+                key: "example_cidrs".to_owned(),
+            },
+        ]);
+        for index in 1..=32 {
+            let path = format!("/example/{index}");
+            let query = format!("example={index}");
+            let decision = scope.evaluate(
+                &facts(
+                    if index % 2 == 0 { "GET" } else { "POST" },
+                    &path,
+                    Some(&query),
+                    Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, index))),
+                    Some(64512 + u32::from(index)),
+                ),
+                &services,
+            );
+            assert!(
+                matches!(decision, ProtectionScopeDecision::Protect),
+                "should evaluate both configured sources for unmatched traffic"
+            );
+            let keys: HashSet<_> = IP_CIDR_SOURCE_CACHE
+                .lock()
+                .expect("should lock CIDR cache")
+                .keys()
+                // Other native tests can populate unrelated sources concurrently.
+                .filter(|key| {
+                    key.config_store == "example-ip-bypass"
+                        || key.config_store == "example-rule-store"
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                keys, expected_keys,
+                "should retain only config-derived keys across traffic and refreshes"
+            );
+        }
     }
 
     #[test]

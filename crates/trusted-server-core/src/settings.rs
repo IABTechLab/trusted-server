@@ -2550,11 +2550,13 @@ pub struct DebugConfig {
     pub inject_adm_for_testing: bool,
 
     /// Expose the reusable-sandbox counters endpoint at `GET /_ts/debug/sandbox`
-    /// and attach the same counters to workload responses.
+    /// and attach the same counters to private, no-store workload responses.
     ///
     /// The counters are the guest-instance identifier, the request ordinal
     /// within that instance, the application build count, and the request
     /// correlation id. They carry no settings, secrets, or request content.
+    /// Cacheable responses omit counters without changing their cache policy;
+    /// probes of those routes cannot establish sandbox reuse.
     ///
     /// Independent of the adapter's `reusable-sandbox` Cargo feature by design:
     /// the feature decides whether a `Serve` loop exists, this flag decides

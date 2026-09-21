@@ -185,6 +185,7 @@ pub(crate) fn metrics_enabled(settings: &Settings) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SandboxLimits {
     pub(crate) max_requests: usize,
+    pub(crate) max_memory_mib: u32,
     pub(crate) max_lifetime: Duration,
     pub(crate) timeout: Duration,
 }
@@ -207,13 +208,14 @@ pub(crate) enum ServeMode {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawLimits {
     pub(crate) max_requests: Option<u64>,
+    pub(crate) max_memory_mib: Option<u64>,
     pub(crate) max_lifetime_ms: Option<u64>,
     pub(crate) timeout_ms: Option<u64>,
 }
 
 /// Resolves raw configuration into a serving mode.
 ///
-/// Reuse requires all three bounds. A bare request limit is refused because the
+/// Reuse requires all four bounds. A bare request limit is refused because the
 /// SDK's omitted lifetime and wait timeout both default to [`Duration::MAX`],
 /// which would leave a sandbox waiting without a bound. An application-level
 /// request limit of `0` normalizes to `1`, because the SDK reads
@@ -221,9 +223,12 @@ pub(crate) struct RawLimits {
 /// writing `0` intends.
 #[cfg(any(feature = "reusable-sandbox", test))]
 pub(crate) fn resolve_mode(raw: RawLimits) -> ServeMode {
-    let (Some(max_requests), Some(max_lifetime_ms), Some(timeout_ms)) =
-        (raw.max_requests, raw.max_lifetime_ms, raw.timeout_ms)
-    else {
+    let (Some(max_requests), Some(max_lifetime_ms), Some(timeout_ms), Some(max_memory_mib)) = (
+        raw.max_requests,
+        raw.max_lifetime_ms,
+        raw.timeout_ms,
+        raw.max_memory_mib,
+    ) else {
         return ServeMode::Single;
     };
 
@@ -236,8 +241,18 @@ pub(crate) fn resolve_mode(raw: RawLimits) -> ServeMode {
         return ServeMode::Single;
     };
 
+    let Ok(max_memory_mib) = u32::try_from(max_memory_mib) else {
+        return ServeMode::Single;
+    };
+    // The SDK uses u32::MAX for unsupported heap snapshots. Keep the bound
+    // below that sentinel so an unavailable reading always retires the guest.
+    if max_memory_mib == 0 || max_memory_mib == u32::MAX {
+        return ServeMode::Single;
+    }
+
     ServeMode::Reuse(SandboxLimits {
         max_requests,
+        max_memory_mib,
         max_lifetime: Duration::from_millis(max_lifetime_ms),
         timeout: Duration::from_millis(timeout_ms),
     })
@@ -250,6 +265,8 @@ const KEY_MAX_REQUESTS: &str = "TS__SANDBOX__MAX_REQUESTS";
 const KEY_MAX_LIFETIME_MS: &str = "TS__SANDBOX__MAX_LIFETIME_MS";
 #[cfg(any(feature = "reusable-sandbox", test))]
 const KEY_TIMEOUT_MS: &str = "TS__SANDBOX__TIMEOUT_MS";
+#[cfg(any(feature = "reusable-sandbox", test))]
+const KEY_MAX_MEMORY_MIB: &str = "TS__SANDBOX__MAX_MEMORY_MIB";
 
 /// Builds the service-scoped runtime-environment key for a bound.
 ///
@@ -307,6 +324,7 @@ where
 
     let limits = RawLimits {
         max_requests: read(KEY_MAX_REQUESTS),
+        max_memory_mib: read(KEY_MAX_MEMORY_MIB),
         max_lifetime_ms: read(KEY_MAX_LIFETIME_MS),
         timeout_ms: read(KEY_TIMEOUT_MS),
     };
@@ -386,6 +404,7 @@ mod tests {
     fn full(max_requests: u64) -> RawLimits {
         RawLimits {
             max_requests: Some(max_requests),
+            max_memory_mib: Some(128),
             max_lifetime_ms: Some(30_000),
             timeout_ms: Some(500),
         }
@@ -422,6 +441,7 @@ mod tests {
     fn partial_configuration_refuses_to_reuse() {
         let raw = RawLimits {
             max_requests: Some(10),
+            max_memory_mib: Some(128),
             max_lifetime_ms: None,
             timeout_ms: Some(500),
         };
@@ -459,10 +479,11 @@ mod tests {
             resolve_mode(full(10)),
             ServeMode::Reuse(SandboxLimits {
                 max_requests: 10,
+                max_memory_mib: 128,
                 max_lifetime: Duration::from_millis(30_000),
                 timeout: Duration::from_millis(500),
             }),
-            "all three bounds present should enter the serving loop"
+            "all four bounds present should enter the serving loop"
         );
     }
 
@@ -573,7 +594,7 @@ mod tests {
         );
         assert_eq!(
             diagnostics.len(),
-            3,
+            4,
             "each failed key should report why reuse was declined"
         );
         assert!(
@@ -611,6 +632,46 @@ mod tests {
     }
 
     #[test]
+    fn positive_memory_limits_are_preserved_without_truncation() {
+        for memory in [1, 128, u32::MAX - 1] {
+            let mode = resolve_mode(RawLimits {
+                max_memory_mib: Some(u64::from(memory)),
+                ..full(10)
+            });
+            assert!(
+                matches!(mode, ServeMode::Reuse(limits) if limits.max_memory_mib == memory),
+                "should pass a valid memory bound unchanged to the SDK"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_memory_limit_refuses_reuse() {
+        for memory in [
+            None,
+            Some("0"),
+            Some("-1"),
+            Some("many"),
+            Some("4294967295"),
+            Some("4294967296"),
+        ] {
+            let (limits, _) = collect_raw_limits::<LookupFailed, _>("example-service", |key| {
+                Ok(if key.ends_with("TS__SANDBOX__MAX_MEMORY_MIB") {
+                    memory.map(str::to_owned)
+                } else {
+                    Some("10".to_owned())
+                })
+            });
+
+            assert_eq!(
+                resolve_mode(limits),
+                ServeMode::Single,
+                "should refuse reuse with missing or invalid memory limit {memory:?}"
+            );
+        }
+    }
+
+    #[test]
     fn absent_keys_report_nothing_and_stay_single_request() {
         let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>("svc", |_key| Ok(None));
 
@@ -631,6 +692,8 @@ mod tests {
             Ok(Some(
                 if key.ends_with(KEY_MAX_REQUESTS) {
                     "10"
+                } else if key.ends_with(KEY_MAX_MEMORY_MIB) {
+                    "128"
                 } else if key.ends_with(KEY_MAX_LIFETIME_MS) {
                     "30000"
                 } else {
@@ -645,6 +708,7 @@ mod tests {
             resolve_mode(limits),
             ServeMode::Reuse(SandboxLimits {
                 max_requests: 10,
+                max_memory_mib: 128,
                 max_lifetime: Duration::from_millis(30_000),
                 timeout: Duration::from_millis(500),
             }),
