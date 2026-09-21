@@ -86,6 +86,44 @@ impl<'a> EscapeSequenceIter<'a> {
     fn position(&self) -> usize {
         self.pos
     }
+
+    /// Whether appending bytes could change how the next escape is decoded.
+    fn has_partial_escape(&self) -> bool {
+        let remaining = &self.bytes[self.pos..];
+        if remaining.first() != Some(&b'\\') {
+            return false;
+        }
+        match remaining.get(1) {
+            None => true,
+            Some(b'x') => remaining.len() < 4,
+            Some(b'u') => {
+                if remaining.len() < 6 {
+                    return remaining[2..].iter().all(u8::is_ascii_hexdigit);
+                }
+                let Some(code_unit) = self
+                    .str_ref
+                    .get(self.pos + 2..self.pos + 6)
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+                else {
+                    return false;
+                };
+                if !(0xD800..=0xDBFF).contains(&code_unit) || remaining.len() >= 12 {
+                    return false;
+                }
+                // A high surrogate can still join a low surrogate. Retain only
+                // prefixes that can grow into `\uDC00` through `\uDFFF`.
+                let tail = &remaining[6..];
+                tail.iter().enumerate().all(|(index, byte)| match index {
+                    0 => *byte == b'\\',
+                    1 => *byte == b'u',
+                    2 => matches!(byte, b'd' | b'D'),
+                    3 => matches!(byte, b'c'..=b'f' | b'C'..=b'F'),
+                    _ => byte.is_ascii_hexdigit(),
+                })
+            }
+            Some(_) => false,
+        }
+    }
 }
 
 impl Iterator for EscapeSequenceIter<'_> {
@@ -223,9 +261,6 @@ pub(super) enum TChunkScan {
     Invalid,
 }
 
-/// Longest escape sequence in source bytes: `\uD83D\uDE00`.
-const MAX_ESCAPE_SEQUENCE_BYTES: usize = 12;
-
 /// A T-chunk whose header has been parsed but whose content has not fully arrived.
 pub(super) struct PendingTChunk {
     match_start: usize,
@@ -298,11 +333,7 @@ pub(super) fn next_tchunk(
         None => EscapeSequenceIter::from_position(content, chunk.pos),
     };
     while chunk.consumed < chunk.declared_length {
-        let position = iter.position();
-        if hold_back_partial_escape
-            && content.as_bytes()[position..].first() == Some(&b'\\')
-            && content.len() - position < MAX_ESCAPE_SEQUENCE_BYTES
-        {
+        if hold_back_partial_escape && iter.has_partial_escape() {
             break;
         }
         match iter.next() {
@@ -550,6 +581,24 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
             .collect();
     }
 
+    // Markers preserve script boundaries, but inserting one inside an escape
+    // changes its decoded length. Preserve this group rather than emitting a
+    // header counted differently by the classifier and the marker-aware scan.
+    for payload in &payloads[..payloads.len() - 1] {
+        let mut iter = EscapeSequenceIter::new(payload);
+        loop {
+            if iter.has_partial_escape() {
+                return payloads
+                    .iter()
+                    .map(|payload| (*payload).to_owned())
+                    .collect();
+            }
+            if iter.next().is_none() {
+                break;
+            }
+        }
+    }
+
     let mut combined = String::with_capacity(total_size);
     combined.push_str(payloads[0]);
     for payload in &payloads[1..] {
@@ -653,6 +702,100 @@ mod tests {
             result.starts_with("1a:T24,"),
             "T-chunk length should be updated from 1c (28) to 24 (36). Got: {result}"
         );
+    }
+
+    #[test]
+    fn incremental_scan_waits_only_for_incomplete_escapes() {
+        for (escape, length) in [
+            (r"\n", 1),
+            (r#"\""#, 1),
+            (r"\\", 1),
+            (r"\x41", 1),
+            (r"\u0041", 1),
+            (r"\ud83d\ude00", 4),
+        ] {
+            let header = format!("1:T{length:x},");
+            for split in 0..escape.len() {
+                let incomplete = format!("{header}{}", &escape[..split]);
+                let TChunkStep::Pending(pending) = next_tchunk(&incomplete, 0, None, None, true)
+                else {
+                    panic!("should retain incomplete escape {escape} at byte {split}");
+                };
+                let complete = format!("{header}{escape}");
+                assert!(
+                    matches!(
+                        next_tchunk(&complete, 0, Some(pending), None, true),
+                        TChunkStep::Found(_)
+                    ),
+                    "should resume and release complete escape {escape} at byte {split}"
+                );
+            }
+        }
+        for content in [
+            r"1:T3,\ud83d!",
+            r"1:T3,\ud83d\u0041",
+            r"1:T6,\uZZZZ",
+            r"1:T2,\q",
+        ] {
+            assert!(
+                matches!(
+                    next_tchunk(content, 0, None, None, true),
+                    TChunkStep::Found(_)
+                ),
+                "should not hold a disproved escape or surrogate pair: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn escapes_split_between_scripts_preserve_the_group_unchanged() {
+        for escape in [r"\n", r"\x41", r"\u0041", r"\ud83d\ude00"] {
+            let length = calculate_unescaped_byte_length(escape);
+            for split in 1..escape.len() {
+                let first = format!("1:T{length:x},{}", &escape[..split]);
+                let second = format!("{}\nhttps://origin.example.com/path/", &escape[split..]);
+                let payloads = [first.as_str(), second.as_str()];
+                let rewritten = rewrite_rsc_scripts_combined(
+                    &payloads,
+                    "origin.example.com",
+                    "proxy.example.com",
+                    "https",
+                );
+                assert_eq!(
+                    rewritten, payloads,
+                    "should preserve the group when a marker would split {escape} at byte {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_payload_escape_splits_preserve_declared_lengths() {
+        for body in [
+            r"\x41\x42",
+            r"a\nb",
+            r#"{\"a\":\"b\"}"#,
+            r"\ud83d\ude00",
+            r"\\\x41",
+        ] {
+            let length = calculate_unescaped_byte_length(body);
+            let header = format!("1:T{length:x},");
+            let document = format!("{header}{body}\nhttps://origin.example.com/path/");
+            for split in header.len()..header.len() + body.len() {
+                let payloads = [&document[..split], &document[split..]];
+                let rewritten = rewrite_rsc_scripts_combined(
+                    &payloads,
+                    "origin.example.com",
+                    "origin.example.com",
+                    "https",
+                );
+                assert_eq!(
+                    rewritten.concat(),
+                    document,
+                    "should preserve lengths for an identity rewrite at split {split} of {body}"
+                );
+            }
+        }
     }
 
     #[test]

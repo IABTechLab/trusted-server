@@ -618,6 +618,8 @@ pub(super) struct RscGroupClassifier {
     /// Start of the trailing non-chunk segment.
     segment_start: usize,
     inspector: SegmentInspector,
+    /// Malformed non-chunk text, deferred until chunk discovery is complete.
+    invalid_segment: bool,
     invalid: bool,
 }
 
@@ -632,6 +634,7 @@ impl RscGroupClassifier {
             pending: None,
             segment_start: 0,
             inspector: SegmentInspector::default(),
+            invalid_segment: false,
             invalid: false,
         }
     }
@@ -672,6 +675,7 @@ impl RscGroupClassifier {
         self.pending = None;
         self.segment_start = 0;
         self.inspector = SegmentInspector::default();
+        self.invalid_segment = false;
         self.invalid = false;
     }
 
@@ -695,8 +699,7 @@ impl RscGroupClassifier {
                     if settled.inspect(&self.combined[self.segment_start..chunk.match_start], false)
                         == HeaderSuffixStatus::Invalid
                     {
-                        self.invalid = true;
-                        return RscGroupStatus::Invalid;
+                        self.invalid_segment = true;
                     }
                     if self.boundaries.iter().any(|boundary| {
                         chunk.match_start < *boundary && *boundary < chunk.header_end
@@ -719,12 +722,21 @@ impl RscGroupClassifier {
             }
         }
 
+        // A later pending chunk takes precedence over malformed non-chunk text
+        // in a full scan. Do not turn a provisional segment verdict into a
+        // document-wide bypass while more payloads can still arrive.
+        if self.invalid_segment && finalize {
+            return RscGroupStatus::Invalid;
+        }
         match self
             .inspector
             .inspect(&self.combined[self.segment_start..], true)
         {
             HeaderSuffixStatus::Complete => {
-                if self.header_split {
+                self.scan_from = self.combined.len();
+                if self.invalid_segment {
+                    RscGroupStatus::NeedMore
+                } else if self.header_split {
                     RscGroupStatus::CompleteUnrewritable
                 } else {
                     RscGroupStatus::CompleteRewritable
@@ -744,8 +756,12 @@ impl RscGroupClassifier {
                 RscGroupStatus::NeedMore
             }
             HeaderSuffixStatus::Invalid => {
-                self.invalid = true;
-                RscGroupStatus::Invalid
+                self.scan_from = self.segment_start + self.inspector.partial_header_start();
+                if finalize {
+                    RscGroupStatus::Invalid
+                } else {
+                    RscGroupStatus::NeedMore
+                }
             }
         }
     }
@@ -853,6 +869,118 @@ impl SegmentInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::nextjs::rsc::{TChunkScan, scan_tchunks};
+
+    // Keep the reference independent of the incremental classifier: discover all
+    // chunks first, then inspect each non-chunk segment from scratch.
+    fn classify_full_rescan(payloads: &[&str], limit: usize) -> RscGroupStatus {
+        let combined = payloads.concat();
+        if combined.len() > limit {
+            return RscGroupStatus::Invalid;
+        }
+        let chunks = match scan_tchunks(&combined) {
+            TChunkScan::Complete(chunks) => chunks,
+            TChunkScan::NeedMore => return RscGroupStatus::NeedMore,
+            TChunkScan::Invalid => return RscGroupStatus::Invalid,
+        };
+        let mut segment_start = 0;
+        for chunk in &chunks {
+            if SegmentInspector::default()
+                .inspect(&combined[segment_start..chunk.match_start], false)
+                == HeaderSuffixStatus::Invalid
+            {
+                return RscGroupStatus::Invalid;
+            }
+            segment_start = chunk.content_end;
+        }
+        match SegmentInspector::default().inspect(&combined[segment_start..], true) {
+            HeaderSuffixStatus::NeedMore => return RscGroupStatus::NeedMore,
+            HeaderSuffixStatus::Invalid => return RscGroupStatus::Invalid,
+            HeaderSuffixStatus::Complete => {}
+        }
+        let mut boundary = 0;
+        for payload in payloads.iter().take(payloads.len().saturating_sub(1)) {
+            boundary += payload.len();
+            if chunks
+                .iter()
+                .any(|chunk| chunk.match_start < boundary && boundary < chunk.header_end)
+            {
+                return RscGroupStatus::CompleteUnrewritable;
+            }
+        }
+        RscGroupStatus::CompleteRewritable
+    }
+
+    #[test]
+    fn incomplete_nested_header_does_not_latch_document_bypass() {
+        let payloads = ["a", ":T3:", "Te,"];
+        let mut classifier = RscGroupClassifier::new(1024);
+        for payload in payloads {
+            assert_eq!(
+                classifier.push(payload),
+                RscGroupStatus::NeedMore,
+                "should allow an incomplete nested header to grow"
+            );
+        }
+        assert_eq!(
+            classifier.finalize(),
+            classify_full_rescan(&payloads, 1024),
+            "should agree with a full scan of the incomplete chunk"
+        );
+        let (mut processor, placeholders) = processor_with_payloads(&payloads, 1024);
+        for placeholder in placeholders {
+            assert!(
+                processor
+                    .process_chunk(placeholder.as_bytes(), false)
+                    .expect("should hold incomplete group")
+                    .is_empty(),
+                "should await content"
+            );
+        }
+        assert!(
+            !processor
+                .state
+                .lock()
+                .expect("should lock state")
+                .bypass_rsc,
+            "should not bypass the document for an incomplete group"
+        );
+        assert_eq!(
+            processor
+                .process_chunk(&[], true)
+                .expect("should restore at EOF"),
+            payloads.concat().as_bytes(),
+            "should preserve incomplete content at EOF"
+        );
+    }
+
+    #[test]
+    fn incremental_classification_matches_independent_rescan_at_all_splits() {
+        for document in [
+            "a:T3:Te,",
+            "a:T3:Te,xxxxxxxxxxxxxx",
+            "a:T3:x1:T2,y",
+            "1:T3,abc2:T2,xy",
+            "1:Tzz,invalid",
+            "ordinary text",
+            r#"1:T3,a\n\""#,
+        ] {
+            for first in 1..document.len() {
+                for second in first..document.len() {
+                    let payloads = [
+                        &document[..first],
+                        &document[first..second],
+                        &document[second..],
+                    ];
+                    assert_eq!(
+                        classify_rsc_group(&payloads, 1024),
+                        classify_full_rescan(&payloads, 1024),
+                        "should match the independent oracle for {payloads:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn classifies_complete_header_with_cross_payload_content_as_rewritable() {
@@ -1067,6 +1195,52 @@ mod tests {
     }
 
     #[test]
+    fn stream_processor_releases_complete_escapes_before_eof() {
+        for payload in [
+            r"1:T3,ab\n",
+            r#"1:T9,{\"a\":\"b\"}"#,
+            r"1:T1,\x41",
+            r"1:T1,\u0041",
+            r"1:T4,\ud83d\ude00",
+            r"1:T2,\\n",
+        ] {
+            let (mut processor, placeholders) = processor_with_payloads(&[payload], 128);
+            let input = format!("<p>{}</p>", placeholders[0]);
+
+            let output = processor
+                .process_chunk(input.as_bytes(), false)
+                .expect("should release a complete escaped payload before EOF");
+
+            assert_eq!(
+                output,
+                format!("<p>{payload}</p>").as_bytes(),
+                "should release {payload}"
+            );
+            assert!(processor.group.is_empty(), "should release the group");
+            assert!(
+                processor.held_output.is_empty(),
+                "should release held output"
+            );
+            let body = vec![b'x'; 256];
+            assert_eq!(
+                processor
+                    .process_chunk(&body, false)
+                    .expect("should stream subsequent body"),
+                body,
+                "should stream a body larger than the hold limit"
+            );
+            assert!(
+                !processor
+                    .state
+                    .lock()
+                    .expect("should lock state")
+                    .bypass_rsc,
+                "should not bypass subsequent RSC after a complete escaped payload"
+            );
+        }
+    }
+
+    #[test]
     fn stream_processor_holds_only_until_cross_payload_content_completes() {
         let payloads = ["1:T3,ab", "c"];
         let (mut processor, placeholders) = processor_with_payloads(&payloads, 1024);
@@ -1112,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_group_restores_later_payloads_in_the_same_output_chunk() {
+    fn malformed_segment_restores_later_payloads_at_eof() {
         let payloads = [
             "1:Tzz,invalid",
             r#"1:T29,{"url":"https://origin.example.com/path"}"#,
@@ -1121,12 +1295,12 @@ mod tests {
         let input = format!("{}middle{}tail", placeholders[0], placeholders[1]);
 
         let output = processor
-            .process_chunk(input.as_bytes(), false)
+            .process_chunk(input.as_bytes(), true)
             .expect("should restore invalid group and later payload");
         assert_eq!(
             output,
             format!("{}middle{}tail", payloads[0], payloads[1]).as_bytes(),
-            "document-wide bypass must take effect within the current output chunk"
+            "should restore malformed groups and subsequent payloads unchanged at EOF"
         );
     }
 
@@ -1227,7 +1401,7 @@ mod tests {
 
             assert_eq!(
                 incremental,
-                classify_rsc_group(&payloads, usize::MAX),
+                classify_full_rescan(&payloads, usize::MAX),
                 "incremental classification of {segments} segments should match the whole group"
             );
             assert_eq!(

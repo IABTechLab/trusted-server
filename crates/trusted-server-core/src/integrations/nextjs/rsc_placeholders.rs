@@ -128,8 +128,15 @@ impl NextJsRscPlaceholderRewriter {
                 ScriptRewriteAction::replace(restored)
             }
             FragmentCapture::PassThrough => {
+                let trimmed = state.rsc_receiver_trimmed;
+                state.rsc_receiver_trimmed = false;
                 if is_last && content.len() > limit && content.contains("__next_f") {
-                    let unsafe_continuation = find_rsc_push_payload_range(content)
+                    let range = if trimmed {
+                        find_trimmed_rsc_push_payload_range(content)
+                    } else {
+                        find_rsc_push_payload_range(content)
+                    };
+                    let unsafe_continuation = range
                         .map(|(start, end)| {
                             matches!(
                                 classify_rsc_group(&[&content[start..end]], limit),
@@ -474,6 +481,48 @@ mod tests {
             action,
             ScriptRewriteAction::Keep,
             "Non-RSC scripts should be kept unchanged"
+        );
+    }
+
+    #[test]
+    fn oversized_trimmed_complete_claim_keeps_later_scripts_capturable() {
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+            max_combined_payload_bytes: 100,
+            ..(*test_config()).clone()
+        }));
+        assert_eq!(
+            rewriter.rewrite("self.", &ctx(false, &state)),
+            ScriptRewriteAction::Keep,
+            "should release and remember the qualified receiver"
+        );
+        let script = format!(r#"__next_f.push([1,"1:T50,{}"])"#, "x".repeat(80));
+
+        assert_eq!(
+            rewriter.rewrite(&script, &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should pass through the oversized complete script"
+        );
+
+        let shared = document_state(&state);
+        {
+            let guard = shared.lock().expect("should lock document state");
+            assert!(
+                !guard.bypass_rsc,
+                "should limit fallback to the oversized script"
+            );
+            assert!(
+                !guard.rsc_receiver_trimmed,
+                "should clear the completed claim's receiver flag"
+            );
+        }
+        let later = r#"self.__next_f.push([1,"1:T3,abc"])"#;
+        assert!(
+            matches!(
+                rewriter.rewrite(later, &ctx(true, &state)),
+                ScriptRewriteAction::Replace(_)
+            ),
+            "should capture the next qualified script"
         );
     }
 

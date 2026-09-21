@@ -554,9 +554,13 @@ pub struct IntegrationHtmlContext<'a> {
 /// Owned request data supplied when an integration creates an HTML stream processor.
 #[derive(Clone)]
 pub struct IntegrationHtmlStreamContext {
+    /// Publisher-facing host used for rewritten URLs.
     pub request_host: String,
+    /// Publisher-facing scheme used for rewritten URLs.
     pub request_scheme: String,
+    /// Origin host whose URLs may be rewritten.
     pub origin_host: String,
+    /// Request-local state shared with the document's integration rewriters.
     pub document_state: IntegrationDocumentState,
 }
 

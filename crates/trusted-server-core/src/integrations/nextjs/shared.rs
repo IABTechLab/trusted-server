@@ -14,9 +14,10 @@ use crate::host_rewrite::rewrite_bare_host_at_boundaries;
 // `Settings::prepare_runtime`.
 /// RSC push script call pattern for extracting payload string boundaries.
 ///
-/// The `self.`/`window.` receiver is required. A fragmented script keeps its
-/// receiver out of the output stream via [`RSC_RECEIVER_CANDIDATES`] instead of
-/// relaxing this pattern, because an unqualified `__next_f.push([1,"…"])`
+/// The `self.`/`window.` receiver is required. A fragmented script retains up to
+/// [`RSC_RECEIVER_CONTEXT_BYTES`] of released text and verifies its receiver via
+/// [`receiver_context_is_flight_push`] instead of relaxing this pattern, because
+/// an unqualified `__next_f.push([1,"…"])`
 /// cannot be distinguished from an unrelated publisher script that happens to
 /// own a property of the same name.
 pub(crate) static RSC_PUSH_CALL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {

@@ -10,6 +10,42 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-07-850-parser-aware-body-hold-nextjs-streaming-design.md`
 
+## Second review corrections — 2026-09-21
+
+- Replace the fixed twelve-byte escape hold-back with escape-specific prefix
+  checks. Complete escapes release before EOF, including escaped JSON and
+  surrogate pairs. If a script boundary interrupts an escape, preserve that
+  group unchanged: inserting boundary markers inside the escape can change the
+  decoded byte count and invalidate its T header.
+- Use the verified trimmed receiver matcher for oversized trimmed claims and
+  clear the receiver flag on pass-through. A complete oversized script does not
+  disable capture of later independent scripts; unsafe continuations retain the
+  existing document-wide fallback.
+- Defer malformed non-chunk segment verdicts while a later incomplete chunk can
+  still take precedence. EOF or the existing byte/payload limits restore
+  malformed groups unchanged. This intentionally delays fallback for malformed
+  text; valid complete groups still stream. Such malformed tails may be rescanned
+  within those limits. Regression comparisons use a separate full-rescan oracle,
+  rather than a second invocation of the incremental classifier.
+- Correct the receiver documentation link and document the stream context fields.
+
+Memory accounting follow-up: queued and grouped original payloads share the
+default 16 MiB capture budget; moving a payload into the group does not release its
+charge. Together with the classifier's 10 MiB combined buffer and the 10 MiB held
+output limit, retained content lengths can total approximately 36 MiB. This is
+not a peak heap bound: payload clones, rewrite/substitution temporaries, spare
+capacity, and parser state also consume memory. A measured Fastly heap profile
+remains follow-up work. Lazy-driver disconnect telemetry and migration-guard
+coverage are pre-existing issues outside these corrections.
+
+Verification for these corrections passed: all six target-specific Clippy
+aliases, all four adapter test aliases, 14 cross-adapter parity tests, 2,709
+native core tests, Rust formatting, 959 JS tests with Node 24.12.0, the JS build,
+and JS/documentation formatting. Fastly and Axum required host access for the
+macOS keychain and local test listeners. Core documentation builds successfully
+with 29 unrelated documentation warnings. An independent review of the
+corrections reported no important correctness findings.
+
 ## Completion review — 2026-09-09
 
 The implementation is complete. The step checkboxes below preserve the original
