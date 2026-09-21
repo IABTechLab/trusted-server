@@ -777,6 +777,8 @@ server-to-server ATS API.
 | EC/KV is unavailable                                     | A current-request EID can still reach `/auction`; persistence degrades                             |
 | The resolved envelope exceeds the 512-byte EID value cap | The envelope is dropped from both the `/auction` payload and EC persistence; the auction continues |
 | The CMP is callable but never returns a settled result   | The managed entry is never seeded; no vendor call, no identity storage, and the auction continues  |
+| Two managed entries address one Prebid submodule         | The later entry is dropped with a logged error; the first entry's configuration takes effect       |
+| A silent CMP stub is replaced by a working CMP           | The shim re-subscribes to the replacement; a CMP that already answered once keeps its own wait     |
 
 The TCF rows assume either the managed-ID automatic setup described above or a
 publisher-owned Prebid GDPR configuration. A CMP API and its policy remain
