@@ -345,12 +345,13 @@ or CORS headers. It is Fastly-only and requires the EC KV store.
 Unified proxy for resources referenced by creatives (images, scripts, CSS, etc.).
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `tsurl` | string | Yes | Target URL without query parameters (base URL) |
-| `tstoken` | string | Yes | Base64url SHA-256 token derived from the encrypted reconstructed target URL |
-| `tsexp` | integer | No | Unix expiry carried by newly minted URLs and covered by `tstoken` |
-| `*` | any | No | Original target URL query parameters (preserved as-is) |
+
+| Parameter | Type    | Required | Description                                                                 |
+| --------- | ------- | -------- | --------------------------------------------------------------------------- |
+| `tsurl`   | string  | Yes      | Target URL without query parameters (base URL)                              |
+| `tstoken` | string  | Yes      | Base64url SHA-256 token derived from the encrypted reconstructed target URL |
+| `tsexp`   | integer | No       | Unix expiry carried by newly minted URLs and covered by `tstoken`           |
+| `*`       | any     | No       | Original target URL query parameters (preserved as-is)                      |
 
 **Response:**
 
@@ -402,12 +403,13 @@ curl "https://edge.example.com/first-party/proxy?tsurl=https://ad.doubleclick.ne
 Click tracking redirect endpoint.
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `tsurl` | string | Yes | Target redirect URL without query parameters |
-| `tstoken` | string | Yes | Base64url SHA-256 token derived from the encrypted reconstructed target URL |
-| `tsexp` | integer | No | Optional Unix expiry covered by `tstoken` |
-| `*` | any | No | Original target URL query parameters |
+
+| Parameter | Type    | Required | Description                                                                 |
+| --------- | ------- | -------- | --------------------------------------------------------------------------- |
+| `tsurl`   | string  | Yes      | Target redirect URL without query parameters                                |
+| `tstoken` | string  | Yes      | Base64url SHA-256 token derived from the encrypted reconstructed target URL |
+| `tsexp`   | integer | No       | Optional Unix expiry covered by `tstoken`                                   |
+| `*`       | any     | No       | Original target URL query parameters                                        |
 
 **Response:**
 
@@ -932,9 +934,10 @@ enabled standalone `gpt_diagnostics` module. An unknown, disabled, or
 non-deferred module filename returns `404`.
 
 **Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `v` | string | No | Cache-busting hash (SHA256 of bundle contents) |
+
+| Parameter | Type   | Required | Description                                    |
+| --------- | ------ | -------- | ---------------------------------------------- |
+| `v`       | string | No       | Cache-busting hash (SHA256 of bundle contents) |
 
 **Response:**
 
@@ -996,6 +999,7 @@ rewriter, injector, post-processor, request filter, or auction mediator.
 | `google_tag_manager` | `enabled=true`                                                   | `POST /integrations/google_tag_manager/collect`   |
 | `google_tag_manager` | `enabled=true`                                                   | `POST /integrations/google_tag_manager/g/collect` |
 | `gpt_diagnostics`    | `enabled=true`                                                   | None                                              |
+| `js_asset_proxy`     | `enabled=true;asset.proxy=enabled`                               | `GET <asset.path>` per configured asset           |
 | `gpt`                | `enabled=true`                                                   | `GET /integrations/gpt/pagead/*`                  |
 | `gpt`                | `enabled=true`                                                   | `GET /integrations/gpt/script`                    |
 | `gpt`                | `enabled=true`                                                   | `GET /integrations/gpt/tag/*`                     |
@@ -1039,6 +1043,7 @@ available when a deployment needs either.
 | Didomi consent    | `GET` or `POST` under the configured prefix (default `/integrations/didomi/consent/*`); path selects SDK or API origin; query and bounded POST body forwarded          | Upstream status/body preserved; SDK responses receive the integration's CORS headers; API responses retain selected upstream headers; no local cache policy                                   | `curl -i https://edge.example.com/integrations/didomi/consent/loader.js`                                                                  |
 | GTM/gtag scripts  | `GET` the generated `gtm.js`, `gtag.js`, or `gtag/js` paths; query forwarded or configured container ID supplied; successful script is rewritten                       | Non-success upstream status preserved; rewritten scripts use `cache_max_age`; oversized rewritten upstream bodies use shared integration errors                                               | `curl -i 'https://edge.example.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXX'`                                                   |
 | Google collect    | `GET` or `POST` the generated `collect` or `g/collect` paths; query, selected headers, and bounded body proxy to the configured Google origin                          | Malformed `Content-Length` returns `400`; body over `max_beacon_body_size` returns `413`; stream-read failure returns `502`; upstream response otherwise preserved                            | Browser beacon; body schema belongs to Google Analytics                                                                                   |
+| JS asset proxy    | `GET` each configured `[[integrations.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags      | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
 | GPT               | `GET` `/script`, `/pagead/*`, or `/tag/*`; path/query proxy to the configured GPT origins and script content can be rewritten                                          | Upstream status is preserved; successful scripts/assets apply integration cache rules; selected upstream CORS is preserved                                                                    | `curl -i https://edge.example.com/integrations/gpt/script`                                                                                |
 | Lockr SDK         | `GET /integrations/lockr/sdk`; no body; fetches and returns the configured SDK as JavaScript                                                                           | Successful SDK uses `cache_ttl_seconds`; upstream/transport failures follow integration mapping; no added CORS policy                                                                         | `curl -i https://edge.example.com/integrations/lockr/sdk`                                                                                 |
 | Lockr API         | `GET` or `POST /integrations/lockr/api/*`; path, query, selected headers, and bounded body proxy to `api_endpoint`; publisher credentials are stripped                 | Upstream status/body preserved; no local cache/CORS policy                                                                                                                                    | Payload is Lockr-specific; use the SDK for normal calls                                                                                   |

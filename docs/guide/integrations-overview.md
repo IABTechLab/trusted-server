@@ -35,6 +35,7 @@ their operational procedures.
 | [`google_tag_manager`](/guide/integrations/google_tag_manager) | production         | yes       | settings builder   | bundled         |
 | [`gpt`](/guide/integrations/gpt)                               | production         | yes       | settings builder   | bundled         |
 | [`gpt_diagnostics`](/guide/integrations/gpt-diagnostics)       | development        | yes       | settings builder   | standalone      |
+| `js_asset_proxy` (no dedicated guide)                          | development        | yes       | settings builder   | none            |
 | [`lockr`](/guide/integrations/lockr)                           | production         | yes       | settings builder   | bundled         |
 | [`nextjs`](/guide/integrations/nextjs)                         | production         | yes       | settings builder   | none            |
 | [`osano`](/guide/integrations/osano)                           | development        | yes       | settings builder   | bundled         |

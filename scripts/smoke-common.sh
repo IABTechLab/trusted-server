@@ -28,15 +28,30 @@ smoke_remove_workspace() {
 
 smoke_stop_process() {
     local pid="${1:-}"
-    if [ -n "$pid" ]; then
-        if command -v pkill >/dev/null 2>&1; then
-            pkill -TERM -P "$pid" 2>/dev/null || true
-        fi
-    fi
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    [ -n "$pid" ] || return 0
+    # Capture child PIDs while the parent is alive; after the parent dies they
+    # are reparented and can no longer be found through it.
+    local children=""
+    children=$(pgrep -P "$pid" 2>/dev/null || true)
+    local child
+    for child in $children; do
+        kill -TERM "$child" 2>/dev/null || true
+    done
+    if kill -0 "$pid" 2>/dev/null; then
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     fi
+    # Only the direct parent is a shell job, so signaled children must be
+    # polled until they release their sockets.
+    local remaining
+    for child in $children; do
+        remaining=50
+        while kill -0 "$child" 2>/dev/null && [ "$remaining" -gt 0 ]; do
+            sleep 0.1
+            remaining=$((remaining - 1))
+        done
+        kill -KILL "$child" 2>/dev/null || true
+    done
 }
 
 smoke_assert_process_alive() {

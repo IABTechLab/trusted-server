@@ -11,9 +11,10 @@ smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command jq
 smoke_require_command python3
+smoke_require_command pgrep
 
 WORKSPACE=$(smoke_make_workspace axum)
-ORIGIN_PORT=${AXUM_SMOKE_ORIGIN_PORT:-18880}
+ORIGIN_PORT=${AXUM_SMOKE_ORIGIN_PORT:-18889}
 BASE_PORT=${AXUM_SMOKE_PORT:-18890}
 ORIGIN_PID=""
 APP_PID=""

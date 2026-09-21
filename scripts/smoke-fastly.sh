@@ -11,12 +11,13 @@ smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command fastly
 smoke_require_command python3
+smoke_require_command pgrep
 
 WORKSPACE=$(smoke_make_workspace fastly)
 FASTLY_PROJECT="$WORKSPACE/project"
 FASTLY_MANIFEST="$FASTLY_PROJECT/fastly.toml"
 EDGEZERO_MANIFEST="$FASTLY_PROJECT/edgezero.toml"
-ORIGIN_PORT=${FASTLY_SMOKE_ORIGIN_PORT:-18880}
+ORIGIN_PORT=${FASTLY_SMOKE_ORIGIN_PORT:-18989}
 BASE_PORT=${FASTLY_SMOKE_PORT:-18980}
 ORIGIN_PID=""
 APP_PID=""

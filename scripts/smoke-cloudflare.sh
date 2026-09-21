@@ -13,6 +13,7 @@ smoke_require_command curl
 smoke_require_command jq
 smoke_require_command python3
 smoke_require_command wrangler
+smoke_require_command pgrep
 
 EXPECTED_WRANGLER=$(awk '$1 == "wrangler" { print $2 }' "$REPO_ROOT/.tool-versions")
 [ -n "$EXPECTED_WRANGLER" ] || smoke_die "missing Wrangler pin in .tool-versions"
@@ -21,7 +22,7 @@ ACTUAL_WRANGLER=$(wrangler --version | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/
     smoke_die "Wrangler $EXPECTED_WRANGLER is required; found ${ACTUAL_WRANGLER:-unknown}"
 
 WORKSPACE=$(smoke_make_workspace cloudflare)
-ORIGIN_PORT=${CLOUDFLARE_SMOKE_ORIGIN_PORT:-18880}
+ORIGIN_PORT=${CLOUDFLARE_SMOKE_ORIGIN_PORT:-19089}
 BASE_PORT=${CLOUDFLARE_SMOKE_PORT:-19080}
 ORIGIN_PID=""
 APP_PID=""

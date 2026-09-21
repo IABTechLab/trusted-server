@@ -32,9 +32,10 @@ release responsibilities.
 
 ## Verify
 
-Run the target-matched checks in [CLAUDE.md](CLAUDE.md#ci-gates), the
+Run the target-matched checks in [AGENTS.md](AGENTS.md#ci-gates), the
 canonical command surface for local and CI verification. [TESTING.md](TESTING.md)
-links focused runbooks without duplicating that matrix.
+covers auction-orchestration testing specifically and repeats the adapter test
+aliases relevant to that runbook; it isn't a link index for other runbooks.
 
 Keep a pull request in draft while required checks or known changes remain.
 Before requesting review, inspect the complete diff, resolve all failures, and

@@ -1444,22 +1444,23 @@ Every deploy-validated integration ID is listed here. A section is optional
 unless its integration is enabled or a CLI workflow retains an explicit
 disabled stub.
 
-| Section                             | Reference                                                    |
-| ----------------------------------- | ------------------------------------------------------------ |
-| `[integrations.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)          |
-| `[integrations.aps]`                | [APS](/guide/integrations/aps)                               |
-| `[integrations.datadome]`           | [DataDome](/guide/integrations/datadome)                     |
-| `[integrations.didomi]`             | [Didomi](/guide/integrations/didomi)                         |
-| `[integrations.google_tag_manager]` | [Google Tag Manager](/guide/integrations/google_tag_manager) |
-| `[integrations.gpt]`                | [GPT](/guide/integrations/gpt)                               |
-| `[integrations.gpt_diagnostics]`    | [GPT diagnostics](/guide/integrations/gpt-diagnostics)       |
-| `[integrations.lockr]`              | [lockr](/guide/integrations/lockr)                           |
-| `[integrations.nextjs]`             | [Next.js](/guide/integrations/nextjs)                        |
-| `[integrations.osano]`              | [Osano](/guide/integrations/osano)                           |
-| `[integrations.permutive]`          | [Permutive](/guide/integrations/permutive)                   |
-| `[integrations.prebid]`             | [Prebid](/guide/integrations/prebid)                         |
-| `[integrations.sourcepoint]`        | [Sourcepoint](/guide/integrations/sourcepoint)               |
-| `[integrations.testlight]`          | [Testlight](/guide/integrations/testlight)                   |
+| Section                             | Reference                                                          |
+| ----------------------------------- | ------------------------------------------------------------------ |
+| `[integrations.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)                |
+| `[integrations.aps]`                | [APS](/guide/integrations/aps)                                     |
+| `[integrations.datadome]`           | [DataDome](/guide/integrations/datadome)                           |
+| `[integrations.didomi]`             | [Didomi](/guide/integrations/didomi)                               |
+| `[integrations.google_tag_manager]` | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
+| `[integrations.gpt]`                | [GPT](/guide/integrations/gpt)                                     |
+| `[integrations.gpt_diagnostics]`    | [GPT diagnostics](/guide/integrations/gpt-diagnostics)             |
+| `[integrations.js_asset_proxy]`     | [JS Asset Proxy](#js-asset-proxy-integration) (no dedicated guide) |
+| `[integrations.lockr]`              | [lockr](/guide/integrations/lockr)                                 |
+| `[integrations.nextjs]`             | [Next.js](/guide/integrations/nextjs)                              |
+| `[integrations.osano]`              | [Osano](/guide/integrations/osano)                                 |
+| `[integrations.permutive]`          | [Permutive](/guide/integrations/permutive)                         |
+| `[integrations.prebid]`             | [Prebid](/guide/integrations/prebid)                               |
+| `[integrations.sourcepoint]`        | [Sourcepoint](/guide/integrations/sourcepoint)                     |
+| `[integrations.testlight]`          | [Testlight](/guide/integrations/testlight)                         |
 
 ### Common Fields
 
@@ -1594,6 +1595,32 @@ See [GPT](/guide/integrations/gpt).
 The only field is `enabled`, a Boolean that defaults to `false`. When enabled,
 the standalone diagnostics tag is available, but individual browser sessions
 still require the activation flow in [GPT diagnostics](/guide/integrations/gpt-diagnostics).
+
+### JS Asset Proxy Integration
+
+**Section**: `[integrations.js_asset_proxy]`
+
+Serves explicitly configured third-party JavaScript assets from first-party
+paths. Each asset maps one exact publisher-facing path to one exact HTTPS
+upstream URL and can independently enable proxying, disable proxying, or block
+matching script tags in publisher HTML. There is no dedicated integration
+guide; the registered routes appear in the
+[API reference](/guide/api-reference#integration-endpoints).
+
+| Field               | Type    | Default | Contract                                      |
+| ------------------- | ------- | ------- | --------------------------------------------- |
+| `enabled`           | Boolean | `false` | Enable asset proxying and HTML rewriting      |
+| `cache_ttl_seconds` | Integer | None    | Optional downstream cache TTL for every asset |
+| `assets`            | Array   | `[]`    | Asset mappings; required when enabled         |
+
+Each `[[integrations.js_asset_proxy.assets]]` entry:
+
+| Field               | Type    | Default   | Contract                                                  |
+| ------------------- | ------- | --------- | --------------------------------------------------------- |
+| `path`              | String  | Required  | Exact first-party request path served by Trusted Server   |
+| `origin_url`        | String  | Required  | Exact upstream JavaScript URL fetched and match-rewritten |
+| `proxy`             | String  | `enabled` | `enabled`, `disabled`, or `blocked` (removes script tags) |
+| `cache_ttl_seconds` | Integer | None      | Optional per-asset downstream cache TTL override          |
 
 ### lockr Integration
 
