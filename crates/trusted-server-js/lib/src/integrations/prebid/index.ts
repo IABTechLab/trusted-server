@@ -1964,7 +1964,7 @@ function clearPrebidEidsCookie(): void {
  * (e.g. `GET /_ts/page-bids`) and for backend ingestion at response finalize.
  */
 function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
-  let payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
+  const payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
   const droppedSources = new Set<string>();
 
   while (payload.length > 0) {
