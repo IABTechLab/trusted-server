@@ -18,16 +18,16 @@ Route only partner-approved bidder endpoints through Fabric. Keep the approved N
 
 For each bidder and PBS region, record:
 
-| Decision | Required evidence |
-| --- | --- |
-| Participation | Partner name, responder gateway ID or public endpoint, AWS account owner, and acceptance owner |
-| Link type | Standard internal link or outbound external link, with the selected region |
-| PBS binding | Pinned PBS Go release, adapter endpoint field, config source, rollout owner, and link URL update procedure |
-| Capacity | Peak transactions per second, bidder timeout, payload sizes, burst duration, and regional failover load |
-| Fallback | Behavior while a link is requested, inactive, over quota, timing out, or unavailable |
-| Operations | Link creation, partner acceptance, status checks, endpoint changes, deletion order, alerts, and recovery owner |
-| Cost | Region, monthly sent transactions, payload distribution, no-bid volume, link count, external traffic, and estimate date |
-| Privacy and security | OpenRTB fields, TLS mode, source-IP requirements, data residency, logging, and retention |
+| Decision             | Required evidence                                                                                                       |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Participation        | Partner name, responder gateway ID or public endpoint, AWS account owner, and acceptance owner                          |
+| Link type            | Standard internal link or outbound external link, with the selected region                                              |
+| PBS binding          | Pinned PBS Go release, adapter endpoint field, config source, rollout owner, and link URL update procedure              |
+| Capacity             | Peak transactions per second, bidder timeout, payload sizes, burst duration, and regional failover load                 |
+| Fallback             | Behavior while a link is requested, inactive, over quota, timing out, or unavailable                                    |
+| Operations           | Link creation, partner acceptance, status checks, endpoint changes, deletion order, alerts, and recovery owner          |
+| Cost                 | Region, monthly sent transactions, payload distribution, no-bid volume, link count, external traffic, and estimate date |
+| Privacy and security | OpenRTB fields, TLS mode, source-IP requirements, data residency, logging, and retention                                |
 
 Gateway IDs, link state, quota increases, and partner acceptance are external facts. Ask before authenticated AWS inspection, naming the account, role, regions, and read scope. Do not treat a partner's willingness to participate as proof that its gateway, endpoint, adapter, or regional capacity is ready.
 

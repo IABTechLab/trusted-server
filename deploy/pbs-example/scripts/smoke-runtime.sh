@@ -16,7 +16,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Smoke always uses loopback and checked-in dummy inputs, never inherited selectors.
+export PBS_BIND_ADDRESS="127.0.0.1"
 export PBS_HOST_PORT="$host_port"
+export PBS_CONFIG_FILE="$example_dir/runtime/pbs.yaml"
+export PBS_SECRET_ENV_FILE="$example_dir/runtime/examples/pbs-secrets.env"
 "${compose[@]}" up --detach
 
 for _ in $(seq 1 30); do

@@ -26,6 +26,9 @@ pub(super) trait Aws {
 
 pub(super) struct AwsCli;
 
+/// Provider output is withheld, so a rejected write cannot be distinguished from a lost response.
+pub(super) const WRITE_NOT_CONFIRMED: &str = "write not confirmed; outcome may be uncertain; retain the request token and reuse it only for the original identical payload; use a new token for separately intended changed values";
+
 impl Aws for AwsCli {
     fn call(
         &self,
@@ -76,7 +79,7 @@ impl Aws for AwsCli {
         drop(payload);
         if !output.status.success() {
             let message = if operation == "put-secret-value" {
-                "write outcome uncertain; retain the request token and retry identical input"
+                WRITE_NOT_CONFIRMED
             } else {
                 operation
             };
@@ -84,7 +87,7 @@ impl Aws for AwsCli {
         }
         serde_json::from_slice(&output.stdout).map_err(|_| {
             let message = if operation == "put-secret-value" {
-                "write response invalid; outcome uncertain, retain the request token"
+                WRITE_NOT_CONFIRMED
             } else {
                 "invalid JSON response"
             };

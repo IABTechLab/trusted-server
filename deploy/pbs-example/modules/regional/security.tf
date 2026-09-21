@@ -3,29 +3,29 @@ resource "aws_security_group" "alb" {
   description = "HTTPS ingress for the regional PBS ALB"
   vpc_id      = aws_vpc.main.id
 
-  dynamic "ingress" {
-    for_each = var.trusted_server_cidr_blocks
-
-    content {
-      description = "Trusted Server HTTPS"
-      from_port   = 443
-      to_port     = 443
-      protocol    = "tcp"
-      cidr_blocks = [ingress.value]
-    }
-  }
-
-  egress {
-    description = "Forward requests to private PBS hosts"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   tags = merge(var.tags, {
     Name = "${var.name}-alb"
   })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "trusted_server_https" {
+  for_each = var.trusted_server_cidr_blocks
+
+  description       = "Trusted Server HTTPS"
+  security_group_id = aws_security_group.alb.id
+  cidr_ipv4         = each.value
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_egress_rule" "alb_to_pbs" {
+  description                  = "Forward requests to private PBS hosts"
+  security_group_id            = aws_security_group.alb.id
+  referenced_security_group_id = aws_security_group.pbs.id
+  from_port                    = var.pbs_port
+  to_port                      = var.pbs_port
+  ip_protocol                  = "tcp"
 }
 
 resource "aws_security_group" "pbs" {

@@ -272,7 +272,9 @@ fn pinned_image(value: &str) -> bool {
                 && !image.contains('@')
                 && !image.chars().any(char::is_whitespace)
                 && digest.len() == 64
-                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         })
 }
 
@@ -434,6 +436,21 @@ pub(super) mod tests {
         fs::write(dir.path().join("bindings.json"), bindings.to_string())
             .expect("should write bindings");
         (dir, path)
+    }
+
+    #[test]
+    fn pinned_image_requires_lowercase_sha256_hex() {
+        let image = |digest: &str| format!("registry.example.com/pbs@sha256:{digest}");
+        assert!(pinned_image(&image(&"0123456789abcdef".repeat(4))));
+        for uppercase in 'A'..='F' {
+            assert!(!pinned_image(&image(&format!(
+                "{}{uppercase}",
+                "a".repeat(63)
+            ))));
+        }
+        for digest in ["a".repeat(63), "a".repeat(65), "g".repeat(64)] {
+            assert!(!pinned_image(&image(&digest)));
+        }
     }
 
     #[test]

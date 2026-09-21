@@ -2,7 +2,7 @@
 
 `ts prebid server` manages local configuration inputs and a small set of AWS operations for self-hosted Prebid Server Go. It sits beside `ts prebid client`, which builds browser JavaScript, and remains separate from the existing Trusted Server `ts config` and `ts deploy` commands.
 
-The namespace is experimental and is being evaluated in PR review. There is no separate binary or crate.
+The namespace is experimental; its interface may change without a deprecation cycle. There is no separate binary or crate.
 
 ## Build and try locally
 
@@ -19,12 +19,12 @@ On macOS use `build_cli_macos` and `run_cli_macos`. The examples contain fiction
 
 ## Commands and current limits
 
-| Command                                                             | What it does                                                                                                        | Access                        |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| Command                                                                       | What it does                                                                                                                         | Access                        |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------- |
 | `ts prebid server inspect --config <file>`                                    | Reports routed Prebid Server providers and bidders separately from browser Prebid fields; host-secret requirements remain unresolved | Local read-only               |
-| `ts prebid server check --deployment <file>`                                  | Validates schema, targets, binding metadata, and regional YAML merging                                              | Local read-only               |
-| `ts prebid server secrets set <bidder> --deployment <file> --region <region>` | Writes a complete JSON value to an existing, declared Secrets Manager secret after identity and confirmation checks | AWS reads and one value write |
-| `ts prebid server status --deployment <file>`                                 | Reports EC2 instance state and infrastructure health for the explicitly listed instances                            | AWS reads                     |
+| `ts prebid server check --deployment <file>`                                  | Validates schema, targets, binding metadata, and regional YAML merging                                                               | Local read-only               |
+| `ts prebid server secrets set <bidder> --deployment <file> --region <region>` | Writes a complete JSON value to an existing, declared Secrets Manager secret after identity and confirmation checks                  | AWS reads and one value write |
+| `ts prebid server status --deployment <file>`                                 | Reports EC2 instance state and infrastructure health for the explicitly listed instances                                             | AWS reads                     |
 
 Add `--json` anywhere under `ts prebid server` for a machine-readable report. Errors and operator notices go to stderr; failures exit with code 2. A partial status report still appears on stdout, with `complete: false` and exit code 2.
 
@@ -88,7 +88,7 @@ File and stdin inputs are mutually exclusive. `--stdin` requires `--yes` and `--
 
 Secret values never enter command arguments or reports. The AWS CLI receives JSON through a tool-owned temporary file, owner-only on Unix, which is removed on normal success and error paths. Operator-provided input files are not changed or deleted. Run on a trusted host with protected temporary storage; abrupt process termination can leave temporary files requiring cleanup. Windows temporary-file ACL behavior has not been validated.
 
-A successful write reports its version identifier. It does not create secret metadata, change infrastructure, replace containers, or rotate the bidder's credential. Check regional replication, separately replace consumers, and verify them before revoking old partner credentials. A lost/malformed response leaves the write outcome uncertain; retain the displayed request token and retry identical input rather than creating another logical update.
+A successful write reports its version identifier. It does not create secret metadata, change infrastructure, replace containers, or rotate the bidder's credential. Check regional replication, separately replace consumers, and verify them before revoking old partner credentials. A failed or unverifiable response means the write is not confirmed; the outcome may be uncertain. Retain the displayed request token and reuse it only for the original identical payload. Use a new token only for separately intended changed values. Provider error details are withheld, so the CLI cannot distinguish a rejected write from a lost response.
 
 ## Ownership and sandbox compatibility
 

@@ -157,7 +157,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             PrebidCommand::Server(args) => pbs::run(&args)
                 .map(|()| RunOutcome::Success)
                 .map_err(|error| error.current_context().to_string()),
-        }
+        },
         Command::Provision(args) => {
             edgezero_cli::run_provision(&args).map(|()| RunOutcome::Success)
         }
@@ -188,6 +188,25 @@ mod tests {
             err.kind(),
             clap::error::ErrorKind::DisplayVersion,
             "should print the version rather than fail to parse"
+        );
+    }
+
+    #[test]
+    fn prebid_rejects_retired_bundle_command() {
+        let error = Args::try_parse_from(["ts", "prebid", "bundle"])
+            .expect_err("should reject intentionally retired bundle spelling");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn prebid_server_secret_help_explains_descriptor_relative_paths() {
+        let error = Args::try_parse_from(["ts", "prebid", "server", "secrets", "set", "--help"])
+            .expect_err("should display secret help");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            error
+                .to_string()
+                .contains("Deployment descriptor; paths inside it are relative to this file")
         );
     }
 

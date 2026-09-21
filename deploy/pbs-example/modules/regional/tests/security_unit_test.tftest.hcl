@@ -20,6 +20,54 @@ mock_provider "aws" {
   }
 }
 
+override_resource {
+  target          = aws_subnet.public["us-east-1a"]
+  override_during = plan
+  values = {
+    id = "subnet-00000000000000001"
+  }
+}
+
+override_resource {
+  target          = aws_subnet.public["us-east-1b"]
+  override_during = plan
+  values = {
+    id = "subnet-00000000000000002"
+  }
+}
+
+override_resource {
+  target          = aws_subnet.private["us-east-1a"]
+  override_during = plan
+  values = {
+    id = "subnet-00000000000000003"
+  }
+}
+
+override_resource {
+  target          = aws_subnet.private["us-east-1b"]
+  override_during = plan
+  values = {
+    id = "subnet-00000000000000004"
+  }
+}
+
+override_resource {
+  target          = aws_security_group.alb
+  override_during = plan
+  values = {
+    id = "sg-00000000000000001"
+  }
+}
+
+override_resource {
+  target          = aws_security_group.pbs
+  override_during = plan
+  values = {
+    id = "sg-00000000000000002"
+  }
+}
+
 variables {
   alarm_actions              = []
   ami_id                     = "ami-0123456789abcdef0"
@@ -45,17 +93,64 @@ run "plans_private_hosts_and_scoped_ingress" {
     error_message = "PBS hosts should not receive public IP addresses."
   }
 
+  # Explicit instance paths keep Terraform 1.16.2 failure diagnostics from serializing
+  # the whole instance map, which contains provider-marked sensitive attributes.
   assert {
-    condition     = length(aws_security_group.alb.ingress) == length(var.trusted_server_cidr_blocks)
+    condition = alltrue([
+      aws_instance.pbs["us-east-1a"].metadata_options[0].http_tokens == "required",
+      aws_instance.pbs["us-east-1b"].metadata_options[0].http_tokens == "required",
+    ])
+    error_message = "PBS hosts should require IMDSv2 session tokens."
+  }
+
+  assert {
+    condition = alltrue([
+      aws_instance.pbs["us-east-1a"].root_block_device[0].encrypted,
+      aws_instance.pbs["us-east-1b"].root_block_device[0].encrypted,
+    ])
+    error_message = "PBS host root volumes should be encrypted."
+  }
+
+  assert {
+    condition = alltrue([
+      aws_instance.pbs["us-east-1a"].subnet_id == aws_subnet.private["us-east-1a"].id,
+      aws_instance.pbs["us-east-1b"].subnet_id == aws_subnet.private["us-east-1b"].id,
+    ])
+    error_message = "PBS hosts should launch in the private subnet of their own AZ."
+  }
+
+  assert {
+    condition     = aws_lb_listener.https.ssl_policy == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    error_message = "The ALB listener should pin the TLS 1.3/1.2 policy."
+  }
+
+  assert {
+    condition = (
+      aws_vpc_security_group_egress_rule.alb_to_pbs.security_group_id == aws_security_group.alb.id &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.referenced_security_group_id == aws_security_group.pbs.id &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.ip_protocol == "tcp" &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.from_port == var.pbs_port &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.to_port == var.pbs_port &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.cidr_ipv4 == null &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.cidr_ipv6 == null &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.prefix_list_id == null
+    )
+    error_message = "ALB outbound traffic should reach only the PBS security group on the PBS TCP port."
+  }
+
+  assert {
+    condition     = length(aws_vpc_security_group_ingress_rule.trusted_server_https) == length(var.trusted_server_cidr_blocks)
     error_message = "The ALB should have one ingress rule for each approved caller CIDR."
   }
 
   assert {
     condition = alltrue([
-      for rule in aws_security_group.alb.ingress :
-      length(rule.cidr_blocks) == 1 && contains(var.trusted_server_cidr_blocks, one(rule.cidr_blocks))
+      for cidr, rule in aws_vpc_security_group_ingress_rule.trusted_server_https :
+      rule.security_group_id == aws_security_group.alb.id &&
+      rule.cidr_ipv4 == cidr && contains(var.trusted_server_cidr_blocks, cidr) &&
+      rule.ip_protocol == "tcp" && rule.from_port == 443 && rule.to_port == 443
     ])
-    error_message = "Every ALB ingress rule should use an approved caller CIDR."
+    error_message = "Every ALB ingress rule should permit only HTTPS from its approved caller CIDR."
   }
 
   assert {

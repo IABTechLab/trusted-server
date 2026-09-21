@@ -17,16 +17,16 @@ Use EKS only when the user's existing platform or an explicit requirement justif
 
 ## Network, ingress, and egress
 
-| Need                                    | Candidate services or mechanism                         | Required evidence                                                                                       |
-| --------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Public HTTPS on standalone hosts        | Public subnet, internet gateway, Elastic IP, Caddy      | Accepted exposure, durable certificate storage, renewal and replacement path                            |
-| Managed HTTPS with multiple backends    | ALB and ACM                                             | Certificate ownership/validation, target health, draining, timeout budget, private management endpoints |
-| Private compute reaching public bidders | NAT-based egress or an approved existing egress service | AZ failure behavior, routing, hourly/data charges, and outbound address stability                       |
+| Need                                    | Candidate services or mechanism                                          | Required evidence                                                                                                                 |
+| --------------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| Public HTTPS on standalone hosts        | Public subnet, internet gateway, Elastic IP, Caddy                       | Accepted exposure, durable certificate storage, renewal and replacement path                                                      |
+| Managed HTTPS with multiple backends    | ALB and ACM                                                              | Certificate ownership/validation, target health, draining, timeout budget, private management endpoints                           |
+| Private compute reaching public bidders | NAT-based egress or an approved existing egress service                  | AZ failure behavior, routing, hourly/data charges, and outbound address stability                                                 |
 | Private PBS-to-bidder connectivity      | AWS RTB Fabric requester gateway and standard or outbound external links | Partner participation, gateway and link ownership, regional support, quotas, bidder endpoint mapping, timeout, fallback, and cost |
-| Bidder source-IP allowlists             | Stable egress IPs                                       | Every normal, scaling, and failover path uses partner-approved addresses                                |
-| Existing caller selects regions         | Regional hostnames                                      | Caller routing and failure policy, TLS, identity behavior                                               |
-| DNS-based regional selection            | Route 53 latency records with per-region health checks  | Independent health targets, cached-answer behavior, all-unhealthy behavior, and failover capacity       |
-| Public auctions from untrusted callers  | Existing controls or WAF with compatible ingress        | Auction payload compatibility, rate limits, false-positive testing, cost, and owner                     |
+| Bidder source-IP allowlists             | Stable egress IPs                                                        | Every normal, scaling, and failover path uses partner-approved addresses                                                          |
+| Existing caller selects regions         | Regional hostnames                                                       | Caller routing and failure policy, TLS, identity behavior                                                                         |
+| DNS-based regional selection            | Route 53 latency records with per-region health checks                   | Independent health targets, cached-answer behavior, all-unhealthy behavior, and failover capacity                                 |
+| Public auctions from untrusted callers  | Existing controls or WAF with compatible ingress                         | Auction payload compatibility, rate limits, false-positive testing, cost, and owner                                               |
 
 Private subnets do not provide internet egress by themselves. VPC endpoints may serve supported AWS APIs but do not replace bidder internet access. Public addressing on replaceable compute does not by itself provide stable egress for allowlists.
 

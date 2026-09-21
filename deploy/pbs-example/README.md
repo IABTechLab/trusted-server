@@ -41,10 +41,13 @@ docker compose \
   --env-file deploy/pbs-example/runtime/examples/compose.env \
   -f deploy/pbs-example/runtime/compose.yaml \
   config --quiet
-deploy/pbs-example/scripts/smoke-runtime.sh
+bash -n deploy/pbs-example/scripts/smoke-runtime.sh
+deploy/pbs-example/scripts/test-smoke-runtime.py
 ```
 
-The Terraform tests use mocked AWS providers and explicit plan mode. The deployment descriptor and binding file contain fictional identifiers for local validation only. The smoke check pulls and starts the pinned image with dummy values, checks `/status` and startup-log redaction, and sends no auction request.
+The Terraform tests use mocked AWS providers and explicit plan mode. The deployment descriptor and binding file contain fictional identifiers for local validation only. The wiring test renders Compose JSON and exercises the smoke script with fake lifecycle and health commands. It verifies the deployment all-interface binding, smoke-only loopback binding, and forced dummy input selectors without starting containers.
+
+A separately approved `deploy/pbs-example/scripts/smoke-runtime.sh` run pulls and starts the pinned image with dummy values on loopback, checks `/status` and startup-log redaction, and sends no auction request. Static rendering and fake-command checks are not runtime startup evidence.
 
 ## Adapting the example
 

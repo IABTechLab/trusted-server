@@ -28,7 +28,7 @@ terraform -chdir=deploy/pbs-example/modules/regional test \
   -filter=tests/security_unit_test.tftest.hcl
 ```
 
-`init -backend=false` downloads the locked provider but does not access the configured local state or AWS. Both selected test files use mocked AWS providers and explicit plan commands. Confirm that the root file runs five tests and the module file runs two tests. `validate` and mocked tests do not prove AWS permissions, quotas, AMI existence, certificates, subnet availability, or capacity.
+`init -backend=false` downloads the locked provider but does not access the configured local state or AWS. Both selected test files use mocked AWS providers and explicit plan commands. Confirm that the root file runs five tests and the module file runs two tests. Regional assertions cover IMDSv2, encrypted root volumes, private subnet/AZ placement, the TLS policy, scoped ALB ingress/egress, alarms, and secret access. `validate` and mocked tests do not prove AWS permissions, quotas, AMI existence, certificates, subnet availability, or capacity.
 
 Check the PBS descriptor without AWS access:
 
@@ -51,15 +51,24 @@ docker compose \
 
 Expected result: Compose renders successfully without pulling or starting the image. The dummy environment file is not a credential.
 
-Validate the JSON input and start the pinned PBS image against the nonsecret baseline:
+Validate the JSON input and smoke command wiring without starting containers:
 
 ```bash
 python3 -m json.tool \
   deploy/pbs-example/runtime/secret-bindings.example.json >/dev/null
+bash -n deploy/pbs-example/scripts/smoke-runtime.sh
+deploy/pbs-example/scripts/test-smoke-runtime.py
+```
+
+The wiring test requires Python 3 and Docker Compose. It renders production and smoke configurations, uses fake Docker lifecycle and curl commands, and checks that inherited selectors cannot replace the dummy inputs. It does not pull images, start PBS, or prove runtime health.
+
+### Separately approved local runtime smoke
+
+```bash
 deploy/pbs-example/scripts/smoke-runtime.sh
 ```
 
-The smoke script pulls the pinned image if needed, starts it with dummy values on local port `18080`, requires `/status` to return `ok`, rejects either dummy credential appearing in startup logs, and removes its container and network on exit. It sends no auction request and contacts no bidder. Set `PBS_SMOKE_PORT` only when port `18080` is unavailable.
+The smoke script pulls the pinned image if needed, starts it with dummy values bound only to `127.0.0.1:18080`, requires `/status` to return `ok`, rejects either dummy credential appearing in startup logs, and removes its container and network on exit. It sends no auction request and contacts no bidder. Set `PBS_SMOKE_PORT` only when port `18080` is unavailable. The script forces the checked-in baseline and dummy secret file regardless of inherited `PBS_CONFIG_FILE` or `PBS_SECRET_ENV_FILE` values. Shared deployment Compose still binds all host interfaces so the ALB can reach PBS; the PBS security group restricts ingress.
 
 ## Authorized Terraform workflow
 
@@ -111,7 +120,7 @@ Inputs: an approved profile, the exact descriptor, one complete JSON payload, a 
 
 Output: a nonsecret Secrets Manager version identifier and the target region. The command does not deploy PBS, refresh Compose, or prove bidder authorization.
 
-Failure behavior: preserve the retry UUID and input file. If the result is uncertain, retry the identical logical write rather than creating a new version. On partial regional success, record each region separately.
+Failure behavior: preserve the retry UUID and input file. A failed or unverifiable response means the write is not confirmed and its outcome may be uncertain. Reuse the token only for the original identical payload; use a new token only for separately intended changed values. Withheld provider errors prevent distinguishing a rejected write from a lost response. On partial regional success, record each region separately.
 
 ## Runtime release and rollback
 

@@ -65,6 +65,8 @@ pub(crate) enum PbsError {
     Input(&'static str),
     #[display("PBS I/O failed: {_0}")]
     Io(&'static str),
+    #[display("PBS I/O failed: cannot open input file {path:?}")]
+    InputFile { path: PathBuf },
     #[display("AWS operation failed: {_0}; provider output withheld")]
     Aws(&'static str),
     #[display("AWS account does not match the deployment descriptor; no further calls made")]
@@ -147,7 +149,11 @@ pub(crate) fn run(args: &PbsArgs) -> Result<()> {
 /// # Errors
 /// Returns an I/O error or rejects oversized/non-UTF-8 input.
 pub(super) fn read_text(path: &Path, limit: usize) -> Result<String> {
-    let file = File::open(path).map_err(|_| Report::new(PbsError::Io("cannot open input file")))?;
+    let file = File::open(path).map_err(|_| {
+        Report::new(PbsError::InputFile {
+            path: path.to_path_buf(),
+        })
+    })?;
     read_bounded(file, limit)
 }
 
@@ -239,6 +245,26 @@ impl Interaction for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_bounded_preserves_size_utf8_and_error_redaction_guards() {
+        assert_eq!(
+            read_bounded(&b"abcd"[..], 4).expect("should accept limit"),
+            "abcd"
+        );
+        for (input, limit) in [(&b"DUMMY_SECRET"[..], 4), (&b"\xffDUMMY_SECRET"[..], 64)] {
+            let error = read_bounded(input, limit).expect_err("should reject invalid input");
+            assert!(!format!("{error:?}").contains("DUMMY_SECRET"));
+        }
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("DUMMY_SECRET"))
+            }
+        }
+        let error = read_bounded(FailedRead, 4).expect_err("should reject read failure");
+        assert!(!format!("{error:?}").contains("DUMMY_SECRET"));
+    }
 
     #[test]
     fn confirmation_accepts_only_bounded_yes() {

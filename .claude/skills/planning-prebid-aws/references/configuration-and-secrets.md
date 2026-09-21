@@ -12,17 +12,17 @@ Before asking questions the repository can answer:
 4. Add observations to the existing deployment decision record with source path/key, candidate requirement, confidence/status, and the remaining question. Report credential identifiers or presence only; keep raw TOML, credential values, and commercially sensitive publisher values out of reports and generated examples.
 5. Verify candidate adapters against the selected PBS Go release and confirm partner authorization. Record each host-secret requirement as required, not needed, or unresolved. A bidder name alone proves neither a secret requirement nor permission to use the bidder.
 
-| Trusted Server input                                              | Discovery use                                                                                        |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `auction.enabled`                                                 | Determine active versus disabled server-auction intent without expanding defaults                    |
-| `auction.providers.<id>` with `profile = "prebid-server"`         | Identify each configured PBS provider; withhold endpoint values                                      |
-| Provider `timeout_ms` and `profile_config.test_mode` or `debug`    | Record explicit timeout and diagnostic intent, not permission to contact bidders                      |
-| Provider `profile_config.bid_param_override_rules`                 | Count conditional publisher or placement inputs without reporting their values                       |
-| `auction.bidders.<bidder>.provider`                                | Group candidate server-side adapters under the referenced PBS provider                               |
-| `integrations.prebid.enabled`, `account_id`, `timeout_ms`, `debug` | Record browser integration intent and compatibility questions separately from server demand          |
-| `integrations.prebid.client_side_bidders`                          | Browser-side participation; do not automatically enable these adapters in PBS                        |
-| `integrations.prebid.bundle`                                      | Browser bundle and identity capabilities, not proof of server-side use                               |
-| Relevant privacy, format, and stored-request settings             | Identify dependencies that need confirmation from the caller or request path                         |
+| Trusted Server input                                               | Discovery use                                                                               |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `auction.enabled`                                                  | Determine active versus disabled server-auction intent without expanding defaults           |
+| `auction.providers.<id>` with `profile = "prebid-server"`          | Identify each configured PBS provider; withhold endpoint values                             |
+| Provider `timeout_ms` and `profile_config.test_mode` or `debug`    | Record explicit timeout and diagnostic intent, not permission to contact bidders            |
+| Provider `profile_config.bid_param_override_rules`                 | Count conditional publisher or placement inputs without reporting their values              |
+| `auction.bidders.<bidder>.provider`                                | Group candidate server-side adapters under the referenced PBS provider                      |
+| `integrations.prebid.enabled`, `account_id`, `timeout_ms`, `debug` | Record browser integration intent and compatibility questions separately from server demand |
+| `integrations.prebid.client_side_bidders`                          | Browser-side participation; do not automatically enable these adapters in PBS               |
+| `integrations.prebid.bundle`                                       | Browser bundle and identity capabilities, not proof of server-side use                      |
+| Relevant privacy, format, and stored-request settings              | Identify dependencies that need confirmation from the caller or request path                |
 
 Use `ts prebid server inspect --config <selected-path>` for redacted local discovery. It reports explicit values without expanding defaults or proving host-secret requirements. Resolve schema defaults and adapter metadata separately, recording unsupported details as unresolved rather than fetching credentials or inventing mappings. Read config without invoking commands that publish or rewrite it. Leave `trusted-server.toml` unchanged. Propose caller endpoint/account changes separately after integration approval; discovery must not activate bidders, publish configuration, or change traffic.
 
@@ -75,8 +75,8 @@ Never package or log secret values. Treat container inspection and debug output 
 
 Use `ts prebid server` instead of generating deployment-local wrappers for these implemented operations. Keep existing `ts config`, `ts deploy`, and `ts prebid client` behavior unchanged.
 
-| Command                                                             | Current result and boundary                                                                                                                                     |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Command                                                                       | Current result and boundary                                                                                                                                     |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ts prebid server inspect --config <path>`                                    | Local discovery with unresolved requirements; no source changes or secret retrieval                                                                             |
 | `ts prebid server check --deployment <path>`                                  | Local schema, binding, and regional merge checks; no AWS calls, upstream PBS schema validation, or startup proof                                                |
 | `ts prebid server secrets set <bidder> --deployment <path> --region <region>` | Authorized complete-value write to an existing declared secret; hidden terminal or file/stdin input, account/confirmation checks, and retry UUID; no deployment |

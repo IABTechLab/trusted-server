@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::aws::{Aws, verify_identity};
+use super::aws::{Aws, WRITE_NOT_CONFIRMED, verify_identity};
 use super::config::{Binding, Deployment, invalid};
 use super::{Interaction, Output, PbsError, Result, read_bounded, read_text};
 
@@ -20,8 +20,9 @@ const MAX_SECRET_BYTES: usize = 65_536;
 pub(super) struct SetArgs {
     /// Bidder identifier declared in the binding file.
     bidder: String,
+    /// Deployment descriptor; paths inside it are relative to this file.
     #[arg(long)]
-    pub deployment: PathBuf,
+    pub(super) deployment: PathBuf,
     /// Exactly one declared region; replicas cannot be written independently.
     #[arg(long)]
     region: String,
@@ -180,9 +181,7 @@ pub(super) fn set(
     if response.get("ARN").and_then(Value::as_str) != Some(arn.as_str())
         || response.get("VersionId").and_then(Value::as_str) != Some(token.as_str())
     {
-        return Err(Report::new(PbsError::Aws(
-            "write response could not be verified; outcome uncertain, retain the request token",
-        )));
+        return Err(Report::new(PbsError::Aws(WRITE_NOT_CONFIRMED)));
     }
     Ok(Output {
         failure: None,

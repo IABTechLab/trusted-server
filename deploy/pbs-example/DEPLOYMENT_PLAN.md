@@ -4,23 +4,23 @@ Status: draft generated files, locally checked after validation. This directory 
 
 ## Decision record
 
-| Requirement | Value | Status | Evidence or decision owner | Blocks |
-| --- | --- | --- | --- | --- |
-| Purpose | Production-shaped architecture example, not a live deployment | Confirmed | User approval | None |
-| Caller | Trusted Server | Confirmed | User | Caller egress ranges remain required |
-| Regions | `us-east-1` and `us-west-2` | Confirmed | User | Account-specific AZ selection remains unresolved |
-| Regional topology | Two AZs, one PBS EC2 host per AZ | Confirmed | User | AMIs and subnets remain required |
-| Total PBS hosts | Four | Confirmed | Derived from topology | Capacity remains unmeasured |
-| Runtime | EC2 with Docker Compose | Confirmed | User | Release and secret injection are deferred implementation work |
-| Regional ingress | Public HTTPS ALB | Confirmed | User | ACM certificate ARNs and caller CIDRs required |
-| Global routing | Route 53 latency aliases with ALB health evaluation | Proposed | Architecture decision | Existing hosted-zone ID required |
-| WAF | Not included in this demo | Confirmed | User | Abuse controls remain outside this example |
-| Terraform state | Local backend | Confirmed | User | No team locking or remote recovery |
-| PBS release | Go v4.7.0, digest pinned | Proposed and verified | PBS release and Docker metadata checked during generation | Recheck before any future use |
-| Workload | 200 global peak auctions/s, 4 bidders, 1.5 s caller timeout, 1 s PBS timeout | Proposed example assumption | Planning assumption | No capacity claim until load tested |
-| Secrets | Independent regional Secrets Manager metadata and EC2 read policy; values written separately | Confirmed | User and repository CLI contract | Real bidder mapping, authorization, and runtime injection required |
-| Trusted Server config | No authoritative `trusted-server.toml` exists in this checkout | Confirmed | Repository inspection | Caller behavior remains an external input |
-| Deployment directory | `deploy/pbs-example/` | Confirmed | User | None |
+| Requirement           | Value                                                                                        | Status                      | Evidence or decision owner                                | Blocks                                                             |
+| --------------------- | -------------------------------------------------------------------------------------------- | --------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------ |
+| Purpose               | Production-shaped architecture example, not a live deployment                                | Confirmed                   | User approval                                             | None                                                               |
+| Caller                | Trusted Server                                                                               | Confirmed                   | User                                                      | Caller egress ranges remain required                               |
+| Regions               | `us-east-1` and `us-west-2`                                                                  | Confirmed                   | User                                                      | Account-specific AZ selection remains unresolved                   |
+| Regional topology     | Two AZs, one PBS EC2 host per AZ                                                             | Confirmed                   | User                                                      | AMIs and subnets remain required                                   |
+| Total PBS hosts       | Four                                                                                         | Confirmed                   | Derived from topology                                     | Capacity remains unmeasured                                        |
+| Runtime               | EC2 with Docker Compose                                                                      | Confirmed                   | User                                                      | Release and secret injection are deferred implementation work      |
+| Regional ingress      | Public HTTPS ALB                                                                             | Confirmed                   | User                                                      | ACM certificate ARNs and caller CIDRs required                     |
+| Global routing        | Route 53 latency aliases with ALB health evaluation                                          | Proposed                    | Architecture decision                                     | Existing hosted-zone ID required                                   |
+| WAF                   | Not included in this demo                                                                    | Confirmed                   | User                                                      | Abuse controls remain outside this example                         |
+| Terraform state       | Local backend                                                                                | Confirmed                   | User                                                      | No team locking or remote recovery                                 |
+| PBS release           | Go v4.7.0, digest pinned                                                                     | Proposed and verified       | PBS release and Docker metadata checked during generation | Recheck before any future use                                      |
+| Workload              | 200 global peak auctions/s, 4 bidders, 1.5 s caller timeout, 1 s PBS timeout                 | Proposed example assumption | Planning assumption                                       | No capacity claim until load tested                                |
+| Secrets               | Independent regional Secrets Manager metadata and EC2 read policy; values written separately | Confirmed                   | User and repository CLI contract                          | Real bidder mapping, authorization, and runtime injection required |
+| Trusted Server config | No authoritative `trusted-server.toml` exists in this checkout                               | Confirmed                   | Repository inspection                                     | Caller behavior remains an external input                          |
+| Deployment directory  | `deploy/pbs-example/`                                                                        | Confirmed                   | User                                                      | None                                                               |
 
 ## Architecture
 
@@ -45,18 +45,18 @@ The EC2 AMIs are inputs rather than built by Terraform. They must contain the ap
 
 ## Services and ownership
 
-| Service or artifact | Action | Owner | Purpose |
-| --- | --- | --- | --- |
-| VPC, subnets, routes, IGW, NAT, security groups | Create | Terraform | Regional network and egress |
-| ALB, target group, HTTPS listener | Create | Terraform | Regional HTTPS ingress and health routing |
-| Route 53 records | Reuse zone, create records | Terraform | Latency-based regional selection |
-| EC2 instances and IAM profiles | Create | Terraform | Compose hosts and SSM access |
-| Secrets Manager secret metadata | Create | Terraform | One independently encrypted secret per region for the example bidder |
-| Secret values | External write | Authorized operator or automation | Credential lifecycle; never Terraform |
-| PBS YAML and Compose definition | Git-owned | Runtime owner | Nonsecret runtime contract |
-| Regional YAML merge and rendered file | Deferred runtime release owner | Deployment implementation | One resolved config per region |
-| PBS process lifecycle | Deferred runtime release owner | Deployment implementation | Start, replace, health, rollback |
-| Terraform state | Local operator | Terraform | Demo-only state; no shared locking |
+| Service or artifact                             | Action                         | Owner                             | Purpose                                                              |
+| ----------------------------------------------- | ------------------------------ | --------------------------------- | -------------------------------------------------------------------- |
+| VPC, subnets, routes, IGW, NAT, security groups | Create                         | Terraform                         | Regional network and egress                                          |
+| ALB, target group, HTTPS listener               | Create                         | Terraform                         | Regional HTTPS ingress and health routing                            |
+| Route 53 records                                | Reuse zone, create records     | Terraform                         | Latency-based regional selection                                     |
+| EC2 instances and IAM profiles                  | Create                         | Terraform                         | Compose hosts and SSM access                                         |
+| Secrets Manager secret metadata                 | Create                         | Terraform                         | One independently encrypted secret per region for the example bidder |
+| Secret values                                   | External write                 | Authorized operator or automation | Credential lifecycle; never Terraform                                |
+| PBS YAML and Compose definition                 | Git-owned                      | Runtime owner                     | Nonsecret runtime contract                                           |
+| Regional YAML merge and rendered file           | Deferred runtime release owner | Deployment implementation         | One resolved config per region                                       |
+| PBS process lifecycle                           | Deferred runtime release owner | Deployment implementation         | Start, replace, health, rollback                                     |
+| Terraform state                                 | Local operator                 | Terraform                         | Demo-only state; no shared locking                                   |
 
 ## Capacity assumptions
 
@@ -85,24 +85,32 @@ A controlled load test must measure CPU, memory, connection reuse, outbound band
 - Customer-managed KMS keys are regional inputs. East and West accept separate ARNs; null uses each region's Secrets Manager service key.
 - The committed descriptor and binding files are fictional local fixtures. After an authorized apply, Terraform renders ignored operator files containing the actual instance IDs and secret ARNs.
 
+## Deferred security and observability decisions
+
+ALB access logging is deliberately deferred. This example has no request-level ALB forensic record. Before production use, the platform owner must propose the log bucket, delivery permissions, encryption, access controls, and deletion lifecycle. The privacy owner must approve which request metadata may be retained, its retention period, and who may query it. The runtime owner must define incident retrieval and verify delivery. No log bucket or access-log policy is provisioned here.
+
+AWS API traffic, including SSM and Secrets Manager requests and any direct KMS requests, uses public service endpoints through each AZ's NAT gateway over TLS. Private hosts do not imply a private AWS API path. The platform and security owners must decide whether regional interface VPC endpoints are required, including endpoint policies, security groups, and private DNS. Compare endpoint hourly and data-processing charges against NAT charges and the required security boundary. Endpoints for AWS APIs would not replace public bidder egress; this example adds none.
+
+The AWS-managed `AmazonSSMManagedInstanceCore` attachment is the deliberate broad IAM exception. Its SSM agent permissions include `Resource: "*"`, unlike the inline policy scoped to declared bidder secret ARNs and the optional regional KMS key. The security owner must review the managed policy and its future updates before deployment. Do not describe the entire instance role as resource-scoped.
+
 ## Cost drivers
 
 No price estimate is claimed. The main drivers are four EC2 instances, four NAT gateways and their Elastic IPs, two ALBs, public IPv4 addresses, cross-AZ traffic if routing changes, CloudWatch alarms, Secrets Manager, Route 53 records, and bidder internet traffic. A current estimate requires selected regions, traffic volume, and current AWS pricing verification.
 
 ## Generated files and checks
 
-| Path | Consumer | Local check |
-| --- | --- | --- |
-| `README.md` | Example user | Safe walkthrough and stop boundary review |
-| `terraform.tf`, `providers.tf`, `variables.tf` | Terraform | Format and validate |
-| `main.tf`, `modules/regional/` | Terraform | Mocked plan tests for topology, provider mappings, ingress, and secret access |
-| `runtime/pbs.yaml`, `runtime/regions/` | PBS release process and CLI check | YAML parse and `ts prebid server check` |
-| `runtime/compose.yaml` | Deferred EC2 runtime owner | Compose rendering and pinned-image startup smoke |
-| `runtime/secret-bindings.example.json` | Existing PBS CLI | JSON parse and fictional deployment check |
-| `deployment.example.yaml` | Existing PBS CLI | Fictional local `ts prebid server check` only |
-| Terraform-rendered generated descriptor and bindings | Authorized operator | Review actual IDs, then CLI check and status |
-| `DEPLOYMENT_PLAN.md` | Reviewers | Diff and decision review |
-| `RUNBOOK.md` | Authorized operator | Procedure review; no cloud execution |
+| Path                                                 | Consumer                          | Local check                                                                                                                                                              |
+| ---------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `README.md`                                          | Example user                      | Safe walkthrough and stop boundary review                                                                                                                                |
+| `terraform.tf`, `providers.tf`, `variables.tf`       | Terraform                         | Format and validate                                                                                                                                                      |
+| `main.tf`, `modules/regional/`                       | Terraform                         | Mocked plan tests for topology, provider mappings, IMDSv2, encrypted root volumes, private subnet/AZ placement, TLS policy, scoped ALB ingress/egress, and secret access |
+| `runtime/pbs.yaml`, `runtime/regions/`               | PBS release process and CLI check | YAML parse and `ts prebid server check`                                                                                                                                  |
+| `runtime/compose.yaml`                               | Deferred EC2 runtime owner        | Compose rendering and fake-command smoke wiring; separately approved pinned-image startup smoke                                                                          |
+| `runtime/secret-bindings.example.json`               | Existing PBS CLI                  | JSON parse and fictional deployment check                                                                                                                                |
+| `deployment.example.yaml`                            | Existing PBS CLI                  | Fictional local `ts prebid server check` only                                                                                                                            |
+| Terraform-rendered generated descriptor and bindings | Authorized operator               | Review actual IDs, then CLI check and status                                                                                                                             |
+| `DEPLOYMENT_PLAN.md`                                 | Reviewers                         | Diff and decision review                                                                                                                                                 |
+| `RUNBOOK.md`                                         | Authorized operator               | Procedure review; no cloud execution                                                                                                                                     |
 
 ## Sources and verification
 

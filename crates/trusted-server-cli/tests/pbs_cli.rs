@@ -50,11 +50,18 @@ if 'get-caller-identity' in args:
 elif 'describe-secret' in args:
     print(json.dumps({'ARN': arn}))
 elif 'put-secret-value' in args:
-    if os.environ.get('PBS_FAKE_FAILURE') == 'yes':
-        print(request['SecretString'], file=sys.stderr)
+    failure = os.environ.get('PBS_FAKE_FAILURE')
+    if failure in ('collision', 'transport'):
+        error = 'ResourceExistsException' if failure == 'collision' else 'Connection reset by peer'
+        print(error + ': ' + request['SecretString'], file=sys.stderr)
         sys.exit(1)
     (root / 'captured_request.json').write_text(json.dumps(request))
-    print(json.dumps({'ARN': arn, 'VersionId': request['ClientRequestToken']}))
+    if failure == 'invalid-json':
+        print('invalid response ' + request['SecretString'])
+    elif failure == 'unverified':
+        print(json.dumps({'ARN': arn, 'VersionId': 'unexpected', 'SecretString': request['SecretString']}))
+    else:
+        print(json.dumps({'ARN': arn, 'VersionId': request['ClientRequestToken']}))
 elif 'describe-instance-status' in args:
     print(json.dumps({'InstanceStatuses': []}))
 else:
@@ -170,6 +177,75 @@ fn local_commands_never_execute_aws_and_preserve_the_source() {
 }
 
 #[test]
+fn missing_descriptor_inputs_report_escaped_paths() {
+    for missing in ["deployment.yaml", "pbs.yaml", "bindings.json", "east.yaml"] {
+        let dir = fixture();
+        let inputs = dir.path().join("inputs\n\t\u{1b}[31m\"\\");
+        fs::create_dir(&inputs).expect("should create nested input directory");
+        for name in ["deployment.yaml", "pbs.yaml", "bindings.json", "east.yaml"] {
+            if name != missing {
+                fs::copy(dir.path().join(name), inputs.join(name)).expect("should copy input");
+            }
+        }
+        let path = inputs.join(missing);
+        let output = command(dir.path())
+            .args(["prebid", "server", "check", "--deployment"])
+            .arg(inputs.join("deployment.yaml"))
+            .output()
+            .expect("should run CLI");
+        assert_missing_path(&output, &path);
+        assert!(!dir.path().join("calls").exists(), "should not call AWS");
+    }
+}
+
+#[test]
+fn missing_secret_input_reports_escaped_path_without_writing() {
+    let dir = fixture();
+    let path = dir.path().join("missing\n\t\u{1b}[31m\"\\secret.json");
+    let output = command(dir.path())
+        .args([
+            "prebid",
+            "server",
+            "secrets",
+            "set",
+            "examplebidder",
+            "--deployment",
+            "deployment.yaml",
+            "--region",
+            "us-east-1",
+            "--yes",
+            "--request-token",
+            TOKEN,
+            "--file",
+        ])
+        .arg(&path)
+        .output()
+        .expect("should run CLI");
+    assert_missing_path(&output, &path);
+    let calls = fs::read_to_string(dir.path().join("calls")).expect("should read calls");
+    assert!(!calls.contains("put-secret-value"));
+    assert_payload_cleanup(dir.path());
+}
+
+fn assert_missing_path(output: &Output, path: &Path) {
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("cannot open input file {path:?}")),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(&*path.to_string_lossy()),
+        "should escape control characters"
+    );
+    assert!(!stderr.contains("os error"));
+    assert!(!stderr.contains('\u{1b}'));
+    assert!(!stderr.contains('\t'));
+    assert_no_secret(output);
+}
+
+#[test]
 fn secret_payload_is_private_not_in_argv_and_deleted_after_use() {
     let dir = fixture();
     let input = json!({"api_key": "DUMMY_SECRET-$\"\nvalue"}).to_string();
@@ -214,23 +290,48 @@ fn secret_payload_is_private_not_in_argv_and_deleted_after_use() {
 
 #[test]
 fn aws_errors_never_forward_provider_stderr_and_cleanup_payloads() {
-    let dir = fixture();
-    fs::write(
-        dir.path().join("secret.json"),
-        "{\"api_key\":\"DUMMY_SECRET\"}",
-    )
-    .expect("should write fixture");
-    let output = secret_command(dir.path())
-        .env("PBS_FAKE_FAILURE", "yes")
-        .output()
-        .expect("should run CLI");
-    assert_eq!(output.status.code(), Some(2));
-    assert_no_secret(&output);
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("outcome uncertain"),
-        "should warn that the write may have succeeded"
-    );
-    assert_payload_cleanup(dir.path());
+    for failure in ["collision", "transport", "invalid-json", "unverified"] {
+        let dir = fixture();
+        let input = "{\"api_key\":\"DUMMY_SECRET\"}";
+        fs::write(dir.path().join("secret.json"), input).expect("should write fixture");
+        let output = secret_command(dir.path())
+            .env("PBS_FAKE_FAILURE", failure)
+            .output()
+            .expect("should run CLI");
+        assert_eq!(output.status.code(), Some(2));
+        assert_no_secret(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for guidance in [
+            "write not confirmed",
+            "uncertain",
+            "retain the request token",
+            "reuse it only for the original identical payload",
+            "new token for separately intended changed values",
+            "provider output withheld",
+            TOKEN,
+        ] {
+            assert!(
+                stderr.contains(guidance),
+                "{failure}: missing {guidance}: {stderr}"
+            );
+        }
+        assert!(!stderr.contains("ResourceExistsException"));
+        assert!(!stderr.contains("Connection reset by peer"));
+        assert!(!stderr.contains("unexpected"));
+        assert!(output.stdout.is_empty());
+        let calls = fs::read_to_string(dir.path().join("calls")).expect("should read calls");
+        assert_eq!(
+            calls.matches("put-secret-value").count(),
+            1,
+            "should not retry"
+        );
+        assert!(!calls.contains("DUMMY_SECRET"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("secret.json")).expect("should read input"),
+            input
+        );
+        assert_payload_cleanup(dir.path());
+    }
 }
 
 #[test]
