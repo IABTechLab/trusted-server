@@ -47,7 +47,69 @@ pub struct DeviceSignals {
     /// writes. Computed by the producing module: the built-in module uses a
     /// User-Agent-only heuristic, while the Fastly module strengthens it with
     /// the TLS and HTTP/2 signals.
+    ///
+    /// [`human_confidence`](Self::human_confidence) is the module's answer
+    /// about a person, which nothing gates on.
     pub looks_like_browser: bool,
+
+    /// How confident the device module is that a person is looking at the
+    /// page. A module that scores the request writes it, and every other
+    /// module leaves it `Unknown`.
+    ///
+    /// Unlike [`looks_like_browser`](Self::looks_like_browser) this is not a
+    /// guess about the shape of a header. It is the module's answer from the
+    /// evidence it weighs, such as whether the browser window was in view,
+    /// whether a web driver is present, how old the browser is, whether the
+    /// address carries people and what kind of connection it is. A declared
+    /// agent answers `Low` by name on the first request, and a person the
+    /// module cannot place answers `Unknown` rather than being guessed at.
+    pub human_confidence: HumanConfidence,
+}
+
+/// The confidence that a person is looking at the page.
+///
+/// The four answers a scoring device module can give, with `Unknown` kept
+/// apart from `Low` because a request alone cannot establish a person.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum HumanConfidence {
+    /// High confidence that a person is viewing the page.
+    High,
+
+    /// The evidence is mixed and the request cannot be placed either way. A
+    /// person may be viewing the page.
+    Medium,
+
+    /// Almost certainly no person is directly involved in viewing the content.
+    Low,
+
+    /// Not established. **This is not the same as `Low`.** It is the honest
+    /// answer before the client-side script has run, because whether the
+    /// window was in view cannot be known from the request alone, and
+    /// treating it as `Low` would call every first-time visitor a machine.
+    #[default]
+    Unknown,
+}
+
+impl HumanConfidence {
+    /// The answer as text.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "High",
+            Self::Medium => "Medium",
+            Self::Low => "Low",
+            Self::Unknown => "Unknown",
+        }
+    }
+
+    /// Whether this answer says a machine is almost certainly responsible.
+    ///
+    /// Only `Low` does. `Unknown` does not, which is the whole reason the two
+    /// are separate values.
+    #[must_use]
+    pub fn is_machine(self) -> bool {
+        matches!(self, Self::Low)
+    }
 }
 
 impl DeviceSignals {
@@ -77,6 +139,9 @@ impl DeviceSignals {
             h2_fp_hash: None,
             known_browser: None,
             looks_like_browser,
+            // Unknown until the client-side script has run, because whether
+            // the window was in view cannot be known from the request.
+            human_confidence: HumanConfidence::Unknown,
         }
     }
 
@@ -109,6 +174,8 @@ impl DeviceSignals {
             h2_fp_hash,
             known_browser,
             looks_like_browser,
+            // As above: the request alone cannot establish this.
+            human_confidence: HumanConfidence::Unknown,
         }
     }
 
@@ -794,6 +861,25 @@ mod tests {
                 "a non-browser client should fail the UA-only gate: {ua:?}"
             );
         }
+    }
+
+    /// A request alone cannot establish a person, so the signals read from
+    /// one say `Unknown`, which is not `Low`, and nothing calls a first-time
+    /// visitor a machine.
+    #[test]
+    fn a_request_alone_establishes_no_person() {
+        for signals in [
+            DeviceSignals::derive_ua_only(CHROME_MAC_UA),
+            DeviceSignals::derive_ua_only("curl/8.0"),
+            DeviceSignals::derive(CHROME_MAC_UA, Some("t13d1516h2"), Some("abc123def456")),
+            DeviceSignals::derive("curl/8.0", None, None),
+            DeviceSignals::unknown(),
+        ] {
+            assert_eq!(signals.human_confidence, HumanConfidence::Unknown);
+            assert!(!signals.human_confidence.is_machine());
+        }
+        assert!(HumanConfidence::Low.is_machine());
+        assert_eq!(HumanConfidence::default(), HumanConfidence::Unknown);
     }
 
     #[test]

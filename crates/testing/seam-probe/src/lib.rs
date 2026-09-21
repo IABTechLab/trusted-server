@@ -38,7 +38,7 @@ use trusted_server_core::auction::demand::{
 };
 use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
-use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
+use trusted_server_core::ec::device::{DeviceModule, DeviceSignals, HumanConfidence};
 use trusted_server_core::ec::module::{EdgeCookieModule, GeneratedEdgeCookie, ModuleCode};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
@@ -376,6 +376,7 @@ impl DeviceModule for SeamProbeDevice {
             looks_like_browser: true,
             ja4_class: None,
             h2_fp_hash: None,
+            human_confidence: HumanConfidence::Unknown,
         }
     }
 }
