@@ -258,7 +258,10 @@ async function runAuction(pageWindow, fetchSpy) {
       {
         code: 'ad-slot-1',
         mediaTypes: { banner: { sizes: [[300, 250]] } },
-        bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 1 } },
+          { bidder: 'trustedServer', params: { storedRequest: undefined } },
+        ],
       },
       {
         code: 'ad-slot-2',
