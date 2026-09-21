@@ -359,15 +359,15 @@ pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
     let nonce_full = hasher.finalize();
     let mut nonce = [0_u8; 24];
     nonce[..24].copy_from_slice(&nonce_full[..24]);
-    let nonce = XNonce::from_slice(&nonce);
+    let nonce = XNonce::from(nonce);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext_url.as_bytes())
+        .encrypt(&nonce, plaintext_url.as_bytes())
         .expect("encryption failure");
 
     let mut out: Vec<u8> = Vec::with_capacity(2 + 24 + ciphertext.len());
     out.extend_from_slice(b"x1");
-    out.extend_from_slice(nonce);
+    out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
     URL_SAFE_NO_PAD.encode(out)
 }
@@ -383,12 +383,12 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
         return None;
     }
     let nonce_bytes = &data[2..2 + 24];
-    let nonce = XNonce::from_slice(nonce_bytes);
+    let nonce = XNonce::try_from(nonce_bytes).ok()?;
     let ciphertext = &data[2 + 24..];
 
     let key_bytes = Sha256::digest(settings.publisher.proxy_secret.expose().as_bytes());
     let cipher = XChaCha20Poly1305::new(&key_bytes);
-    let pt = cipher.decrypt(nonce, ciphertext).ok()?;
+    let pt = cipher.decrypt(&nonce, ciphertext).ok()?;
     String::from_utf8(pt).ok()
 }
 

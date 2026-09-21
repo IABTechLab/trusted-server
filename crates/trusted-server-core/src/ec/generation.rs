@@ -6,7 +6,7 @@
 use std::net::IpAddr;
 
 use error_stack::{Report, ResultExt};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as _, Mac};
 use rand::Rng;
 use sha2::Sha256;
 

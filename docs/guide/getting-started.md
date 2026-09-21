@@ -50,7 +50,7 @@ Simulates the full Fastly production environment locally.
 Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 ```
 
 Create and push the starter config, then start the local Fastly simulator:

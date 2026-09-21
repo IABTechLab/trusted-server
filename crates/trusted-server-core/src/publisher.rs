@@ -6801,7 +6801,7 @@ fn mark_deprecated_alias(response: &mut Response<EdgeBody>, is_legacy_alias: boo
 #[cfg(test)]
 mod tests {
     use std::future::Future as _;
-    use std::io::{self, Read as _, Write as _};
+    use std::io::{self, Read as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use brotli::Decompressor;
