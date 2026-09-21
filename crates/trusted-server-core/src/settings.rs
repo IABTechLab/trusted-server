@@ -3807,16 +3807,20 @@ mod tests {
     }
 
     // One distinctive canary per `Redacted<String>` field reachable from
-    // `Settings`'s derived `Debug` impl. A new secret field added without the
-    // `Redacted` wrapper should be caught here by adding its own canary;
-    // re-run `rg 'Redacted<' crates/trusted-server-core/src` when touching
-    // this test to check the field list is still complete.
+    // `Settings`'s derived `Debug` impl. This is a regression guard over the
+    // field list below, not a completeness guarantee: a new secret field
+    // added without the `Redacted` wrapper has no canary here and will pass
+    // this test while leaking. Adding the canary is a manual step.
     //
-    // Do not use `..Struct::default()` anywhere in this function. This test's
-    // entire purpose is exhaustive field coverage, and a default spread would
-    // silently swallow any field added to `Handler`, `TinybirdSettings`, or
-    // any other struct built here, defeating that coverage. List every field
-    // explicitly instead.
+    // Integration configs are deliberately out of scope. They reach
+    // `Settings` as opaque JSON under `IntegrationSettings`, whose
+    // hand-written `Debug` impl prints only integration IDs, never values.
+    //
+    // Do not use `..Struct::default()` anywhere in this function. A default
+    // spread would let a new secret field be added to `Handler`,
+    // `TinybirdSettings`, or any other struct built here without forcing
+    // anyone to consider it. The compile break is the prompt; the canary
+    // list below is still maintained by hand. List every field explicitly.
     #[test]
     fn settings_debug_output_redacts_every_secret_field() {
         const CANARY_PROXY_SECRET: &str = "CANARY-PROXY-SECRET-0123456789";
@@ -3832,6 +3836,7 @@ mod tests {
         const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
         const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
         const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
+        const CANARY_DATADOME_SERVER_SIDE_KEY: &str = "CANARY-DATADOME-SERVER-SIDE-KEY-0123456789";
 
         let mut settings = create_test_settings();
 
@@ -3890,11 +3895,30 @@ mod tests {
             max_body_bytes: 0,
         };
 
+        // `IntegrationSettings` stores integration configs as opaque JSON and
+        // relies on a hand-written `Debug` impl to suppress their values. That
+        // impl is the only thing keeping resolved DataDome credentials out of
+        // this output, so pin it here.
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &json!({
+                    "enabled": true,
+                    "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
+                }),
+            )
+            .expect("should insert datadome integration config");
+
         let debug = format!("{settings:?}");
 
         assert!(
             debug.contains("[REDACTED]"),
             "should redact secret fields in Settings debug output"
+        );
+        assert!(
+            debug.contains("^/secure"),
+            "should leave non-secret handler path visible in debug output"
         );
 
         let canaries = [
@@ -3928,6 +3952,10 @@ mod tests {
                 CANARY_TINYBIRD_AUCTION_TOKEN,
             ),
             ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
+            (
+                "integrations.datadome.server_side_key_secret_name",
+                CANARY_DATADOME_SERVER_SIDE_KEY,
+            ),
         ];
 
         for (field, canary) in canaries {
