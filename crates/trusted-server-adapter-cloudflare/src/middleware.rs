@@ -8,6 +8,7 @@ use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::request_timing::RequestTimings;
 use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,40 @@ impl Middleware for SanitizeRequestMiddleware {
 }
 
 // ---------------------------------------------------------------------------
+// RequestTimingMiddleware
+// ---------------------------------------------------------------------------
+
+/// Attaches the server request clock consumed by core timing instrumentation.
+///
+/// This adapter does not emit `Server-Timing`; the collector keeps timing
+/// origins consistent for request-scoped consumers such as GPT diagnostics.
+/// Health checks remain outside timing collection on every adapter.
+#[derive(Default)]
+pub struct RequestTimingMiddleware;
+
+impl RequestTimingMiddleware {
+    /// Creates a new [`RequestTimingMiddleware`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait(?Send)]
+impl Middleware for RequestTimingMiddleware {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        if ctx.request().uri().path() != "/health"
+            && ctx.request().extensions().get::<RequestTimings>().is_none()
+        {
+            ctx.request_mut()
+                .extensions_mut()
+                .insert(RequestTimings::new());
+        }
+        next.run(ctx).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FinalizeResponseMiddleware
 // ---------------------------------------------------------------------------
 
@@ -56,9 +91,9 @@ impl Middleware for SanitizeRequestMiddleware {
 /// (injected by the Cloudflare Workers runtime). On the native host target the
 /// header is absent, so `X-Geo-Info-Available: false` is emitted.
 ///
-/// Registered directly inside [`SanitizeRequestMiddleware`] and ahead of
-/// [`AuthMiddleware`] so that every outgoing response — including auth-rejected
-/// ones — carries a consistent set of headers.
+/// Registered inside [`RequestTimingMiddleware`] and ahead of [`AuthMiddleware`]
+/// so that every outgoing response — including auth-rejected ones — carries a
+/// consistent set of headers.
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
 }
@@ -180,15 +215,19 @@ mod tests {
             .expect("should build empty test response")
     }
 
-    fn empty_ctx() -> RequestContext {
+    fn ctx_for_path(path: &str) -> RequestContext {
         let req = request_builder()
             .method(Method::GET)
-            .uri("/test")
+            .uri(path)
             .header("x-reader-ip", "198.51.100.7")
             .header("x-reader-ip-auth", "fictional-shared-secret-0123456789")
             .body(Body::empty())
             .expect("should build test request");
         RequestContext::new(req, PathParams::new(HashMap::new()))
+    }
+
+    fn empty_ctx() -> RequestContext {
+        ctx_for_path("/test")
     }
 
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
@@ -287,6 +326,34 @@ mod tests {
             Some("custom-value"),
             "should apply operator-configured response headers"
         );
+    }
+
+    #[test]
+    fn request_timing_middleware_attaches_a_collector_except_for_health() {
+        for (path, expected) in [("/test", true), ("/health", false)] {
+            let observed = Arc::new(Mutex::new(None));
+            let handler_observed = Arc::clone(&observed);
+            let handler = Arc::new(move |ctx: RequestContext| {
+                let handler_observed = Arc::clone(&handler_observed);
+                async move {
+                    *handler_observed.lock().expect("should lock observation") =
+                        Some(ctx.request().extensions().get::<RequestTimings>().is_some());
+                    Ok::<Response, EdgeError>(empty_response())
+                }
+            });
+
+            block_on(
+                RequestTimingMiddleware::new()
+                    .handle(ctx_for_path(path), Next::new(&[], &*handler)),
+            )
+            .expect("should run timing middleware");
+
+            assert_eq!(
+                *observed.lock().expect("should lock observation"),
+                Some(expected),
+                "collector presence should match timing policy for {path}"
+            );
+        }
     }
 
     #[test]

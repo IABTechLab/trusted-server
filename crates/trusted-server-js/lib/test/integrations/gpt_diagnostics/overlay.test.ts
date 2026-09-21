@@ -275,9 +275,9 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Auction type: SSAT');
     expect(responseSentArticle).toContain('Winning bidder: example-bidder');
     expect(responseSentArticle).toContain('Winning bid price bucket: 1.20');
-    expect(responseSentArticle).toContain('Edge request T0 → auction dispatched 4 ms');
-    expect(responseSentArticle).toContain('Edge request T0 → auction resolved 84 ms');
-    expect(responseSentArticle).toContain('Edge request T0 → bids committed 85 ms');
+    expect(responseSentArticle).toContain('Initial document request T0 → auction dispatched 4 ms');
+    expect(responseSentArticle).toContain('Initial document request T0 → auction resolved 84 ms');
+    expect(responseSentArticle).toContain('Initial document request T0 → bids committed 85 ms');
     expect(responseSentArticle).toContain('Auction wait (in stream) 80 ms');
     expect(responseSentArticle).toContain('Opportunity → request 0 ms');
     expect(responseSentArticle).toContain('Direct opportunity: Renderable candidate');
@@ -303,8 +303,8 @@ describe('GptDiagnosticsOverlay', () => {
     const selectedArticle = slotArticle(root!, 'selected-slot').textContent ?? '';
     expect(selectedArticle).toContain('Request path: Competing paths');
     expect(selectedArticle).toContain('Auction type: Competing auctions');
-    expect(selectedArticle).toContain('SPA page-bids T0 → auction dispatched 0 ms');
-    expect(selectedArticle).toContain('SPA page-bids T0 → auction resolved 40 ms');
+    expect(selectedArticle).toContain('SPA page-bids request T0 → auction dispatched 0 ms');
+    expect(selectedArticle).toContain('SPA page-bids request T0 → auction resolved 40 ms');
     expect(selectedArticle).toContain('Direct opportunity: Unrenderable candidate');
     expect(selectedArticle).toContain('Trusted Server creative request observed at 23 ms');
     expect(selectedArticle).not.toContain('Trusted Server markup response sent');
