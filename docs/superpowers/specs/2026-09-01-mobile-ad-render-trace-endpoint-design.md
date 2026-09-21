@@ -451,7 +451,17 @@ trace_page_enabled = false
 Rules (route responses below apply after configured authentication):
 
 - `trace_page_enabled = true` requires `enabled = true`; invalid combinations
-  fail configuration validation.
+  fail configuration validation, including when `enabled` is omitted (defaults
+  to false). Add a raw-config validation hook in both deploy and runtime
+  validation, following `validate_js_asset_proxy_config` in
+  `crates/trusted-server-core/src/config.rs`. It must deserialize and validate
+  this combination outside the enabled gate: `IntegrationSettings::get_typed`
+  returns `Ok(None)` before `validate()` for disabled integrations, so a schema
+  validator alone cannot enforce this rule. Preserve unknown-field rejection
+  on disabled configurations. This spec explicitly requires invalid enabled
+  configuration to fail rather than be logged and disabled; the prior rationale
+  is the HIGH-severity finding in
+  `2026-03-11-production-readiness-report-design.md`, not a contributor-doc rule.
 - Operator documentation beside this option states that the public page makes
   the allowlisted presence/validity of four HttpOnly Trusted Server cookies
   visible to same-origin JavaScript whenever the feature is enabled. It also
@@ -465,7 +475,12 @@ Rules (route responses below apply after configured authentication):
   parameters do not activate or deactivate tracing and are not reflected into
   the page or export.
 - `HEAD /_ts/trace` returns the GET status and headers without a body or state
-  mutation.
+  mutation. Explicitly handle `HEAD` on every trace path in all four adapters,
+  returning a bodyless local 405 on POST-only paths. Fastly's
+  `publisher_fallback_methods()` includes `HEAD`; a GET registration alone
+  sends HEAD to the publisher fallback, as pinned by
+  `dispatch_head_on_named_get_route_falls_through_to_publisher_fallback` in
+  `crates/trusted-server-adapter-fastly/src/app.rs`.
 - `GET /_ts/trace/state` returns private/no-store JSON containing only
   `observed_active: true|false`, determined from whether that request carried
   exactly one valid diagnostics cookie. `HEAD` returns the same status and
@@ -485,13 +500,20 @@ Rules (route responses below apply after configured authentication):
   cookie using `X-TS-Trace-Action: end`, and returns a small local JSON result.
   After explicit user confirmation, client JavaScript independently attempts
   local report deletion and the end POST. Neither result gates the other.
-- For both POST paths, absent or exactly-zero `Content-Length` is accepted,
-  `Transfer-Encoding` is rejected, and the adapter reads at most one byte when
-  it must verify an absent length. Any body byte or positive/invalid length
-  returns local `413 Payload Too Large` without draining or processing an
-  unbounded body. The one-byte read inherits a maximum two-second adapter
-  request-body deadline; timeout returns local `408 Request Timeout` with no
-  mutation.
+- For both POST paths, accept absent or exactly-zero `Content-Length` only
+  when the body is empty; reject `Transfer-Encoding`, positive/invalid lengths,
+  and any actual body bytes with local `413 Payload Too Large` and no mutation.
+  Precheck headers, then use `Body::into_bytes_bounded(0)` to check emptiness,
+  following the header-precheck/body-size-check pattern in
+  `crates/trusted-server-core/src/auction/endpoints.rs`. This is an application
+  acceptance limit, not a transport read or allocation limit. Pinned EdgeZero
+  v0.0.8 buffers the Fastly body with blocking `read_to_end` and the Cloudflare
+  body with `req.bytes().await` before core handling. Spin also buffers the
+  body; Axum buffers JSON bodies but can stream other content types. `Body`
+  exposes no read deadline, and Fastly uses `futures::executor::block_on` without a timer.
+  Therefore v1 promises neither a one-byte transport read, a two-second timeout,
+  nor a local 408. Transport-level size/deadline protection requires a separate
+  adapter/upstream change; document the pre-buffering limitation at deployment.
 - State-changing POSTs require an `Origin` exactly matching the canonical
   request origin and `Sec-Fetch-Site: same-origin`. Missing, conflicting,
   malformed, cross-site, or duplicate control values return local `403` without
@@ -503,7 +525,16 @@ Rules (route responses below apply after configured authentication):
   default ports removed before exact comparison. Invalid or multi-valued host,
   authority, scheme, or origin input fails closed.
 - Unsupported methods on a shell or state-changing path return a local 405
-  Method Not Allowed response with the path-specific `Allow` header.
+  Method Not Allowed response with the path-specific `Allow` header:
+  `GET, HEAD` for shell/state/assets and `POST` for enable/end. Classification
+  must intercept unsupported methods before router dispatch. The router's
+  `MethodNotAllowed` response has no `Allow` header and bypasses
+  `FinalizeResponseMiddleware`, as pinned by
+  `dispatch_unregistered_method_returns_405_at_router_level` in the Fastly
+  adapter. The trace responder itself supplies `Allow` and all section 12.3
+  error-response hardening; it must not rely on router-generated errors.
+  Fastly entry-point finalization can add ordinary headers later, but does not
+  establish this trace-specific contract on behalf of the router.
 - Disabled deployments return a local `404` for the complete trace route set,
   including assets, and never fall through to the publisher origin.
 - The `/_ts/trace` namespace is reserved. A trailing slash, extra path segment,
@@ -512,6 +543,13 @@ Rules (route responses below apply after configured authentication):
   segment returns a local `400`. None falls through to the publisher origin.
   The adapter classifies from its canonical parsed path while retaining enough
   raw-path information to reject ambiguous encodings consistently.
+
+Reuse the bounded percent-decode-to-fixed-point classification pattern from
+`deny_admin_diagnostic_fallback` in `crates/trusted-server-core/src/ec/admin.rs`
+(`MAX_PERCENT_DECODE_ROUNDS = 4`), moving trace classification before dispatch
+rather than relying on fallback. Register and intercept trace paths on Fastly,
+Axum, Cloudflare, and Spin from the first implementation PR; existing Fastly-only
+`/_ts/*` routes are not a parity precedent.
 
 Every adapter implements the following order:
 
@@ -650,7 +688,11 @@ The classifier uses this deterministic contract:
   precedence is therefore diagnostic rather than first- or last-value
   selection.
 - Per-value limits are 512 bytes for `ts-ec`, 8 KiB for `ts-eids`, and 16 bytes
-  each for `ts-tester` and `__Host-ts-console`. A single value beyond its limit
+  each for `ts-tester` and `__Host-ts-console`. Only the 8 KiB EID limit is
+  inherited (`MAX_EIDS_COOKIE_BYTES` in `ec/prebid_eids.rs`); the other limits
+  are new trace-inspection bounds. The 512-byte EC limit is an outer guard,
+  above the exact 71-character format accepted by `is_valid_ec_id` in
+  `ec/generation.rs`, and does not broaden EC validity. A single value beyond its limit
   is `present_invalid/oversized`; it does not change the other three states.
 - One `ts-ec` occurrence is valid only when the canonical EC cookie validator
   accepts its complete value.
@@ -726,6 +768,40 @@ rejects a stored report that supplies them. The remaining current v1 fields
 retain their source meaning and require explicit allowlisting; future source
 fields are not inherited automatically. `trustedServerAuctionId`, when
 present, must satisfy the diagnostic auction-token contract in section 9.4.
+
+The following is the exhaustive v1 property allowlist derived from the current
+interfaces in `crates/trusted-server-js/lib/src/core/types.ts`, after the above
+exclusions. Preserve source optionality and validate each source enum against its
+explicit current members; do not spread source objects or dynamically inherit
+later fields. Section 9.5 supplies numeric, string, array, and depth bounds.
+
+| Object                | Allowed properties                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GPT projection        | `schema_version`, `source_schema_version`, `capturedAt`, `page`, `slots`, `callbackIssues`, `attributionIssues`, `coverage`, `metadata`                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `page`                | `origin`, `pathname` (fixed redacted literal)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Slot                  | `runtimeSlotNumber`, `binding`, `currentVisibilityPercentage`, `maximumVisibilityPercentage`, `requests`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `binding`             | `status`, `reason` (current `GptDiagnosticsBindingReason` enum)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Request cycle         | `requestNumber`, `requestedAtMs`, `responseAtMs`, `renderAtMs`, `loadAtMs`, `viewableAtMs`, `durations`, `isEmpty`, `requestedSlotSizes`, `size`, `observedSlotSize`, `isBackfill`, `slotContentChanged`, `incompleteSequence`, `responseClass`, `requestPath`, `requestIntentId`, `trustedServerAuctionId`, `opportunityToRequestMs`, `replacedRequestNumber`, `previousRenderToRequestMs`, `creativeChanged`, `loadObservedBeforeRender`, `trustedServerOpportunity`, `trustedServerCreativeRequestAtMs`, `trustedServerCreativeResponseAtMs`, `trustedServerCreativeFailures`, `delivery` |
+| `durations`           | `requestToResponseMs`, `responseToRenderMs`, `requestToRenderMs`, `renderToLoadMs`, `renderToViewableMs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Callback issue        | `kind`, `runtimeSlotNumber`, `timestampMs`, `disposition`, `reason` (only the documented values below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Attribution issue     | `reason` (current `GptDiagnosticsAttributionIssueReason` enum), `timestampMs`, `runtimeSlotNumber`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `coverage`            | Exactly the six current callback-kind keys: `slotRequested`, `slotResponseReceived`, `slotRenderEnded`, `slotOnload`, `impressionViewable`, `slotVisibilityChanged`                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Each coverage counter | `observed`, `matched`, `unmatched`, `ambiguous`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `metadata`            | `droppedCallbacks`, `droppedAttributionIssues`, `evictedSlots`, `evictedRequestCycles`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+
+Callback `reason` accepts only the current store's six emitted literals:
+`invalid_event_order`, `missing_response_before_render`,
+`invalid_visibility_percentage`, `evicted_slot`, `no_compatible_request_cycle`,
+and `overlapping_request_cycles`.
+Although the source interface types it as `string`, the trace validator rejects
+all other values rather than copying arbitrary text.
+
+`requestPath` is the bounded `GptDiagnosticsRequestPath` enum, not a URL or
+pathname; include it as browser intent only. `requestIntentId` is a local numeric
+sequence, not an external request identifier. Source `version` becomes
+`source_schema_version`; no other source properties pass through. Tests must
+classify every current source member as copied, transformed, or excluded, and
+reject extra keys at every object boundary.
 
 It is deliberately not named or represented as `GptDiagnosticsExportV1`,
 because redaction, excluded identifiers, and trace-level bounds change the
@@ -812,11 +888,16 @@ telemetry and OpenRTB objects:
   request ID, or an identifier joinable to user-bearing logs.
 - Auction tokens are `ts-auc-` followed by a lowercase UUID v4 in the existing
   producer's 32-hex-digit unhyphenated form (`Uuid::new_v4().simple()`). Slot
-  tokens are `ts-slot-` followed by a canonical lowercase hyphenated UUID v4,
+  tokens are new: neither a `ts-slot-` producer nor a TSJS `crypto.randomUUID()`
+  call exists today. This design introduces tokens that are `ts-slot-` followed by a canonical lowercase hyphenated UUID v4,
   matching `crypto.randomUUID()`. Both validators enforce UUID version 4 and
   the RFC variant and reject every other shape. Tokens are compared verbatim,
   never normalized during validation or correlation; no producer format change
-  is required for the existing GPT auction opportunity marker.
+  is required for the existing GPT auction opportunity marker. For the GPT
+  projection, validation and comparison start from the marker returned by
+  `normalizedAuctionId` in `gpt_diagnostics/store.ts`, which already trims
+  whitespace and caps the stored value. Trace validation performs no further
+  normalization; invalid shapes are not repaired into valid tokens.
 - `slot_number` is a one-based ordinal over the exact post-conversion
   `AuctionRequest.slots` sequence observed by orchestration. It is display-only
   and is never used to map a response back to pre-conversion client input.
@@ -838,7 +919,10 @@ telemetry and OpenRTB objects:
 - `source` is assigned by the server call site: initial document auction is
   `initial_navigation_ssat`, `/_ts/page-bids` is `spa_page_bids`, and
   `POST /auction` is `auction_api`. Browser `requestPath` does not determine or
-  override this value.
+  override this value. These are intentionally trace-owned public names:
+  existing `AuctionSource` in `auction/telemetry.rs` uses `initial_navigation`,
+  `spa_navigation`, and `auction_api`, respectively. Map these explicitly;
+  do not change telemetry vocabulary or serialize it directly into the report.
 - `provider_number` is assigned deterministically in provider dispatch order
   and is stable only within one auction. Provider names, bidder/seat names, and
   provider metadata are omitted. `returned_bid_count` is a count, not a bid
@@ -901,7 +985,10 @@ before an envelope arrives is recorded separately by the browser as
 `evidence_transport_failed`.
 
 Initial-navigation and SPA slot definitions carry their token on the exact slot
-object TSJS already consumes:
+object TSJS already consumes. This is a two-sided addition: add optional `ext?`
+to the TypeScript `AuctionSlot` interface in `core/types.ts` and the matching
+nested key to Rust's `build_slot_json` in `publisher.rs`. Neither has this member
+today; Rust builds free-form JSON, and TSJS currently retains the slot objects:
 
 ```text
 AuctionSlot.ext.trusted_server.trace_slot_ref: string
@@ -989,7 +1076,8 @@ that preserves existing request-path attribution.
   `ext.trusted_server.trace_slot_ref`. Failed, abandoned, skipped, and zero-bid
   outcomes still inject their bounded evidence when the publisher document can
   be delivered.
-- **SPA page-bids:** `/_ts/page-bids` adds an optional, namespaced
+- **SPA page-bids:** `/_ts/page-bids` and its still-live deprecated alias
+  `/__ts/page-bids` both add an optional, namespaced
   `trace_auction` transport envelope beside its existing bid result. TSJS
   validates and records it and consumes each returned slot's
   `ext.trusted_server.trace_slot_ref` before triggering ad initialization. Both
@@ -1089,7 +1177,7 @@ Runtime limits are part of the v1 contract:
 
 | Value                                           | Limit                                                        |
 | ----------------------------------------------- | ------------------------------------------------------------ |
-| Container nesting                               | 8 levels                                                     |
+| Container nesting                               | 10 levels                                                    |
 | Server auctions                                 | 16                                                           |
 | Slot correlations                               | 128                                                          |
 | Provider calls                                  | 16 per server auction                                        |
@@ -1115,6 +1203,12 @@ Runtime limits are part of the v1 contract:
 | Requested or selected creative dimension        | Finite integer from 1 through 100,000                        |
 | GPT-reported fill dimension (`size`)            | Finite integer from 1 through 100,000                        |
 | Observed CSS box dimension (`observedSlotSize`) | Finite integer from 0 through 100,000                        |
+
+The depth cap includes two levels of headroom above the current deepest valid
+GPT path: report (1), GPT projection (2), slots array (3), slot (4), requests
+array (5), cycle (6), `requestedSlotSizes` array (7), size tuple (8). Headroom
+does not permit unknown fields; future schema additions still require explicit
+compatibility review. Test the complete current projection and over-depth input.
 
 `observedSlotSize` preserves zero dimensions, including `[0, 0]` for a
 hidden or collapsed element after a filled GPT render. Zero is a measured box
@@ -1154,7 +1248,7 @@ wrapping or saturating the count.
 
 For depth accounting, the `TraceReportV1` object—not its storage wrapper—is
 level 1; entering either an object or an array increments the level by one;
-primitives do not. No accepted report value may enter a ninth container level.
+primitives do not. No accepted report value may enter an eleventh container level.
 The storage wrapper is validated separately as the exact two-field object
 `{ stored_at_ms, report }`.
 
@@ -1311,7 +1405,10 @@ The HTML shell, enable/end responses, every active diagnostic publisher
 response, and every dynamic page-bids or `/auction` response carrying trace
 evidence are terminally `private, no-store`. The fixed versioned JS/CSS assets
 are the sole exception and may be publicly cached because they contain no
-request or report data. HTML and JSON endpoint responses also send:
+request or report data. HTML and JSON endpoint responses, including state
+results and all local authentication, routing, validation, and disabled-route errors, also send the
+following headers. Every such error is `private, no-store`; only successful
+fixed-asset responses qualify for the cache exception:
 
 - Path-appropriate `Content-Type`: `text/html; charset=utf-8` for the shell and
   `application/json; charset=utf-8` for enable, end, and state results.
@@ -1323,8 +1420,18 @@ usb=()`
 
 ```text
 default-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none';
-object-src 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'self'
+object-src 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'self';
+img-src data:
 ```
+
+The shell supplies a fixed data-URL favicon; `img-src data:` allows it without
+an automatic publisher `/favicon.ico` fetch. All styles live in the fixed CSS
+asset: toggle classes or the `hidden` attribute, with no inline style attributes,
+style blocks, or JavaScript style-property writes. JSON download uses a Blob
+object URL assigned directly to an `<a download>` followed by a click, then
+revokes the URL after the download has started. Do not fetch the blob URL or
+embed it in a frame. This fixes the download mechanism without widening
+`connect-src` or enabling frames; browser tests exercise it under this exact CSP.
 
 The endpoint makes no third-party requests. Its script and stylesheet are fixed
 same-origin static assets. Setup-request values are server-rendered as escaped
@@ -1352,13 +1459,26 @@ extension; active responses add them only in request-scoped injection or the
 request-scoped body seam.
 The existing diagnostics private/no-store decision remains a load-bearing gate.
 Tests must prove that late response-header handlers cannot make traced content
-publicly cacheable.
+publicly cacheable. Reuse
+`apply_response_headers_with_cache_privacy` in `response_privacy.rs`, which
+skips operator cache-header overrides on already uncacheable responses. Fastly
+also re-runs privacy guards in `apply_terminal_response_effects` after late EC
+and filter effects; retain its
+`late_filter_effects_cannot_make_an_assembled_response_public` regression.
+`apply_finalize_headers` is terminal on Axum, Cloudflare, and Spin, but not on
+Fastly; trace handling must preserve the appropriate terminal protection.
 
 ### 12.5 Operator authentication policy
 
-Trace routing preserves the existing `auth.rs` namespace contract: every
-matching operator Basic Authentication rule is enforced, including `^/_ts` or
-`^/`. Classification may run early, but does not authorize a request. Only
+Trace routing preserves existing first-match-wins operator authentication:
+`Settings::handler_for_path` selects one handler, and trace handling enforces
+that handler's Basic Authentication policy. Rules do not compose; a preceding
+narrow rule can shadow `^/_ts` or `^/`. With no matching handler, trace remains
+public: the fail-closed unmatched-path backstop in `enforce_basic_auth` applies
+only to `/_ts/admin`, not trace. Call the synchronous `enforce_basic_auth` with
+settings and the request before serving any trace response. Do not copy the
+Fastly `/_ts/debug/ja4` early return, which bypasses `AuthMiddleware`.
+Classification may run early, but does not authorize a request. Only
 authentication is factored ahead of trace handling; ordinary event, identity,
 filter, and auction processing stays outside trace routes. A challenge exposes
 no setup context, changes no cookie, and is terminally private/no-store.
@@ -1431,7 +1551,8 @@ results, never a prerequisite for returning them.
 ### 14.1 Core unit tests
 
 - Configuration defaults off and rejects trace-page enablement without GPT
-  diagnostics.
+  diagnostics, with `enabled` both explicitly false and omitted, on both
+  deploy and runtime validation paths.
 - With GPT diagnostics enabled but `trace_page_enabled = false`, a valid
   console cookie still enables the existing console but never mints trace
   tokens, builds auction evidence, adds response extensions, or emits
@@ -1455,8 +1576,9 @@ results, never a prerequisite for returning them.
   Absent, invalid, duplicate, and uninspectable cookies all report inactive,
   with no claim that inactive proves the cookie is absent.
 - Empty-body enforcement rejects positive/invalid lengths, transfer encoding,
-  the first unexpected body byte, and the two-second deadline without an
-  unbounded read.
+  nonempty bodies even with absent/zero lengths, and verifies no mutation on
+  rejection. Tests must not claim a transport bound or timeout that the pinned
+  adapters cannot enforce.
 - Endpoint skips EC generation/finalization, EID ingestion, auction, telemetry,
   configured filters, ordinary event context, and origin fetch.
 - Cookie-health scanner covers multiple header fields; zero, one, and duplicate
@@ -1467,6 +1589,8 @@ results, never a prerequisite for returning them.
   fields.
 - Server-auction projection maps initial navigation, SPA page-bids, and auction
   API call sites to the exact public source enums without using a browser hint.
+  Canonical and legacy page-bids routes produce equivalent gated evidence and
+  slot extensions, including the TSJS retry against the legacy alias.
 - The diagnostic auction token is minted before dispatch and remains identical
   across completed, zero-bid, skipped, failed, and abandoned evidence and the
   corresponding SSAT/SPA browser opportunity marker. API tokens remain
@@ -1510,12 +1634,16 @@ results, never a prerequisite for returning them.
   sources.
 - Axum, Cloudflare, and Spin return the common route/schema with unavailable
   fields omitted.
-- Trace-route failures never fall through to publisher origin.
+- Trace-route failures never fall through to publisher origin, including HEAD
+  on each exact path, malformed reserved paths, and arbitrary unsupported
+  methods intercepted before router dispatch. Assert path-specific `Allow`,
+  bodyless HEAD errors, and hardening headers on local errors.
 - Broad `^/_ts` and `^/` authentication rules challenge every trace path
   (shell/state/actions/assets, disabled routes, and unsupported methods); valid
   credentials proceed to trace handling, while `^/_ts/admin` leaves trace
   routes public. Challenges expose no context or cookie mutation, and
-  protected assets remain private/no-store.
+  protected assets remain private/no-store. Also test an earlier narrow handler
+  shadowing a broad rule to pin first-match-wins behavior.
 - GET, HEAD, state-changing POST, and unsupported methods obey the same
   lifecycle contract across adapters.
 - Every adapter omits JA4/H2 and rejects control characters or overlong platform
@@ -1735,7 +1863,9 @@ independently reviewable plans and preferably four PRs:
    shared 30-minute endpoint/query cookie policy, bounded cookie-health
    inspection, base request-context schema, projection of already populated
    `ClientInfo`/`GeoInfo` fields, response hardening, and adapter parity. Do not
-   add speculative new platform fields in this change.
+   add speculative new platform fields in this change. Include the raw-config
+   validation hook and method-independent dispatch on all four adapters in
+   this first PR; Fastly-only route registration does not satisfy the contract.
 2. **Live server-auction evidence:** introduce the public diagnostic auction and
    slot tokens, project `TraceAuctionEvidenceV1` at the live observation
    boundary, transport it through initial navigation, page-bids, and both
