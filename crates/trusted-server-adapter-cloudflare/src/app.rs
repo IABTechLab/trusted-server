@@ -36,7 +36,9 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
+use crate::middleware::{
+    AuthMiddleware, FinalizeResponseMiddleware, RequestTimingMiddleware, SanitizeRequestMiddleware,
+};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -467,6 +469,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // any middleware registered ahead of it would observe the
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(RequestTimingMiddleware::new())
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(

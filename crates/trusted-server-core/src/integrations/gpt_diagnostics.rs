@@ -62,6 +62,7 @@ pub enum GptDiagnosticsCookieAction {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GptDiagnosticsRequestDecision {
     active: bool,
+    browser_session_active: bool,
     clean_browser_path_and_query: Option<String>,
     cookie_action: GptDiagnosticsCookieAction,
 }
@@ -71,6 +72,16 @@ impl GptDiagnosticsRequestDecision {
     #[must_use]
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    /// Whether this request came from an activated diagnostics browser session.
+    ///
+    /// Unlike [`Self::active`], this remains true for non-document requests such
+    /// as the SPA page-bids fetch. It is captured before the private activation
+    /// cookie is stripped from the request.
+    #[must_use]
+    pub(crate) fn browser_session_active(&self) -> bool {
+        self.browser_session_active
     }
 
     /// Whether the response must be private and non-storeable.
@@ -121,6 +132,7 @@ impl GptDiagnosticsRequestDecision {
     pub(crate) fn active_for_tests() -> Self {
         Self {
             active: true,
+            browser_session_active: true,
             clean_browser_path_and_query: None,
             cookie_action: GptDiagnosticsCookieAction::None,
         }
@@ -143,6 +155,7 @@ mod head_seam_invariant_tests {
                 ] {
                     out.push(GptDiagnosticsRequestDecision {
                         active,
+                        browser_session_active: active,
                         clean_browser_path_and_query: clean.clone(),
                         cookie_action,
                     });
@@ -279,12 +292,19 @@ pub fn prepare_request(
         replace_path_and_query(request, &clean_path)?;
     }
 
-    let mut decision = GptDiagnosticsRequestDecision::default();
+    let mut decision = GptDiagnosticsRequestDecision {
+        browser_session_active: integration_enabled
+            && directive == QueryDirective::Absent
+            && cookie_state.occurrences == 1
+            && cookie_state.canonical,
+        ..GptDiagnosticsRequestDecision::default()
+    };
     if integration_enabled && eligible_navigation && had_reserved_query {
         decision.clean_browser_path_and_query = Some(clean_path);
         match directive {
             QueryDirective::Enable => {
                 decision.active = true;
+                decision.browser_session_active = true;
                 decision.cookie_action = GptDiagnosticsCookieAction::SetSession;
             }
             QueryDirective::Disable => {
@@ -540,6 +560,22 @@ mod tests {
         let decision = prepare_request(&settings(true), &mut duplicate).expect("should prepare");
         assert!(!decision.active());
         assert_eq!(duplicate.headers()[header::COOKIE], "other=value");
+    }
+
+    #[test]
+    fn active_cookie_marks_non_document_requests_without_activating_document_behavior() {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/_ts/page-bids?path=/article")
+            .header(header::COOKIE, "__Host-ts-console=1; other=value")
+            .body(EdgeBody::empty())
+            .expect("should build page-bids request");
+
+        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+
+        assert!(!decision.active());
+        assert!(decision.browser_session_active());
+        assert_eq!(request.headers()[header::COOKIE], "other=value");
     }
 
     #[test]
