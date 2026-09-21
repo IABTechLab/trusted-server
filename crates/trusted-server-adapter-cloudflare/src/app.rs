@@ -111,7 +111,7 @@ const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
 #[derive(Debug, Eq, PartialEq, derive_more::Display)]
 enum CloudflareConfigEnvelopeError {
     #[display(
-        "Cloudflare TRUSTED_SERVER_CONFIG missing string values at `{primary_key}` and legacy `{legacy_key}`"
+        "Cloudflare TRUSTED_SERVER_CONFIG has no `{primary_key}` or legacy `{legacy_key}` property"
     )]
     Missing {
         primary_key: &'static str,
@@ -880,13 +880,23 @@ mod tests {
     fn cloudflare_config_reports_missing_keys() {
         let value = serde_json::json!({});
 
+        let error = cloudflare_config_envelope(&value)
+            .expect_err("should reject config without either accepted property");
+
         assert_eq!(
-            cloudflare_config_envelope(&value),
-            Err(CloudflareConfigEnvelopeError::Missing {
+            error,
+            CloudflareConfigEnvelopeError::Missing {
                 primary_key: CONFIG_BLOB_KEY,
                 legacy_key: LEGACY_CONFIG_BLOB_KEY,
-            }),
+            },
             "missing config should name both accepted keys"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cloudflare TRUSTED_SERVER_CONFIG has no `{CONFIG_BLOB_KEY}` or legacy `{LEGACY_CONFIG_BLOB_KEY}` property"
+            ),
+            "missing config should report absent properties, not invalid types"
         );
     }
 

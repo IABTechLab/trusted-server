@@ -2094,55 +2094,126 @@ After the EdgeZero cutover, the Fastly adapter always dispatches through the
 EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
 canary keys are no longer read.
 
-The Fastly service opens the logical config store selected by
-`[stores.config].default` in `edgezero.toml` and reads the app-config blob at
-its default key. A Fastly resource link maps that logical store name to the
-physical config store for the service at runtime.
+`[stores.config].default` in `edgezero.toml` supplies the logical config store
+ID and default blob key, currently `trusted_server_config`. Fastly has no
+process environment. Its entry point reads service-scoped overrides from the
+`edgezero_runtime_env` Config Store before opening the app-config store:
 
-Fastly store names are account-level. For a first deployment, the default setup
-is safe only when no other service in the account uses the
-`trusted_server_config` physical store:
+```mermaid
+flowchart TD
+    A[Manifest default store ID] --> B[Resolve store name and blob key]
+    C[Service-scoped entries in edgezero_runtime_env] --> B
+    B --> D[Open the resolved resource-link name]
+    D --> E[Read the selected blob key from the linked physical store]
+```
+
+For this logical ID, the runtime selectors are:
+
+```text
+EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
+EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
+```
+
+The runtime ignores unscoped entries. Missing or blank selectors fall back to
+the logical ID. A resource link must exist under the resolved name, not always
+under `trusted_server_config`.
+
+### Initial setup with a service-specific store
+
+Fastly store names are account-level. Choose a physical name that is not used
+by another service. The default physical name is safe only if the service owns
+that store exclusively.
+
+Create the Fastly service and an editable service version before provisioning
+non-default mappings. Select its ID through top-level `service_id` in
+`fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must agree. Do not
+reuse the checked-in service ID for your deployment. Without a service ID,
+provisioning rejects non-default mappings before creating resources.
+
+The following example is for initial setup before the service receives traffic.
+Replace the service ID and choose your own physical store name:
 
 ```bash
+export FASTLY_SERVICE_ID="<service-id>"
+export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=example_config
+
+ts provision --adapter fastly --dry-run
 ts provision --adapter fastly
+```
+
+Provisioning creates the stores and persists the selected name in the
+service-scoped `edgezero_runtime_env` entry. Keep all intended store-name
+overrides set when provisioning, including any [secret-store mapping](/guide/fastly#secret-stores).
+Provisioning reconciles mappings for all declared stores, so omitting a previous
+override can remove it.
+
+For an existing service, Fastly does not reapply `[setup]` entries. Follow the
+provisioner's resource-link instructions. Both the app-config store and the
+runtime-env store must be linked to the same editable version. For this example:
+
+```bash
+fastly resource-link create --service-id "$FASTLY_SERVICE_ID" --version latest --autoclone \
+  --resource-id <config-store-id> --name example_config
+fastly resource-link create --service-id "$FASTLY_SERVICE_ID" --version latest --autoclone \
+  --resource-id <runtime-env-store-id> --name edgezero_runtime_env
+
 ts config push --adapter fastly --dry-run
 ts config push --adapter fastly
+fastly compute publish --service-id "$FASTLY_SERVICE_ID" --version latest
 ```
 
-The pinned EdgeZero provisioner cannot create a service-specific physical store
-with a different logical resource-link name during first deployment. Its
-`__NAME` override becomes both the physical store name and the generated Fastly
-setup-table key, so the deployed service would link that physical name while the
-Trusted Server entry point opens `trusted_server_config`. Do not use
-`ts provision` with a `__NAME` override for this case.
+Look up each store ID by its name before linking. Confirm the push dry run names
+`example_config`, not the account-level default. Publish the application to the
+linked version only after seeding its config store; a missing or invalid blob
+makes application startup fail closed. Do not activate a new service's empty
+version before uploading the application. If your deployment separates upload
+from activation, activate the prepared version with
+`fastly service-version activate --service-id "$FASTLY_SERVICE_ID" --version <version>`
+only after both the code and config are ready.
 
-For a service in a shared account, create the service and a service version
-first. Then create and link the service-specific physical store explicitly,
-seed it, and activate the linked version before publishing traffic:
+Keep the `__NAME` override in your deployment environment for **every subsequent
+push**. The CLI reads its process environment, not the service's persisted
+runtime mapping. Omitting the override can write to the wrong physical store.
+Reject empty values in deployment scripts rather than relying on the fallback.
+
+For a live service, changing entries in its active `edgezero_runtime_env` store
+changes runtime selection immediately, independently of service-version
+activation. Do not use the initial-setup sequence to migrate a live mapping.
+Prepare and seed the destination and make its resource link available to the
+active version before switching the selector, or use an isolated staged runtime
+configuration.
+
+An existing deployment may instead link a service-specific physical store under
+the logical name `trusted_server_config`, with no runtime `__NAME` override.
+That alias works, but the CLI still needs the physical-name override on every
+push. Do not add a runtime override unless a link under the newly selected name
+also exists.
+
+### Selecting another blob key
+
+A normal push writes at the logical store ID. A runtime `__KEY` override does
+not change that write destination. To select another production key, first push
+with `ts config push --adapter fastly --key <key>`, then set the matching
+service-scoped `__KEY` entry in `edgezero_runtime_env`. Changing that entry affects
+the active service immediately. Do not point the production selector at a
+staging key; staged deployments need their own runtime-env store.
+
+### Local development
+
+The repository's Viceroy configuration uses the default logical app-config name
+and key. Clear production overrides for the local push:
 
 ```bash
-fastly config-store create --name <physical-store-name>
-fastly resource-link create --service-id <service-id> --version latest --autoclone \
-  --resource-id <config-store-id> --name trusted_server_config
-EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
-  ts config push --adapter fastly --dry-run
-EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
-  ts config push --adapter fastly
-fastly service-version activate --service-id <service-id> --version latest
+env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME \
+  -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
+  ts config push --adapter fastly --local
 ```
 
-Confirm that each dry run names the intended physical store before writing. In
-a shared account, it must be the service-specific store rather than the
-account-level default. The resource-link name must match the logical store ID,
-and the physical store must contain a valid Trusted Server app-config blob
-envelope at its default key. An absent or empty entry makes application startup
-fail closed.
-
-**Local development** (writes the entry used by Viceroy in `fastly.toml`):
-
-```bash
-ts config push --adapter fastly --local
-```
+`--local` writes under `[local_server.config_stores.<resolved-name>]` in the
+tracked `fastly.toml`. If you customize Viceroy's service-scoped runtime selectors,
+keep that local name and the pushed key aligned with them. Review the generated
+diff and do not commit deployment-specific app-config entries. Credentials belong
+in secret stores; the app-config blob contains their key references.
 
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service

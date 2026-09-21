@@ -40,22 +40,23 @@ pub fn config_key(env: &EnvConfig) -> String {
     env.store_key("config", DEFAULT_CONFIG_STORE_ID)
 }
 
-/// Returns the default `EdgeZero` app-config store name.
+/// Resolves the `EdgeZero` app-config store name from the process environment.
 ///
-/// Process-environment overrides apply to native adapters such as Axum. Fastly
-/// has no process environment, so it uses the manifest default as the logical
-/// name and resolves the physical store through a resource link.
+/// Native adapters such as Axum use this wrapper. Fastly instead supplies an
+/// `EnvConfig` populated from service-scoped entries in `edgezero_runtime_env`
+/// and resolves the store name from that configuration. Without an override,
+/// both paths use the manifest default logical store ID.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
     config_store_name(&EnvConfig::from_env())
 }
 
-/// Returns the default config-store key containing the app-config blob.
+/// Resolves the app-config blob key from the process environment.
 ///
-/// Process-environment overrides apply to native adapters such as Axum. When
-/// using a key override, pass the same value to `ts config push --key`; the CLI
-/// otherwise writes at the logical store ID. Fastly has no process environment,
-/// so its custom entry point uses the manifest default key.
+/// Native adapters such as Axum use this wrapper. Fastly resolves the key from
+/// service-scoped entries in `edgezero_runtime_env` instead. A runtime `__KEY`
+/// override must match `ts config push --key`; an ordinary push without that
+/// flag writes at the logical store ID, regardless of the `__KEY` override.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
@@ -366,8 +367,12 @@ mod tests {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), envelope_json)]),
         };
 
-        let loaded = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect("should load settings");
+        let loaded = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -413,8 +418,12 @@ mod tests {
             ]),
         };
 
-        let loaded = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect("should load settings");
+        let loaded = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -443,8 +452,12 @@ mod tests {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]),
         };
 
-        let err = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect_err("should reject malformed chunk length metadata");
+        let err = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect_err("should reject malformed chunk length metadata");
 
         assert!(
             err.to_string().contains("chunk lengths total mismatch"),
@@ -458,8 +471,12 @@ mod tests {
             entries: BTreeMap::new(),
         };
 
-        let err = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect_err("should fail when blob is missing");
+        let err = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect_err("should fail when blob is missing");
 
         assert!(
             err.to_string().contains(CONFIG_BLOB_KEY),

@@ -42,4 +42,5 @@ worker = { workspace = true }
 [dev-dependencies]
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

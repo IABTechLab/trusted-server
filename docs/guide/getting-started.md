@@ -80,6 +80,10 @@ the variables into your shell before starting the server.
 cp trusted-server.example.toml trusted-server.toml
 set -a && source .env.dev && set +a
 
+# Use the repository's default app-config store name and key for this quickstart.
+unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
+unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
+
 # Create the local blob-backed config-store entry.
 ts config push --adapter axum --local --yes
 export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
@@ -106,11 +110,24 @@ The server will be available at `http://localhost:8787`. Set `PORT=<port>` befor
 | Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=…` |
 | Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PROXY_KEY=…`            |
 
+The repeated `TRUSTED_SERVER_CONFIG` segments in the example are intentional:
+`TRUSTED_SERVER_CONFIG_` is the adapter prefix, followed by the resolved store
+name and blob key. Both default to `[stores.config].default` in `edgezero.toml`,
+currently `trusted_server_config`. The commands above assume that repository
+default and clear any name/key overrides left in the shell.
+
+If you customize the defaults or use `EDGEZERO__STORES__CONFIG__<ID>__NAME` or
+`__KEY`, adjust the exported variable's store/key segments and the `jq` key to
+match. Pass a matching `--key` to `ts config push` when overriding the runtime
+key. The local JSON filename still uses the logical store ID, even with a
+physical-name override.
+
 The config-store value is the verified app-config blob. Secret-store values are
 looked up by the key names in that blob. Store names and key names are uppercased
-with hyphens and dots replaced by underscores. The quick-start exports ephemeral
-secret-store values only into the current shell; do not put secret values in the
-TOML config, config-store blob, or a source-controlled environment file.
+with hyphens, dots, and spaces replaced by underscores. The quick-start exports
+ephemeral secret-store values only into the current shell; do not put secret
+values in the TOML config, config-store blob, or a source-controlled environment
+file.
 
 > **Dev server limitations:** The Axum adapter does not support KV store,
 > geo lookup, config/secret-store writes, or admin key-management routes.
