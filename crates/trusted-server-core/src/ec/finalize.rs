@@ -20,7 +20,7 @@ use super::kv::{
     CreateIfAbsentOutcome, KvIdentityGraph, TombstoneOutcome, apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
-use super::prebid_eids::collect_eid_cookie_updates;
+use super::prebid_eids::collect_eid_updates;
 use super::registry::PartnerRegistry;
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
@@ -70,7 +70,12 @@ pub fn ec_finalize_response(
     // Returning user: consent is granted and EC came from request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
-            let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
+            let updates = collect_eid_updates(
+                eids_cookie,
+                sharedid_cookie,
+                ec_context.client_eids(),
+                registry,
+            );
             let snapshot = graph.upsert_partner_ids_from_snapshot(
                 &ec_id,
                 &updates,
@@ -100,7 +105,12 @@ pub fn ec_finalize_response(
             return;
         };
 
-        let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
+        let updates = collect_eid_updates(
+            eids_cookie,
+            sharedid_cookie,
+            ec_context.client_eids(),
+            registry,
+        );
         let snapshot = graph.upsert_partner_ids_from_snapshot(
             &ec_id,
             &updates,
@@ -392,9 +402,12 @@ where
 mod tests {
     use http::HeaderValue;
 
+    use base64::Engine as _;
+
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
@@ -1002,6 +1015,88 @@ mod tests {
             stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
             Some("shared-cookie-id"),
             "a stale endpoint miss must not suppress EID persistence"
+        );
+    }
+
+    #[test]
+    fn finalize_persists_every_configured_partner_from_client_eids_over_a_trimmed_cookie() {
+        // Regression test for #1184: the `ts-eids` cookie only carries what
+        // the browser could fit under its size cap, but `/auction` also
+        // hands finalization the full EID set from the request body via
+        // `EcContext::set_client_eids`. That full set must land in KV even
+        // when the cookie alone would have dropped a configured partner.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("cleids1");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row this request updates");
+        let mut ec_context = returning_user_context(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+            false,
+        );
+        // Only `id5-sync.com` "fit" in the (simulated) trimmed cookie;
+        // `liveramp.com` was dropped by the browser's size cap.
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!([
+                {"source": "id5-sync.com", "uids": [{"id": "ID5_from_cookie", "atype": 1}]}
+            ]))
+            .expect("should serialize test cookie payload"),
+        );
+        ec_context.set_client_eids(vec![
+            Eid {
+                source: "id5-sync.com".to_owned(),
+                uids: vec![Uid {
+                    id: "ID5_from_body".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            },
+            Eid {
+                source: "liveramp.com".to_owned(),
+                uids: vec![Uid {
+                    id: "LR_from_body".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+            },
+        ]);
+        let partners = vec![make_partner("id5-sync.com"), make_partner("liveramp.com")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&eids_cookie),
+            None,
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should exist after ingestion");
+        assert_eq!(
+            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
+            Some("ID5_from_body"),
+            "the request body's EID should win over the cookie's stale value"
+        );
+        assert_eq!(
+            stored.ids.get("liveramp.com").map(|id| id.uid.as_str()),
+            Some("LR_from_body"),
+            "a partner the cookie trimmed must still be ingested from the body"
         );
     }
 

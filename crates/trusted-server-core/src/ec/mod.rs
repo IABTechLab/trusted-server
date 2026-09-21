@@ -77,6 +77,7 @@ use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::openrtb::Eid;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
@@ -233,6 +234,11 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
+    /// EIDs parsed from the current request's own payload (e.g. the `/auction`
+    /// JSON body), when the route has one. Carried to response finalization so
+    /// KV ingestion can use the full set the client actually sent instead of
+    /// being limited to whatever fits in the size-capped `ts-eids` cookie.
+    client_eids: Option<Vec<Eid>>,
 }
 
 impl EcContext {
@@ -314,6 +320,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
         })
     }
 
@@ -502,6 +509,18 @@ impl EcContext {
         self.recovery_eligible
     }
 
+    /// Records the current request's own EIDs (e.g. an `/auction` body) for
+    /// use by response finalization's KV ingestion.
+    pub fn set_client_eids(&mut self, eids: Vec<Eid>) {
+        self.client_eids = Some(eids);
+    }
+
+    /// Returns the current request's own EIDs, if the route captured any.
+    #[must_use]
+    pub fn client_eids(&self) -> Option<&[Eid]> {
+        self.client_eids.as_deref()
+    }
+
     /// Replaces an orphaned active ID after its new backing row is persisted.
     pub(crate) fn replace_with_generated(&mut self, ec_id: String, snapshot: EcKvSnapshot) {
         self.ec_value = Some(ec_id);
@@ -556,6 +575,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
         }
     }
 
@@ -578,6 +598,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
         }
     }
 
@@ -603,6 +624,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
         }
     }
 }

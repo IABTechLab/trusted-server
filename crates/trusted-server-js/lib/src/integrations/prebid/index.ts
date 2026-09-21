@@ -1956,12 +1956,21 @@ function clearPrebidEidsCookie(): void {
   document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
 }
 
+/**
+ * Trims an EID payload so its base64-encoded cookie fits `MAX_EID_COOKIE_BYTES`,
+ * dropping UIDs then whole sources from the tail. `/auction` requests still
+ * forward the untrimmed set in the request body (see `buildAdRequest`); this
+ * cap only bounds what the `ts-eids` cookie carries for routes without a body
+ * (e.g. `GET /_ts/page-bids`) and for backend ingestion at response finalize.
+ */
 function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
   let payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
+  const droppedSources = new Set<string>();
 
   while (payload.length > 0) {
     const encoded = btoa(JSON.stringify(payload));
     if (encoded.length <= MAX_EID_COOKIE_BYTES) {
+      warnAboutDroppedEidSources(droppedSources);
       return payload;
     }
 
@@ -1971,10 +1980,24 @@ function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
       continue;
     }
 
-    payload = payload.slice(0, payload.length - 1);
+    const dropped = payload.pop();
+    if (dropped) {
+      droppedSources.add(dropped.source);
+    }
   }
 
+  warnAboutDroppedEidSources(droppedSources);
   return undefined;
+}
+
+/** Logs which EID sources `fitAuctionEidsToCookie` had to drop, if any. */
+function warnAboutDroppedEidSources(droppedSources: Set<string>): void {
+  if (droppedSources.size === 0) {
+    return;
+  }
+  log.warn(
+    `[tsjs-prebid] ts-eids cookie exceeded ${MAX_EID_COOKIE_BYTES} bytes; dropped sources: ${[...droppedSources].join(', ')}`
+  );
 }
 
 /**

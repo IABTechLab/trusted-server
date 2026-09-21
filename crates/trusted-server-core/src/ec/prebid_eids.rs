@@ -166,9 +166,18 @@ pub fn ingest_eid_cookies(
 }
 
 /// Collects validated request-local partner updates without performing KV I/O.
-pub(crate) fn collect_eid_cookie_updates(
+///
+/// `body_eids` is the current request's own EIDs (e.g. an `/auction` JSON
+/// body), when the route captured any. It is applied after the `ts-eids`
+/// cookie so it wins on conflicts: the cookie is size-capped by the browser
+/// (see `MAX_EID_COOKIE_BYTES` in the TSJS Prebid integration) and may be
+/// missing partners the request body still carries in full. The `sharedId`
+/// cookie is applied last, unaffected by `body_eids`, preserving its existing
+/// override behavior.
+pub(crate) fn collect_eid_updates(
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
+    body_eids: Option<&[Eid]>,
     registry: &PartnerRegistry,
 ) -> Vec<PartnerIdUpdate> {
     if registry.is_empty() {
@@ -178,6 +187,9 @@ pub(crate) fn collect_eid_cookie_updates(
     let mut updates = Vec::new();
     if let Some(cookie) = eids_cookie {
         updates.extend(collect_prebid_eid_updates(cookie, registry));
+    }
+    if let Some(eids) = body_eids {
+        updates.extend(collect_prebid_eid_updates_from_eids(eids, registry));
     }
     if let Some(cookie) = sharedid_cookie
         && let Some(update) = collect_sharedid_update(cookie, registry)
@@ -210,7 +222,7 @@ fn ingest_eid_cookies_with_writer(
     writer: &dyn PartnerIdBulkWriter,
     registry: &PartnerRegistry,
 ) {
-    let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
+    let updates = collect_eid_updates(eids_cookie, sharedid_cookie, None, registry);
     if updates.is_empty() {
         return;
     }
@@ -715,13 +727,13 @@ mod tests {
     }
 
     #[test]
-    fn collect_eid_cookie_updates_merges_prebid_and_sharedid_without_kv() {
+    fn collect_eid_updates_merges_prebid_and_sharedid_without_kv() {
         let registry = make_registry(vec![("id5", "id5-sync.com"), ("sharedid", "sharedid.org")]);
         let eids_cookie = encode_json(&json!([
             {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some(" shared-1 "), &registry);
+        let updates = collect_eid_updates(Some(&eids_cookie), Some(" shared-1 "), None, &registry);
 
         assert_eq!(
             updates.len(),
@@ -733,13 +745,56 @@ mod tests {
     }
 
     #[test]
-    fn collect_eid_cookie_updates_empty_registry_returns_no_updates() {
+    fn collect_eid_updates_body_eids_ingest_partners_the_cookie_trimmed() {
+        // Simulates a `ts-eids` cookie that the browser trimmed to fit
+        // `MAX_EID_COOKIE_BYTES`, dropping the `liveramp.com` source, while
+        // the `/auction` request body still carried it (and the newer,
+        // updated `id5-sync.com` uid) in full.
+        let registry = make_registry(vec![("id5", "id5-sync.com"), ("liveramp", "liveramp.com")]);
+        let eids_cookie = encode_json(&json!([
+            {"source": "id5-sync.com", "uids": [{"id": "ID5_stale", "atype": 1}]}
+        ]));
+        let body_eids = vec![
+            Eid {
+                source: "id5-sync.com".to_owned(),
+                uids: vec![Uid {
+                    id: "ID5_fresh".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            },
+            Eid {
+                source: "liveramp.com".to_owned(),
+                uids: vec![Uid {
+                    id: "LR_xyz".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+            },
+        ];
+
+        let updates = collect_eid_updates(Some(&eids_cookie), None, Some(&body_eids), &registry);
+
+        assert_eq!(
+            updates,
+            vec![
+                PartnerIdUpdate::new("id5-sync.com", "ID5_fresh"),
+                PartnerIdUpdate::new("liveramp.com", "LR_xyz"),
+            ],
+            "body EIDs should ingest every configured partner present in the \
+             request, including the one the cookie trimmed, and should win \
+             over a stale cookie value for a partner both carry"
+        );
+    }
+
+    #[test]
+    fn collect_eid_updates_empty_registry_returns_no_updates() {
         let registry = PartnerRegistry::empty();
         let eids_cookie = encode_json(&json!([
             {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some("shared-1"), &registry);
+        let updates = collect_eid_updates(Some(&eids_cookie), Some("shared-1"), None, &registry);
 
         assert!(
             updates.is_empty(),

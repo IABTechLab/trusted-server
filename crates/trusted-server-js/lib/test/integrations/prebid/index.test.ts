@@ -1551,6 +1551,49 @@ describe('prebid/installPrebidNpm', () => {
       ]);
     });
 
+    it('trims an oversized ts-eids cookie deterministically and warns which sources were dropped', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      // A long uid value per source makes the encoded payload exceed
+      // MAX_EID_COOKIE_BYTES (3072) once several sources are present, the
+      // same way a real page with many ID modules would.
+      const longUid = 'x'.repeat(400);
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'id5-sync.com', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'liveramp.com', uids: [{ id: longUid, atype: 3 }] },
+        { source: 'criteo.com', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'uidapi.com', uids: [{ id: longUid, atype: 3 }] },
+        { source: 'pubcid.org', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'sharedid.org', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'dropped.example', uids: [{ id: longUid, atype: 1 }] },
+      ]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(cookieValue!.length).toBeLessThanOrEqual(3072);
+
+      const persistedSources = (JSON.parse(atob(cookieValue!)) as Array<{ source: string }>).map(
+        (eid) => eid.source
+      );
+      expect(persistedSources).not.toContain('dropped.example');
+      expect(persistedSources).toContain('id5-sync.com');
+
+      const warnedMessage = warnSpy.mock.calls
+        .map((call) => call.at(-1))
+        .find(
+          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
+        );
+      expect(warnedMessage).toBeDefined();
+      expect(warnedMessage).toContain('dropped.example');
+    });
+
     it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
       document.cookie = `ts-eids=${btoa(JSON.stringify([{ source: 'sharedid.org', uids: [{ id: 'stale' }] }]))}`;
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {

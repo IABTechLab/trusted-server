@@ -298,6 +298,12 @@ pub async fn handle_auction(
     } else {
         None
     };
+    // Carry the full request-local EID set to response finalization so KV
+    // ingestion uses what this request actually sent, not just whatever fits
+    // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
+    if let Some(eids) = &client_eids {
+        ec_context.set_client_eids(eids.clone());
+    }
 
     // Resolve partner EIDs from the KV identity graph when the user has a valid
     // EC and both KV and partner stores are available. Gate the read on a
@@ -793,6 +799,98 @@ mod tests {
             stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
             Some("shared-cookie-id"),
             "the sharedId update must still be ingested from the shared snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
+        // Regression test for #1184: `/auction` sends every EID it has in the
+        // request body, but response finalization used to ingest identity
+        // graph updates only from the `ts-eids` cookie — which the browser
+        // caps in size and may not have sent at all. `handle_auction` must
+        // hand its parsed body EIDs to `ec_context` so finalization ingests
+        // them regardless of what the cookie carried.
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            had_eids: Arc::new(std::sync::Mutex::new(None)),
+        }));
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("id5-sync.com")])
+            .expect("should build partner registry");
+
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.eidbdy", "a".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph.create(&ec_id, &live).expect("should seed live row");
+
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ],
+                    "eids": [
+                        {"source": "id5-sync.com", "uids": [{"id": "ID5_from_body", "atype": 1}]}
+                    ]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // The capturing provider deliberately fails its launch; identity
+        // resolution — the subject of this test — completes before dispatch.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        assert_eq!(
+            ec_context.client_eids().map(|eids| eids
+                .iter()
+                .map(|eid| eid.source.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["id5-sync.com"]),
+            "the endpoint must hand its parsed body EIDs to the request context"
+        );
+
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None, // No `ts-eids` cookie on this request at all.
+            None,
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should exist");
+        assert_eq!(
+            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
+            Some("ID5_from_body"),
+            "the body's EID must be ingested into KV without a ts-eids cookie"
         );
     }
 
