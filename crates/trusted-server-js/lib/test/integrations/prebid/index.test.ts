@@ -22,9 +22,21 @@ function apsRenderer() {
  * build-prebid-external.mjs). Individual tests override and restore it.
  */
 const DEFAULT_BUNDLE_MANIFEST = {
-  adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-  bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-  userIdModules: ['sharedIdSystem'],
+  schemaVersion: 1,
+  modules: {
+    bidder: [
+      'rubiconBidAdapter',
+      'openxBidAdapter',
+      'exampleBrowserBidAdapter',
+      'appnexusBidAdapter',
+    ],
+    userId: ['sharedIdSystem'],
+    analytics: [],
+  },
+  runtimeCodes: {
+    bidder: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+    analytics: [],
+  },
 };
 
 /** Loose bid shape used by the requestBids shim tests. */
@@ -174,9 +186,21 @@ const {
   };
   w.pbjs = mockPbjs;
   w.__tsjs_prebid_bundle = {
-    adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-    bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-    userIdModules: ['sharedIdSystem'],
+    schemaVersion: 1,
+    modules: {
+      bidder: [
+        'rubiconBidAdapter',
+        'openxBidAdapter',
+        'exampleBrowserBidAdapter',
+        'appnexusBidAdapter',
+      ],
+      userId: ['sharedIdSystem'],
+      analytics: [],
+    },
+    runtimeCodes: {
+      bidder: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+      analytics: [],
+    },
   };
 
   return {
@@ -422,6 +446,7 @@ describe('prebid/installPrebidNpm', () => {
     mockGetUserIdsAsEids.mockReturnValue([]);
     mockGetConfig.mockReset();
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
     delete testWindow.__tsjs_prebid;
     delete testWindow.__tsjs_prebid_diagnostics;
     delete testWindow.tsjs;
@@ -848,6 +873,71 @@ describe('prebid/installPrebidNpm', () => {
       configuredUserIdNames: [],
       missingConfiguredUserIdNames: [],
     });
+  });
+
+  it('keeps User ID diagnostics when runtimeCodes is malformed', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: DEFAULT_BUNDLE_MANIFEST.modules,
+      runtimeCodes: null,
+    };
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: ['sharedIdSystem'],
+      configuredUserIdNames: [],
+      missingConfiguredUserIdNames: [],
+    });
+  });
+
+  it('treats a non-object modules container independently from runtime codes', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: null,
+      runtimeCodes: DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [{ name: 'sharedId' }] : {}
+    );
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules.includedModules).toEqual([]);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects the whole User ID list while preserving valid bidder runtime codes', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        userId: ['sharedIdSystem', 42],
+      },
+      runtimeCodes: DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [{ name: 'sharedId' }] : {}
+    );
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: [],
+      configuredUserIdNames: ['sharedId'],
+      missingConfiguredUserIdNames: [],
+    });
+    expect(
+      warnSpy.mock.calls.some(([message]) =>
+        String(message).includes('did not stamp a User ID module manifest')
+      )
+    ).toBe(true);
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it('refreshes late User ID config without repeating missing-module warnings', () => {
@@ -5479,8 +5569,14 @@ describe('prebid/client-side bidders', () => {
     // rubicon is compiled into the external bundle, but openx is not
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
-      adapters: ['rubicon'],
-      bidderCodes: ['rubicon'],
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        bidder: ['rubiconBidAdapter'],
+      },
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['rubicon'],
+      },
     };
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['rubicon', 'openx'],
@@ -5507,7 +5603,9 @@ describe('prebid/client-side bidders', () => {
     // The error should point at the operator surface: the CLI config key,
     // not the internal build script.
     const pointsAtBundleConfig = errorCalls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle].adapters'))
+      args.some(
+        (a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle.modules].bidder')
+      )
     );
     expect(pointsAtBundleConfig).toBe(true);
 
@@ -5521,13 +5619,19 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
-  it('accepts alias bidder codes stamped in bidderCodes', () => {
-    // The adf module registers adf plus the adform/adformOpenRTB aliases;
-    // the module-name list alone would flag them as missing.
+  it('accepts alias bidder runtime codes', () => {
+    // The adfBidAdapter module registers adf plus the adform and
+    // adformOpenRTB aliases. The module stem alone would flag them as missing.
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
-      adapters: ['adf'],
-      bidderCodes: ['adf', 'adform', 'adformOpenRTB'],
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        bidder: ['adfBidAdapter'],
+      },
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['adf', 'adform', 'adformOpenRTB'],
+      },
     };
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['adform'],
@@ -5554,8 +5658,14 @@ describe('prebid/client-side bidders', () => {
     // must be flagged even though the module itself is compiled in.
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
-      adapters: ['a1Media'],
-      bidderCodes: ['a1media'],
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        bidder: ['a1MediaBidAdapter'],
+      },
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['a1media'],
+      },
     };
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['a1Media'],
@@ -5579,9 +5689,21 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
-  it('treats a malformed manifest as unstamped instead of throwing', () => {
-    // The manifest is a plain window global any page script can overwrite.
-    testWindow.__tsjs_prebid_bundle = { adapters: 'rubicon', userIdModules: 42 };
+  it.each([
+    null,
+    [],
+    {},
+    { schemaVersion: 0 },
+    { schemaVersion: 2 },
+    { schemaVersion: '1' },
+    {
+      adapters: ['rubicon'],
+      bidderCodes: ['rubicon'],
+      userIdModules: ['sharedIdSystem'],
+    },
+    { adapters: 'rubicon', userIdModules: 42 },
+  ])('treats unsupported manifest %# as unstamped instead of throwing', (manifest) => {
+    testWindow.__tsjs_prebid_bundle = manifest;
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['rubicon'],
       serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
@@ -5592,7 +5714,11 @@ describe('prebid/client-side bidders', () => {
     expect(() => installPrebidNpm()).not.toThrow();
 
     const hasManifestWarn = warnSpy.mock.calls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('did not stamp an adapter manifest'))
+      args.some(
+        (a) =>
+          typeof a === 'string' &&
+          a.includes('did not stamp a supported bidder runtime-code manifest')
+      )
     );
     expect(hasManifestWarn).toBe(true);
 
@@ -5600,7 +5726,35 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
-  it('warns when the external bundle stamped no adapter manifest', () => {
+  it('rejects a whole mixed bidder list while preserving module lists', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: DEFAULT_BUNDLE_MANIFEST.modules,
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['rubicon', 42],
+      },
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    expect(
+      warnSpy.mock.calls.some((args) =>
+        args.some(
+          (value) =>
+            typeof value === 'string' &&
+            value.includes('did not stamp a supported bidder runtime-code manifest')
+        )
+      )
+    ).toBe(true);
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules.includedModules).toEqual([
+      'sharedIdSystem',
+    ]);
+  });
+
+  it('warns when the external bundle stamped no bidder runtime-code manifest', () => {
     delete testWindow.__tsjs_prebid_bundle;
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['rubicon'],
@@ -5612,7 +5766,11 @@ describe('prebid/client-side bidders', () => {
     installPrebidNpm();
 
     const hasManifestWarn = warnSpy.mock.calls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('did not stamp an adapter manifest'))
+      args.some(
+        (a) =>
+          typeof a === 'string' &&
+          a.includes('did not stamp a supported bidder runtime-code manifest')
+      )
     );
     expect(hasManifestWarn).toBe(true);
 
