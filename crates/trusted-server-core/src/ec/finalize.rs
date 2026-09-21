@@ -10,6 +10,7 @@ use error_stack::Report;
 use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
+use crate::consent::gate_eids_by_consent;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -70,10 +71,10 @@ pub fn ec_finalize_response(
     // Returning user: consent is granted and EC came from request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
-            let updates = collect_eid_updates(
+            let updates = collect_consent_gated_eid_updates(
                 eids_cookie,
                 sharedid_cookie,
-                ec_context.client_eids(),
+                ec_context,
                 registry,
             );
             let snapshot = graph.upsert_partner_ids_from_snapshot(
@@ -105,12 +106,8 @@ pub fn ec_finalize_response(
             return;
         };
 
-        let updates = collect_eid_updates(
-            eids_cookie,
-            sharedid_cookie,
-            ec_context.client_eids(),
-            registry,
-        );
+        let updates =
+            collect_consent_gated_eid_updates(eids_cookie, sharedid_cookie, ec_context, registry);
         let snapshot = graph.upsert_partner_ids_from_snapshot(
             &ec_id,
             &updates,
@@ -123,6 +120,32 @@ pub fn ec_finalize_response(
             log::warn!("Skipping generated EC cookie because backing row is not authoritative");
         }
     }
+}
+
+/// Collects EID-derived KV updates and applies TCF Purpose 4 (personalized
+/// ads) consent gating on top of the Purpose 1 (EC) gate `ec_finalize_response`
+/// already enforces before reaching this point.
+///
+/// `consent_allows_ec` only requires Purpose 1 (device storage), but EIDs
+/// additionally require Purpose 4 before they may be transmitted — the same
+/// rule [`gate_eids_by_consent`](crate::consent::gate_eids_by_consent) applies
+/// to the outbound `/auction` bid request. Without this, a user who denies
+/// Purpose 4 would have their EIDs correctly stripped from the bid request
+/// but still written to the identity graph from the `ts-eids`/`sharedId`
+/// cookies or the `/auction` request body.
+fn collect_consent_gated_eid_updates(
+    eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
+    ec_context: &EcContext,
+    registry: &PartnerRegistry,
+) -> Vec<super::kv::PartnerIdUpdate> {
+    let updates = collect_eid_updates(
+        eids_cookie,
+        sharedid_cookie,
+        ec_context.client_eids(),
+        registry,
+    );
+    gate_eids_by_consent(Some(updates), Some(ec_context.consent())).unwrap_or_default()
 }
 
 fn recover_orphaned_ec(
@@ -406,7 +429,7 @@ mod tests {
 
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
-    use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
     use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -1097,6 +1120,95 @@ mod tests {
             stored.ids.get("liveramp.com").map(|id| id.uid.as_str()),
             Some("LR_from_body"),
             "a partner the cookie trimmed must still be ingested from the body"
+        );
+    }
+
+    #[test]
+    fn finalize_withholds_eid_kv_writes_when_purpose_four_is_denied() {
+        // A GDPR user can grant TCF Purpose 1 (storage/EC) while denying
+        // Purpose 4 (personalized ads). `gate_eids_by_consent` already strips
+        // EIDs from the outbound /auction bid request in that case; the KV
+        // write path must apply the same Purpose 4 check, or a user's opt-out
+        // is silently ignored for what gets persisted to the identity graph.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("purp4x");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let purpose1_only_consent = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                // Purpose 1 (index 0) granted; Purpose 4 (index 3) denied.
+                purpose_consents: {
+                    let mut purposes = vec![false; 24];
+                    purposes[0] = true;
+                    purposes
+                },
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let live = KvEntry::new(
+            &purpose1_only_consent,
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row this request updates");
+        let mut ec_context = EcContext::new_for_test_with_cookie(
+            Some(ec_id.clone()),
+            Some(ec_id.clone()),
+            true,
+            false,
+            purpose1_only_consent,
+        );
+        ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
+            ec_id: ec_id.clone(),
+        });
+        ec_context.set_client_eids(vec![Eid {
+            source: "id5-sync.com".to_owned(),
+            uids: vec![Uid {
+                id: "ID5_should_not_persist".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }]);
+        let partners = vec![make_partner("id5-sync.com")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert!(
+            !stored.ids.contains_key("id5-sync.com"),
+            "denying TCF Purpose 4 must keep the EID out of KV even though Purpose 1 \
+             (EC) consent is granted"
         );
     }
 
