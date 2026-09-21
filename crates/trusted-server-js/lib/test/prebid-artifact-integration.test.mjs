@@ -183,6 +183,7 @@ describe('external bundle + served shim evaluated together', () => {
             {
               bidder: 'trustedServer',
               params: {
+                storedRequest: undefined,
                 bidderParams: {
                   appnexus: { placementId: 1 },
                   pbsProviderId: { placementId: 2 },

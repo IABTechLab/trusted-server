@@ -270,6 +270,9 @@ enum StoredRequestIntent {
 }
 
 impl StoredRequestIntent {
+    /// Legacy fallback retains original candidate presence after overrides.
+    /// Usable overrides become inline demand; candidates still empty afterward
+    /// preserve the pre-intent stored fallback behavior.
     fn allows_fallback(self, has_candidates: bool) -> bool {
         match self {
             Self::Disabled => false,

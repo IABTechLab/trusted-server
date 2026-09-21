@@ -134,10 +134,12 @@ Bidder keys still resolve through the server's `[auction.bidders]` routes.
 | Omitted                | Preserve legacy inference for existing callers and server-generated opportunities. Missing, `null`, or empty `bidderParams` permits stored demand; routed empty bidder objects also retain fallback after overrides. |
 
 `storedRequest: null` is invalid, as are strings, numbers, arrays, and objects.
-An invalid value rejects the whole envelope, including its inline params and zone,
-and increments the malformed-envelope diagnostic. Independent valid direct bidder
-entries and eligible non-PBS providers still run; this is not whole-request HTTP
-rejection. An absent or empty `bids` list also retains legacy stored inference.
+JavaScript `undefined` is removed by JSON serialization, so the server receives an
+omitted value and applies legacy inference. An invalid serialized value rejects the
+whole envelope, including its inline params and zone, and increments the
+malformed-envelope diagnostic. Independent valid direct bidder entries and eligible
+non-PBS providers still run; this is not whole-request HTTP rejection. An absent or
+empty `bids` list also retains legacy stored inference.
 
 PBS applies provider-local overrides before checking inline demand. If no usable
 inline params remain, it uses stored demand only when permitted, otherwise it

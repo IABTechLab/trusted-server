@@ -294,10 +294,10 @@ impl GenericOpenRtbProvider {
         )? {
             OpenRtbBuildOutcome::Ready(request) => request,
             OpenRtbBuildOutcome::NoImpressions => {
-                return Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
-                    self.provider_name(),
-                    0,
-                )));
+                return Ok(ProviderRequestOutcome::Immediate(
+                    AuctionResponse::no_bid(self.provider_name(), 0)
+                        .with_metadata("routing", json!({"skipped_no_usable_demand": true})),
+                ));
             }
         };
 

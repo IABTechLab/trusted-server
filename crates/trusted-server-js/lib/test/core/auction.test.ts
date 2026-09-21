@@ -91,7 +91,7 @@ describe('auction/buildAdRequest', () => {
   });
 
   it.each([{}, { storedRequest: false }, { storedRequest: true }, { storedRequest: null }])(
-    'retains stored intent presence in serialized shared requests: %j',
+    'passes bid params through verbatim in serialized shared requests: %j',
     (intent) => {
       const params = { bidderParams: {}, ...intent };
       for (const input of [
@@ -103,6 +103,18 @@ describe('auction/buildAdRequest', () => {
       }
     }
   );
+
+  it('omits explicitly undefined bid params from serialized shared requests', () => {
+    const params = { bidderParams: {}, storedRequest: undefined };
+    for (const input of [
+      [{ code: 'example-slot', bids: [{ bidder: 'trustedServer', params }] }],
+      [{ adUnitCode: 'example-slot', bidder: 'trustedServer', params }],
+    ]) {
+      const wire = JSON.parse(JSON.stringify(buildAdRequest(input)));
+      expect(wire.adUnits[0].bids[0].params).toEqual({ bidderParams: {} });
+      expect(wire.adUnits[0].bids[0].params).not.toHaveProperty('storedRequest');
+    }
+  });
 
   it('handles empty units array', () => {
     const result = buildAdRequest([]);
