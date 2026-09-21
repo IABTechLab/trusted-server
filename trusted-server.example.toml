@@ -366,8 +366,9 @@ auction_timeout_ms = 500
 # With both lists empty, false bypasses all Cookie headers, as before.
 # An origin `Vary: Cookie` is always refused, regardless of these settings.
 # origin_is_cookie_independent = false
-# Invalid names, duplicates, and cross-list overlap reject configuration.
-# Named policies bypass ambiguous/nonconforming Cookie fields, including duplicates.
+# Invalid names, duplicates, cross-list overlap, and TS identity cookies in the
+# key list reject configuration. Named policies bypass ambiguous/nonconforming
+# Cookie fields, including duplicate key cookies.
 # If a downstream CDN maps ab_bucket to X-Exp-Variant, also add x-exp-variant to
 # template_cache_vary; that header alone cannot separate arms at TS.
 # Rollback: older binaries reject both new fields even as empty lists. Remove

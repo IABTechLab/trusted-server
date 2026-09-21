@@ -16,7 +16,8 @@ pub(crate) enum TemplateCookieDecision {
 ///
 /// # Errors
 ///
-/// Returns an error naming the field and cookie when a name is invalid or repeated.
+/// Returns an error naming the field and cookie when a name is invalid or repeated,
+/// or when the key list names a Trusted Server identity cookie.
 pub(crate) fn validate_cookie_names(
     key_names: &[String],
     bypass_names: &[String],

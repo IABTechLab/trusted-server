@@ -478,7 +478,8 @@ impl CreativeOpportunitiesConfig {
     /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
     /// blank but consumed by a default path or `{network_id}` template; when a
     /// slot has an invalid identifier, page pattern set, format list, or
-    /// dimensions; when cookie policy names are invalid, duplicated, or overlapping;
+    /// dimensions; when cookie policy names are invalid, duplicated, or overlapping,
+    /// or when the key list names a Trusted Server identity cookie;
     /// when `template_cache_max_age_seconds` falls outside 1–86,400;
     /// when a `{section}` template lacks a valid
     /// [`section_root`](Self::section_root); or when configured values make a
