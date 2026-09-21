@@ -173,8 +173,12 @@ fn sanitize_section(segment: &str) -> String {
 /// The path is used **raw** (not percent-decoded) so this stays consistent with
 /// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
 /// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
+///
+/// Public so operator tooling that *infers* a `{section}` template from observed
+/// ad-unit paths can check its inference against the exact derivation the
+/// runtime will perform, rather than reimplementing the sanitization rules.
 #[must_use]
-fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
+pub fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
     match path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -334,26 +338,34 @@ pub struct CreativeOpportunitiesConfig {
     /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_max_age_seconds: Option<u32>,
-    /// Operator assertion that the origin's HTML does not depend on request cookies.
+    /// Named bounded cookie variants whose raw values enter the shared-template key.
     ///
-    /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
-    /// template cache, in both directions. That is safe and it is also very nearly a
-    /// disable switch: Trusted Server sets its own identity cookie, so essentially every
-    /// repeat visitor carries one. Left at the default, the cache can only ever serve
-    /// first-ever page views and cookie-less clients.
+    /// Cookie names are case-sensitive. Use experiment arms or region buckets, never
+    /// session tokens or reader IDs. Missing cookies and present-empty values differ.
+    /// Unset or empty adds no cookie dimensions and preserves the legacy policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_key_cookies: Option<Vec<String>>,
+    /// Cookie names whose presence forces inline processing, with no lookup or store.
     ///
-    /// Setting `true` asserts the origin serves the same HTML with or without cookies.
-    /// On the template cache path, an origin declaring `Vary: Cookie` still refuses
-    /// storage regardless of this flag or the configured key. Readthrough performs no
-    /// response-side check: when [`Self::origin_readthrough_enabled`] is also `true`,
-    /// cookie-bearing requests become eligible with no runtime guard on this assertion.
-    /// Verify the cookie axis specifically before enabling both flags.
+    /// Empty values still count as present. Names must be unique and must not overlap
+    /// [`Self::template_cache_key_cookies`]. Unset or empty means no bypass cookies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_bypass_cookies: Option<Vec<String>>,
+    /// Assertion that cookies outside the key and bypass lists do not affect origin HTML.
     ///
-    /// Verify rather than assume: `ts origin probe-shareability` compares the origin's
-    /// responses with and without a representative cookie jar and answers exactly this
-    /// question. See the configuration guide's template-cache section.
+    /// Defaults to false: any unlisted cookie disqualifies both lookup and storage.
+    /// With both lists empty, this retains the original all-cookie behavior. TS mints
+    /// its own identity cookie, so most repeat visitors bypass unless the operator can
+    /// safely assert independence. No identity or consent cookie is implicitly exempt.
     ///
-    /// Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Named bypass cookies always disqualify. On the template cache path, an origin's
+    /// `Vary: Cookie` still refuses storage regardless of this assertion or the key.
+    /// Readthrough performs no response-side check: when
+    /// [`Self::origin_readthrough_enabled`] is also `true`, otherwise eligible requests
+    /// with unlisted cookies rely on this assertion alone. Configured key-cookie
+    /// dimensions disable readthrough because its key does not include their values.
+    /// Verify the cookie axis with `ts origin probe-shareability` before enabling both
+    /// flags; see the configuration guide's template-cache section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
     /// Whether this origin's responses may be held in the platform's shared readthrough
@@ -373,6 +385,8 @@ pub struct CreativeOpportunitiesConfig {
     /// `Cache-Control` plus an operator's verification, so enabling it must be a
     /// deliberate act rather than a consequence of deploying.
     ///
+    /// Configured [`Self::template_cache_key_cookies`] disable readthrough because
+    /// its key does not include their values; template variants remain eligible.
     /// Verify with `ts origin probe-shareability` before setting this.
     ///
     /// Setting this back to `false` restores the existing ad-stack bypass policy, not
@@ -393,11 +407,10 @@ impl CreativeOpportunitiesConfig {
         self.assembly_mode.unwrap_or_default()
     }
 
-    /// Whether a cookie-bearing request may participate in the shared cache.
+    /// Whether unlisted request cookies are asserted irrelevant to origin HTML.
     ///
-    /// Defaults to `false`, which is the conservative reading and also the one that
-    /// makes the cache almost inert on real traffic. See
-    /// [`Self::origin_is_cookie_independent`].
+    /// Defaults to false. Named key cookies remain variant dimensions, and named
+    /// bypass cookies remain disqualifying regardless of this assertion.
     #[must_use]
     pub fn origin_is_cookie_independent(&self) -> bool {
         self.origin_is_cookie_independent.unwrap_or(false)
@@ -410,6 +423,22 @@ impl CreativeOpportunitiesConfig {
     #[must_use]
     pub fn origin_readthrough_enabled(&self) -> bool {
         self.origin_readthrough_enabled.unwrap_or(false)
+    }
+
+    /// Exact cookie names included as bounded shared-template key dimensions.
+    #[must_use]
+    pub fn template_cache_key_cookies(&self) -> &[String] {
+        self.template_cache_key_cookies
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Exact cookie names whose presence disqualifies shared-template caching.
+    #[must_use]
+    pub fn template_cache_bypass_cookies(&self) -> &[String] {
+        self.template_cache_bypass_cookies
+            .as_deref()
+            .unwrap_or_default()
     }
 
     /// Headers the cache key covers, per operator config.
@@ -497,11 +526,17 @@ impl CreativeOpportunitiesConfig {
     /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
     /// blank but consumed by a default path or `{network_id}` template; when a
     /// slot has an invalid identifier, page pattern set, format list, or
-    /// dimensions; when `template_cache_max_age_seconds` falls outside 1–86,400;
+    /// dimensions; when cookie policy names are invalid, duplicated, or overlapping,
+    /// or when the key list names a Trusted Server identity cookie;
+    /// when `template_cache_max_age_seconds` falls outside 1–86,400;
     /// when a `{section}` template lacks a valid
     /// [`section_root`](Self::section_root); or when configured values make a
     /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
+        crate::cookies::template_cache_policy::validate_cookie_names(
+            self.template_cache_key_cookies(),
+            self.template_cache_bypass_cookies(),
+        )?;
         if self
             .template_cache_max_age_seconds
             .is_some_and(|seconds| !(1..=MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS).contains(&seconds))
@@ -743,15 +778,7 @@ impl CreativeOpportunitySlot {
         // skip `compile_patterns`). Re-compiles on every call.
         self.page_patterns
             .iter()
-            .any(|pattern| match Pattern::new(pattern) {
-                Ok(p) => p.matches(path),
-                Err(_) => {
-                    let normalised = pattern.replace("**", "*");
-                    Pattern::new(&normalised)
-                        .map(|p| p.matches(path))
-                        .unwrap_or(false)
-                }
-            })
+            .any(|pattern| compile_page_pattern(pattern).is_ok_and(|p| p.matches(path)))
     }
 
     /// Compile [`page_patterns`](Self::page_patterns) into the
@@ -768,22 +795,20 @@ impl CreativeOpportunitySlot {
         self.compiled_patterns = self
             .page_patterns
             .iter()
-            .filter_map(|pattern| {
-                match Pattern::new(pattern).or_else(|_| Pattern::new(&pattern.replace("**", "*"))) {
-                    Ok(compiled) => Some(compiled),
-                    Err(_) => {
-                        // Build-time validation only requires *one* valid pattern
-                        // per slot, so a mixed valid/invalid set passes the build
-                        // with the bad pattern silently dropped here. Warn so the
-                        // operator can see the slot matches fewer pages than
-                        // configured.
-                        log::warn!(
-                            "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
-                            self.id,
-                            pattern
-                        );
-                        None
-                    }
+            .filter_map(|pattern| match compile_page_pattern(pattern) {
+                Ok(compiled) => Some(compiled),
+                Err(error) => {
+                    // Build-time validation only requires *one* valid pattern
+                    // per slot, so a mixed valid/invalid set passes the build
+                    // with the bad pattern silently dropped here. Warn so the
+                    // operator can see the slot matches fewer pages than
+                    // configured.
+                    log::warn!(
+                        "slot `{}`: dropping page pattern '{}': {error}",
+                        self.id,
+                        pattern
+                    );
+                    None
                 }
             })
             .collect();
@@ -1036,6 +1061,48 @@ pub struct PrebidSlotParams {
     pub bidders: HashMap<String, serde_json::Value>,
 }
 
+/// Compiles a [`page_patterns`](CreativeOpportunitySlot::page_patterns) entry
+/// using the runtime's normalisation.
+///
+/// This is the single definition of what the runtime accepts as a page glob:
+/// a direct [`Pattern::new`], falling back to the `**`→`*` rewrite that
+/// [`CreativeOpportunitySlot::compile_patterns`] and
+/// [`matches_path`](CreativeOpportunitySlot::matches_path) apply.
+///
+/// # Errors
+///
+/// Returns an error string when the pattern compiles neither directly nor after
+/// normalisation.
+pub(crate) fn compile_page_pattern(pattern: &str) -> Result<Pattern, String> {
+    Pattern::new(pattern)
+        .or_else(|_| Pattern::new(&pattern.replace("**", "*")))
+        .map_err(|error| format!("page pattern '{pattern}' is not a valid glob: {error}"))
+}
+
+/// Validates a [`page_patterns`](CreativeOpportunitySlot::page_patterns) entry
+/// using the runtime's normalisation.
+///
+/// This exposes validation without leaking the runtime's `glob::Pattern` type
+/// into the public API.
+///
+/// # Errors
+///
+/// Returns an error string when the pattern compiles neither directly nor after
+/// the runtime's `**` to `*` normalisation.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::creative_opportunities::validate_page_pattern;
+///
+/// assert!(validate_page_pattern("/news/*").is_ok());
+/// assert!(validate_page_pattern("/20**").is_ok());
+/// assert!(validate_page_pattern("[").is_err());
+/// ```
+pub fn validate_page_pattern(pattern: &str) -> Result<(), String> {
+    compile_page_pattern(pattern).map(|_| ())
+}
+
 /// Validates that a slot ID contains only safe characters.
 ///
 /// Allowed characters: ASCII alphanumerics, underscores (`_`), and hyphens (`-`).
@@ -1068,6 +1135,151 @@ pub fn match_slots<'a>(
     slots.iter().filter(|s| s.matches_path(path)).collect()
 }
 
+/// Three-state outcome of the server-side ad-stack gate.
+///
+/// [`Yes`](RuntimeAdStackExpected::Yes) and [`No`](RuntimeAdStackExpected::No)
+/// are decided purely from known inputs; [`Unknown`](RuntimeAdStackExpected::Unknown)
+/// is reserved for callers (such as the operator CLI) that cannot prove the live
+/// consent state and pass `None` for `consent_allows_auction`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimeAdStackExpected {
+    /// All known gates pass and consent is known to allow the auction.
+    Yes,
+    /// At least one known gate blocks the server-side ad stack.
+    No,
+    /// All known gates pass but consent is unproven.
+    Unknown,
+}
+
+/// Identifies a single gate evaluated by [`evaluate_ad_stack_gate`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AdStackGateName {
+    /// Request method is `GET`.
+    MethodGet,
+    /// Request is a top-level navigation.
+    Navigation,
+    /// Request is not a prefetch.
+    NotPrefetch,
+    /// Request is not from a known bot.
+    NotBot,
+    /// At least one configured slot matches the request path.
+    MatchedSlots,
+    /// Consent is known to allow the auction.
+    ConsentAllowsAuction,
+    /// The global `[auction].enabled` kill switch is on.
+    AuctionEnabled,
+    /// The `[creative_opportunities].enabled` template switch is on.
+    AdTemplatesEnabled,
+}
+
+impl AdStackGateName {
+    const ALL: [Self; 8] = [
+        Self::MethodGet,
+        Self::Navigation,
+        Self::NotPrefetch,
+        Self::NotBot,
+        Self::MatchedSlots,
+        Self::ConsentAllowsAuction,
+        Self::AuctionEnabled,
+        Self::AdTemplatesEnabled,
+    ];
+
+    fn blocks(self, input: AdStackGateInput) -> bool {
+        match self {
+            Self::MethodGet => !input.method_get,
+            Self::Navigation => !input.navigation,
+            Self::NotPrefetch => input.prefetch,
+            Self::NotBot => input.bot,
+            Self::MatchedSlots => !input.matched_slots,
+            Self::ConsentAllowsAuction => input.consent_allows_auction == Some(false),
+            Self::AuctionEnabled => !input.auction_enabled,
+            Self::AdTemplatesEnabled => !input.ad_templates_enabled,
+        }
+    }
+}
+
+/// Inputs to [`evaluate_ad_stack_gate`].
+///
+/// `consent_allows_auction` is tri-state: `Some(true)` allows, `Some(false)`
+/// blocks, and `None` means the caller cannot prove the consent state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AdStackGateInput {
+    /// Request method is `GET`.
+    pub method_get: bool,
+    /// Request is a top-level navigation.
+    pub navigation: bool,
+    /// Request advertises itself as a prefetch.
+    pub prefetch: bool,
+    /// Request is from a known bot.
+    pub bot: bool,
+    /// At least one configured slot matches the request path.
+    pub matched_slots: bool,
+    /// Whether consent allows the auction.
+    ///
+    /// `Some(true)` allows the auction, `Some(false)` blocks it, and `None`
+    /// means the caller cannot prove either state. Unknown consent is not a
+    /// denial: it produces [`RuntimeAdStackExpected::Unknown`] when every known
+    /// boolean gate passes.
+    pub consent_allows_auction: Option<bool>,
+    /// The global `[auction].enabled` kill switch.
+    pub auction_enabled: bool,
+    /// The `[creative_opportunities].enabled` template switch.
+    ///
+    /// `false` whenever creative opportunities are absent from the
+    /// configuration, so an unconfigured publisher blocks here as well.
+    pub ad_templates_enabled: bool,
+}
+
+/// Result of [`evaluate_ad_stack_gate`]: the three-state expectation plus the
+/// original inputs used to derive per-gate diagnostics on demand.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdStackGateResult {
+    /// The three-state ad-stack expectation.
+    pub expected: RuntimeAdStackExpected,
+    input: AdStackGateInput,
+}
+
+impl AdStackGateResult {
+    /// Returns the gates that blocked the server-side ad stack.
+    pub fn blocking_gates(&self) -> impl Iterator<Item = AdStackGateName> + '_ {
+        AdStackGateName::ALL
+            .into_iter()
+            .filter(|gate| gate.blocks(self.input))
+    }
+}
+
+/// Evaluates whether the server-side ad stack should run for a request.
+///
+/// Any known gate that fails sets [`No`](RuntimeAdStackExpected::No) and is
+/// recorded in [`AdStackGateResult::blocking_gates`]. When no known gate blocks,
+/// the result is [`Yes`](RuntimeAdStackExpected::Yes) if consent is known to
+/// allow the auction, or [`Unknown`](RuntimeAdStackExpected::Unknown) when
+/// `consent_allows_auction` is `None`.
+///
+/// Gate polarity mirrors the runtime publisher path: `method_get`, `navigation`,
+/// `matched_slots`, `auction_enabled`, and `ad_templates_enabled` block when
+/// `false`; `prefetch` and `bot` block when `true`.
+#[must_use]
+pub fn evaluate_ad_stack_gate(input: AdStackGateInput) -> AdStackGateResult {
+    let known_gate_blocks = !input.method_get
+        || !input.navigation
+        || input.prefetch
+        || input.bot
+        || !input.matched_slots
+        || input.consent_allows_auction == Some(false)
+        || !input.auction_enabled
+        || !input.ad_templates_enabled;
+    let expected = if known_gate_blocks {
+        RuntimeAdStackExpected::No
+    } else if input.consent_allows_auction.is_none() {
+        RuntimeAdStackExpected::Unknown
+    } else {
+        RuntimeAdStackExpected::Yes
+    };
+
+    AdStackGateResult { expected, input }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1082,6 +1294,159 @@ mod tests {
     };
     use crate::auction::routing::route_auction;
     use crate::auction::types::{AuctionRequest, PublisherInfo, UserInfo};
+
+    #[test]
+    fn ad_stack_gate_passes_for_eligible_navigation() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: true,
+            ad_templates_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Yes);
+        assert_eq!(result.blocking_gates().count(), 0);
+    }
+
+    #[test]
+    fn ad_stack_gate_blocks_known_kill_switch() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: false,
+            ad_templates_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::No);
+        assert!(
+            result
+                .blocking_gates()
+                .any(|gate| gate == AdStackGateName::AuctionEnabled)
+        );
+    }
+
+    #[test]
+    fn ad_stack_gate_blocks_disabled_ad_templates() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: true,
+            ad_templates_enabled: false,
+        });
+
+        assert_eq!(
+            result.expected,
+            RuntimeAdStackExpected::No,
+            "a disabled [creative_opportunities].enabled switch should block the ad stack"
+        );
+        assert!(
+            result
+                .blocking_gates()
+                .any(|gate| gate == AdStackGateName::AdTemplatesEnabled),
+            "the template switch should be named as the blocking gate"
+        );
+    }
+
+    #[test]
+    fn ad_stack_gate_is_unknown_when_consent_is_unknown() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: None,
+            auction_enabled: true,
+            ad_templates_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Unknown);
+    }
+
+    // Locks the spec §5.2 mirror invariant: with Some(consent) supplied for every
+    // input combination, `expected == Yes` must equal the legacy all-AND boolean.
+    #[test]
+    fn ad_stack_gate_with_known_consent_matches_legacy_boolean() {
+        for bits in 0u16..256 {
+            let input = AdStackGateInput {
+                method_get: bits & 1 != 0,
+                navigation: bits & 2 != 0,
+                prefetch: bits & 4 != 0,
+                bot: bits & 8 != 0,
+                matched_slots: bits & 16 != 0,
+                consent_allows_auction: Some(bits & 32 != 0),
+                auction_enabled: bits & 64 != 0,
+                ad_templates_enabled: bits & 128 != 0,
+            };
+            // Legacy semantics: all positive gates true, both negative gates false.
+            let legacy = input.method_get
+                && input.navigation
+                && !input.prefetch
+                && !input.bot
+                && input.matched_slots
+                && input.consent_allows_auction == Some(true)
+                && input.auction_enabled
+                && input.ad_templates_enabled;
+            let got = evaluate_ad_stack_gate(input).expected == RuntimeAdStackExpected::Yes;
+            assert_eq!(got, legacy, "gate mismatch for bits={bits}");
+        }
+    }
+
+    #[test]
+    fn ad_stack_gate_with_unknown_consent_matches_known_boolean_gates() {
+        for bits in 0u8..128 {
+            let input = AdStackGateInput {
+                method_get: bits & 1 != 0,
+                navigation: bits & 2 != 0,
+                prefetch: bits & 4 != 0,
+                bot: bits & 8 != 0,
+                matched_slots: bits & 16 != 0,
+                consent_allows_auction: None,
+                auction_enabled: bits & 32 != 0,
+                ad_templates_enabled: bits & 64 != 0,
+            };
+            let known_gates_pass = input.method_get
+                && input.navigation
+                && !input.prefetch
+                && !input.bot
+                && input.matched_slots
+                && input.auction_enabled
+                && input.ad_templates_enabled;
+            let expected = if known_gates_pass {
+                RuntimeAdStackExpected::Unknown
+            } else {
+                RuntimeAdStackExpected::No
+            };
+
+            assert_eq!(
+                evaluate_ad_stack_gate(input).expected,
+                expected,
+                "should match unknown-consent gate semantics for bits={bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_page_pattern_preserves_specific_compile_error() {
+        let error = validate_page_pattern("[").expect_err("should reject invalid glob");
+
+        assert!(
+            error.contains("page pattern '[' is not a valid glob"),
+            "should retain the invalid pattern in the error: {error}"
+        );
+    }
 
     fn make_slot(id: &str, patterns: Vec<&str>) -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
@@ -1396,6 +1761,8 @@ mod tests {
             assembly_mode: None,
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
+            template_cache_key_cookies: None,
+            template_cache_bypass_cookies: None,
             origin_is_cookie_independent: None,
             origin_readthrough_enabled: None,
             section_segment: None,
@@ -1799,6 +2166,8 @@ mod tests {
             assembly_mode: None,
             template_cache_vary: None,
             template_cache_max_age_seconds: None,
+            template_cache_key_cookies: None,
+            template_cache_bypass_cookies: None,
             origin_is_cookie_independent: None,
             origin_readthrough_enabled: None,
             section_segment: None,
@@ -2238,6 +2607,83 @@ mod tests {
                 .expect_err("authorization must not enter shared-template cache keys");
             assert!(err.contains("Authorization"), "unexpected error: {err}");
         }
+    }
+
+    #[test]
+    fn template_cookie_config_accepts_independent_lists_and_preserves_omission() {
+        for policy in [
+            "",
+            "template_cache_key_cookies = []\ntemplate_cache_bypass_cookies = []",
+            "template_cache_key_cookies = [\"ab_bucket\"]",
+            "template_cache_bypass_cookies = [\"session\"]",
+            "template_cache_key_cookies = [\"ab_bucket\"]\ntemplate_cache_bypass_cookies = []",
+            "template_cache_key_cookies = []\ntemplate_cache_bypass_cookies = [\"session\"]",
+            "template_cache_key_cookies = [\"ab_bucket\", \"Session\"]\ntemplate_cache_bypass_cookies = [\"session\"]",
+        ] {
+            let config: CreativeOpportunitiesConfig =
+                toml::from_str(&format!("gam_network_id = \"99999\"\n{policy}"))
+                    .expect("should deserialize optional cookie policies");
+            config
+                .validate_runtime()
+                .expect("should accept valid cookie names");
+            assert!(
+                !config.origin_is_cookie_independent(),
+                "should retain conservative default"
+            );
+            let serialized = serde_json::to_value(&config).expect("should serialize configuration");
+            for field in [
+                "template_cache_key_cookies",
+                "template_cache_bypass_cookies",
+            ] {
+                assert_eq!(
+                    serialized.get(field).is_some(),
+                    policy.contains(field),
+                    "should preserve omitted fields"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn template_cookie_config_rejects_invalid_duplicate_and_overlapping_names() {
+        for field in [
+            "template_cache_key_cookies",
+            "template_cache_bypass_cookies",
+        ] {
+            for names in [
+                vec![""],
+                vec!["bad name"],
+                vec!["a=b"],
+                vec!["a;b"],
+                vec!["é"],
+                vec!["a\t"],
+                vec!["a", "a"],
+            ] {
+                let value = serde_json::json!({"gam_network_id": "99999", (field): names});
+                let config: CreativeOpportunitiesConfig = serde_json::from_value(value)
+                    .expect("should deserialize names before validation");
+                let error = config
+                    .validate_runtime()
+                    .expect_err("should reject invalid or repeated cookie names");
+                assert!(
+                    error.contains(field),
+                    "should identify invalid policy field"
+                );
+            }
+        }
+        let config: CreativeOpportunitiesConfig = serde_json::from_value(serde_json::json!({
+            "gam_network_id": "99999",
+            "template_cache_key_cookies": ["session"],
+            "template_cache_bypass_cookies": ["session"]
+        }))
+        .expect("should deserialize overlapping lists before validation");
+        assert!(
+            config
+                .validate_runtime()
+                .expect_err("should reject overlapping policies")
+                .contains("session"),
+            "should identify overlapping name"
+        );
     }
 
     #[test]
