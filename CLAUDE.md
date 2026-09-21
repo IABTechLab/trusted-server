@@ -380,6 +380,8 @@ Every pull request must pass the gates in this section.
 - `cargo test --package trusted-server-openrtb-codegen --target $(rustc -vV | sed -n 's/host: //p')`
 - `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
 - `cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release`
+- `BID_DELAY=3 ./scripts/template-cache-local-test.sh esi`
+- `BID_DELAY=3 ./scripts/template-cache-local-test.sh inline`
 
 ## Manual documentation gates
 
