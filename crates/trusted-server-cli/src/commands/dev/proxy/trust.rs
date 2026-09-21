@@ -56,7 +56,11 @@ fn lock_file(path: &Path) -> Result<File> {
         .mode(0o600)
         .open(path)
         .change_context(TrustError::Io)?;
-    file.try_lock().change_context(TrustError::Busy)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(Report::new(TrustError::Busy)),
+        Err(err) => return Err(Report::new(err).change_context(TrustError::Io)),
+    }
     Ok(file)
 }
 
@@ -101,6 +105,7 @@ pub(super) fn import_firefox(profile: &Path, cert: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Platform trust contract: validate CA generation, install trust, and confirm removal.
 #[cfg(target_os = "linux")]
 pub(super) use linux::{ensure_can_generate, install, uninstall};
 
@@ -240,32 +245,6 @@ mod linux {
         Ok(())
     }
 
-    /// Reads nickname rows without losing embedded spaces. Malformed output fails closed.
-    fn nicknames(db: &str) -> Result<Vec<String>> {
-        let list = certutil(&["-L", "-d", db])?;
-        let text = String::from_utf8(list.stdout).change_context(TrustError::Command)?;
-        let mut names = Vec::new();
-        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            if line == "SSL,S/MIME,JAR/XPI"
-                || (line.starts_with("Certificate Nickname") && line.ends_with(" Trust Attributes"))
-            {
-                continue;
-            }
-            let (name, trust) = line.rsplit_once(char::is_whitespace).ok_or_else(|| {
-                Report::new(TrustError::Command).attach("invalid NSS nickname listing")
-            })?;
-            if trust.split(',').count() != 3
-                || !trust
-                    .bytes()
-                    .all(|byte| byte == b',' || byte.is_ascii_alphabetic())
-            {
-                return Err(Report::new(TrustError::Command).attach("invalid NSS trust attributes"));
-            }
-            names.push(name.trim_end().to_owned());
-        }
-        Ok(names)
-    }
-
     /// Returns exact NSS derSubject identity without applying CA reconstruction rules.
     /// Malformed DER or trailing data is an error, not a skipped certificate.
     fn subject(der: &[u8]) -> Result<Vec<u8>> {
@@ -278,28 +257,39 @@ mod linux {
         Ok(certificate.subject().as_raw().to_vec())
     }
 
-    /// NSS named exports include every certificate with the same subject.
-    /// Reject a different certificate with that subject before importing anything.
-    fn check_subject_conflicts(entry: &Destination) -> Result<()> {
+    /// Queries the CA's subject without reconstructing nicknames from a padded table.
+    /// Returns an error on query failure, invalid output, or a different same-subject cert.
+    fn check_subject_conflicts(entry: &Destination, cert_path: &Path) -> Result<()> {
         let subject = subject(&entry.certificate)?;
         let db = format!("sql:{}", entry.database.display());
-        for nickname in nicknames(&db)? {
-            let exported = certutil(&["-L", "-n", &nickname, "-a", "-d", &db])?;
-            let certificates = rustls_pemfile::certs(&mut exported.stdout.as_slice())
-                .collect::<std::io::Result<Vec<_>>>()
-                .change_context(TrustError::State)?;
-            if certificates.is_empty() {
-                return Err(Report::new(TrustError::State));
+        let cert_path = fs::canonicalize(cert_path).change_context(TrustError::Io)?;
+        // NSS accepts a certificate filename when -n does not resolve to a nickname.
+        // It loads that cert temporarily and exports the whole matching-subject set,
+        // including the supplied cert even if it is not stored. No import is needed.
+        let exported = certutil(&["-L", "-n", &cert_path.to_string_lossy(), "-a", "-d", &db])?;
+        let certificates = rustls_pemfile::certs(&mut exported.stdout.as_slice())
+            .collect::<std::io::Result<Vec<_>>>()
+            .change_context(TrustError::State)?;
+        let mut found_expected = false;
+        for certificate in certificates {
+            // A nickname matching the filename must not select an unrelated subject.
+            if self::subject(certificate.as_ref())? != subject {
+                return Err(Report::new(TrustError::State).attach(
+                    "NSS subject query returned an unrelated certificate; trust was not changed",
+                ));
             }
-            for certificate in certificates {
-                let existing_subject = self::subject(certificate.as_ref())?;
-                if existing_subject == subject && certificate.as_ref() != entry.certificate {
-                    return Err(Report::new(TrustError::Identity).attach(format!(
-                        "{} already contains same-subject certificate {nickname}; remove its trust with the original CA directory or resolve the manual import before installing another dev CA",
-                        entry.database.display()
-                    )));
-                }
+            if certificate.as_ref() != entry.certificate {
+                return Err(Report::new(TrustError::Identity).attach(format!(
+                    "{} already contains a different same-subject certificate; remove its trust with the original CA directory or resolve the manual import before installing another dev CA",
+                    entry.database.display()
+                )));
             }
+            found_expected = true;
+        }
+        if !found_expected {
+            return Err(Report::new(TrustError::State).attach(
+                "NSS subject query did not return the supplied CA; trust was not changed",
+            ));
         }
         Ok(())
     }
@@ -310,9 +300,19 @@ mod linux {
             return Ok(false);
         }
         let db = format!("sql:{}", entry.database.display());
-        let present = nicknames(&db)?
-            .iter()
-            .any(|nickname| nickname == &entry.nickname);
+        let list = certutil(&["-L", "-d", &db])?;
+        // Match only our known ASCII nickname, excluding the final trust column.
+        // Do not reconstruct foreign nicknames or reject their malformed row fragments.
+        // Padding and embedded newlines can imitate a managed row, so a match still
+        // requires the exact named DER export below, never deletion alone.
+        let present = list.stdout.split(|byte| *byte == b'\n').any(|line| {
+            let row = line.trim_ascii_end();
+            row.iter()
+                .rposition(u8::is_ascii_whitespace)
+                .is_some_and(|separator| {
+                    row[..separator].trim_ascii_end() == entry.nickname.as_bytes()
+                })
+        });
         if !present {
             return Ok(false);
         }
@@ -333,6 +333,8 @@ mod linux {
         let database = fs::canonicalize(database).change_context(TrustError::Io)?;
         // All ts CA directories serialize changes to this shared NSS destination.
         let _database_lock = lock_file(&database.join("ts-dev-proxy-trust.lock"))?;
+        // A later rejection may leave a newly initialized empty store behind.
+        // Certificate trust and the journal remain unchanged until preflight succeeds.
         initialize(&database)?;
         let certificate = certificate(cert_path)?;
         // The hash only names the entry. Full DER equality authorizes all mutations.
@@ -354,8 +356,9 @@ mod linux {
             }
         };
         let entry = &entries[index];
+        // Check identity only; an identical existing certificate is re-imported safely.
         contains(entry)?;
-        check_subject_conflicts(entry)?;
+        check_subject_conflicts(entry, cert_path)?;
         write_record(ca_dir, &entries)?;
         let db = format!("sql:{}", entry.database.display());
         certutil(&[
@@ -540,7 +543,12 @@ mod tests {
     fn ca_lock_rejects_concurrent_operations_and_releases_on_drop() {
         let dir = tempfile::tempdir().expect("should create isolated CA directory");
         let first = lock(dir.path()).expect("should acquire first lock");
-        assert!(lock(dir.path()).is_err());
+        assert!(matches!(
+            lock(dir.path())
+                .expect_err("should reject contention")
+                .current_context(),
+            TrustError::Busy
+        ));
         drop(first);
         assert!(lock(dir.path()).is_ok());
     }

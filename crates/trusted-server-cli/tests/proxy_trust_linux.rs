@@ -29,6 +29,46 @@ impl Fixture {
         self.ca().join("managed-nss-trust.json")
     }
 
+    fn initialize_nss(&self) {
+        fs::create_dir_all(self.db()).expect("should create isolated NSS directory");
+        let out = Command::new("certutil")
+            .args(["-N", "--empty-password", "-d"])
+            .arg(format!("sql:{}", self.db().display()))
+            .output()
+            .expect("should initialize isolated NSS database");
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    fn import_certificate(&self, nickname: &str, certificate: &Path) {
+        let out = Command::new("certutil")
+            .args(["-A", "-n", nickname, "-t", "C,,", "-d"])
+            .arg(format!("sql:{}", self.db().display()))
+            .arg("-i")
+            .arg(certificate)
+            .output()
+            .expect("should import fixture certificate");
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    fn export_certificate(&self, nickname: &str) -> Vec<u8> {
+        let out = Command::new("certutil")
+            .args(["-L", "-n", nickname, "-r", "-d"])
+            .arg(format!("sql:{}", self.db().display()))
+            .output()
+            .expect("should export fixture certificate");
+        assert!(out.status.success(), "{out:?}");
+        out.stdout
+    }
+
+    fn unrelated_certificate(&self) -> PathBuf {
+        let cert = rcgen::generate_simple_self_signed(vec!["unrelated.example.com".into()])
+            .expect("should generate unrelated certificate")
+            .cert;
+        let path = self.root.path().join("unrelated.pem");
+        fs::write(&path, cert.pem()).expect("should write unrelated certificate");
+        path
+    }
+
     fn command(&self, action: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ts"));
         cmd.env("HOME", self.root.path())
@@ -226,7 +266,7 @@ fn real_nss_repeat_install_path_change_and_uninstall() {
 #[test]
 fn failed_import_keeps_the_destination_recorded_for_retry() {
     let fixture = Fixture::new();
-    let bin = fixture.fake_tool("case \"$1\" in\n-N|-L) exit 0;;\n-A) test -s \"$HOME/ca/managed-nss-trust.json\" || exit 99; echo 'recorded before import' >&2; exit 1;;\n*) exit 99;;\nesac");
+    let bin = fixture.fake_tool("case \"$1:$2\" in\n-N:*|-L:-d) exit 0;;\n-L:-n) /bin/cat \"$HOME/ca/ca-cert.pem\";;\n-A:*) test -s \"$HOME/ca/managed-nss-trust.json\" || exit 99; echo 'recorded before import' >&2; exit 1;;\n*) exit 99;;\nesac");
     let out = fixture
         .command("install")
         .env("PATH", &bin)
@@ -304,7 +344,13 @@ fn real_nss_identity_conflict_preserves_key_and_record() {
 #[test]
 #[ignore = "requires certutil; all stores and HOME are disposable"]
 fn real_nss_same_subject_install_conflict_is_rejected_before_mutation() {
-    for managed in [true, false] {
+    for manual_nickname in [
+        None,
+        Some("Manually imported dev CA"),
+        Some("Manually imported dev CA "),
+        Some("Manually imported\ndev CA"),
+    ] {
+        let managed = manual_nickname.is_none();
         let first = Fixture::new();
         let second = Fixture::new();
         let tool = which::which("certutil").expect("should have NSS tools");
@@ -328,7 +374,7 @@ fn real_nss_same_subject_install_conflict_is_rejected_before_mutation() {
                     .expect("should initialize NSS")
                     .success()
             );
-            let nickname = "Manually imported dev CA";
+            let nickname = manual_nickname.expect("should have manual nickname");
             assert!(
                 Command::new(&tool)
                     .args(["-A", "-n", nickname, "-t", "C,,", "-d", &db, "-i"])
@@ -362,6 +408,11 @@ fn real_nss_same_subject_install_conflict_is_rejected_before_mutation() {
         assert!(
             !result.status.success(),
             "different-key same-subject CA must be rejected before import"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("managed certificate identity conflict"),
+            "must identify the subject conflict regardless of nickname: {result:?}"
         );
         assert_eq!(
             database_before,
@@ -520,6 +571,177 @@ fn real_nss_preflight_preserves_leaf_intermediate_and_multicert_exports() {
             .status
             .success()
     );
+}
+
+fn assert_foreign_nickname_does_not_block_lifecycle(fixture: &Fixture, nickname: &str) {
+    fixture.import_certificate(nickname, &fixture.unrelated_certificate());
+    let unrelated = fixture.export_certificate(nickname);
+    for action in ["install", "install", "uninstall", "uninstall", "install"] {
+        let out = fixture.run(action);
+        assert!(
+            out.status.success(),
+            "nickname={nickname:?}; {action}: {out:?}"
+        );
+        assert_eq!(fixture.export_certificate(nickname), unrelated);
+    }
+    let key = fs::read(fixture.ca().join("ca-key.pem")).expect("should read original key");
+    let out = fixture.run("regenerate");
+    assert!(
+        out.status.success(),
+        "nickname={nickname:?}; regenerate: {out:?}"
+    );
+    assert_ne!(
+        fs::read(fixture.ca().join("ca-key.pem")).expect("should read rotated key"),
+        key
+    );
+    assert_eq!(fixture.export_certificate(nickname), unrelated);
+    assert_eq!(
+        fs::read_to_string(fixture.journal()).expect("should read cleared journal"),
+        "[]"
+    );
+}
+
+#[test]
+#[ignore = "requires certutil; all stores and HOME are disposable"]
+fn real_nss_trailing_space_nickname_does_not_block_lifecycle() {
+    let fixture = Fixture::new();
+    fixture.initialize_nss();
+    assert_foreign_nickname_does_not_block_lifecycle(&fixture, "Unrelated example.com CA ");
+}
+
+#[test]
+#[ignore = "requires certutil; all stores and HOME are disposable"]
+fn real_nss_newline_nickname_does_not_block_lifecycle() {
+    let fixture = Fixture::new();
+    fixture.initialize_nss();
+    assert_foreign_nickname_does_not_block_lifecycle(&fixture, "Line One\nLine Two");
+}
+
+#[test]
+#[ignore = "requires certutil; all stores and HOME are disposable"]
+fn real_nss_managed_prefix_in_foreign_nickname_does_not_block_lifecycle() {
+    let fixture = Fixture::new();
+    assert!(fixture.run("install").status.success());
+    let entries: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.journal()).expect("should read journal"))
+            .expect("should parse journal");
+    let nickname = entries[0]["nickname"]
+        .as_str()
+        .expect("should have nickname");
+    assert!(fixture.run("uninstall").status.success());
+    assert_foreign_nickname_does_not_block_lifecycle(
+        &fixture,
+        &format!("{nickname} foreign-alias"),
+    );
+}
+
+#[test]
+#[ignore = "requires certutil; all stores and HOME are disposable"]
+fn real_nss_trailing_space_alias_cannot_hide_same_subject_conflict() {
+    let first = Fixture::new();
+    let second = Fixture::new();
+    first.initialize_nss();
+    // The human-readable table renders these two distinct nicknames identically.
+    let nickname = "Foreign example.com CA";
+    let conflicting_nickname = "Foreign example.com CA ";
+    first.import_certificate(nickname, &first.unrelated_certificate());
+    first.import_certificate(conflicting_nickname, &first.ca().join("ca-cert.pem"));
+    let unrelated = first.export_certificate(nickname);
+    let conflicting = first.export_certificate(conflicting_nickname);
+    let before = fs::read(first.db().join("cert9.db")).expect("should snapshot NSS database");
+    let out = second
+        .command("install")
+        .env("XDG_DATA_HOME", first.root.path().join("data"))
+        .output()
+        .expect("should attempt conflicting install");
+    assert!(
+        fs::read(first.db().join("cert9.db")).expect("should read unchanged NSS database")
+            == before,
+        "conflicting install must not mutate NSS: {out:?}"
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("managed certificate identity conflict"),
+        "{out:?}"
+    );
+    assert!(!second.journal().exists());
+    assert_eq!(first.export_certificate(nickname), unrelated);
+    assert_eq!(first.export_certificate(conflicting_nickname), conflicting);
+}
+
+#[test]
+#[ignore = "requires certutil; all stores and HOME are disposable"]
+fn real_nss_ambiguous_managed_nickname_preserves_material_and_trust() {
+    let nickname = "ts-dev-proxy-0123456789abcdef";
+    for foreign in [
+        format!("{nickname} "),
+        format!("Foreign\n{nickname} C,,\nAnother"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.record();
+        fixture.initialize_nss();
+        fixture.import_certificate(&foreign, &fixture.unrelated_certificate());
+        let before = fs::read(fixture.db().join("cert9.db")).expect("should snapshot NSS database");
+        let tool = which::which("certutil").expect("should have NSS tools");
+        // Display padding or embedded newlines can imitate an actual managed row.
+        // A failed exact lookup must not authorize deletion or rotation.
+        fixture.assert_rotation_fails_unchanged(tool.parent().expect("should have tool directory"));
+        for action in ["install", "uninstall"] {
+            let out = fixture.run(action);
+            assert!(!out.status.success(), "{foreign:?}; {action}: {out:?}");
+        }
+        assert!(
+            fs::read(fixture.db().join("cert9.db")).expect("should read unchanged NSS database")
+                == before
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires certutil; all stores and HOME are disposable"]
+fn real_nss_filename_nickname_collision_fails_closed() {
+    let fixture = Fixture::new();
+    fixture.initialize_nss();
+    let nickname = fixture.ca().join("ca-cert.pem");
+    fixture.import_certificate(
+        &nickname.to_string_lossy(),
+        &fixture.unrelated_certificate(),
+    );
+    let before = fs::read(fixture.db().join("cert9.db")).expect("should snapshot NSS database");
+    let out = fixture.run("install");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("NSS subject query returned an unrelated certificate"),
+        "{out:?}"
+    );
+    assert!(!fixture.journal().exists());
+    assert!(
+        fs::read(fixture.db().join("cert9.db")).expect("should read unchanged NSS database")
+            == before
+    );
+}
+
+#[test]
+fn failed_or_incomplete_subject_queries_stop_before_import() {
+    for query in [
+        "echo 'subject query failed' >&2; exit 99",
+        "exit 0",
+        "/bin/cat \"$HOME/ca/ca-cert.pem\"; echo '-----BEGIN CERTIFICATE-----'; echo 'AQID'",
+    ] {
+        let fixture = Fixture::new();
+        let bin = fixture.fake_tool(&format!(
+            "case \"$1:$2\" in\n-N:*|-L:-d) exit 0;;\n-L:-n) {query};;\n-A:*) : > \"$HOME/import-attempted\"; exit 99;;\n*) exit 99;;\nesac"
+        ));
+        let out = fixture
+            .command("install")
+            .env("PATH", bin)
+            .output()
+            .expect("should attempt subject query");
+        assert!(!out.status.success(), "{query}: {out:?}");
+        assert!(!fixture.journal().exists());
+        assert!(!fixture.root.path().join("import-attempted").exists());
+    }
 }
 
 #[test]
