@@ -125,8 +125,15 @@ pub trait EcKvStore {
 
     /// Lists keys sharing the given prefix from strongly consistent state.
     ///
-    /// Returns at most `limit` keys. Callers that use key contents for a
-    /// correctness decision must validate the complete key shape.
+    /// Returns one bounded page of at most `limit` keys, not an exhaustive scan.
+    /// Results may be truncated; a full page does not prove that all matching
+    /// keys were returned. Callers must handle truncation conservatively (for
+    /// example, reject a saturated cleanup) and validate the complete key shape
+    /// before using key contents for a correctness decision.
+    ///
+    /// Completed writes must be visible even when [`Self::lookup`] lags. If the
+    /// backend cannot provide strong listing, it must return an error rather
+    /// than substitute eventually consistent results.
     ///
     /// # Errors
     ///
@@ -137,7 +144,11 @@ pub trait EcKvStore {
         limit: u32,
     ) -> Result<Vec<String>, Report<TrustedServerError>>;
 
-    /// Counts keys sharing the given prefix, up to `limit`.
+    /// Counts keys in one strongly consistent prefix-list page, up to `limit`.
+    ///
+    /// Delegates to [`Self::list_keys_with_prefix`] and inherits its bounded,
+    /// potentially truncated result. This is a capped count, not an exhaustive
+    /// total; callers needing completeness must account for truncation.
     ///
     /// # Errors
     ///
