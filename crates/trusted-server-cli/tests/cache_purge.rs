@@ -14,6 +14,34 @@ use trusted_server_cli::commands::cache::{CacheCommand, PurgeArgs, run};
 /// process, where one test clearing the variable races another that just set it.
 static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn plaintext_remote_services_are_rejected_before_sending_credentials() {
+    for service in [
+        "http://edge.example.com",
+        "http://localhost.example.com",
+        "ftp://127.0.0.1",
+    ] {
+        let mut out = Vec::new();
+        let error = with_password(Some("example-password"), || {
+            run(
+                CacheCommand::Purge(PurgeArgs {
+                    service: service.to_owned(),
+                    all: true,
+                    page: None,
+                    username: "admin".to_owned(),
+                }),
+                &mut out,
+            )
+        })
+        .expect_err("should refuse insecure remote transport");
+        assert!(
+            error.to_string().contains("HTTPS"),
+            "should explain the transport requirement: {error}"
+        );
+        assert!(out.is_empty(), "should not report a successful purge");
+    }
+}
+
 /// Set the admin password for one call and clear it afterwards.
 fn with_password<T>(password: Option<&str>, body: impl FnOnce() -> T) -> T {
     // A panicking test poisons the lock; the data is `()`, so recovering it loses nothing

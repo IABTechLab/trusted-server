@@ -296,7 +296,6 @@ impl RuntimeServices {
     }
 
     /// Returns a clone of this instance with the template cache replaced.
-    ///
     #[must_use]
     pub fn with_template_cache(self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         Self {

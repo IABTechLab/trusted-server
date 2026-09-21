@@ -70,7 +70,7 @@ impl FixtureRequest {
 /// What the fixture should answer with.
 pub struct FixtureResponse {
     status: u16,
-    headers: Vec<(String, String)>,
+    headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
 }
 
@@ -80,7 +80,7 @@ impl FixtureResponse {
     pub fn html(body: impl Into<Vec<u8>>) -> Self {
         Self {
             status: 200,
-            headers: vec![("content-type".to_owned(), "text/html".to_owned())],
+            headers: vec![("content-type".to_owned(), b"text/html".to_vec())],
             body: body.into(),
         }
     }
@@ -95,7 +95,23 @@ impl FixtureResponse {
     /// Append a response header. Repeatable.
     #[must_use]
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
-        self.headers.push((name.to_owned(), value.to_owned()));
+        self.headers
+            .push((name.to_owned(), value.as_bytes().to_vec()));
+        self
+    }
+
+    /// Append a header containing bytes that cannot be represented as text.
+    #[must_use]
+    pub fn with_raw_header(mut self, name: &str, value: &[u8]) -> Self {
+        self.headers.push((name.to_owned(), value.to_vec()));
+        self
+    }
+
+    /// Remove every instance of a response header.
+    #[must_use]
+    pub fn without_header(mut self, name: &str) -> Self {
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         self
     }
 
@@ -213,7 +229,9 @@ where
     };
     out.extend_from_slice(format!("HTTP/1.1 {} {reason}\r\n", response.status).as_bytes());
     for (name, value) in &response.headers {
-        out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        out.extend_from_slice(format!("{name}: ").as_bytes());
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(format!("content-length: {}\r\n", response.body.len()).as_bytes());
     // No keep-alive: one request per connection keeps the fixture trivial, and the probe

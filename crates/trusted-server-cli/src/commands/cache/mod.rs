@@ -1,4 +1,4 @@
-//! `ts cache` — operator control over the shared template cache.
+//! `ts cache` — operator control over shared template and origin caches.
 
 pub mod purge;
 
@@ -9,7 +9,7 @@ use crate::error::CliResult;
 /// Subcommands under `ts cache`.
 #[derive(Debug, Subcommand)]
 pub enum CacheCommand {
-    /// Purge cached templates through a deployed service's admin endpoint.
+    /// Purge cached templates and tagged origin responses through a deployed service's admin endpoint.
     Purge(PurgeArgs),
 }
 
@@ -27,15 +27,15 @@ pub enum CacheCommand {
 /// purging — a class of bug that a second client-side derivation would reintroduce.
 #[derive(Debug, clap::Args)]
 pub struct PurgeArgs {
-    /// Base URL of the deployed Trusted Server service, e.g. `https://edge.example.com`.
+    /// HTTPS base URL of the service; HTTP is permitted only for loopback development.
     #[arg(long)]
     pub service: String,
 
-    /// Purge every cached template.
+    /// Purge every cached template and tagged origin response.
     #[arg(long, conflicts_with = "page")]
     pub all: bool,
 
-    /// Purge one reader-facing page URL, as a reader would type it.
+    /// Purge one reader-facing page URL, including its exact scheme, host, and port.
     #[arg(long, conflicts_with = "all")]
     pub page: Option<String>,
 

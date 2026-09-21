@@ -1995,7 +1995,11 @@ Rollback must preserve configuration compatibility:
    it back: setting it to `false` serializes it into the blob, so a binary that predates
    it then rejects the whole configuration and every request fails.
 3. Purge the template cache with `ts cache purge --service <url> --all`, or
-   `--page <url>` for a single reader-facing URL. The admin endpoint
+   `--page <url>` for a single reader-facing URL. Use its exact scheme, host, and
+   port: `http://example.com/article` and `https://example.com/article` have different
+   purge keys. A success acknowledges invalidation of the requested key, not that an
+   object existed. `--service` requires HTTPS, except for loopback development
+   services (`localhost`, `127.0.0.1`, or `::1`). The admin endpoint
    `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
    the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
    works.
@@ -2055,6 +2059,12 @@ cached `Set-Cookie`. That last case is the sharpest: readthrough admits requests
 carrying _no_ cookie, which is exactly the first-time visitor an origin issues a
 session cookie to.
 
+`origin_is_cookie_independent = true` also widens this gate: cookie-bearing
+requests become readthrough-eligible. On the template cache, an origin's
+`Vary: Cookie` still overrides that assertion. On readthrough there is no such
+response-side guard. Setting both flags is the highest-risk configuration and
+requires a cookie-axis probe pass specifically.
+
 #### You cannot verify this locally
 
 Viceroy does not implement the readthrough cache. Measured with the gate enabled, the
@@ -2081,14 +2091,25 @@ saying nothing about this setting.
    or custom-header difference only when every response declares it. Cookie
    differences and different decoded gzip/identity documents always fail, because
    the template cache requires those representations to be identical.
+   Navigation samples send HTML `Accept` and navigation Fetch Metadata and must
+   return `text/html`. RSC uses an explicit same-origin fetch profile, permitting
+   HTML fallback or `text/x-component`. A separate fetch control keeps `RSC`
+   variation independent of `Accept` and Fetch Metadata changes. If navigation
+   and fetch controls differ, all changed profile headers must be declared in
+   `Vary`; this conservative check cannot attribute a combined-profile difference
+   to one header. `Vary: *`, revalidation directives, and unreadable safety headers
+   always fail.
    The probe is the only response-safety control on the readthrough path.
 3. Read the probe's stated limits. It runs from one client address, so
    personalisation keyed on the reader's IP — geo, rate class — is invisible to
    it, as are `Accept-Language` and client-hint variants it does not vary.
 4. Set `origin_readthrough_enabled = true` and push the configuration.
-5. Watch the `origin_cache_shareable` breakdown in auction telemetry. It records
-   the predicate on every row, so it shows how much traffic the gate admits — and,
-   before you enable it, how much it _would_ admit.
+5. Watch the `origin_cache_shareable` breakdown in publisher summary telemetry.
+   Its denominator is matching-slot candidates, including skipped auctions; it
+   does not measure every publisher origin fetch or a site-wide admission rate.
+   See the [telemetry population and query](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md#the-denominator-is-matching-slot-candidates-not-all-requests).
+   The predicate estimates eligibility in that population before or after enablement,
+   not actual cache hits.
 6. Confirm the origin's own hit rate and page correctness before widening to more
    URLs.
 
@@ -2098,16 +2119,18 @@ saying nothing about this setting.
    next request with no deploy and restores the previous policy: ad-serving
    requests bypass, while non-ad traffic keeps the platform default. It does not
    disable origin caching globally.
-2. **Objects already stored are not purgeable by this service.** `ts cache purge`
-   and the admin endpoint cover the template cache (`ts-template`) only. Whether
-   readthrough objects can be tagged for purge has not been verified against a
-   real Fastly service, so no tagging is applied and no purge command claims to
-   reach them. After flipping the flag, already-stored objects age out on the
-   origin's own TTL and can still serve non-ad traffic. Changing the origin's TTL
-   does not shorten an already-cached object's lifetime.
+2. Purge tagged objects with `ts cache purge --service <https-service-url> --all`,
+   or `--page <reader-url>` for one exact reader-facing URL. Both the template cache
+   and opted-in origin readthrough objects carry the page key and `ts-template`
+   purge-all key. The readthrough tags use the original reader URL, before origin
+   rewriting, and work in both inline and ESI assembly modes.
+3. Objects stored by older versions without readthrough tags remain unreachable
+   through these purge keys and must expire on the origin's TTL. Changing the
+   origin's TTL does not shorten an already-cached object's lifetime.
 
-Step 2 is the reason to treat enablement as one-way for the duration of the
-origin's TTL, and to widen URL coverage slowly.
+The Fastly SDK attaches these tags to cached objects; production hit and purge
+behavior still requires validation on a deployed service, since Viceroy does not
+implement readthrough caching.
 
 ### `gam_unit_path` templating
 

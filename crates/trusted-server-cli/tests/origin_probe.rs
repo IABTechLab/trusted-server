@@ -780,7 +780,7 @@ fn declared_custom_signals_are_probed_independently_without_duplicate_axes() {
     );
     assert_eq!(
         server.request_count(),
-        8,
+        9,
         "should sample each signal independently and the configured header with RSC"
     );
 }
@@ -812,7 +812,7 @@ fn unsafe_headers_are_still_checked_after_self_identity_first_differs() {
     );
     assert_eq!(
         server.request_count(),
-        8,
+        9,
         "should complete every requested sample"
     );
 }
@@ -867,5 +867,243 @@ fn admission_cookie_cannot_hide_first_visitor_session_issuance() {
     assert!(
         !report.passed(),
         "should fail the machine-readable gate too"
+    );
+}
+
+#[test]
+fn navigation_negotiation_cannot_hide_session_cookies_behind_json() {
+    let server = FixtureServer::start(|request| {
+        let navigation = request
+            .header("accept")
+            .is_some_and(|value| value.contains("text/html"))
+            && request.header("sec-fetch-mode") == Some("navigate")
+            && request.header("sec-fetch-dest") == Some("document");
+        let response = FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("vary", "Accept");
+        if navigation {
+            response.with_header("set-cookie", "session=example; Path=/")
+        } else {
+            response
+                .without_header("content-type")
+                .with_header("content-type", "application/json")
+                .with_body(serde_json::json!({"stable": true}).to_string())
+        }
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+    assert!(!ok, "should reject a navigation that sets session cookies");
+    assert!(
+        !verdict(&report, "set-cookie").passed,
+        "should inspect HTML navigation cookies"
+    );
+}
+
+#[test]
+fn non_html_navigation_responses_cannot_be_certified() {
+    for content_type in [
+        None,
+        Some("application/json"),
+        Some("text/plain"),
+        Some("text/html-invalid"),
+    ] {
+        let server = FixtureServer::start(move |_| {
+            let response = FixtureResponse::html("stable")
+                .with_header("cache-control", "public, max-age=300")
+                .without_header("content-type");
+            match content_type {
+                Some(value) => response.with_header("content-type", value),
+                None => response,
+            }
+        });
+        let (ok, report) = probe(&server, json_args(&server));
+        assert!(
+            !ok,
+            "should reject unexpected navigation representation {content_type:?}"
+        );
+        assert!(
+            !verdict(&report, "content-type").passed,
+            "should report representation failure"
+        );
+    }
+}
+
+#[test]
+fn revalidation_directives_override_positive_freshness() {
+    for (name, value) in [
+        ("cache-control", "public, max-age=300, no-cache"),
+        ("cache-control", "No-Cache=\"Set-Cookie\""),
+        ("surrogate-control", "max-age=300, no-cache"),
+        ("pragma", "no-cache"),
+    ] {
+        let server = FixtureServer::start(move |_| {
+            FixtureResponse::html("<html>stable</html>")
+                .with_header("cache-control", "public, max-age=300")
+                .with_header(name, value)
+        });
+        let (ok, report) = probe(&server, json_args(&server));
+        assert!(!ok, "should reject required revalidation from {name}");
+        assert!(
+            !verdict(&report, "freshness").passed,
+            "should refuse freshness despite positive max-age"
+        );
+    }
+}
+
+#[test]
+fn wildcard_vary_refuses_both_stable_and_varying_responses() {
+    for varying in [false, true] {
+        let server = FixtureServer::start(move |request| {
+            let body = if varying {
+                request.header("user-agent").unwrap_or("none")
+            } else {
+                "stable"
+            };
+            FixtureResponse::html(format!("<html>{body}</html>"))
+                .with_header("cache-control", "public, max-age=300")
+                .with_header("vary", "*")
+        });
+        let (ok, report) = probe(&server, json_args(&server));
+        assert!(!ok, "should refuse Vary wildcard even with stable bytes");
+        assert!(
+            !verdict(&report, "vary-coverage").passed,
+            "should explain wildcard refusal"
+        );
+        assert!(
+            !axis(&report, "user-agent").covered_by_vary,
+            "should not treat wildcard as axis coverage"
+        );
+    }
+}
+
+#[test]
+fn undecodable_safety_headers_fail_closed_on_every_sample() {
+    for name in [
+        "set-cookie",
+        "cache-control",
+        "surrogate-control",
+        "pragma",
+        "vary",
+        "content-security-policy",
+        "age",
+        "content-type",
+        "x-cache",
+    ] {
+        for sample in [0, 1, 3] {
+            let server = FixtureServer::start(move |request| {
+                let response = FixtureResponse::html("<html>stable</html>")
+                    .with_header("cache-control", "public, max-age=300");
+                if request.request_index == sample {
+                    response.with_raw_header(name, b"session=example; extension=caf\xe9")
+                } else {
+                    response
+                }
+            });
+            let (ok, report) = probe(&server, json_args(&server));
+            assert!(
+                !ok,
+                "should refuse undecodable {name} on sample {sample}: {}",
+                report.render_text()
+            );
+            if name == "set-cookie" {
+                assert!(
+                    !verdict(&report, "set-cookie").passed,
+                    "should preserve cookie presence"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rsc_uses_a_fetch_profile_and_accepts_flight_with_declared_rsc_variation() {
+    let server = FixtureServer::start(|request| {
+        let is_fetch = request.header("sec-fetch-mode") == Some("cors");
+        for name in [
+            "accept",
+            "sec-fetch-mode",
+            "sec-fetch-dest",
+            "sec-fetch-site",
+        ] {
+            assert_eq!(request.header_count(name), 1, "should send one {name}");
+        }
+        if is_fetch {
+            assert_eq!(
+                request.header("accept"),
+                Some("*/*"),
+                "should request a browser fetch representation"
+            );
+            assert_eq!(
+                request.header("sec-fetch-dest"),
+                Some("empty"),
+                "should use the fetch destination"
+            );
+            assert_eq!(
+                request.header("sec-fetch-site"),
+                Some("same-origin"),
+                "should describe the same-origin fetch"
+            );
+            assert!(
+                request.header("sec-fetch-user").is_none(),
+                "should not label fetches as user navigations"
+            );
+        } else {
+            assert_eq!(
+                request.header("sec-fetch-mode"),
+                Some("navigate"),
+                "should use navigation metadata"
+            );
+            assert_eq!(
+                request.header("sec-fetch-user"),
+                Some("?1"),
+                "should represent user navigation"
+            );
+        }
+        let response = FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("vary", "rsc");
+        if request.header("rsc").is_some() {
+            assert!(
+                is_fetch,
+                "should hold the fetch profile for every RSC variant"
+            );
+            response
+                .without_header("content-type")
+                .with_header("content-type", "text/x-component")
+                .with_body("0:example-flight")
+        } else {
+            response
+        }
+    });
+    let mut args = json_args(&server);
+    args.vary_header = vec!["x-layout".to_owned()];
+    let (ok, report) = probe(&server, args);
+    assert!(
+        ok,
+        "should allow independently covered RSC variation: {}",
+        report.render_text()
+    );
+}
+
+#[test]
+fn vary_rsc_cannot_excuse_an_accept_negotiated_difference() {
+    let server = FixtureServer::start(|request| {
+        let body = if request.header("accept") == Some("*/*") {
+            "fetch"
+        } else {
+            "navigation"
+        };
+        FixtureResponse::html(format!("<html>{body}</html>"))
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("vary", "rsc")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+    assert!(!ok, "should not attribute Accept variation to RSC");
+    assert!(
+        !axis(&report, "fetch-profile").passed(),
+        "should retain the independently varied profile"
+    );
+    assert!(
+        !axis(&report, "rsc").differs(),
+        "should hold the fetch profile constant while toggling RSC"
     );
 }

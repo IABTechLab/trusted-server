@@ -1,6 +1,5 @@
 //! Fetching an origin under varied request signals, and judging the results.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::commands::origin::report::{
@@ -27,7 +26,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 struct Fetched {
     status: u16,
     body: Vec<u8>,
-    headers: HashMap<String, Vec<String>>,
+    headers: reqwest::header::HeaderMap,
+    profile: RequestProfile,
 }
 
 impl Fetched {
@@ -36,13 +36,27 @@ impl Fetched {
     /// The only accessor on purpose. A first-instance-only variant reads as if it returns
     /// "the" value, which is wrong for any field a proxy can append to: judging a response
     /// on the origin's `Cache-Control` while a later `private` goes unread is a false pass.
-    fn all(&self, name: &str) -> &[String] {
-        self.headers.get(name).map_or(&[], Vec::as_slice)
+    fn all(&self, name: &str) -> Vec<&str> {
+        // Raw values remain in `headers`; `header_encoding_verdict` rejects any
+        // uninterpretable safety field before these textual checks can certify it.
+        self.headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect()
     }
+}
+
+/// Browser request context for navigation and RSC comparisons.
+#[derive(Clone, Copy)]
+enum RequestProfile {
+    Navigation,
+    Fetch,
 }
 
 /// What varies between the two arms of one axis.
 struct Arm<'a> {
+    profile: RequestProfile,
     headers: &'a [(&'a str, &'a str)],
 }
 
@@ -103,11 +117,17 @@ async fn probe_one(
 ) -> CliResult<UrlReport> {
     let cookie_jar = cookie_header(extra_cookies, admission_cookie);
 
-    // Baseline: the admission cookie and nothing else, and the left arm of every axis
-    // below. It carries that cookie because without it a bot-protected origin answers
+    // Baseline: an HTML navigation carrying only the optional admission cookie. It carries that cookie because without it a bot-protected origin answers
     // every arm with a challenge page, and the probe would then compare two challenge
     // pages and report on those instead of on the origin.
-    let baseline = fetch(client, url, &[], admission_cookie).await?;
+    let baseline = fetch(
+        client,
+        url,
+        RequestProfile::Navigation,
+        &[],
+        admission_cookie,
+    )
+    .await?;
 
     // A challenge page is not the origin. Judging one produces a confident verdict about
     // content the origin never served — in practice a false FAIL that reads exactly like a
@@ -132,6 +152,16 @@ async fn probe_one(
         .map(|(index, response)| (format!("self-identity repeat {}", index + 1), response))
         .collect();
 
+    // Hold the browser fetch profile constant when toggling RSC. Otherwise an
+    // Accept-negotiated difference could be incorrectly excused by `Vary: RSC`.
+    let mut fetch_control =
+        fetch(client, url, RequestProfile::Fetch, &[], admission_cookie).await?;
+    axes.push(AxisResult {
+        name: "fetch-profile".to_owned(),
+        description: "HTML navigation vs. a same-origin browser fetch".to_owned(),
+        difference: first_difference(&baseline.body, &fetch_control.body),
+        covered_by_vary: false,
+    });
     let mut rsc_body = Vec::new();
     for (name, description, value) in [
         (
@@ -154,10 +184,19 @@ async fn probe_one(
         let (axis, mut response) = compare_axis(
             client,
             url,
-            &baseline.body,
+            if name == "rsc" {
+                &fetch_control.body
+            } else {
+                &baseline.body
+            },
             name,
             description,
             Arm {
+                profile: if name == "rsc" {
+                    RequestProfile::Fetch
+                } else {
+                    RequestProfile::Navigation
+                },
                 headers: &[(name, value)],
             },
             admission_cookie,
@@ -171,6 +210,9 @@ async fn probe_one(
         axes.push(axis);
         samples.push((name.to_owned(), response));
     }
+
+    fetch_control.body.clear();
+    samples.push(("fetch-profile".to_owned(), fetch_control));
 
     // Each configured signal needs its own comparison and Vary declaration. Combining
     // these with RSC lets Vary: rsc hide a difference caused by an unrelated header.
@@ -187,6 +229,7 @@ async fn probe_one(
             &name,
             &description,
             Arm {
+                profile: RequestProfile::Navigation,
                 headers: &[(name.as_str(), "1")],
             },
             admission_cookie,
@@ -204,6 +247,7 @@ async fn probe_one(
             &name,
             &description,
             Arm {
+                profile: RequestProfile::Fetch,
                 headers: &[("rsc", "1"), (name.as_str(), "1")],
             },
             admission_cookie,
@@ -271,11 +315,13 @@ fn mark_axes_covered_by_vary(samples: &[(String, Fetched)], axes: &mut [AxisResu
             continue;
         }
         axis.covered_by_vary = samples.iter().all(|(_, response)| {
-            response
+            let declared: Vec<&str> = response
                 .all("vary")
-                .iter()
+                .into_iter()
                 .flat_map(|value| value.split(','))
-                .any(|name| name.trim().eq_ignore_ascii_case(&axis.name) || name.trim() == "*")
+                .map(str::trim)
+                .collect();
+            !declared.contains(&"*") && vary_covers_axis(&declared, &axis.name)
         });
     }
 }
@@ -291,7 +337,14 @@ async fn self_identity_axis(
     let mut difference = None;
     let mut samples = Vec::new();
     for _ in 0..repeat.max(1) {
-        let mut again = fetch(client, url, &[], admission_cookie).await?;
+        let mut again = fetch(
+            client,
+            url,
+            RequestProfile::Navigation,
+            &[],
+            admission_cookie,
+        )
+        .await?;
         if difference.is_none() {
             difference = first_difference(&baseline.body, &again.body);
         }
@@ -320,7 +373,7 @@ async fn compare_axis(
     arm: Arm<'_>,
     admission_cookie: Option<&str>,
 ) -> CliResult<(AxisResult, Fetched)> {
-    let varied = fetch(client, url, arm.headers, admission_cookie).await?;
+    let varied = fetch(client, url, arm.profile, arm.headers, admission_cookie).await?;
     let axis = AxisResult {
         name: name.to_owned(),
         description: description.to_owned(),
@@ -338,6 +391,8 @@ fn judge_headers(response: &Fetched, axes: &[AxisResult]) -> Vec<VerdictResult> 
             passed: response.status == 200,
             detail: format!("response status: {}", response.status),
         },
+        header_encoding_verdict(response),
+        content_type_verdict(response),
         fronting_cache_verdict(response),
         freshness_verdict(response),
         set_cookie_verdict(response),
@@ -346,8 +401,86 @@ fn judge_headers(response: &Fetched, axes: &[AxisResult]) -> Vec<VerdictResult> 
     ]
 }
 
+/// Keep undecodable safety evidence from becoming a successful textual check.
+fn header_encoding_verdict(response: &Fetched) -> VerdictResult {
+    let unreadable: Vec<&str> = response
+        .headers
+        .iter()
+        .filter(|(name, value)| {
+            matches!(
+                name.as_str(),
+                "set-cookie"
+                    | "age"
+                    | "cache-control"
+                    | "surrogate-control"
+                    | "pragma"
+                    | "vary"
+                    | "content-security-policy"
+                    | "content-type"
+                    | "x-cache"
+                    | "cf-cache-status"
+                    | "x-cache-status"
+            ) && value.to_str().is_err()
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    VerdictResult {
+        name: "header-encoding".to_owned(),
+        passed: unreadable.is_empty(),
+        detail: if unreadable.is_empty() {
+            "safety headers are readable".to_owned()
+        } else {
+            format!(
+                "cannot interpret safety header(s): {}; raw values retained",
+                unreadable.join(", ")
+            )
+        },
+    }
+}
+
+/// Certify HTML navigations, while allowing flight payloads on the RSC fetch profile.
+fn content_type_verdict(response: &Fetched) -> VerdictResult {
+    let types = response.all("content-type");
+    let passed = types.len() == 1
+        && types.iter().all(|value| {
+            let media_type = value.split(';').next().unwrap_or("").trim();
+            media_type.eq_ignore_ascii_case("text/html")
+                || (matches!(response.profile, RequestProfile::Fetch)
+                    && media_type.eq_ignore_ascii_case("text/x-component"))
+        });
+    VerdictResult {
+        name: "content-type".to_owned(),
+        passed,
+        detail: format!(
+            "expected HTML for navigation, or HTML/flight for the fetch profile; content-type: {types:?}"
+        ),
+    }
+}
+
+/// Every signal changed by the profile comparison must be covered. This is
+/// deliberately conservative: a combined profile cannot attribute a difference
+/// to just one of its headers.
+fn vary_covers_axis(declared: &[&str], axis: &str) -> bool {
+    let required = if axis == "fetch-profile" {
+        &[
+            "accept",
+            "sec-fetch-dest",
+            "sec-fetch-mode",
+            "sec-fetch-site",
+            "sec-fetch-user",
+        ][..]
+    } else {
+        std::slice::from_ref(&axis)
+    };
+    required.iter().all(|name| {
+        declared
+            .iter()
+            .any(|field| field.eq_ignore_ascii_case(name))
+    })
+}
+
 /// Every axis compares two responses. A cache between this tool and the origin can answer
-/// both from one stored object, so all five axes read identical and the report goes green
+/// both from one stored object, so the axes read identical and the report goes green
 /// on an origin that personalizes freely on a miss. That is the one failure that invalidates
 /// the whole run at once, so it is judged before anything else.
 ///
@@ -360,7 +493,7 @@ fn fronting_cache_verdict(baseline: &Fetched) -> VerdictResult {
     // Even Age: 0 can be a fresh cache hit. Any Age field makes direct-origin
     // evidence uncertain; malformed values must not turn that uncertainty into a pass.
     let ages = baseline.all("age");
-    let served_from_cache = !ages.is_empty();
+    let served_from_cache = baseline.headers.contains_key("age");
 
     const HIT_INDICATORS: &[&str] = &["x-cache", "cf-cache-status", "x-cache-status"];
     let vendor_hit = HIT_INDICATORS.iter().find(|name| {
@@ -402,9 +535,14 @@ fn freshness_verdict(baseline: &Fetched) -> VerdictResult {
     let positive = [&cache_control, &surrogate]
         .iter()
         .any(|value| has_positive_freshness(value));
-    let forbids = [&cache_control, &surrogate].iter().any(|value| {
-        let lowered = value.to_ascii_lowercase();
-        lowered.contains("no-store") || lowered.contains("private")
+    let pragma = baseline.all("pragma").join(", ");
+    let forbids = [&cache_control, &surrogate, &pragma].iter().any(|value| {
+        value.split(',').any(|directive| {
+            let name = directive.split('=').next().unwrap_or("").trim();
+            ["no-store", "private", "no-cache"]
+                .iter()
+                .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+        })
     });
 
     VerdictResult {
@@ -413,7 +551,9 @@ fn freshness_verdict(baseline: &Fetched) -> VerdictResult {
         detail: if cache_control.is_empty() && surrogate.is_empty() {
             "origin declared no Cache-Control or Surrogate-Control".to_owned()
         } else {
-            format!("cache-control: {cache_control:?}, surrogate-control: {surrogate:?}")
+            format!(
+                "cache-control: {cache_control:?}, surrogate-control: {surrogate:?}, pragma: {pragma:?}"
+            )
         },
     }
 }
@@ -421,14 +561,14 @@ fn freshness_verdict(baseline: &Fetched) -> VerdictResult {
 /// A cached `Set-Cookie` is replayed to every later cookieless reader, which is
 /// cross-reader session fixation rather than a staleness bug.
 fn set_cookie_verdict(baseline: &Fetched) -> VerdictResult {
-    let cookies = baseline.all("set-cookie");
+    let cookies = baseline.headers.get_all("set-cookie").iter().count();
     VerdictResult {
         name: "set-cookie".to_owned(),
-        passed: cookies.is_empty(),
-        detail: if cookies.is_empty() {
+        passed: cookies == 0,
+        detail: if cookies == 0 {
             "origin set no cookies".to_owned()
         } else {
-            format!("origin set {} cookie(s) on this response", cookies.len())
+            format!("origin set {} cookie(s) on this response", cookies)
         },
     }
 }
@@ -470,15 +610,16 @@ fn vary_coverage_verdict(baseline: &Fetched, axes: &[AxisResult]) -> VerdictResu
         // Self-identity is not a request signal, so `Vary` cannot cover it.
         .filter(|name| *name != "self-identity")
         .filter(|name| {
-            !declared
-                .iter()
-                .any(|declared| declared == name || declared == "*")
+            !vary_covers_axis(
+                &declared.iter().map(String::as_str).collect::<Vec<_>>(),
+                name,
+            )
         })
         .collect();
 
     VerdictResult {
         name: "vary-coverage".to_owned(),
-        passed: uncovered.is_empty(),
+        passed: uncovered.is_empty() && !declared.iter().any(|name| name == "*"),
         detail: if uncovered.is_empty() {
             format!("declared Vary: {declared:?}")
         } else {
@@ -520,6 +661,7 @@ fn cookie_header(extra: &[String], admission_cookie: Option<&str>) -> String {
 async fn fetch(
     client: &reqwest::Client,
     url: &str,
+    profile: RequestProfile,
     headers: &[(&str, &str)],
     admission_cookie: Option<&str>,
 ) -> CliResult<Fetched> {
@@ -533,6 +675,24 @@ async fn fetch(
         // changes what the origin may compress.
         ("accept-encoding", "identity"),
     ];
+    match profile {
+        RequestProfile::Navigation => resolved.extend([
+            (
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ),
+            ("sec-fetch-dest", "document"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-site", "none"),
+            ("sec-fetch-user", "?1"),
+        ]),
+        RequestProfile::Fetch => resolved.extend([
+            ("accept", "*/*"),
+            ("sec-fetch-dest", "empty"),
+            ("sec-fetch-mode", "cors"),
+            ("sec-fetch-site", "same-origin"),
+        ]),
+    }
     // Seeded before the arm's own headers so an arm that sets `cookie` replaces it rather
     // than duplicating it — every arm must be admitted, but only the cookie arm varies
     // what else it carries.
@@ -560,14 +720,7 @@ async fn fetch(
     };
     let status = response.status().as_u16();
 
-    let mut collected: HashMap<String, Vec<String>> = HashMap::new();
-    for (name, value) in response.headers() {
-        let Ok(value) = value.to_str() else { continue };
-        collected
-            .entry(name.as_str().to_ascii_lowercase())
-            .or_default()
-            .push(value.to_owned());
-    }
+    let collected = response.headers().clone();
 
     let body = match response.bytes().await {
         Ok(bytes) => bytes.to_vec(),
@@ -578,6 +731,7 @@ async fn fetch(
         status,
         body,
         headers: collected,
+        profile,
     })
 }
 
@@ -586,17 +740,20 @@ mod tests {
     use super::*;
 
     fn fetched(headers: &[(&str, &str)]) -> Fetched {
-        let mut collected: HashMap<String, Vec<String>> = HashMap::new();
+        let mut collected = reqwest::header::HeaderMap::new();
         for (name, value) in headers {
-            collected
-                .entry((*name).to_owned())
-                .or_default()
-                .push((*value).to_owned());
+            collected.append(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .expect("should parse test header name"),
+                reqwest::header::HeaderValue::from_str(value)
+                    .expect("should parse test header value"),
+            );
         }
         Fetched {
             status: 200,
             body: b"<html></html>".to_vec(),
             headers: collected,
+            profile: RequestProfile::Navigation,
         }
     }
 
@@ -683,9 +840,12 @@ mod tests {
     }
 
     #[test]
-    fn vary_star_covers_everything() {
+    fn vary_star_refuses_sharing() {
         let axes = vec![failing_axis("user-agent"), failing_axis("cookie")];
-        assert!(vary_coverage_verdict(&fetched(&[("vary", "*")]), &axes).passed);
+        assert!(
+            !vary_coverage_verdict(&fetched(&[("vary", "*")]), &axes).passed,
+            "should refuse wildcard Vary"
+        );
     }
 
     #[test]

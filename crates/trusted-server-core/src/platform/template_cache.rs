@@ -193,6 +193,8 @@ impl TemplateCacheKey {
 /// one form or a purge silently misses. Normalized: scheme and host case, a default port,
 /// one trailing slash, an empty query, and the *order* of the query parameters. **Not**
 /// normalized: the parameters themselves, since a different query is a different page.
+/// HTTP and HTTPS remain distinct: purge with the reader-facing scheme, host, and port.
+/// A successful purge acknowledges invalidation of that key, not that an object existed.
 ///
 /// Parameter order is normalized because a reader reaching `?a=1&b=2` and one reaching
 /// `?b=2&a=1` are on the same page, and both orderings can be cached as separate entries.
@@ -877,6 +879,15 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn reader_url_purges_are_scheme_specific() {
+        assert_ne!(
+            reader_url_surrogate_key("http://example.com/a"),
+            reader_url_surrogate_key("https://example.com/a"),
+            "should preserve the reader URL scheme in purge identity"
+        );
     }
 
     #[test]

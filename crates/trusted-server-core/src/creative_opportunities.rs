@@ -343,10 +343,11 @@ pub struct CreativeOpportunitiesConfig {
     /// first-ever page views and cookie-less clients.
     ///
     /// Setting `true` asserts the origin serves the same HTML with or without cookies.
-    /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
-    /// response is refused regardless of this flag or the configured key. So a wrong
-    /// assertion is caught whenever the origin is honest about it, and this only widens
-    /// the window where the origin personalizes *silently*.
+    /// On the template cache path, an origin declaring `Vary: Cookie` still refuses
+    /// storage regardless of this flag or the configured key. Readthrough performs no
+    /// response-side check: when [`Self::origin_readthrough_enabled`] is also `true`,
+    /// cookie-bearing requests become eligible with no runtime guard on this assertion.
+    /// Verify the cookie axis specifically before enabling both flags.
     ///
     /// Verify rather than assume: `ts origin probe-shareability` compares the origin's
     /// responses with and without a representative cookie jar and answers exactly this
@@ -375,10 +376,9 @@ pub struct CreativeOpportunitiesConfig {
     /// Verify with `ts origin probe-shareability` before setting this.
     ///
     /// Setting this back to `false` restores the existing ad-stack bypass policy, not
-    /// a global cache bypass. Rollback is not retroactive: readthrough objects
-    /// carry no surrogate key, so neither `ts cache purge` nor the admin endpoint can
-    /// reach them — those cover the template cache only. Already-stored objects age out
-    /// on the origin's TTL. Treat enablement as one-way for that long.
+    /// a global cache bypass. Purge already-stored tagged objects with `ts cache purge`
+    /// (`--all` or the exact reader-facing `--page` URL). Objects stored by versions
+    /// without readthrough tags must still expire on the origin's TTL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_readthrough_enabled: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.

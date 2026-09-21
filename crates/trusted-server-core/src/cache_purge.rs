@@ -1,4 +1,4 @@
-//! The operator-facing template-cache purge endpoint.
+//! The operator-facing purge endpoint for templates and tagged origin responses.
 //!
 //! `POST /_ts/admin/cache/purge` with `{"scope":"all"}` or
 //! `{"scope":"url","url":"https://example.com/page"}`.
@@ -46,7 +46,7 @@ struct PurgeBody {
 /// What an operator asked to purge.
 #[derive(Debug, PartialEq, Eq)]
 enum PurgeRequest {
-    /// Every template this service has cached.
+    /// Every template and tagged origin response this service has cached.
     All,
     /// One reader-facing URL, as a reader would type it; canonicalized before hashing.
     Url(String),

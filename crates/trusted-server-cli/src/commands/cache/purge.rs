@@ -24,8 +24,33 @@ fn request_body(args: &PurgeArgs) -> CliResult<String> {
 }
 
 /// Join the service base URL and the purge path without doubling or dropping a slash.
-fn purge_endpoint(service: &str) -> String {
-    format!("{}{PURGE_PATH}", service.trim_end_matches('/'))
+fn purge_endpoint(service: &str) -> CliResult<String> {
+    let mut url =
+        reqwest::Url::parse(service).map_err(|_| "--service must be an absolute HTTPS URL")?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return cli_error(
+            "--service requires HTTPS to protect the admin credential; HTTP is allowed only for loopback development services",
+        );
+    }
+    if url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.path().trim_matches('/').is_empty()
+    {
+        return cli_error(
+            "--service must be a base HTTPS URL without credentials, a path, query, or fragment",
+        );
+    }
+    url.set_path(PURGE_PATH);
+    Ok(url.to_string())
 }
 
 /// The acknowledgment returned by the purge endpoint.
@@ -45,6 +70,7 @@ struct PurgeAcknowledgment {
 /// status, redirects, or does not acknowledge the requested purge scope.
 pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<()> {
     let body = request_body(args)?;
+    let endpoint = purge_endpoint(&args.service)?;
 
     let password = std::env::var(ADMIN_PASSWORD_ENVIRONMENT_VARIABLE).map_err(|_| {
         format!(
@@ -54,7 +80,6 @@ pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<(
         )
     })?;
 
-    let endpoint = purge_endpoint(&args.service);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -178,9 +203,49 @@ mod tests {
             "https://edge.example.com///",
         ] {
             assert_eq!(
-                purge_endpoint(service),
+                purge_endpoint(service).expect("should accept a secure base URL"),
                 "https://edge.example.com/_ts/admin/cache/purge",
                 "{service} must resolve to one well-formed endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn only_loopback_services_may_use_plaintext_http() {
+        for service in [
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "http://localhost:8080",
+        ] {
+            assert!(
+                purge_endpoint(service).is_ok(),
+                "should permit loopback development: {service}"
+            );
+        }
+        for service in [
+            "http://192.0.2.1",
+            "http://[2001:db8::1]",
+            "http://localhost.example.com",
+        ] {
+            assert!(
+                purge_endpoint(service).is_err(),
+                "should refuse remote plaintext transport: {service}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_urls_cannot_redirect_the_purge_path_or_embed_credentials() {
+        for service in [
+            "not a URL",
+            "https://example.com/path",
+            "https://example.com?query=1",
+            "https://example.com#fragment",
+            "https://user:example-password@example.com",
+        ] {
+            assert!(
+                purge_endpoint(service).is_err(),
+                "should require an unambiguous service base URL"
             );
         }
     }

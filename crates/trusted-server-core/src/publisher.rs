@@ -66,8 +66,9 @@ use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{
-    GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
-    contains_publisher_esi_directive,
+    GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
+    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, VarySpec, contains_publisher_esi_directive,
+    reader_url_surrogate_key,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
 use crate::response_privacy::{
@@ -1724,12 +1725,12 @@ pub async fn buffer_publisher_response_async(
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
             let bytes = output.into_inner();
-            // Cache taxonomy for this path: the origin readthrough cache is the raw origin/read-through cache,
-            // the template cache stores processed reader-neutral HTML, and an assembled-response cache would be
-            // a forbidden cache of the final per-user assembled response.
+            // The origin readthrough cache holds raw origin bytes; the template cache
+            // stores processed reader-neutral HTML. Caching the final per-user
+            // assembled response is forbidden.
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
-            // Swapping these two lines would create the forbidden an assembled-response cache leak.
+            // Swapping these two lines would leak an assembled response into the cache.
             // Read before the store: `store_template_if_authorized` *takes* the key so a
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
@@ -2151,7 +2152,7 @@ impl core::error::Error for SeamError {}
 /// the publisher path stamps `private, no-store` and strips validators. Omitting it
 /// here does not fall back to a safe default — it emits HTML with no `Cache-Control` at
 /// all, which is heuristically cacheable by browsers and intermediaries. That is a
-/// forbidden an assembled-response cache cache of a final per-user assembled response.
+/// forbidden cache of a final per-user assembled response.
 ///
 /// Asserting the absence of `public`/`s-maxage`/`Surrogate-Control` would not have
 /// caught it. Nothing was present to forbid.
@@ -4114,6 +4115,7 @@ fn apply_origin_cache_intent(
     readthrough_enabled: bool,
     origin_response_is_shareable: bool,
     should_run_ad_stack: bool,
+    reader_url: &str,
 ) -> PlatformHttpRequest {
     // With the opt-in disabled, preserve the existing policy: ad-serving requests
     // bypass and other publisher requests use the platform default. Enabling the flag
@@ -4126,6 +4128,13 @@ fn apply_origin_cache_intent(
     };
     if bypass {
         request.with_cache_bypass()
+    } else if readthrough_enabled {
+        // The same reader-facing key and all-scope key used by the purge endpoint.
+        // Fastly accepts multiple space-separated surrogate keys without changing TTL.
+        request.with_shared_cache(format!(
+            "{TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY} {}",
+            reader_url_surrogate_key(reader_url),
+        ))
     } else {
         request
     }
@@ -4484,6 +4493,14 @@ pub async fn handle_publisher_request(
     if reader_requires_origin && matches!(assembly_mode, AssemblyMode::Esi) {
         log::debug!("template_cache bypass: request cache semantics or diagnostics require origin");
     }
+    // Capture the reader URL before origin rewriting, including its query. Inline
+    // assembly has no template key, but readthrough still needs both purge scopes.
+    let readthrough_reader_url = if origin_readthrough_enabled && origin_response_is_shareable {
+        let path = req.uri().path_and_query().map_or("/", |path| path.as_str());
+        format!("{request_scheme}://{request_host}{path}")
+    } else {
+        String::new()
+    };
     let template_cache_key =
         request_can_use_shared_template.then(|| crate::platform::TemplateCacheKey {
             url: target_uri.to_string(),
@@ -4543,6 +4560,7 @@ pub async fn handle_publisher_request(
             origin_readthrough_enabled,
             origin_response_is_shareable,
             should_run_ad_stack,
+            &readthrough_reader_url,
         );
         pending_origin = Some(
             services
@@ -4852,6 +4870,7 @@ pub async fn handle_publisher_request(
             origin_readthrough_enabled,
             origin_response_is_shareable,
             should_run_ad_stack,
+            &readthrough_reader_url,
         );
         services.http_client().send(platform_request).await
     };
@@ -5995,8 +6014,8 @@ impl TemplateCachePolicy {
 /// the most serious one that applies.
 ///
 /// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
-/// §6.6 for why the the origin readthrough cache raw-origin/read-through cache, the reader-neutral template cache, and
-/// the forbidden an assembled-response cache final assembled-response cache are distinct.
+/// §6.6 for why the raw origin readthrough cache, the reader-neutral template cache, and
+/// the forbidden final assembled-response cache are distinct.
 #[cfg(test)]
 pub(crate) fn template_cache_bypass_reason(
     mode: AssemblyMode,
@@ -10038,7 +10057,12 @@ mod tests {
 
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        crate::platform::reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
                 "the EC-preload path must honor the gate, not decide for itself"
             );
         }
@@ -10117,42 +10141,75 @@ mod tests {
         }
 
         #[test]
-        fn both_origin_fetch_paths_share_one_cache_decision() {
-            // Guards the divergence rather than one of its symptoms. The two fetch paths
-            // are alternatives for the same request, and a test can only reach the
-            // EC-preload one with a valid signed EC id, so the protection here is that
-            // neither path decides for itself: both call this, and this is pure.
-            for readthrough_enabled in [false, true] {
-                for shareable in [false, true] {
-                    for ad_stack in [false, true] {
-                        let request = PlatformHttpRequest::new(
-                            HttpRequest::builder()
-                                .body(EdgeBody::empty())
-                                .expect("should build request"),
-                            "backend",
-                        );
-                        let expected = if if readthrough_enabled {
-                            !shareable
-                        } else {
-                            ad_stack
-                        } {
-                            PlatformCacheIntent::Bypass
-                        } else {
-                            PlatformCacheIntent::Default
-                        };
-                        assert_eq!(
-                            apply_origin_cache_intent(
-                                request,
-                                readthrough_enabled,
-                                shareable,
-                                ad_stack
-                            )
-                            .cache_intent,
-                            expected,
-                            "should preserve legacy policy unless opted in (enabled={readthrough_enabled}, shareable={shareable}, ad_stack={ad_stack})"
-                        );
-                    }
+        fn cache_intent_matches_the_explicit_opt_in_policy() {
+            let shared = PlatformCacheIntent::Shared {
+                surrogate_key: format!(
+                    "ts-template {}",
+                    reader_url_surrogate_key("https://example.com/article")
+                ),
+            };
+            for (enabled, shareable, ad_stack, expected) in [
+                (false, false, false, PlatformCacheIntent::Default),
+                (false, false, true, PlatformCacheIntent::Bypass),
+                (false, true, false, PlatformCacheIntent::Default),
+                (false, true, true, PlatformCacheIntent::Bypass),
+                (true, false, false, PlatformCacheIntent::Bypass),
+                (true, false, true, PlatformCacheIntent::Bypass),
+                (true, true, false, shared.clone()),
+                (true, true, true, shared),
+            ] {
+                let request = PlatformHttpRequest::new(
+                    HttpRequest::builder()
+                        .body(EdgeBody::empty())
+                        .expect("should build request"),
+                    "backend",
+                );
+                assert_eq!(
+                    apply_origin_cache_intent(
+                        request,
+                        enabled,
+                        shareable,
+                        ad_stack,
+                        "https://example.com/article"
+                    )
+                    .cache_intent,
+                    expected,
+                    "should honor the explicit policy (enabled={enabled}, shareable={shareable}, ad_stack={ad_stack})"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn readthrough_tags_the_reader_url_before_origin_rewriting_in_inline_mode() {
+            for preload in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services =
+                    services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+                stub.set_pending_streaming_responses_supported(preload);
+                let settings = Arc::new(settings_with_readthrough_enabled("inline"));
+                queue_shareable_html(&stub);
+                let mut request = navigation_request();
+                request
+                    .headers_mut()
+                    .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+                *request.uri_mut() = "https://ts.example.com/article?b=2&a=1"
+                    .parse()
+                    .expect("should parse reader URI");
+                if preload {
+                    run_through_ec_preload(&settings, &services, request).await;
+                } else {
+                    let _ = run(&settings, &services, request).await;
                 }
+                let page_key = crate::platform::reader_url_surrogate_key(
+                    "https://ts.example.com/article?a=1&b=2",
+                );
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Shared {
+                        surrogate_key: format!("ts-template {page_key}"),
+                    }],
+                    "should attach the URL-purge and all-purge keys independently of template eligibility (preload={preload})"
+                );
             }
         }
 
@@ -10182,7 +10239,12 @@ mod tests {
 
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        crate::platform::reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
                 "a shareable navigation must not force a MISS"
             );
         }
@@ -10212,7 +10274,12 @@ mod tests {
 
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        crate::platform::reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
                 "a stripped conditional navigation asks the origin an unconditional \
                  question, so its answer is shareable"
             );
@@ -10706,7 +10773,12 @@ mod tests {
             );
             assert_eq!(
                 stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
                 "a shareable cold fetch must stop forcing a MISS — the origin round \
                  trip issue #852 exists to take off the hot path"
             );
@@ -11805,7 +11877,7 @@ mod tests {
         #[tokio::test]
         async fn the_cached_template_holds_the_marker_and_never_the_bids() {
             // Store the reader-neutral template before assembling the final per-user
-            // response, which must never enter the forbidden an assembled-response cache cache. If
+            // response, which must never enter the forbidden assembled-response cache. If
             // these were swapped, the cache would hold one visitor's bids and serve them
             // to the next — and every test above would still pass, because the served
             // page would look correct.
