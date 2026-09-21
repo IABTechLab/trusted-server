@@ -131,19 +131,32 @@ impl NextJsRscPlaceholderRewriter {
                 let trimmed = state.rsc_receiver_trimmed;
                 state.rsc_receiver_trimmed = false;
                 if is_last && content.len() > limit && content.contains("__next_f") {
-                    let range = if trimmed {
-                        find_trimmed_rsc_push_payload_range(content)
-                    } else {
-                        find_rsc_push_payload_range(content)
+                    let mut remaining = content;
+                    let mut receiver_trimmed = trimmed;
+                    let unsafe_continuation = loop {
+                        let range = if receiver_trimmed {
+                            find_trimmed_rsc_push_payload_range(remaining)
+                        } else {
+                            find_rsc_push_payload_range(remaining)
+                        };
+                        let Some((start, end)) = range else {
+                            break true;
+                        };
+                        if matches!(
+                            classify_rsc_group(&[&remaining[start..end]], limit),
+                            RscGroupStatus::NeedMore | RscGroupStatus::Invalid
+                        ) {
+                            break true;
+                        }
+                        // Skip the entire string so push-like text inside a
+                        // payload is not classified as another call. Only the
+                        // first receiver can have streamed in an earlier fragment.
+                        remaining = &remaining[end + 1..];
+                        receiver_trimmed = false;
+                        if !remaining.contains("__next_f") {
+                            break false;
+                        }
                     };
-                    let unsafe_continuation = range
-                        .map(|(start, end)| {
-                            matches!(
-                                classify_rsc_group(&[&content[start..end]], limit),
-                                RscGroupStatus::NeedMore | RscGroupStatus::Invalid
-                            )
-                        })
-                        .unwrap_or(true);
                     state.bypass_rsc |= unsafe_continuation
                         || state.captured_payload_bytes > 0
                         || !state.captured_payloads.is_empty();
@@ -482,6 +495,55 @@ mod tests {
             ScriptRewriteAction::Keep,
             "Non-RSC scripts should be kept unchanged"
         );
+    }
+
+    #[test]
+    fn oversized_batched_pushes_classify_later_payloads() {
+        for trimmed in [false, true] {
+            for (header, should_bypass) in [("T64", true), ("T50", false), ("T", true)] {
+                let state = IntegrationDocumentState::default();
+                let rewriter =
+                    NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+                        max_combined_payload_bytes: 100,
+                        ..(*test_config()).clone()
+                    }));
+                let receiver = if trimmed {
+                    assert_eq!(
+                        rewriter.rewrite("self.", &ctx(false, &state)),
+                        ScriptRewriteAction::Keep,
+                        "should release the qualified receiver"
+                    );
+                    ""
+                } else {
+                    "self."
+                };
+                let script = format!(
+                    r#"{receiver}__next_f.push([1,"1:T3,abc"]);self.__next_f.push([1,"2:{header},{}"])"#,
+                    "x".repeat(80)
+                );
+
+                assert_eq!(
+                    rewriter.rewrite(&script, &ctx(true, &state)),
+                    ScriptRewriteAction::Keep,
+                    "should preserve the oversized batch"
+                );
+                assert_eq!(
+                    document_state(&state)
+                        .lock()
+                        .expect("should lock document state")
+                        .bypass_rsc,
+                    should_bypass,
+                    "should classify the second payload with header {header}, trimmed={trimmed}"
+                );
+                let later = r#"self.__next_f.push([1,"1:T3,abc"]);"#;
+                let action = rewriter.rewrite(later, &ctx(true, &state));
+                assert_eq!(
+                    matches!(action, ScriptRewriteAction::Keep),
+                    should_bypass,
+                    "should bypass later scripts only when the batch is unsafe"
+                );
+            }
+        }
     }
 
     #[test]
