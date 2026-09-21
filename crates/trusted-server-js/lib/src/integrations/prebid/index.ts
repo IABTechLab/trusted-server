@@ -484,6 +484,9 @@ function recordCompletedPrebidAuction(
   const counts = new Map<string, number>();
   for (const code of adUnitCodes) counts.set(code, (counts.get(code) ?? 0) + 1);
   const nowMs = performance.now();
+  for (const [key, attempt] of prebidDiagnosticAttempts) {
+    if (nowMs > attempt.expiresAtMs) prebidDiagnosticAttempts.delete(key);
+  }
   const generation = window.tsjs?.navGeneration ?? 0;
   for (let index = 0; index < auctionSlots.length; index += 1) {
     const slot = auctionSlots[index];

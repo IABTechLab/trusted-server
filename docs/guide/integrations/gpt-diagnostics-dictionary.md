@@ -86,21 +86,21 @@ Path markers live for five seconds, are consumed once, and are keyed by GPT slot
 
 ## Timing
 
-All values are milliseconds. Missing timing that should apply is `Unavailable`, never zero. Server timing is `Not applicable` when no completed server auction was observed. A displayed zero is a valid immediate observation.
+All values are milliseconds. Missing timing that should apply is `Unavailable`, never zero. Server timing is `Not applicable` when no completed server auction was observed. A displayed zero is a valid immediate observation. The three server rows below are rendered with their T0 anchor substituted: `Edge request T0` for a navigation-origin auction and `SPA page-bids T0` for an SPA-origin one.
 
-| Label                                       | Origin and boundaries                                                            | Raw field                                  |
-| ------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------ |
-| `Server request start → auction dispatched` | Server request `RequestTimings` T0 to successful `dispatch_auction` outcome      | `serverAuctionTimings.auctionDispatchedMs` |
-| `Server request start → auction collected`  | Same T0 to completion of `collect_dispatched_auction`                            | `auctionResolvedMs`                        |
-| `Server request start → bids ready`         | Same T0 to winning-bid map commit                                                | `auctionCommittedMs`                       |
-| `Auction collection wait`                   | Actual duration blocked in collect; placement is `pre-header` or `in stream`     | `auctionWaitMs`, `auctionWaitPlacement`    |
-| `Opportunity → request`                     | Browser `performance.now()`: recorder observation to matched GPT `slotRequested` | `opportunityToRequestMs`                   |
-| `GAM request → response`                    | Browser `slotRequested` to `slotResponseReceived`                                | `durations.requestToResponseMs`            |
-| `GAM response → render`                     | Browser `slotResponseReceived` to `slotRenderEnded`                              | `responseToRenderMs`                       |
-| `GAM request → render`                      | Browser `slotRequested` to `slotRenderEnded`                                     | `requestToRenderMs`                        |
-| `Render → load`                             | Browser `slotRenderEnded` to `slotOnload`                                        | `renderToLoadMs`                           |
-| `Render → viewable`                         | Browser `slotRenderEnded` to `impressionViewable`                                | `renderToViewableMs`                       |
-| `Replaced rendered request`                 | Earlier browser render callback to later request callback                        | `previousRenderToRequestMs`                |
+| Label                              | Origin and boundaries                                                            | Raw field                                  |
+| ---------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------ |
+| `<T0 anchor> → auction dispatched` | Server request `RequestTimings` T0 to successful `dispatch_auction` outcome      | `serverAuctionTimings.auctionDispatchedMs` |
+| `<T0 anchor> → auction collected`  | Same T0 to completion of `collect_dispatched_auction`                            | `auctionResolvedMs`                        |
+| `<T0 anchor> → bids ready`         | Same T0 to winning-bid map commit                                                | `auctionCommittedMs`                       |
+| `Auction collection wait`          | Actual duration blocked in collect; placement is `pre-header` or `in stream`     | `auctionWaitMs`, `auctionWaitPlacement`    |
+| `Opportunity → request`            | Browser `performance.now()`: recorder observation to matched GPT `slotRequested` | `opportunityToRequestMs`                   |
+| `GAM request → response`           | Browser `slotRequested` to `slotResponseReceived`                                | `durations.requestToResponseMs`            |
+| `GAM response → render`            | Browser `slotResponseReceived` to `slotRenderEnded`                              | `responseToRenderMs`                       |
+| `GAM request → render`             | Browser `slotRequested` to `slotRenderEnded`                                     | `requestToRenderMs`                        |
+| `Render → load`                    | Browser `slotRenderEnded` to `slotOnload`                                        | `renderToLoadMs`                           |
+| `Render → viewable`                | Browser `slotRenderEnded` to `impressionViewable`                                | `renderToViewableMs`                       |
+| `Replaced rendered request`        | Earlier browser render callback to later request callback                        | `previousRenderToRequestMs`                |
 
 Server offsets are not browser timestamps. `auctionResolvedMs` means collection completed (including timeout handling), not that a network byte arrived at that exact instant.
 
@@ -109,7 +109,7 @@ Server offsets are not browser timestamps. `auctionResolvedMs` means collection 
 | Label                                                                          | Raw field / source                    | Meaning and limits                                                                                                                          |
 | ------------------------------------------------------------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Requested sizes`                                                              | `requestedSlotSizes`                  | Configured sizes supplied to GPT; ordinary sizes such as 300×250 remain visible. Missing data is shown as `Requested sizes: Not observed`.  |
-| `GPT-reported size`                                                            | `size`                                | Exact `slotRenderEnded.size`. A 1×1 placeholder is shown as `GPT-reported size: 1×1 placeholder hidden` and retained unchanged in V1 JSON.  |
+| `GPT-reported size`                                                            | `size`                                | Exact `slotRenderEnded.size`. A 1×1 placeholder is shown as `GPT-reported size: placeholder hidden` and retained unchanged in V1 JSON.      |
 | `Size filled` / `Measured outer slot size`                                     | `observedSlotSize`                    | CSS outer box of the exact uniquely bound slot after fill. Missing data is shown as `Size filled: Not observed · Measured outer slot size`. |
 | `GPT visibility`                                                               | current/maximum visibility percentage | Values from GPT visibility callbacks; absence is `GPT visibility: Not observed`.                                                            |
 | `Binding: Bound` / `Bound`                                                     | `binding.status=bound`                | Exactly one connected publisher element matched.                                                                                            |

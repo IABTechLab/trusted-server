@@ -730,11 +730,11 @@ export class GptDiagnosticsStore {
     const requestPath = this.requestPath(intent);
     const auctionType = this.auctionType(intent, trustedServerEvidence);
     const serverAuctionTimingOrigin: GptDiagnosticsServerAuctionTimingOrigin | undefined =
-      trustedServerEvidence?.serverAuctionTimings === undefined
-        ? undefined
-        : trustedServerEvidence.auctionType === 'trusted_server'
-          ? 'spa_auction'
-          : 'navigation';
+      trustedServerEvidence?.auctionType === 'trusted_server'
+        ? 'spa_auction'
+        : trustedServerEvidence?.auctionType === 'ssat'
+          ? 'navigation'
+          : undefined;
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,

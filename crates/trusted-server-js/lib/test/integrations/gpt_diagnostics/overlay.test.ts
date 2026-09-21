@@ -575,6 +575,68 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.destroy();
   });
 
+  it('labels unavailable SPA auction timing with the SPA request clock', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const diagnosticSlot = slot('spa-without-timings');
+    store.recordTrustedServerOpportunity(
+      diagnosticSlot,
+      'auction-spa-without-timings',
+      'renderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        winner: { bidder: 'example-bidder', priceBucket: '1.20' },
+      }
+    );
+    store.recordSlotRequested(diagnosticSlot);
+    let root: ShadowRoot | undefined;
+    const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
+      scheduleFrame: (callback) => frames.push(callback),
+      onShadowRoot: (createdRoot) => {
+        root = createdRoot;
+      },
+    });
+    runNextFrame(frames);
+    runNextFrame(frames);
+
+    expect(root?.textContent).toContain('SPA page-bids T0 → auction dispatched Unavailable');
+    expect(root?.textContent).not.toContain('Edge request T0 → auction dispatched Unavailable');
+    overlay.destroy();
+  });
+
+  it('announces an evicted request selection once and then clears it', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const diagnosticSlot = slot('evicted-selection');
+    store.recordSlotRequested(diagnosticSlot);
+    let root: ShadowRoot | undefined;
+    const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
+      scheduleFrame: (callback) => frames.push(callback),
+      onShadowRoot: (createdRoot) => {
+        root = createdRoot;
+      },
+    });
+    runNextFrame(frames);
+    runNextFrame(frames);
+
+    overlay.selectRequest(1, 1);
+    runNextFrame(frames);
+    let requestsToRecord = 10;
+    while (requestsToRecord > 0) {
+      store.recordSlotRequested(diagnosticSlot);
+      requestsToRecord -= 1;
+    }
+    runNextFrame(frames);
+
+    expect(root?.textContent).toContain('Ad #1, Request #1 is no longer retained.');
+    store.recordSlotResponseReceived(diagnosticSlot);
+    runNextFrame(frames);
+    expect(root?.textContent).not.toContain('Ad #1, Request #1 is no longer retained.');
+    overlay.destroy();
+  });
+
   it('reveals an exact request and locates it without mutating publisher markup', () => {
     const frames: Array<() => void> = [];
     const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
