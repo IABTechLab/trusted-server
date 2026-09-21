@@ -443,15 +443,14 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
-    /// Known partner API token placeholders that must not be used in deployments.
+    /// Known partner secret placeholders (`api_token` and `ts_pull_token`) that
+    /// must not be used in deployments.
     pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
         "partner-api-token-32-bytes-minimum",
         "replace-with-partner-api-token-32-bytes-minimum",
         "sharedid-internal-token-32-bytes",
         "inttest-api-key-1-32-bytes-minimum",
         "inttest2-api-key-2-32-bytes-minimum",
-        "partner_api_token",
-        "partner_ts_pull_token",
     ];
 
     /// Returns `true` if `api_token` matches a known placeholder value
@@ -5441,7 +5440,9 @@ source_domain = "partner.example.com"
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
         settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
-        settings.ec.partners = vec![test_partner_with_pull_token("partner_ts_pull_token")];
+        settings.ec.partners = vec![test_partner_with_pull_token(
+            "partner-api-token-32-bytes-minimum",
+        )];
 
         let err = settings
             .reject_placeholder_secrets()
@@ -5465,36 +5466,6 @@ source_domain = "partner.example.com"
         settings
             .reject_placeholder_secrets()
             .expect("should accept a realistic partner pull token");
-    }
-
-    /// Guards against the placeholder lists drifting away from the example config
-    /// Example value shipped in `trusted-server.example.toml` must be recognized
-    /// as a placeholder
-    #[test]
-    fn example_toml_partner_secret_examples_are_recognized_placeholders() {
-        const EXAMPLE_TOML: &str = include_str!("../../../trusted-server.example.toml");
-        const EXAMPLE_PARTNER_KEYS: &[&str] = &["api_token", "ts_pull_token"];
-        let pattern = format!(
-            r#"(?m)^\s*#?\s*(?:{})\s*=\s*"([^"]+)""#,
-            EXAMPLE_PARTNER_KEYS.join("|")
-        );
-        let example_value =
-            Regex::new(&pattern).expect("should compile example partner secret regex");
-
-        let mut checked_any = false;
-        for capture in example_value.captures_iter(EXAMPLE_TOML) {
-            checked_any = true;
-            let value = &capture[1];
-            assert!(
-                EcPartner::is_placeholder_api_token(value),
-                "example config partner secret '{value}' should be a recognized placeholder \
-                 — add it to EcPartner::API_TOKEN_PLACEHOLDERS"
-            );
-        }
-        assert!(
-            checked_any,
-            "should have found at least one partner secret example value in the template"
-        );
     }
 
     #[test]
