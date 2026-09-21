@@ -294,13 +294,15 @@ impl AdServerMockProvider {
 
                 let Some(width) = bid["w"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
                     log::debug!(
-                        "adserver_mock: bid for slot '{slot_id}' has invalid width, skipping"
+                        "adserver_mock: bid for slot '{slot_id}' has invalid width {:?}, skipping",
+                        bid["w"]
                     );
                     continue;
                 };
                 let Some(height) = bid["h"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
                     log::debug!(
-                        "adserver_mock: bid for slot '{slot_id}' has invalid height, skipping"
+                        "adserver_mock: bid for slot '{slot_id}' has invalid height {:?}, skipping",
+                        bid["h"]
                     );
                     continue;
                 };
@@ -1336,11 +1338,13 @@ mod tests {
     #[test]
     fn test_parse_mediation_response_skips_oversized_dimensions() {
         // A dimension above u32::MAX must be rejected rather than silently
-        // wrapped into a small, plausible-looking value.
+        // wrapped into a small, plausible-looking value. The offset of 101 is
+        // load-bearing: u32::MAX + 1 truncates to 0, which the zero-check
+        // below would already have caught, so it would not pin this fix.
         let config = AdServerMockConfig::default();
         let provider = AdServerMockProvider::new(config);
 
-        let oversized_width = u64::from(u32::MAX) + 1;
+        let oversized_width = u64::from(u32::MAX) + 101;
         let mediation_response = json!({
             "id": "test-auction-123",
             "seatbid": [
