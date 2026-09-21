@@ -182,9 +182,11 @@ curl --cacert "$(ts dev proxy ca path)" --proxy http://127.0.0.1:18080 https://w
 Chrome discovery tries `google-chrome`, `google-chrome-stable`, `chromium`, then
 `chromium-browser` on PATH. Firefox requires native `firefox` on PATH. Discovery
 skips known Snap/Flatpak executable paths but does not inspect shell wrappers.
-A launcher such as `/usr/bin/chromium` can still start a packaged browser. Confirm
-that the selected launcher uses a native installation; Snap/Flatpak wrappers are
-unsupported and may not honor the supplied profile or trust configuration.
+On Ubuntu, the transitional Firefox and Chromium packages can install launchers
+such as `/usr/bin/firefox` or `/usr/bin/chromium-browser` that start Snap. Resolving
+symlinks does not detect that redirection. Confirm that the selected launcher uses
+a native installation; Snap/Flatpak wrappers are unsupported and may not honor the
+supplied profile or trust configuration.
 
 ### Trust the CA in Firefox
 
@@ -193,14 +195,17 @@ Firefox does not reliably consult the macOS login keychain. When you use
 NSS database using `certutil`. `certutil` is not built into macOS — install it
 with `brew install nss`, or the Linux package listed above. If import fails,
 the proxy prints an error and skips Firefox launch. If you are pointing an existing Firefox profile at the
-proxy manually, run:
+proxy manually, find its root directory in Firefox's `about:profiles` and replace
+`<profile-directory>` below with that full path:
 
 ```bash
 certutil -A -n "Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION" \
-  -t "CT,," \
+  -t "C,," \
   -i "$(ts dev proxy ca path)" \
-  -d "sql:$HOME/Library/Application Support/Firefox/Profiles/<profile>"
+  -d "sql:<profile-directory>"
 ```
+
+`C,,` grants server-certificate CA trust, matching the temporary-profile import.
 
 ### Revoking trust when done
 
@@ -248,11 +253,30 @@ A CA-directory lock serializes CA commands and initial loading. A second lock in
 each shared NSS directory serializes `ts` trust changes across different CA
 directories. Neither lock controls external browser or `certutil` writers.
 
-All generated dev CAs share a subject name. NSS exports all certificates with a
-matching subject even when queried by nickname, so Linux `ca install` rejects a
-different same-subject certificate before import. Remove the first CA using its
-original `--ca-dir`, or resolve an existing manual import, before installing a CA
-from another directory. Reinstalling the identical certificate is supported.
+All generated dev CAs share a subject name. Linux `ca install` queries NSS using
+the CA file to export the matching-subject certificates, rather than reconstructing
+other users' nicknames from NSS's display table. It rejects a different same-subject
+certificate before import. Remove the first CA using its original `--ca-dir`, or
+resolve an existing manual import, before installing a CA from another directory.
+Reinstalling the identical certificate is supported.
+
+A manual nickname that visually imitates a managed `ts-dev-proxy-<hash>` entry,
+for example by adding a trailing space, can still make NSS's padded listing
+ambiguous. Such a collision stops the operation even if the exact managed nickname
+is absent. Resolve the manual nickname collision before retrying; the CLI does not
+interpret a failed named lookup as proof of absence.
+
+Failed queries, failed exports, and invalid certificate output still stop the
+operation. They are not treated as proof of absence or skipped with a warning.
+Keep the CA files and journal, and use the command, database path, and NSS error in
+the diagnostic to investigate. Check that `certutil` is installed and the reported
+store is accessible. Retry a busy operation after the other process exits; an I/O
+or unsupported-filesystem-lock error needs its underlying cause fixed instead.
+For a damaged NSS store or a manual certificate conflict, coordinate recovery with
+whoever manages that store before retrying. Do not delete unrelated certificates,
+reset the database, or discard the journal to force rotation. Initializing a new
+store may leave an empty database behind if installation later fails, but no
+certificate is imported until the subject check succeeds.
 
 ## Host header behavior
 
@@ -334,30 +358,15 @@ proxy on the LAN.
 
 ## All options
 
-```
-ts dev proxy [OPTIONS] [COMMAND]
+Read the complete option list from the installed version:
 
-Options:
-      --map <FROM=TO>           Rewrite rule (repeatable)
-  -f, --from <HOST>             Single-rule FROM (pairs with --to)
-  -t, --to <HOST[:PORT]>        Single-rule TO (hostname; pairs with --from)
-      --resolve <HOST:IP>       Pin HOST's connection to IP (curl-style, repeatable)
-      --listen <ADDR>           Listen address [default: 127.0.0.1:18080]
-      --allow-non-loopback      Permit non-loopback --listen (disables blind tunnel)
-      --launch <LIST>           Browsers to launch (chrome,firefox,safari or all)
-      --rewrite-host            Send Host: <TO> instead of the default <FROM>
-      --basic-auth <USER:PASS>  Inject Basic auth (visible in ps — prefer --basic-auth-file)
-      --basic-auth-file <PATH>  Read USER:PASS from a file
-      --insecure                Skip upstream TLS certificate verification
-      --upstream-plaintext      Connect to upstream over plain HTTP
-      --connect-timeout <SECONDS>  Upstream connect timeout in seconds [default: 10]
-      --ca-dir <PATH>           CA cert/key directory [default: ~/Library/Application Support/
-                                trusted-server/dev-proxy on macOS]
+```bash
+ts dev proxy --help
+ts dev proxy ca --help
 ```
 
 Proxy routing is flags-only. CA and Linux NSS paths honor HOME and absolute
-XDG_DATA_HOME as described above. The
-`[COMMAND]` slot is the `ca` subcommand — see
+XDG_DATA_HOME as described above. For certificate management, see
 [CA companion commands](#ca-companion-commands).
 
 ## Browser details

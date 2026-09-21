@@ -17,6 +17,7 @@ use crate::output;
 /// is `on` or `off`. A missing third line is tolerated when reading (treated as
 /// `on` if a URL is present, else `off`) for forward-compatibility with the
 /// earlier two-line format.
+#[cfg(any(target_os = "macos", test))]
 const SAFARI_RESTORE_FILE: &str = "safari-proxy-restore";
 
 /// Generates a PAC script that proxies only `https://` requests for matched FROM hosts.
@@ -77,6 +78,7 @@ pub fn launch(
         match browser {
             Browser::Chrome => launch_chrome(cfg),
             Browser::Firefox => launch_firefox(cfg),
+            #[cfg(target_os = "macos")]
             Browser::Safari => launch_safari(cfg),
         }
     }
@@ -266,6 +268,15 @@ fn find_native_browser(
         .map(Command::new)
 }
 
+/// Finds a launcher on PATH and resolves symlinks before checking packaging paths.
+#[cfg(target_os = "linux")]
+fn lookup_on_path(name: &str) -> Option<std::path::PathBuf> {
+    which::which(name)
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+}
+
+/// Returns the platform Chrome or Chromium command.
 fn chrome_command() -> Option<Command> {
     #[cfg(target_os = "macos")]
     {
@@ -275,11 +286,7 @@ fn chrome_command() -> Option<Command> {
     }
     #[cfg(target_os = "linux")]
     {
-        find_native_browser(CHROME_LAUNCHERS, |name| {
-            which::which(name)
-                .ok()
-                .and_then(|path| path.canonicalize().ok())
-        })
+        find_native_browser(CHROME_LAUNCHERS, lookup_on_path)
     }
 }
 
@@ -376,11 +383,7 @@ fn firefox_command() -> Option<Command> {
     }
     #[cfg(target_os = "linux")]
     {
-        find_native_browser(&["firefox"], |name| {
-            which::which(name)
-                .ok()
-                .and_then(|path| path.canonicalize().ok())
-        })
+        find_native_browser(&["firefox"], lookup_on_path)
     }
 }
 
@@ -393,6 +396,7 @@ fn firefox_command() -> Option<Command> {
 /// The restore file is consumed by [`restore_system_proxy_if_pending`] — either
 /// at the next startup (crash recovery) or on clean Ctrl-C exit.  If the
 /// process is SIGKILL'd the file remains and is recovered on the next run.
+#[cfg(target_os = "macos")]
 fn launch_safari(cfg: &ResolvedConfig) {
     let pac_url = format!("http://{}/proxy.pac", proxy_connect_addr(cfg.listen));
 
@@ -488,34 +492,29 @@ fn launch_safari(cfg: &ResolvedConfig) {
 }
 
 /// Returns the active Wi-Fi/Ethernet network service name, or `None`.
+#[cfg(target_os = "macos")]
 fn detect_network_service() -> Option<String> {
-    #[cfg(not(target_os = "macos"))]
-    return None;
+    // Find the default-route interface name.
+    let route_out = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    let route_text = String::from_utf8_lossy(&route_out.stdout);
+    let interface = route_text
+        .lines()
+        .find(|l| l.trim_start().starts_with("interface:"))?
+        .split(':')
+        .nth(1)?
+        .trim()
+        .to_string();
 
-    #[cfg(target_os = "macos")]
-    {
-        // Find the default-route interface name.
-        let route_out = Command::new("route")
-            .args(["-n", "get", "default"])
-            .output()
-            .ok()?;
-        let route_text = String::from_utf8_lossy(&route_out.stdout);
-        let interface = route_text
-            .lines()
-            .find(|l| l.trim_start().starts_with("interface:"))?
-            .split(':')
-            .nth(1)?
-            .trim()
-            .to_string();
-
-        // Map interface → service name via networksetup -listnetworkserviceorder.
-        let ns_out = Command::new("networksetup")
-            .arg("-listnetworkserviceorder")
-            .output()
-            .ok()?;
-        let ns_text = String::from_utf8_lossy(&ns_out.stdout);
-        service_for_interface(&ns_text, &interface)
-    }
+    // Map interface → service name via networksetup -listnetworkserviceorder.
+    let ns_out = Command::new("networksetup")
+        .arg("-listnetworkserviceorder")
+        .output()
+        .ok()?;
+    let ns_text = String::from_utf8_lossy(&ns_out.stdout);
+    service_for_interface(&ns_text, &interface)
 }
 
 /// Maps a default-route interface (e.g. `en0`) to its macOS network-service name
@@ -567,6 +566,7 @@ fn service_for_interface(ns_output: &str, interface: &str) -> Option<String> {
 ///
 /// A `URL:` of `(null)` (or empty) yields `None`; `Enabled:` is `true` only for
 /// a `Yes` (case-insensitive). Pure and unit-testable.
+#[cfg(any(target_os = "macos", test))]
 fn parse_auto_proxy_state(text: &str) -> (Option<String>, bool) {
     let mut url = None;
     let mut enabled = false;
@@ -586,6 +586,7 @@ fn parse_auto_proxy_state(text: &str) -> (Option<String>, bool) {
 /// Returns the current auto-proxy `(url, enabled)` state for a network service.
 ///
 /// A failure to run `networksetup` is reported as `(None, false)`.
+#[cfg(target_os = "macos")]
 fn get_auto_proxy_state(service: &str) -> (Option<String>, bool) {
     let Ok(out) = Command::new("networksetup")
         .args(["-getautoproxyurl", service])
@@ -598,6 +599,7 @@ fn get_auto_proxy_state(service: &str) -> (Option<String>, bool) {
 
 /// Single-quotes a value for safe inclusion in a printed POSIX shell command
 /// (handles spaces, `&`, and other metacharacters; embedded `'` are escaped).
+#[cfg(any(target_os = "macos", test))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

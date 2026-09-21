@@ -47,7 +47,7 @@ pub enum ConfigError {
     )]
     BasicAuthNonLoopback { value: String },
     /// An unknown or unsupported browser was passed to `--launch`.
-    #[display("unsupported browser `{value}` (use chrome|firefox|all; safari is macOS-only)")]
+    #[display("unsupported browser `{value}` (use chrome|firefox|all, plus safari on macOS)")]
     Browser { value: String },
 }
 
@@ -94,8 +94,12 @@ impl core::fmt::Debug for BasicAuth {
 /// A browser the proxy can launch and configure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Browser {
+    /// Chrome or Chromium using a temporary profile.
     Chrome,
+    /// Firefox using a temporary profile.
     Firefox,
+    /// Safari using the macOS system proxy settings.
+    #[cfg(target_os = "macos")]
     Safari,
 }
 
