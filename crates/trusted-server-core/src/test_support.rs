@@ -25,8 +25,8 @@ pub mod tests {
             enabled = true
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
-            [integrations.prebid.bundle]
-            adapters = ["exampleBidder"]
+            [integrations.prebid.bundle.modules]
+            bidder = ["exampleBidderBidAdapter"]
 
             [integrations.nextjs]
             enabled = false

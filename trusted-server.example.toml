@@ -495,10 +495,41 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
-# Bundle build inputs consumed by the `ts prebid bundle` CLI (not the runtime):
-# [integrations.prebid.bundle]
-# adapters = ["rubicon"]
-# user_id_modules = ["sharedIdSystem"]
+# Bundle build inputs consumed by `ts prebid bundle`, not by the edge runtime.
+# Values are exact upstream module stems without `.js`.
+# [integrations.prebid.bundle.modules]
+# bidder = ["rubiconBidAdapter"]
+# Omit user_id for the curated default preset; use [] to select none.
+# user_id = ["sharedIdSystem"]
+# Omitted or empty analytics selects no analytics adapters.
+# analytics = ["atsAnalyticsAdapter"]
+
+# Prebid User ID modules that Trusted Server installs and keeps installed, so
+# operators can manage identity centrally without publisher JavaScript changes.
+# Each entry is forwarded to Prebid.js verbatim: `name` is a
+# `userSync.userIds` entry name, `params` and `storage` are whatever that module
+# documents. Trusted Server does not interpret them; supported names come from
+# the checked-in User ID registry. Each `name` must appear only once.
+#
+# The module must be present in the built bundle: name it under
+# [integrations.prebid.bundle].user_id_modules, or omit that list to take the
+# generator's default preset. `ts prebid bundle` resolves every managed name
+# through the checked-in User ID registry and fails if the generated manifest
+# omits its required module without updating the configured hash or SRI.
+#
+# Persisting a resolved ID into the EC identity graph additionally needs a
+# matching partner under [[ec.partners]] whose source_domain equals the module's
+# OpenRTB EID source; without one the ID still reaches the auction but is never
+# written to KV.
+#
+# [[integrations.prebid.managed_user_ids]]
+# name = "sharedId"
+#
+# [integrations.prebid.managed_user_ids.storage]
+# type = "cookie"            # or "html5"
+# name = "_sharedid"
+# expires = 15               # days; omit to keep Prebid's default
+# refresh_in_seconds = 1800  # omit to keep Prebid's default
 
 # Next.js first-party rewriting for App Router / RSC payloads.
 # [integrations.nextjs]
