@@ -886,7 +886,15 @@ function restoreTrustedServerFirstImpressionTargeting(slot: RefreshGptSlot): voi
       Boolean(candidate && ts && firstImpressionClaim(ts, candidate)?.owner === 'trusted_server')
     );
   const claim = ts && element ? firstImpressionClaim(ts, element) : undefined;
-  if (claim?.owner !== 'trusted_server' || !claim.targeting || !slot.setTargeting) return;
+  // After settlement, a legitimate refresh may already have newer targeting.
+  // Deny the losing request without restoring the initial snapshot over it.
+  if (
+    claim?.owner !== 'trusted_server' ||
+    claim.phase === 'rendered' ||
+    !claim.targeting ||
+    !slot.setTargeting
+  )
+    return;
   clearRefreshTargeting(slot);
   for (const [key, value] of Object.entries(claim.targeting)) slot.setTargeting(key, value);
 }

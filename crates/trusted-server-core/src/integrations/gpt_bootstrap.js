@@ -259,10 +259,10 @@
             });
             return;
           }
-          claim.phase = phase;
+          if (claim.phase !== "rendered") claim.phase = phase;
           if (claim.owner === "publisher") {
             claim.expiresAt = Number.POSITIVE_INFINITY;
-          } else {
+          } else if (phase === "rendered") {
             claim.publisherRegistrationClosed = true;
           }
         };

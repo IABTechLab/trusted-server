@@ -232,10 +232,7 @@ export function registerPublisherFirstImpressionAuctions(
     ) {
       continue;
     }
-    if (
-      claim.owner === 'trusted_server' &&
-      (claim.publisherRegistrationClosed || claim.expiresAt <= now)
-    ) {
+    if (claim.owner === 'trusted_server' && claim.publisherRegistrationClosed) {
       continue;
     }
     if (Object.keys(claim.publisherAuctions).length >= MAX_PUBLISHER_AUCTIONS_PER_SLOT) continue;
@@ -300,7 +297,6 @@ export function releasePublisherFirstImpressionAuction(
   const found = findPublisherAuction(ts, token, now);
   if (!found) return;
   if (found.claim.owner === 'trusted_server' && found.auction.suppressDelivery) {
-    found.claim.publisherRegistrationClosed = true;
     return;
   }
   found.auction.expiresAt = Math.min(found.auction.expiresAt, now);
@@ -324,8 +320,9 @@ export function consumePublisherFirstImpressionDelivery(
   if (!found) return false;
 
   const suppress = found.claim.owner === 'trusted_server' && found.auction.suppressDelivery;
-  delete found.claim.publisherAuctions[token];
-  if (suppress) found.claim.publisherRegistrationClosed = true;
+  // Keep the losing disposition if the wrapped auction callback runs again.
+  // Consuming a delivery does not settle TS's initial render.
+  if (!suppress) delete found.claim.publisherAuctions[token];
   return suppress;
 }
 
@@ -352,13 +349,12 @@ export function observeFirstImpressionGptLifecycle(
     return;
   }
 
-  claim.phase = phase;
+  if (claim.phase !== 'rendered') claim.phase = phase;
   if (claim.owner === 'publisher') {
     claim.expiresAt = Number.POSITIVE_INFINITY;
-  } else {
-    // Once TS has committed a GPT request, only publisher auctions that were
-    // already registered can still represent an overlapping first impression.
-    // New publisher refreshes are ordinary later impressions and must proceed.
+  } else if (phase === 'rendered') {
+    // Auctions begun before the initial render settles still overlap it, even
+    // after slotRequested or the publisher fallback lease has elapsed.
     claim.publisherRegistrationClosed = true;
   }
 }

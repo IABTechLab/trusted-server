@@ -299,55 +299,69 @@ describe('gpt_bootstrap.js fallback', () => {
     }
   });
 
-  it('retains an expired TS suppression tombstone in the persistent bootstrap listener', () => {
-    const queue: Array<() => void> = [];
-    const listeners = new Map<string, (event: { slot: { getSlotElementId(): string } }) => void>();
-    const pubads = {
-      addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
-        listeners.set(name, listener as (event: { slot: { getSlotElementId(): string } }) => void);
-      }),
-      getSlots: vi.fn(() => []),
-      refresh: vi.fn(),
-    };
-    (window as TestWindow).googletag = makeGoogleTag({
-      cmd: queue,
-      pubads: vi.fn(() => pubads),
-    });
-    document.body.innerHTML = '<div id="persistent-slot"></div>';
+  it.each([true, false])(
+    'settles the persistent bootstrap listener on render (empty=%s)',
+    (isEmpty) => {
+      const queue: Array<() => void> = [];
+      const listeners = new Map<
+        string,
+        (event: { slot: { getSlotElementId(): string } }) => void
+      >();
+      const pubads = {
+        addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
+          listeners.set(
+            name,
+            listener as (event: { slot: { getSlotElementId(): string } }) => void
+          );
+        }),
+        getSlots: vi.fn(() => []),
+        refresh: vi.fn(),
+      };
+      (window as TestWindow).googletag = makeGoogleTag({
+        cmd: queue,
+        pubads: vi.fn(() => pubads),
+      });
+      document.body.innerHTML = '<div id="persistent-slot"></div>';
 
-    runBootstrap();
-    [...queue].forEach((command) => command());
-    const element = document.getElementById('persistent-slot')!;
-    const claim: FirstImpressionSlotClaim = {
-      generation: 0,
-      slotElementId: element.id,
-      element,
-      owner: 'trusted_server',
-      phase: 'delivery_pending',
-      expiresAt: 0,
-      publisherAuctions: {
-        late: {
-          token: 'late',
-          adUnitCode: element.id,
-          phase: 'delivery_pending',
-          expiresAt: 0,
-          adIds: ['late-ad'],
-          suppressDelivery: true,
+      runBootstrap();
+      [...queue].forEach((command) => command());
+      const element = document.getElementById('persistent-slot')!;
+      const claim: FirstImpressionSlotClaim = {
+        generation: 0,
+        slotElementId: element.id,
+        element,
+        owner: 'trusted_server',
+        phase: 'delivery_pending',
+        expiresAt: 0,
+        publisherAuctions: {
+          late: {
+            token: 'late',
+            adUnitCode: element.id,
+            phase: 'delivery_pending',
+            expiresAt: 0,
+            adIds: ['late-ad'],
+            suppressDelivery: true,
+          },
         },
-      },
-    };
-    (window as TestWindow).tsjs!.firstImpression = {
-      generation: 0,
-      nextToken: 1,
-      slots: { [element.id]: claim },
-      fallbackSlots: {},
-    };
+      };
+      (window as TestWindow).tsjs!.firstImpression = {
+        generation: 0,
+        nextToken: 1,
+        slots: { [element.id]: claim },
+        fallbackSlots: {},
+      };
 
-    listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
+      listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
 
-    expect(claim.publisherAuctions.late).toBeDefined();
-    expect(claim.publisherRegistrationClosed).toBe(true);
-  });
+      expect(claim.publisherAuctions.late).toBeDefined();
+      expect(claim.publisherRegistrationClosed).not.toBe(true);
+      const renderedEvent = { slot: { getSlotElementId: () => element.id }, isEmpty };
+      listeners.get('slotRenderEnded')!(renderedEvent);
+      expect(claim.publisherRegistrationClosed).toBe(true);
+      listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
+      expect(claim.phase).toBe('rendered');
+    }
+  );
 
   it('prunes a malformed bootstrap registry key before recording the main-document slot', () => {
     const queue: Array<() => void> = [];
