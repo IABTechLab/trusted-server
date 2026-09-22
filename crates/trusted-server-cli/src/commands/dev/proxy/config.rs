@@ -359,14 +359,6 @@ mod tests {
         AddressPolicy, OriginKey, ReferenceIdentity, Transport, VerifyMode,
     };
 
-    fn base_args() -> crate::commands::dev::proxy::ProxyArgs {
-        parse_args(&[
-            "ts",
-            "--listen",
-            crate::commands::dev::proxy::DEFAULT_LISTEN,
-        ])
-    }
-
     fn parse_args(argv: &[&str]) -> crate::commands::dev::proxy::ProxyArgs {
         #[derive(clap::Parser)]
         struct W {
@@ -378,7 +370,10 @@ mod tests {
 
     #[test]
     fn clap_parses_rewrite_host_as_a_bool() {
-        assert!(!base_args().rewrite_host, "absent --rewrite-host is false");
+        assert!(
+            !parse_args(&["ts", "--from", "a.example.com", "--to", "b.example.com"]).rewrite_host,
+            "absent --rewrite-host is false"
+        );
         assert!(
             parse_args(&["ts", "--rewrite-host"]).rewrite_host,
             "present --rewrite-host is true"
@@ -386,10 +381,24 @@ mod tests {
     }
 
     #[test]
+    fn clap_applies_the_real_listen_default() {
+        let args = parse_args(&["ts", "--rewrite-host"]);
+        assert_eq!(
+            args.listen,
+            crate::commands::dev::proxy::DEFAULT_LISTEN,
+            "should apply the real clap --listen default"
+        );
+    }
+
+    #[test]
     fn single_rule_from_to_keeps_from_host_by_default() {
-        let mut args = base_args();
-        args.from = Some("www.example-publisher.com".into());
-        args.to = Some("to.edgecompute.app".into());
+        let args = parse_args(&[
+            "ts",
+            "--from",
+            "www.example-publisher.com",
+            "--to",
+            "to.edgecompute.app",
+        ]);
         let cfg = resolve(&args).expect("should resolve");
         let rule = cfg
             .rules
@@ -405,9 +414,12 @@ mod tests {
 
     #[test]
     fn rewrite_host_uses_to() {
-        let mut args = base_args();
-        args.map = vec!["www.example-publisher.com=to.edgecompute.app".into()];
-        args.rewrite_host = true;
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "www.example-publisher.com=to.edgecompute.app",
+            "--rewrite-host",
+        ]);
         let cfg = resolve(&args).expect("should resolve");
         assert_eq!(
             rewrite_for(
@@ -423,10 +435,13 @@ mod tests {
 
     #[test]
     fn resolve_pins_host_to_ip() {
-        let mut args = base_args();
-        args.map = vec!["www.example-publisher.com=ts.edgecompute.app".into()];
-        // Mixed case to confirm the host key is lowercased.
-        args.resolve = vec!["TS.EdgeCompute.app:192.0.2.10".into()];
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "www.example-publisher.com=ts.edgecompute.app",
+            "--resolve",
+            "TS.EdgeCompute.app:192.0.2.10", // Mixed case to confirm the host key is lowercased.
+        ]);
         let cfg = resolve(&args).expect("should resolve");
         assert_eq!(
             cfg.resolve.get("ts.edgecompute.app"),
@@ -437,10 +452,13 @@ mod tests {
 
     #[test]
     fn resolve_accepts_ipv6_target() {
-        let mut args = base_args();
-        args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        // Split-on-first-colon must keep the colon-bearing IPv6 address intact.
-        args.resolve = vec!["b.edgecompute.app:::1".into()];
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            "--resolve",
+            "b.edgecompute.app:::1", // Split-on-first-colon must keep the colon-bearing IPv6 address intact.
+        ]);
         let cfg = resolve(&args).expect("should resolve");
         assert_eq!(
             cfg.resolve.get("b.edgecompute.app"),
@@ -451,11 +469,15 @@ mod tests {
 
     #[test]
     fn resolve_host_not_matching_any_rule_warns_but_succeeds() {
-        let mut args = base_args();
-        args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        // A pin for a host that is no rule's TO is a likely typo: it should warn
-        // (not error) and still be recorded.
-        args.resolve = vec!["typo.edgecompute.app:192.0.2.10".into()];
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            // A pin for a host that is no rule's TO is a likely typo: it should warn
+            // (not error) and still be recorded.
+            "--resolve",
+            "typo.edgecompute.app:192.0.2.10",
+        ]);
         let cfg = resolve(&args).expect("an unmatched --resolve host should warn, not error");
         assert!(
             cfg.resolve.contains_key("typo.edgecompute.app"),
@@ -465,9 +487,13 @@ mod tests {
 
     #[test]
     fn resolve_rejects_malformed_value() {
-        let mut args = base_args();
-        args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        args.resolve = vec!["b.edgecompute.app:not-an-ip".into()];
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            "--resolve",
+            "b.edgecompute.app:not-an-ip",
+        ]);
         let err = resolve(&args).expect_err("a non-IP --resolve target should error");
         assert!(
             matches!(err.current_context(), ConfigError::Resolve { .. }),
@@ -477,8 +503,7 @@ mod tests {
 
     #[test]
     fn map_value_must_be_from_equals_to() {
-        let mut args = base_args();
-        args.map = vec!["not-a-map".into()];
+        let args = parse_args(&["ts", "--map", "not-a-map"]);
         assert!(resolve(&args).is_err(), "malformed --map errors");
     }
 
@@ -486,11 +511,16 @@ mod tests {
     fn basic_auth_on_non_loopback_listen_is_rejected() {
         // Injected Basic auth on a non-loopback bind would expose the upstream
         // credentials to any reachable network client.
-        let mut args = base_args();
-        args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        args.listen = "0.0.0.0:18080".into();
-        args.allow_non_loopback = true;
-        args.basic_auth = Some("dev:secret".into());
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            "--listen",
+            "0.0.0.0:18080",
+            "--allow-non-loopback",
+            "--basic-auth",
+            "dev:secret",
+        ]);
         let err =
             resolve(&args).expect_err("non-loopback listen with --basic-auth should be rejected");
         assert!(
@@ -502,7 +532,14 @@ mod tests {
         );
 
         // The same non-loopback bind without credentials is allowed.
-        args.basic_auth = None;
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            "--listen",
+            "0.0.0.0:18080",
+            "--allow-non-loopback",
+        ]);
         assert!(
             resolve(&args).is_ok(),
             "non-loopback without --basic-auth is allowed"
@@ -512,8 +549,7 @@ mod tests {
     #[test]
     fn invalid_from_host_is_rejected() {
         // A FROM with characters that would break the PAC JS / Host header.
-        let mut args = base_args();
-        args.map = vec!["bad\"host=to.edgecompute.app".into()];
+        let args = parse_args(&["ts", "--map", "bad\"host=to.edgecompute.app"]);
         let err = resolve(&args).expect_err("a malformed FROM host should error");
         assert!(
             matches!(err.current_context(), ConfigError::InvalidFrom { .. }),
@@ -523,14 +559,25 @@ mod tests {
 
     #[test]
     fn non_loopback_listen_requires_flag() {
-        let mut args = base_args();
-        args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        args.listen = "0.0.0.0:18080".into();
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            "--listen",
+            "0.0.0.0:18080",
+        ]);
         assert!(
             resolve(&args).is_err(),
             "non-loopback without flag is rejected"
         );
-        args.allow_non_loopback = true;
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            "--listen",
+            "0.0.0.0:18080",
+            "--allow-non-loopback",
+        ]);
         assert!(resolve(&args).is_ok(), "non-loopback allowed with flag");
     }
 
@@ -553,11 +600,15 @@ mod tests {
 
     #[test]
     fn resolve_precomputes_typed_rule_identity_and_headers() {
-        let mut args = base_args();
-        args.map = vec!["www.example.com=TO.Example.com:8443".into()];
-        args.rewrite_host = true;
-        args.insecure = true;
-        args.resolve = vec!["to.example.com:192.0.2.10".into()];
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "www.example.com=TO.Example.com:8443",
+            "--rewrite-host",
+            "--insecure",
+            "--resolve",
+            "to.example.com:192.0.2.10",
+        ]);
 
         let cfg = resolve(&args).expect("should resolve");
         let rule = cfg
@@ -596,10 +647,7 @@ mod tests {
 
     #[test]
     fn resolve_keeps_ip_reference_identities_http1_only() {
-        let mut args = base_args();
-        args.map = vec!["www.example.com=127.0.0.1".into()];
-        args.rewrite_host = true;
-
+        let args = parse_args(&["ts", "--map", "www.example.com=127.0.0.1", "--rewrite-host"]);
         let cfg = resolve(&args).expect("should resolve");
         let rule = cfg
             .rules
@@ -649,9 +697,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("should create temp dir");
         let missing = dir.path().join("no-such-file.txt");
 
-        let mut args = base_args();
-        args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        args.basic_auth_file = Some(missing.to_string_lossy().into_owned());
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.edgecompute.app",
+            "--basic-auth-file",
+            &missing.to_string_lossy(),
+        ]);
 
         let err = resolve(&args).expect_err("should fail when file is missing");
         assert!(
@@ -661,8 +713,18 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "DisplayHelpOnMissingArgumentOrSubcommand")]
+    fn bare_invocation_is_rejected_at_parse_time() {
+        // `arg_required_else_help` makes a fully-bare `ts` fail to parse at all,
+        // before `resolve` (and its `NoRule` check) ever runs.
+        parse_args(&["ts"]);
+    }
+
+    #[test]
     fn no_rule_passed_is_a_no_rule_error() {
-        let args = base_args();
+        // An invocation with some other flag but no rule still reaches
+        // `resolve`: `arg_required_else_help` only rejects a fully-bare `ts`.
+        let args = parse_args(&["ts", "--insecure"]);
         let err = resolve(&args).expect_err("should error when no rule is passed");
         assert!(
             matches!(err.current_context(), ConfigError::NoRule),

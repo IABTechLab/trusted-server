@@ -77,7 +77,8 @@ shorthand, or one or more `--map FROM=TO` rules:
 ts dev proxy -f www.example-publisher.com -t trusted-server-example.edgecompute.app
 ```
 
-With no `--map`/`-f`/`-t`, the proxy exits with
+A bare `ts dev proxy` prints help and exits before proxy startup. An
+invocation with explicit options but no complete rewrite rule reports
 `no rewrite rule: pass --map FROM=TO (or -f/--from with -t/--to)`.
 
 Connection options — `--rewrite-host`, `--basic-auth`/`--basic-auth-file`,
