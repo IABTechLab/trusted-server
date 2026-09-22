@@ -29,7 +29,7 @@
       verify publisher-first and post-render refresh controls.
 - [x] Run JS build/tests/lint/format, browser regression, docs format, and the CI
       commands in `AGENTS.md`; report blocked checks precisely.
-- [ ] Review final diff, address findings, commit spec/plan/code/tests on the same
+- [x] Review final diff, address findings, commit spec/plan/code/tests on the same
       branch, and prepare one PR containing the complete change.
 
 ## Commands
@@ -65,3 +65,4 @@ green phase must preserve ordinary post-render refreshes.
   tests required execution outside the filesystem/network sandbox for native
   certificates and localhost listeners. No production code changes were needed
   for those environment restrictions.
+- Additional template-cache CI harnesses passed: ESI 22 checks and inline 9 checks.
