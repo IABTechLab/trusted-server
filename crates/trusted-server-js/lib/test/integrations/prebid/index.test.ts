@@ -22,9 +22,135 @@ function apsRenderer() {
  * build-prebid-external.mjs). Individual tests override and restore it.
  */
 const DEFAULT_BUNDLE_MANIFEST = {
-  adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-  bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-  userIdModules: ['sharedIdSystem'],
+  schemaVersion: 1,
+  modules: {
+    bidder: [
+      'rubiconBidAdapter',
+      'openxBidAdapter',
+      'exampleBrowserBidAdapter',
+      'appnexusBidAdapter',
+    ],
+    userId: ['sharedIdSystem'],
+    analytics: [],
+  },
+  runtimeCodes: {
+    bidder: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+    analytics: [],
+  },
+};
+
+// A managed User ID entry is operator configuration, forwarded verbatim. The
+// module named here is sample data: nothing in the shim or the server knows
+// which identity vendor `identityLink` belongs to.
+const MANAGED_USER_ID = {
+  name: 'identityLink',
+  params: { pid: '999', notUse3P: false },
+  storage: {
+    type: 'cookie' as const,
+    name: 'idl_env',
+    expires: 15,
+    refreshInSeconds: 1800,
+  },
+};
+
+/**
+ * TCF API mock that answers an `addEventListener` subscription immediately with
+ * a settled consent decision.
+ *
+ * Managed seeding waits for a terminal CMP result, so a stub that never answers
+ * leaves every managed entry deferred by design.
+ */
+function terminalCmp(tcData: Record<string, unknown> = {}) {
+  let nextListenerId = 1;
+  return vi.fn(
+    (
+      command: string,
+      _version?: number,
+      callback?: (result: unknown, success: boolean) => void,
+      parameter?: unknown
+    ) => {
+      if (typeof callback !== 'function') return;
+      if (command === 'addEventListener') {
+        callback(
+          {
+            gdprApplies: true,
+            eventStatus: 'tcloaded',
+            tcString: 'CPexampleTCStringForTests',
+            listenerId: nextListenerId++,
+            ...tcData,
+          },
+          true
+        );
+      } else if (command === 'removeEventListener') {
+        callback(parameter !== undefined, true);
+      }
+    }
+  );
+}
+
+/**
+ * TCF API mock that registers subscriptions without answering them.
+ *
+ * Real CMPs answer asynchronously, which is the only way to reach the states
+ * where a subscription is retired, or refused, before its first callback.
+ */
+function pendingCmp() {
+  let nextListenerId = 1;
+  const listeners = new Map<number, (result: unknown, success: boolean) => void>();
+  const removed: unknown[] = [];
+  const api = vi.fn(
+    (
+      command: string,
+      _version?: number,
+      callback?: (result: unknown, success: boolean) => void,
+      parameter?: unknown
+    ) => {
+      if (command === 'addEventListener' && typeof callback === 'function') {
+        listeners.set(nextListenerId++, callback);
+      } else if (command === 'removeEventListener') {
+        removed.push(parameter);
+        listeners.delete(parameter as number);
+        callback?.(true, true);
+      }
+    }
+  );
+  return {
+    api,
+    removed,
+    listenerCount: () => listeners.size,
+    /** Answers every outstanding subscription with `tcData`. */
+    answer(tcData: Record<string, unknown> = {}) {
+      for (const [listenerId, callback] of listeners) {
+        callback(
+          {
+            gdprApplies: true,
+            eventStatus: 'tcloaded',
+            tcString: 'CPexampleTCStringForTests',
+            listenerId,
+            ...tcData,
+          },
+          true
+        );
+      }
+    },
+    /** Refuses every outstanding subscription the way a CMP reports failure. */
+    refuse() {
+      for (const callback of listeners.values()) {
+        callback(null, false);
+      }
+    },
+  };
+}
+
+const EXPECTED_MANAGED_USER_ID = {
+  name: 'identityLink',
+  params: { pid: '999', notUse3P: false },
+  storage: {
+    type: 'cookie',
+    name: 'idl_env',
+    expires: 15,
+    refreshInSeconds: 1800,
+  },
 };
 
 /** Loose bid shape used by the requestBids shim tests. */
@@ -47,6 +173,7 @@ interface InjectedPrebidTestConfig {
   serverSideBidders?: string[];
   clientSideBidders?: string[];
   excludedGamAdUnitPathSuffixes?: unknown;
+  managedUserIds?: Array<typeof MANAGED_USER_ID>;
 }
 
 interface TestGoogletag {
@@ -61,6 +188,7 @@ interface ApsPrebidTestEntry {
 
 interface PrebidTestWindow {
   pbjs?: unknown;
+  __tcfapi?: unknown;
   tsjs?: {
     apsPrebidRenderers?: Record<string, ApsPrebidTestEntry>;
     [key: string]: unknown;
@@ -109,6 +237,7 @@ interface TestAdapterSpec {
 // of mocking module imports.
 const {
   mockSetConfig,
+  mockMergeConfig,
   mockProcessQueue,
   mockRequestBids,
   mockRegisterBidAdapter,
@@ -120,6 +249,9 @@ const {
   mockPbjs,
 } = vi.hoisted(() => {
   const mockSetConfig = vi.fn();
+  // Prebid's public mergeConfig closes over its internal setConfig rather than
+  // calling pbjs.setConfig, so wrapping setConfig alone cannot intercept it.
+  const mockMergeConfig = vi.fn((config: unknown) => mockSetConfig(config));
   const mockProcessQueue = vi.fn();
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
@@ -140,6 +272,7 @@ const {
   });
   const mockPbjs: {
     setConfig: typeof mockSetConfig;
+    mergeConfig: typeof mockMergeConfig;
     processQueue: typeof mockProcessQueue;
     requestBids: typeof mockRequestBids;
     registerBidAdapter: typeof mockRegisterBidAdapter;
@@ -152,6 +285,7 @@ const {
     [key: string]: unknown;
   } = {
     setConfig: mockSetConfig,
+    mergeConfig: mockMergeConfig,
     processQueue: mockProcessQueue,
     requestBids: mockRequestBids,
     registerBidAdapter: mockRegisterBidAdapter,
@@ -174,13 +308,26 @@ const {
   };
   w.pbjs = mockPbjs;
   w.__tsjs_prebid_bundle = {
-    adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-    bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
-    userIdModules: ['sharedIdSystem'],
+    schemaVersion: 1,
+    modules: {
+      bidder: [
+        'rubiconBidAdapter',
+        'openxBidAdapter',
+        'exampleBrowserBidAdapter',
+        'appnexusBidAdapter',
+      ],
+      userId: ['sharedIdSystem'],
+      analytics: [],
+    },
+    runtimeCodes: {
+      bidder: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+      analytics: [],
+    },
   };
 
   return {
     mockSetConfig,
+    mockMergeConfig,
     mockProcessQueue,
     mockRequestBids,
     mockRegisterBidAdapter,
@@ -221,6 +368,10 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 // self-init above already set it), so every test starts from a clean page.
 beforeEach(() => {
   delete testWindow.__tsjsPrebidShimInstalled;
+  mockPbjs.setConfig = mockSetConfig;
+  mockPbjs.mergeConfig = mockMergeConfig;
+  mockPbjs.processQueue = mockProcessQueue;
+  delete mockPbjs['__tsManagedUserIdsSetConfigInstalled'];
 });
 
 describe('prebid/collectBidders', () => {
@@ -415,17 +566,27 @@ describe('prebid/auctionBidsToPrebidBids', () => {
 describe('prebid/installPrebidNpm', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSetConfig.mockReset();
+    mockProcessQueue.mockReset();
     // Reset requestBids to the mock so each test starts fresh
     mockPbjs.requestBids = mockRequestBids;
+    mockPbjs.setConfig = mockSetConfig;
+    mockPbjs.mergeConfig = mockMergeConfig;
+    mockPbjs.processQueue = mockProcessQueue;
     mockPbjs.adUnits = [];
+    mockPbjs.que = [];
+    mockPbjs.getConfig = mockGetConfig;
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
     mockGetConfig.mockReset();
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
     delete testWindow.__tsjs_prebid;
     delete testWindow.__tsjs_prebid_diagnostics;
+    delete testWindow.__tcfapi;
     delete testWindow.tsjs;
     delete mockPbjs['__tsApsBidResponseListenerInstalled'];
+    delete mockPbjs['__tsManagedUserIdsSetConfigInstalled'];
     delete mockPbjs.bidderSettings;
   });
 
@@ -840,6 +1001,1248 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockProcessQueue).toHaveBeenCalledTimes(1);
   });
 
+  it('leaves the public config APIs unchanged when no User IDs are managed', () => {
+    const originalSetConfig = mockPbjs.setConfig;
+    const originalMergeConfig = mockPbjs.mergeConfig;
+    testWindow.__tcfapi = terminalCmp();
+
+    installPrebidNpm();
+
+    expect(mockPbjs.setConfig).toBe(originalSetConfig);
+    expect(mockPbjs.mergeConfig).toBe(originalMergeConfig);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+  });
+
+  it('activates IAB GDPR consent before managed User IDs and the publisher queue', () => {
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    const consentCallIndex = mockSetConfig.mock.calls.findIndex(
+      ([value]) => value?.consentManagement?.gdpr?.cmpApi === 'iab'
+    );
+    const managedCallIndex = mockSetConfig.mock.calls.findIndex(
+      ([value]) => value?.userSync?.userIds
+    );
+    expect(consentCallIndex).toBeGreaterThanOrEqual(0);
+    expect(mockSetConfig.mock.calls[consentCallIndex][0]).toEqual({
+      consentManagement: { gdpr: { cmpApi: 'iab' } },
+    });
+    expect(consentCallIndex).toBeLessThan(managedCallIndex);
+    expect(mockSetConfig.mock.invocationCallOrder[consentCallIndex]).toBeLessThan(
+      mockProcessQueue.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('does not activate managed consent without a callable TCF API', () => {
+    testWindow.__tcfapi = true;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+  });
+
+  it('defers managed User ID seeding until a late CMP installs __tcfapi', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+
+    // An asynchronous CMP installs itself after the deferred shim ran.
+    const cmp = terminalCmp();
+    testWindow.__tcfapi = cmp;
+
+    const consentCallIndex = mockSetConfig.mock.calls.findIndex(
+      ([value]) => value?.consentManagement?.gdpr?.cmpApi === 'iab'
+    );
+    const managedCallIndex = mockSetConfig.mock.calls.findIndex(
+      ([value]) => value?.userSync?.userIds
+    );
+    expect(consentCallIndex).toBeGreaterThanOrEqual(0);
+    expect(consentCallIndex).toBeLessThan(managedCallIndex);
+    expect(mockSetConfig.mock.calls[managedCallIndex][0].userSync.userIds).toEqual([
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+    expect(Object.getOwnPropertyDescriptor(testWindow, '__tcfapi')?.value).toBe(cmp);
+  });
+
+  it('keeps managed User IDs deferred across auctions when no CMP appears', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    mockPbjs.requestBids({ adUnits: [] });
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall).toBeUndefined();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    testWindow.__tcfapi = terminalCmp();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it('re-subscribes for consent when a silent CMP stub is replaced', () => {
+    // A non-compliant stub accepts the subscription and never replays it to the
+    // CMP that replaces it, so the outstanding wait can never settle.
+    const stub = pendingCmp();
+    testWindow.__tcfapi = stub.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    expect(stub.listenerCount()).toBe(1);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    // The same stub is still installed, so the wait stays open without churn.
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(stub.listenerCount()).toBe(1);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    const cmp = terminalCmp();
+    testWindow.__tcfapi = cmp;
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(cmp).toHaveBeenCalledWith('addEventListener', 2, expect.any(Function));
+    expect(stub.listenerCount()).toBe(1);
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([EXPECTED_MANAGED_USER_ID]);
+  });
+
+  it('keeps waiting on a CMP that has answered once when the global is shadowed', () => {
+    // A CMP that reports its UI is up is alive and still owns the wait. Another
+    // script shadowing `window.__tcfapi` must not make the shim abandon it: the
+    // real consent decision still arrives on that subscription, and its
+    // listener id belongs to its own id space.
+    const cmp = pendingCmp();
+    testWindow.__tcfapi = cmp.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+    cmp.answer({ eventStatus: 'cmpuishown' });
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    const shadow = pendingCmp();
+    testWindow.__tcfapi = shadow.api;
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(shadow.listenerCount()).toBe(0);
+    expect(shadow.removed).toEqual([]);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    // The user answers the CMP that was there all along.
+    cmp.answer();
+    expect(cmp.removed).toEqual([1]);
+    expect(shadow.removed).toEqual([]);
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([EXPECTED_MANAGED_USER_ID]);
+  });
+
+  it('removes a delayed retired listener through its own CMP after replacement', () => {
+    const oldCmp = pendingCmp();
+    testWindow.__tcfapi = oldCmp.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+
+    const replacement = pendingCmp();
+    const otherConsumer = vi.fn();
+    // Each CMP assigns listener 1 independently. The replacement already has
+    // another consumer before the shim subscribes to it.
+    replacement.api('addEventListener', 2, otherConsumer);
+    testWindow.__tcfapi = replacement.api;
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(replacement.listenerCount()).toBe(2);
+
+    oldCmp.answer();
+
+    expect(oldCmp.removed).toEqual([1]);
+    expect(oldCmp.listenerCount()).toBe(0);
+    expect(replacement.removed).toEqual([]);
+    expect(replacement.listenerCount()).toBe(2);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    replacement.answer();
+    expect(otherConsumer).toHaveBeenCalledOnce();
+    expect(replacement.removed).toEqual([2]);
+    expect(replacement.listenerCount()).toBe(1);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it('cleans up replayed subscriptions through a forwarding bootstrap stub', () => {
+    const cmp = pendingCmp();
+    const queued: Parameters<typeof cmp.api>[] = [];
+    let forwarding = false;
+    const stub = vi.fn((...args: Parameters<typeof cmp.api>) => {
+      if (forwarding) cmp.api(...args);
+      else queued.push(args);
+    });
+    testWindow.__tcfapi = stub;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    expect(queued).toHaveLength(1);
+
+    forwarding = true;
+    testWindow.__tcfapi = cmp.api;
+    for (const args of queued) cmp.api(...args);
+    mockPbjs.requestBids({ adUnits: [] });
+    expect(cmp.listenerCount()).toBe(2);
+    cmp.answer();
+
+    expect(stub).toHaveBeenCalledWith('removeEventListener', 2, expect.any(Function), 1);
+    expect(cmp.removed).toEqual([1, 2]);
+    expect(cmp.listenerCount()).toBe(0);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it('refuses a shim installed over a CMP that is still asking the user', () => {
+    // `gdprApplies: false` is the cheapest possible claim of no jurisdiction.
+    // A script that installs it over a live CMP whose dialog is still on screen
+    // must not be able to settle the wait and release the identity vendor.
+    const cmp = pendingCmp();
+    testWindow.__tcfapi = cmp.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+    cmp.answer({ eventStatus: 'cmpuishown' });
+
+    const outOfScopeShim = vi.fn(
+      (
+        command: string,
+        _version?: number,
+        callback?: (result: unknown, success: boolean) => void
+      ) => {
+        if (command === 'addEventListener') {
+          callback?.({ gdprApplies: false, listenerId: 1 }, true);
+        }
+      }
+    );
+    testWindow.__tcfapi = outOfScopeShim;
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(outOfScopeShim).not.toHaveBeenCalled();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+  });
+
+  it('drops a managed User ID addressing a submodule an earlier entry claimed', () => {
+    // `sharedIdSystem` answers to both names, so Prebid would register one
+    // submodule and read only the first entry.
+    const managedSharedId = { ...MANAGED_USER_ID, name: 'sharedId' };
+    const managedPubCommonId = { ...MANAGED_USER_ID, name: 'pubCommonId' };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [managedSharedId, managedPubCommonId] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([
+      { ...EXPECTED_MANAGED_USER_ID, name: 'sharedId' },
+    ]);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] managed User ID "pubCommonId" addresses the same Prebid submodule as ' +
+        '"sharedId"; dropping it because Prebid would read only the first entry'
+    );
+  });
+
+  it('keeps managed User IDs that address different submodules', () => {
+    const managedSharedId = { ...MANAGED_USER_ID, name: 'sharedId' };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID, managedSharedId] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([
+      EXPECTED_MANAGED_USER_ID,
+      { ...EXPECTED_MANAGED_USER_ID, name: 'sharedId' },
+    ]);
+  });
+
+  it.each(['setConfig', 'mergeConfig'] as const)(
+    'seeds deferred IDs after publisher %s supplies TCF configuration',
+    (method) => {
+      testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+      let consent: unknown = undefined;
+      mockGetConfig.mockImplementation((key?: string) => {
+        if (key === 'consentManagement') return consent;
+        if (key === 'userSync.userIds') return [];
+        return undefined;
+      });
+      installPrebidNpm();
+      expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+      consent = { gdpr: { cmpApi: 'static', consentData: { gdprApplies: false } } };
+      mockPbjs[method]({ consentManagement: consent });
+      expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+    }
+  );
+
+  it.each([false, true])(
+    'preserves publisher userSync and autoRefresh=%s when seeding late IDs',
+    (autoRefresh) => {
+      testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+      const userSync = { userIds: [], auctionDelay: 300, syncEnabled: false, autoRefresh };
+      mockGetConfig.mockImplementation((key?: string) => {
+        if (key === 'userSync.userIds') return [];
+        if (key === 'userSync') return userSync;
+        return undefined;
+      });
+      installPrebidNpm();
+      testWindow.__tcfapi = terminalCmp();
+      const seeds = mockSetConfig.mock.calls.filter(([value]) => value?.userSync?.userIds);
+      expect(seeds[0][0].userSync).toEqual({
+        ...userSync,
+        userIds: [EXPECTED_MANAGED_USER_ID],
+        autoRefresh: true,
+      });
+      expect(seeds.at(-1)?.[0].userSync).toEqual({
+        ...userSync,
+        userIds: [EXPECTED_MANAGED_USER_ID],
+      });
+      expect(seeds).toHaveLength(autoRefresh ? 1 : 2);
+    }
+  );
+
+  it('seeds IDs with existing publisher TCF configuration even without a CMP API', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return { cmpApi: 'static', consentData: {} };
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+    installPrebidNpm();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+  });
+
+  it('keeps IDs deferred when the CMP property cannot be watched', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    const defineProperty = Object.defineProperty;
+    const spy = vi.spyOn(Object, 'defineProperty').mockImplementation((target, key, descriptor) => {
+      if (target === testWindow && key === '__tcfapi') throw new Error('unwatchable');
+      return defineProperty(target, key, descriptor);
+    });
+    try {
+      installPrebidNpm();
+      mockPbjs.requestBids({ adUnits: [] });
+      expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('leaves a legacy top-level TCF consent configuration to the publisher', () => {
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') {
+        return { cmpApi: 'static', consentData: { tcString: 'example' } };
+      }
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+  });
+
+  it('activates managed GDPR consent alongside a publisher USP namespace', () => {
+    const usp = { cmpApi: 'iab' };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return { usp };
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig).toHaveBeenCalledWith({
+      consentManagement: { usp, gdpr: { cmpApi: 'iab' } },
+    });
+  });
+
+  it('retires automatic IAB consent when a late setConfig uses the legacy TCF shape', () => {
+    const publisherConsent = { cmpApi: 'static', consentData: { tcString: 'example' } };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+
+    mockPbjs.setConfig({ consentManagement: publisherConsent });
+
+    expect(mockSetConfig.mock.calls[0][0]).toEqual({
+      consentManagement: { gdpr: { enabled: false } },
+    });
+    expect(mockSetConfig.mock.calls[1][0]).toEqual({ consentManagement: publisherConsent });
+  });
+
+  it('drops the automatic gdpr namespace when a merge uses the legacy TCF shape', () => {
+    const publisherConsent = { cmpApi: 'static', consentData: { tcString: 'example' } };
+    let retired = false;
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') {
+        // After retirement Prebid's deep merge still carries the namespace.
+        return retired ? { ...publisherConsent, gdpr: { enabled: false } } : undefined;
+      }
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+    retired = true;
+
+    mockPbjs.mergeConfig({ consentManagement: publisherConsent });
+
+    expect(mockMergeConfig).toHaveBeenCalledWith({ consentManagement: publisherConsent });
+    const consentCalls = mockSetConfig.mock.calls.filter(([value]) => value?.consentManagement);
+    expect(consentCalls[0]?.[0]).toEqual({
+      consentManagement: { ...publisherConsent, gdpr: { enabled: false } },
+    });
+    expect(consentCalls.at(-1)?.[0]).toEqual({ consentManagement: publisherConsent });
+    expect(consentCalls.at(-1)?.[0].consentManagement).not.toHaveProperty('gdpr');
+  });
+
+  it('preserves sibling consent settings when activating managed GDPR consent', () => {
+    const gpp = { cmpApi: 'iab', timeout: 750 };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return { gpp };
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig).toHaveBeenCalledWith({
+      consentManagement: { gpp, gdpr: { cmpApi: 'iab' } },
+    });
+  });
+
+  it.each([
+    ['an object', { cmpApi: 'static', timeout: 123 }],
+    ['null', null],
+    ['false', false],
+  ])('preserves an effective publisher-owned GDPR value when it is %s', (_label, gdpr) => {
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return { gdpr };
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+  });
+
+  it.each([
+    ['null', null],
+    ['false', false],
+    ['a string', 'invalid'],
+    ['an array', []],
+  ])('does not replace unsafe effective consent state when it is %s', (_label, consent) => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return consent;
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration is not mergeable'
+    );
+  });
+
+  it('does not replace consent state when reading it throws', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') throw new Error('example consent accessor failure');
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration could not be read',
+      expect.any(Error)
+    );
+  });
+
+  it('does not break installation when effective consent property access throws', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const hostileConsent = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('example consent property trap');
+        },
+      }
+    );
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return hostileConsent;
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration could not be inspected',
+      expect.any(Error)
+    );
+  });
+
+  it('lets queued and late publisher consent configuration retain precedence', () => {
+    const queuedConsent = { gdpr: { cmpApi: 'static', timeout: 321 } };
+    const lateConsent = { gdpr: null };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    mockPbjs.que = [() => mockPbjs.setConfig({ consentManagement: queuedConsent })];
+    mockProcessQueue.mockImplementation(() => {
+      for (const callback of mockPbjs.que.splice(0)) callback();
+    });
+
+    installPrebidNpm();
+    mockPbjs.mergeConfig({ consentManagement: lateConsent });
+
+    expect(mockSetConfig).toHaveBeenCalledWith({ consentManagement: queuedConsent });
+    expect(mockMergeConfig).toHaveBeenCalledWith({ consentManagement: lateConsent });
+    expect(
+      mockSetConfig.mock.calls.filter(([value]) => value?.consentManagement?.gdpr?.cmpApi === 'iab')
+    ).toHaveLength(1);
+  });
+
+  it('retires automatic IAB consent before late setConfig takes GDPR ownership', () => {
+    const publisherConsent = { gdpr: { cmpApi: 'static', consentData: { tcString: 'example' } } };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+
+    mockPbjs.setConfig({ consentManagement: publisherConsent });
+
+    expect(mockSetConfig.mock.calls).toEqual([
+      [{ consentManagement: { gdpr: { enabled: false } } }],
+      [{ consentManagement: publisherConsent }],
+    ]);
+  });
+
+  it('retires automatic IAB consent once before mergeConfig takes GDPR ownership', () => {
+    const publisherGdpr = { cmpApi: 'static', consentData: { tcString: 'example' } };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } });
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: { timeout: 500 } } });
+
+    expect(mockSetConfig).toHaveBeenCalledTimes(3);
+    expect(mockSetConfig.mock.calls[0]).toEqual([
+      { consentManagement: { gdpr: { enabled: false } } },
+    ]);
+    expect(mockMergeConfig.mock.calls[0][0]).toEqual({
+      consentManagement: { gdpr: { ...publisherGdpr, enabled: true } },
+    });
+    expect(mockMergeConfig.mock.calls[1][0]).toEqual({
+      consentManagement: { gdpr: { timeout: 500 } },
+    });
+  });
+
+  it('does not replace unknown consent siblings when retirement state cannot be read', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const publisherConsent = { gdpr: { cmpApi: 'static', consentData: { tcString: 'example' } } };
+    let failConsentRead = false;
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement' && failConsentRead) {
+        throw new Error('example late consent read failure');
+      }
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+    failConsentRead = true;
+
+    mockPbjs.mergeConfig({ consentManagement: publisherConsent });
+
+    expect(mockSetConfig).toHaveBeenCalledTimes(1);
+    expect(mockMergeConfig).toHaveBeenCalledWith({ consentManagement: publisherConsent });
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration could not be read',
+      expect.any(Error)
+    );
+  });
+
+  it('restores merged GDPR activation without probing a missing enabled descriptor', () => {
+    const publisherGdpr = new Proxy(
+      { cmpApi: 'static', consentData: { tcString: 'example' } },
+      {
+        getOwnPropertyDescriptor(target, property) {
+          if (property === 'enabled') throw new Error('example enabled descriptor trap');
+          return Reflect.getOwnPropertyDescriptor(target, property);
+        },
+      }
+    );
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockMergeConfig.mockClear();
+
+    expect(() =>
+      mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } })
+    ).not.toThrow();
+
+    expect(mockMergeConfig.mock.calls[0][0]).toEqual({
+      consentManagement: {
+        gdpr: {
+          cmpApi: 'static',
+          consentData: { tcString: 'example' },
+          enabled: true,
+        },
+      },
+    });
+  });
+
+  it('does not clean up before a merge whose enabled getter cannot be inspected', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const publisherGdpr = new Proxy(
+      { cmpApi: 'static', consentData: { tcString: 'example' } },
+      {
+        get(target, property, receiver) {
+          if (property === 'enabled') throw new Error('example enabled getter trap');
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } });
+
+    expect(mockSetConfig).toHaveBeenCalledTimes(1);
+    expect(mockMergeConfig).toHaveBeenCalledWith({
+      consentManagement: { gdpr: publisherGdpr },
+    });
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] publisher consentManagement merge could not be normalized',
+      expect.any(Error)
+    );
+  });
+
+  it('completes ownership transfer when cleanup throws after applying disabled state', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const publisherGdpr = { cmpApi: 'static', consentData: { tcString: 'example' } };
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+    mockSetConfig.mockImplementation((config: { consentManagement?: { gdpr?: unknown } }) => {
+      if ((config.consentManagement?.gdpr as { enabled?: unknown })?.enabled === false) {
+        throw new Error('example cleanup subscriber failure');
+      }
+    });
+
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } });
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: { timeout: 500 } } });
+
+    expect(
+      mockSetConfig.mock.calls.filter(
+        ([config]) => config.consentManagement?.gdpr?.enabled === false
+      )
+    ).toHaveLength(1);
+    expect(mockMergeConfig.mock.calls[0][0]).toEqual({
+      consentManagement: { gdpr: { ...publisherGdpr, enabled: true } },
+    });
+    expect(mockMergeConfig.mock.calls[1][0]).toEqual({
+      consentManagement: { gdpr: { timeout: 500 } },
+    });
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] automatic IAB consent listener could not be retired',
+      expect.any(Error)
+    );
+  });
+
+  it('preserves effective User ID entries and replaces identityLink exactly once', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds'
+        ? [
+            { name: 'sharedId', storage: { name: '_sharedid' } },
+            { name: 'identityLink', params: { pid: 'publisher-value' } },
+            { name: 'identityLink', params: { pid: 'duplicate-value' } },
+          ]
+        : {}
+    );
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0]).toEqual({
+      userSync: {
+        userIds: [{ name: 'sharedId', storage: { name: '_sharedid' } }, EXPECTED_MANAGED_USER_ID],
+      },
+    });
+    expect(
+      managedCall?.[0].userSync.userIds.filter(
+        (entry: { name?: string }) => entry.name === 'identityLink'
+      )
+    ).toHaveLength(1);
+  });
+
+  it('filters a case-variant publisher entry that Prebid would match to the managed module', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    // Prebid matches submodule names case-insensitively and takes the first
+    // matching entry, so a retained `IdentityLink` ahead of the managed
+    // `identityLink` would win and silently defeat operator ownership.
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds'
+        ? [
+            { name: 'sharedId', storage: { name: '_sharedid' } },
+            { name: 'IdentityLink', params: { pid: 'publisher-value' } },
+            { name: 'IDENTITYLINK', params: { pid: 'shouting-value' } },
+          ]
+        : {}
+    );
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0]).toEqual({
+      userSync: {
+        userIds: [{ name: 'sharedId', storage: { name: '_sharedid' } }, EXPECTED_MANAGED_USER_ID],
+      },
+    });
+    expect(
+      managedCall?.[0].userSync.userIds.filter(
+        (entry: { name?: string }) => entry.name?.toLowerCase() === 'identitylink'
+      )
+    ).toEqual([EXPECTED_MANAGED_USER_ID]);
+  });
+
+  it('filters a publisher entry naming a managed module by its Prebid alias', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    // `sharedIdSystem` declares `aliasName: 'pubCommonId'`, and Prebid resolves
+    // an entry to a submodule on either spelling. A retained `pubCommonId`
+    // would sit ahead of the managed `sharedId` and win.
+    const managedSharedId = {
+      name: 'sharedId',
+      storage: { type: 'cookie' as const, name: '_ts_sid' },
+    };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds'
+        ? [
+            { name: 'id5Id', params: { partner: 1 } },
+            { name: 'pubCommonId', storage: { name: '_publisher_pubcid' } },
+          ]
+        : {}
+    );
+    testWindow.__tsjs_prebid = { managedUserIds: [managedSharedId] };
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([
+      { name: 'id5Id', params: { partner: 1 } },
+      managedSharedId,
+    ]);
+  });
+
+  it('removes a retired consent subscription once the CMP finally answers', () => {
+    // The listener id only arrives with a callback, so a subscription retired
+    // before the CMP's first event can only be removed on that event. Skipping
+    // it would leave the CMP holding a dead listener for the page lifetime.
+    const cmp = pendingCmp();
+    testWindow.__tcfapi = cmp.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    let consent: unknown = undefined;
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return consent;
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+    expect(cmp.listenerCount(), 'should subscribe and wait').toBe(1);
+    expect(cmp.removed).toEqual([]);
+
+    // Publisher consent configuration claims ownership before the CMP answers.
+    consent = { gdpr: { cmpApi: 'static', consentData: { gdprApplies: false } } };
+    mockPbjs.setConfig({ consentManagement: consent });
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+
+    cmp.answer();
+
+    expect(cmp.removed, 'should remove the subscription it could not remove earlier').toEqual([1]);
+  });
+
+  it('subscribes again after the CMP refuses a consent subscription', () => {
+    // A refusal is not a consent decision and not final either. Leaving the
+    // wait armed would defer managed IDs for the page lifetime with no path
+    // back, even once a working CMP replaces a stub.
+    const refusing = pendingCmp();
+    testWindow.__tcfapi = refusing.api;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+    refusing.refuse();
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+
+    // The stub gives way to a CMP that answers; an auction rechecks discovery.
+    testWindow.__tcfapi = terminalCmp();
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+  });
+
+  it('normalizes a later case-variant publisher identityLink update', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    installPrebidNpm();
+
+    mockPbjs.setConfig({
+      userSync: {
+        userIds: [
+          { name: 'id5Id', params: { partner: 1 } },
+          { name: 'IdentityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'id5Id', params: { partner: 1 } },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('retires the late-CMP watch once publisher consent configuration seeds the IDs', () => {
+    // No CMP ever appears, so seeding resolves through publisher consent
+    // configuration. The accessor pair installed for that wait must not outlive
+    // it, or `window.__tcfapi` stays accessor-typed for the page lifetime.
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    let consent: unknown = undefined;
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return consent;
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+    expect(Object.getOwnPropertyDescriptor(testWindow, '__tcfapi')?.get).toBeTypeOf('function');
+
+    consent = { gdpr: { cmpApi: 'static', consentData: { gdprApplies: false } } };
+    mockPbjs.setConfig({ consentManagement: consent });
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(true);
+    expect(
+      Object.getOwnPropertyDescriptor(testWindow, '__tcfapi'),
+      'should leave no watched property behind'
+    ).toBeUndefined();
+
+    // A CMP that arrives afterwards lands as a plain own value.
+    const cmp = vi.fn();
+    testWindow.__tcfapi = cmp;
+    expect(Object.getOwnPropertyDescriptor(testWindow, '__tcfapi')?.value).toBe(cmp);
+  });
+
+  it('drops malformed effective User ID state and installs the managed entry', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [null, 'invalid', {}, { name: '' }, { name: 'sharedId' }] : {}
+    );
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('installs the managed entry before processing the publisher queue', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+
+    installPrebidNpm();
+
+    const managedCallOrder = mockSetConfig.mock.invocationCallOrder.find(
+      (_, index) => mockSetConfig.mock.calls[index][0]?.userSync?.userIds
+    );
+    expect(managedCallOrder).toBeLessThan(mockProcessQueue.mock.invocationCallOrder[0]);
+  });
+
+  it('normalizes queued User ID config before a queued auction observes it', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    let observedUserIds: unknown;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockPbjs.que = [
+      () =>
+        mockPbjs.setConfig({
+          userSync: {
+            syncDelay: 50,
+            userIds: [
+              { name: 'sharedId' },
+              { name: 'identityLink', params: { pid: 'publisher-value' } },
+            ],
+          },
+          auctionOptions: { suppressStaleRender: true },
+        }),
+      () => {
+        observedUserIds = mockSetConfig.mock.calls.at(-1)?.[0]?.userSync?.userIds;
+      },
+    ];
+    mockProcessQueue.mockImplementation(() => {
+      for (const callback of mockPbjs.que.splice(0)) callback();
+    });
+
+    installPrebidNpm();
+
+    expect(observedUserIds).toEqual([{ name: 'sharedId' }, EXPECTED_MANAGED_USER_ID]);
+    const queuedConfig = mockSetConfig.mock.calls.at(-1)?.[0];
+    expect(queuedConfig.userSync.syncDelay).toBe(50);
+    expect(queuedConfig.auctionOptions).toEqual({ suppressStaleRender: true });
+  });
+
+  it('normalizes publisher identityLink updates after processQueue', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    installPrebidNpm();
+
+    mockPbjs.setConfig({
+      userSync: {
+        userIds: [
+          { name: 'id5Id', params: { partner: 1 } },
+          { name: 'identityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'id5Id', params: { partner: 1 } },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('normalizes queued identityLink updates made through mergeConfig', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockPbjs.que = [
+      () =>
+        mockPbjs.mergeConfig({
+          userSync: {
+            userIds: [
+              { name: 'sharedId' },
+              { name: 'identityLink', params: { pid: 'publisher-value' } },
+            ],
+          },
+        }),
+    ];
+    mockProcessQueue.mockImplementation(() => {
+      for (const callback of mockPbjs.que.splice(0)) callback();
+    });
+
+    installPrebidNpm();
+
+    expect(mockMergeConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('normalizes late identityLink updates made through mergeConfig', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    installPrebidNpm();
+
+    mockPbjs.mergeConfig({
+      userSync: {
+        userIds: [
+          { name: 'id5Id', params: { partner: 1 } },
+          { name: 'identityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    expect(mockMergeConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'id5Id', params: { partner: 1 } },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('passes unrelated publisher configuration through by reference', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    installPrebidNpm();
+    const publisherConfig = { priceGranularity: 'medium', userSync: { syncDelay: 50 } };
+
+    mockPbjs.setConfig(publisherConfig);
+
+    expect(mockSetConfig.mock.calls.at(-1)?.[0]).toBe(publisherConfig);
+  });
+
+  it('does not stack the managed User ID config wrappers across shim reinstallations', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    installPrebidNpm();
+    const managedSetConfig = mockPbjs.setConfig;
+    const managedMergeConfig = mockPbjs.mergeConfig;
+    delete testWindow.__tsjsPrebidShimInstalled;
+
+    installPrebidNpm();
+
+    expect(mockPbjs.setConfig).toBe(managedSetConfig);
+    expect(mockPbjs.mergeConfig).toBe(managedMergeConfig);
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('skips seeding the managed entry when getConfig is unavailable', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    // Seeding needs the effective User ID entries. Without getConfig they
+    // cannot be read, and installing the managed entry alone would silently
+    // drop every publisher-configured module.
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    delete (mockPbjs as { getConfig?: unknown }).getConfig;
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed User ID entries not seeded'
+    );
+
+    // The wrappers are still installed, so the next publisher userIds call
+    // still gets the managed entry.
+    mockPbjs.setConfig({ userSync: { userIds: [{ name: 'sharedId' }] } });
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('continues installation when reading effective User ID entries throws', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'userSync.userIds') throw new Error('example User ID accessor failure');
+      return undefined;
+    });
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    expect(mockRegisterBidAdapter).toHaveBeenCalledTimes(1);
+    expect(mockProcessQueue).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective User ID entries could not be read; managed User ID entries not seeded',
+      expect.any(Error)
+    );
+
+    // The wrappers remain installed even when the initial seed read fails.
+    mockPbjs.setConfig({ userSync: { userIds: [{ name: 'sharedId' }] } });
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
+  it('passes the publisher config through when normalization throws', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    installPrebidNpm();
+    const hostileConfig = {
+      userSync: {
+        get userIds(): never {
+          throw new Error('example accessor failure');
+        },
+      },
+    };
+
+    mockPbjs.setConfig(hostileConfig as unknown as Parameters<typeof mockPbjs.setConfig>[0]);
+
+    expect(mockSetConfig.mock.calls.at(-1)?.[0]).toBe(hostileConfig);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] managed User ID entries could not be normalized',
+      expect.any(Error)
+    );
+  });
+
+  it('hands Prebid a distinct managed entry object per normalization', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    installPrebidNpm();
+
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const first = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const second = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+
+    expect(first).toEqual(EXPECTED_MANAGED_USER_ID);
+    expect(second).toEqual(EXPECTED_MANAGED_USER_ID);
+    expect(second).not.toBe(first);
+  });
+
+  it('isolates nested managed params from Prebid and from later normalizations', () => {
+    // Managed seeding waits for a settled CMP result; this CMP answers.
+    testWindow.__tcfapi = terminalCmp();
+    // Prebid keeps the entry it receives as `submodule.config` for the life of
+    // the page. A shallow copy would leave nested params shared with
+    // window.__tsjs_prebid and with every other entry built from it.
+    const nestedManagedUserId = {
+      name: 'exampleId',
+      params: { pid: '999', ext: { segments: ['a'] } },
+    };
+    testWindow.__tsjs_prebid = { managedUserIds: [nestedManagedUserId] };
+    installPrebidNpm();
+
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const first = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const second = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+
+    // Simulate Prebid mutating the configuration it retained.
+    (first.params.ext as { segments: string[] }).segments.push('mutated');
+
+    expect(second.params.ext).toEqual({ segments: ['a'] });
+    expect(nestedManagedUserId.params.ext.segments).toEqual(['a']);
+  });
+
+  it('reports identityLink missing when its bundle module is absent', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    testWindow.__tsjs_prebid_bundle = {
+      ...DEFAULT_BUNDLE_MANIFEST,
+      modules: { ...DEFAULT_BUNDLE_MANIFEST.modules, userId: [] },
+    };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [EXPECTED_MANAGED_USER_ID] : {}
+    );
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: [],
+      configuredUserIdNames: ['identityLink'],
+      missingConfiguredUserIdNames: ['identityLink'],
+    });
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
   it('reports the User ID modules selected by the generated bundle', () => {
     installPrebidNpm();
 
@@ -848,6 +2251,71 @@ describe('prebid/installPrebidNpm', () => {
       configuredUserIdNames: [],
       missingConfiguredUserIdNames: [],
     });
+  });
+
+  it('keeps User ID diagnostics when runtimeCodes is malformed', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: DEFAULT_BUNDLE_MANIFEST.modules,
+      runtimeCodes: null,
+    };
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: ['sharedIdSystem'],
+      configuredUserIdNames: [],
+      missingConfiguredUserIdNames: [],
+    });
+  });
+
+  it('treats a non-object modules container independently from runtime codes', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: null,
+      runtimeCodes: DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [{ name: 'sharedId' }] : {}
+    );
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules.includedModules).toEqual([]);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects the whole User ID list while preserving valid bidder runtime codes', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        userId: ['sharedIdSystem', 42],
+      },
+      runtimeCodes: DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [{ name: 'sharedId' }] : {}
+    );
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: [],
+      configuredUserIdNames: ['sharedId'],
+      missingConfiguredUserIdNames: [],
+    });
+    expect(
+      warnSpy.mock.calls.some(([message]) =>
+        String(message).includes('did not stamp a User ID module manifest')
+      )
+    ).toBe(true);
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it('refreshes late User ID config without repeating missing-module warnings', () => {
@@ -988,6 +2456,90 @@ describe('prebid/installPrebidNpm', () => {
           uids: [{ id: 'pair_123', atype: 571187 }],
         },
       ]);
+    });
+
+    it('forwards the opaque LiveRamp envelope as a liveramp.com EID', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+        },
+      ]);
+
+      const request = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidId: 'bid-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(request.data).eids).toEqual([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+        },
+      ]);
+    });
+
+    it('drops empty and malformed LiveRamp envelope values', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'liveramp.com',
+          uids: [
+            { id: '' },
+            { id: undefined as unknown as string },
+            { id: 'opaque-valid-envelope', atype: 3 },
+          ],
+        },
+        { source: '', uids: [{ id: 'opaque-invalid-source' }] },
+      ]);
+
+      const request = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(request.data).eids).toEqual([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-valid-envelope', atype: 3 }],
+        },
+      ]);
+    });
+
+    it('never writes an opaque LiveRamp envelope to logs', () => {
+      const sentinel = 'opaque-envelope-must-not-be-logged';
+      const spies = [
+        vi.spyOn(log, 'debug').mockImplementation(() => {}),
+        vi.spyOn(log, 'info').mockImplementation(() => {}),
+        vi.spyOn(log, 'warn').mockImplementation(() => {}),
+        vi.spyOn(log, 'error').mockImplementation(() => {}),
+      ];
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'liveramp.com', uids: [{ id: sentinel, atype: 3 }] },
+      ]);
+
+      spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      const logged = spies.flatMap((spy) => spy.mock.calls).flat();
+      expect(logged.some((value) => JSON.stringify(value).includes(sentinel))).toBe(false);
     });
 
     it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
@@ -1547,6 +3099,32 @@ describe('prebid/installPrebidNpm', () => {
             { id: 'shared_123', atype: 3 },
             { id: 'shared_456', ext: { provider: 'example' } },
           ],
+        },
+      ]);
+    });
+
+    it('preserves an opaque LiveRamp envelope in the ts-eids cookie', () => {
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+        },
+      ]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(JSON.parse(atob(cookieValue!))).toEqual([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
         },
       ]);
     });
@@ -5479,8 +7057,14 @@ describe('prebid/client-side bidders', () => {
     // rubicon is compiled into the external bundle, but openx is not
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
-      adapters: ['rubicon'],
-      bidderCodes: ['rubicon'],
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        bidder: ['rubiconBidAdapter'],
+      },
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['rubicon'],
+      },
     };
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['rubicon', 'openx'],
@@ -5507,7 +7091,9 @@ describe('prebid/client-side bidders', () => {
     // The error should point at the operator surface: the CLI config key,
     // not the internal build script.
     const pointsAtBundleConfig = errorCalls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle].adapters'))
+      args.some(
+        (a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle.modules].bidder')
+      )
     );
     expect(pointsAtBundleConfig).toBe(true);
 
@@ -5521,13 +7107,19 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
-  it('accepts alias bidder codes stamped in bidderCodes', () => {
-    // The adf module registers adf plus the adform/adformOpenRTB aliases;
-    // the module-name list alone would flag them as missing.
+  it('accepts alias bidder runtime codes', () => {
+    // The adfBidAdapter module registers adf plus the adform and
+    // adformOpenRTB aliases. The module stem alone would flag them as missing.
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
-      adapters: ['adf'],
-      bidderCodes: ['adf', 'adform', 'adformOpenRTB'],
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        bidder: ['adfBidAdapter'],
+      },
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['adf', 'adform', 'adformOpenRTB'],
+      },
     };
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['adform'],
@@ -5554,8 +7146,14 @@ describe('prebid/client-side bidders', () => {
     // must be flagged even though the module itself is compiled in.
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
-      adapters: ['a1Media'],
-      bidderCodes: ['a1media'],
+      modules: {
+        ...DEFAULT_BUNDLE_MANIFEST.modules,
+        bidder: ['a1MediaBidAdapter'],
+      },
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['a1media'],
+      },
     };
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['a1Media'],
@@ -5579,9 +7177,21 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
-  it('treats a malformed manifest as unstamped instead of throwing', () => {
-    // The manifest is a plain window global any page script can overwrite.
-    testWindow.__tsjs_prebid_bundle = { adapters: 'rubicon', userIdModules: 42 };
+  it.each([
+    null,
+    [],
+    {},
+    { schemaVersion: 0 },
+    { schemaVersion: 2 },
+    { schemaVersion: '1' },
+    {
+      adapters: ['rubicon'],
+      bidderCodes: ['rubicon'],
+      userIdModules: ['sharedIdSystem'],
+    },
+    { adapters: 'rubicon', userIdModules: 42 },
+  ])('treats unsupported manifest %# as unstamped instead of throwing', (manifest) => {
+    testWindow.__tsjs_prebid_bundle = manifest;
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['rubicon'],
       serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
@@ -5592,7 +7202,11 @@ describe('prebid/client-side bidders', () => {
     expect(() => installPrebidNpm()).not.toThrow();
 
     const hasManifestWarn = warnSpy.mock.calls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('did not stamp an adapter manifest'))
+      args.some(
+        (a) =>
+          typeof a === 'string' &&
+          a.includes('did not stamp a supported bidder runtime-code manifest')
+      )
     );
     expect(hasManifestWarn).toBe(true);
 
@@ -5600,7 +7214,35 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
-  it('warns when the external bundle stamped no adapter manifest', () => {
+  it('rejects a whole mixed bidder list while preserving module lists', () => {
+    testWindow.__tsjs_prebid_bundle = {
+      schemaVersion: 1,
+      modules: DEFAULT_BUNDLE_MANIFEST.modules,
+      runtimeCodes: {
+        ...DEFAULT_BUNDLE_MANIFEST.runtimeCodes,
+        bidder: ['rubicon', 42],
+      },
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    expect(
+      warnSpy.mock.calls.some((args) =>
+        args.some(
+          (value) =>
+            typeof value === 'string' &&
+            value.includes('did not stamp a supported bidder runtime-code manifest')
+        )
+      )
+    ).toBe(true);
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules.includedModules).toEqual([
+      'sharedIdSystem',
+    ]);
+  });
+
+  it('warns when the external bundle stamped no bidder runtime-code manifest', () => {
     delete testWindow.__tsjs_prebid_bundle;
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['rubicon'],
@@ -5612,7 +7254,11 @@ describe('prebid/client-side bidders', () => {
     installPrebidNpm();
 
     const hasManifestWarn = warnSpy.mock.calls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('did not stamp an adapter manifest'))
+      args.some(
+        (a) =>
+          typeof a === 'string' &&
+          a.includes('did not stamp a supported bidder runtime-code manifest')
+      )
     );
     expect(hasManifestWarn).toBe(true);
 
