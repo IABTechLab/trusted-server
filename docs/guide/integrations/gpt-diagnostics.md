@@ -492,6 +492,31 @@ GPT was not observed after listener installation. Confirm GPT initializes and
 executes queued `googletag.cmd` callbacks. Diagnostics do not create GPT, poll for it,
 or patch publisher request behavior.
 
+### Initial Trusted Server rendering remains pending
+
+Initial-render ownership has no five-second timeout that permits competing delivery.
+A Trusted Server claim protects its initial render until `slotRenderEnded` or the
+claim's element/navigation lifetime ends. A missing render event therefore keeps
+competing delivery suppressed; elapsed time alone does not release ownership.
+
+After five seconds, a still-current pending claim records one historical
+`pendingRenderDiagnostic` snapshot with `phase` and `ageMs`. Inspect it in browser
+DevTools, using the slot's DOM ID:
+
+```js
+window.tsjs?.firstImpression?.slots['example-slot']?.pendingRenderDiagnostic
+```
+
+Enable `window.tsjs.log.setLevel('debug')` before the check to also see
+`[tsjs-gpt] initial render remains pending`. The snapshot is recorded even when
+logging is disabled or unavailable. It indicates delayed rendering, not a confirmed
+failure, and does not unlock the slot. It remains historical if rendering later
+finishes.
+
+This initial-render diagnostic is available through debug logging and inspectable
+runtime state only. It is not shown in the GPT diagnostics panel or its JSON export,
+and does not require activation of that panel.
+
 ### Initial callbacks are missing
 
 The integration can observe only callbacks emitted after its listeners execute.

@@ -266,7 +266,8 @@ export function registerPublisherFirstImpressionAuctions(
     if (Object.keys(claim.publisherAuctions).length >= MAX_PUBLISHER_AUCTIONS_PER_SLOT) {
       // All TS-owned entries are retained denial tokens for this exact claim.
       // Reuse one at capacity rather than granting delivery or allocating more.
-      // Its sequence identity also prevents reuse by a replacement DOM element.
+      // Claim validation retires tokens when the physical element changes;
+      // sequence IDs keep replacement claims from reusing those retired tokens.
       if (claim.owner === 'trusted_server') {
         const denial = Object.values(claim.publisherAuctions).find(
           (auction) => auction.suppressDelivery
