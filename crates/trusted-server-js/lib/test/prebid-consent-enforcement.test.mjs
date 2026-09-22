@@ -59,10 +59,11 @@ beforeAll(async () => {
   outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'trusted-server-prebid-consent-'));
 
   await main([
-    '--adapters',
-    'adf',
-    '--user-id-modules',
-    'identityLinkIdSystem',
+    '--modules-json',
+    JSON.stringify({
+      bidder: ['adfBidAdapter'],
+      userId: ['identityLinkIdSystem'],
+    }),
     '--out',
     outputDirectory,
   ]);

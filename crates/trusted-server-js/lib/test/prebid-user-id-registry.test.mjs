@@ -39,7 +39,7 @@ describe('Prebid User ID registry matches installed submodules', () => {
             load(id) {
               if (id !== '\0' + virtualEntry) return;
               return `
-            import ${JSON.stringify(entry.importPath)};
+            import ${JSON.stringify(`prebid.js/modules/${entry.moduleName}.js`)};
             import { hook, module } from ${JSON.stringify(path.join(prebidDir, 'src/hook.js'))};
             window.registeredUserIds = [];
             module('userId', (submodule) => {
