@@ -22,6 +22,7 @@ const prebidVersion = verifyPrebidPackageVersion();
 let outputDirectory;
 let analyticsArtifact;
 let noAnalyticsArtifact;
+let managedUserIdArtifact;
 let shimCode;
 
 async function buildArtifact(modules) {
@@ -46,6 +47,10 @@ beforeAll(async () => {
   noAnalyticsArtifact = await buildArtifact({
     bidder: ['rubiconBidAdapter'],
     userId: ['sharedIdSystem'],
+  });
+  managedUserIdArtifact = await buildArtifact({
+    bidder: ['rubiconBidAdapter'],
+    userId: ['sharedIdSystem', 'identityLinkIdSystem'],
   });
 
   const { build } = await import('vite');
@@ -207,11 +212,12 @@ function expectNoUnexpectedNetworkActivity(stubs) {
   ).toEqual([]);
 }
 
-function installServerState(pageWindow, { analytics = false } = {}) {
+function installServerState(pageWindow, { analytics = false, managedUserIds } = {}) {
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
   pageWindow.__tsjs_prebid = {
     clientSideBidders: [],
     serverSideBidders: ['appnexus'],
+    ...(managedUserIds ? { managedUserIds } : {}),
   };
 
   if (analytics) {
@@ -303,7 +309,12 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    expect(shimCode.length).toBeLessThan(33_000);
+    // A value-import of Prebid or a private rendering helper would multiply
+    // the shim size. The bound sits just above the normal compact shim output,
+    // which is roughly 40 KB: tight enough that material growth has to be
+    // noticed and re-justified here, and far enough below a multiplication
+    // that one still fails loudly. The bundle beside it is 200 KB and up.
+    expect(shimCode.length).toBeLessThan(41_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
@@ -363,6 +374,108 @@ describe('tsjs-prebid production artifacts', () => {
 
       await runAuction(pageWindow, stubs.fetchSpy);
       expectNoUnexpectedNetworkActivity(stubs);
+    } finally {
+      dom.window.close();
+    }
+  }, 60_000);
+
+  it('owns the managed User ID entry against publisher setConfig and mergeConfig', async () => {
+    const dom = createPage();
+    try {
+      const pageWindow = dom.window;
+      installNetworkAndConsoleStubs(pageWindow);
+      installServerState(pageWindow, {
+        managedUserIds: [
+          {
+            name: 'identityLink',
+            params: { pid: '999', notUse3P: false },
+            storage: {
+              type: 'cookie',
+              name: 'idl_env',
+              expires: 15,
+              refreshInSeconds: 1800,
+            },
+          },
+        ],
+      });
+
+      pageWindow.eval(managedUserIdArtifact.bundleCode);
+      expect(pageWindow.__tsjs_prebid_bundle.modules.userId).toEqual([
+        'sharedIdSystem',
+        'identityLinkIdSystem',
+      ]);
+
+      pageWindow.eval(shimCode);
+
+      pageWindow.pbjs.setConfig({ userSync: { userIds: [{ name: 'sharedId' }] } });
+
+      // Managed IDs remain deferred until the publisher supplies its consent policy.
+      expect(
+        pageWindow.pbjs.getConfig('userSync.userIds').some(({ name }) => name === 'identityLink')
+      ).toBe(false);
+
+      pageWindow.pbjs.setConfig({
+        consentManagement: {
+          gdpr: { cmpApi: 'static', consentData: { gdprApplies: false } },
+        },
+      });
+
+      pageWindow.pbjs.requestBids({ adUnits: [] });
+
+      expect(pageWindow.pbjs.getConfig('userSync.userIds')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'sharedId' }),
+          expect.objectContaining({
+            name: 'identityLink',
+            params: { pid: '999', notUse3P: false },
+            storage: expect.objectContaining({ name: 'idl_env' }),
+          }),
+        ])
+      );
+
+      // Characterize the pinned Prebid artifact: partial userSync updates retain
+      // its effective User ID list, including the operator-managed entry.
+      pageWindow.pbjs.setConfig({ userSync: { syncDelay: 50 } });
+
+      const userIdsAfterPartialUpdate = pageWindow.pbjs.getConfig('userSync.userIds');
+      expect(userIdsAfterPartialUpdate.filter(({ name }) => name === 'identityLink')).toEqual([
+        expect.objectContaining({
+          name: 'identityLink',
+          params: { pid: '999', notUse3P: false },
+        }),
+      ]);
+      expect(userIdsAfterPartialUpdate).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+      );
+      expect(pageWindow.pbjs.getConfig('userSync.syncDelay')).toBe(50);
+
+      // Exercise the real Prebid mergeConfig implementation. It closes over
+      // Prebid's internal setConfig, so the shim must guard mergeConfig itself
+      // to prevent a publisher-owned duplicate from bypassing the setConfig guard.
+      pageWindow.pbjs.mergeConfig({
+        userSync: {
+          userIds: [
+            { name: 'sharedId' },
+            { name: 'identityLink', params: { pid: 'publisher-value' } },
+          ],
+        },
+      });
+
+      const mergedUserIds = pageWindow.pbjs.getConfig('userSync.userIds');
+      expect(mergedUserIds.filter(({ name }) => name === 'identityLink')).toEqual([
+        expect.objectContaining({
+          name: 'identityLink',
+          params: { pid: '999', notUse3P: false },
+        }),
+      ]);
+      expect(mergedUserIds).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+      );
+
+      // requestBids leaves User ID submodule work in flight. Let it settle
+      // before closing the window, or jsdom tears down under it and the
+      // rejection surfaces as an unhandled error.
+      await new Promise((resolve) => setTimeout(resolve, 100));
     } finally {
       dom.window.close();
     }
