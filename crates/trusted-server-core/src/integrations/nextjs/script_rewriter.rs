@@ -89,7 +89,7 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
         // accumulated text via Replace — intermediate fragments were already
         // removed from lol_html's output via RemoveNode.
         buf.push_str(content);
-        let full_content = std::mem::take::<String>(&mut buf);
+        let full_content = std::mem::take(&mut *buf);
         let action = self.rewrite_structured(&full_content, ctx);
         if matches!(action, ScriptRewriteAction::Keep) {
             return ScriptRewriteAction::replace(full_content);

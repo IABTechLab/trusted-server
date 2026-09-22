@@ -204,12 +204,15 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
 /// not necessarily the sandbox that served any preceding workload request, so
 /// reuse is established from the counters attached to workload responses
 /// rather than from polling this.
+///
+/// `ordinal` is this probe's own 1-based position in the sandbox, which is
+/// also the number of callbacks the sandbox has served including this one.
+/// The lifetime count is therefore not reported separately.
 #[cfg(feature = "reusable-sandbox")]
 fn sandbox_metrics_response(sandbox: &Sandbox, ordinal: u64) -> FastlyResponse {
     let body = serde_json::json!({
         "instance": instance_id(),
         "ordinal": ordinal,
-        "requests": sandbox.requests(),
         "builds": sandbox.initialization_attempts(),
     });
 
