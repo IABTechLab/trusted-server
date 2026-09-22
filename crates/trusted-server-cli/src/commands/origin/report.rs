@@ -20,9 +20,14 @@ pub struct Difference {
 }
 
 /// One comparison between two fetches that differ in exactly one request signal.
+///
+/// The two arms are compared as a cache would store them: the response's policy headers
+/// followed by its body. A byte offset in [`Difference`] is therefore an offset into that
+/// representation, not into the HTML.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxisResult {
-    /// Axis name, which is also the request header this axis varies.
+    /// Axis name. Usually the request header this axis varies; the `bot` and `prefetch`
+    /// axes are named for the request class they test instead.
     pub name: String,
     /// What the two arms varied.
     pub description: String,
@@ -154,16 +159,18 @@ pub const LIMITS: &str = "\nLimits of this result:\n  \
        client IP (geo, rate-class) is undetectable here.\n  \
      - Covers the URLs sampled, not the origin as a whole.\n  \
      - Sends synthetic cookies. An origin that personalizes only for a genuine\n    \
-       authenticated session shows no difference unless you pass that session's\n    \
-       cookies with --cookie.\n  \
+       authenticated session shows no difference unless you supply that session's\n    \
+       cookies in TRUSTED_SERVER_PROBE_COOKIES.\n  \
+     - Compares the body and the policy headers a cache stores with it, not every\n    \
+       response header. A difference in a field outside that set is not reported.\n  \
      - Varies only the signals it has axes for. Accept-Language, Referer and client\n    \
        hints are never varied, so locale-based personalization would not be seen.\n  \
      - Compares a handful of back-to-back requests, so variation on a slower cycle\n    \
        (an hourly rotation, a low-frequency experiment bucket) can fall between them.\n";
 
-/// First byte at which two bodies diverge, with a short escaped window from each.
+/// First byte at which two representations diverge, with a short escaped window from each.
 ///
-/// Returns `None` when the bodies are identical.
+/// Returns `None` when they are identical.
 #[must_use]
 pub fn first_difference(left: &[u8], right: &[u8]) -> Option<Difference> {
     if left == right {

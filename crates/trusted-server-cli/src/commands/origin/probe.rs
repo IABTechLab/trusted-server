@@ -20,6 +20,41 @@ const TS_COOKIES: &[&str] = &[
 const DESKTOP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 const MOBILE_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 
+/// A crawler user agent, matching a fragment the runtime itself classifies as a bot.
+///
+/// The ad stack is suppressed for bots and prefetches, but shareability is not: neither
+/// classification reaches `origin_response_is_shareable`, so a crawler, challenge, or
+/// prefetch document an origin serves without `Vary` can be stored and then handed to a
+/// human navigation. These two axes are what makes that visible.
+const BOT_USER_AGENT: &str =
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.example.com/bot.html)";
+
+/// Response headers a platform cache stores with the body and replays to every later
+/// reader.
+///
+/// Bodies alone are not the cached representation. Two responses with identical HTML, a
+/// per-audience `Content-Security-Policy`, and no matching `Vary` are cross-served
+/// policies: a weaker one removes a browser protection, a stricter one breaks the page.
+///
+/// An allowlist rather than a denylist of volatile fields, because the alternative fails
+/// an origin for every `Date`, request id, or trace header it happens to emit, and a probe
+/// that cries wolf is one an operator learns to rerun until it passes. Everything here is
+/// policy or representation, and none of it is per-request by design.
+const POLICY_HEADERS: &[&str] = &[
+    "content-language",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "content-type",
+    "cross-origin-embedder-policy",
+    "cross-origin-opener-policy",
+    "cross-origin-resource-policy",
+    "permissions-policy",
+    "referrer-policy",
+    "strict-transport-security",
+    "x-content-type-options",
+    "x-frame-options",
+];
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One fetch's result, reduced to what the probe judges.
@@ -44,6 +79,27 @@ impl Fetched {
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect()
+    }
+
+    /// What a cache would store for this response: its policy headers, then its body.
+    ///
+    /// Every axis compares these rather than bodies, so a difference in a cached header is
+    /// judged by the same `Vary` rules as a difference in the HTML. Header order is this
+    /// function's, not the wire's, so two responses carrying the same fields in a
+    /// different order are not reported as differing.
+    fn canonical(&self) -> Vec<u8> {
+        let mut canonical = Vec::with_capacity(self.body.len() + 256);
+        for name in POLICY_HEADERS {
+            for value in self.all(name) {
+                canonical.extend_from_slice(name.as_bytes());
+                canonical.extend_from_slice(b": ");
+                canonical.extend_from_slice(value.trim().as_bytes());
+                canonical.push(b'\n');
+            }
+        }
+        canonical.push(b'\n');
+        canonical.extend_from_slice(&self.body);
+        canonical
     }
 }
 
@@ -137,14 +193,18 @@ async fn probe_one(
             "{url} answered {} rather than 200, so there is nothing to judge.\n\
              A bot wall or redirect returns a page the origin did not compose, and every \
              verdict below it would describe that page.\n\
-             Pass a session cookie that reaches real content with \
-             --admission-cookie 'name=value'.",
+             Set TRUSTED_SERVER_PROBE_ADMISSION_COOKIE to a session cookie that reaches \
+             real content, as name=value.",
             baseline.status
         ));
     }
 
+    // Bodies are compared as the cache would store them: policy headers first, then the
+    // document.
+    let baseline_canonical = baseline.canonical();
+
     let (self_identity, repeated) =
-        self_identity_axis(client, url, &baseline, repeat, admission_cookie).await?;
+        self_identity_axis(client, url, &baseline_canonical, repeat, admission_cookie).await?;
     let mut axes = vec![self_identity];
     let mut samples: Vec<(String, Fetched)> = repeated
         .into_iter()
@@ -156,38 +216,56 @@ async fn probe_one(
     // Accept-negotiated difference could be incorrectly excused by `Vary: RSC`.
     let mut fetch_control =
         fetch(client, url, RequestProfile::Fetch, &[], admission_cookie).await?;
+    let fetch_control_canonical = fetch_control.canonical();
     axes.push(AxisResult {
         name: "fetch-profile".to_owned(),
         description: "HTML navigation vs. a same-origin browser fetch".to_owned(),
-        difference: first_difference(&baseline.body, &fetch_control.body),
+        difference: first_difference(&baseline_canonical, &fetch_control_canonical),
         covered_by_vary: false,
     });
-    let mut rsc_body = Vec::new();
-    for (name, description, value) in [
+    let mut rsc_canonical = Vec::new();
+    // An axis is named for what it varies, which is not always the header it sends: the
+    // bot arm varies the user agent, and the prefetch arm varies `Sec-Purpose`.
+    for (name, header, description, value) in [
         (
+            "cookie",
             "cookie",
             "bare vs. a representative cookie jar",
             cookie_jar.as_str(),
         ),
         (
             "accept-encoding",
+            "accept-encoding",
             "identity vs. gzip, compared after decoding",
             "gzip",
         ),
         (
             "user-agent",
+            "user-agent",
             "desktop vs. mobile user agent",
             MOBILE_USER_AGENT,
         ),
-        ("rsc", "bare vs. an RSC request", "1"),
+        (
+            "bot",
+            "user-agent",
+            "browser vs. crawler user agent",
+            BOT_USER_AGENT,
+        ),
+        (
+            "prefetch",
+            "sec-purpose",
+            "navigation vs. a prefetch navigation",
+            "prefetch",
+        ),
+        ("rsc", "rsc", "bare vs. an RSC request", "1"),
     ] {
         let (axis, mut response) = compare_axis(
             client,
             url,
             if name == "rsc" {
-                &fetch_control.body
+                &fetch_control_canonical
             } else {
-                &baseline.body
+                &baseline_canonical
             },
             name,
             description,
@@ -197,16 +275,15 @@ async fn probe_one(
                 } else {
                     RequestProfile::Navigation
                 },
-                headers: &[(name, value)],
+                headers: &[(header, value)],
             },
             admission_cookie,
         )
         .await?;
         if name == "rsc" {
-            rsc_body = std::mem::take(&mut response.body);
-        } else {
-            response.body = Vec::new();
+            rsc_canonical = response.canonical();
         }
+        response.body = Vec::new();
         axes.push(axis);
         samples.push((name.to_owned(), response));
     }
@@ -225,7 +302,7 @@ async fn probe_one(
         let (mut axis, mut response) = compare_axis(
             client,
             url,
-            &baseline.body,
+            &baseline_canonical,
             &name,
             &description,
             Arm {
@@ -243,7 +320,7 @@ async fn probe_one(
         let (rsc_axis, mut response) = compare_axis(
             client,
             url,
-            &rsc_body,
+            &rsc_canonical,
             &name,
             &description,
             Arm {
@@ -330,7 +407,7 @@ fn mark_axes_covered_by_vary(samples: &[(String, Fetched)], axes: &mut [AxisResu
 async fn self_identity_axis(
     client: &reqwest::Client,
     url: &str,
-    baseline: &Fetched,
+    baseline_canonical: &[u8],
     repeat: u32,
     admission_cookie: Option<&str>,
 ) -> CliResult<(AxisResult, Vec<Fetched>)> {
@@ -346,7 +423,7 @@ async fn self_identity_axis(
         )
         .await?;
         if difference.is_none() {
-            difference = first_difference(&baseline.body, &again.body);
+            difference = first_difference(baseline_canonical, &again.canonical());
         }
         // Only response metadata is needed after comparison; do not retain a page body
         // per repeat or per variant.
@@ -367,7 +444,7 @@ async fn self_identity_axis(
 async fn compare_axis(
     client: &reqwest::Client,
     url: &str,
-    baseline_body: &[u8],
+    baseline_canonical: &[u8],
     name: &str,
     description: &str,
     arm: Arm<'_>,
@@ -377,7 +454,7 @@ async fn compare_axis(
     let axis = AxisResult {
         name: name.to_owned(),
         description: description.to_owned(),
-        difference: first_difference(baseline_body, &varied.body),
+        difference: first_difference(baseline_canonical, &varied.canonical()),
         covered_by_vary: false,
     };
     Ok((axis, varied))
@@ -461,16 +538,18 @@ fn content_type_verdict(response: &Fetched) -> VerdictResult {
 /// deliberately conservative: a combined profile cannot attribute a difference
 /// to just one of its headers.
 fn vary_covers_axis(declared: &[&str], axis: &str) -> bool {
-    let required = if axis == "fetch-profile" {
-        &[
+    let required = match axis {
+        "fetch-profile" => &[
             "accept",
             "sec-fetch-dest",
             "sec-fetch-mode",
             "sec-fetch-site",
             "sec-fetch-user",
-        ][..]
-    } else {
-        std::slice::from_ref(&axis)
+        ][..],
+        // Named for the classification, keyed on the header the arm actually sent.
+        "bot" => &["user-agent"][..],
+        "prefetch" => &["sec-purpose"][..],
+        _ => std::slice::from_ref(&axis),
     };
     required.iter().all(|name| {
         declared
@@ -856,6 +935,63 @@ mod tests {
             "an unstable origin is a self-identity failure; Vary cannot express it and the \
              operator must not be sent looking for a header"
         );
+    }
+
+    #[test]
+    fn a_stable_body_with_a_different_policy_header_is_a_difference() {
+        // Fastly stores response headers with the body, so a per-audience CSP is
+        // cross-served exactly as a per-audience document would be.
+        let strict = fetched(&[("content-security-policy", "default-src 'self'")]);
+        let weak = fetched(&[("content-security-policy", "default-src *")]);
+        assert_eq!(
+            strict.body, weak.body,
+            "the bodies are identical on purpose"
+        );
+        assert!(
+            first_difference(&strict.canonical(), &weak.canonical()).is_some(),
+            "a weaker policy served to one audience must not be storable for another"
+        );
+    }
+
+    #[test]
+    fn a_volatile_header_is_not_a_difference() {
+        // A request id or trace header changes on every response. Failing an origin for
+        // one would teach operators to rerun the probe until it passes.
+        let first = fetched(&[
+            ("x-request-id", "a"),
+            ("date", "Mon, 01 Jan 2035 00:00:00 GMT"),
+        ]);
+        let second = fetched(&[
+            ("x-request-id", "b"),
+            ("date", "Mon, 01 Jan 2035 00:00:01 GMT"),
+        ]);
+        assert_eq!(
+            first_difference(&first.canonical(), &second.canonical()),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_header_order_does_not_depend_on_the_wire_order() {
+        let one = fetched(&[
+            ("referrer-policy", "no-referrer"),
+            ("x-frame-options", "DENY"),
+        ]);
+        let other = fetched(&[
+            ("x-frame-options", "DENY"),
+            ("referrer-policy", "no-referrer"),
+        ]);
+        assert_eq!(first_difference(&one.canonical(), &other.canonical()), None);
+    }
+
+    #[test]
+    fn the_bot_and_prefetch_axes_are_covered_by_the_headers_they_send() {
+        // Each axis is named for the classification it tests, not for the header it
+        // varies, so `Vary` coverage has to be mapped rather than matched by name.
+        assert!(vary_covers_axis(&["user-agent"], "bot"));
+        assert!(!vary_covers_axis(&["bot"], "bot"));
+        assert!(vary_covers_axis(&["sec-purpose"], "prefetch"));
+        assert!(!vary_covers_axis(&["purpose"], "prefetch"));
     }
 
     #[test]

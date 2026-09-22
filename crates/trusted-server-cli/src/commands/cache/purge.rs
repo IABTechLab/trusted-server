@@ -27,17 +27,7 @@ fn request_body(args: &PurgeArgs) -> CliResult<String> {
 fn purge_endpoint(service: &str) -> CliResult<String> {
     let mut url =
         reqwest::Url::parse(service).map_err(|_| "--service must be an absolute HTTPS URL")?;
-    let loopback = match url.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        return cli_error(
-            "--service requires HTTPS to protect the admin credential; HTTP is allowed only for loopback development services",
-        );
-    }
+    crate::url_guard::require_credential_safe_transport(&url, "--service")?;
     if url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()

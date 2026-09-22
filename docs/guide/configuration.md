@@ -2227,14 +2227,25 @@ saying nothing about this setting.
 
 #### Enablement
 
-1. Run `ts origin probe-shareability --url <representative URLs>`, passing
-   `--cookie` for any publisher cookie a real reader carries.
-   `--admission-cookie` runs are diagnostic only: every request carries that cookie,
-   so cookieless responses remain untested and the safety gate fails. Rerun against
-   the origin without this option before enabling caching.
+1. Run `ts origin probe-shareability --url <representative URLs>`. Publisher cookies a
+   real reader carries go in `TRUSTED_SERVER_PROBE_COOKIES` as one cookie header value
+   (`name=value; name=value`), and a bot-wall admission cookie in
+   `TRUSTED_SERVER_PROBE_ADMISSION_COOKIE`. Both are environment-only, never flags:
+   these are credentials, and an argument is visible to every process on the host
+   through `ps` and lands in shell history. Each `--url` must be HTTPS; plain HTTP is
+   accepted only for a loopback development origin. Admission-cookie runs are
+   diagnostic only: every request carries that cookie, so cookieless responses remain
+   untested and the safety gate fails. Rerun against the origin without it before
+   enabling caching.
 2. **Every axis and every verdict must pass.** Do not enable on a partial pass.
    The probe checks status and safety headers on every sampled response, including
-   repeats. Any `Age` header, including `Age: 0`, blocks the verdict because a
+   repeats. Each axis compares what a cache would store — the body **and** the policy
+   headers replayed with it, such as `Content-Security-Policy` — so an origin that
+   serves one document under two policies fails just as a varying document does.
+   Crawler user agents and prefetch requests are their own axes: neither
+   classification blocks readthrough, so an origin that answers a bot or a prefetch
+   with a different document without declaring `Vary` would otherwise have that
+   document cross-served to a reader. Any `Age` header, including `Age: 0`, blocks the verdict because a
    fresh cached response can hide origin personalization. Pass `--vary-header <name>` for each additional request header to test;
    each is varied independently, both with and without RSC. A declared `Vary` can
    explain a user-agent, RSC,

@@ -11,6 +11,12 @@ use crate::error::CliResult;
 #[derive(Debug, Subcommand)]
 pub enum OriginCommand {
     /// Check whether an origin's responses may be shared between readers.
+    ///
+    /// Cookies are read from the environment, never from the command line, because they
+    /// are credentials: set `TRUSTED_SERVER_PROBE_COOKIES` to the publisher cookies a real
+    /// reader carries (`name=value; name=value`), and
+    /// `TRUSTED_SERVER_PROBE_ADMISSION_COOKIE` to a cookie that gets past a bot wall. Every --url must be HTTPS; plain HTTP is
+    /// accepted only for a loopback development origin.
     ProbeShareability(ProbeShareabilityArgs),
 }
 
@@ -26,11 +32,14 @@ pub struct ProbeShareabilityArgs {
     #[arg(long, default_value_t = 3)]
     pub repeat: u32,
 
-    /// Extra cookie to send in the cookie arm, as `name=value`. Repeatable.
+    /// Extra cookies sent in the cookie arm, read from
+    /// [`PROBE_COOKIES_ENVIRONMENT_VARIABLE`].
     ///
-    /// The probe always sends a representative Trusted Server cookie set; use this to add
-    /// publisher cookies a real reader would also carry.
-    #[arg(long)]
+    /// Never a flag. The report asks for the cookies of a genuine authenticated session,
+    /// and an argument is visible to every other process on the host through `ps` and
+    /// lands in shell history. The probe always sends a representative Trusted Server
+    /// cookie set; the environment adds publisher cookies a real reader would also carry.
+    #[arg(skip)]
     pub cookie: Vec<String>,
 
     /// Request header the origin is configured to vary on, beyond `rsc`. Repeatable.
@@ -41,15 +50,17 @@ pub struct ProbeShareabilityArgs {
     #[arg(long = "vary-header")]
     pub vary_header: Vec<String>,
 
-    /// Cookie every request carries, as `name=value`, to get past a bot wall.
+    /// Cookie every request carries to get past a bot wall, read from
+    /// [`PROBE_ADMISSION_COOKIE_ENVIRONMENT_VARIABLE`].
     ///
-    /// Distinct from `--cookie`: this one is sent on *every* arm including the baseline,
+    /// Also environment-only: a bot-wall admission token is a credential. Distinct from
+    /// the cookie arm's extras: this one is sent on *every* arm including the baseline,
     /// because without it a protected origin answers each arm with a challenge page and
     /// the probe would report on those instead of on the origin. It is not part of what
     /// the cookie axis varies. These runs are diagnostic only and always fail the safety
-    /// gate because cookieless responses are untested. Rerun without this option against
-    /// the origin before enabling caching.
-    #[arg(long = "admission-cookie")]
+    /// gate because cookieless responses are untested. Rerun without it against the
+    /// origin before enabling caching.
+    #[arg(skip)]
     pub admission_cookie: Option<String>,
 
     /// Emit JSON instead of a human-readable report.
@@ -66,14 +77,69 @@ pub struct ProbeShareabilityArgs {
 /// can gate a deploy.
 pub fn run(command: OriginCommand, out: &mut impl std::io::Write) -> CliResult<()> {
     match command {
-        OriginCommand::ProbeShareability(args) => run_probe(&args, out),
+        OriginCommand::ProbeShareability(mut args) => {
+            load_cookies_from_environment(&mut args);
+            run_probe(&args, out)
+        }
+    }
+}
+
+/// Environment variable carrying the cookie arm's extra cookies, as one cookie header
+/// value: `name=value; name=value`.
+///
+/// Read from the environment and never accepted as a flag, for the same reason as the
+/// admin password in `ts cache purge`: an argument is visible to every other process on
+/// the host through `ps`, and lands in shell history. The report asks operators to probe
+/// with a genuine session's cookies, so these values are credentials.
+pub const PROBE_COOKIES_ENVIRONMENT_VARIABLE: &str = "TRUSTED_SERVER_PROBE_COOKIES";
+
+/// Environment variable carrying the bot-wall admission cookie, as `name=value`.
+pub const PROBE_ADMISSION_COOKIE_ENVIRONMENT_VARIABLE: &str =
+    "TRUSTED_SERVER_PROBE_ADMISSION_COOKIE";
+
+/// Split a cookie header value into its `name=value` pairs.
+fn split_cookie_header(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Fold the environment's cookies into the parsed arguments.
+///
+/// Appends rather than replaces so a caller that constructed the arguments directly — the
+/// integration suite — keeps what it set.
+fn load_cookies_from_environment(args: &mut ProbeShareabilityArgs) {
+    if let Ok(value) = std::env::var(PROBE_COOKIES_ENVIRONMENT_VARIABLE) {
+        args.cookie.extend(split_cookie_header(&value));
+    }
+    if args.admission_cookie.is_none()
+        && let Ok(value) = std::env::var(PROBE_ADMISSION_COOKIE_ENVIRONMENT_VARIABLE)
+    {
+        let value = value.trim();
+        if !value.is_empty() {
+            args.admission_cookie = Some(value.to_owned());
+        }
     }
 }
 
 fn run_probe(args: &ProbeShareabilityArgs, out: &mut impl std::io::Write) -> CliResult<()> {
+    // Transport first: every later step sends the cookies below to these URLs, so a URL
+    // that cannot carry a credential safely must be refused before one is read.
+    for url in &args.url {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|error| format!("--url must be an absolute URL, got {url:?}: {error}"))?;
+        crate::url_guard::require_credential_safe_transport(&parsed, "--url")?;
+    }
+
     for cookie in &args.cookie {
         if !cookie.contains('=') {
-            return crate::error::cli_error(format!("--cookie expects name=value, got {cookie:?}"));
+            return crate::error::cli_error(format!(
+                "{PROBE_COOKIES_ENVIRONMENT_VARIABLE} expects name=value pairs separated by \
+                 `;`, got {cookie:?}"
+            ));
         }
     }
 
@@ -81,7 +147,7 @@ fn run_probe(args: &ProbeShareabilityArgs, out: &mut impl std::io::Write) -> Cli
         && !cookie.contains('=')
     {
         return crate::error::cli_error(format!(
-            "--admission-cookie expects name=value, got {cookie:?}"
+            "{PROBE_ADMISSION_COOKIE_ENVIRONMENT_VARIABLE} expects name=value, got {cookie:?}"
         ));
     }
 

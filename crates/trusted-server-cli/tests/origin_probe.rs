@@ -236,6 +236,138 @@ fn a_user_agent_varying_origin_fails_unless_it_declares_vary() {
 }
 
 #[test]
+fn a_bot_varying_origin_fails_the_bot_axis() {
+    // Bots are excluded from the ad stack but not from shareability, so a crawler or
+    // challenge document an origin serves without Vary can be stored and then handed to a
+    // human navigation.
+    let server = FixtureServer::start(|request| {
+        let bot = request
+            .header("user-agent")
+            .is_some_and(|agent| agent.contains("Googlebot"));
+        FixtureResponse::html(if bot {
+            "<html>crawler document</html>"
+        } else {
+            "<html>reader document</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok, "a crawler-specific document must not be cross-served");
+    assert!(!axis(&report, "bot").passed());
+    assert!(
+        !verdict(&report, "vary-coverage").passed,
+        "the undeclared signal is what gets cross-served"
+    );
+}
+
+#[test]
+fn a_prefetch_varying_origin_fails_the_prefetch_axis() {
+    let server = FixtureServer::start(|request| {
+        let prefetch = request
+            .header("sec-purpose")
+            .is_some_and(|purpose| purpose.contains("prefetch"));
+        FixtureResponse::html(if prefetch {
+            "<html>prefetch shell</html>"
+        } else {
+            "<html>reader document</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(!ok, "a prefetch-specific document must not be cross-served");
+    assert!(!axis(&report, "prefetch").passed());
+}
+
+#[test]
+fn a_declared_vary_still_excuses_the_bot_axis() {
+    // The axis is named for the classification; the cache keys on the header it varied.
+    let server = FixtureServer::start(|request| {
+        let bot = request
+            .header("user-agent")
+            .is_some_and(|agent| agent.contains("Googlebot"));
+        FixtureResponse::html(if bot {
+            "<html>crawler document</html>"
+        } else {
+            "<html>reader document</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+        .with_header("vary", "User-Agent")
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(
+        ok,
+        "an origin that declares User-Agent is keyed on it: {}",
+        report.render_text()
+    );
+}
+
+#[test]
+fn a_stable_body_with_a_varying_policy_header_is_not_shareable() {
+    // Fastly stores response headers with the body. A per-audience CSP is cross-served
+    // exactly as a per-audience document would be: the weaker policy removes a browser
+    // protection for readers the origin meant to protect.
+    let server = FixtureServer::start(|request| {
+        let mobile = request
+            .header("user-agent")
+            .is_some_and(|agent| agent.contains("iPhone"));
+        FixtureResponse::html("<html>one document for everyone</html>")
+            .with_header("cache-control", "public, max-age=300")
+            .with_header(
+                "content-security-policy",
+                if mobile {
+                    "default-src *"
+                } else {
+                    "default-src 'self'"
+                },
+            )
+    });
+    let (ok, report) = probe(&server, json_args(&server));
+
+    assert!(
+        !ok,
+        "identical HTML is not identical cached representations"
+    );
+    assert!(
+        !axis(&report, "user-agent").passed(),
+        "the axis compares what the cache stores, not just the body"
+    );
+}
+
+#[test]
+fn a_plain_http_url_is_refused_before_any_cookie_is_sent() {
+    // The probe carries publisher session cookies. Sending them to a non-loopback origin
+    // over HTTP puts them on the wire in the clear.
+    let mut args = json_args(&FixtureServer::start(shareable("<html>stable</html>")));
+    args.url = vec!["http://origin.example.com/article".to_owned()];
+
+    let mut out = Vec::new();
+    let outcome = run(OriginCommand::ProbeShareability(args), &mut out);
+
+    let error = outcome.expect_err("plain HTTP must be refused");
+    assert!(
+        error.contains("HTTPS"),
+        "the error must name the requirement, got: {error}"
+    );
+}
+
+#[test]
+fn a_url_carrying_credentials_is_refused() {
+    let mut args = json_args(&FixtureServer::start(shareable("<html>stable</html>")));
+    args.url = vec!["https://reader:example-password@origin.example.com/article".to_owned()];
+
+    let mut out = Vec::new();
+    let outcome = run(OriginCommand::ProbeShareability(args), &mut out);
+
+    assert!(
+        outcome.is_err(),
+        "userinfo reaches proxy logs and shell history"
+    );
+}
+
+#[test]
 fn an_rsc_varying_origin_fails_the_rsc_axis() {
     // RSC fetches already flow through the readthrough cache while HTML navigations are
     // passed, so this is the axis specific to removing the bypass.
@@ -491,7 +623,7 @@ fn a_bot_wall_aborts_the_probe_instead_of_judging_the_challenge_page() {
     let error = outcome.expect_err("a challenge page must not be judged");
     let message = error.to_string();
     assert!(
-        message.contains("403") && message.contains("admission-cookie"),
+        message.contains("403") && message.contains("TRUSTED_SERVER_PROBE_ADMISSION_COOKIE"),
         "the error must name the status and how to get past it, got: {message}"
     );
 }
@@ -780,7 +912,7 @@ fn declared_custom_signals_are_probed_independently_without_duplicate_axes() {
     );
     assert_eq!(
         server.request_count(),
-        9,
+        11,
         "should sample each signal independently and the configured header with RSC"
     );
 }
@@ -812,7 +944,7 @@ fn unsafe_headers_are_still_checked_after_self_identity_first_differs() {
     );
     assert_eq!(
         server.request_count(),
-        9,
+        11,
         "should complete every requested sample"
     );
 }
