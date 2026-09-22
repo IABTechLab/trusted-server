@@ -17,20 +17,25 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
-derive_more = { workspace = true, features = ["display"] }
+derive_more = { workspace = true }
 edgezero-cli = { workspace = true }
+edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
+glob = { workspace = true }
+http = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+similar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
+tracing = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
@@ -72,10 +77,11 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
+temp-env = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
