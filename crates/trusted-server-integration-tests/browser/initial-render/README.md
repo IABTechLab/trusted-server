@@ -12,6 +12,7 @@ npm ci --prefix crates/trusted-server-js/lib
 npm ci --prefix crates/trusted-server-integration-tests/browser
 (cd crates/trusted-server-integration-tests/browser && npx playwright install chromium)
 (cd crates/trusted-server-js/lib && node build-all.mjs)
+node --test crates/trusted-server-integration-tests/browser/initial-render/pages.test.cjs
 node crates/trusted-server-integration-tests/browser/initial-render/run.cjs
 ```
 
@@ -64,3 +65,6 @@ creative DOM as well as request counts. This demonstrates the admission and
 replacement mechanism; it does not establish how a real GAM auction would choose
 a winner or prove that a specific live site's flicker has the same cause. Rust
 auction execution and HTML injection are outside this regression's scope.
+
+The page-construction tests use the JS package’s existing jsdom dependency and
+verify that script-closing tags and HTML in labels/ad IDs remain data.

@@ -76,8 +76,7 @@ const scriptContents = new Map(
   ].map((file) => [file, fs.readFileSync(file, "utf8")]),
 );
 const origin = "https://publisher.example.com";
-const creative = (label) =>
-  `<!doctype html><html><body style="margin:0;width:300px;height:250px;background:${label === "Server result" ? "#b6e3ff" : "#ffcda8"};font:24px sans-serif"><div class="marker">${label}</div><script>requestAnimationFrame(()=>top.postMessage({type:'fixture-creative-ready',label:${JSON.stringify(label)}},'*'));</script></body></html>`;
+const { creative, pucPage } = require("./pages.cjs");
 const scenarios = [
   "publisher-first",
   "before-request-event",
@@ -129,10 +128,15 @@ const scenarios = [
             notifyAuction();
             return;
           }
+          if (url.pathname === "/fixture-puc.js")
+            return route.fulfill({
+              contentType: "application/javascript",
+              body: puc,
+            });
           if (url.pathname === "/fixture-puc")
             return route.fulfill({
               contentType: "text/html",
-              body: `<!doctype html><script>${puc}</script><script>window.ucTag.renderAd(document,{adId:${JSON.stringify(url.searchParams.get("adId"))},pubUrl:${JSON.stringify(origin)}});</script>`,
+              body: pucPage(),
             });
           if (url.pathname === "/")
             return route.fulfill({
@@ -471,6 +475,7 @@ const scenarios = [
             path.join(dist, "tsjs-prebid.js"),
             external,
             __filename,
+            path.join(__dirname, "pages.cjs"),
             path.join(__dirname, "gpt-fixture.js"),
             path.join(
               repo,
