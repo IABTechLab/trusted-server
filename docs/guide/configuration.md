@@ -1345,19 +1345,21 @@ apply when the integration section exists in `trusted-server.toml`.
 timeout, routing, profile debug/test controls, consent forwarding, bidder-param
 overrides, and notification suppression belong under `[auction]`.
 
-| Browser field                         | Type          | Default                                                                | Description                                                                                                                   |
-| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                             | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter                                                |
-| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration                                                             |
-| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout                                                       |
-| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug                                                             |
-| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                                                                       |
-| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                                                                    |
-| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                                                                   |
-| `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                                                                 |
-| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                                                                  |
-| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                                                                             |
-| `managed_user_ids`                    | Array[Table]  | `[]`                                                                   | Prebid User ID modules Trusted Server installs and keeps installed; each entry is forwarded to Prebid.js verbatim (see below) |
+| Browser field                        | Type          | Default                                                                | Description                                                                    |
+| ------------------------------------ | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `enabled`                            | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
+| `account_id`                         | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
+| `timeout_ms`                         | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
+| `debug`                              | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
+| `client_side_bidders`                | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
+| `excluded_gam_ad_unit_path_suffixes` | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
+| `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
+| `external_bundle_url`                | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
+| `external_bundle_sha256` / `*_sri`   | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
+| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid bundle`                           |
+| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid bundle`                          |
+| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid bundle`                        |
+| `managed_user_ids`                   | Array[Table]  | `[]`                                                                   | Prebid User ID modules Trusted Server installs and keeps installed (see below) |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
@@ -1371,7 +1373,7 @@ routes and injected into the browser. There is no second server bidder list in
 enabled = true
 timeout_ms = 1000
 debug = false
-client_side_bidders = ["example-browser"]
+client_side_bidders = ["rubicon"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 script_patterns = ["/prebid.js", "/prebid.min.js"]
 
@@ -1387,8 +1389,10 @@ refresh_in_seconds = 1800
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[integrations.prebid.bundle]
-adapters = ["example-browser"]
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["atsAnalyticsAdapter"]
 
 [auction.providers.pbs-main]
 protocol = "openrtb-2.6"

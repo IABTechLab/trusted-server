@@ -494,12 +494,27 @@ impl IntegrationConfig for LegacyPrebidServerConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrebidBundleBuildConfig {
-    /// Prebid.js bidder adapters included by `ts prebid bundle`.
+    /// Typed Prebid.js module selections consumed by `ts prebid bundle`.
     #[serde(default)]
-    pub adapters: Vec<String>,
-    /// Optional Prebid.js user ID modules included by `ts prebid bundle`.
+    pub modules: PrebidBundleModulesConfig,
+}
+
+/// Exact Prebid.js module stems selected by `ts prebid bundle`.
+///
+/// The CLI validates these values. The runtime only parses them so app config
+/// carrying build inputs remains loadable.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrebidBundleModulesConfig {
+    /// Bidder adapter module stems.
     #[serde(default)]
-    pub user_id_modules: Option<Vec<String>>,
+    pub bidder: Vec<String>,
+    /// User ID module stems; omission selects the generator's curated preset.
+    #[serde(default)]
+    pub user_id: Option<Vec<String>>,
+    /// Analytics adapter module stems; omission selects no analytics adapters.
+    #[serde(default)]
+    pub analytics: Option<Vec<String>>,
 }
 
 /// Browser-only Prebid integration settings.
@@ -3979,6 +3994,73 @@ proxy_secret = "test-secret"
 [ec]
 passphrase = "test-secret-key-32-bytes-minimum"
 "#;
+
+    fn parse_browser_prebid_toml_result(
+        prebid_section: &str,
+    ) -> Result<Option<PrebidIntegrationConfig>, Report<TrustedServerError>> {
+        let toml_str = format!("{}{}", TOML_BASE, prebid_section);
+        let settings = Settings::from_toml(&toml_str)?;
+        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)
+    }
+
+    #[test]
+    fn browser_config_accepts_strict_nested_bundle_modules() {
+        let config = parse_browser_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["atsAnalyticsAdapter"]
+"#,
+        )
+        .expect("should parse nested Prebid bundle modules")
+        .expect("should enable Prebid browser config");
+        let bundle = serde_json::to_value(config.bundle).expect("should serialize bundle config");
+
+        assert_eq!(
+            bundle,
+            json!({
+                "modules": {
+                    "bidder": ["rubiconBidAdapter"],
+                    "user_id": ["sharedIdSystem"],
+                    "analytics": ["atsAnalyticsAdapter"]
+                }
+            }),
+            "should retain nested Prebid bundle module stems"
+        );
+    }
+
+    #[test]
+    fn browser_config_rejects_removed_and_unknown_bundle_fields() {
+        for enabled in [true, false] {
+            for (section, field, value) in [
+                ("bundle", "adapters", "[\"rubicon\"]"),
+                ("bundle", "user_id_modules", "[\"sharedIdSystem\"]"),
+                ("bundle", "analytics_adapters", "[\"atsAnalyticsAdapter\"]"),
+                ("bundle.modules", "unsupported_kind", "[]"),
+            ] {
+                let error = parse_browser_prebid_toml_result(&format!(
+                    r#"
+[integrations.prebid]
+enabled = {enabled}
+
+[integrations.prebid.{section}]
+{field} = {value}
+"#
+                ))
+                .expect_err("should reject a removed or unknown Prebid bundle field");
+
+                let error = format!("{error:?}");
+                assert!(
+                    error.contains(field),
+                    "should identify rejected field {field:?} when enabled is {enabled}: {error}"
+                );
+            }
+        }
+    }
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section
     /// (plus any sub-tables) into a [`LegacyPrebidServerConfig`].
