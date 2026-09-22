@@ -77,11 +77,36 @@ pub fn ec_finalize_response(
                 ec_context,
                 registry,
             );
-            let snapshot = graph.upsert_partner_ids_from_snapshot(
-                &ec_id,
-                &updates,
-                ec_context.kv_snapshot().clone(),
-            );
+            // `upsert_partner_ids_from_snapshot` early-returns the incoming
+            // snapshot unrefreshed when `updates` is empty, which is correct
+            // when there was never anything to write (an unconfigured
+            // registry, or no EID cookies/body this request — the case
+            // `finalize_not_read_snapshot_does_not_rotate` covers). But when
+            // Purpose 4 denial is what emptied `updates`, the request *did*
+            // have EID data, and orphan recovery below still needs an actual
+            // `Missing` read to detect an orphaned cookie. An unread
+            // `NotRead` snapshot proves nothing, so a Purpose-4-only denial
+            // must not also skip that one read on a recovery-eligible
+            // request.
+            let snapshot = if updates.is_empty()
+                && ec_context.recovery_eligible()
+                && matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead)
+                && !collect_eid_updates(
+                    eids_cookie,
+                    sharedid_cookie,
+                    ec_context.client_eids(),
+                    registry,
+                )
+                .is_empty()
+            {
+                graph.load_snapshot(&ec_id)
+            } else {
+                graph.upsert_partner_ids_from_snapshot(
+                    &ec_id,
+                    &updates,
+                    ec_context.kv_snapshot().clone(),
+                )
+            };
             ec_context.set_kv_snapshot(snapshot);
             if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. })
                 && ec_context.recovery_eligible()
@@ -987,6 +1012,95 @@ mod tests {
         assert!(
             get_header(&response, "set-cookie").is_some(),
             "should emit replacement cookie after persistence"
+        );
+    }
+
+    #[test]
+    fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
+        // Regression test: this request has real EID data (a configured
+        // partner and a captured client EID), but TCF Purpose 4 denial gates
+        // it away, emptying the update list. That must not also suppress the
+        // snapshot refresh that orphan recovery depends on. Without a
+        // preloaded snapshot (a non-GET publisher navigation never calls
+        // `should_preload_ec_snapshot`), the context starts at `NotRead`; only
+        // an actual KV read can prove the row is missing and let recovery run.
+        //
+        // This is distinct from `finalize_not_read_snapshot_does_not_rotate`,
+        // which covers a request with no EID data at all (nothing gated it
+        // away) and must still not rotate.
+        let settings = create_test_settings();
+        let orphaned_ec = sample_ec_id("orphn2");
+        let purpose1_only_consent = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                // Purpose 1 (index 0) granted; Purpose 4 (index 3) denied.
+                purpose_consents: {
+                    let mut purposes = vec![false; 24];
+                    purposes[0] = true;
+                    purposes
+                },
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(orphaned_ec.clone()),
+            purpose1_only_consent,
+            Some("192.0.2.11".to_owned()),
+        );
+        ec_context.set_recovery_eligible(true);
+        ec_context.set_client_eids(vec![Eid {
+            source: "id5-sync.com".to_owned(),
+            uids: vec![Uid {
+                id: "ID5_should_not_persist".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }]);
+        let partners = vec![make_partner("id5-sync.com")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let replacement = ec_context.ec_value().expect(
+            "should rotate the orphan even though Purpose 4 denial emptied the gated update list",
+        );
+        assert_ne!(replacement, &orphaned_ec);
+        let (stored, _) = graph
+            .get(replacement)
+            .expect("should read replacement")
+            .expect("replacement cookie should have a backing row");
+        assert!(
+            get_header(&response, "set-cookie").is_some(),
+            "should emit replacement cookie after persistence"
+        );
+        assert!(
+            !stored.ids.contains_key("id5-sync.com"),
+            "denied Purpose 4 EID must not be persisted even on the recovered row"
         );
     }
 

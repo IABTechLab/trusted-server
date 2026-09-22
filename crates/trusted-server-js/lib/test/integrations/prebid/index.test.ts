@@ -1594,6 +1594,46 @@ describe('prebid/installPrebidNpm', () => {
       expect(warnedMessage).toContain('dropped.example');
     });
 
+    it('warns about a source whose UIDs were partially trimmed but retained', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      // A single source with many UIDs is trimmed down to fit rather than
+      // dropped outright — it stays in the payload, but with fewer UIDs.
+      const longUid = 'x'.repeat(400);
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'id5-sync.com',
+          uids: Array.from({ length: 10 }, (_, i) => ({ id: `${longUid}${i}`, atype: 1 })),
+        },
+      ]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+
+      const persisted = JSON.parse(atob(cookieValue!)) as Array<{
+        source: string;
+        uids: unknown[];
+      }>;
+      expect(persisted.map((eid) => eid.source)).toContain('id5-sync.com');
+      const persistedSource = persisted.find((eid) => eid.source === 'id5-sync.com');
+      expect(persistedSource!.uids.length).toBeLessThan(10);
+
+      const warnedMessage = warnSpy.mock.calls
+        .map((call) => call.at(-1))
+        .find(
+          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
+        );
+      expect(warnedMessage).toBeDefined();
+      expect(warnedMessage).toContain('trimmed uids from sources: id5-sync.com');
+    });
+
     it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
       document.cookie = `ts-eids=${btoa(JSON.stringify([{ source: 'sharedid.org', uids: [{ id: 'stale' }] }]))}`;
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {

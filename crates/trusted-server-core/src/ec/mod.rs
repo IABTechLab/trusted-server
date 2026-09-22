@@ -511,13 +511,13 @@ impl EcContext {
 
     /// Records the current request's own EIDs (e.g. an `/auction` body) for
     /// use by response finalization's KV ingestion.
-    pub fn set_client_eids(&mut self, eids: Vec<Eid>) {
+    pub(crate) fn set_client_eids(&mut self, eids: Vec<Eid>) {
         self.client_eids = Some(eids);
     }
 
     /// Returns the current request's own EIDs, if the route captured any.
     #[must_use]
-    pub fn client_eids(&self) -> Option<&[Eid]> {
+    pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
         self.client_eids.as_deref()
     }
 
