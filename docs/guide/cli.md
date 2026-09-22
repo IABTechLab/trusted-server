@@ -608,7 +608,7 @@ APIs.
 
 ## Generate an external Prebid bundle
 
-`ts prebid bundle` builds the local external Prebid browser bundle configured in
+`ts prebid client` builds the local external Prebid browser bundle configured in
 `trusted-server.toml`.
 
 ```toml
@@ -628,7 +628,7 @@ Run the command after installing JS dependencies:
 ```bash
 cd crates/trusted-server-js/lib && npm ci
 cd ../../..
-ts prebid bundle
+ts prebid client
 ```
 
 By default, generated artifacts are written to `dist/prebid/`. The versioned
@@ -644,8 +644,27 @@ HTTPS asset URL, and include that host plus any redirect targets in
 Use custom paths when needed:
 
 ```bash
-ts prebid bundle --config publisher-a.toml --out build/prebid
+ts prebid client --config publisher-a.toml --out build/prebid
 ```
 
-`ts prebid bundle` is local-only. It has no `--adapter` option and does not
+`ts prebid client` is local-only. It has no `--adapter` option and does not
 upload, provision, deploy, or push config.
+
+## Operate a self-hosted Prebid Server
+
+The experimental `ts prebid server` namespace supports four bounded operations:
+
+- `inspect` reads selected local Trusted Server configuration.
+- `check` validates a deployment descriptor and regional configuration locally.
+- `secrets set` writes one approved value to an existing AWS Secrets Manager secret.
+- `status` reads declared EC2 infrastructure state, not PBS health or readiness.
+
+AWS operations require AWS CLI v2 on `PATH`; `inspect` and `check` do not contact
+AWS. Add `--json` anywhere under `ts prebid server` for machine-readable output.
+Failures use exit code 2, including incomplete `status` reports that still write
+partial JSON to stdout.
+
+See the
+[experimental PBS command reference](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-cli/README.md)
+for the deployment descriptor schema, secret-write safeguards, and current
+limitations.
