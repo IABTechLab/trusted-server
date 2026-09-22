@@ -40,8 +40,8 @@ lifetime. It is asynchronous admission control, not a thread mutex.
    cannot reopen it. New auctions after settlement remain ordinary refreshes.
 5. A registered losing token survives its lease, settlement, and consumption
    until its element/navigation lifetime ends. The same wrapped callback may
-   execute again without gaining delivery permission. Pending Prebid code/bid
-   indexes remain consumed after delivery so they cannot indefinitely suppress
+   execute again without gaining delivery permission. The existing pending Prebid code/bid
+   index cleanup remains unchanged: indexes are consumed after delivery so they cannot indefinitely suppress
    unrelated, code-only refreshes.
 6. Navigation or physical element replacement invalidates existing state under
    the existing identity rules. Do not add another generation or revision model.
@@ -65,13 +65,28 @@ Retain the current callback-local and pending bid/code correlation behavior.
 Re-entering the wrapped auction callback re-registers its original losing token.
 After pending correlation has been consumed, neither repeated delivery using
 its old bid ID nor an unattributable deferred refresh is guaranteed suppression.
-Re-entering the wrapped callback re-registers its original losing token. Do not keep consumed code-only registrations indefinitely.
+Do not keep consumed code-only registrations indefinitely.
 
 Preserve mixed-slot filtering, SRA batching, exclusion paths, refresh options,
-internal TS refresh bypass, and one-shot GPT handoff consumption. Existing bounded
-claim/token capacities remain unchanged; this patch does not claim unlimited
-protection beyond those limits. Broad targeting guards, index redesign, overflow
-policy, diagnostic UI work, and creative-renderer revisions are deferred.
+internal TS refresh bypass, and one-shot GPT handoff consumption. The existing claim/token limits remain unchanged. At the 16-token per-claim
+limit, overlapping auctions reuse a retained denial token from that exact TS
+claim. No extra token is allocated and reaching capacity cannot permit delivery.
+Render settlement still permits fresh auctions. Old tokens cannot suppress a
+replacement DOM element or a new navigation. Publisher-owned capacity behavior
+and the existing 256-claim limit remain unchanged.
+
+Each newly acquired TS claim schedules one five-second diagnostic check, including
+publisher-to-TS fallback. If that same claim and element/navigation lifetime are
+still pending, record `pendingRenderDiagnostic` with phase and elapsed milliseconds.
+The optional `tsjs.log.debug` message is “initial render remains pending”; enable
+`tsjs.log.setLevel('debug')` to see it. The snapshot remains available on the claim
+when logging is disabled or missing. This is evidence of delayed rendering, not
+an error classification or timer-based unlock. Settled, released, replaced, and
+previous-navigation claims do not emit it. Runtime and bootstrap use the same
+rule; logger failures cannot affect delivery. There is no polling or new UI.
+
+Broad targeting guards, pending-index redesign, diagnostic UI work, and
+creative-renderer revisions remain deferred.
 
 ## Implementation map
 
@@ -88,21 +103,27 @@ policy, diagnostic UI work, and creative-renderer revisions are deferred.
 
 ## Required verification
 
-| Schedule or condition                                      | Expected behavior                           |
-| ---------------------------------------------------------- | ------------------------------------------- |
-| Publisher starts first                                     | Publisher retains initial delivery          |
-| Publisher starts after request, before render              | No competing native refresh                 |
-| Losing callback completes before or after render           | No competing native refresh                 |
-| Initial render pending beyond five seconds                 | New overlap still suppressed                |
-| Losing callback consumed or throws, another auction starts | Protection remains open                     |
-| Same wrapped losing callback repeats                       | Still suppressed                            |
-| Fresh auction after filled or empty render                 | Subsequent refresh allowed                  |
-| Later request event after initial render                   | Initial settlement stays terminal           |
-| Losing callback after a legitimate refresh                 | No extra request or TS snapshot restoration |
-| Setup failure before request                               | Existing safe claim release retained        |
-| Navigation or element replacement                          | Old lifetime does not suppress new work     |
-| Bootstrap then runtime                                     | Same request-to-render boundary             |
-| Mixed slots, excluded slots, bare refresh, handoff         | Existing forwarding semantics preserved     |
+| Schedule or condition                                      | Expected behavior                                                          |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Publisher starts first                                     | Publisher retains initial delivery                                         |
+| Publisher starts after request, before render              | No competing native refresh                                                |
+| Losing callback completes before or after render           | No competing native refresh                                                |
+| Initial render pending beyond five seconds                 | New overlap still suppressed                                               |
+| Losing callback consumed or throws, another auction starts | Protection remains open                                                    |
+| Same wrapped losing callback repeats                       | Still suppressed                                                           |
+| Fresh auction after filled or empty render                 | Subsequent refresh allowed                                                 |
+| More than 16 overlapping auctions                          | Suppression remains bounded and effective; fresh post-render refresh works |
+| Five-second pending diagnostic                             | One record; no unlock, no stale-lifetime report; logger failures harmless  |
+| Later request event after initial render                   | Initial settlement stays terminal                                          |
+| Losing callback after a legitimate refresh                 | No extra request or TS snapshot restoration                                |
+| Setup failure before request                               | Existing safe claim release retained                                       |
+| Navigation or element replacement                          | Old lifetime does not suppress new work                                    |
+| Bootstrap then runtime                                     | Same request-to-render boundary                                            |
+| Mixed slots, excluded slots, bare refresh, handoff         | Existing forwarding semantics preserved                                    |
+
+CI runs the page-construction tests and both variants of the standalone browser
+regression in fixed mode and uploads its evidence even on failure. Baseline mode
+is a manual comparison tool, not a routine CI assertion.
 
 Run focused tests red before implementation, then green, JS tests/lint/format/build,
 the controlled browser regression, and repository CI gates before PR handoff.

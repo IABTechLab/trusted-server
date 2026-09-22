@@ -385,7 +385,10 @@ export interface FirstImpressionSlotClaim {
   element: HTMLElement;
   owner: FirstImpressionOwner;
   phase: FirstImpressionPhase;
+  /** Publisher fallback deadline; TS claims remain owned until render or retirement. */
   expiresAt: number;
+  /** One historical snapshot if initial TS rendering is still pending after five seconds. */
+  pendingRenderDiagnostic?: { phase: FirstImpressionPhase; ageMs: number };
   publisherAuctions: Record<string, FirstImpressionPublisherAuction>;
   /** No later publisher auction may join this TS-owned first impression. */
   publisherRegistrationClosed?: boolean;

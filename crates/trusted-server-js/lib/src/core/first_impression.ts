@@ -7,7 +7,7 @@ import type {
   TsjsApi,
 } from './types';
 
-/** Time allowed for one navigation's losing first-impression delivery. */
+/** Lease for publisher ownership before its initial GPT request. */
 export const FIRST_IMPRESSION_LEASE_MS = 5000;
 
 const MAX_FIRST_IMPRESSION_SLOTS = 256;
@@ -131,6 +131,31 @@ function storeClaim(state: FirstImpressionState, claim: FirstImpressionSlotClaim
   return true;
 }
 
+/** Record pending initial rendering once, without changing delivery admission. */
+function schedulePendingRenderDiagnostic(ts: TsjsApi, claim: FirstImpressionSlotClaim): void {
+  const startedAt = Date.now();
+  window.setTimeout(() => {
+    if (
+      ts.firstImpression?.slots[claim.slotElementId] !== claim ||
+      !claimMatchesElement(claim, claim.element, currentGeneration(ts)) ||
+      claim.owner !== 'trusted_server' ||
+      claim.phase === 'rendered'
+    )
+      return;
+    const diagnostic = { phase: claim.phase, ageMs: Date.now() - startedAt };
+    claim.pendingRenderDiagnostic = diagnostic;
+    try {
+      ts.log?.debug('[tsjs-gpt] initial render remains pending', {
+        slot: claim.slotElementId,
+        generation: claim.generation,
+        ...diagnostic,
+      });
+    } catch {
+      // Optional logging must never affect initial ownership or delivery.
+    }
+  }, FIRST_IMPRESSION_LEASE_MS);
+}
+
 /** Atomically claim an untouched slot for Trusted Server. */
 export function claimFirstImpressionForTrustedServer(
   ts: TsjsApi,
@@ -150,10 +175,11 @@ export function claimFirstImpressionForTrustedServer(
 
     existing.owner = 'trusted_server';
     existing.phase = 'delivery_pending';
-    existing.expiresAt = now + FIRST_IMPRESSION_LEASE_MS;
+    existing.expiresAt = Number.POSITIVE_INFINITY;
     for (const auction of Object.values(existing.publisherAuctions)) {
       auction.suppressDelivery = true;
     }
+    schedulePendingRenderDiagnostic(ts, existing);
     return existing;
   }
 
@@ -163,10 +189,12 @@ export function claimFirstImpressionForTrustedServer(
     element,
     owner: 'trusted_server',
     phase: 'delivery_pending',
-    expiresAt: now + FIRST_IMPRESSION_LEASE_MS,
+    expiresAt: Number.POSITIVE_INFINITY,
     publisherAuctions: {},
   };
-  return storeClaim(state, claim) ? claim : undefined;
+  if (!storeClaim(state, claim)) return undefined;
+  schedulePendingRenderDiagnostic(ts, claim);
+  return claim;
 }
 
 function schedulePublisherAuctionExpiry(ts: TsjsApi, token: string): void {
@@ -235,7 +263,18 @@ export function registerPublisherFirstImpressionAuctions(
     if (claim.owner === 'trusted_server' && claim.publisherRegistrationClosed) {
       continue;
     }
-    if (Object.keys(claim.publisherAuctions).length >= MAX_PUBLISHER_AUCTIONS_PER_SLOT) continue;
+    if (Object.keys(claim.publisherAuctions).length >= MAX_PUBLISHER_AUCTIONS_PER_SLOT) {
+      // All TS-owned entries are retained denial tokens for this exact claim.
+      // Reuse one at capacity rather than granting delivery or allocating more.
+      // Its sequence identity also prevents reuse by a replacement DOM element.
+      if (claim.owner === 'trusted_server') {
+        const denial = Object.values(claim.publisherAuctions).find(
+          (auction) => auction.suppressDelivery
+        );
+        if (denial) registrations.set(adUnitCode, denial.token);
+      }
+      continue;
+    }
 
     const token = `${state.generation}:${++state.nextToken}`;
     const auction: FirstImpressionPublisherAuction = {

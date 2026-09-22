@@ -227,6 +227,72 @@ describe('gpt_bootstrap.js fallback', () => {
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
   });
 
+  it.each(['pending', 'rendered', 'replaced', 'navigation', 'throwing logger', 'missing logger'])(
+    'records a bounded bootstrap pending diagnostic: %s',
+    (outcome) => {
+      vi.useFakeTimers();
+      try {
+        const slot = {
+          addService: vi.fn().mockReturnThis(),
+          setTargeting: vi.fn().mockReturnThis(),
+          getSlotElementId: () => 'example-pending-slot',
+        };
+        const pubads = { getSlots: () => [slot], refresh: vi.fn(), enableSingleRequest: vi.fn() };
+        (window as TestWindow).googletag = makeGoogleTag({
+          cmd: { push: (command) => command() },
+          pubads: () => pubads,
+        });
+        document.body.innerHTML = '<div id="example-pending-slot"></div>';
+        runBootstrap();
+        const ts = (window as TestWindow).tsjs!;
+        const debug = vi.fn(() => {
+          if (outcome === 'throwing logger') throw new Error('example logger failure');
+        });
+        if (outcome !== 'missing logger')
+          ts.log = {
+            setLevel: vi.fn(),
+            getLevel: () => 'debug',
+            info: vi.fn(),
+            warn: vi.fn(),
+            error: vi.fn(),
+            debug,
+          };
+        ts.adSlots = [
+          {
+            id: 'example-ad',
+            gam_unit_path: '/123/example',
+            div_id: 'example-pending-slot',
+            formats: [[300, 250]],
+          },
+        ];
+        ts.bids = {};
+        ts.adInit!();
+        const claim = ts.firstImpression!.slots['example-pending-slot'];
+        expect(claim).toBeDefined();
+        if (outcome === 'rendered') claim.phase = 'rendered';
+        if (outcome === 'replaced')
+          document.body.innerHTML = '<div id="example-pending-slot"></div>';
+        if (outcome === 'navigation') ts.navGeneration = 1;
+        expect(() => vi.advanceTimersByTime(5000)).not.toThrow();
+        if (['pending', 'throwing logger', 'missing logger'].includes(outcome)) {
+          expect(claim).toHaveProperty('pendingRenderDiagnostic', {
+            phase: 'delivery_pending',
+            ageMs: 5000,
+          });
+          expect(claim.publisherRegistrationClosed).not.toBe(true);
+          vi.advanceTimersByTime(30000);
+          expect(debug).toHaveBeenCalledTimes(outcome === 'missing logger' ? 0 : 1);
+        } else {
+          expect(claim).not.toHaveProperty('pendingRenderDiagnostic');
+          expect(debug).not.toHaveBeenCalled();
+        }
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    }
+  );
+
   it('keeps the bootstrap lease synchronized with the bundle contract', () => {
     const bootstrapLease = /var FIRST_IMPRESSION_LEASE_MS = (\d+);/.exec(BOOTSTRAP_SOURCE);
 

@@ -68,3 +68,16 @@ auction execution and HTML injection are outside this regression's scope.
 
 The page-construction tests use the JS package’s existing jsdom dependency and
 verify that script-closing tags and HTML in labels/ad IDs remain data.
+
+## CI
+
+The `browser integration tests` job in `.github/workflows/integration-tests.yml`
+runs both the page-construction tests and this regression against freshly built
+production TSJS bundles. The runner uses its default fixed expectations and runs
+both runtime and bootstrap variants. It builds its own Rubicon + Shared ID
+Prebid artifact rather than reusing the bidder-only artifact for other browser
+tests.
+
+Evidence is written under `$RUNNER_TEMP/initial-render-evidence` and uploaded as
+the `initial-render-evidence` artifact even when a test fails, with seven-day
+retention.

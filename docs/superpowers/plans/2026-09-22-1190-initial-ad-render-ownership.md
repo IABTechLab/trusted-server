@@ -66,3 +66,21 @@ green phase must preserve ordinary post-render refreshes.
   certificates and localhost listeners. No production code changes were needed
   for those environment restrictions.
 - Additional template-cache CI harnesses passed: ESI 22 checks and inline 9 checks.
+
+## Follow-up review corrections
+
+- [x] Reproduce the 17th-auction capacity escape; reuse a retained, lifetime-bound
+      denial token at capacity and test publisher, synthetic, and excluded refreshes.
+- [x] Add one diagnostic snapshot for initial renders pending beyond five seconds
+      in runtime/bootstrap; preserve admission and ignore retired claims/logger errors.
+- [x] Wire both standalone page and browser regressions into browser CI with evidence uploads.
+- [x] Clarify TS expiry, unchanged pending-index cleanup, and post-render targeting;
+      remove the duplicated sentence.
+- [x] Complete follow-up validation and independent review.
+- [x] Prepare the fixes for the same PR.
+
+Follow-up verification passed: 1,053 JS tests, lint/format/build, both fixture
+escaping tests, all 10 browser scenarios using a fresh external Prebid build,
+docs format/lint/build, Rust formatting, all eight clippy configurations, all
+four adapter suites, parity, codegen, and the full CLI script including opt-in
+browser tests. Independent review found no blocking issues.
