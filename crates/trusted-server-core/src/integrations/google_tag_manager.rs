@@ -1956,7 +1956,7 @@ mod tests {
         // subdomain, so a wildcard must not survive config load.
         for upstream in [
             "https://*.attacker.example",
-            "https://*.googletagmanager.com",
+            "https://*.googletagmanager.com", // allow-domain: googletagmanager.com
         ] {
             let config = GoogleTagManagerConfig {
                 upstream_url: upstream.to_string(),

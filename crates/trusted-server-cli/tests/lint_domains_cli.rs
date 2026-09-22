@@ -682,6 +682,125 @@ fn explicit_path_scans_named_file() {
         .stdout(predicate::str::contains("disallowed host test.com"));
 }
 
+/// Scope exclusions are written as repo-relative paths, so the policy
+/// decision must not depend on which directory the command runs from.
+/// An excluded `node_modules/pkg.js` used to be scanned when named as
+/// `pkg.js` from inside `node_modules`.
+#[test]
+fn explicit_path_scope_is_independent_of_current_directory() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    let excluded_dir = temp.path().join("node_modules");
+    std::fs::create_dir(&excluded_dir).expect("should create node_modules");
+    std::fs::write(
+        excluded_dir.join("pkg.js"),
+        "const bad = \"https://test.com\";\n",
+    )
+    .expect("should write pkg.js");
+
+    // Repo-root spelling: excluded.
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "node_modules/pkg.js"])
+        .assert()
+        .code(0)
+        .stderr(predicate::str::contains("skipping"));
+
+    // Absolute spelling: excluded.
+    let mut absolute = Command::cargo_bin("ts").expect("should locate the ts binary");
+    absolute
+        .current_dir(temp.path())
+        .args([
+            "dev",
+            "lint",
+            "domains",
+            excluded_dir.join("pkg.js").to_str().expect("utf-8 path"),
+        ])
+        .assert()
+        .code(0)
+        .stderr(predicate::str::contains("skipping"));
+
+    // Bare basename from inside the excluded directory: also excluded.
+    let mut nested = Command::cargo_bin("ts").expect("should locate the ts binary");
+    nested
+        .current_dir(&excluded_dir)
+        .args(["dev", "lint", "domains", "pkg.js"])
+        .assert()
+        .code(0)
+        .stderr(predicate::str::contains("skipping"));
+
+    // `..` spelling reaching back into the excluded directory.
+    let mut dotdot = Command::cargo_bin("ts").expect("should locate the ts binary");
+    dotdot
+        .current_dir(&excluded_dir)
+        .args(["dev", "lint", "domains", "../node_modules/pkg.js"])
+        .assert()
+        .code(0)
+        .stderr(predicate::str::contains("skipping"));
+}
+
+/// The mirror of the case above: normalisation must not pull an
+/// in-scope file out of scope. The same file is reported under every
+/// spelling.
+#[test]
+fn explicit_path_in_scope_is_reported_under_every_spelling() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    let nested_dir = temp.path().join("src");
+    std::fs::create_dir(&nested_dir).expect("should create src");
+    std::fs::write(
+        nested_dir.join("named.rs"),
+        "let bad = \"https://test.com\";\n",
+    )
+    .expect("should write named.rs");
+
+    for (cwd, spelling) in [
+        (temp.path().to_path_buf(), "src/named.rs".to_string()),
+        (
+            temp.path().to_path_buf(),
+            nested_dir
+                .join("named.rs")
+                .to_str()
+                .expect("utf-8 path")
+                .to_string(),
+        ),
+        (nested_dir.clone(), "named.rs".to_string()),
+        (nested_dir.clone(), "../src/named.rs".to_string()),
+    ] {
+        let mut cmd = Command::cargo_bin("ts").expect("should locate the ts binary");
+        cmd.current_dir(&cwd)
+            .args(["dev", "lint", "domains", &spelling])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("disallowed host test.com"));
+    }
+}
+
+/// Address literals and URL-valid hostname punctuation reach the
+/// binary-observable report, not just the extractors.
+#[test]
+fn explicit_path_reports_address_literals_and_punctuation_hosts() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    std::fs::write(
+        temp.path().join("hosts.js"),
+        concat!(
+            "const a = \"https://[::ffff:192.0.2.1]/\";\n",
+            "const b = \"https://github.com!unapproved.internal/path\";\n",
+            "const c = \"//192.0.2.1/path\";\n",
+            "const d = \"//[2001:db8::1]/path\";\n",
+            "const e = {\"url\":\"https://192.0.2.2\",\"email\":\"a@example.com\"};\n",
+        ),
+    )
+    .expect("should write hosts.js");
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "hosts.js"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("::ffff:c000:201"))
+        .stdout(predicate::str::contains("github.com!unapproved.internal"))
+        .stdout(predicate::str::contains("192.0.2.1"))
+        .stdout(predicate::str::contains("2001:db8::1"))
+        .stdout(predicate::str::contains("192.0.2.2"));
+}
+
 #[test]
 fn explicit_missing_path_exits_two() {
     let temp = tempfile::tempdir().expect("should create tempdir");

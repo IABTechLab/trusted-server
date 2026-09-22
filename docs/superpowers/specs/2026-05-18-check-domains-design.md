@@ -696,44 +696,78 @@ Rust's standard `regex` crate does not support lookahead. The patterns
 are designed to work without it: the regex captures the **whole
 authority**, and a second step canonicalises it.
 
-**Authority character class** (shared by both regexes):
+**Authority terminator class** (shared by both regexes), as the inner
+text of a negated class:
 
 ```
-[\p{L}\p{N}\p{M}\-._%:\x{3002}\x{FF0E}\x{FF61}]
+/?\#\s"'`(){}[],;<>|\
 ```
 
-This admits everything WHATWG host parsing turns into a plain host,
-not just ASCII letters, digits, `-` and `.`: percent escapes (`%2e`
-decodes to a dot), underscores (accepted by many resolvers), non-ASCII
-letters and combining marks (IDNA-mapped), the ideographic full stops
-IDNA maps to `.`, and `:` for a port. Review found that a narrower
-class let `https://github.com%2eevil.com`, `https://github.com。evil.com`
-and `https://github.com_evil.com` through: the match stopped at the
-unexpected character and handed the allowlist the prefix `github.com`.
-The rule is that **matching never stops early inside a host**; the
-match ends only at a character that cannot be part of one (`/`, `?`,
-`#`, whitespace, quotes, brackets, and similar).
+This is a _delimiter_ list, not an allow-list. An allow-list of
+"host-ish" characters stops early on anything it forgot and hands the
+allowlist a prefix of the real host: review found a narrower positive
+class let `https://github.com%2eevil.com`,
+`https://github.com。evil.com` and `https://github.com_evil.com`
+through. So the authority runs to the first character that genuinely
+ends it, and the whole token is judged after canonicalisation. The rule
+is that **matching never stops early inside a host**.
+
+For the same reason the class holds only characters that end an
+authority for _every_ reader of the line. `!`, `$`, `&`, `=`, and `*`
+are not among them: WHATWG host parsing accepts all five inside a
+hostname, so `https://github.com!unapproved.internal/` names a host a
+browser really resolves, and a headless-Chromium probe confirmed the
+request goes out with that full hostname. Terminating on them handed
+the allowlist the `github.com` prefix and passed the URL. The cost of
+scanning them as part of the authority is that a chain like
+`?next=https://a.example&then=https://b.example` reads as one long
+host: a visible false positive an operator can suppress, which is the
+safer direction to be wrong in.
+
+Two prefixes are trimmed from a captured authority before
+canonicalisation, because in source they are not part of the host:
+
+- A trailing `$` or `#` — the position where a `${...}` interpolation
+  opened, since the capture stops at the `{`. Without this,
+  `http://127.0.0.1:${PORT}` reported the host `127.0.0.1:$` instead
+  of the allowed loopback address. Only a `$` that _ends_ the capture
+  is trimmed; one inside the authority stays, so
+  `github.com$unapproved.internal` is still reported whole.
+- A leading `*.` wildcard label — a config pattern for the host it
+  expands to, so `"https://*.googletagmanager.com"` is judged as
+  `googletagmanager.com`. Only a leading label is stripped, so
+  `github.com*unapproved.internal` is still reported whole.
 
 **Absolute URL regex:**
 
 ```
-(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[\p{L}\p{N}]<authority-class>*)
+(?i)https?://<userinfo>(\[[0-9a-fA-F:.]+\]|[^<authority-terminator>]+)
 ```
 
-- `(?:[^/?\s#]+@)?` is a non-capturing optional group that consumes
-  any RFC 3986 `userinfo@` prefix so the captured authority is the
-  real one. Without it, `https://github.com@test.com/path` would
-  extract the allowlisted `github.com` and miss the actual host
+- `<userinfo>` is the optional group `(?:[^/?\s#"'`<>\]+@)?`, which
+consumes any RFC 3986 `userinfo@`prefix so the captured authority
+is the real one. Without it,`https://github.com@test.com/path`
+  would extract the allowlisted `github.com` and miss the actual host
   `test.com` — a real bypass for a security-relevant linter.
   Multi-`@` userinfo is handled by regex backtracking: the engine
   consumes as much as possible while still finding an `@` followed
   by a valid host token.
-- The non-IPv6 branch requires the authority to **start with a letter
-  or digit**. This rejects placeholder noise like `https://...`
-  (which an unanchored class would match, producing the bogus host
-  `...`). A leading `-` or `.` is rejected by the same rule.
+- The userinfo span stops at the characters that close a source string
+  (`"`, `'`, backtick, `<`, `>`, `\`) so it cannot reach out of the
+  URL token it belongs to. A span bounded only by `[^/?\s#]` matched
+  through `","email":"a@` in
+  `{"url":"https://192.0.2.1","email":"a@example.com"}` and checked
+  only the allowlisted `example.com`, hiding the IP address entirely.
+- Placeholder noise like `https://...` is rejected after
+  canonicalisation, by requiring at least one alphanumeric character
+  in the host, rather than by anchoring the capture's first character.
 - Bracketed IPv6 is captured as `[…]`; the brackets are stripped in
-  normalisation.
+  normalisation. The branch admits `.` as well as hex and `:` so an
+  IPv6 literal with an embedded IPv4 part —
+  `https://[::ffff:192.0.2.1]/` — is captured and left for the URL
+  parser to canonicalise (to `::ffff:c000:201`). A hex-and-colon-only
+  branch skipped those URLs outright, since the other branch cannot
+  begin with `[`.
 
 **Canonicalisation.** Each captured authority is parsed as
 `http://<authority>` with the `url` crate (WHATWG URL Standard) and
@@ -751,7 +785,7 @@ is then seen as the URL it decodes to.
 **Protocol-relative URL regex:**
 
 ```
-(?i)(?:^|[\s"'(=<>{,\[\]`])//(?:[^/?\s#]+@)?([\p{L}\p{N}]<authority-class>*\.[A-Za-z]{2,})
+(?i)(?:^|[\s"'(=<>{,\[\]`])//<userinfo>(\[[0-9a-fA-F:.]+\]|[^<authority-terminator>]+)
 ```
 
 - The non-capturing group `(?:^|[\s"'(=<>{,\[\]` + backtick + `])`
@@ -761,9 +795,10 @@ is then seen as the URL it decodes to.
   JavaScript/TypeScript template literals
   (`` `//cdn.example.com/${path}` ``); `{`, `[`, `,` cover
   JSON / TS object literals where a URL string follows a key.
-- `(?:[^/?\s#]+@)?` skips userinfo for the same bypass-prevention
+- `<userinfo>` skips userinfo for the same bypass-prevention
   reason as the absolute URL regex — `//github.com@evil.example/x`
-  reports `evil.example`, not `github.com`.
+  reports `evil.example`, not `github.com` — and is bounded by the same
+  source-string delimiters so it cannot consume a later field.
 - **Why not `:`?** `:` deliberately excluded — `http://foo.com` has
   `//` preceded by `:` (the URL scheme separator). Adding `:` to the
   boundary class would cause the protocol-relative regex to also
@@ -771,10 +806,22 @@ is then seen as the URL it decodes to.
 - Prevents matching `// comment text` (the `//` is at column 0 or
   preceded by code, but the trailing TLD constraint also filters
   out comment dividers like `// foo bar`).
-- The host capture `[\p{L}\p{N}]<authority-class>*\.[A-Za-z]{2,}`
-  requires at least one dot followed by a TLD-like suffix and a
-  leading letter or digit, and is canonicalised exactly like an
-  absolute URL's authority.
+- The authority takes the same two branches as an absolute URL —
+  bracketed IPv6, or a run up to the first terminator — and is
+  canonicalised identically. The dotted TLD-like suffix that filters
+  out comment dividers is _not_ part of the pattern: a trailing
+  `\.[A-Za-z]{2,}` anchor backtracks into an allowlisted prefix when
+  the real suffix is percent-encoded (`//github.com%2eevil%2ecom`
+  reported `github.com`). It is applied after canonicalisation
+  instead, where `%2e` has already become `.`.
+- **Address literals are exempt from the dotted-suffix rule.**
+  `//192.0.2.1/path` and `//[2001:db8::1]/path` are valid
+  protocol-relative URLs naming a direct endpoint, but an IPv4 address
+  has no alphabetic suffix and an IPv6 literal has no dot at all, so
+  the suffix filter dropped both — letting exactly the kind of
+  hardcoded non-loopback endpoint this linter exists to catch pass
+  every scan mode. A canonical host that parses as an `IpAddr` is
+  always reportable.
 - **Intentional asymmetry with the absolute-URL regex**: the
   absolute pattern accepts single-label hosts (`http://myservice/`,
   no dot), while this protocol-relative pattern requires a dotted
@@ -1261,6 +1308,13 @@ credential position when it skips past it to find the real host, and
 `.env*` files are in scope by design, so the machine-readable report
 that CI archives must not echo it. The human format prints only
 `path:line: disallowed host <host>` and never the excerpt.
+
+The redacted span is bounded by the same source-string delimiters as
+the extractors' userinfo group, so it cannot reach past the URL it
+belongs to. A span bounded only by `[^/?\s#]` reached through
+`","email":"someone@` and masked an unrelated field in
+`{"url":"https://evil.internal/x","email":"someone@example.com"}`,
+removing source the report is meant to show.
 
 ### Pre-commit hook
 

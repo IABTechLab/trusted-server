@@ -10,7 +10,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
 use std::str::from_utf8;
 use std::sync::OnceLock;
 
@@ -340,9 +341,35 @@ mod allow_check_tests {
 /// percent escape -- and hands the allowlist a prefix of the real
 /// host, so the full token is taken here and judged after
 /// canonicalisation by [`canonical_host`].
+///
+/// For the same reason the class holds only characters that end an
+/// authority for *every* reader of the line. `!`, `$`, `&`, `=`, and
+/// `*` are not among them: the WHATWG parser accepts all five inside a
+/// hostname, so `https://github.com!unapproved.internal/` names a host
+/// a browser will really resolve. Terminating on them handed the
+/// allowlist the `github.com` prefix and passed the URL. They are
+/// therefore scanned as part of the authority, at the cost of reading a
+/// chain like `?next=https://a.example&then=https://b.example` as one
+/// long host: a visible false positive an operator can suppress, which
+/// is the safer direction to be wrong in.
+///
 /// The inner text of that class (no enclosing brackets), so callers can
 /// splice it into either a negated or a positive character class.
-const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#&=$*!\s"'`(){}\[\],;<>|\\"#;
+const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#\s"'`(){}\[\],;<>|\\"#;
+
+/// Optional RFC 3986 `userinfo@` prefix, as an inner regex fragment.
+///
+/// Skipping this span is what makes the captured authority the real one
+/// rather than a deceiving `user@` part: without it,
+/// `https://github.com@test.example/path` extracts the allowlisted
+/// `github.com` and misses `test.example`.
+///
+/// The span stops at the characters that close a source string, so it
+/// cannot reach out of the URL token it belongs to and swallow a later
+/// field. `{"url":"https://192.0.2.1","email":"a@example.com"}` used to
+/// match through `","email":"a@` and check only the allowlisted
+/// `example.com`, hiding the IP address entirely.
+const USERINFO_INNER: &str = r#"(?:[^/?\s#"'`<>\\]+@)?"#;
 
 /// Regex for absolute `http(s)://` URLs. Captures the whole authority
 /// (bracketed IPv6, or a host that starts with a letter or digit so
@@ -350,16 +377,20 @@ const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#&=$*!\s"'`(){}\[\],;<>|\\"#;
 /// [`canonical_host`] to parse; matching never stops early inside a
 /// host.
 ///
-/// `(?:[^/?\s#]+@)?` skips any RFC 3986 `userinfo@` prefix so the
-/// captured authority is the real one, not a deceiving `user@`
-/// part. Without this, `https://github.com@test.com/path` would
-/// extract the allowlisted `github.com` and miss the actual host
-/// `test.com`.
+/// [`USERINFO_INNER`] skips any RFC 3986 `userinfo@` prefix so the
+/// captured authority is the real one, not a deceiving `user@` part.
+///
+/// The bracketed branch admits `.` as well as hex and `:` so an IPv6
+/// literal with an embedded IPv4 part -- `https://[::ffff:192.0.2.1]/`
+/// -- is captured and left for the URL parser to validate and
+/// canonicalise. A hex-and-colon-only branch skipped those URLs
+/// outright, since the other branch cannot begin with `[`.
 fn absolute_url_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(&format!(
-            r"(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[^{TERM}]+)",
+            r"(?i)https?://{USERINFO}(\[[0-9a-fA-F:.]+\]|[^{TERM}]+)",
+            USERINFO = USERINFO_INNER,
             TERM = AUTHORITY_TERMINATOR_INNER
         ))
         .expect("should compile absolute URL regex")
@@ -376,12 +407,47 @@ fn unescape_solidus(line: &str) -> Cow<'_, str> {
     }
 }
 
+/// Strip a leading `*.` wildcard label from a captured authority.
+///
+/// `*` is legal in a WHATWG hostname, so it cannot terminate the
+/// authority capture without reopening the prefix bypass. A leading
+/// `*.` in source is a config pattern rather than a host, though:
+/// `"https://*.googletagmanager.com"` names the allowlisted host it
+/// patterns over, and reporting it verbatim flagged a string the
+/// allowlist already covers. Judging the wildcard by the host it
+/// expands to also keeps `*.disallowed.test` reportable.
+///
+/// Only a leading label is stripped; a `*` elsewhere in the authority
+/// stays, so `github.com*unapproved.internal` is still reported whole.
+fn strip_wildcard_label(authority: &str) -> &str {
+    authority.strip_prefix("*.").unwrap_or(authority)
+}
+
+/// Trim a template-interpolation span from the end of a captured
+/// authority.
+///
+/// `$` is a legal hostname character, so it cannot be a terminator
+/// without reopening the `github.com$unapproved.internal` bypass. But
+/// in source it usually opens an interpolation whose braces the
+/// authority capture stops at, leaving a `$` stranded on the host:
+/// `http://127.0.0.1:${PORT}` captured `127.0.0.1:$` and reported a
+/// loopback address the allowlist would otherwise have permitted.
+///
+/// Only a `$` or `#` that ends the capture is trimmed -- the position
+/// where an interpolation must have opened. One in the middle of the
+/// authority is left alone, so an attacker cannot hide a host behind
+/// it.
+fn trim_interpolation_start(authority: &str) -> &str {
+    authority.trim_end_matches(['$', '#'])
+}
+
 /// Reduce a captured authority to the canonical hostname a browser
 /// would connect to: percent-decoded, IDNA-mapped to ASCII,
 /// lowercased, port dropped, brackets and trailing dot stripped. An
 /// authority the WHATWG parser rejects is reported as written rather
 /// than trimmed to an allowlisted prefix.
 fn canonical_host(authority: &str) -> String {
+    let authority = strip_wildcard_label(trim_interpolation_start(authority));
     let parsed = Url::parse(&format!("http://{authority}"));
     match parsed.as_ref().ok().and_then(Url::host_str) {
         Some(host) => normalise_host(host),
@@ -564,6 +630,110 @@ mod absolute_url_tests {
         );
     }
 
+    /// Regression: the userinfo span must not reach past the end of the
+    /// URL's own source string. It used to match through
+    /// `","email":"a@` and check only the allowlisted `example.com`,
+    /// hiding the IP address.
+    #[test]
+    fn userinfo_does_not_cross_source_string_boundary() {
+        assert_eq!(
+            extract_absolute_hosts(r#"{"url":"https://192.0.2.1","email":"a@example.com"}"#),
+            vec!["192.0.2.1"]
+        );
+        assert_eq!(
+            extract_absolute_hosts("const u = 'https://192.0.2.1'; const e = 'a@example.com';"),
+            vec!["192.0.2.1"]
+        );
+        // A backtick template and an angle-bracketed attribute close
+        // the span too.
+        assert_eq!(
+            extract_absolute_hosts("`https://192.0.2.1`, mail a@example.com"),
+            vec!["192.0.2.1"]
+        );
+    }
+
+    /// Regression: an IPv6 literal carrying an embedded IPv4 part is a
+    /// valid non-loopback authority. The bracketed branch excluded `.`
+    /// and the other branch cannot start with `[`, so the whole URL was
+    /// skipped.
+    #[test]
+    fn extracts_ipv6_with_embedded_ipv4() {
+        assert_eq!(
+            extract_absolute_hosts("const a = \"https://[::ffff:192.0.2.1]/\";"),
+            vec!["::ffff:c000:201"]
+        );
+        assert_eq!(
+            extract_absolute_hosts("https://[::ffff:127.0.0.1]/"),
+            vec!["::ffff:7f00:1"]
+        );
+    }
+
+    /// A `$` or `*` that opens source interpolation or a config
+    /// wildcard is not part of the host, but one inside the authority
+    /// still is -- otherwise trimming would reopen the prefix bypass.
+    #[test]
+    fn interpolation_and_wildcard_prefixes_do_not_become_hosts() {
+        // `${...}`: the capture stops at `{`, stranding the `$`.
+        assert_eq!(
+            extract_absolute_hosts("await ready(`http://127.0.0.1:${ORIGIN_PORT}`);"),
+            vec!["127.0.0.1"]
+        );
+        assert_eq!(
+            extract_absolute_hosts("`http://publisher.example${RENDER_PATH}`"),
+            vec!["publisher.example"]
+        );
+        // A leading `*.` is a config pattern for the host it expands to.
+        assert_eq!(
+            extract_absolute_hosts(r#"let u = "https://*.unapproved.internal";"#),
+            vec!["unapproved.internal"]
+        );
+        // But neither trim may swallow an interior character.
+        assert_eq!(
+            extract_absolute_hosts("https://github.com$unapproved.internal/path"),
+            vec!["github.com$unapproved.internal"]
+        );
+        assert_eq!(
+            extract_absolute_hosts("https://github.com*unapproved.internal/path"),
+            vec!["github.com*unapproved.internal"]
+        );
+    }
+
+    /// Regression: `!`, `$`, `&`, `=`, and `*` are accepted inside a
+    /// hostname by the WHATWG parser, so terminating the authority on
+    /// them handed the allowlist a `github.com` prefix and passed a URL
+    /// naming a host a browser really resolves.
+    #[test]
+    fn url_valid_punctuation_does_not_truncate_to_allowlisted_prefix() {
+        for (input, expected) in [
+            (
+                "https://github.com!unapproved.internal/path",
+                "github.com!unapproved.internal",
+            ),
+            (
+                "https://github.com$unapproved.internal/path",
+                "github.com$unapproved.internal",
+            ),
+            (
+                "https://github.com&unapproved.internal/path",
+                "github.com&unapproved.internal",
+            ),
+            (
+                "https://github.com=unapproved.internal/path",
+                "github.com=unapproved.internal",
+            ),
+            (
+                "https://github.com*unapproved.internal/path",
+                "github.com*unapproved.internal",
+            ),
+        ] {
+            assert_eq!(
+                extract_absolute_hosts(input),
+                vec![expected],
+                "input: {input}"
+            );
+        }
+    }
+
     #[test]
     fn unparseable_authority_is_reported_as_written() {
         // A dangling percent sign is rejected by the host parser; the
@@ -579,20 +749,33 @@ mod absolute_url_tests {
 /// preceded by a boundary character (start-of-line, whitespace,
 /// quote, paren, `=`, `<`, `>`, `{`, `,`, `[`, `]`, backtick) — but
 /// NOT `:`, which would double-match the `//` in an absolute URL.
-/// `(?:[^/?\s#]+@)?` skips any RFC 3986 userinfo so a deceiving
-/// `//user@evil.com` pattern reports `evil.com`, not `user`. The
-/// authority uses the same [`AUTHORITY_CLASS`] as absolute URLs and
-/// requires a dotted TLD-like suffix to filter out code comment
-/// dividers.
+/// [`USERINFO_INNER`] skips any RFC 3986 userinfo so a deceiving
+/// `//user@evil.example` pattern reports `evil.example`, not `user`.
+/// The authority takes the same two branches as absolute URLs --
+/// bracketed IPv6, or a run up to the first
+/// [`AUTHORITY_TERMINATOR_INNER`] character -- and the dotted
+/// TLD-like suffix that filters out code comment dividers is applied
+/// afterwards, by [`is_reportable_host`], where an address literal can
+/// be recognised instead.
 fn protocol_relative_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(&format!(
-            r#"(?i)(?:^|[\s"'(=<>{{,\[\]`])//(?:[^/?\s#]+@)?([^{TERM}]+)"#,
+            r#"(?i)(?:^|[\s"'(=<>{{,\[\]`])//{USERINFO}(\[[0-9a-fA-F:.]+\]|[^{TERM}]+)"#,
+            USERINFO = USERINFO_INNER,
             TERM = AUTHORITY_TERMINATOR_INNER
         ))
         .expect("should compile protocol-relative URL regex")
     })
+}
+
+/// Whether a canonical host is an IP address literal rather than a
+/// name.
+///
+/// [`normalise_host`] has already stripped the brackets from an IPv6
+/// literal, so the IPv6 form arrives here bare.
+fn is_address_literal(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
 }
 
 /// Whether a canonical host is a real registrable name rather than a
@@ -604,7 +787,18 @@ fn protocol_relative_regex() -> &'static Regex {
 /// would report `github.com`). So the whole token is captured and the
 /// dotted-suffix rule is applied here, to the canonical host, where
 /// `%2e` has already become `.`.
+///
+/// Address literals are exempt from that rule and always reportable.
+/// `//192.0.2.1/path` and `//[2001:db8::1]/path` are valid
+/// protocol-relative URLs naming a direct endpoint, but an IPv4 address
+/// has no alphabetic suffix and an IPv6 literal has no dot at all, so
+/// the dotted-suffix filter dropped both -- letting exactly the kind of
+/// hardcoded non-loopback endpoint this linter exists to catch pass
+/// every scan mode.
 fn is_reportable_host(host: &str) -> bool {
+    if is_address_literal(host) {
+        return true;
+    }
     match host.rsplit_once('.') {
         Some((label, tld)) => {
             !label.is_empty()
@@ -683,6 +877,42 @@ mod protocol_relative_tests {
         // The trailing TLD-like constraint (.{2,}) filters this out;
         // "comment text" has no dotted-suffix.
         assert!(extract_protocol_relative_hosts("// comment text").is_empty());
+    }
+
+    /// Regression: protocol-relative URLs naming an address literal
+    /// were dropped -- IPv4 by the dotted alphabetic-suffix filter,
+    /// IPv6 by the authority capture -- so a direct non-loopback
+    /// endpoint passed every scan mode.
+    #[test]
+    fn extracts_address_literals() {
+        assert_eq!(
+            extract_protocol_relative_hosts("const c = \"//192.0.2.1/path\";"),
+            vec!["192.0.2.1"]
+        );
+        assert_eq!(
+            extract_protocol_relative_hosts("const d = \"//[2001:db8::1]/path\";"),
+            vec!["2001:db8::1"]
+        );
+        // Loopback is extracted here and allowed later by `is_allowed`,
+        // so extraction must not silently drop it either.
+        assert_eq!(
+            extract_protocol_relative_hosts("src=\"//127.0.0.1:8080/x\""),
+            vec!["127.0.0.1"]
+        );
+        assert_eq!(
+            extract_protocol_relative_hosts("src=\"//[::1]:8080/x\""),
+            vec!["::1"]
+        );
+    }
+
+    /// Regression: the userinfo span must stop at the end of the URL's
+    /// own source string rather than consuming a later email field.
+    #[test]
+    fn userinfo_does_not_cross_source_string_boundary() {
+        assert_eq!(
+            extract_protocol_relative_hosts(r#"{"src":"//192.0.2.1","email":"a@example.com"}"#),
+            vec!["192.0.2.1"]
+        );
     }
 
     /// Regression for the userinfo-bypass on protocol-relative URLs.
@@ -2219,6 +2449,149 @@ mod path_is_scanned_tests {
     }
 }
 
+/// The path spelling the scope rules are applied to, for a path the
+/// user named on the command line.
+///
+/// Exclusions are written as repo-relative paths, so judging the
+/// caller's raw spelling made scope depend on the current directory:
+/// `crates/.../lint/domains.rs` from the repo root self-excluded, while
+/// `domains.rs` from that same file's directory was scanned and
+/// reported its own fixtures, and an excluded `node_modules/pkg.js`
+/// scanned when named as `pkg.js` from inside `node_modules`. This
+/// resolves every spelling of a file to the same answer.
+///
+/// The result is repo-relative when the path is inside a Git worktree
+/// and the absolutised path otherwise -- [`path_is_scanned`] accepts
+/// either -- and always uses `/` separators, which is what that
+/// function splits components on. It is used only for the scope
+/// decision; the caller's own spelling is kept for reading and
+/// reporting the file.
+///
+/// Lexical only: `..` and `.` are folded without touching the
+/// filesystem, and symlinks are left unresolved, so a missing path or a
+/// symlink still reaches the checks in [`explicit_path_lines`] that
+/// report it.
+fn policy_path(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            // With no readable cwd there is nothing to resolve
+            // against; fall back to the caller's spelling.
+            Err(_) => return to_slash_separated(path),
+        }
+    };
+    let absolute = lexically_normalise(&absolute);
+
+    // `gix::discover` walks up from the path's own directory, so a file
+    // in a different repository than the cwd is judged against its own.
+    let start = absolute.parent().unwrap_or(&absolute);
+    let relative = gix::discover(start)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .map(|workdir| lexically_normalise(&workdir))
+        .and_then(|workdir| absolute.strip_prefix(&workdir).ok().map(Path::to_path_buf));
+
+    to_slash_separated(&relative.unwrap_or(absolute))
+}
+
+/// Render a path with `/` separators, whatever the platform's own are.
+fn to_slash_separated(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Fold `.` and `..` components without consulting the filesystem.
+///
+/// [`Path::canonicalize`] would resolve symlinks and fail on a missing
+/// path, both of which [`explicit_path_lines`] has to see for itself.
+fn lexically_normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Keep a leading `..` that has nothing to pop: there is
+                // no parent recorded to cancel it against.
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod policy_path_tests {
+    use super::*;
+
+    /// Every spelling of the linter's own source must resolve to the
+    /// same self-excluded policy path. Only absolute inputs are used:
+    /// they need no current directory, so these tests do not race the
+    /// process-wide cwd that relative spellings depend on. The
+    /// cwd-relative spellings are covered end-to-end in
+    /// `tests/lint_domains_cli.rs`.
+    #[test]
+    fn folds_dot_and_dotdot_to_the_same_path() {
+        let plain = policy_path(Path::new("/repo/crates/cli/src/domains.rs"));
+        assert_eq!(
+            policy_path(Path::new("/repo/crates/cli/./src/domains.rs")),
+            plain,
+            "should fold `.`"
+        );
+        assert_eq!(
+            policy_path(Path::new("/repo/crates/cli/src/lint/../domains.rs")),
+            plain,
+            "should fold `..`"
+        );
+        assert_eq!(
+            policy_path(Path::new("/repo/other/../crates/cli/src/domains.rs")),
+            plain,
+            "should fold `..` mid-path"
+        );
+    }
+
+    /// A `..` with nothing to cancel against has to survive: dropping
+    /// it would silently rewrite the path to a different file.
+    #[test]
+    fn keeps_a_leading_dotdot() {
+        assert_eq!(
+            lexically_normalise(Path::new("../a/b.rs")),
+            Path::new("../a/b.rs")
+        );
+        assert_eq!(
+            lexically_normalise(Path::new("a/../../b.rs")),
+            Path::new("../b.rs")
+        );
+    }
+
+    /// The result feeds [`path_is_scanned`], which splits components on
+    /// `/`, so the separator must be `/` regardless of platform.
+    #[test]
+    fn uses_slash_separators() {
+        let out = policy_path(Path::new("/repo/node_modules/pkg.js"));
+        assert!(out.contains("node_modules/pkg.js"), "should use `/`: {out}");
+        assert!(!path_is_scanned(&out), "should stay excluded: {out}");
+    }
+
+    /// A path outside any worktree keeps its absolutised spelling, and
+    /// component-based exclusions still apply to it.
+    #[test]
+    fn absolute_path_outside_a_repo_is_still_scoped() {
+        assert!(!path_is_scanned(&policy_path(Path::new(
+            "/nowhere/target/build.rs"
+        ))));
+        assert!(path_is_scanned(&policy_path(Path::new(
+            "/nowhere/src/lib.rs"
+        ))));
+    }
+}
+
 /// Scan explicitly-named paths in full.
 ///
 /// Policy filters (extension/path exclusion, symlink, non-regular,
@@ -2237,8 +2610,7 @@ pub(crate) fn explicit_path_lines(
 ) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
     let mut out = Vec::new();
     for path in paths {
-        let path_str = path.to_string_lossy();
-        if !path_is_scanned(&path_str) {
+        if !path_is_scanned(&policy_path(path)) {
             warn(format!(
                 "note: {} is not in scanned extensions or is excluded; skipping",
                 path.display()
@@ -2403,7 +2775,8 @@ pub struct FileViolation {
 fn userinfo_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)((?:https?:)?\\?/\\?/)[^/?\s#]+@").expect("should compile userinfo regex")
+        Regex::new(r#"(?i)((?:https?:)?\\?/\\?/)[^/?\s#"'`<>\\]+@"#)
+            .expect("should compile userinfo regex")
     })
 }
 
@@ -2429,6 +2802,15 @@ mod redact_userinfo_tests {
             redact_userinfo("src=\"//token@cdn.example.evil/x\""),
             "src=\"//<redacted>@cdn.example.evil/x\""
         );
+    }
+
+    /// Regression: the span must stop at the end of the URL's own
+    /// source string. The broad pattern reached through
+    /// `","email":"someone@` and masked an unrelated source field.
+    #[test]
+    fn leaves_unrelated_fields_after_the_url_intact() {
+        let line = r#"{"url":"https://evil.internal/x","email":"someone@example.com"}"#;
+        assert_eq!(redact_userinfo(line), line);
     }
 
     #[test]
