@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -10,6 +11,7 @@ use toml_edit::{DocumentMut, Item, table, value};
 pub(crate) type CliResult<T> = Result<T, String>;
 
 const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid bundle`.";
+const USER_ID_REGISTRY_RELATIVE_PATH: &str = "src/integrations/prebid/user_id_modules.json";
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct PrebidBundleArgs {
@@ -81,6 +83,7 @@ struct PrebidBundleSection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PrebidBundleConfig {
     pub modules: PrebidBundleModules,
+    pub managed_user_id_names: Vec<String>,
     pub external_bundle_url: Option<String>,
 }
 
@@ -185,9 +188,43 @@ fn npm_prebid_bundle_args(request: &PrebidBundleGenerateRequest) -> CliResult<Ve
 struct PrebidBundleManifest {
     #[serde(rename = "schemaVersion")]
     schema_version: u64,
+    #[serde(default)]
+    modules: PrebidBundleManifestModules,
     sha256: String,
     sri: String,
     filename: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PrebidBundleManifestModules {
+    #[serde(rename = "userId", default)]
+    user_id: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrebidUserIdModuleRegistry {
+    modules: Vec<PrebidUserIdModuleRegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrebidUserIdModuleRegistryEntry {
+    module_name: String,
+    config_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequiredPrebidUserIdModule {
+    config_name: String,
+    module_name: String,
+}
+
+struct PrebidBundleRunContext<'a> {
+    current_dir: &'a Path,
+    js_lib_dir: PathBuf,
+    registry_path: &'a Path,
+    registry: &'a PrebidUserIdModuleRegistry,
 }
 
 pub(crate) fn run_bundle(
@@ -200,19 +237,52 @@ pub(crate) fn run_bundle(
     let current_dir = env::current_dir()
         .map_err(|error| report_error(format!("failed to read current directory: {error}")))?;
     let js_lib_dir = find_js_lib_dir(&current_dir)?;
-    let out_dir = resolve_output_dir(&current_dir, &args.out);
+    let (registry_path, registry) = load_user_id_registry(&js_lib_dir)?;
+
+    run_bundle_with_context(
+        args,
+        config,
+        PrebidBundleRunContext {
+            current_dir: &current_dir,
+            js_lib_dir,
+            registry_path: &registry_path,
+            registry: &registry,
+        },
+        generator,
+        out,
+        err,
+    )
+}
+
+fn run_bundle_with_context(
+    args: &PrebidBundleArgs,
+    config: PrebidBundleConfig,
+    context: PrebidBundleRunContext<'_>,
+    generator: &mut dyn PrebidBundleGenerator,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> CliResult<()> {
+    let requirements = resolve_managed_user_id_modules(
+        &config.managed_user_id_names,
+        context.registry,
+        context.registry_path,
+    )?;
+    let out_dir = resolve_output_dir(context.current_dir, &args.out);
     ensure_output_dir_writable(&out_dir)?;
 
+    let manifest_path = out_dir.join("manifest.json");
+    invalidate_manifest(&manifest_path)?;
+
     let request = PrebidBundleGenerateRequest {
-        js_lib_dir,
+        js_lib_dir: context.js_lib_dir,
         out_dir: out_dir.clone(),
         modules: config.modules,
     };
 
     generator.generate(&request, out, err)?;
 
-    let manifest_path = out_dir.join("manifest.json");
     let manifest = load_manifest(&manifest_path)?;
+    validate_managed_user_id_modules(&requirements, &manifest, &args.config)?;
     patch_config_metadata(&args.config, &manifest.sha256, &manifest.sri)?;
 
     writeln!(
@@ -241,6 +311,164 @@ pub(crate) fn run_bundle(
     .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
 
     Ok(())
+}
+
+fn validate_managed_user_id_modules(
+    requirements: &[RequiredPrebidUserIdModule],
+    manifest: &PrebidBundleManifest,
+    config_path: &Path,
+) -> CliResult<()> {
+    for requirement in requirements {
+        if !manifest
+            .modules
+            .user_id
+            .iter()
+            .any(|module| module == &requirement.module_name)
+        {
+            return cli_error(format!(
+                "{} configures managed User ID {:?}, which requires Prebid module {:?}, but the generated manifest omits it; add {:?} to integrations.prebid.bundle.modules.user_id and rerun `ts prebid bundle`",
+                config_path.display(),
+                requirement.config_name,
+                requirement.module_name,
+                requirement.module_name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_managed_user_id_names(prebid: &toml::Value, config_path: &Path) -> CliResult<Vec<String>> {
+    let Some(value) = prebid.get("managed_user_ids") else {
+        return Ok(Vec::new());
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        report_error(format!(
+            "{} integrations.prebid.managed_user_ids must be an array of tables",
+            config_path.display()
+        ))
+    })?;
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let table = entry.as_table().ok_or_else(|| {
+                report_error(format!(
+                    "{} integrations.prebid.managed_user_ids[{index}] must be a table",
+                    config_path.display()
+                ))
+            })?;
+            let field = format!("integrations.prebid.managed_user_ids[{index}].name");
+            let name = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    report_error(format!(
+                        "{} {field} must be a non-empty string",
+                        config_path.display()
+                    ))
+                })?;
+            if name.trim().is_empty() {
+                return cli_error(format!(
+                    "{} {field} must be a non-empty string",
+                    config_path.display()
+                ));
+            }
+            Ok(name.to_string())
+        })
+        .collect()
+}
+
+fn load_user_id_registry(js_lib_dir: &Path) -> CliResult<(PathBuf, PrebidUserIdModuleRegistry)> {
+    let path = js_lib_dir.join(USER_ID_REGISTRY_RELATIVE_PATH);
+    let contents = fs::read_to_string(&path).map_err(|error| {
+        report_error(format!(
+            "failed to read Prebid User ID registry {}: {error}",
+            path.display()
+        ))
+    })?;
+    let registry = serde_json::from_str(&contents).map_err(|error| {
+        report_error(format!(
+            "failed to parse Prebid User ID registry {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((path, registry))
+}
+
+fn resolve_managed_user_id_modules(
+    managed_names: &[String],
+    registry: &PrebidUserIdModuleRegistry,
+    registry_path: &Path,
+) -> CliResult<Vec<RequiredPrebidUserIdModule>> {
+    let resolved = managed_names
+        .iter()
+        .map(|config_name| {
+            let mut candidates = registry
+                .modules
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .config_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(config_name))
+                })
+                .map(|entry| entry.module_name.clone())
+                .collect::<Vec<_>>();
+            candidates.sort();
+            candidates.dedup();
+
+            match candidates.as_slice() {
+                [] => cli_error(format!(
+                    "managed User ID name {config_name:?} is not registered in {}",
+                    registry_path.display()
+                )),
+                [module_name] => Ok(RequiredPrebidUserIdModule {
+                    config_name: config_name.clone(),
+                    module_name: module_name.clone(),
+                }),
+                _ => cli_error(format!(
+                    "managed User ID name {config_name:?} is ambiguous in {}; candidate modules: {}",
+                    registry_path.display(),
+                    candidates.join(", ")
+                )),
+            }
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+
+    reject_managed_user_id_module_collisions(&resolved, registry_path)?;
+    Ok(resolved)
+}
+
+fn reject_managed_user_id_module_collisions(
+    resolved: &[RequiredPrebidUserIdModule],
+    registry_path: &Path,
+) -> CliResult<()> {
+    let mut owners: HashMap<&str, &str> = HashMap::with_capacity(resolved.len());
+    for entry in resolved {
+        let Some(previous) = owners.insert(&entry.module_name, &entry.config_name) else {
+            continue;
+        };
+        return cli_error(format!(
+            "managed User ID names {previous:?} and {:?} both resolve to module {:?} in {}; \
+             Prebid registers one submodule for those names and ignores every entry after the first",
+            entry.config_name,
+            entry.module_name,
+            registry_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn invalidate_manifest(path: &Path) -> CliResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => cli_error(format!(
+            "failed to remove stale Prebid manifest {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleConfig> {
@@ -312,6 +540,7 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
 
     Ok(PrebidBundleConfig {
         modules: section.modules,
+        managed_user_id_names: read_managed_user_id_names(prebid, config_path)?,
         external_bundle_url,
     })
 }
@@ -605,6 +834,464 @@ fn write_atomic(path: &Path, contents: &str) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_config(managed: &str, user_id: &str) -> String {
+        format!(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example.com/openrtb2/auction"
+{managed}
+
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter"]
+user_id = [{user_id}]
+"#
+        )
+    }
+
+    fn test_registry() -> PrebidUserIdModuleRegistry {
+        PrebidUserIdModuleRegistry {
+            modules: vec![
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "sharedIdSystem".to_string(),
+                    config_names: vec!["sharedId".to_string(), "pubCommonId".to_string()],
+                },
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "identityLinkIdSystem".to_string(),
+                    config_names: vec!["identityLink".to_string()],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn bundle_config_loader_reads_managed_user_id_names_in_order() {
+        let (_temp, path) = write_config(&managed_config(
+            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n\n[[integrations.prebid.managed_user_ids]]\nname = \"pubCommonId\"\n",
+            "\"identityLinkIdSystem\", \"sharedIdSystem\"",
+        ));
+
+        let config = load_bundle_config(&path).expect("should load managed names");
+
+        assert_eq!(
+            config.managed_user_id_names,
+            ["identityLink", "pubCommonId"],
+            "should preserve managed entry order"
+        );
+    }
+
+    #[test]
+    fn bundle_config_loader_defaults_managed_user_id_names_to_empty() {
+        let (_temp, path) = write_config(&valid_config());
+
+        let config = load_bundle_config(&path).expect("should load bundle config");
+
+        assert!(
+            config.managed_user_id_names.is_empty(),
+            "should default to no managed entries"
+        );
+    }
+
+    #[test]
+    fn bundle_config_loader_rejects_non_array_managed_user_ids() {
+        for managed in ["\"identityLink\"", "{ name = \"identityLink\" }"] {
+            let (_temp, path) = write_config(&managed_config(
+                &format!("managed_user_ids = {managed}"),
+                "\"sharedIdSystem\"",
+            ));
+
+            let error = load_bundle_config(&path).expect_err("should require an array");
+
+            assert!(
+                error.contains("integrations.prebid.managed_user_ids must be an array of tables"),
+                "should identify the malformed managed list: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_config_loader_rejects_non_table_managed_entry() {
+        let (_temp, path) = write_config(&managed_config(
+            "managed_user_ids = [\"identityLink\"]",
+            "\"sharedIdSystem\"",
+        ));
+
+        let error = load_bundle_config(&path).expect_err("should require managed tables");
+
+        assert!(
+            error.contains("integrations.prebid.managed_user_ids[0] must be a table"),
+            "should identify the malformed managed entry: {error}"
+        );
+    }
+
+    #[test]
+    fn bundle_config_loader_rejects_managed_entry_without_string_name() {
+        for entry in [
+            "{ params = { pid = \"999\" } }",
+            "{ name = 123 }",
+            "{ name = \"\" }",
+            "{ name = \"   \" }",
+        ] {
+            let (_temp, path) = write_config(&managed_config(
+                &format!("managed_user_ids = [{entry}]"),
+                "\"sharedIdSystem\"",
+            ));
+
+            let error = load_bundle_config(&path).expect_err("should reject malformed name");
+
+            assert!(
+                error.contains("integrations.prebid.managed_user_ids[0].name"),
+                "should identify the malformed managed name: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_name_resolves_an_alias_and_a_case_variant() {
+        let registry = test_registry();
+        let registry_path = Path::new("user_id_modules.json");
+
+        for name in ["pubCommonId", "PUBCOMMONID"] {
+            let required =
+                resolve_managed_user_id_modules(&[name.to_string()], &registry, registry_path)
+                    .expect("should resolve the alias");
+
+            assert_eq!(
+                required,
+                [RequiredPrebidUserIdModule {
+                    config_name: name.to_string(),
+                    module_name: "sharedIdSystem".to_string(),
+                }],
+                "should resolve {name} to its registered module"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_names_sharing_one_module_are_rejected() {
+        let registry = test_registry();
+
+        let error = resolve_managed_user_id_modules(
+            &["sharedId".to_string(), "pubCommonId".to_string()],
+            &registry,
+            Path::new("user_id_modules.json"),
+        )
+        .expect_err("should reject a module collision");
+
+        assert!(
+            error.contains("sharedIdSystem"),
+            "should name the shared module: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_managed_name_identifies_name_and_registry() {
+        let error = resolve_managed_user_id_modules(
+            &["notARealId".to_string()],
+            &test_registry(),
+            Path::new("user_id_modules.json"),
+        )
+        .expect_err("should reject an unregistered name");
+
+        assert!(
+            error.contains("notARealId") && error.contains("user_id_modules.json"),
+            "should name the entry and the registry: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_managed_names_require_no_modules() {
+        let required = resolve_managed_user_id_modules(
+            &[],
+            &test_registry(),
+            Path::new("user_id_modules.json"),
+        )
+        .expect("should resolve an empty list");
+
+        assert!(required.is_empty(), "should require no modules");
+    }
+
+    #[test]
+    fn run_bundle_rejects_managed_name_when_bundle_omits_required_module() {
+        let (_temp, config_path) = write_config(&managed_config(
+            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n",
+            "\"sharedIdSystem\"",
+        ));
+        let original = fs::read_to_string(&config_path).expect("should read original config");
+        let output_root = tempfile::tempdir().expect("should create output root");
+        let mut generator = FakeGenerator {
+            generate_error: None,
+            generate_calls: Vec::new(),
+            write_manifest: true,
+            manifest_schema: Some(serde_json::json!(1)),
+        };
+        let args = PrebidBundleArgs {
+            config: config_path,
+            out: output_root.path().join("prebid"),
+        };
+
+        let error = run_bundle(&args, &mut generator, &mut Vec::new(), &mut Vec::new())
+            .expect_err("should reject missing managed module");
+
+        assert!(
+            error.contains("identityLink") && error.contains("identityLinkIdSystem"),
+            "should name the managed entry and its required module: {error}"
+        );
+        assert!(
+            error.contains("integrations.prebid.bundle.modules.user_id"),
+            "should identify the corrective field: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&args.config).expect("should reread config"),
+            original,
+            "should not patch metadata after a consistency failure"
+        );
+    }
+
+    #[test]
+    fn run_bundle_accepts_bundle_with_required_managed_module() {
+        let (_temp, config_path) = write_config(&managed_config(
+            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n",
+            "\"sharedIdSystem\", \"identityLinkIdSystem\"",
+        ));
+        let output_root = tempfile::tempdir().expect("should create output root");
+        let mut generator = FakeGenerator {
+            generate_error: None,
+            generate_calls: Vec::new(),
+            write_manifest: true,
+            manifest_schema: Some(serde_json::json!(1)),
+        };
+        let args = PrebidBundleArgs {
+            config: config_path,
+            out: output_root.path().join("prebid"),
+        };
+
+        run_bundle(&args, &mut generator, &mut Vec::new(), &mut Vec::new())
+            .expect("should accept a bundle containing the managed module");
+    }
+
+    #[test]
+    fn managed_names_differing_only_by_case_are_rejected_as_a_module_collision() {
+        let error = resolve_managed_user_id_modules(
+            &["identityLink".to_string(), "IdentityLink".to_string()],
+            &test_registry(),
+            Path::new("registry/user_id_modules.json"),
+        )
+        .expect_err("should reject two spellings of one module");
+
+        assert!(
+            error.contains("identityLinkIdSystem"),
+            "should identify the shared module rather than report an unknown name: {error}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_managed_name_lists_sorted_candidate_modules() {
+        let registry = PrebidUserIdModuleRegistry {
+            modules: vec![
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "zetaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "alphaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "zetaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+            ],
+        };
+        let registry_path = Path::new("registry/user_id_modules.json");
+
+        let error =
+            resolve_managed_user_id_modules(&["ambiguousId".to_string()], &registry, registry_path)
+                .expect_err("should reject ambiguous name");
+
+        assert!(
+            error.contains("ambiguousId"),
+            "should identify the name: {error}"
+        );
+        assert!(
+            error.contains("alphaIdSystem, zetaIdSystem"),
+            "should list sorted unique candidates: {error}"
+        );
+        assert!(
+            error.contains(&registry_path.display().to_string()),
+            "should identify the registry: {error}"
+        );
+    }
+
+    #[test]
+    fn run_bundle_rejects_ambiguous_managed_name_before_generation() {
+        let (_temp, config_path) = write_config(&managed_config(
+            "\n[[integrations.prebid.managed_user_ids]]\nname = \"ambiguousId\"\n",
+            "\"sharedIdSystem\"",
+        ));
+        let original = fs::read_to_string(&config_path).expect("should read original config");
+        let output_root = tempfile::tempdir().expect("should create output root");
+        let registry = PrebidUserIdModuleRegistry {
+            modules: vec![
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "zetaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "alphaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+            ],
+        };
+        let args = PrebidBundleArgs {
+            config: config_path.clone(),
+            out: output_root.path().join("prebid"),
+        };
+        let loaded = load_bundle_config(&config_path).expect("should load focused config");
+        let mut generator = FakeGenerator {
+            generate_error: None,
+            generate_calls: Vec::new(),
+            write_manifest: true,
+            manifest_schema: Some(serde_json::json!(1)),
+        };
+
+        let error = run_bundle_with_context(
+            &args,
+            loaded,
+            PrebidBundleRunContext {
+                current_dir: output_root.path(),
+                js_lib_dir: PathBuf::from("unused-js-lib"),
+                registry_path: Path::new("synthetic/user_id_modules.json"),
+                registry: &registry,
+            },
+            &mut generator,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect_err("should reject ambiguous managed name");
+
+        assert!(
+            error.contains("ambiguousId") && error.contains("alphaIdSystem, zetaIdSystem"),
+            "should name the entry and its sorted candidates: {error}"
+        );
+        assert!(
+            generator.generate_calls.is_empty(),
+            "should fail before invoking the generator"
+        );
+        assert_eq!(
+            fs::read_to_string(&args.config).expect("should reread config"),
+            original,
+            "should not patch metadata after a resolution failure"
+        );
+    }
+
+    #[test]
+    fn run_bundle_rejects_unknown_managed_name_before_generation() {
+        let (_temp, config_path) = write_config(&managed_config(
+            "\n[[integrations.prebid.managed_user_ids]]\nname = \"unknownId\"\n",
+            "\"sharedIdSystem\"",
+        ));
+        let original = fs::read_to_string(&config_path).expect("should read original config");
+        let output_root = tempfile::tempdir().expect("should create output root");
+        let mut generator = FakeGenerator {
+            generate_error: None,
+            generate_calls: Vec::new(),
+            write_manifest: true,
+            manifest_schema: Some(serde_json::json!(1)),
+        };
+        let args = PrebidBundleArgs {
+            config: config_path,
+            out: output_root.path().join("prebid"),
+        };
+
+        let error = run_bundle(&args, &mut generator, &mut Vec::new(), &mut Vec::new())
+            .expect_err("should reject unknown managed name");
+
+        assert!(
+            error.contains("unknownId"),
+            "should identify the unregistered name: {error}"
+        );
+        assert!(
+            generator.generate_calls.is_empty(),
+            "should fail before invoking the generator"
+        );
+        assert_eq!(
+            fs::read_to_string(&args.config).expect("should reread config"),
+            original,
+            "should not patch metadata after a resolution failure"
+        );
+    }
+
+    #[test]
+    fn run_bundle_rejects_malformed_managed_name_before_generation() {
+        let (_temp, config_path) = write_config(&managed_config(
+            "managed_user_ids = [{ params = { pid = \"999\" } }]",
+            "\"sharedIdSystem\"",
+        ));
+        let original = fs::read_to_string(&config_path).expect("should read original config");
+        let output_root = tempfile::tempdir().expect("should create output root");
+        let mut generator = FakeGenerator {
+            generate_error: None,
+            generate_calls: Vec::new(),
+            write_manifest: true,
+            manifest_schema: Some(serde_json::json!(1)),
+        };
+        let args = PrebidBundleArgs {
+            config: config_path,
+            out: output_root.path().join("prebid"),
+        };
+
+        let error = run_bundle(&args, &mut generator, &mut Vec::new(), &mut Vec::new())
+            .expect_err("should reject malformed managed name");
+
+        assert!(
+            error.contains("managed_user_ids[0].name"),
+            "should identify the malformed entry: {error}"
+        );
+        assert!(
+            generator.generate_calls.is_empty(),
+            "should fail before invoking the generator"
+        );
+        assert_eq!(
+            fs::read_to_string(&args.config).expect("should reread config"),
+            original,
+            "should not patch metadata after a config failure"
+        );
+    }
+
+    #[test]
+    fn run_bundle_requires_every_managed_module() {
+        let (_temp, config_path) = write_config(&managed_config(
+            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n\n[[integrations.prebid.managed_user_ids]]\nname = \"sharedId\"\n",
+            "\"identityLinkIdSystem\"",
+        ));
+        let original = fs::read_to_string(&config_path).expect("should read original config");
+        let output_root = tempfile::tempdir().expect("should create output root");
+        let mut generator = FakeGenerator {
+            generate_error: None,
+            generate_calls: Vec::new(),
+            write_manifest: true,
+            manifest_schema: Some(serde_json::json!(1)),
+        };
+        let args = PrebidBundleArgs {
+            config: config_path,
+            out: output_root.path().join("prebid"),
+        };
+
+        let error = run_bundle(&args, &mut generator, &mut Vec::new(), &mut Vec::new())
+            .expect_err("should require every managed module");
+
+        assert!(
+            error.contains("sharedId") && error.contains("sharedIdSystem"),
+            "should identify the omitted managed entry and its module: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&args.config).expect("should reread config"),
+            original,
+            "should not patch metadata after a consistency failure"
+        );
+    }
 
     fn write_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::TempDir::new().expect("should create temp dir");
