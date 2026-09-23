@@ -87,6 +87,10 @@ const scenarios = [
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const reports = [];
+  // Tracked across the whole run so a throw anywhere in a scenario still writes
+  // that scenario's trace into the evidence directory CI uploads on failure.
+  let pendingTrace = null;
+  let openContext = null;
   try {
     for (const variant of options.variant === "both"
       ? ["runtime", "bootstrap"]
@@ -97,6 +101,11 @@ const scenarios = [
         const context = await browser.newContext({
           viewport: { width: 720, height: 500 },
         });
+        openContext = context;
+        pendingTrace = {
+          context,
+          path: path.join(out, scenario + "-trace.zip"),
+        };
         await context.tracing.start({
           screenshots: true,
           snapshots: true,
@@ -383,9 +392,8 @@ const scenarios = [
           path.join(outputRoot, "evidence.json"),
           JSON.stringify(reports, null, 2),
         );
-        await context.tracing.stop({
-          path: path.join(out, scenario + "-trace.zip"),
-        });
+        await context.tracing.stop({ path: pendingTrace.path });
+        pendingTrace = null;
         assert.equal(
           errors.length,
           0,
@@ -440,6 +448,7 @@ const scenarios = [
           }),
         );
         await context.close();
+        openContext = null;
       }
     }
     fs.writeFileSync(
@@ -447,17 +456,14 @@ const scenarios = [
       JSON.stringify(
         {
           browserVersion: browser.version(),
-          sourceCommit: require("node:child_process")
-            .execFileSync("git", ["rev-parse", "HEAD"], {
-              cwd: repo,
-              encoding: "utf8",
-            })
-            .trim(),
-          worktreeStatus: require("node:child_process").execFileSync(
-            "git",
-            ["status", "--short"],
-            { cwd: repo, encoding: "utf8" },
-          ),
+          sourceCommit: execFileSync("git", ["rev-parse", "HEAD"], {
+            cwd: repo,
+            encoding: "utf8",
+          }).trim(),
+          worktreeStatus: execFileSync("git", ["status", "--short"], {
+            cwd: repo,
+            encoding: "utf8",
+          }),
           externalPrebidVersion: manifest.prebidVersion,
           pucVersion: require(
             path.join(
@@ -495,6 +501,12 @@ const scenarios = [
     );
     console.log("Controlled comparison assertions passed.");
   } finally {
+    if (pendingTrace) {
+      await pendingTrace.context.tracing
+        .stop({ path: pendingTrace.path })
+        .catch(() => {});
+    }
+    if (openContext) await openContext.close().catch(() => {});
     await browser.close();
   }
 })().catch((e) => {

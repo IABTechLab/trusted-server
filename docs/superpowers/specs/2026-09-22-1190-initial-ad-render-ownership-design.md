@@ -36,6 +36,15 @@ lifetime. It is asynchronous admission control, not a thread mutex.
 3. Filled and empty `slotRenderEnded` both settle the initial attempt. A missing
    render event does not unlock a submitted request on a timer. Setup failure
    before submission retains the existing claim release behavior.
+   Two consequences are deliberate scope decisions, not oversights. First, because
+   nothing unlocks a submitted request on a timer, a slot whose `slotRenderEnded`
+   never arrives stays owned by TS for the element/navigation lifetime; the
+   five-second `pendingRenderDiagnostic` makes that visible without recovering
+   from it. Second, because empty and filled renders settle identically, a
+   publisher auction that overlapped an _empty_ initial render keeps its denial
+   token and its delivery is dropped, which can leave the slot blank until an
+   ordinary post-settlement refresh. Threading an emptiness signal through both
+   lifecycle observers to release those tokens is deferred.
 4. Settlement is terminal for initial ownership. Later `slotRequested` events
    cannot reopen it. New auctions after settlement remain ordinary refreshes.
 5. A registered losing token survives its lease, settlement, and consumption

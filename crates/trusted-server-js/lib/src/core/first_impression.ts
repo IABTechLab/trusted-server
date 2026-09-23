@@ -7,7 +7,7 @@ import type {
   TsjsApi,
 } from './types';
 
-/** Lease for publisher ownership before its initial GPT request. */
+/** Lease for publisher claims and auctions, and the TS pending-render diagnostic delay. */
 export const FIRST_IMPRESSION_LEASE_MS = 5000;
 
 const MAX_FIRST_IMPRESSION_SLOTS = 256;
@@ -175,6 +175,10 @@ export function claimFirstImpressionForTrustedServer(
 
     existing.owner = 'trusted_server';
     existing.phase = 'delivery_pending';
+    // Deliberately unbounded: per the design contract, a missing `slotRenderEnded`
+    // never unlocks a submitted request on a timer. Only navigation or physical
+    // element replacement retires this claim; `schedulePendingRenderDiagnostic`
+    // makes a stuck initial render observable without changing admission.
     existing.expiresAt = Number.POSITIVE_INFINITY;
     for (const auction of Object.values(existing.publisherAuctions)) {
       auction.suppressDelivery = true;
@@ -189,6 +193,7 @@ export function claimFirstImpressionForTrustedServer(
     element,
     owner: 'trusted_server',
     phase: 'delivery_pending',
+    // Unbounded by contract; see the fallback transition above.
     expiresAt: Number.POSITIVE_INFINITY,
     publisherAuctions: {},
   };
@@ -394,7 +399,9 @@ export function observeFirstImpressionGptLifecycle(
     claim.expiresAt = Number.POSITIVE_INFINITY;
   } else if (phase === 'rendered') {
     // Auctions begun before the initial render settles still overlap it, even
-    // after slotRequested or the publisher fallback lease has elapsed.
+    // after slotRequested or the publisher fallback lease has elapsed. Filled and
+    // empty renders settle identically: already-retained denial tokens keep
+    // suppressing, by design, so this observer needs no emptiness signal.
     claim.publisherRegistrationClosed = true;
   }
 }
