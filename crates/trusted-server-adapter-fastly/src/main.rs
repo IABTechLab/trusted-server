@@ -15,7 +15,7 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::finalize::{ec_finalize_response, execute_pending_ec_kv_write};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
@@ -221,7 +221,7 @@ fn edgezero_main(mut req: FastlyRequest) {
             match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
                 Ok(partner_registry) => {
                     send_edgezero_response(response, request_filter_effects.as_ref());
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    run_edgezero_post_send_ec_work(settings, &partner_registry, &mut ec_state);
                     return;
                 }
                 Err(e) => {
@@ -236,10 +236,10 @@ fn edgezero_main(mut req: FastlyRequest) {
                     match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
                         Ok(partner_registry) => {
                             send_edgezero_response(response, request_filter_effects.as_ref());
-                            run_edgezero_pull_sync_after_send(
+                            run_edgezero_post_send_ec_work(
                                 &settings,
                                 &partner_registry,
-                                &ec_state,
+                                &mut ec_state,
                             );
                             return;
                         }
@@ -306,7 +306,7 @@ fn apply_edgezero_ec_finalize(
     } else {
         None
     };
-    ec_finalize_response(
+    ec_state.pending_kv_write = ec_finalize_response(
         settings,
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
@@ -318,11 +318,24 @@ fn apply_edgezero_ec_finalize(
     Ok(partner_registry)
 }
 
-fn run_edgezero_pull_sync_after_send(
+/// Runs EC work whose completion does not gate the response: draining any KV
+/// persistence [`apply_edgezero_ec_finalize`] deferred, then dispatching
+/// pull-sync. Persistence runs first so pull-sync's partner disclosure sees
+/// the just-merged identity state rather than what was read pre-send.
+fn run_edgezero_post_send_ec_work(
     settings: &Settings,
     partner_registry: &PartnerRegistry,
-    ec_state: &EcFinalizeState,
+    ec_state: &mut EcFinalizeState,
 ) {
+    if let Some(pending) = ec_state.pending_kv_write.take() {
+        match maybe_identity_graph(settings) {
+            Some(graph) => execute_pending_ec_kv_write(&graph, &mut ec_state.ec_context, pending),
+            None => log::warn!(
+                "Skipping deferred EC KV write: identity graph unavailable after response was sent"
+            ),
+        }
+    }
+
     if ec_state.is_real_browser
         && let Some(context) = build_pull_sync_context(&ec_state.ec_context)
     {

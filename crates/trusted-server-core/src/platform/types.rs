@@ -188,6 +188,15 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Precomputed [`crate::publisher::template_fingerprint`] for the current
+    /// settings, when the adapter has one to share.
+    ///
+    /// That function serializes the whole settings struct to JSON and hashes
+    /// it — expensive enough to matter when an adapter reuses the same
+    /// `Settings` across requests (e.g. a warm Fastly instance). Adapters
+    /// that rebuild settings every request can leave this unset: callers
+    /// fall back to computing it fresh, which is exactly today's behavior.
+    pub(crate) template_fingerprint: Option<Arc<str>>,
 }
 
 impl RuntimeServices {
@@ -275,6 +284,16 @@ impl RuntimeServices {
         &self.client_info
     }
 
+    /// Returns the precomputed [`crate::publisher::template_fingerprint`] for
+    /// the current settings, if the adapter provided one.
+    ///
+    /// `None` means the adapter doesn't cache settings across requests;
+    /// callers should compute it fresh in that case.
+    #[must_use]
+    pub fn template_fingerprint(&self) -> Option<&str> {
+        self.template_fingerprint.as_deref()
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -342,6 +361,7 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    template_fingerprint: Option<Arc<str>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -357,6 +377,7 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            template_fingerprint: None,
         }
     }
 
@@ -436,6 +457,16 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set a precomputed [`crate::publisher::template_fingerprint`] for the
+    /// current settings, so callers that need it reuse this instead of
+    /// recomputing it per request. Optional — see
+    /// [`RuntimeServices::template_fingerprint`].
+    #[must_use]
+    pub fn template_fingerprint(mut self, template_fingerprint: Arc<str>) -> Self {
+        self.template_fingerprint = Some(template_fingerprint);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -476,6 +507,7 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
+            template_fingerprint: self.template_fingerprint,
         }
     }
 }

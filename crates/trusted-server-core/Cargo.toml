@@ -79,3 +79,7 @@ harness = false
 [[bench]]
 name = "html_processor_bench"
 harness = false
+
+[[bench]]
+name = "registry_bundle_bench"
+harness = false

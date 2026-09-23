@@ -86,7 +86,8 @@
 //! [`load_settings_from_config_store`]; if settings loading itself fails, they
 //! are returned without geo or TS headers.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
@@ -115,6 +116,7 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::finalize::PendingEcKvWrite;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
@@ -125,7 +127,7 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, PlatformConfigStore, PlatformKvStore, RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -171,16 +173,25 @@ impl RuntimeStoreConfig {
     }
 }
 
-/// Application state built once per Wasm instance and shared for its lifetime.
+/// Application state built from settings and shared for as long as it stays valid.
 ///
-/// In Fastly Compute each request spawns a new Wasm instance, so this struct is
-/// effectively per-request. It holds pre-parsed settings and all service handles.
+/// Fastly Compute's reusable sandbox mode keeps a warm Wasm instance alive
+/// across multiple requests. [`TrustedServerApp::router_with_state`] caches
+/// the built state across requests on a warm instance (see [`AppCache`]), so
+/// treat this as reusable for the cache's validity window, not strictly
+/// per-request.
 pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// [`trusted_server_core::publisher::template_fingerprint`] for
+    /// `settings`, computed once here instead of per request. It serializes
+    /// the whole settings struct to JSON and hashes it, so recomputing it on
+    /// every request that reuses this cached `AppState` would throw away
+    /// most of the win `AppCache` provides.
+    pub(crate) template_fingerprint: Arc<str>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -193,6 +204,106 @@ pub(crate) fn build_state(
     stores: &RuntimeStoreConfig,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     build_state_from_settings(load_settings_from_config_store(stores)?)
+}
+
+// ---------------------------------------------------------------------------
+// AppCache — cross-request reuse of AppState/RouterService on a warm instance
+// ---------------------------------------------------------------------------
+
+/// Upper bound on how long a cached [`AppState`]/[`RouterService`] pair may be
+/// reused without re-reading the config store, even when the config store's
+/// raw entry hasn't changed.
+///
+/// Settings resolve secret *values* at build time (see
+/// [`crate::app::load_settings_from_config_store`] ->
+/// `settings_from_config_blob` -> `resolve_secret_references`), and a secret
+/// rotation in the secret store does not change the config store's raw entry.
+/// Content-based invalidation alone would not notice that. This TTL is the
+/// backstop: it bounds how long a rotated secret can keep being served from
+/// cache, independent of whether the config content changed.
+const APP_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// A cached, reusable build of the application.
+struct CachedApp {
+    /// The config store's raw entry value this was built from — the chunk
+    /// pointer JSON when chunked, or the full envelope when not. Used as the
+    /// cheap, content-based cache-invalidation key: any change to the config
+    /// (including a chunk's contents, which changes the pointer's declared
+    /// hashes) changes this string.
+    config_cache_key: String,
+    built_at: Instant,
+    router: RouterService,
+    state: Arc<AppState>,
+}
+
+/// Caches the built [`RouterService`]/[`AppState`] across requests that land
+/// on the same warm Wasm instance, keyed by the config store's raw entry
+/// value and bounded by [`APP_CACHE_TTL`].
+///
+/// Building the app (config + secret store reads, settings validation,
+/// auction plan compilation, integration registry construction, route table
+/// registration) is the single largest per-request cost in this adapter —
+/// see the TTFB investigation this cache resolves. This pays off because
+/// Fastly's reusable sandbox mode keeps a warm instance alive across
+/// requests; correctness never depends on reuse actually happening — a cold
+/// instance still falls back to the uncached build exactly as before.
+///
+/// A plain [`Mutex`] is used rather than relying on Fastly's single-request-
+/// per-instance execution model, since that model is not part of this
+/// codebase's documented contract and the lock is uncontended in practice.
+struct AppCache {
+    inner: Mutex<Option<CachedApp>>,
+}
+
+impl AppCache {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Returns the cached router/state for `config_cache_key` if it is still
+    /// within `ttl` and the key matches, otherwise calls `build` and caches
+    /// its result (when it produced a valid [`AppState`]).
+    fn get_or_build(
+        &self,
+        config_cache_key: &str,
+        ttl: Duration,
+        build: impl FnOnce() -> (RouterService, Option<Arc<AppState>>),
+    ) -> (RouterService, Option<Arc<AppState>>) {
+        {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.config_cache_key == config_cache_key
+                && cached.built_at.elapsed() < ttl
+            {
+                return (cached.router.clone(), Some(Arc::clone(&cached.state)));
+            }
+        }
+
+        let (router, state) = build();
+        if let Some(ref state) = state {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(CachedApp {
+                config_cache_key: config_cache_key.to_owned(),
+                built_at: Instant::now(),
+                router: router.clone(),
+                state: Arc::clone(state),
+            });
+        }
+        (router, state)
+    }
+}
+
+fn global_app_cache() -> &'static AppCache {
+    static CACHE: OnceLock<AppCache> = OnceLock::new();
+    CACHE.get_or_init(AppCache::new)
 }
 
 pub(crate) fn load_settings_from_config_store(
@@ -219,6 +330,8 @@ pub(crate) fn build_state_from_settings(
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let template_fingerprint: Arc<str> =
+        trusted_server_core::publisher::template_fingerprint(&settings).into();
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -226,6 +339,7 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        template_fingerprint,
     }))
 }
 
@@ -307,6 +421,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .geo(Arc::new(FastlyPlatformGeo))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
+        .template_fingerprint(Arc::clone(&state.template_fingerprint))
         .build()
 }
 
@@ -351,6 +466,13 @@ pub(crate) struct EcFinalizeState {
     /// Per-request services carried to the entry point so the pull-sync
     /// dispatcher can reuse the same platform HTTP client.
     pub(crate) services: RuntimeServices,
+    /// KV persistence deferred by `ec_finalize_response`, run by the entry
+    /// point after the response is sent.
+    pub(crate) pending_kv_write: Option<PendingEcKvWrite>,
+    /// Geo lookup result, already computed during EC setup (or batch-sync's
+    /// own lookup). `FinalizeResponseMiddleware` reuses this instead of
+    /// looking up the same IP a second time.
+    pub(crate) geo_info: Option<GeoInfo>,
 }
 
 /// Per-request EC identity state built before dispatch, mirroring the
@@ -385,6 +507,8 @@ impl EcRequestState {
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
             services: self.services,
+            pending_kv_write: None,
+            geo_info: self.geo_info,
         }
     }
 }
@@ -751,6 +875,16 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
+    // Computed here (rather than left for FinalizeResponseMiddleware) so
+    // every attached EcFinalizeState carries a real lookup result — the
+    // middleware trusts presence of this state to mean "already looked up".
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed during batch-sync finalize: {e}");
+            None
+        });
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
@@ -768,6 +902,8 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
         sharedid_cookie,
         is_real_browser,
         services: services.clone(),
+        pending_kv_write: None,
+        geo_info,
     });
     response
 }
@@ -1284,7 +1420,31 @@ impl TrustedServerApp {
         (app, state)
     }
 
+    /// Builds (or reuses a cached) router/state pair for this request.
+    ///
+    /// Reads the config store's raw entry once, cheaply — the same read
+    /// [`load_settings_from_config_store`] would do as its first step
+    /// regardless — and uses it as the cache key. On a warm instance where
+    /// that entry is unchanged and the cache hasn't aged past
+    /// [`APP_CACHE_TTL`], this skips config/secret store reads, settings
+    /// validation, auction plan compilation, and route table construction
+    /// entirely. Any failure reading the cache key (store misconfigured,
+    /// entry missing, etc.) falls through to the uncached path unchanged,
+    /// which fails the same way it always has.
     fn router_with_state(stores: &RuntimeStoreConfig) -> (RouterService, Option<Arc<AppState>>) {
+        match FastlyPlatformConfigStore.get(&stores.config_store_name, &stores.config_key) {
+            Ok(config_cache_key) => {
+                global_app_cache().get_or_build(&config_cache_key, APP_CACHE_TTL, || {
+                    Self::router_with_state_uncached(stores)
+                })
+            }
+            Err(_) => Self::router_with_state_uncached(stores),
+        }
+    }
+
+    fn router_with_state_uncached(
+        stores: &RuntimeStoreConfig,
+    ) -> (RouterService, Option<Arc<AppState>>) {
         let state = match build_state(stores) {
             Ok(state) => state,
             Err(ref e) => {
@@ -1374,8 +1534,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
-        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
+        AppCache, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
         TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
         build_state_from_settings, compile_auction_plan, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
@@ -1538,6 +1698,103 @@ mod tests {
         build_state_from_settings(settings).expect("should build app state from settings")
     }
 
+    // -------------------------------------------------------------------
+    // AppCache tests
+    // -------------------------------------------------------------------
+
+    fn cache_test_build(calls: &Arc<AtomicUsize>) -> (RouterService, Option<Arc<AppState>>) {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let state = app_state_for_settings(test_settings());
+        (TrustedServerApp::routes_for_state(&state), Some(state))
+    }
+
+    #[test]
+    fn app_cache_reuses_state_for_the_same_key_within_ttl() {
+        let cache = AppCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let (_, first_state) = cache.get_or_build("config-v1", Duration::from_secs(60), || {
+            cache_test_build(&calls)
+        });
+        let (_, second_state) = cache.get_or_build("config-v1", Duration::from_secs(60), || {
+            cache_test_build(&calls)
+        });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should build only once when the key is unchanged and the cache is fresh"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &first_state.expect("first build should succeed"),
+                &second_state.expect("second call should return the cached state"),
+            ),
+            "should return the exact same cached Arc<AppState>, not a rebuilt one"
+        );
+    }
+
+    #[test]
+    fn app_cache_rebuilds_when_the_config_key_changes() {
+        let cache = AppCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        cache.get_or_build("config-v1", Duration::from_secs(60), || {
+            cache_test_build(&calls)
+        });
+        cache.get_or_build("config-v2", Duration::from_secs(60), || {
+            cache_test_build(&calls)
+        });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a changed config-store entry must invalidate the cache immediately"
+        );
+    }
+
+    #[test]
+    fn app_cache_rebuilds_once_the_ttl_has_elapsed() {
+        let cache = AppCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        cache.get_or_build("config-v1", Duration::ZERO, || cache_test_build(&calls));
+        cache.get_or_build("config-v1", Duration::ZERO, || cache_test_build(&calls));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a zero TTL should never be considered fresh, bounding secret staleness \
+             even when the config-store entry is unchanged"
+        );
+    }
+
+    #[test]
+    fn app_cache_does_not_cache_a_failed_build() {
+        let cache = AppCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_failing = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let report = Report::new(TrustedServerError::Configuration {
+                message: "simulated startup failure".to_owned(),
+            });
+            (startup_error_router(&report), None)
+        };
+
+        let (_, first_state) =
+            cache.get_or_build("config-v1", Duration::from_secs(60), build_failing);
+        let (_, second_state) =
+            cache.get_or_build("config-v1", Duration::from_secs(60), build_failing);
+
+        assert!(first_state.is_none(), "simulated build should fail");
+        assert!(second_state.is_none(), "simulated build should fail again");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a failed build must not be cached, so the next request retries it"
+        );
+    }
+
     fn empty_request(method: Method, path: &str) -> edgezero_core::http::Request {
         // Production requests arrive with absolute URIs from the fastly
         // adapter — mirror that here so URI-derived logic behaves the same.
@@ -1605,6 +1862,28 @@ mod tests {
     }
 
     #[test]
+    fn per_request_services_carry_the_precomputed_template_fingerprint() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+
+        assert_eq!(
+            services.template_fingerprint(),
+            Some(&*state.template_fingerprint),
+            "per-request services should carry AppState's precomputed fingerprint"
+        );
+        assert_eq!(
+            services.template_fingerprint(),
+            Some(trusted_server_core::publisher::template_fingerprint(&state.settings).as_str()),
+            "the precomputed fingerprint must match a fresh computation for the same settings"
+        );
+    }
+
+    #[test]
     fn per_request_services_register_the_fastly_template_assembler() {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         let context = RequestContext::new(
@@ -1651,6 +1930,8 @@ mod tests {
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        let template_fingerprint: Arc<str> =
+            trusted_server_core::publisher::template_fingerprint(&settings).into();
         let state = Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
@@ -1659,6 +1940,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            template_fingerprint,
         });
         TrustedServerApp::routes_for_state(&state)
     }

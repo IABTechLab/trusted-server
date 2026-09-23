@@ -294,6 +294,10 @@ fn detect_request_scheme(
 /// Build a static text response with strong `ETag` and standard caching headers.
 /// Handles If-None-Match to return 304 when appropriate.
 ///
+/// `content_hash` must be the bare hex SHA-256 digest of `body`; callers that
+/// already compute a hash over `body` for another purpose (e.g. cache-busting)
+/// should pass it through here instead of hashing the body a second time.
+///
 /// # Panics
 ///
 /// Panics if the generated response headers cannot be represented in an
@@ -303,9 +307,9 @@ pub fn serve_static_with_etag(
     req: &Request<EdgeBody>,
     content_type: &str,
     edge_header: EdgeCacheHeader,
+    content_hash: &str,
 ) -> Response<EdgeBody> {
-    let hash = Sha256::digest(body.as_bytes());
-    let etag = format!("\"sha256-{}\"", hex::encode(hash));
+    let etag = format!("\"sha256-{content_hash}\"");
     let short_policy = CachePolicy::public_short_with_stale(
         Duration::from_secs(300),
         Duration::from_secs(60),
