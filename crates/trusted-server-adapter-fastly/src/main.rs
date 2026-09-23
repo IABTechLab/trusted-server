@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+use std::time::Duration;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
@@ -11,11 +12,12 @@ use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
+use fastly::http::serve::Serve;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::finalize::{ec_finalize_response, execute_pending_ec_kv_write};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
@@ -70,21 +72,51 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     None
 }
 
+/// Maximum downstream requests one reused Wasm instance serves before exiting.
+const MAX_REQUESTS_PER_INSTANCE: usize = 1000;
+
+/// How long an idle instance waits for its next downstream request before exiting.
+///
+/// A waiting instance keeps its memory and is billed for wall-clock time, so
+/// this stays short: reuse pays off under steady traffic, not across lulls.
+const INSTANCE_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Heap size, in mebibytes, past which a reused instance exits instead of
+/// accepting another request, bounding growth from anything retained across
+/// requests.
+const MAX_INSTANCE_MEMORY_MIB: u32 = 128;
+
+/// Installs the global logger once per Wasm instance.
+static LOGGER_INIT: Once = Once::new();
+
 /// Entry point for the Fastly Compute program.
 ///
-/// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
-/// `#[fastly::main]` so the `EdgeZero` streaming publisher path can call
-/// [`fastly::Response::stream_to_client`] explicitly.
+/// Opts into Fastly reusable sandboxes via [`Serve`], so one Wasm instance
+/// handles up to [`MAX_REQUESTS_PER_INSTANCE`] requests. Reuse is what lets
+/// the cross-request app-state cache in [`app`] hit; without it every request
+/// runs on a fresh instance and rebuilds everything.
 fn main() {
-    let req = FastlyRequest::from_client();
+    Serve::new()
+        .with_max_requests(MAX_REQUESTS_PER_INSTANCE)
+        .with_timeout(INSTANCE_IDLE_TIMEOUT)
+        .with_max_memory(MAX_INSTANCE_MEMORY_MIB)
+        .run(handle_request);
+}
 
+/// Handles one downstream request on a possibly reused Wasm instance.
+///
+/// Returns `()` because every path sends its own response, either with
+/// [`fastly::Response::send_to_client`] or, on the `EdgeZero` streaming
+/// publisher path, with [`fastly::Response::stream_to_client`].
+fn handle_request(req: FastlyRequest) {
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
     if let Some(response) = health_response(&req) {
         response.send_to_client();
         return;
     }
 
-    logging::init_logger();
+    // The global logger can only be installed once; a reused instance keeps it.
+    LOGGER_INIT.call_once(logging::init_logger);
     edgezero_main(req);
 }
 
@@ -221,7 +253,7 @@ fn edgezero_main(mut req: FastlyRequest) {
             match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
                 Ok(partner_registry) => {
                     send_edgezero_response(response, request_filter_effects.as_ref());
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    run_edgezero_post_send_ec_work(settings, &partner_registry, &mut ec_state);
                     return;
                 }
                 Err(e) => {
@@ -236,10 +268,10 @@ fn edgezero_main(mut req: FastlyRequest) {
                     match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
                         Ok(partner_registry) => {
                             send_edgezero_response(response, request_filter_effects.as_ref());
-                            run_edgezero_pull_sync_after_send(
+                            run_edgezero_post_send_ec_work(
                                 &settings,
                                 &partner_registry,
-                                &ec_state,
+                                &mut ec_state,
                             );
                             return;
                         }
@@ -306,7 +338,7 @@ fn apply_edgezero_ec_finalize(
     } else {
         None
     };
-    ec_finalize_response(
+    ec_state.pending_kv_write = ec_finalize_response(
         settings,
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
@@ -318,11 +350,24 @@ fn apply_edgezero_ec_finalize(
     Ok(partner_registry)
 }
 
-fn run_edgezero_pull_sync_after_send(
+/// Runs EC work whose completion does not gate the response: draining any KV
+/// persistence [`apply_edgezero_ec_finalize`] deferred, then dispatching
+/// pull-sync. Persistence runs first so pull-sync's partner disclosure sees
+/// the just-merged identity state rather than what was read pre-send.
+fn run_edgezero_post_send_ec_work(
     settings: &Settings,
     partner_registry: &PartnerRegistry,
-    ec_state: &EcFinalizeState,
+    ec_state: &mut EcFinalizeState,
 ) {
+    if let Some(pending) = ec_state.pending_kv_write.take() {
+        match maybe_identity_graph(settings) {
+            Some(graph) => execute_pending_ec_kv_write(&graph, &mut ec_state.ec_context, pending),
+            None => log::warn!(
+                "Skipping deferred EC KV write: identity graph unavailable after response was sent"
+            ),
+        }
+    }
+
     if ec_state.is_real_browser
         && let Some(context) = build_pull_sync_context(&ec_state.ec_context)
     {

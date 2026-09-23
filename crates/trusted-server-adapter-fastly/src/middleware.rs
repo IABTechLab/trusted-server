@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use crate::app::EcFinalizeState;
 use async_trait::async_trait;
 use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::context::RequestContext;
@@ -80,11 +81,20 @@ impl Middleware for FinalizeResponseMiddleware {
             }
         };
 
+        // Route handlers that attach EcFinalizeState (EC setup, batch-sync)
+        // already looked up geo for the same IP; reuse that instead of
+        // looking it up again here.
         let geo_info = resolve_geo_for_response(&response, client_ip, |ip| {
-            self.geo.lookup(ip).unwrap_or_else(|e| {
-                log::warn!("geo lookup failed: {e}");
-                None
-            })
+            response
+                .extensions()
+                .get::<EcFinalizeState>()
+                .map(|state| state.geo_info.clone())
+                .unwrap_or_else(|| {
+                    self.geo.lookup(ip).unwrap_or_else(|e| {
+                        log::warn!("geo lookup failed: {e}");
+                        None
+                    })
+                })
         });
 
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);

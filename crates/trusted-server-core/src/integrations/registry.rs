@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -711,6 +711,11 @@ struct IntegrationRegistryInner {
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+
+    // Lazily computed, memoized on first access — see
+    // `IntegrationRegistry::js_module_ids_immediate`/`_deferred`.
+    js_module_ids_immediate: OnceLock<Vec<&'static str>>,
+    js_module_ids_deferred: OnceLock<Vec<&'static str>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -732,6 +737,8 @@ impl Default for IntegrationRegistryInner {
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            js_module_ids_immediate: OnceLock::new(),
+            js_module_ids_deferred: OnceLock::new(),
         }
     }
 }
@@ -1204,12 +1211,21 @@ impl IntegrationRegistry {
 
     /// Return JS module IDs for the main (synchronous) bundle, excluding
     /// modules registered with [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js).
+    ///
+    /// Memoized on first call: the registry is immutable after construction,
+    /// so every caller within a request shares one computed result instead
+    /// of repeating the underlying [`js_module_ids`](Self::js_module_ids) scan.
     #[must_use]
     pub fn js_module_ids_immediate(&self) -> Vec<&'static str> {
-        self.js_module_ids()
-            .into_iter()
-            .filter(|id| !self.inner.deferred_js_ids.contains(id))
-            .collect()
+        self.inner
+            .js_module_ids_immediate
+            .get_or_init(|| {
+                self.js_module_ids()
+                    .into_iter()
+                    .filter(|id| !self.inner.deferred_js_ids.contains(id))
+                    .collect()
+            })
+            .clone()
     }
 
     /// Return JS module IDs that should be loaded with `<script defer>`.
@@ -1218,12 +1234,20 @@ impl IntegrationRegistry {
     /// [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js)
     /// that are actually enabled. Returns an empty vec when no deferred
     /// integrations are configured.
+    ///
+    /// Memoized on first call — see
+    /// [`js_module_ids_immediate`](Self::js_module_ids_immediate).
     #[must_use]
     pub fn js_module_ids_deferred(&self) -> Vec<&'static str> {
-        self.js_module_ids()
-            .into_iter()
-            .filter(|id| self.inner.deferred_js_ids.contains(id))
-            .collect()
+        self.inner
+            .js_module_ids_deferred
+            .get_or_init(|| {
+                self.js_module_ids()
+                    .into_iter()
+                    .filter(|id| self.inner.deferred_js_ids.contains(id))
+                    .collect()
+            })
+            .clone()
     }
 
     #[cfg(test)]
@@ -1259,6 +1283,8 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                js_module_ids_immediate: OnceLock::new(),
+                js_module_ids_deferred: OnceLock::new(),
             }),
             plan: None,
         }
@@ -1289,6 +1315,8 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                js_module_ids_immediate: OnceLock::new(),
+                js_module_ids_deferred: OnceLock::new(),
             }),
             plan: None,
         }
@@ -1315,6 +1343,8 @@ impl IntegrationRegistry {
                 request_filters,
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                js_module_ids_immediate: OnceLock::new(),
+                js_module_ids_deferred: OnceLock::new(),
             }),
             plan: None,
         }
@@ -1381,6 +1411,8 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                js_module_ids_immediate: OnceLock::new(),
+                js_module_ids_deferred: OnceLock::new(),
             }),
             plan: None,
         }

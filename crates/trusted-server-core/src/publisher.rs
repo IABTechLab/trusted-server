@@ -582,6 +582,7 @@ fn serve_tsjs_static(
         req,
         "application/javascript; charset=utf-8",
         edge_header,
+        expected_hash,
     );
     if request_version_hash(req).is_some_and(|hash| hash == expected_hash) {
         CachePolicy::public_immutable(Duration::from_secs(31_536_000))
@@ -1962,11 +1963,17 @@ fn assemble_if_shared(
 /// safe by default: a change misses until someone proves it irrelevant, never cross-serves
 /// an old template under new behavior.
 ///
+/// Serializes the whole settings struct to JSON and hashes it, so this is not
+/// cheap — callers that already hold a value computed for the same `settings`
+/// (e.g. via [`RuntimeServices::template_fingerprint`](crate::platform::RuntimeServices::template_fingerprint))
+/// should reuse it instead of calling this again.
+///
 /// # Panics
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
-fn template_fingerprint(settings: &Settings) -> String {
+#[must_use]
+pub fn template_fingerprint(settings: &Settings) -> String {
     use sha2::Digest as _;
 
     let mut hasher = sha2::Sha256::new();
@@ -4372,7 +4379,10 @@ pub async fn handle_publisher_request(
                 .unwrap_or_else(|| VarySpec::new([]))
                 .values_from(req.headers()),
             cookie_values,
-            template_fingerprint: template_fingerprint(settings),
+            template_fingerprint: services
+                .template_fingerprint()
+                .map(str::to_owned)
+                .unwrap_or_else(|| template_fingerprint(settings)),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
@@ -12362,7 +12372,7 @@ mod tests {
                         finalizer,
                     )
                     .await;
-                    crate::ec::finalize::ec_finalize_response(
+                    let pending = crate::ec::finalize::ec_finalize_response(
                         &settings,
                         &mut ec_context,
                         Some(&graph),
@@ -12371,6 +12381,13 @@ mod tests {
                         None,
                         &mut response,
                     );
+                    if let Some(pending) = pending {
+                        crate::ec::finalize::execute_pending_ec_kv_write(
+                            &graph,
+                            &mut ec_context,
+                            pending,
+                        );
+                    }
                     assert_eq!(
                         response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
                         if index == 0 { "miss-stored" } else { "hit" },

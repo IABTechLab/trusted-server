@@ -17,7 +17,8 @@ use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{
-    CreateIfAbsentOutcome, KvIdentityGraph, TombstoneOutcome, apply_partner_id_updates,
+    CreateIfAbsentOutcome, KvIdentityGraph, PartnerIdUpdate, TombstoneOutcome,
+    apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
 use super::prebid_eids::collect_eid_cookie_updates;
@@ -43,6 +44,14 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
 /// from the request *before* routing consumes it.
+///
+/// Returns a [`PendingEcKvWrite`] when this call decided on a KV persistence
+/// step whose durability is safe to defer until after the response is sent —
+/// the caller should run it via [`execute_pending_ec_kv_write`] once the
+/// response has gone out. `None` means either no such step was needed, or the
+/// step could not be safely deferred and was already performed synchronously
+/// (the returning-user branch below always writes synchronously, since its
+/// KV read also decides whether the cookie rotates in this same response).
 pub fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
@@ -51,12 +60,12 @@ pub fn ec_finalize_response(
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
-) {
+) -> Option<PendingEcKvWrite> {
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
-        finalize_unusable_consent(
+        return finalize_unusable_consent(
             settings,
             ec_context,
             kv,
@@ -64,7 +73,6 @@ pub fn ec_finalize_response(
             consent_withdrawn,
             response,
         );
-        return;
     }
 
     // Returning user: consent is granted and EC came from request.
@@ -87,30 +95,115 @@ pub fn ec_finalize_response(
         }
 
         // Ordinary returning-user page views no longer refresh the browser
-        // cookie, emit the EC header, or update KV TTL.
-        return;
+        // cookie, emit the EC header, or update KV TTL. The read above also
+        // gates orphan-recovery rotation, so it cannot be deferred like the
+        // enrichment write below.
+        return None;
     }
 
     // Newly generated EC in this request. Do not emit a generated EC when
     // there is no KV graph: that would mint a browser cookie with no backing
     // identity-graph row, producing a phantom ID on later requests.
     if ec_context.ec_generated() {
-        let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) else {
+        let (Some(_graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) else {
             log::info!("Skipping generated EC response write because KV graph is unavailable");
-            return;
+            return None;
         };
 
-        let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
-        let snapshot = graph.upsert_partner_ids_from_snapshot(
-            &ec_id,
-            &updates,
-            ec_context.kv_snapshot().clone(),
-        );
-        ec_context.set_kv_snapshot(snapshot);
-        if ec_context.kv_snapshot().entry_for(&ec_id).is_some() {
-            set_ec_cookie_on_response(settings, ec_context, response);
-        } else {
+        // `generate_if_needed` only marks the EC as generated after a
+        // successful `create_if_absent`, which already seeds a `Present`
+        // snapshot for `ec_id` — so the cookie is set from that existing
+        // proof without a new KV round trip here. EID-merge enrichment is
+        // the only I/O this branch still needs, and it is safe to defer
+        // past the response send: nothing before the response depends on it
+        // landing, and later requests read the graph fresh regardless.
+        if ec_context.kv_snapshot().entry_for(&ec_id).is_none() {
             log::warn!("Skipping generated EC cookie because backing row is not authoritative");
+            return None;
+        }
+        set_ec_cookie_on_response(settings, ec_context, response);
+
+        let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
+        if updates.is_empty() {
+            return None;
+        }
+        return Some(PendingEcKvWrite::enrichment(
+            ec_id,
+            updates,
+            ec_context.kv_snapshot().clone(),
+        ));
+    }
+
+    None
+}
+
+/// KV identity-graph work deferred by [`ec_finalize_response`] until after
+/// the response is sent.
+///
+/// Every branch that produces one has already committed everything the
+/// response needs (cookie, headers) from state already proven correct — this
+/// only carries the follow-up KV persistence. Run it with
+/// [`execute_pending_ec_kv_write`].
+///
+/// Clones so it can ride alongside [`EcContext`] in state that derives
+/// `Clone` (e.g. the Fastly adapter's `EcFinalizeState`).
+#[derive(Clone)]
+pub struct PendingEcKvWrite(PendingEcKvWriteKind);
+
+#[derive(Clone)]
+enum PendingEcKvWriteKind {
+    /// Merge Prebid/`SharedID` EID updates into a just-generated EC entry.
+    GeneratedEnrichment {
+        ec_id: String,
+        updates: Vec<PartnerIdUpdate>,
+        snapshot: EcKvSnapshot,
+    },
+    /// Tombstone the identity-graph rows for a withdrawn EC identity.
+    WithdrawalTombstones { ec_ids: HashSet<String> },
+}
+
+impl PendingEcKvWrite {
+    fn enrichment(ec_id: String, updates: Vec<PartnerIdUpdate>, snapshot: EcKvSnapshot) -> Self {
+        Self(PendingEcKvWriteKind::GeneratedEnrichment {
+            ec_id,
+            updates,
+            snapshot,
+        })
+    }
+
+    fn withdrawal(ec_ids: HashSet<String>) -> Self {
+        Self(PendingEcKvWriteKind::WithdrawalTombstones { ec_ids })
+    }
+}
+
+/// Persists a [`PendingEcKvWrite`] returned by [`ec_finalize_response`].
+///
+/// Intended to run after the response has already been sent to the client.
+/// Errors are logged, not propagated — matching how these same KV operations
+/// are handled when they run synchronously elsewhere in this module.
+pub fn execute_pending_ec_kv_write(
+    graph: &KvIdentityGraph,
+    ec_context: &mut EcContext,
+    pending: PendingEcKvWrite,
+) {
+    match pending.0 {
+        PendingEcKvWriteKind::GeneratedEnrichment {
+            ec_id,
+            updates,
+            snapshot,
+        } => {
+            let merged = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+            ec_context.set_kv_snapshot(merged);
+        }
+        PendingEcKvWriteKind::WithdrawalTombstones { ec_ids } => {
+            apply_withdrawal_tombstones(&ec_ids, |ec_id| {
+                let outcome = graph.write_withdrawal_tombstone(ec_id, |snapshot| {
+                    if ec_context.ec_value() == Some(ec_id) {
+                        ec_context.set_kv_snapshot(snapshot);
+                    }
+                });
+                log_tombstone_outcome(ec_id, outcome);
+            });
         }
     }
 }
@@ -297,11 +390,11 @@ fn finalize_unusable_consent(
     registry: &PartnerRegistry,
     consent_withdrawn: bool,
     response: &mut Response<EdgeBody>,
-) {
+) -> Option<PendingEcKvWrite> {
     clear_ec_headers_on_response(response, Some(registry));
 
     if !(consent_withdrawn && ec_context.cookie_was_present()) {
-        return;
+        return None;
     }
 
     expire_ec_cookie(settings, response);
@@ -310,22 +403,15 @@ fn finalize_unusable_consent(
     let ids_to_withdraw = withdrawal_ec_ids(ec_context);
 
     // The identity-graph tombstone is the authoritative withdrawal marker
-    // for subsequent EC behavior.
-    if let Some(graph) = kv {
-        apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
-            // The graph hands back the post-withdrawal snapshot rather than
-            // leaving the caller to rebuild it, so post-send work that reads
-            // the context — pull sync discloses the raw EC ID to partners —
-            // sees the tombstone that was just written. Only the active ID has
-            // a snapshot in the context to correct.
-            let outcome = graph.write_withdrawal_tombstone(ec_id, |snapshot| {
-                if ec_context.ec_value() == Some(ec_id) {
-                    ec_context.set_kv_snapshot(snapshot);
-                }
-            });
-            log_tombstone_outcome(ec_id, outcome);
-        });
+    // for subsequent EC behavior. The browser cookie above is already
+    // cleared, and pull sync never runs for a request that just withdrew
+    // consent (it requires consent to be granted), so writing the tombstone
+    // is safe to defer until after the response is sent.
+    if kv.is_some() && !ids_to_withdraw.is_empty() {
+        return Some(PendingEcKvWrite::withdrawal(ids_to_withdraw));
     }
+
+    None
 }
 
 /// Records what happened to one withdrawal tombstone.
@@ -621,7 +707,7 @@ mod tests {
         let mut response = empty_response();
         let registry = PartnerRegistry::from_config(&[]).expect("should build registry");
 
-        ec_finalize_response(
+        let pending = ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&kv),
@@ -630,6 +716,9 @@ mod tests {
             None,
             &mut response,
         );
+        if let Some(pending) = pending {
+            execute_pending_ec_kv_write(&kv, &mut ec_context, pending);
+        }
 
         assert!(
             kv.get(&ec_id).expect("should read back").is_none(),
@@ -672,7 +761,7 @@ mod tests {
         let mut response = empty_response();
         let registry = PartnerRegistry::from_config(&[]).expect("should build registry");
 
-        ec_finalize_response(
+        let pending = ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&kv),
@@ -681,6 +770,9 @@ mod tests {
             None,
             &mut response,
         );
+        if let Some(pending) = pending {
+            execute_pending_ec_kv_write(&kv, &mut ec_context, pending);
+        }
 
         let (entry, _) = kv
             .get(&ec_id)
@@ -723,7 +815,7 @@ mod tests {
         set_header(&mut response, "x-ts-ec", "stale");
         let registry = PartnerRegistry::from_config(&[]).expect("should build registry");
 
-        ec_finalize_response(
+        let pending = ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&kv),
@@ -732,6 +824,9 @@ mod tests {
             None,
             &mut response,
         );
+        if let Some(pending) = pending {
+            execute_pending_ec_kv_write(&kv, &mut ec_context, pending);
+        }
 
         let set_cookie = get_header_str(&response, "set-cookie").unwrap_or_default();
         assert!(
@@ -1499,7 +1594,7 @@ mod tests {
         ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec));
         let mut response = empty_response();
 
-        ec_finalize_response(
+        let pending = ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&graph),
@@ -1508,6 +1603,9 @@ mod tests {
             None,
             &mut response,
         );
+        if let Some(pending) = pending {
+            execute_pending_ec_kv_write(&graph, &mut ec_context, pending);
+        }
 
         let (active_stored, _) = graph
             .get(&active_ec)

@@ -89,6 +89,15 @@ pub fn extract_cookie_value<B>(req: &Request<B>, name: &str) -> Option<String> {
 /// Returns an empty string if all cookies were stripped or the input was empty.
 #[must_use]
 pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
+    let needs_stripping = cookie_header.split(';').any(|pair| {
+        pair.split('=')
+            .next()
+            .is_some_and(|name| cookie_names.contains(&name.trim()))
+    });
+    if !needs_stripping {
+        return cookie_header.to_owned();
+    }
+
     cookie_header
         .split(';')
         .map(str::trim)
