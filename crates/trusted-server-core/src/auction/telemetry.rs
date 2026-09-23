@@ -202,7 +202,10 @@ impl AuctionObservationContext {
         }
     }
 
-    /// Record whether the origin readthrough gate admitted this request.
+    /// Record whether this request's origin response would be eligible for readthrough.
+    ///
+    /// A predicate about the request, recorded whether or not `origin_readthrough_enabled`
+    /// is set — not an outcome of the gate.
     pub fn set_origin_cache_shareable(&mut self, shareable: bool) {
         self.origin_cache_shareable = Some(shareable);
     }

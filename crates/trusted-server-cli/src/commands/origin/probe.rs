@@ -365,9 +365,10 @@ async fn probe_one(
         verdicts.push(VerdictResult {
             name: "cookieless-coverage".to_owned(),
             passed: false,
-            detail: "--admission-cookie was sent on every request; cookieless responses were \
-                     not tested. This diagnostic run cannot establish cache safety. Probe \
-                     the origin without --admission-cookie before enabling caching."
+            detail: "TRUSTED_SERVER_PROBE_ADMISSION_COOKIE was sent on every request; \
+                     cookieless responses were not tested. This diagnostic run cannot \
+                     establish cache safety. Unset it and probe the origin again before \
+                     enabling caching."
                 .to_owned(),
         });
     }

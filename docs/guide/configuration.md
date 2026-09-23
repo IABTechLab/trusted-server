@@ -2178,6 +2178,15 @@ ineligible non-ad requests bypass it. Eligible requests are `GET`s with a `Host`
 no disqualifying authorization or cookie, and no remaining conditional or range
 semantics.
 
+**Document requests only.** The gate answers a question about pages — whether the
+origin's HTML may be shared between readers — so it applies to document requests
+(`Sec-Fetch-Dest: document` and equivalents, or a navigation when that header is
+absent). Subresources keep the platform default whether the flag is on or off.
+Judging them on shareability would bypass the edge cache for every cookie-bearing
+or conditional asset request, which is most repeat-visitor asset traffic, and would
+tag every cached asset with `ts-template`, turning the template rollback purge into
+an origin-wide asset flush.
+
 #### This cache has far weaker guarantees than the template cache
 
 Read this before enabling it. The template cache refuses storage on inspection of
@@ -2288,6 +2297,15 @@ saying nothing about this setting.
 3. Objects stored by older versions without readthrough tags remain unreachable
    through these purge keys and must expire on the origin's TTL. Changing the
    origin's TTL does not shorten an already-cached object's lifetime.
+4. **Use `--all` on multi-host or dual-scheme deployments.** The template cache keys
+   on scheme and host, so purging each spelling you serve covers it. Readthrough does
+   not line up the same way: reader URLs that rewrite to one origin URL — `http://`
+   and `https://`, or `www.` and the apex on one service — share a single stored
+   object, tagged with the reader URL of whichever request filled it first. A
+   `--page https://example.com/a` can therefore leave an `http://`-tagged object in
+   place, and the next template miss refetches through it and re-stores the stale page
+   into the freshly purged template cache. If you serve one page under more than one
+   reader-facing spelling, purge with `--all`.
 
 The Fastly SDK attaches these tags to cached objects; production hit and purge
 behavior still requires validation on a deployed service, since Viceroy does not

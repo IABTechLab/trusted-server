@@ -69,8 +69,22 @@ impl PurgeRequest {
                 "scope \"all\" takes no url; did you mean {\"scope\":\"url\",\"url\":…}?"
                     .to_owned(),
             ),
-            ("url", Some(url)) if !url.trim().is_empty() => Ok(Self::Url(url)),
-            ("url", _) => Err("scope \"url\" requires a non-empty url".to_owned()),
+            // Parsed, not merely non-empty. `reader_url_surrogate_key` hashes whatever it
+            // is given, so a path, a scheme-less host, or an `ftp://` URL would be
+            // acknowledged as purged under a key nothing was ever stored with — the exact
+            // silent no-op that key's own documentation calls the failure that matters.
+            // A CMS webhook sending paths would purge nothing and never find out.
+            ("url", Some(url))
+                if url::Url::parse(&url).is_ok_and(|parsed| {
+                    matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+                }) =>
+            {
+                Ok(Self::Url(url))
+            }
+            ("url", _) => Err(
+                "scope \"url\" requires an absolute http(s) url, as a reader addresses the page"
+                    .to_owned(),
+            ),
             (other, _) => Err(format!(
                 "unknown scope {other:?}; expected \"all\" or \"url\""
             )),
@@ -323,6 +337,11 @@ mod tests {
             &br#"{"scope":"everything"}"#[..],
             br#"{"scope":"url"}"#,
             br#"{"scope":"url","url":"   "}"#,
+            // Hashed as given, these would each be acknowledged as purged under a key
+            // that can never match a stored object.
+            br#"{"scope":"url","url":"/article"}"#,
+            br#"{"scope":"url","url":"example.com/article"}"#,
+            br#"{"scope":"url","url":"ftp://example.com/article"}"#,
             br#"{"scope":"all","url":"https://example.com/a"}"#,
             br#"{}"#,
             br#"{"scope":"ALL"}"#,
@@ -332,6 +351,21 @@ mod tests {
             assert!(
                 PurgeRequest::parse(body).is_err(),
                 "{} must not parse",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_reader_facing_url_still_parses() {
+        for body in [
+            &br#"{"scope":"url","url":"https://ts.example.com/article"}"#[..],
+            br#"{"scope":"url","url":"http://ts.example.com/article?a=1"}"#,
+            br#"{"scope":"url","url":"https://ts.example.com"}"#,
+        ] {
+            assert!(
+                PurgeRequest::parse(body).is_ok(),
+                "{} is a URL a reader can address and must still purge",
                 String::from_utf8_lossy(body)
             );
         }

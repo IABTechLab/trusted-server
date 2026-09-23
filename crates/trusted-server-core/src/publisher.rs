@@ -4093,20 +4093,30 @@ fn apply_origin_cache_intent(
     readthrough_enabled: bool,
     origin_response_is_shareable: bool,
     should_run_ad_stack: bool,
+    request_is_document: bool,
     reader_url: &str,
 ) -> PlatformHttpRequest {
     // With the opt-in disabled, preserve the existing policy: ad-serving requests
     // bypass and other publisher requests use the platform default. Enabling the flag
     // replaces that policy with request shareability, both widening eligible ad traffic
-    // and tightening non-ad traffic that carries disqualifying reader state.
-    let bypass = if readthrough_enabled {
+    // and tightening non-ad *document* traffic that carries disqualifying reader state.
+    //
+    // Documents only. Subresources keep the platform default, because the readthrough
+    // gate answers a question about pages: whether the origin's HTML may be shared
+    // between readers. Judging them on it would bypass the edge cache for every
+    // cookie-bearing or conditional asset request — browsers send first-party cookies on
+    // subresources, so that is most repeat-visitor asset traffic — and would tag every
+    // cached asset with `ts-template`, turning the template rollback lever into an
+    // origin-wide asset flush.
+    let readthrough_applies = readthrough_enabled && request_is_document;
+    let bypass = if readthrough_applies {
         !origin_response_is_shareable
     } else {
         should_run_ad_stack
     };
     if bypass {
         request.with_cache_bypass()
-    } else if readthrough_enabled {
+    } else if readthrough_applies {
         // The same reader-facing key and all-scope key used by the purge endpoint.
         // Fastly accepts multiple space-separated surrogate keys without changing TTL.
         request.with_shared_cache(format!(
@@ -4424,6 +4434,9 @@ pub async fn handle_publisher_request(
         || datadome_suppression_requires_origin;
 
     let method_is_cacheable = req.method() == Method::GET;
+    // Read while the request is still in hand: the readthrough policy below applies to
+    // documents only, and the origin send consumes these headers.
+    let request_is_document = is_html_document_request(&req);
     let shared_request_inputs = SharedRequestInputs {
         method_is_cacheable,
         host_present: !request_host.is_empty(),
@@ -4492,12 +4505,13 @@ pub async fn handle_publisher_request(
     }
     // Capture the reader URL before origin rewriting, including its query. Inline
     // assembly has no template key, but readthrough still needs both purge scopes.
-    let readthrough_reader_url = if origin_readthrough_enabled && origin_response_is_shareable {
-        let path = req.uri().path_and_query().map_or("/", |path| path.as_str());
-        format!("{request_scheme}://{request_host}{path}")
-    } else {
-        String::new()
-    };
+    let readthrough_reader_url =
+        if origin_readthrough_enabled && origin_response_is_shareable && request_is_document {
+            let path = req.uri().path_and_query().map_or("/", |path| path.as_str());
+            format!("{request_scheme}://{request_host}{path}")
+        } else {
+            String::new()
+        };
     let template_cache_key =
         request_can_use_shared_template.then(|| crate::platform::TemplateCacheKey {
             url: target_uri.to_string(),
@@ -4558,6 +4572,7 @@ pub async fn handle_publisher_request(
             origin_readthrough_enabled,
             origin_response_is_shareable,
             should_run_ad_stack,
+            request_is_document,
             &readthrough_reader_url,
         );
         pending_origin = Some(
@@ -4868,6 +4883,7 @@ pub async fn handle_publisher_request(
             origin_readthrough_enabled,
             origin_response_is_shareable,
             should_run_ad_stack,
+            request_is_document,
             &readthrough_reader_url,
         );
         services.http_client().send(platform_request).await
@@ -10151,6 +10167,49 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn enabled_readthrough_still_preserves_subresource_caching() {
+            // Browsers send first-party cookies on subresources, so judging assets on
+            // shareability would bypass the edge cache for most repeat-visitor asset
+            // traffic — and tag the rest with `ts-template`, so the template rollback
+            // purge would flush every cached asset at once.
+            for cookie in [None, Some("ts-ec=abc")] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services =
+                    services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+                let settings = Arc::new(settings_with_readthrough_enabled("inline"));
+                stub.push_response_with_headers(
+                    200,
+                    b"body {}".to_vec(),
+                    vec![
+                        ("content-type", "text/css"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+                let mut request = HttpRequest::builder()
+                    .uri("https://ts.example.com/style.css")
+                    .header(header::HOST, "ts.example.com")
+                    .header("sec-fetch-dest", "style")
+                    .body(EdgeBody::empty())
+                    .expect("should build an asset request");
+                if let Some(cookie) = cookie {
+                    request.headers_mut().insert(
+                        header::COOKIE,
+                        HeaderValue::from_str(cookie).expect("should build a cookie header"),
+                    );
+                }
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Default],
+                    "the opt-in governs documents; a subresource keeps the platform default \
+                     (cookie={cookie:?})"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn disabled_readthrough_preserves_non_ad_preload_caching() {
             let stub = Arc::new(StubHttpClient::new());
             let services = services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
@@ -10175,15 +10234,20 @@ mod tests {
                     reader_url_surrogate_key("https://example.com/article")
                 ),
             };
-            for (enabled, shareable, ad_stack, expected) in [
-                (false, false, false, PlatformCacheIntent::Default),
-                (false, false, true, PlatformCacheIntent::Bypass),
-                (false, true, false, PlatformCacheIntent::Default),
-                (false, true, true, PlatformCacheIntent::Bypass),
-                (true, false, false, PlatformCacheIntent::Bypass),
-                (true, false, true, PlatformCacheIntent::Bypass),
-                (true, true, false, shared.clone()),
-                (true, true, true, shared),
+            for (enabled, shareable, ad_stack, document, expected) in [
+                (false, false, false, true, PlatformCacheIntent::Default),
+                (false, false, true, true, PlatformCacheIntent::Bypass),
+                (false, true, false, true, PlatformCacheIntent::Default),
+                (false, true, true, true, PlatformCacheIntent::Bypass),
+                (true, false, false, true, PlatformCacheIntent::Bypass),
+                (true, false, true, true, PlatformCacheIntent::Bypass),
+                (true, true, false, true, shared.clone()),
+                (true, true, true, true, shared),
+                // A subresource keeps the platform default whatever the gate says, so
+                // enabling readthrough never bypasses an asset fetch or tags it for the
+                // template rollback purge.
+                (true, false, false, false, PlatformCacheIntent::Default),
+                (true, true, false, false, PlatformCacheIntent::Default),
             ] {
                 let request = PlatformHttpRequest::new(
                     HttpRequest::builder()
@@ -10197,11 +10261,12 @@ mod tests {
                         enabled,
                         shareable,
                         ad_stack,
+                        document,
                         "https://example.com/article"
                     )
                     .cache_intent,
                     expected,
-                    "should honor the explicit policy (enabled={enabled}, shareable={shareable}, ad_stack={ad_stack})"
+                    "should honor the explicit policy (enabled={enabled}, shareable={shareable}, ad_stack={ad_stack}, document={document})"
                 );
             }
         }

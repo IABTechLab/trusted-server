@@ -1135,16 +1135,9 @@ struct NamedRoute {
 
 /// Every method an admin route must claim to keep non-primary methods from falling
 /// through to the publisher with the `Authorization` header still attached.
-const ALL_ADMIN_METHODS: &[Method] = &[
-    Method::GET,
-    Method::POST,
-    Method::HEAD,
-    Method::OPTIONS,
-    Method::PUT,
-    Method::PATCH,
-    Method::DELETE,
-];
-
+///
+/// Named for the legacy `/admin/*` aliases it was introduced for, and reused by every
+/// route with the same requirement here and in the Axum and Spin adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -1182,7 +1175,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     // The handler answers the non-POST methods with 405 itself.
     NamedRoute {
         path: "/_ts/admin/cache/purge",
-        primary_methods: ALL_ADMIN_METHODS,
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::AdminCachePurge,
     },
     // Admin EC lookup: the bare route reads the EC ID from the caller's
