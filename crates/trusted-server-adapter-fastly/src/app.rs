@@ -243,10 +243,11 @@ struct CachedApp {
 /// Building the app (config + secret store reads, settings validation,
 /// auction plan compilation, integration registry construction, route table
 /// registration) is the single largest per-request cost in this adapter —
-/// see the TTFB investigation this cache resolves. This pays off because
-/// Fastly's reusable sandbox mode keeps a warm instance alive across
-/// requests; correctness never depends on reuse actually happening — a cold
-/// instance still falls back to the uncached build exactly as before.
+/// see the TTFB investigation this cache resolves. This pays off only because
+/// the entry point in `main.rs` opts into Fastly's reusable sandboxes, so a
+/// warm instance serves many requests; correctness never depends on reuse
+/// actually happening — a cold instance still falls back to the uncached
+/// build exactly as before.
 ///
 /// A plain [`Mutex`] is used rather than relying on Fastly's single-request-
 /// per-instance execution model, since that model is not part of this

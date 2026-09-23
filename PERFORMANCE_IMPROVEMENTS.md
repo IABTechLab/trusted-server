@@ -46,17 +46,29 @@ integration test.
 
 6. **Cache `template_fingerprint`**
    (`publisher.rs`, `platform/types.rs`, `app.rs`)
-   `template_fingerprint(settings)` serializes the *entire* settings struct
+   `template_fingerprint(settings)` serializes the _entire_ settings struct
    to JSON and SHA-256-hashes it — this was recomputed on every eligible
    publisher request. It's now computed once per `AppState` build and
    threaded through `RuntimeServices` as an optional field (defaults to
    `None`, so Axum/Cloudflare/Spin — untouched by this change — keep
    recomputing it exactly as before).
 
+7. **Reuse Wasm instances across requests (`Serve` loop)** (`main.rs`)
+   Fastly starts a fresh Wasm instance per request unless the program opts
+   into reusable sandboxes. `main()` previously handled a single
+   `FastlyRequest::from_client()` and exited, so `AppCache` (#5) could never
+   hit, on Fastly or under Viceroy, and every request paid its miss path on
+   top of the full rebuild. `main()` now runs `fastly::http::serve::Serve`,
+   so one instance serves up to `MAX_REQUESTS_PER_INSTANCE` (1000) requests,
+   exits after `INSTANCE_IDLE_TIMEOUT` (1 s) without a new request, and
+   stops accepting requests past `MAX_INSTANCE_MEMORY_MIB` (128 MiB). The
+   global logger is installed once per instance, since installing it twice
+   panics.
+
 ## Behavior regressions
 
-None found in testing. Two narrow, intentional behavior changes are worth
-knowing about — both are deliberate tradeoffs, not bugs:
+None found in testing. Four narrow, intentional behavior changes are worth
+knowing about — all are deliberate tradeoffs, not bugs:
 
 - **EC-finalize cookie/KV race (#1).** Previously, if the EID-merge KV
   read-back raced and observed a stale `Missing`/`Failed` state immediately
@@ -72,15 +84,27 @@ knowing about — both are deliberate tradeoffs, not bugs:
   don't change its content hash. This is an explicit, bounded tradeoff (the
   TTL backstop), not unbounded staleness — tune `APP_CACHE_TTL` in `app.rs`
   if a tighter window is wanted.
+- **Process-global state now outlives a request (#7).** Anything in a
+  `static` is shared by every request an instance serves. An audit of the
+  adapter, core, and `edgezero-adapter-fastly` found only compiled regexes,
+  fixed lookup tables, bounded or TTL-expiring caches, and log-once flags
+  (for example, the missing-geo consent warning now logs once per instance
+  rather than once per request). Environment variables read at request time
+  are per-instance constants. New `static` state must stay safe to share
+  across requests.
+- **Idle instances are billed (#7).** An instance waiting for its next
+  request keeps its memory and wall-clock time, which is why the idle
+  timeout is short. Tune the three limits in `main.rs` against production
+  traffic.
 
 ## Performance: before → after
 
 ### I/O deferrals (#1, #3) — structurally correct, not visible under Viceroy
 
-| Fix | Viceroy TTFB before → after |
-|---|---|
-| Defer EC-finalize KV write | 2.43ms → 2.41ms (flat) |
-| Dedupe geo lookup | 2.45ms → 2.44ms (flat) |
+| Fix                        | Viceroy TTFB before → after |
+| -------------------------- | --------------------------- |
+| Defer EC-finalize KV write | 2.43ms → 2.41ms (flat)      |
+| Dedupe geo lookup          | 2.45ms → 2.44ms (flat)      |
 
 Both remove a network round-trip to Fastly's KV/geo services. Viceroy's local
 KV/geo backends are in-memory with near-zero latency, so there's no real
@@ -90,11 +114,11 @@ production network-latency backends.
 
 ### CPU-bound work removed (#2, #5, #6) — measurable, real wins
 
-| Fix | Before | After | Delta |
-|---|---|---|---|
-| Memoized `js_module_ids` (same-run comparison) | 84-89 ns/call | 12 ns/call | **~6-7x faster** |
-| `AppCache`, settings/registry-dominated endpoint | ~4,800-8,100 perf samples / 400 reqs | ~0 samples / 400 reqs | Near-total elimination |
-| `AppCache` + `template_fingerprint`, full page render (`perf stat`, precise cycle count) | 6,470,830,488 cycles / 400 reqs | 6,384,503,694 cycles / 400 reqs | **~1.3% fewer cycles** |
+| Fix                                                                                      | Before                               | After                           | Delta                  |
+| ---------------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------- | ---------------------- |
+| Memoized `js_module_ids` (same-run comparison)                                           | 84-89 ns/call                        | 12 ns/call                      | **~6-7x faster**       |
+| `AppCache`, settings/registry-dominated endpoint                                         | ~4,800-8,100 perf samples / 400 reqs | ~0 samples / 400 reqs           | Near-total elimination |
+| `AppCache` + `template_fingerprint`, full page render (`perf stat`, precise cycle count) | 6,470,830,488 cycles / 400 reqs      | 6,384,503,694 cycles / 400 reqs | **~1.3% fewer cycles** |
 
 The full-page-render number is smaller because HTML rewriting, origin fetch,
 and auction dispatch dominate a real page render's total cost — the same
@@ -102,3 +126,26 @@ absolute savings is a smaller slice of a bigger pie than on a route that does
 almost nothing but settings/registry work. Wall-clock TTFB for the full
 render stayed ~2.3-2.4ms either way; the CPU saving is too small relative to
 total request latency to show up through `curl`'s own timing noise.
+
+### Instance reuse (#7) — what makes `AppCache` pay off
+
+Same Viceroy binary for every build, 6 interleaved rounds of 20 sequential
+requests per endpoint, rotating which build runs first. Values are the median
+of the per-round TTFB p50s.
+
+| Endpoint                           | `main`  | Branch without reuse (#1-#6) | Branch with reuse (#1-#7) |
+| ---------------------------------- | ------- | ---------------------------- | ------------------------- |
+| `/.well-known/trusted-server.json` | 1.49 ms | 3.62 ms                      | **0.25 ms**               |
+| `/static/tsjs=tsjs-unified.min.js` | 3.03 ms | 4.42 ms                      | **0.33 ms**               |
+| `/` (proxied to origin)            | 70.2 ms | 70.9 ms                      | 70.2 ms                   |
+
+Without reuse, every request misses `AppCache` and still pays for the extra
+config-store read and the clones stored for a later hit that never comes, so
+#1-#6 alone were ~1.4-2 ms slower than `main` on these routes. With reuse,
+the cache hits and the per-request rebuild disappears. On a proxied page,
+the origin round trip dominates and the saving is within noise.
+
+The same request sequence (static assets, admin auth, auction, URL signing,
+proxied pages) returned identical statuses, cookies, headers, and bodies with
+and without reuse, and 400 requests over 10 concurrent connections completed
+with no errors.

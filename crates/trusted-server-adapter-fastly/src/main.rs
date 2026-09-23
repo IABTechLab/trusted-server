@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+use std::time::Duration;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
@@ -11,6 +12,7 @@ use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
+use fastly::http::serve::Serve;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::EdgeCacheHeader;
@@ -70,21 +72,51 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     None
 }
 
+/// Maximum downstream requests one reused Wasm instance serves before exiting.
+const MAX_REQUESTS_PER_INSTANCE: usize = 1000;
+
+/// How long an idle instance waits for its next downstream request before exiting.
+///
+/// A waiting instance keeps its memory and is billed for wall-clock time, so
+/// this stays short: reuse pays off under steady traffic, not across lulls.
+const INSTANCE_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Heap size, in mebibytes, past which a reused instance exits instead of
+/// accepting another request, bounding growth from anything retained across
+/// requests.
+const MAX_INSTANCE_MEMORY_MIB: u32 = 128;
+
+/// Installs the global logger once per Wasm instance.
+static LOGGER_INIT: Once = Once::new();
+
 /// Entry point for the Fastly Compute program.
 ///
-/// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
-/// `#[fastly::main]` so the `EdgeZero` streaming publisher path can call
-/// [`fastly::Response::stream_to_client`] explicitly.
+/// Opts into Fastly reusable sandboxes via [`Serve`], so one Wasm instance
+/// handles up to [`MAX_REQUESTS_PER_INSTANCE`] requests. Reuse is what lets
+/// the cross-request app-state cache in [`app`] hit; without it every request
+/// runs on a fresh instance and rebuilds everything.
 fn main() {
-    let req = FastlyRequest::from_client();
+    Serve::new()
+        .with_max_requests(MAX_REQUESTS_PER_INSTANCE)
+        .with_timeout(INSTANCE_IDLE_TIMEOUT)
+        .with_max_memory(MAX_INSTANCE_MEMORY_MIB)
+        .run(handle_request);
+}
 
+/// Handles one downstream request on a possibly reused Wasm instance.
+///
+/// Returns `()` because every path sends its own response, either with
+/// [`fastly::Response::send_to_client`] or, on the `EdgeZero` streaming
+/// publisher path, with [`fastly::Response::stream_to_client`].
+fn handle_request(req: FastlyRequest) {
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
     if let Some(response) = health_response(&req) {
         response.send_to_client();
         return;
     }
 
-    logging::init_logger();
+    // The global logger can only be installed once; a reused instance keeps it.
+    LOGGER_INIT.call_once(logging::init_logger);
     edgezero_main(req);
 }
 
