@@ -6,6 +6,7 @@
 //! Trusted Server edge — not the origin — so they are never probed here; supply
 //! them explicitly if you need to audit them.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -22,6 +23,12 @@ const MAX_DISCOVERED_URLS: usize = 50;
 /// Per-request timeout for origin fetches.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Cap on how many body bytes are read per response. Only the root page's HTML
+/// is ever parsed for discovery; every other body is discarded, so this bounds
+/// a fast link from pulling an unbounded payload (a large image or video) that
+/// the timeout alone would not catch.
+const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Arguments for `ts dev audit headers`.
 #[derive(Debug, clap::Args)]
 pub struct AuditHeadersArgs {
@@ -35,6 +42,11 @@ pub struct AuditHeadersArgs {
     /// Override the origin URL, skipping the config lookup.
     #[arg(long)]
     pub origin: Option<String>,
+    /// Follow discovered asset URLs that resolve to a different origin. By
+    /// default the automatic crawl audits only same-origin assets; explicit
+    /// URLs are always fetched regardless of this flag.
+    #[arg(long)]
+    pub include_cross_origin: bool,
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
     pub json: bool,
@@ -64,10 +76,23 @@ pub(crate) struct ReqwestOriginClient {
 }
 
 impl ReqwestOriginClient {
-    /// Builds a client with a bounded per-request timeout.
+    /// Builds a client with a bounded per-request timeout and no redirect
+    /// following. Redirects are not followed so the audited URL's own cache
+    /// headers are classified on their merits — a long-lived cached 3xx is a
+    /// real misconfiguration this tool should surface, and following would
+    /// silently attribute the final hop's headers to the requested URL.
     pub(crate) fn new() -> CliResult<Self> {
+        // reqwest is built with `rustls-tls-webpki-roots-no-provider`, which
+        // installs no rustls crypto provider. `ts dev proxy` (macOS-only)
+        // installs aws-lc-rs, but on other hosts nothing does, so the first
+        // HTTPS build would panic with "no provider set". Install it here;
+        // `install_default` is idempotent and returns `Err` if one is already
+        // installed (e.g. by the proxy on macOS), which is fine to ignore.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| format!("failed to build HTTP client: {error}"))?;
         Ok(Self { client })
@@ -83,7 +108,12 @@ impl OriginClient for ReqwestOriginClient {
             .map_err(|error| format!("failed to fetch {url}: {error}"))?;
 
         let headers = extract_headers(response.headers());
-        let body = response.text().unwrap_or_default();
+
+        // Read at most MAX_BODY_BYTES: only the root page's HTML is parsed for
+        // discovery, so a truncated body is harmless for every other response.
+        let mut buffer = Vec::new();
+        let _ = response.take(MAX_BODY_BYTES).read_to_end(&mut buffer);
+        let body = String::from_utf8_lossy(&buffer).into_owned();
 
         Ok(OriginResponse { headers, body })
     }
@@ -119,7 +149,10 @@ pub(crate) fn collect_responses(
     }
 }
 
-/// Fetches an explicit list of URLs.
+/// Fetches an explicit list of URLs. A malformed URL is a hard error (operator
+/// typo), but a per-URL fetch failure is tolerated with a warning so one
+/// unreachable URL does not discard the verdicts for the others; only an
+/// all-fail run errors out.
 fn collect_explicit(
     urls: &[String],
     client: &dyn OriginClient,
@@ -127,11 +160,16 @@ fn collect_explicit(
     let mut responses = Vec::with_capacity(urls.len());
     for raw in urls {
         let url = Url::parse(raw).map_err(|error| format!("invalid URL `{raw}`: {error}"))?;
-        let response = client.fetch(&url)?;
-        responses.push(FetchedResponse {
-            url,
-            headers: response.headers,
-        });
+        match client.fetch(&url) {
+            Ok(response) => responses.push(FetchedResponse {
+                url,
+                headers: response.headers,
+            }),
+            Err(error) => log::warn!("skipping {url}: {error}"),
+        }
+    }
+    if responses.is_empty() {
+        return cli_error("all requested URLs failed to fetch");
     }
     // With explicit URLs there is no single origin; report the first host.
     let origin = responses
@@ -152,7 +190,7 @@ fn collect_via_discovery(
         Url::parse(&origin).map_err(|error| format!("invalid origin `{origin}`: {error}"))?;
 
     let root_response = client.fetch(&root)?;
-    let discovered = discover_asset_urls(&root, &root_response.body);
+    let discovered = discover_asset_urls(&root, &root_response.body, args.include_cross_origin);
 
     let mut responses = Vec::with_capacity(discovered.len() + 1);
     responses.push(FetchedResponse {
@@ -207,7 +245,12 @@ fn resolve_origin(args: &AuditHeadersArgs) -> CliResult<String> {
 /// Extracts asset URLs from HTML: `<script src>`, `<img src>`,
 /// `<link rel=stylesheet href>`, and `<link rel=icon href>`, resolved against
 /// the origin and de-duplicated. Falls back to `/favicon.ico`.
-fn discover_asset_urls(base: &Url, html: &str) -> Vec<Url> {
+///
+/// By default only same-origin assets are returned: the automatic crawl must
+/// not wander to third-party or link-local hosts and fold their cache posture
+/// into the audited origin's report. `include_cross_origin` opts into following
+/// off-origin assets (e.g. to audit a CDN's own posture).
+fn discover_asset_urls(base: &Url, html: &str, include_cross_origin: bool) -> Vec<Url> {
     let document = Html::parse_document(html);
     let mut urls = Vec::new();
 
@@ -216,6 +259,7 @@ fn discover_asset_urls(base: &Url, html: &str) -> Vec<Url> {
             return;
         }
         if let Ok(resolved) = base.join(raw)
+            && (include_cross_origin || resolved.origin() == base.origin())
             && !urls.contains(&resolved)
         {
             urls.push(resolved);
@@ -307,6 +351,7 @@ mod tests {
             urls: Vec::new(),
             config: PathBuf::from("trusted-server.toml"),
             origin: Some(origin.to_owned()),
+            include_cross_origin: false,
             json: false,
         }
     }
@@ -323,7 +368,7 @@ mod tests {
               <img src="/logo.png">
             </body></html>
         "#;
-        let urls = discover_asset_urls(&base, html);
+        let urls = discover_asset_urls(&base, html, false);
         assert!(
             urls.contains(&Url::parse("https://origin.example/app.js").unwrap()),
             "should discover script src"
@@ -335,6 +380,42 @@ mod tests {
         assert!(
             urls.contains(&Url::parse("https://origin.example/logo.png").unwrap()),
             "should discover img src"
+        );
+    }
+
+    #[test]
+    fn discovery_excludes_cross_origin_by_default() {
+        let base = Url::parse("https://origin.example").expect("should parse base");
+        let html = r#"
+            <html><head>
+              <script src="https://cdn.other.example/evil.js"></script>
+              <script src="/local.js"></script>
+            </head></html>
+        "#;
+        let urls = discover_asset_urls(&base, html, false);
+        assert!(
+            urls.contains(&Url::parse("https://origin.example/local.js").unwrap()),
+            "should keep the same-origin asset"
+        );
+        assert!(
+            !urls
+                .iter()
+                .any(|url| url.host_str() == Some("cdn.other.example")),
+            "should not follow a cross-origin asset by default"
+        );
+    }
+
+    #[test]
+    fn discovery_includes_cross_origin_when_opted_in() {
+        let base = Url::parse("https://origin.example").expect("should parse base");
+        let html = r#"<html><head>
+              <script src="https://cdn.other.example/lib.js"></script>
+            </head></html>"#;
+        let urls = discover_asset_urls(&base, html, true);
+        assert!(
+            urls.iter()
+                .any(|url| url.host_str() == Some("cdn.other.example")),
+            "should follow a cross-origin asset when opted in"
         );
     }
 
@@ -378,6 +459,7 @@ mod tests {
             urls: vec!["https://origin.example/rtb".to_owned()],
             config: PathBuf::from("trusted-server.toml"),
             origin: None,
+            include_cross_origin: false,
             json: false,
         };
         let (_, responses) = collect_responses(&explicit, &client).expect("should collect");
@@ -396,9 +478,52 @@ mod tests {
             urls: vec!["not a url".to_owned()],
             config: PathBuf::from("trusted-server.toml"),
             origin: None,
+            include_cross_origin: false,
             json: false,
         };
         let error = collect_responses(&explicit, &client).expect_err("should reject invalid URL");
         assert!(error.contains("invalid URL"), "should explain the failure");
+    }
+
+    #[test]
+    fn explicit_urls_tolerate_partial_failure() {
+        // One reachable URL, one unreachable: the audit should keep the good
+        // verdict rather than aborting on the first failure.
+        let client = FakeClient::new().with("https://origin.example/ok", "text/html", "");
+        let explicit = AuditHeadersArgs {
+            urls: vec![
+                "https://origin.example/ok".to_owned(),
+                "https://origin.example/down".to_owned(),
+            ],
+            config: PathBuf::from("trusted-server.toml"),
+            origin: None,
+            include_cross_origin: false,
+            json: false,
+        };
+        let (_, responses) =
+            collect_responses(&explicit, &client).expect("should tolerate one failure");
+        assert_eq!(
+            responses.len(),
+            1,
+            "should keep the reachable URL's response"
+        );
+    }
+
+    #[test]
+    fn explicit_urls_error_when_all_fail() {
+        let client = FakeClient::new();
+        let explicit = AuditHeadersArgs {
+            urls: vec!["https://origin.example/down".to_owned()],
+            config: PathBuf::from("trusted-server.toml"),
+            origin: None,
+            include_cross_origin: false,
+            json: false,
+        };
+        let error =
+            collect_responses(&explicit, &client).expect_err("should error when all URLs fail");
+        assert!(
+            error.contains("all requested URLs failed"),
+            "should explain the all-fail case"
+        );
     }
 }

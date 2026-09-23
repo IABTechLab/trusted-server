@@ -57,12 +57,17 @@ pub(crate) struct AuditReport {
 
 impl AuditReport {
     /// The process exit code the CLI should return: 1 if any group failed,
-    /// 2 if any warned (and none failed), 0 otherwise.
+    /// 3 if any warned (and none failed), 0 otherwise.
+    ///
+    /// 2 is deliberately skipped: `main` exits 2 for any CLI error, so reusing
+    /// it for warnings would make a warn-only audit indistinguishable from an
+    /// audit that never ran (unreachable origin, bad config). CI gates keying
+    /// on the code can then tell "cache warnings" (3) from "audit failed" (2).
     pub(crate) fn exit_code(&self) -> i32 {
         if self.summary.fail > 0 {
             1
         } else if self.summary.warn > 0 {
-            2
+            3
         } else {
             0
         }
@@ -269,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn warn_only_exits_two() {
+    fn warn_only_exits_three() {
         let responses = vec![response(
             "https://origin.example/app.js",
             "application/javascript",
@@ -277,6 +282,10 @@ mod tests {
         )];
         let report = run_analysis("https://origin.example", &responses);
         assert_eq!(report.summary.warn, 1, "non-immutable JS should warn");
-        assert_eq!(report.exit_code(), 2, "warn-only should exit 2");
+        assert_eq!(
+            report.exit_code(),
+            3,
+            "warn-only should exit 3, not 2 (2 is the CLI error code)"
+        );
     }
 }

@@ -3,8 +3,9 @@
 //! Fetches origin responses (explicit URLs, or discovered from the origin root),
 //! classifies them by content type, evaluates each against the cacheability
 //! rules, and renders a per-type pass/warn/fail report. The command exits 1 when
-//! any content-type group fails, 2 when only warnings are present, and 0 when
-//! all pass.
+//! any content-type group fails, 3 when only warnings are present, and 0 when
+//! all pass. Exit 2 is reserved for CLI-level errors (see `main.rs`), so a CI
+//! gate can distinguish cache warnings from an audit that never ran.
 
 mod analyze;
 mod fetch;
@@ -20,7 +21,8 @@ use analyze::AuditReport;
 use fetch::{OriginClient, ReqwestOriginClient, collect_responses};
 
 /// Runs the header audit against a live origin, printing to stdout and returning
-/// the process exit code (0 pass, 1 fail, 2 warn-only).
+/// the process exit code (0 pass, 1 fail, 3 warn-only; 2 is reserved for CLI
+/// errors).
 pub fn run(args: &AuditHeadersArgs) -> Result<i32, String> {
     let client = ReqwestOriginClient::new()?;
     let stdout = std::io::stdout();
@@ -96,6 +98,7 @@ mod tests {
             urls: Vec::new(),
             config: PathBuf::from("trusted-server.toml"),
             origin: Some(origin.to_owned()),
+            include_cross_origin: false,
             json,
         }
     }

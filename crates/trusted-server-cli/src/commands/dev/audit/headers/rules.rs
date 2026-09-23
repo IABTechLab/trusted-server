@@ -203,10 +203,16 @@ impl CacheDirectives {
                 continue;
             }
             if let Some((name, seconds)) = token.split_once('=') {
-                let seconds = seconds.trim_matches('"').parse::<u64>().ok();
+                // Trim whitespace on both sides of the quote-stripping so
+                // `max-age = 3600` and `max-age = "3600"` (legal per HTTP
+                // parameter syntax) still parse.
+                let seconds = seconds.trim().trim_matches('"').trim().parse::<u64>().ok();
                 match name.trim() {
-                    "max-age" => max_age = seconds,
-                    "s-maxage" => s_maxage = seconds,
+                    // First valid occurrence wins: a later malformed or
+                    // duplicate directive must not discard an already-parsed
+                    // value (RFC 9111 §4.2.1 — treat unparseable as absent).
+                    "max-age" => max_age = max_age.or(seconds),
+                    "s-maxage" => s_maxage = s_maxage.or(seconds),
                     _ => {}
                 }
                 tokens.insert(name.trim().to_owned());
@@ -250,17 +256,19 @@ pub(crate) fn evaluate(group: ContentTypeGroup, headers: &ResponseHeaders) -> Ve
     }
 }
 
-/// HTML must not be shared across users: `no-store` alone is sufficient
-/// (RFC 9111 §5.2.2.5), or `private` combined with `no-cache`.
+/// HTML must not be shared across users. `no-store` alone is sufficient
+/// (RFC 9111 §5.2.2.5), as is `private` alone (RFC 9111 §5.2.2.7 — a shared
+/// cache must not store a `private` response). `no-cache` alone is NOT
+/// sufficient: a shared cache may still store the response and, on a 304,
+/// serve one user's body to another.
 fn evaluate_html(headers: &ResponseHeaders) -> Vec<HeaderVerdict> {
     let mut verdicts = Vec::new();
 
-    let expected = "no-store, or private + no-cache";
+    let expected = "no-store, or private";
     match headers.cache_control.as_deref() {
         Some(value) => {
             let directives = CacheDirectives::parse(value);
-            let safe = directives.has("no-store")
-                || (directives.has("private") && directives.has("no-cache"));
+            let safe = directives.has("no-store") || directives.has("private");
             if safe {
                 verdicts.push(HeaderVerdict::pass(
                     "Cache-Control",
@@ -273,7 +281,7 @@ fn evaluate_html(headers: &ResponseHeaders) -> Vec<HeaderVerdict> {
                     Verdict::Fail,
                     Some(value.to_owned()),
                     expected,
-                    "HTML served without no-store (or private + no-cache) risks sharing personalized content across users",
+                    "HTML served without no-store or private risks sharing personalized content across users",
                 ));
             }
         }
@@ -282,7 +290,7 @@ fn evaluate_html(headers: &ResponseHeaders) -> Vec<HeaderVerdict> {
             Verdict::Fail,
             None,
             expected,
-            "HTML has no Cache-Control; set `no-store` to prevent shared caching of personalized content",
+            "HTML has no Cache-Control; set `no-store` or `private` to prevent shared caching of personalized content",
         )),
     }
 
@@ -341,7 +349,8 @@ fn evaluate_immutable(
         verdicts.push(evaluate_etag(headers));
     }
     verdicts.extend(evaluate_surrogate_key(group, headers));
-    verdicts.extend(evaluate_vary(headers, /* flag_wildcard */ false));
+    verdicts.extend(evaluate_surrogate_disables_caching(headers));
+    verdicts.extend(evaluate_vary(headers, /* flag_wildcard */ true));
 
     verdicts
 }
@@ -384,37 +393,63 @@ fn evaluate_image(headers: &ResponseHeaders) -> Vec<HeaderVerdict> {
         )),
     }
 
-    // The CDN TTL (Surrogate-Control max-age, else s-maxage) should be at least
-    // the browser TTL, so the edge does not re-fetch more often than clients.
-    if let Some(surrogate) = headers.surrogate_control.as_deref() {
-        let surrogate_directives = CacheDirectives::parse(surrogate);
-        let cdn_ttl = surrogate_directives
-            .max_age
-            .or(surrogate_directives.s_maxage);
-        let browser_ttl = cache_control
-            .as_ref()
-            .and_then(|directives| directives.max_age);
-        if let (Some(cdn), Some(browser)) = (cdn_ttl, browser_ttl) {
-            if cdn < browser {
-                verdicts.push(HeaderVerdict::flagged(
-                    "Surrogate-Control",
-                    Verdict::Warn,
-                    Some(surrogate.to_owned()),
-                    "CDN max-age >= browser max-age",
-                    "CDN caching shorter than browser caching; raise Surrogate-Control max-age (or s-maxage)",
-                ));
-            } else {
-                verdicts.push(HeaderVerdict::pass(
-                    "Surrogate-Control",
-                    Some(surrogate.to_owned()),
-                    "CDN max-age >= browser max-age",
-                ));
+    // The CDN TTL should be at least the browser TTL, so the edge does not
+    // re-fetch more often than clients. The CDN TTL is resolved from
+    // `Surrogate-Control` max-age first, then a `Cache-Control: s-maxage`
+    // (the standard shared-cache TTL, honored even without Surrogate-Control),
+    // matching the three-level resolution the module documents.
+    let browser_ttl = cache_control
+        .as_ref()
+        .and_then(|directives| directives.max_age);
+    let surrogate_directives = headers
+        .surrogate_control
+        .as_deref()
+        .map(CacheDirectives::parse);
+    let cdn_ttl = surrogate_directives
+        .as_ref()
+        .and_then(|directives| directives.max_age.or(directives.s_maxage))
+        .or_else(|| {
+            cache_control
+                .as_ref()
+                .and_then(|directives| directives.s_maxage)
+        });
+    if let (Some(cdn), Some(browser)) = (cdn_ttl, browser_ttl) {
+        // Label the verdict after whichever header actually supplied the TTL so
+        // it never collides with the cacheability `Cache-Control` verdict above.
+        let (header, actual) = match &headers.surrogate_control {
+            Some(surrogate)
+                if surrogate_directives
+                    .as_ref()
+                    .and_then(|directives| directives.max_age.or(directives.s_maxage))
+                    .is_some() =>
+            {
+                ("Surrogate-Control", surrogate.clone())
             }
+            _ => (
+                "s-maxage",
+                headers.cache_control.clone().unwrap_or_default(),
+            ),
+        };
+        if cdn < browser {
+            verdicts.push(HeaderVerdict::flagged(
+                header,
+                Verdict::Warn,
+                Some(actual),
+                "CDN TTL >= browser TTL",
+                "CDN caching shorter than browser caching; raise the shared-cache TTL (Surrogate-Control max-age or s-maxage)",
+            ));
+        } else {
+            verdicts.push(HeaderVerdict::pass(
+                header,
+                Some(actual),
+                "CDN TTL >= browser TTL",
+            ));
         }
     }
 
     verdicts.extend(evaluate_surrogate_key(ContentTypeGroup::Image, headers));
-    verdicts.extend(evaluate_vary(headers, /* flag_wildcard */ false));
+    verdicts.extend(evaluate_surrogate_disables_caching(headers));
+    verdicts.extend(evaluate_vary(headers, /* flag_wildcard */ true));
 
     verdicts
 }
@@ -480,6 +515,29 @@ fn evaluate_surrogate_no_store(
             recommendation,
         )
     })
+}
+
+/// On a cacheable group, a `Surrogate-Control` that forbids edge caching
+/// (`no-store` / `private` / `no-cache`, or a zero TTL) defeats the point of a
+/// cacheable asset. Numeric-TTL cases like `max-age=0` are already caught by the
+/// CDN-vs-browser comparison, so this covers the token-only directives that
+/// carry no numeric value.
+fn evaluate_surrogate_disables_caching(headers: &ResponseHeaders) -> Option<HeaderVerdict> {
+    let value = headers.surrogate_control.as_deref()?;
+    let directives = CacheDirectives::parse(value);
+    let disables =
+        directives.has("no-store") || directives.has("private") || directives.has("no-cache");
+    if disables {
+        Some(HeaderVerdict::flagged(
+            "Surrogate-Control",
+            Verdict::Warn,
+            Some(value.to_owned()),
+            "should allow CDN caching",
+            "Surrogate-Control disables edge caching for a cacheable asset; the CDN will not cache it",
+        ))
+    } else {
+        None
+    }
 }
 
 /// `Surrogate-Key` enables targeted CDN purge; absence is a warning on
@@ -686,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn vary_wildcard_warns_only_for_html() {
+    fn vary_wildcard_warns_on_html() {
         let html = evaluate(
             ContentTypeGroup::Html,
             &ResponseHeaders {
@@ -761,6 +819,128 @@ mod tests {
             Verdict::rollup(std::iter::empty()),
             Verdict::Pass,
             "empty should default to pass"
+        );
+    }
+
+    #[test]
+    fn html_passes_on_private_alone() {
+        // RFC 9111 §5.2.2.7: `private` alone forbids a shared cache from storing
+        // the response, so `private, max-age=0` is a correct personalized-HTML
+        // posture and must not fail.
+        let verdicts = evaluate(
+            ContentTypeGroup::Html,
+            &headers_with(Some("private, max-age=0")),
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Pass,
+            "private alone should satisfy HTML"
+        );
+    }
+
+    #[test]
+    fn vary_wildcard_warns_on_all_cacheable_groups() {
+        // Vary: * makes a response uncacheable by any cache, so it must be
+        // flagged on the immutable/cacheable groups where it is most damaging,
+        // not only on HTML.
+        for group in [
+            ContentTypeGroup::JavaScript,
+            ContentTypeGroup::Image,
+            ContentTypeGroup::StaticAsset,
+        ] {
+            let verdicts = evaluate(
+                group,
+                &ResponseHeaders {
+                    cache_control: Some("public, max-age=31536000, immutable".to_owned()),
+                    surrogate_key: Some("k".to_owned()),
+                    etag: Some("\"abc\"".to_owned()),
+                    vary: Some("*".to_owned()),
+                    ..ResponseHeaders::default()
+                },
+            );
+            assert_eq!(
+                verdict_for(&verdicts, "Vary"),
+                Verdict::Warn,
+                "Vary: * should warn on {}",
+                group.label()
+            );
+        }
+    }
+
+    #[test]
+    fn image_honors_cache_control_s_maxage_as_cdn_ttl() {
+        // A standard `Cache-Control: s-maxage` shared-cache TTL below the browser
+        // max-age should warn even without a Surrogate-Control header.
+        let verdicts = evaluate(
+            ContentTypeGroup::Image,
+            &ResponseHeaders {
+                cache_control: Some("public, max-age=86400, s-maxage=60".to_owned()),
+                surrogate_key: Some("img".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "s-maxage"),
+            Verdict::Warn,
+            "s-maxage below browser TTL should warn via Cache-Control"
+        );
+    }
+
+    #[test]
+    fn cacheable_group_flags_surrogate_control_no_store() {
+        // An image with a perfectly cacheable Cache-Control but
+        // Surrogate-Control: no-store is not cached by the CDN — must not pass.
+        let verdicts = evaluate(
+            ContentTypeGroup::Image,
+            &ResponseHeaders {
+                cache_control: Some("public, max-age=86400".to_owned()),
+                surrogate_control: Some("no-store".to_owned()),
+                surrogate_key: Some("img".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Surrogate-Control"),
+            Verdict::Warn,
+            "Surrogate-Control: no-store should warn on a cacheable image"
+        );
+    }
+
+    #[test]
+    fn max_age_with_spaces_around_equals_parses() {
+        let verdicts = evaluate(
+            ContentTypeGroup::JavaScript,
+            &ResponseHeaders {
+                cache_control: Some("public, max-age = 31536000, immutable".to_owned()),
+                surrogate_key: Some("js".to_owned()),
+                etag: Some("\"abc\"".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Pass,
+            "whitespace around `=` should not lose the max-age value"
+        );
+    }
+
+    #[test]
+    fn duplicate_or_malformed_directive_keeps_first_valid_value() {
+        // RFC 9111 §4.2.1: a later malformed/duplicate directive is treated as
+        // absent, not allowed to discard an already-parsed value.
+        let verdicts = evaluate(
+            ContentTypeGroup::JavaScript,
+            &ResponseHeaders {
+                cache_control: Some("public, immutable, max-age=31536000, max-age=foo".to_owned()),
+                surrogate_key: Some("js".to_owned()),
+                etag: Some("\"abc\"".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Pass,
+            "a trailing malformed max-age must not null the valid one"
         );
     }
 }

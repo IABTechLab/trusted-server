@@ -28,8 +28,10 @@ pub fn run(command: &DevAuditCommand) -> Result<(), String> {
     match command {
         DevAuditCommand::Headers(args) => {
             let exit_code = headers::run(args)?;
-            // 0 means every content-type group passed; 1 (a group failed) and 2
-            // (warnings only) are surfaced as process exit codes for CI gating.
+            // 0 means every content-type group passed. Non-zero audit outcomes
+            // (1 = a group failed, 3 = warnings only) are surfaced as process
+            // exit codes for CI gating. 3 is used for warnings rather than 2
+            // because `main` already exits 2 for any CLI error.
             if exit_code == 0 {
                 Ok(())
             } else {
