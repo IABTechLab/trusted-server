@@ -801,6 +801,57 @@ fn explicit_path_reports_address_literals_and_punctuation_hosts() {
         .stdout(predicate::str::contains("192.0.2.2"));
 }
 
+/// Both round-3 findings were reported against staged mode as well as
+/// explicit-path mode, so lock the binary-observable behaviour there:
+/// the pre-commit hook runs this path.
+#[test]
+fn staged_reports_punctuation_and_idna_hosts() {
+    let temp = repo_with_initial_commit();
+    let repo = gix::open(temp.path()).expect("should reopen repo");
+    std::fs::write(
+        temp.path().join("bad.js"),
+        concat!(
+            "const a = \"https://example.com;unapproved.internal/\";\n",
+            "const b = \"//service.xn--0zwm56d/path\";\n",
+        ),
+    )
+    .expect("should write bad.js");
+    common::stage_all(&repo);
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "--staged"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "disallowed host example.com;unapproved.internal",
+        ))
+        .stdout(predicate::str::contains(
+            "disallowed host service.xn--0zwm56d",
+        ));
+}
+
+/// The mirror: trailing source punctuation must not be reported as part
+/// of a host, so an allowlisted URL in ordinary source stays clean.
+#[test]
+fn staged_allows_allowlisted_host_with_trailing_punctuation() {
+    let temp = repo_with_initial_commit();
+    let repo = gix::open(temp.path()).expect("should reopen repo");
+    std::fs::write(
+        temp.path().join("ok.js"),
+        concat!(
+            "// see [docs](https://github.com) for details\n",
+            "const u = new URL('https://github.com').href;\n",
+        ),
+    )
+    .expect("should write ok.js");
+    common::stage_all(&repo);
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "--staged"])
+        .assert()
+        .code(0);
+}
+
 #[test]
 fn explicit_missing_path_exits_two() {
     let temp = tempfile::tempdir().expect("should create tempdir");

@@ -700,7 +700,7 @@ authority**, and a second step canonicalises it.
 text of a negated class:
 
 ```
-/?\#\s"'`(){}[],;<>|\
+/?\#\s"`{}[]<>|\
 ```
 
 This is a _delimiter_ list, not an allow-list. An allow-list of
@@ -713,30 +713,53 @@ ends it, and the whole token is judged after canonicalisation. The rule
 is that **matching never stops early inside a host**.
 
 For the same reason the class holds only characters that end an
-authority for _every_ reader of the line. `!`, `$`, `&`, `=`, and `*`
-are not among them: WHATWG host parsing accepts all five inside a
-hostname, so `https://github.com!unapproved.internal/` names a host a
-browser really resolves, and a headless-Chromium probe confirmed the
-request goes out with that full hostname. Terminating on them handed
-the allowlist the `github.com` prefix and passed the URL. The cost of
-scanning them as part of the authority is that a chain like
-`?next=https://a.example&then=https://b.example` reads as one long
-host: a visible false positive an operator can suppress, which is the
-safer direction to be wrong in.
+authority for _every_ reader of the line. `!`, `$`, `&`, `=`, `*`, `;`,
+`,`, `(`, `)` and `'` are not among them: WHATWG host parsing accepts
+all of them inside a hostname, so
+`https://github.com!unapproved.internal/` and
+`https://example.com;unapproved.internal/` name hosts a browser really
+resolves, and a headless-Chromium probe confirmed the request goes out
+with the full hostname. Terminating on them handed the allowlist the
+`github.com` / `example.com` prefix and passed the URL.
 
-Two prefixes are trimmed from a captured authority before
-canonicalisation, because in source they are not part of the host:
+What remains are the characters that genuinely cannot appear in a host
+(`/`, `?`, `#`, whitespace, `<`, `>`, `|`, `\`, `"`, backtick) plus the
+bracket and brace pairs:
 
-- A trailing `$` or `#` — the position where a `${...}` interpolation
-  opened, since the capture stops at the `{`. Without this,
-  `http://127.0.0.1:${PORT}` reported the host `127.0.0.1:$` instead
-  of the allowed loopback address. Only a `$` that _ends_ the capture
-  is trimmed; one inside the authority stays, so
-  `github.com$unapproved.internal` is still reported whole.
-- A leading `*.` wildcard label — a config pattern for the host it
-  expands to, so `"https://*.googletagmanager.com"` is judged as
-  `googletagmanager.com`. Only a leading label is stripped, so
-  `github.com*unapproved.internal` is still reported whole.
+- `[` and `]` stay because the URL parser rejects them outright outside
+  an IPv6 literal, which the regex captures with a dedicated branch.
+- `{` and `}` stay because they enclose interpolation rather than
+  appearing in hosts. This was measured, not assumed: dropping them
+  turned every `format!("https://{host}{path}")` in the workspace into
+  a violation — 115 new false positives across a full-repo scan,
+  against 3 real hosts recovered.
+
+**Trimming instead of terminating.** The characters removed from the
+class are handled after capture, which is where source punctuation
+lands. This keeps an embedded occurrence in the host (so
+`example.com;unapproved.internal` is reported whole and the prefix
+bypass stays closed) while excluding a trailing one:
+
+- Everything from a `'` onwards is cut, since a quote inside a captured
+  authority marks where the source string closed and the rest is code:
+  `expect(new URL('https://pub.example.com').href)` captured
+  `pub.example.com').href` and now yields `pub.example.com`. A URL
+  inside a quoted string cannot contain the quote anyway.
+- A trailing `$`, `#`, `*`, `(`, `)`, `,`, `;`, `!`, `&` or `=` is then
+  trimmed. `$` and `#` are the position where a `${...}` interpolation
+  opened, since the capture stops at the `{`: without this,
+  `http://127.0.0.1:${PORT}` reported `127.0.0.1:$` instead of the
+  allowed loopback. `)` closes a Markdown link, `,` and `;` separate
+  list items and statements.
+- A leading `*.` wildcard label is stripped as a config pattern for the
+  host it expands to, so `"https://*.googletagmanager.com"` is judged
+  as `googletagmanager.com`.
+
+Only the leading label and the trailing run are affected, so
+`github.com$unapproved.internal`, `github.com*unapproved.internal` and
+`example.com(unapproved.internal` are all still reported whole. On a
+full-repo scan this combination holds the violation count exactly level
+with the narrower class while closing the bypass.
 
 **Absolute URL regex:**
 
@@ -814,6 +837,13 @@ is then seen as the URL it decodes to.
   the real suffix is percent-encoded (`//github.com%2eevil%2ecom`
   reported `github.com`). It is applied after canonicalisation
   instead, where `%2e` has already become `.`.
+- **IDNA top-level domains satisfy the dotted-suffix rule.**
+  Canonicalisation maps a Unicode TLD to its punycode form, which
+  carries `xn--` and therefore hyphens and digits, so an
+  ASCII-alphabetic-only test discarded it: `//service.测试/path` and its
+  `//service.xn--0zwm56d/path` spelling both passed every scan mode
+  while the same host prefixed with `https:` was correctly rejected. A
+  suffix that is alphabetic **or** begins `xn--` is accepted.
 - **Address literals are exempt from the dotted-suffix rule.**
   `//192.0.2.1/path` and `//[2001:db8::1]/path` are valid
   protocol-relative URLs naming a direct endpoint, but an IPv4 address

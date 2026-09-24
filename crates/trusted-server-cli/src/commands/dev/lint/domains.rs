@@ -343,19 +343,32 @@ mod allow_check_tests {
 /// canonicalisation by [`canonical_host`].
 ///
 /// For the same reason the class holds only characters that end an
-/// authority for *every* reader of the line. `!`, `$`, `&`, `=`, and
-/// `*` are not among them: the WHATWG parser accepts all five inside a
-/// hostname, so `https://github.com!unapproved.internal/` names a host
-/// a browser will really resolve. Terminating on them handed the
-/// allowlist the `github.com` prefix and passed the URL. They are
-/// therefore scanned as part of the authority, at the cost of reading a
-/// chain like `?next=https://a.example&then=https://b.example` as one
-/// long host: a visible false positive an operator can suppress, which
-/// is the safer direction to be wrong in.
+/// authority for *every* reader of the line. `!`, `$`, `&`, `=`, `*`,
+/// `;`, `,`, `(`, `)`, and `'` are not among them: the WHATWG parser
+/// accepts all of them inside a hostname, so
+/// `https://github.com!unapproved.internal/` and
+/// `https://example.com;unapproved.internal/` name hosts a browser will
+/// really resolve. Terminating on them handed the allowlist the
+/// `github.com` / `example.com` prefix and passed the URL.
+///
+/// What remains are the characters that genuinely cannot be in a host
+/// (`/`, `?`, `#`, whitespace, `<`, `>`, `|`, `\`, `"`, backtick) plus
+/// the bracket and brace pairs. `[` and `]` are kept because the URL
+/// parser rejects them outright outside an IPv6 literal, which the
+/// regex captures with a dedicated branch. `{` and `}` are kept because
+/// they enclose interpolation rather than appearing in hosts: dropping
+/// them turned every `format!("https://{host}{path}")` in the workspace
+/// into a violation (measured: 115 new false positives across a
+/// full-repo scan, against 3 real hosts recovered).
+///
+/// The characters that were removed are instead trimmed from the *end*
+/// of a capture by [`trim_trailing_source_punctuation`], which is where
+/// source punctuation lands, so an embedded one still reaches the
+/// allowlist while a trailing one does not become part of the host.
 ///
 /// The inner text of that class (no enclosing brackets), so callers can
 /// splice it into either a negated or a positive character class.
-const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#\s"'`(){}\[\],;<>|\\"#;
+const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#\s"`{}\[\]<>|\\"#;
 
 /// Optional RFC 3986 `userinfo@` prefix, as an inner regex fragment.
 ///
@@ -423,22 +436,46 @@ fn strip_wildcard_label(authority: &str) -> &str {
     authority.strip_prefix("*.").unwrap_or(authority)
 }
 
-/// Trim a template-interpolation span from the end of a captured
-/// authority.
+/// Punctuation trimmed from the end of a captured authority.
 ///
-/// `$` is a legal hostname character, so it cannot be a terminator
-/// without reopening the `github.com$unapproved.internal` bypass. But
-/// in source it usually opens an interpolation whose braces the
-/// authority capture stops at, leaving a `$` stranded on the host:
-/// `http://127.0.0.1:${PORT}` captured `127.0.0.1:$` and reported a
-/// loopback address the allowlist would otherwise have permitted.
+/// Every one of these is legal inside a WHATWG hostname, so none can
+/// terminate the authority capture without handing the allowlist a
+/// prefix of the real host. In source, though, they overwhelmingly
+/// appear *after* a URL rather than inside one:
 ///
-/// Only a `$` or `#` that ends the capture is trimmed -- the position
-/// where an interpolation must have opened. One in the middle of the
-/// authority is left alone, so an attacker cannot hide a host behind
-/// it.
-fn trim_interpolation_start(authority: &str) -> &str {
-    authority.trim_end_matches(['$', '#'])
+/// - `$` opens a `${...}` interpolation whose brace stops the capture,
+///   leaving the `$` stranded (`http://127.0.0.1:${PORT}`).
+/// - `)` closes a Markdown link or a call (`[docs](https://a.example)`).
+/// - `,` and `;` separate list items and statements.
+/// - `(` and `*` round out the pairs so a trailing one is not read as
+///   part of the host.
+///
+/// Trimming is deliberately restricted to the *end* of the capture: an
+/// occurrence inside the authority is preserved and still reaches the
+/// allowlist, so `example.com;unapproved.internal` is reported whole
+/// and the prefix bypass stays closed.
+const TRAILING_SOURCE_PUNCTUATION: &[char] = &['$', '#', '*', '(', ')', ',', ';', '!', '&', '='];
+
+/// Trim trailing source punctuation from a captured authority.
+///
+/// See [`TRAILING_SOURCE_PUNCTUATION`] for why each character is
+/// admitted into the capture and then removed here rather than being
+/// treated as a terminator.
+///
+/// A `'` is handled before that trim, because it is the one admitted
+/// character that reliably marks where the *source string* ended rather
+/// than merely trailing the URL. Everything from it onwards is code, not
+/// host: `expect(u('https://pub.example.com').href)` captured
+/// `pub.example.com').href`. Cutting at the quote leaves
+/// `pub.example.com`, while a quote inside a real authority is not
+/// something a URL in a quoted string can contain anyway -- it would
+/// have closed the string.
+fn trim_trailing_source_punctuation(authority: &str) -> &str {
+    let authority = match authority.find('\'') {
+        Some(i) => &authority[..i],
+        None => authority,
+    };
+    authority.trim_end_matches(TRAILING_SOURCE_PUNCTUATION)
 }
 
 /// Reduce a captured authority to the canonical hostname a browser
@@ -447,7 +484,7 @@ fn trim_interpolation_start(authority: &str) -> &str {
 /// authority the WHATWG parser rejects is reported as written rather
 /// than trimmed to an allowlisted prefix.
 fn canonical_host(authority: &str) -> String {
-    let authority = strip_wildcard_label(trim_interpolation_start(authority));
+    let authority = strip_wildcard_label(trim_trailing_source_punctuation(authority));
     let parsed = Url::parse(&format!("http://{authority}"));
     match parsed.as_ref().ok().and_then(Url::host_str) {
         Some(host) => normalise_host(host),
@@ -668,6 +705,76 @@ mod absolute_url_tests {
         );
     }
 
+    /// Regression: `;`, `,`, `(`, `)` and `'` are accepted inside a
+    /// hostname by the WHATWG parser, so terminating the authority on
+    /// them handed the allowlist an `example.com` prefix and passed a
+    /// URL naming a host a browser really resolves.
+    #[test]
+    fn source_punctuation_does_not_truncate_to_allowlisted_prefix() {
+        for (input, expected) in [
+            (
+                "https://example.com;unapproved.internal/",
+                "example.com;unapproved.internal",
+            ),
+            (
+                "https://example.com,unapproved.internal/",
+                "example.com,unapproved.internal",
+            ),
+            (
+                "https://example.com(unapproved.internal/",
+                "example.com(unapproved.internal",
+            ),
+            (
+                "https://example.com)unapproved.internal/",
+                "example.com)unapproved.internal",
+            ),
+        ] {
+            assert_eq!(
+                extract_absolute_hosts(input),
+                vec![expected],
+                "input: {input}"
+            );
+        }
+    }
+
+    /// The quote cut slices by byte index, so a multi-byte host must
+    /// not panic. IDNA hosts make this reachable rather than theoretical.
+    #[test]
+    fn quote_cut_is_safe_on_multibyte_hosts() {
+        assert_eq!(
+            extract_absolute_hosts("u('https://service.\u{6d4b}\u{8bd5}').href"),
+            vec!["service.xn--0zwm56d"]
+        );
+        // A multi-byte label with no quote at all.
+        assert_eq!(
+            extract_absolute_hosts("https://service.\u{6d4b}\u{8bd5}/path"),
+            vec!["service.xn--0zwm56d"]
+        );
+    }
+
+    /// The same characters trailing a URL are source punctuation, not
+    /// host, and must not be reported as part of it. These are the
+    /// shapes that a full-repo scan turned up.
+    #[test]
+    fn trailing_source_punctuation_is_not_part_of_the_host() {
+        for input in [
+            // Markdown link.
+            "see [the console](https://example.com) for details",
+            // List and statement separators.
+            r#"let hosts = ["https://example.com", "x"];"#,
+            "let u = \"https://example.com\";",
+            // Single-quoted string, then more code on the same line.
+            "expect(new URL('https://example.com').href).toBe(x)",
+            "expect(u('https://example.com')).toBeDefined()",
+        ] {
+            assert_eq!(
+                extract_absolute_hosts(input),
+                vec!["example.com"],
+                "input: {input}"
+            );
+        }
+    }
+
     /// A `$` or `*` that opens source interpolation or a config
     /// wildcard is not part of the host, but one inside the authority
     /// still is -- otherwise trimming would reopen the prefix bypass.
@@ -795,6 +902,13 @@ fn is_address_literal(host: &str) -> bool {
 /// the dotted-suffix filter dropped both -- letting exactly the kind of
 /// hardcoded non-loopback endpoint this linter exists to catch pass
 /// every scan mode.
+///
+/// An IDNA top-level domain is reportable too. Canonicalisation maps a
+/// Unicode TLD to its punycode form, which carries `xn--` and so
+/// contains hyphens and digits: an ASCII-alphabetic-only test discarded
+/// it, and `//service.<unicode-tld>/path` and its
+/// `//service.xn--<label>/path` spelling both passed every scan mode
+/// while the same host prefixed with `https:` was correctly rejected.
 fn is_reportable_host(host: &str) -> bool {
     if is_address_literal(host) {
         return true;
@@ -803,7 +917,7 @@ fn is_reportable_host(host: &str) -> bool {
         Some((label, tld)) => {
             !label.is_empty()
                 && tld.len() >= 2
-                && tld.chars().all(|c| c.is_ascii_alphabetic())
+                && (tld.chars().all(|c| c.is_ascii_alphabetic()) || tld.starts_with("xn--"))
                 && host.chars().next().is_some_and(char::is_alphanumeric)
         }
         None => false,
@@ -902,6 +1016,42 @@ mod protocol_relative_tests {
         assert_eq!(
             extract_protocol_relative_hosts("src=\"//[::1]:8080/x\""),
             vec!["::1"]
+        );
+    }
+
+    /// Regression: canonicalisation maps a Unicode TLD to punycode,
+    /// whose `xn--` prefix carries hyphens and digits. An
+    /// ASCII-alphabetic-only suffix test discarded it, so both
+    /// spellings passed every scan mode while the `https:` form of the
+    /// same host was correctly rejected.
+    #[test]
+    fn extracts_idna_top_level_domains() {
+        let unicode =
+            extract_protocol_relative_hosts("const d = \"//service.\u{6d4b}\u{8bd5}/path\";");
+        assert_eq!(unicode, vec!["service.xn--0zwm56d"]);
+        // The ASCII punycode spelling of the same host.
+        assert_eq!(
+            extract_protocol_relative_hosts("const d = \"//service.xn--0zwm56d/path\";"),
+            vec!["service.xn--0zwm56d"]
+        );
+        // Both spellings must agree with the absolute form.
+        assert_eq!(
+            extract_absolute_hosts("const d = \"https://service.xn--0zwm56d/path\";"),
+            unicode
+        );
+    }
+
+    /// The prefix bypass must stay closed on protocol-relative URLs
+    /// too, while trailing punctuation is still excluded from the host.
+    #[test]
+    fn source_punctuation_is_handled_on_protocol_relative_urls() {
+        assert_eq!(
+            extract_protocol_relative_hosts("src=\"//example.com;unapproved.internal/x\""),
+            vec!["example.com;unapproved.internal"]
+        );
+        assert_eq!(
+            extract_protocol_relative_hosts("see [cdn](//cdn.example.evil) here"),
+            vec!["cdn.example.evil"]
         );
     }
 
