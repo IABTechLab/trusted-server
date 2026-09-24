@@ -3315,6 +3315,7 @@ impl Settings {
         "/_ts/admin/ec",
         "/_ts/admin/ec/{id}",
         "/_ts/admin/eids",
+        "/_ts/admin/cache/purge",
     ];
 
     /// Probes that establish handler coverage for the dynamic
@@ -7384,6 +7385,7 @@ source_domain = "partner.example.com"
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
                 "/_ts/admin/eids",
+                "/_ts/admin/cache/purge",
             ],
             "should report every admin endpoint as uncovered"
         );
@@ -7423,6 +7425,7 @@ source_domain = "partner.example.com"
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
                 "/_ts/admin/eids",
+                "/_ts/admin/cache/purge",
             ],
             "should detect the admin endpoints not covered by the narrow handler"
         );
@@ -7434,7 +7437,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7459,7 +7462,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7542,7 +7545,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7568,7 +7571,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7593,7 +7596,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 

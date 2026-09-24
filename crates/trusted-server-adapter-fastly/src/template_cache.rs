@@ -12,9 +12,7 @@
 //! under `fastly compute serve`, `cargo test-fastly` and the parity suite. It is also
 //! silently dead whenever the origin request is in pass mode, and its closure bounds
 //! (`Fn + Send + Sync`) are incompatible with a platform layer that is `!Send` by
-//! construction. Recorded in the spike plan's Task 3 Step 4 so nobody re-proposes it.
-//!
-//! Spike-only. Remove with the spike.
+//! construction. Recorded here so nobody re-proposes it.
 
 use fastly::cache::core::{CacheKey, Found, Transaction};
 use std::io::Write as _;
@@ -282,6 +280,11 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             .map_err(|e| backend_error(format!("purging invalid template failed: {e:?}")))
     }
 
+    async fn purge_url_surrogate_key(&self, key: &str) -> Result<(), TemplateCacheError> {
+        fastly::http::purge::purge_surrogate_key(key)
+            .map_err(|e| backend_error(format!("purging surrogate key {key} failed: {e:?}")))
+    }
+
     async fn purge_all(&self) -> Result<(), TemplateCacheError> {
         fastly::http::purge::purge_surrogate_key(TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY)
             .map_err(|e| backend_error(format!("purging templates failed: {e:?}")))
@@ -316,6 +319,7 @@ mod tests {
             url: url.to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/page".to_string(),
             origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
             assembly_mode: AssemblyMode::Esi,
             vary_values: vec![trusted_server_core::platform::VaryHeaderValues {
