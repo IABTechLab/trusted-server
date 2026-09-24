@@ -703,7 +703,7 @@ mod tests {
     use super::{
         ConsentPipelineInput, allows_ec_creation, apply_expiration_check,
         apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
-        consent_allows_server_side_auction, has_explicit_ec_withdrawal,
+        consent_allows_server_side_auction, gate_eids_by_consent, has_explicit_ec_withdrawal,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
@@ -1078,6 +1078,36 @@ mod tests {
     /// Helper: builds a TCF consent with configurable Purpose 1 (storage).
     fn make_tcf_with_storage(has_storage: bool) -> TcfConsent {
         TcfBuilder::new().with_storage(has_storage).build()
+    }
+
+    #[test]
+    fn gate_eids_by_consent_strips_every_eid_when_personalization_is_denied() {
+        let context = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(
+                TcfBuilder::new()
+                    .with_storage(true)
+                    .with_personalized_ads(false)
+                    .build(),
+            ),
+            ..ConsentContext::default()
+        };
+
+        // Gating is all-or-nothing across sources; LiveRamp is included here as
+        // the case that motivated this coverage, not as a special case.
+        let gated = gate_eids_by_consent(
+            Some(vec![
+                ("liveramp.com", "opaque-test-envelope"),
+                ("sharedid.org", "shared-test-id"),
+            ]),
+            Some(&context),
+        );
+
+        assert!(
+            gated.is_none(),
+            "should remove every EID when personalization consent is denied"
+        );
     }
 
     #[test]

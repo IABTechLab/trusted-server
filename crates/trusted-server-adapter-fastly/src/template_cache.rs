@@ -322,6 +322,7 @@ mod tests {
                 name: "rsc".to_string(),
                 values: Some(vec![b"1".to_vec()]),
             }],
+            cookie_values: Vec::new(),
             template_fingerprint: "fp".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
         }
