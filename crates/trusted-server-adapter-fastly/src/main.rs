@@ -13,7 +13,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
-use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -39,16 +39,23 @@ mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
+mod sandbox;
 mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, load_settings_from_config_store,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp,
+    load_settings_from_config_store,
 };
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
+use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics};
+// Only the reuse path builds a serving loop, so the retirement snapshots have
+// no consumer in the default build.
+#[cfg(feature = "reusable-sandbox")]
+use crate::sandbox::RetirementCounters;
 
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
@@ -74,9 +81,89 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
 ///
 /// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
 /// `#[fastly::main]` so the `EdgeZero` streaming publisher path can call
-/// [`fastly::Response::stream_to_client`] explicitly.
+/// [`fastly::Response::stream_to_client`] explicitly. It owns the sandbox
+/// lifecycle and delegates each request to [`handle_request`].
+///
+/// Without the `reusable-sandbox` feature this takes one request and returns,
+/// which is the original behaviour. With the feature, the bounds still have to
+/// come from the runtime environment before the SDK serving loop is entered;
+/// an unconfigured or partially configured sandbox stays single-request.
 fn main() {
-    let req = FastlyRequest::from_client();
+    let (mode, diagnostics) = serve_mode();
+
+    // Held outside the sandbox: `serve_custom` owns the `Sandbox` and exposes
+    // no slot for application state that is not the retained payload.
+    let mut startup = StartupDiagnostics::default();
+    for message in diagnostics {
+        startup.push(message);
+    }
+
+    match mode {
+        ServeMode::Single => {
+            // `run_custom` completes the callback's SDK result exactly once.
+            // The callback sends its own response and returns `()`, so there
+            // is no error for the SDK to turn into a second response.
+            let Ok(()) = edgezero_adapter_fastly::lifecycle::run_custom(
+                FastlyRequest::from_client(),
+                |request, sandbox: &mut Sandbox| handle_request(request, sandbox, &mut startup),
+            );
+        }
+        ServeMode::Reuse(limits) => serve_loop(limits, startup),
+    }
+}
+
+/// Serves requests from one sandbox under explicit bounds.
+///
+/// Only compiled with the `reusable-sandbox` feature; [`serve_mode`] can never
+/// return [`ServeMode::Reuse`] without it.
+#[cfg(feature = "reusable-sandbox")]
+fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnostics) {
+    // `serve_custom` owns the `Sandbox` and drops it when serving ends, so the
+    // retirement line reports snapshots taken while it was still borrowed.
+    // `RetirementCounters` reads the attempt count on the way out, so a build
+    // performed by the final callback is included.
+    let mut counters = RetirementCounters::default();
+
+    let summary = edgezero_adapter_fastly::lifecycle::serve_custom(
+        fastly::http::serve::Serve::new()
+            .with_max_requests(limits.max_requests)
+            .with_max_memory(limits.max_memory_mib)
+            .with_max_lifetime(limits.max_lifetime)
+            .with_timeout(limits.timeout),
+        |request, sandbox: &mut Sandbox| {
+            counters.observe(sandbox, |sandbox| {
+                handle_request(request, sandbox, &mut startup);
+            });
+        },
+    );
+
+    log::info!(
+        "sandbox retiring after {} attempted callback(s), {} observed, {} build attempt(s)",
+        summary.requests(),
+        counters.requests(),
+        counters.attempts()
+    );
+}
+
+#[cfg(not(feature = "reusable-sandbox"))]
+fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnostics) {
+    unreachable!("serve_mode never selects reuse without the reusable-sandbox feature")
+}
+
+/// Handles one request end to end, sending its own response.
+///
+/// Returns `()` rather than a response so the streaming publisher path can
+/// call [`fastly::Response::stream_to_client`] itself. The SDK's
+/// `HandlerResult` impl for `()` treats that as already sent.
+///
+/// Every non-panicking path through this function must send exactly once. In a
+/// reused sandbox the SDK refuses to wait for the next request until the
+/// current one is complete, so a missed send stalls the loop rather than
+/// merely dropping one response.
+fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut StartupDiagnostics) {
+    // The framework counts the callback before invoking it, including early
+    // returns, so this is already this request's 1-based ordinal.
+    let ordinal = sandbox.requests();
 
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
     if let Some(response) = health_response(&req) {
@@ -84,14 +171,178 @@ fn main() {
         return;
     }
 
-    logging::init_logger();
-    edgezero_main(req);
+    // Marked complete only once installation succeeds, so a failed install is
+    // retried on a later callback. `setup_once` rolls nothing back, so that is
+    // only correct because `init_logger` is harmless to repeat — see its docs.
+    match sandbox.setup_once(crate::logging::init_logger) {
+        Ok(()) => startup.flush(),
+        Err(error) => {
+            // Logger installation failed, so its own error cannot rely on log.
+            // Keep startup diagnostics pending until installation succeeds.
+            #[allow(clippy::print_stderr, reason = "logger installation failed")]
+            {
+                eprintln!("logger installation failed, retrying next callback: {error}");
+            }
+        }
+    }
+
+    // Correlation is request-local and never retained. `FASTLY_TRACE_ID` names
+    // the sandbox, not the request, so it is not used here. The id rides on the
+    // response only when metrics are enabled; the client request is left
+    // untouched so nothing new reaches origin in the default configuration.
+    let request_id = req
+        .get_client_request_id()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}-{ordinal}", instance_id()));
+
+    edgezero_main(req, sandbox, ordinal, &request_id);
+}
+
+/// Builds the counters snapshot response.
+///
+/// A snapshot only. It reports the sandbox that served *this* probe, which is
+/// not necessarily the sandbox that served any preceding workload request, so
+/// reuse is established from the counters attached to workload responses
+/// rather than from polling this.
+///
+/// `ordinal` is this probe's own 1-based position in the sandbox, which is
+/// also the number of callbacks the sandbox has served including this one.
+/// The lifetime count is therefore not reported separately.
+#[cfg(feature = "reusable-sandbox")]
+fn sandbox_metrics_response(sandbox: &Sandbox, ordinal: u64) -> FastlyResponse {
+    let body = serde_json::json!({
+        "instance": instance_id(),
+        "ordinal": ordinal,
+        "builds": sandbox.initialization_attempts(),
+    });
+
+    FastlyResponse::from_status(fastly::http::StatusCode::OK)
+        .with_header("cache-control", "private, no-store")
+        .with_body_json(&body)
+        .unwrap_or_else(|e| {
+            log::error!("failed to serialize sandbox metrics: {e}");
+            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+        })
+}
+
+/// Attaches sandbox counters only to private, no-store workload responses.
+///
+/// Called before headers are committed, which on the streaming path means
+/// before `stream_to_client`. The counters therefore describe the request up
+/// to commitment and cannot report its eventual outcome; a failure after
+/// commitment is recorded in logs instead and reconciled during analysis.
+fn attach_sandbox_counters(response: &mut HttpResponse, counters: &SandboxCounters) {
+    // Per-request measurements must never be replayed from a cache. Requiring
+    // no-store also excludes browser-cacheable and field-qualified privacy.
+    if !cache_control_headers_have_directive(response.headers(), "private")
+        || !cache_control_headers_have_directive(response.headers(), "no-store")
+    {
+        return;
+    }
+
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (sandbox::HEADER_SANDBOX_INSTANCE, instance_id()),
+        (
+            sandbox::HEADER_SANDBOX_ORDINAL,
+            counters.ordinal.to_string(),
+        ),
+        (sandbox::HEADER_SANDBOX_BUILDS, counters.builds.to_string()),
+        (
+            sandbox::HEADER_SANDBOX_REQUEST_ID,
+            counters.request_id.clone(),
+        ),
+        (sandbox::HEADER_SANDBOX_VCPU_MS, vcpu_ms()),
+        (sandbox::HEADER_SANDBOX_HEAP_MIB, heap_mib()),
+    ] {
+        match edgezero_core::http::HeaderValue::from_str(&value) {
+            Ok(value) => {
+                headers.insert(name, value);
+            }
+            Err(e) => log::warn!("sandbox counter `{name}` is not a valid header value: {e}"),
+        }
+    }
+}
+
+/// Resolves how this sandbox will serve requests.
+///
+/// Without the `reusable-sandbox` feature this is unconditionally
+/// [`ServeMode::Single`] and reads nothing, so the default build does no
+/// startup work the original entry point did not do.
+/// Returns the mode alongside diagnostics that must wait for the logger.
+///
+/// This runs before any logger exists, so the reasons reuse was declined are
+/// carried out rather than logged here, where they would be discarded.
+#[cfg(feature = "reusable-sandbox")]
+fn serve_mode() -> (ServeMode, Vec<String>) {
+    let (raw, diagnostics) = crate::sandbox::read_raw_limits();
+    (crate::sandbox::resolve_mode(raw), diagnostics)
+}
+
+#[cfg(not(feature = "reusable-sandbox"))]
+fn serve_mode() -> (ServeMode, Vec<String>) {
+    (ServeMode::Single, Vec::new())
+}
+
+/// Guest-instance identifier used to attribute requests to a sandbox.
+///
+/// `FASTLY_TRACE_ID` describes the sandbox, which is exactly what is wanted
+/// here and exactly why it must not be used as a request id. An absent value
+/// is reported rather than synthesized, so a measurement run cannot silently
+/// claim reuse it never observed.
+fn instance_id() -> String {
+    // The SDK documents this as the per-sandbox identifier; on wasm32-wasip1
+    // it resolves to `FASTLY_TRACE_ID`, which is why that value must never be
+    // used as a request id.
+    let id = fastly::compute_runtime::sandbox_id();
+    if id.is_empty() {
+        return sandbox::INSTANCE_ID_UNAVAILABLE.to_owned();
+    }
+    id.to_owned()
+}
+
+/// Cumulative guest vCPU milliseconds, or a marker when unsupported.
+fn vcpu_ms() -> String {
+    fastly::compute_runtime::elapsed_vcpu_ms().map_or_else(
+        |_| sandbox::COUNTER_UNSUPPORTED.to_owned(),
+        |v| v.to_string(),
+    )
+}
+
+/// Guest heap snapshot in MiB, or a marker when unsupported.
+fn heap_mib() -> String {
+    fastly::compute_runtime::heap_memory_snapshot_mib().map_or_else(
+        |_| sandbox::COUNTER_UNSUPPORTED.to_owned(),
+        |v| v.to_string(),
+    )
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest) {
+fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, request_id: &str) {
     let runtime_env = runtime_env_config(TrustedServerApp::stores());
     let runtime_stores = RuntimeStoreConfig::from_env(&runtime_env);
+
+    // Short-circuit the sandbox counters probe before app construction. It must
+    // not build the application: polling it would otherwise increment the very
+    // build counter it reports.
+    #[cfg(feature = "reusable-sandbox")]
+    if req.get_method() == FastlyMethod::GET && req.get_path() == sandbox::SANDBOX_METRICS_PATH {
+        match load_settings_from_config_store(&runtime_stores) {
+            Ok(settings) if sandbox::metrics_enabled(&settings) => {
+                sandbox_metrics_response(sandbox, ordinal).send_to_client();
+            }
+            Ok(_) => {
+                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+            }
+            Err(e) => {
+                log::warn!("sandbox metrics endpoint: failed to load settings: {e:?}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+            }
+        }
+        return;
+    }
 
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
@@ -126,8 +377,40 @@ fn edgezero_main(mut req: FastlyRequest) {
             }
         };
 
-    let (app, app_state) = TrustedServerApp::build_app_with_state(&runtime_stores);
+    // Build lazily, once per sandbox. Reached only past the health, JA4, and
+    // counters short-circuits, so none of those pays for construction.
+    //
+    // `initialize` builds only when the sandbox is empty, retains only
+    // success, and returns the error unchanged. A failed build hands back its
+    // error router as the error payload: that serves this request and is then
+    // dropped, so a transient config-store failure cannot pin the sandbox into
+    // permanent error mode, and the next callback retries construction.
+    let failed_build = sandbox
+        .initialize(|| {
+            let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
+            match state {
+                Some(state) => Ok(RetainedApp { app, state }),
+                None => Err(app),
+            }
+        })
+        .err();
+
+    let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
+        match (failed_build.as_ref(), sandbox.state()) {
+            (Some(app), _) => (app, None),
+            (None, Some(retained)) => (&retained.app, Some(Arc::clone(&retained.state))),
+            (None, None) => {
+                log::error!("no application available after initialization");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+                return;
+            }
+        };
+
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
+    let counters =
+        SandboxCounters::capture(sandbox, ordinal, request_id, settings_snapshot.as_deref());
     let trusted_client_ip = settings_snapshot
         .as_deref()
         .and_then(|settings| settings.trusted_client_ip.as_ref());
@@ -220,7 +503,11 @@ fn edgezero_main(mut req: FastlyRequest) {
         if let Some(settings) = settings_snapshot.as_deref() {
             match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
                 Ok(partner_registry) => {
-                    send_edgezero_response(response, request_filter_effects.as_ref());
+                    send_edgezero_response(
+                        response,
+                        request_filter_effects.as_ref(),
+                        counters.as_ref(),
+                    );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
                     return;
                 }
@@ -235,7 +522,11 @@ fn edgezero_main(mut req: FastlyRequest) {
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
                         Ok(partner_registry) => {
-                            send_edgezero_response(response, request_filter_effects.as_ref());
+                            send_edgezero_response(
+                                response,
+                                request_filter_effects.as_ref(),
+                                counters.as_ref(),
+                            );
                             run_edgezero_pull_sync_after_send(
                                 &settings,
                                 &partner_registry,
@@ -257,7 +548,7 @@ fn edgezero_main(mut req: FastlyRequest) {
         }
     }
 
-    send_edgezero_response(response, request_filter_effects.as_ref());
+    send_edgezero_response(response, request_filter_effects.as_ref(), counters.as_ref());
 }
 
 fn edge_error_response(error: EdgeError) -> HttpResponse {
@@ -338,8 +629,25 @@ fn run_edgezero_pull_sync_after_send(
 fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
+    counters: Option<&SandboxCounters>,
 ) {
     apply_terminal_response_effects(&mut response, request_filter_effects);
+
+    // Captured before the body is consumed so post-commitment failures can be
+    // matched back to the response that carried these counters.
+    let counter_context = counters.map_or_else(String::new, |counters| {
+        format!(
+            " [instance={} ordinal={} request={}]",
+            instance_id(),
+            counters.ordinal,
+            counters.request_id
+        )
+    });
+
+    // Before headers commit, including before `stream_to_client` below.
+    if let Some(counters) = counters.as_ref() {
+        attach_sandbox_counters(&mut response, counters);
+    }
 
     let (parts, body) = response.into_parts();
 
@@ -353,11 +661,19 @@ fn send_edgezero_response(
             match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
                 Ok(()) => {
                     if let Err(e) = streaming_body.finish() {
-                        log::error!("failed to finish EdgeZero streaming body: {e}");
+                        // Also post-commitment: same attribution as the
+                        // streaming failure below.
+                        log::error!(
+                            "failed to finish EdgeZero streaming body{counter_context}: {e}"
+                        );
                     }
                 }
                 Err(e) => {
-                    log::error!("EdgeZero streaming failed: {e:?}");
+                    // After commitment: log and stop. Returning an error here
+                    // would let the SDK attempt a second response. Counters
+                    // already went out with the headers, so the failure is
+                    // tagged with the same identity for reconciliation.
+                    log::error!("EdgeZero streaming failed{counter_context}: {e:?}");
                     drop(streaming_body);
                 }
             }
@@ -582,6 +898,73 @@ mod tests {
         assert!(
             response.headers().get("x-ts-finalized").is_none(),
             "sentinel should not be sent to clients"
+        );
+    }
+
+    #[test]
+    fn sandbox_counters_never_appear_on_cacheable_responses() {
+        let counters = SandboxCounters {
+            ordinal: 2,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        };
+        for policy in [
+            None,
+            Some("public, s-maxage=3600"),
+            Some("private, max-age=60"),
+            Some("private=\"set-cookie\""),
+            Some("public, extension=\"private, no-store\""),
+        ] {
+            let mut response = HttpResponse::new(EdgeBody::empty());
+            if let Some(policy) = policy {
+                response.headers_mut().insert(
+                    "cache-control",
+                    HeaderValue::from_str(policy).expect("should encode cache policy"),
+                );
+            }
+            apply_terminal_response_effects(&mut response, None);
+            let original_headers = response.headers().clone();
+
+            attach_sandbox_counters(&mut response, &counters);
+
+            assert_eq!(
+                response.headers(),
+                &original_headers,
+                "should preserve cache policy and omit all counters for {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_counters_follow_final_private_no_store_policy() {
+        let counters = SandboxCounters {
+            ordinal: 2,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        };
+        let mut response = response_builder()
+            .header("cache-control", "public, s-maxage=3600")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(TerminalPrivateResponse);
+        apply_terminal_response_effects(&mut response, None);
+
+        attach_sandbox_counters(&mut response, &counters);
+
+        assert_eq!(
+            response.headers()[sandbox::HEADER_SANDBOX_REQUEST_ID],
+            "request-example",
+            "should identify this uncached request"
+        );
+        assert_eq!(
+            response.headers()[sandbox::HEADER_SANDBOX_ORDINAL],
+            "2",
+            "should report the current ordinal"
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "no-store, private",
+            "should retain terminal privacy"
         );
     }
 

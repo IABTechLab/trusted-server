@@ -21,5 +21,8 @@ pub use run::{RunOutcome, run_from_env};
 // internals.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod commands;
-#[cfg(target_os = "macos")]
+// Console output wrappers. Gated to non-wasm hosts rather than macOS: the
+// macOS-only proxy was its first consumer, but `ts dev sandbox-probe` builds
+// on every host target and needs it too.
+#[cfg(not(target_arch = "wasm32"))]
 mod output;

@@ -98,6 +98,7 @@ spin up --from crates/trusted-server-adapter-spin
 # See .cargo/config.toml; default-members = [fastly] so Viceroy can locate
 # the binary via `cargo run --bin`.
 cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-fastly-reuse # Fastly adapter with the reusable-sandbox feature on
 cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
@@ -346,7 +347,7 @@ Every PR must pass:
 
 1. `cargo fmt --all -- --check`
 2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm && cargo clippy-cli && cargo clippy-codegen`
-3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
+3. `cargo test-fastly && cargo test-fastly-reuse && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)

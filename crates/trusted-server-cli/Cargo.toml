@@ -39,6 +39,17 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
 
+# `ts dev sandbox-probe` needs a real HTTP/1.1 client with keep-alive. These
+# are shared with the macOS-only proxy but scoped to every non-wasm host, so
+# the probe is built and linted on Linux CI too. The exclusion still keeps
+# `tokio`/`ring` off the repo-default `wasm32-wasip1` target.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["http1", "client"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
 # `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
 # automation via `networksetup`, and a native TLS / networking stack. Scoping
 # these dependencies to macOS keeps unsupported targets (notably the

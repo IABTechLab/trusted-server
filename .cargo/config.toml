@@ -30,6 +30,10 @@ build-fastly = "build -p trusted-server-core -p trusted-server-adapter-fastly -p
 check-fastly = "check -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1"
 clippy-fastly = "clippy -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-js -p trusted-server-openrtb --all-targets --all-features --target wasm32-wasip1 -- -D warnings"
 test-fastly = "test -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1"
+# Feature-on counterpart of `test-fastly`. `test-fastly` does NOT pass
+# --all-features, so without this the reusable-sandbox code is linted by
+# `clippy-fastly` but its tests never execute.
+test-fastly-reuse = "test -p trusted-server-adapter-fastly --target wasm32-wasip1 --features reusable-sandbox"
 
 # --- Axum adapter (native dev server) ---
 build-axum = "build -p trusted-server-adapter-axum"
