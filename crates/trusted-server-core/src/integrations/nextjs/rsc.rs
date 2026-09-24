@@ -520,9 +520,9 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     request_scheme: &str,
     max_combined_payload_bytes: usize,
 ) -> Vec<String> {
-    if payloads.is_empty() {
+    let Some((_, preceding_payloads)) = payloads.split_last() else {
         return Vec::new();
-    }
+    };
 
     // Early exit if no payload contains the origin host - avoids regex compilation
     if !payloads.iter().any(|p| p.contains(origin_host)) {
@@ -546,8 +546,8 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     };
 
     // Check total size before allocating combined buffer
-    let total_size: usize =
-        payloads.iter().map(|p| p.len()).sum::<usize>() + (payloads.len() - 1) * RSC_MARKER.len();
+    let total_size: usize = payloads.iter().map(|p| p.len()).sum::<usize>()
+        + preceding_payloads.len() * RSC_MARKER.len();
 
     if total_size > max_combined_payload_bytes {
         // Avoid allocating a large combined buffer. If the payloads contain cross-script T-chunks,
@@ -584,7 +584,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     // Markers preserve script boundaries, but inserting one inside an escape
     // changes its decoded length. Preserve this group rather than emitting a
     // header counted differently by the classifier and the marker-aware scan.
-    for payload in &payloads[..payloads.len() - 1] {
+    for payload in preceding_payloads {
         let mut iter = EscapeSequenceIter::new(payload);
         loop {
             if iter.has_partial_escape() {
