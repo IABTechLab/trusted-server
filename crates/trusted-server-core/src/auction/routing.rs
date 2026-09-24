@@ -154,6 +154,13 @@ impl ProviderAuctionInput {
     pub(crate) fn slots(&self) -> &[ProviderSlotInput] {
         &self.slots
     }
+
+    /// Clone this input while retaining only slots accepted by `keep`.
+    pub(crate) fn filtered_slots(&self, mut keep: impl FnMut(&ProviderSlotInput) -> bool) -> Self {
+        let mut filtered = self.clone();
+        filtered.slots.retain(|slot| keep(slot));
+        filtered
+    }
 }
 
 /// One eligible slot with only the demand assigned to this provider.
@@ -263,6 +270,9 @@ enum StoredRequestIntent {
 }
 
 impl StoredRequestIntent {
+    /// Legacy fallback retains original candidate presence after overrides.
+    /// Usable overrides become inline demand; candidates still empty afterward
+    /// preserve the pre-intent stored fallback behavior.
     fn allows_fallback(self, has_candidates: bool) -> bool {
         match self {
             Self::Disabled => false,

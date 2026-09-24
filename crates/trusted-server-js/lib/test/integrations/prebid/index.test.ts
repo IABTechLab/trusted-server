@@ -2833,6 +2833,35 @@ describe('prebid/installPrebidNpm', () => {
       }
     });
 
+    it('omits explicitly undefined stored intent from repeated JSON requests', () => {
+      const pbjs = installPrebidNpm();
+      const unit = {
+        code: 'example-undefined-intent',
+        bids: [
+          {
+            bidder: 'trustedServer',
+            params: { bidderParams: {}, storedRequest: undefined },
+          },
+        ],
+      };
+      const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+      for (let call = 0; call < 2; call++) {
+        pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg);
+        const wire = JSON.parse(
+          spec.buildRequests([
+            {
+              adUnitCode: unit.code,
+              mediaTypes: { banner: { sizes: [[300, 250]] } },
+              ...unit.bids[0],
+            },
+          ]).data
+        );
+        const params = wire.adUnits[0].bids[0].params;
+        expect(params).toEqual({ bidderParams: {} });
+        expect(params).not.toHaveProperty('storedRequest');
+      }
+    });
+
     it('serializes disabled stored demand on generated envelopes including inline candidates', () => {
       const pbjs = installPrebidNpm();
       const adUnits = [
@@ -4448,6 +4477,49 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       expect(refreshParams()).toEqual({ bidderParams: {}, storedRequest: false });
     }
   );
+
+  it('omits explicitly undefined stored intent from snapshot and live refresh JSON', () => {
+    const code = 'example-undefined-refresh-intent';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+    const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+    const unit = {
+      code,
+      bids: [
+        {
+          bidder: 'trustedServer',
+          params: { bidderParams: {}, storedRequest: undefined },
+        },
+      ],
+    };
+    const readRefresh = () => {
+      pubads.refresh([slot]);
+      const refresh = refreshAdUnitFromLastRequest();
+      return JSON.parse(
+        spec.buildRequests([
+          { adUnitCode: refresh.code, mediaTypes: refresh.mediaTypes, ...refresh.bids[0] },
+        ]).data
+      ).adUnits[0].bids[0].params;
+    };
+
+    pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg);
+    for (let call = 0; call < 2; call++) {
+      const params = readRefresh();
+      expect(params).toEqual({ bidderParams: {} });
+      expect(params).not.toHaveProperty('storedRequest');
+    }
+
+    mockPbjs.adUnits = [unit];
+    const liveParams = readRefresh();
+    expect(liveParams).toEqual({ bidderParams: {} });
+    expect(liveParams).not.toHaveProperty('storedRequest');
+  });
 
   it('snapshots invalid authored intent immutably and defaults unrecovered refresh JSON to false', () => {
     const code = 'example-intent-snapshot';

@@ -258,7 +258,10 @@ async function runAuction(pageWindow, fetchSpy) {
       {
         code: 'ad-slot-1',
         mediaTypes: { banner: { sizes: [[300, 250]] } },
-        bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 1 } },
+          { bidder: 'trustedServer', params: { storedRequest: undefined } },
+        ],
       },
       {
         code: 'ad-slot-2',
@@ -289,6 +292,9 @@ async function runAuction(pageWindow, fetchSpy) {
   expect(adUnit.code).toBe('ad-slot-1');
   const trustedServerBid = adUnit.bids.find((bid) => bid.bidder === 'trustedServer');
   expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: { placementId: 1 } });
+  // An authored storedRequest left explicitly undefined must not serialize onto
+  // the wire, or the server reads it as a stored-request demand.
+  expect(trustedServerBid.params).not.toHaveProperty('storedRequest');
   // A slot the publisher left without bids must not demand a Prebid Server
   // stored request, or the whole auction is answered from stored config.
   const generated = payload.adUnits.find((unit) => unit.code === 'ad-slot-2');

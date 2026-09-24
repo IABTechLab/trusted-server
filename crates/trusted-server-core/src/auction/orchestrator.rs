@@ -5930,10 +5930,16 @@ mod tests {
                 http.push_response(
                     200,
                     serde_json::to_vec(&serde_json::json!({
-                        "seatbid":[{"seat":"example-seat","bid":[{
-                            "id":format!("bid-{index}"), "impid":format!("inline-{index}"),
-                            "price":2.0, "adm":"<div>example</div>", "w":300, "h":250
-                        }]}]
+                        "seatbid":[{"seat":"example-seat","bid":[
+                            {
+                                "id":format!("bid-{index}"), "impid":format!("inline-{index}"),
+                                "price":2.0, "adm":"<div>example</div>", "w":300, "h":250
+                            },
+                            {
+                                "id":format!("omitted-{index}"), "impid":"fictional-slot",
+                                "price":3.0, "adm":"<div>omitted</div>", "w":300, "h":250
+                            }
+                        ]}]
                     }))
                     .expect("should serialize PBS response"),
                 );
@@ -6024,6 +6030,22 @@ mod tests {
                 2 + inline_providers
             );
             assert_eq!(result.winning_bids.len(), inline_providers);
+            assert!(
+                result.get_all_bids_for_slot("fictional-slot").is_empty(),
+                "should reject a bid for an omitted impression"
+            );
+            for index in inline_providers..2 {
+                let provider_id = if index == 0 { "pbs-a" } else { "pbs-b" };
+                let response = result
+                    .provider_responses
+                    .iter()
+                    .find(|response| response.provider == provider_id)
+                    .expect("should retain skipped PBS provider response");
+                assert_eq!(
+                    response.metadata["routing"]["skipped_no_usable_demand"],
+                    true
+                );
+            }
             for index in 0..inline_providers {
                 let wire: serde_json::Value = serde_json::from_slice(&bodies[index + 1])
                     .expect("should parse PBS wire request");
@@ -6047,6 +6069,20 @@ mod tests {
                         .bid_id
                         .as_deref(),
                     Some(format!("bid-{index}").as_str())
+                );
+                let provider_id = if index == 0 { "pbs-a" } else { "pbs-b" };
+                let response = result
+                    .provider_responses
+                    .iter()
+                    .find(|response| response.provider == provider_id)
+                    .expect("should retain PBS provider response");
+                assert_eq!(
+                    response.metadata["response_admission"]["rejected_bid_count"],
+                    1
+                );
+                assert_eq!(
+                    response.metadata["response_admission"]["rejection_reasons"]["unrequested_impression"],
+                    1
                 );
             }
         }

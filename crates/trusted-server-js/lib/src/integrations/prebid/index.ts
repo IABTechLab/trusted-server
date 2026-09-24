@@ -1544,7 +1544,10 @@ function storedRequestParamsForRefresh(candidateCodes: Array<string | undefined>
     return storedRequestParams(bid);
   }
   const snapshot = findRefreshSnapshot(candidateCodes);
-  return snapshot ? storedRequestParams({ params: snapshot }) : { storedRequest: false };
+  if (!snapshot) return { storedRequest: false };
+  return Object.prototype.hasOwnProperty.call(snapshot, STORED_REQUEST_KEY)
+    ? { storedRequest: copyParamValue(snapshot[STORED_REQUEST_KEY]) }
+    : {};
 }
 
 /** Return a live publisher zone, falling back to a request-scoped snapshot. */
