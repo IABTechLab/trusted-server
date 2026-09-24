@@ -360,12 +360,18 @@ mod tests {
     };
 
     fn parse_args(argv: &[&str]) -> crate::commands::dev::proxy::ProxyArgs {
+        try_parse_args(argv).expect("should parse proxy args")
+    }
+
+    fn try_parse_args(
+        argv: &[&str],
+    ) -> Result<crate::commands::dev::proxy::ProxyArgs, clap::Error> {
         #[derive(clap::Parser)]
         struct W {
             #[command(flatten)]
             a: crate::commands::dev::proxy::ProxyArgs,
         }
-        W::try_parse_from(argv).expect("should parse proxy args").a
+        W::try_parse_from(argv).map(|w| w.a)
     }
 
     #[test]
@@ -713,11 +719,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "DisplayHelpOnMissingArgumentOrSubcommand")]
     fn bare_invocation_is_rejected_at_parse_time() {
         // `arg_required_else_help` makes a fully-bare `ts` fail to parse at all,
         // before `resolve` (and its `NoRule` check) ever runs.
-        parse_args(&["ts"]);
+        let error = try_parse_args(&["ts"])
+            .expect_err("a fully-bare invocation should short-circuit to help");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "should short-circuit to help rather than reaching resolve"
+        );
     }
 
     #[test]
