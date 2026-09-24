@@ -329,14 +329,14 @@ IntegrationRegistration::builder(ID)
 
 ## Configuration Files
 
-| File                  | Purpose                                                    |
-| --------------------- | ---------------------------------------------------------- |
-| `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
-| `fastly.toml`                   | Fastly service configuration and build settings                 |
-| `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
-| `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
-| `.env.dev`                      | Local development environment variables                         |
+| File                          | Purpose                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                 |
+| `fastly.toml`                 | Fastly service configuration and build settings                                                   |
+| `trusted-server.example.toml` | Source-controlled Trusted Server app-config template                                              |
+| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
+| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                       |
+| `.env.dev`                    | Local development environment variables                                                           |
 
 ---
 
@@ -351,6 +351,7 @@ Every PR must pass:
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 7. Docs format (`cd docs && npm run format`)
+8. Root Markdown format (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md"`; fix with `--write` in place of `--check`
 
 ---
 
@@ -439,18 +440,18 @@ both runtime behavior and build/tooling changes.
 
 ## Key Files
 
-| File                                         | Purpose                                           |
-| -------------------------------------------- | ------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
-| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
-| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
-| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
+| File                                                      | Purpose                                              |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`               |
+| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs                |
+| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start                 |
+| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules        |
 | `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
-| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
-| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
-| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
-| `crates/trusted-server-js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
-| `crates/trusted-server-js/src/bundle.rs`                    | Module map, concatenation, hashing                |
+| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                      |
+| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management                  |
+| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities              |
+| `crates/trusted-server-js/build.rs`                       | Discovers dist files, generates `tsjs_modules.rs`    |
+| `crates/trusted-server-js/src/bundle.rs`                  | Module map, concatenation, hashing                   |
 
 ---
 
