@@ -280,9 +280,7 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Server auction winner: example-bidder');
     expect(responseSentArticle).toContain('Server bid price bucket: 1.20 USD');
     expect(responseSentArticle).not.toContain('(currency not supplied)');
-    expect(responseSentArticle).toContain(
-      'Initial document request T0 → auction dispatched 4 ms'
-    );
+    expect(responseSentArticle).toContain('Initial document request T0 → auction dispatched 4 ms');
     expect(responseSentArticle).toContain('Initial document request T0 → auction collected 84 ms');
     expect(responseSentArticle).toContain('Initial document request T0 → bids ready 85 ms');
     expect(responseSentArticle).toContain('Auction collection wait (in stream) 80 ms');
