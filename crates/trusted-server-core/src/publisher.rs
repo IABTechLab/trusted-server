@@ -2079,6 +2079,8 @@ fn template_fingerprint(settings: &Settings) -> String {
     );
     // `serde_json::Value` uses a sorted object map without `preserve_order`, making
     // independently deserialized HashMaps canonical before they are serialized again.
+    // Array order is preserved: set-valued settings must serialize deterministically
+    // themselves (for example, `allowed_context_keys` uses a `BTreeSet`).
     let canonical = serde_json::to_value(settings)
         .and_then(|value| serde_json::to_vec(&value))
         .expect("serializing typed settings should be infallible");
@@ -8904,6 +8906,26 @@ mod tests {
         }
 
         #[test]
+        fn a_context_key_allowlist_fingerprints_identically_across_parses() {
+            let source = format!(
+                "{}\n[auction]\nallowed_context_keys = [\"zeta\", \"alpha\", \"gamma\", \"beta\", \"epsilon\", \"delta\"]\n",
+                crate_test_settings_str()
+            );
+            let first = Settings::from_toml(&source).expect("should parse context allowlist");
+            let expected = template_fingerprint(&first);
+
+            for _ in 0..32 {
+                let settings =
+                    Settings::from_toml(&source).expect("should reparse context allowlist");
+                assert_eq!(
+                    template_fingerprint(&settings),
+                    expected,
+                    "should fingerprint independently parsed allowlists identically"
+                );
+            }
+        }
+
+        #[test]
         fn creative_and_origin_configuration_change_the_fingerprint() {
             let base = super::template_neutrality_tests::settings_with_slots();
 
@@ -11725,6 +11747,42 @@ mod tests {
                 stub.recorded_request_uris().len(),
                 1,
                 "the second request must be served from the first's template"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_context_key_allowlist_keys_one_template() {
+            let mut source = serde_json::to_value(settings_with_mode("esi"))
+                .expect("should serialize cache settings");
+            source["auction"]["allowed_context_keys"] =
+                serde_json::json!(["zeta", "alpha", "gamma", "beta", "epsilon", "delta"]);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            for _ in 0..16 {
+                let settings = Arc::new(
+                    serde_json::from_value(source.clone()).expect("should parse cache settings"),
+                );
+                queue_shareable_html(&stub);
+                let _ = run(&settings, &services, navigation_request()).await;
+            }
+
+            let keys = looked_up_cache_keys(&cache);
+            assert_eq!(keys.len(), 16, "should consult the cache for every request");
+            assert!(
+                keys.iter().all(|key| key == &keys[0]),
+                "should reuse one key across independently parsed allowlists"
+            );
+            assert_eq!(
+                stored_cache_keys(&cache).len(),
+                1,
+                "should store one template"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should fetch the origin only for the first request"
             );
         }
 

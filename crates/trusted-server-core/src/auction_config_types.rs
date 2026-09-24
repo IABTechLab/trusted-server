@@ -2,7 +2,7 @@
 
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use validator::Validate;
 
@@ -76,7 +76,7 @@ pub struct AuctionConfig {
     /// are forwarded into the `AuctionRequest.context`. Unrecognised keys are
     /// silently dropped. An empty list blocks all context keys.
     #[serde(default = "default_allowed_context_keys")]
-    pub allowed_context_keys: HashSet<String>,
+    pub allowed_context_keys: BTreeSet<String>,
 }
 
 impl Default for AuctionConfig {
@@ -90,7 +90,7 @@ impl Default for AuctionConfig {
             mediator: None,
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
-            allowed_context_keys: HashSet::new(),
+            allowed_context_keys: BTreeSet::new(),
         }
     }
 }
@@ -153,8 +153,8 @@ fn default_creative_store() -> String {
     "creative_store".to_owned()
 }
 
-fn default_allowed_context_keys() -> HashSet<String> {
-    HashSet::new()
+fn default_allowed_context_keys() -> BTreeSet<String> {
+    BTreeSet::new()
 }
 
 impl AuctionConfig {

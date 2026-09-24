@@ -520,6 +520,7 @@ mod tests {
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
+    use edgezero_core::blob_envelope::BlobEnvelope;
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -574,6 +575,77 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    #[test]
+    fn settings_collections_serialize_deterministically_across_parses() {
+        let mut source = serde_json::to_value(valid_settings()).expect("should serialize settings");
+        source["response_headers"] = serde_json::json!({"x-example-b": "b", "x-example-a": "a"});
+        source["image_optimizer"] = serde_json::json!({"profile_sets": {
+            "secondary": {"profiles": {"default": "width=200", "small": "width=100"}},
+            "primary": {"profiles": {"default": "width=400", "small": "width=200"}}
+        }});
+        source["auction"]["allowed_context_keys"] = serde_json::json!([
+            "zeta", "alpha", "gamma", "beta", "epsilon", "delta", "alpha"
+        ]);
+        source["auction"]["providers"] = serde_json::json!({
+            "secondary": {
+                "protocol": "openrtb-2.6", "endpoint": "https://secondary.example.com/auction",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
+                "profile_config": {"second": 2, "first": 1}
+            },
+            "primary": {
+                "protocol": "openrtb-2.6", "endpoint": "https://primary.example.com/auction",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
+                "profile_config": {"second": 2, "first": 1}
+            }
+        });
+        source["auction"]["bidders"] = serde_json::json!({
+            "bidder-b": {"provider": "secondary"}, "bidder-a": {"provider": "primary"}
+        });
+        source["creative_opportunities"] = serde_json::json!({
+            "gam_network_id": "99999",
+            "slot": [{
+                "id": "example-slot", "page_patterns": ["/*"],
+                "formats": [{"width": 300, "height": 250}],
+                "targeting": {"section": "example", "category": "news"},
+                "providers": {"prebid": {"bidders": {
+                    "bidder-b": {"placement": "b", "account": "example"},
+                    "bidder-a": {"placement": "a", "account": "example"}
+                }}}
+            }]
+        });
+        // The base fixture also has two integrations with multiple config entries.
+        // Exercise fresh hash seeds on every parse, including nested maps.
+        let parse = || {
+            serde_json::from_value::<TrustedServerAppConfig>(source.clone())
+                .expect("should parse collection-rich settings")
+        };
+        let canonical = |config: &TrustedServerAppConfig| {
+            serde_json::to_value(config).expect("should serialize typed config")
+        };
+        let first = canonical(&parse());
+        let expected_bytes =
+            serde_json::to_vec(&first).expect("should serialize canonical settings");
+        let expected_sha = BlobEnvelope::new(first, "2026-01-01T00:00:00Z".to_owned()).sha256;
+        for _ in 0..32 {
+            let value = canonical(&parse());
+            assert_eq!(
+                serde_json::to_vec(&value).expect("should serialize canonical settings"),
+                expected_bytes,
+                "should serialize every settings map and set deterministically"
+            );
+            assert_eq!(
+                value["auction"]["allowed_context_keys"],
+                serde_json::json!(["alpha", "beta", "delta", "epsilon", "gamma", "zeta"]),
+                "should sort and deduplicate allowlist keys"
+            );
+            assert_eq!(
+                BlobEnvelope::new(value, "2026-01-01T00:00:00Z".to_owned()).sha256,
+                expected_sha,
+                "should produce one envelope hash for equal settings"
+            );
+        }
     }
 
     fn insert_aps_provider(settings: &mut Settings, account_id: &str) {

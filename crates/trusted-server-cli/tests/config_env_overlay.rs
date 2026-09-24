@@ -388,3 +388,69 @@ fn map_shaped_provider_and_bidder_environment_overlays_apply() {
         "pbs-main"
     );
 }
+
+#[test]
+fn pushed_envelope_sha_is_stable_for_one_context_key_allowlist() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read config")
+        .parse::<DocumentMut>()
+        .expect("should parse config");
+    document["auction"]["allowed_context_keys"] = value(
+        ["zeta", "alpha", "gamma", "beta", "epsilon", "delta"]
+            .into_iter()
+            .collect::<Array>(),
+    );
+    fs::write(&project.config_path, document.to_string()).expect("should write allowlist config");
+
+    let run = |operation: &str, flags: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_ts"))
+            .args(["config", operation, "--adapter", "axum", "--manifest"])
+            .arg(&project.manifest_path)
+            .arg("--app-config")
+            .arg(&project.config_path)
+            .args(flags)
+            .current_dir(project.directory.path())
+            .output()
+            .expect("should run config command")
+    };
+    let push = run("push", &["--yes", "--no-diff"]);
+    assert!(
+        push.status.success(),
+        "should push config: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let store = project
+        .directory
+        .path()
+        .join(".edgezero/local-config-trusted_server_config.json");
+    let original = fs::read(&store).expect("should read pushed envelope");
+
+    for _ in 0..16 {
+        let diff = run("diff", &["--local", "--exit-code"]);
+        assert!(
+            diff.status.success(),
+            "should report no config diff: {}",
+            String::from_utf8_lossy(&diff.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&diff.stderr).contains("no changes"),
+            "should report matching envelope hashes"
+        );
+        let push = run("push", &["--yes", "--no-diff"]);
+        assert!(
+            push.status.success(),
+            "should repeat config push successfully"
+        );
+        assert!(
+            String::from_utf8_lossy(&push.stderr).contains("no changes"),
+            "should skip an unchanged push: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        assert_eq!(
+            fs::read(&store).expect("should read local store"),
+            original,
+            "should leave stored envelope unchanged"
+        );
+    }
+}

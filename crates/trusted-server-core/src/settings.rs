@@ -3682,7 +3682,7 @@ mod tests {
     use super::*;
     use regex::Regex;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use crate::auction::build_orchestrator;
@@ -6240,7 +6240,7 @@ source_domain = "partner.example.com"
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert_eq!(
             settings.auction.allowed_context_keys,
-            HashSet::from(["permutive_segments".to_string(), "lockr_ids".to_string()])
+            BTreeSet::from(["permutive_segments".to_string(), "lockr_ids".to_string()])
         );
     }
 

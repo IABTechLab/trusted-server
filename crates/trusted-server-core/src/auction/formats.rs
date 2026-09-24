@@ -564,7 +564,7 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
     use http::Method;
     use serde_json::json;
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::str::FromStr as _;
 
     fn make_request() -> Request<EdgeBody> {
@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn convert_tsjs_to_auction_request_filters_context_values() {
         let mut settings = make_settings();
-        settings.auction.allowed_context_keys = HashSet::from([
+        settings.auction.allowed_context_keys = BTreeSet::from([
             "segments".to_string(),
             "lockr_id".to_string(),
             "count".to_string(),
