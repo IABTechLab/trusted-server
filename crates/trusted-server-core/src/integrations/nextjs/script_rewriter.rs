@@ -4,11 +4,11 @@ use error_stack::Report;
 use regex::{Regex, escape};
 
 use crate::error::TrustedServerError;
-use crate::integrations::ScriptTextAccumulator;
 use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
+use super::rsc_stream::{FragmentCapture, capture_fragment, document_state};
 use super::shared::strip_origin_host_with_optional_port;
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
@@ -66,35 +66,30 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
             return ScriptRewriteAction::keep();
         }
 
-        // Per document, never per registry: a registry-lifetime buffer would
-        // carry one document's partial script into the next.
-        let accumulator = ctx
-            .document_state
-            .get_or_insert_with(NEXTJS_INTEGRATION_ID, ScriptTextAccumulator::default);
-        let mut buf = accumulator.buffer();
+        let state = document_state(ctx.document_state);
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if !ctx.is_last_in_text_node {
-            // Intermediate fragment — accumulate and suppress output.
-            buf.push_str(content);
-            return ScriptRewriteAction::RemoveNode;
+        match capture_fragment(
+            &mut state.next_data,
+            content,
+            ctx.is_last_in_text_node,
+            ctx.max_buffered_script_bytes,
+        ) {
+            FragmentCapture::CompleteBorrowed(complete) => self.rewrite_structured(complete, ctx),
+            FragmentCapture::CompleteOwned(complete) => {
+                let action = self.rewrite_structured(&complete, ctx);
+                if matches!(action, ScriptRewriteAction::Keep) {
+                    ScriptRewriteAction::replace(complete)
+                } else {
+                    action
+                }
+            }
+            FragmentCapture::Suppress => ScriptRewriteAction::RemoveNode,
+            FragmentCapture::Restore(content) => ScriptRewriteAction::replace(content),
+            FragmentCapture::PassThrough => ScriptRewriteAction::Keep,
         }
-
-        // Last fragment. If nothing was accumulated, process directly.
-        if buf.is_empty() {
-            return self.rewrite_structured(content, ctx);
-        }
-
-        // Complete the accumulated text and process the full content.
-        // If rewrite_structured returns Keep, we must still emit the full
-        // accumulated text via Replace — intermediate fragments were already
-        // removed from lol_html's output via RemoveNode.
-        buf.push_str(content);
-        let full_content = std::mem::take(&mut *buf);
-        let action = self.rewrite_structured(&full_content, ctx);
-        if matches!(action, ScriptRewriteAction::Keep) {
-            return ScriptRewriteAction::replace(full_content);
-        }
-        action
     }
 }
 
@@ -234,6 +229,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: true,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state,
         }
     }
@@ -555,6 +551,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
@@ -601,6 +598,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: true,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
 
@@ -631,6 +629,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
@@ -654,5 +653,92 @@ mod tests {
             }
             other => panic!("expected Replace with passthrough, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fragmented_next_data_releases_suppressed_prefix_on_overflow_and_resets() {
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
+        let document_state = IntegrationDocumentState::default();
+        let first = IntegrationScriptContext {
+            selector: "script#__NEXT_DATA__",
+            request_host: "ts.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            max_buffered_script_bytes: 8,
+            document_state: &document_state,
+        };
+
+        assert_eq!(
+            rewriter.rewrite("prefix", &first),
+            ScriptRewriteAction::RemoveNode,
+            "should suppress a bounded prefix",
+        );
+        assert_eq!(
+            rewriter.rewrite("-overflow", &first),
+            ScriptRewriteAction::Replace("prefix-overflow".to_owned()),
+            "should restore the prefix before crossing the limit",
+        );
+        assert_eq!(
+            rewriter.rewrite(
+                "-tail",
+                &IntegrationScriptContext {
+                    is_last_in_text_node: true,
+                    ..first
+                },
+            ),
+            ScriptRewriteAction::Keep,
+            "should pass through the rest of an overflowing script",
+        );
+        assert_eq!(
+            rewriter.rewrite("small", &first),
+            ScriptRewriteAction::RemoveNode,
+            "should reset for the next script",
+        );
+    }
+
+    #[test]
+    fn next_data_fragment_state_is_isolated_between_documents() {
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
+        let first_state = IntegrationDocumentState::default();
+        let second_state = IntegrationDocumentState::default();
+        let first_context = IntegrationScriptContext {
+            selector: "script#__NEXT_DATA__",
+            request_host: "ts.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            max_buffered_script_bytes: 64,
+            document_state: &first_state,
+        };
+        let second_context = IntegrationScriptContext {
+            document_state: &second_state,
+            ..first_context
+        };
+
+        assert_eq!(
+            rewriter.rewrite("first-", &first_context),
+            ScriptRewriteAction::RemoveNode,
+            "should buffer the first document",
+        );
+        assert_eq!(
+            rewriter.rewrite("second-", &second_context),
+            ScriptRewriteAction::RemoveNode,
+            "should buffer the second document independently",
+        );
+
+        let ScriptRewriteAction::Replace(first_output) = rewriter.rewrite(
+            "done",
+            &IntegrationScriptContext {
+                is_last_in_text_node: true,
+                ..first_context
+            },
+        ) else {
+            panic!("should restore the first document");
+        };
+        assert_eq!(
+            first_output, "first-done",
+            "should not combine request state"
+        );
     }
 }

@@ -2511,6 +2511,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: true,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &doc_state,
         };
 
@@ -3424,6 +3425,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
@@ -3476,6 +3478,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &first_document,
         };
         // Must end mid-domain: that is what makes the cheap prefix gate
@@ -3499,6 +3502,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: true,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &second_document,
         };
         let benign = r#"(function(w,d,s,l,i){j.src='https://www.googletagmanager.com/gtm.js?id='+i;})(window,document,'script','dataLayer','GTM-LEAK01');"#;
@@ -3545,6 +3549,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
@@ -3587,6 +3592,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
