@@ -292,8 +292,22 @@ impl AdServerMockProvider {
                 let restored_bidder =
                     original.map_or_else(|| seat_name.to_string(), |b| b.bidder.clone());
 
-                let width = bid["w"].as_u64().unwrap_or(0) as u32;
-                let height = bid["h"].as_u64().unwrap_or(0) as u32;
+                // Keep `{:?}` for the raw upstream values below: Debug escapes
+                // newlines and quotes, which prevents log injection.
+                let Some(width) = bid["w"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                    log::debug!(
+                        "adserver_mock: bid for slot '{slot_id}' has invalid width {:?}, skipping",
+                        bid["w"]
+                    );
+                    continue;
+                };
+                let Some(height) = bid["h"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                    log::debug!(
+                        "adserver_mock: bid for slot '{slot_id}' has invalid height {:?}, skipping",
+                        bid["h"]
+                    );
+                    continue;
+                };
                 if width == 0 || height == 0 {
                     log::debug!(
                         "adserver_mock: bid for slot '{slot_id}' has zero dimension ({width}×{height}), skipping"
@@ -1320,6 +1334,232 @@ mod tests {
         assert_eq!(
             bid2.price, None,
             "Bid without price field should have None price"
+        );
+    }
+
+    #[test]
+    fn test_parse_mediation_response_skips_oversized_dimensions() {
+        // A dimension above u32::MAX must be rejected rather than silently
+        // wrapped into a small, plausible-looking value. The offset of 101 is
+        // load-bearing: u32::MAX + 1 truncates to 0, which the zero-check
+        // below would already have caught, so it would not pin this fix.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let oversized_dimension = u64::from(u32::MAX) + 101;
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-oversized-width",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "adm": "<div>Oversized width</div>",
+                            "w": oversized_dimension,
+                            "h": 90,
+                        },
+                        {
+                            "id": "bid-oversized-height",
+                            "impid": "sidebar",
+                            "price": 1.25,
+                            "adm": "<div>Oversized height</div>",
+                            "w": 300,
+                            "h": oversized_dimension,
+                        },
+                        {
+                            "id": "bid-valid",
+                            "impid": "footer",
+                            "price": 2.00,
+                            "adm": "<div>Valid Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+
+        assert_eq!(
+            auction_response.bids.len(),
+            1,
+            "Bids with oversized w/h should be skipped, only the valid bid should remain"
+        );
+        assert_eq!(auction_response.bids[0].slot_id, "footer");
+        assert_eq!(auction_response.bids[0].width, 728);
+        assert_eq!(auction_response.bids[0].height, 90);
+    }
+
+    #[test]
+    fn test_parse_mediation_response_skips_zero_dimensions() {
+        // Zero or missing dimensions must keep their existing skip behavior.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-zero-width",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "adm": "<div>Zero width</div>",
+                            "w": 0,
+                            "h": 90,
+                        },
+                        {
+                            "id": "bid-zero-height",
+                            "impid": "sidebar",
+                            "price": 1.25,
+                            "adm": "<div>Zero height</div>",
+                            "w": 300,
+                            "h": 0,
+                        },
+                        {
+                            "id": "bid-missing-dimensions",
+                            "impid": "skyscraper",
+                            "price": 1.10,
+                            "adm": "<div>Missing dimensions</div>",
+                        },
+                        {
+                            "id": "bid-valid",
+                            "impid": "footer",
+                            "price": 2.00,
+                            "adm": "<div>Valid Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+
+        let slots: Vec<&str> = auction_response
+            .bids
+            .iter()
+            .map(|bid| bid.slot_id.as_str())
+            .collect();
+        assert_eq!(
+            slots,
+            ["footer"],
+            "should drop the zero-width, zero-height, and missing-dimension bids"
+        );
+    }
+
+    #[test]
+    fn test_parse_mediation_response_accepts_u32_max_dimensions() {
+        // u32::MAX is the largest representable dimension and must be accepted,
+        // pinning the upper boundary of the oversized-dimension check.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-max-dimensions",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "adm": "<div>Max dimensions</div>",
+                            "w": u32::MAX,
+                            "h": u32::MAX,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+
+        assert_eq!(
+            auction_response.bids.len(),
+            1,
+            "should accept a bid whose w/h equal u32::MAX"
+        );
+        assert_eq!(
+            auction_response.bids[0].width,
+            u32::MAX,
+            "should keep width at u32::MAX"
+        );
+        assert_eq!(
+            auction_response.bids[0].height,
+            u32::MAX,
+            "should keep height at u32::MAX"
+        );
+    }
+
+    #[test]
+    fn test_parse_mediation_response_skips_negative_dimensions() {
+        // Negative dimensions are not valid u64 values and must be skipped.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-negative-width",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "adm": "<div>Negative width</div>",
+                            "w": -1,
+                            "h": 90,
+                        },
+                        {
+                            "id": "bid-negative-height",
+                            "impid": "sidebar",
+                            "price": 1.25,
+                            "adm": "<div>Negative height</div>",
+                            "w": 300,
+                            "h": -1,
+                        },
+                        {
+                            "id": "bid-valid",
+                            "impid": "footer",
+                            "price": 2.00,
+                            "adm": "<div>Valid Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+
+        let slots: Vec<&str> = auction_response
+            .bids
+            .iter()
+            .map(|bid| bid.slot_id.as_str())
+            .collect();
+        assert_eq!(
+            slots,
+            ["footer"],
+            "should drop the negative-width and negative-height bids"
         );
     }
 
