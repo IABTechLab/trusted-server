@@ -78,8 +78,8 @@ ts dev proxy -f www.example-publisher.com -t trusted-server-example.edgecompute.
 ```
 
 A bare `ts dev proxy` prints help and exits before proxy startup. An
-invocation with explicit options but no complete rewrite rule reports
-`no rewrite rule: pass --map FROM=TO (or -f/--from with -t/--to)`.
+invocation with explicit options but no complete rewrite rule fails with a
+`no rewrite rule` error before touching system proxy state.
 
 Connection options — `--rewrite-host`, `--basic-auth`/`--basic-auth-file`,
 `--insecure`, and `--upstream-plaintext` — apply to every mapping, not per-rule.
