@@ -6,6 +6,7 @@ import {
   observeFirstImpressionGptLifecycle,
   registerPublisherFirstImpressionAuctions,
   releaseTrustedServerFirstImpressionClaim,
+  reservePublisherFirstImpressionFallback,
 } from '../../src/core/first_impression';
 import { log } from '../../src/core/log';
 import type { TsjsApi } from '../../src/core/types';
@@ -77,6 +78,38 @@ describe('initial render capacity and diagnostics', () => {
       expect(consumePublisherFirstImpressionDelivery(ts, token)).toBe(true);
     }
   );
+
+  it('records one pending snapshot after a publisher-to-TS fallback transition', () => {
+    const debug = vi.fn();
+    const ts: TsjsApi = {
+      version: 'test',
+      que: [],
+      addAdUnits: vi.fn(),
+      renderAdUnit: vi.fn(),
+      renderAllAdUnits: vi.fn(),
+      log: { ...log, debug },
+    };
+    const element = document.getElementById('example-slot')!;
+    const token = registerPublisherFirstImpressionAuctions(ts, [element.id]).get(element.id);
+    const publisherClaim = ts.firstImpression!.slots[element.id];
+    expect(reservePublisherFirstImpressionFallback(ts, element)).toBe(true);
+    vi.advanceTimersByTime(5000);
+    const claim = claimFirstImpressionForTrustedServer(ts, element)!;
+    expect(claim).toBe(publisherClaim);
+    expect(claim.owner).toBe('trusted_server');
+    expect(claim.publisherAuctions[token!]?.suppressDelivery).toBe(true);
+    vi.advanceTimersByTime(4999);
+    expect(debug).not.toHaveBeenCalled();
+    expect(claim).not.toHaveProperty('pendingRenderDiagnostic');
+    vi.advanceTimersByTime(1);
+    expect(debug).toHaveBeenCalledOnce();
+    expect(claim).toHaveProperty('pendingRenderDiagnostic', {
+      phase: 'delivery_pending',
+      ageMs: 5000,
+    });
+    vi.advanceTimersByTime(30000);
+    expect(debug).toHaveBeenCalledOnce();
+  });
 
   it.each(['render', 'release', 'replace', 'navigate'])(
     'ignores a diagnostic timer after %s',

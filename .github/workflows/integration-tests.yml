@@ -219,6 +219,7 @@ jobs:
           retention-days: 7
 
       - name: Run browser tests (Next.js)
+        if: always()
         working-directory: crates/trusted-server-integration-tests/browser
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}

@@ -229,6 +229,8 @@
       if (!canTransitionPublisherFallback) return null;
       existing.owner = "trusted_server";
       existing.phase = "delivery_pending";
+      // Deliberately unbounded, matching first_impression.ts: only render,
+      // navigation, or element replacement ends TS initial ownership.
       existing.expiresAt = Number.POSITIVE_INFINITY;
       Object.keys(existing.publisherAuctions || {}).forEach(function (token) {
         existing.publisherAuctions[token].suppressDelivery = true;
@@ -242,6 +244,7 @@
       element: element,
       owner: "trusted_server",
       phase: "delivery_pending",
+      // Unbounded by contract; see the fallback transition above.
       expiresAt: Number.POSITIVE_INFINITY,
       publisherAuctions: {},
     };

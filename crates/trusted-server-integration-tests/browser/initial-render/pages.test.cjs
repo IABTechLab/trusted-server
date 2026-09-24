@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { JSDOM } = require("../../../trusted-server-js/lib/node_modules/jsdom");
+const { JSDOM } = require("jsdom");
 const { creative, pucPage } = require("./pages.cjs");
 
 const payload =

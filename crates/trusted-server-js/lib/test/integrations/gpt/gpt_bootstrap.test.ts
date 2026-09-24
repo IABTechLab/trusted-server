@@ -293,6 +293,93 @@ describe('gpt_bootstrap.js fallback', () => {
     }
   );
 
+  it('records one pending snapshot after a publisher-to-TS fallback transition', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100);
+    try {
+      const slot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: () => 'example-fallback-slot',
+      };
+      const pubads = { getSlots: () => [slot], refresh: vi.fn(), enableSingleRequest: vi.fn() };
+      (window as TestWindow).googletag = makeGoogleTag({
+        cmd: { push: (command: () => void) => command() },
+        pubads: () => pubads,
+      });
+      document.body.innerHTML = '<div id="example-fallback-slot"></div>';
+      runBootstrap();
+      const ts = (window as TestWindow).tsjs!;
+      const debug = vi.fn();
+      ts.log = {
+        setLevel: vi.fn(),
+        getLevel: () => 'debug',
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug,
+      };
+      const element = document.getElementById('example-fallback-slot')!;
+      const publisherClaim: FirstImpressionSlotClaim = {
+        generation: 0,
+        slotElementId: element.id,
+        element,
+        owner: 'publisher',
+        phase: 'auctioning',
+        expiresAt: 5_100,
+        publisherAuctions: {
+          original: {
+            token: 'original',
+            adUnitCode: element.id,
+            phase: 'auctioning',
+            expiresAt: 5_100,
+            adIds: [],
+            suppressDelivery: false,
+          },
+        },
+      };
+      ts.firstImpression = {
+        generation: 0,
+        nextToken: 1,
+        slots: { [element.id]: publisherClaim },
+        fallbackSlots: {},
+      };
+      ts.adSlots = [
+        {
+          id: 'example-ad',
+          gam_unit_path: '/123/example',
+          div_id: element.id,
+          formats: [[300, 250]],
+        },
+      ];
+      ts.bids = {};
+      ts.adInit!();
+      expect(ts.firstImpression.fallbackSlots[element.id]).toBe(element);
+      expect(publisherClaim.owner).toBe('publisher');
+
+      // The bootstrap retries one millisecond after the publisher lease expires.
+      vi.advanceTimersByTime(5001);
+      const claim = ts.firstImpression.slots[element.id];
+      expect(claim).toBe(publisherClaim);
+      expect(claim.owner).toBe('trusted_server');
+      expect(claim.publisherAuctions.original.suppressDelivery).toBe(true);
+      vi.advanceTimersByTime(4999);
+      expect(debug).not.toHaveBeenCalled();
+      expect(claim).not.toHaveProperty('pendingRenderDiagnostic');
+      vi.advanceTimersByTime(1);
+      expect(debug).toHaveBeenCalledOnce();
+      expect(claim).toHaveProperty('pendingRenderDiagnostic', {
+        phase: 'delivery_pending',
+        ageMs: 5000,
+      });
+      vi.advanceTimersByTime(30000);
+      expect(debug).toHaveBeenCalledOnce();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps the bootstrap lease synchronized with the bundle contract', () => {
     const bootstrapLease = /var FIRST_IMPRESSION_LEASE_MS = (\d+);/.exec(BOOTSTRAP_SOURCE);
 

@@ -511,7 +511,8 @@ Enable `window.tsjs.log.setLevel('debug')` before the check to also see
 `[tsjs-gpt] initial render remains pending`. The snapshot is recorded even when
 logging is disabled or unavailable. It indicates delayed rendering, not a confirmed
 failure, and does not unlock the slot. It remains historical if rendering later
-finishes.
+finishes. A slot deferred by GPT lazy loading (`enableLazyLoad()`) can routinely
+record this snapshot while waiting to approach the viewport.
 
 This initial-render diagnostic is available through debug logging and inspectable
 runtime state only. It is not shown in the GPT diagnostics panel or its JSON export,
