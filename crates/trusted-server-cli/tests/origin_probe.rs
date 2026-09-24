@@ -1239,3 +1239,40 @@ fn vary_rsc_cannot_excuse_an_accept_negotiated_difference() {
         "should hold the fetch profile constant while toggling RSC"
     );
 }
+
+#[test]
+fn plain_fetch_cannot_claim_the_flight_exemption() {
+    let server = FixtureServer::start(|request| {
+        let response = FixtureResponse::html("<html>stable</html>")
+            .with_header("cache-control", "public, max-age=300");
+        if request.header("sec-fetch-mode") == Some("cors") {
+            response
+                .without_header("content-type")
+                .with_header("content-type", "text/x-component")
+        } else {
+            response
+        }
+    });
+    let (_, report) = probe(&server, json_args(&server));
+    assert!(
+        !verdict(&report, "content-type").passed,
+        "should refuse flight without an RSC request"
+    );
+}
+
+#[test]
+fn legacy_prefetch_variation_is_exercised() {
+    let server = FixtureServer::start(|request| {
+        FixtureResponse::html(if request.header("purpose") == Some("prefetch") {
+            "<html>prefetch</html>"
+        } else {
+            "<html>navigation</html>"
+        })
+        .with_header("cache-control", "public, max-age=300")
+    });
+    let (_, report) = probe(&server, json_args(&server));
+    assert!(
+        !axis(&report, "prefetch").passed(),
+        "should detect legacy prefetch variation"
+    );
+}

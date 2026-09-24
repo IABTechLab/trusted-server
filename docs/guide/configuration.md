@@ -2144,7 +2144,9 @@ Rollback must preserve configuration compatibility:
    services (`localhost`, `127.0.0.1`, or `::1`). The admin endpoint
    `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
    the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
-   works.
+   works. With readthrough caching enabled, `--all` also purges tagged origin
+   documents, so the next requests refetch those documents from the origin. Check
+   whether the origin can absorb that load before purging during a traffic peak.
 
 Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary

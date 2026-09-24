@@ -62,7 +62,7 @@ struct Fetched {
     status: u16,
     body: Vec<u8>,
     headers: reqwest::header::HeaderMap,
-    profile: RequestProfile,
+    rsc: bool,
 }
 
 impl Fetched {
@@ -90,10 +90,10 @@ impl Fetched {
     fn canonical(&self) -> Vec<u8> {
         let mut canonical = Vec::with_capacity(self.body.len() + 256);
         for name in POLICY_HEADERS {
-            for value in self.all(name) {
+            for value in self.headers.get_all(*name) {
                 canonical.extend_from_slice(name.as_bytes());
                 canonical.extend_from_slice(b": ");
-                canonical.extend_from_slice(value.trim().as_bytes());
+                canonical.extend_from_slice(value.as_bytes().trim_ascii());
                 canonical.push(b'\n');
             }
         }
@@ -225,7 +225,7 @@ async fn probe_one(
     });
     let mut rsc_canonical = Vec::new();
     // An axis is named for what it varies, which is not always the header it sends: the
-    // bot arm varies the user agent, and the prefetch arm varies `Sec-Purpose`.
+    // bot arm varies the user agent, and the prefetch arm varies both purpose headers.
     for (name, header, description, value) in [
         (
             "cookie",
@@ -259,6 +259,7 @@ async fn probe_one(
         ),
         ("rsc", "rsc", "bare vs. an RSC request", "1"),
     ] {
+        let single_header = [(header, value)];
         let (axis, mut response) = compare_axis(
             client,
             url,
@@ -275,7 +276,11 @@ async fn probe_one(
                 } else {
                     RequestProfile::Navigation
                 },
-                headers: &[(header, value)],
+                headers: if name == "prefetch" {
+                    &[("sec-purpose", "prefetch"), ("purpose", "prefetch")]
+                } else {
+                    &single_header
+                },
             },
             admission_cookie,
         )
@@ -516,21 +521,20 @@ fn header_encoding_verdict(response: &Fetched) -> VerdictResult {
     }
 }
 
-/// Certify HTML navigations, while allowing flight payloads on the RSC fetch profile.
+/// Certify HTML navigations, while allowing flight payloads only when the request sends RSC.
 fn content_type_verdict(response: &Fetched) -> VerdictResult {
     let types = response.all("content-type");
     let passed = types.len() == 1
         && types.iter().all(|value| {
             let media_type = value.split(';').next().unwrap_or("").trim();
             media_type.eq_ignore_ascii_case("text/html")
-                || (matches!(response.profile, RequestProfile::Fetch)
-                    && media_type.eq_ignore_ascii_case("text/x-component"))
+                || (response.rsc && media_type.eq_ignore_ascii_case("text/x-component"))
         });
     VerdictResult {
         name: "content-type".to_owned(),
         passed,
         detail: format!(
-            "expected HTML for navigation, or HTML/flight for the fetch profile; content-type: {types:?}"
+            "expected HTML for navigation, or HTML/flight for requests with RSC: 1; content-type: {types:?}"
         ),
     }
 }
@@ -549,7 +553,7 @@ fn vary_covers_axis(declared: &[&str], axis: &str) -> bool {
         ][..],
         // Named for the classification, keyed on the header the arm actually sent.
         "bot" => &["user-agent"][..],
-        "prefetch" => &["sec-purpose"][..],
+        "prefetch" => &["sec-purpose", "purpose"][..],
         _ => std::slice::from_ref(&axis),
     };
     required.iter().all(|name| {
@@ -712,18 +716,20 @@ fn vary_coverage_verdict(baseline: &Fetched, axes: &[AxisResult]) -> VerdictResu
 }
 
 fn has_positive_freshness(value: &str) -> bool {
-    value.to_ascii_lowercase().split(',').any(|directive| {
-        let directive = directive.trim();
-        for prefix in ["max-age=", "s-maxage="] {
-            if let Some(seconds) = directive.strip_prefix(prefix) {
-                return seconds
-                    .trim_matches('"')
-                    .parse::<u64>()
-                    .is_ok_and(|s| s > 0);
-            }
-        }
-        false
-    })
+    // Shared caches obey s-maxage when present, even if max-age is positive.
+    let lowered = value.to_ascii_lowercase();
+    let seconds_for = |prefix: &str| {
+        lowered.split(',').find_map(|directive| {
+            directive
+                .trim()
+                .strip_prefix(prefix)
+                .map(|seconds| seconds.trim_matches('"').parse::<u64>().ok())
+        })
+    };
+    match seconds_for("s-maxage=") {
+        Some(shared) => shared.is_some_and(|seconds| seconds > 0),
+        None => seconds_for("max-age=").is_some_and(|parsed| parsed.is_some_and(|s| s > 0)),
+    }
 }
 
 /// The cookie arm's jar: the admission cookie plus the cookies a repeat visitor carries.
@@ -811,7 +817,9 @@ async fn fetch(
         status,
         body,
         headers: collected,
-        profile,
+        rsc: resolved
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("rsc") && *value == "1"),
     })
 }
 
@@ -833,7 +841,7 @@ mod tests {
             status: 200,
             body: b"<html></html>".to_vec(),
             headers: collected,
-            profile: RequestProfile::Navigation,
+            rsc: false,
         }
     }
 
@@ -847,6 +855,57 @@ mod tests {
                 right: "b".to_owned(),
             }),
             covered_by_vary: false,
+        }
+    }
+
+    #[test]
+    fn shared_freshness_overrides_browser_freshness() {
+        for value in [
+            "public, s-maxage=0, max-age=300",
+            "public, max-age=300, s-maxage=0",
+            "public, s-maxage=0",
+            "max-age=300, s-maxage=invalid",
+        ] {
+            assert!(
+                !freshness_verdict(&fetched(&[("cache-control", value)])).passed,
+                "should reject shared freshness in {value}"
+            );
+        }
+        for value in ["s-maxage=60, max-age=300", "max-age=300", "s-maxage=\"60\""] {
+            assert!(has_positive_freshness(value), "should accept {value}");
+        }
+    }
+
+    #[test]
+    fn canonical_preserves_undecodable_policy_values() {
+        for name in POLICY_HEADERS {
+            let mut first = fetched(&[]);
+            let mut second = fetched(&[]);
+            first.headers.insert(
+                *name,
+                reqwest::header::HeaderValue::from_bytes(b"policy=\xe9")
+                    .expect("should accept raw header"),
+            );
+            second.headers.insert(
+                *name,
+                reqwest::header::HeaderValue::from_bytes(b"policy=\xe8")
+                    .expect("should accept raw header"),
+            );
+            assert_ne!(
+                first.canonical(),
+                second.canonical(),
+                "should compare raw {name}"
+            );
+            second.headers.insert(
+                *name,
+                reqwest::header::HeaderValue::from_bytes(b" \tpolicy=\xe9 \t")
+                    .expect("should accept padded header"),
+            );
+            assert_eq!(
+                first.canonical(),
+                second.canonical(),
+                "should trim whitespace for {name}"
+            );
         }
     }
 
@@ -991,7 +1050,8 @@ mod tests {
         // varies, so `Vary` coverage has to be mapped rather than matched by name.
         assert!(vary_covers_axis(&["user-agent"], "bot"));
         assert!(!vary_covers_axis(&["bot"], "bot"));
-        assert!(vary_covers_axis(&["sec-purpose"], "prefetch"));
+        assert!(vary_covers_axis(&["sec-purpose", "purpose"], "prefetch"));
+        assert!(!vary_covers_axis(&["sec-purpose"], "prefetch"));
         assert!(!vary_covers_axis(&["purpose"], "prefetch"));
     }
 

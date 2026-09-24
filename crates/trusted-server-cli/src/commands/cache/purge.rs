@@ -18,7 +18,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 fn request_body(args: &PurgeArgs) -> CliResult<String> {
     match (args.all, args.page.as_deref()) {
         (true, _) => Ok(r#"{"scope":"all"}"#.to_owned()),
-        (false, Some(page)) => Ok(serde_json::json!({ "scope": "url", "url": page }).to_string()),
+        (false, Some(page)) => {
+            if !reqwest::Url::parse(page).is_ok_and(|parsed| {
+                matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+            }) {
+                return cli_error("--page must be an absolute http(s) URL with a host");
+            }
+            Ok(serde_json::json!({ "scope": "url", "url": page }).to_string())
+        }
         (false, None) => cli_error("specify --all or --page <url>"),
     }
 }
@@ -147,6 +154,25 @@ mod tests {
             page: page.map(str::to_owned),
             username: "admin".to_owned(),
         }
+    }
+
+    #[test]
+    fn invalid_page_urls_are_rejected_locally() {
+        for page in [
+            "/article",
+            "example.com/article",
+            "ftp://example.com/article",
+            "",
+        ] {
+            assert!(
+                request_body(&args(false, Some(page))).is_err(),
+                "should reject {page:?}"
+            );
+        }
+        assert!(
+            request_body(&args(false, Some("http://example.com/article"))).is_ok(),
+            "should allow HTTP reader URLs"
+        );
     }
 
     #[test]

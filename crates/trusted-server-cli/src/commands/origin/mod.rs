@@ -112,11 +112,15 @@ fn split_cookie_header(value: &str) -> Vec<String> {
 /// Appends rather than replaces so a caller that constructed the arguments directly — the
 /// integration suite — keeps what it set.
 fn load_cookies_from_environment(args: &mut ProbeShareabilityArgs) {
-    if let Ok(value) = std::env::var(PROBE_COOKIES_ENVIRONMENT_VARIABLE) {
+    load_cookies(args, |name| std::env::var(name).ok());
+}
+
+fn load_cookies(args: &mut ProbeShareabilityArgs, environment: impl Fn(&str) -> Option<String>) {
+    if let Some(value) = environment(PROBE_COOKIES_ENVIRONMENT_VARIABLE) {
         args.cookie.extend(split_cookie_header(&value));
     }
     if args.admission_cookie.is_none()
-        && let Ok(value) = std::env::var(PROBE_ADMISSION_COOKIE_ENVIRONMENT_VARIABLE)
+        && let Some(value) = environment(PROBE_ADMISSION_COOKIE_ENVIRONMENT_VARIABLE)
     {
         let value = value.trim();
         if !value.is_empty() {
@@ -176,5 +180,76 @@ fn run_probe(args: &ProbeShareabilityArgs, out: &mut impl std::io::Write) -> Cli
         crate::error::cli_error(
             "origin is not safe to share: do not enable origin_readthrough_enabled or origin_is_cookie_independent",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_header_splits_trims_and_ignores_empty_segments() {
+        assert_eq!(
+            split_cookie_header(" ; session=example ; ; preference=a=b; "),
+            ["session=example", "preference=a=b"],
+            "should preserve cookie pairs while removing empty segments"
+        );
+        assert!(
+            split_cookie_header(" ; ; ").is_empty(),
+            "should ignore empty cookies"
+        );
+    }
+
+    #[test]
+    fn environment_appends_cookies_and_preserves_explicit_admission() {
+        let mut args = ProbeShareabilityArgs {
+            url: vec![],
+            repeat: 1,
+            cookie: vec!["caller=example".to_owned()],
+            vary_header: vec![],
+            admission_cookie: Some("admission=caller".to_owned()),
+            json: false,
+        };
+        load_cookies(&mut args, |name| {
+            Some(if name == PROBE_COOKIES_ENVIRONMENT_VARIABLE {
+                " session=environment; ; preference=example ".to_owned()
+            } else {
+                " admission=environment ".to_owned()
+            })
+        });
+        assert_eq!(
+            args.cookie,
+            [
+                "caller=example",
+                "session=environment",
+                "preference=example"
+            ],
+            "should append parsed environment cookies"
+        );
+        assert_eq!(
+            args.admission_cookie.as_deref(),
+            Some("admission=caller"),
+            "should preserve explicit admission cookie"
+        );
+        args.admission_cookie = None;
+        load_cookies(&mut args, |_| None);
+        assert!(
+            args.admission_cookie.is_none(),
+            "should tolerate an absent environment"
+        );
+        load_cookies(&mut args, |_| Some("  ".to_owned()));
+        assert!(
+            args.admission_cookie.is_none(),
+            "should ignore blank admission cookies"
+        );
+        load_cookies(&mut args, |name| {
+            (name == PROBE_ADMISSION_COOKIE_ENVIRONMENT_VARIABLE)
+                .then(|| " admission=environment ".to_owned())
+        });
+        assert_eq!(
+            args.admission_cookie.as_deref(),
+            Some("admission=environment"),
+            "should trim the environment admission cookie"
+        );
     }
 }
