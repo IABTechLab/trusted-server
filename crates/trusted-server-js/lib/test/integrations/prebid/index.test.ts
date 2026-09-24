@@ -355,6 +355,7 @@ import {
   firstImpressionClaim,
   observeFirstImpressionGptLifecycle,
   registerPublisherFirstImpressionAuctions,
+  releasePublisherFirstImpressionAuction,
   releaseTrustedServerFirstImpressionClaim,
   reservePublisherFirstImpressionFallback,
 } from '../../../src/core/first_impression';
@@ -4346,10 +4347,142 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
 
     expect(consumePublisherFirstImpressionDelivery(ts, first, 103)).toBe(true);
     expect(consumePublisherFirstImpressionDelivery(ts, second, 104)).toBe(true);
-    expect(registerPublisherFirstImpressionAuctions(ts, [element.id], 105)).toEqual(new Map());
+    expect(registerPublisherFirstImpressionAuctions(ts, [element.id], 105).size).toBe(1);
 
     element.remove();
   });
+
+  it('keeps a pending TS render protected beyond the lease and repeated consumption', () => {
+    const element = document.createElement('div');
+    element.id = 'example-slow-render';
+    document.body.appendChild(element);
+    const ts = {} as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, element, 100);
+    observeFirstImpressionGptLifecycle(ts, element, 'requested', 101);
+    const token = registerPublisherFirstImpressionAuctions(ts, [element.id], 6000).get(element.id);
+    expect(consumePublisherFirstImpressionDelivery(ts, token, 6001)).toBe(true);
+    expect(consumePublisherFirstImpressionDelivery(ts, token, 6002)).toBe(true);
+    const laterToken = registerPublisherFirstImpressionAuctions(ts, [element.id], 6003).get(
+      element.id
+    )!;
+    releasePublisherFirstImpressionAuction(ts, laterToken, 6003);
+    expect(registerPublisherFirstImpressionAuctions(ts, [element.id], 6003).size).toBe(1);
+    expect(consumePublisherFirstImpressionDelivery(ts, laterToken, 6003)).toBe(true);
+    observeFirstImpressionGptLifecycle(ts, element, 'rendered', 6004);
+    observeFirstImpressionGptLifecycle(ts, element, 'requested', 6005);
+    expect(ts.firstImpression?.slots[element.id]?.phase).toBe('rendered');
+    expect(registerPublisherFirstImpressionAuctions(ts, [element.id], 6006).size).toBe(0);
+    expect(consumePublisherFirstImpressionDelivery(ts, token, 6007)).toBe(true);
+  });
+
+  it.each(['publisher', 'synthetic', 'excluded'])(
+    'keeps %s refreshes suppressed beyond token capacity until render',
+    (kind) => {
+      const code = 'example-capacity-slot';
+      const slot = {
+        getSlotElementId: () => code,
+        getAdUnitPath: () => '/123/trackingonly',
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+        setTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+      const element = document.getElementById(code)!;
+      const claim = claimFirstImpressionForTrustedServer(ts, element)!;
+      observeFirstImpressionGptLifecycle(ts, element, 'requested');
+      if (kind === 'excluded')
+        testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+      mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+      const pbjs = installPrebidNpm();
+      for (let index = 0; index < 40; index++) {
+        if (kind === 'publisher') {
+          pbjs.requestBids({
+            adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+            bidsBackHandler: () => pubads.refresh([slot]),
+          } as unknown as RequestBidsArg);
+        } else pubads.refresh([slot]);
+        expect(originalRefresh).not.toHaveBeenCalled();
+      }
+      expect(Object.keys(claim.publisherAuctions)).toHaveLength(16);
+      observeFirstImpressionGptLifecycle(ts, element, 'rendered');
+      deliveryAdIds.delete(slot);
+      pubads.refresh([slot]);
+      expect(originalRefresh).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('keeps registration open when a losing publisher callback throws', () => {
+    const code = 'example-throwing-overlap';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    const element = document.getElementById(code)!;
+    claimFirstImpressionForTrustedServer(ts, element);
+    observeFirstImpressionGptLifecycle(ts, element, 'requested');
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    const pbjs = installPrebidNpm();
+    expect(() =>
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => {
+          throw new Error('example callback failure');
+        },
+      } as unknown as RequestBidsArg)
+    ).toThrow('example callback failure');
+    pbjs.requestBids({
+      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: () => pubads.refresh([slot]),
+    } as unknown as RequestBidsArg);
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it.each(['before render', 'after render', 'after a later refresh'])(
+    'suppresses an overlapping publisher callback %s, including repeated callbacks',
+    (completion) => {
+      const code = 'example-render-overlap';
+      const slot = {
+        getSlotElementId: () => code,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+        setTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+      const element = document.getElementById(code)!;
+      const claim = claimFirstImpressionForTrustedServer(ts, element)!;
+      claim.targeting = { hb_adid: 'example-initial-ad' };
+      observeFirstImpressionGptLifecycle(ts, element, 'requested');
+      mockRequestBids.mockImplementation(() => undefined);
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => pubads.refresh([slot]),
+      } as unknown as RequestBidsArg);
+      const overlap = mockRequestBids.mock.calls.at(-1)![0];
+      if (completion !== 'before render') {
+        observeFirstImpressionGptLifecycle(ts, element, 'rendered');
+      }
+      if (completion === 'after a later refresh') {
+        mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+        pubads.refresh([slot]);
+        expect(originalRefresh).toHaveBeenCalledOnce();
+        slot.setTargeting.mockClear();
+      }
+      const accepted = originalRefresh.mock.calls.length;
+      completePublisherAuction(overlap);
+      completePublisherAuction(overlap);
+      expect(originalRefresh).toHaveBeenCalledTimes(accepted);
+      if (completion !== 'before render') expect(slot.setTargeting).not.toHaveBeenCalled();
+    }
+  );
 
   it('suppresses a correlated TS-owned delivery after the five-second lease', () => {
     const element = document.createElement('div');
@@ -4558,6 +4691,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       completePublisherAuction(originalPublisherAuction);
       expect(originalRefresh).toHaveBeenCalledOnce();
 
+      observeFirstImpressionGptLifecycle(ts, document.getElementById(code)!, 'rendered');
       deliveryAdIds.delete(slot);
       pubads.refresh([slot]);
       expect(mockRequestBids).toHaveBeenCalledTimes(2);
@@ -4775,7 +4909,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(originalRefresh).toHaveBeenCalledWith([firstSlot], undefined);
   });
 
-  it('allows publisher refreshes that start after the TS first impression request', () => {
+  it('suppresses publisher auctions between the initial request and render', () => {
     const code = 'requested-ts-owned-refresh-slot';
     const element = document.createElement('div');
     element.id = code;
@@ -4784,11 +4918,12 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     claimFirstImpressionForTrustedServer(ts, element);
     observeFirstImpressionGptLifecycle(ts, element, 'requested');
 
-    expect(registerPublisherFirstImpressionAuctions(ts, [code])).toEqual(new Map());
-    expect(ts.firstImpression?.slots[code]?.publisherRegistrationClosed).toBe(true);
+    const token = registerPublisherFirstImpressionAuctions(ts, [code]).get(code);
+    expect(consumePublisherFirstImpressionDelivery(ts, token)).toBe(true);
+    expect(ts.firstImpression?.slots[code]?.publisherRegistrationClosed).not.toBe(true);
   });
 
-  it('clears a stale GPT handoff when delegating a post-request publisher refresh', () => {
+  it('clears a stale GPT handoff when delegating a post-render publisher refresh', () => {
     const code = 'post-request-handoff-slot';
     const slot = {
       getSlotElementId: () => code,
@@ -4825,7 +4960,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     element.id = code;
     document.body.appendChild(element);
     claimFirstImpressionForTrustedServer(ts, element);
-    observeFirstImpressionGptLifecycle(ts, element, 'requested');
+    observeFirstImpressionGptLifecycle(ts, element, 'rendered');
     installRefreshHandler(640);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
     installPrebidNpm();
@@ -4858,7 +4993,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(originalRefresh).not.toHaveBeenCalled();
   });
 
-  it('delegates an all-excluded refresh after the TS first impression request', () => {
+  it('delegates an all-excluded refresh after the TS first impression render', () => {
     const code = 'requested-all-excluded-slot';
     const slot = {
       getSlotElementId: () => code,
@@ -4896,7 +5031,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     element.id = code;
     document.body.appendChild(element);
     claimFirstImpressionForTrustedServer(ts, element);
-    observeFirstImpressionGptLifecycle(ts, element, 'requested');
+    observeFirstImpressionGptLifecycle(ts, element, 'rendered');
     testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
     installRefreshHandler(640);
     installPrebidNpm();
@@ -4957,6 +5092,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
 
     expect(handoff.suppressPublisherRefresh).toBe(false);
     expect(innerRefresh).not.toHaveBeenCalled();
+    observeFirstImpressionGptLifecycle(ts, element, 'rendered');
 
     pubads.refresh([slot]);
 
@@ -5093,7 +5229,8 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       expect(originalRefresh).not.toHaveBeenCalled();
       expect(slot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
       expect(slot.setTargeting).toHaveBeenCalledWith('hb_adid', 'example-ts-ad-id');
-      expect(ts.firstImpression?.slots[code]?.publisherRegistrationClosed).toBe(true);
+      expect(ts.firstImpression?.slots[code]?.publisherRegistrationClosed).not.toBe(true);
+      observeFirstImpressionGptLifecycle(ts, element, 'rendered');
 
       pubads.refresh([slot], { changeCorrelator: false });
 

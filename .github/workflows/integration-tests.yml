@@ -200,7 +200,26 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
 
+      - name: Test initial render fixture escaping
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: node --test initial-render/pages.test.cjs
+
+      - name: Test initial render ownership
+        working-directory: crates/trusted-server-integration-tests/browser
+        # Let the runner build its Rubicon + Shared ID artifact; the bidder-only
+        # artifact above belongs to the existing Playwright tests.
+        run: node initial-render/run.cjs --out "$RUNNER_TEMP/initial-render-evidence"
+
+      - name: Upload initial render evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: initial-render-evidence
+          path: ${{ runner.temp }}/initial-render-evidence/
+          retention-days: 7
+
       - name: Run browser tests (Next.js)
+        if: always()
         working-directory: crates/trusted-server-integration-tests/browser
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}

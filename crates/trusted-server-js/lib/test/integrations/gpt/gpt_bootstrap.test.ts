@@ -227,6 +227,159 @@ describe('gpt_bootstrap.js fallback', () => {
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
   });
 
+  it.each(['pending', 'rendered', 'replaced', 'navigation', 'throwing logger', 'missing logger'])(
+    'records a bounded bootstrap pending diagnostic: %s',
+    (outcome) => {
+      vi.useFakeTimers();
+      try {
+        const slot = {
+          addService: vi.fn().mockReturnThis(),
+          setTargeting: vi.fn().mockReturnThis(),
+          getSlotElementId: () => 'example-pending-slot',
+        };
+        const pubads = { getSlots: () => [slot], refresh: vi.fn(), enableSingleRequest: vi.fn() };
+        (window as TestWindow).googletag = makeGoogleTag({
+          cmd: { push: (command) => command() },
+          pubads: () => pubads,
+        });
+        document.body.innerHTML = '<div id="example-pending-slot"></div>';
+        runBootstrap();
+        const ts = (window as TestWindow).tsjs!;
+        const debug = vi.fn(() => {
+          if (outcome === 'throwing logger') throw new Error('example logger failure');
+        });
+        if (outcome !== 'missing logger')
+          ts.log = {
+            setLevel: vi.fn(),
+            getLevel: () => 'debug',
+            info: vi.fn(),
+            warn: vi.fn(),
+            error: vi.fn(),
+            debug,
+          };
+        ts.adSlots = [
+          {
+            id: 'example-ad',
+            gam_unit_path: '/123/example',
+            div_id: 'example-pending-slot',
+            formats: [[300, 250]],
+          },
+        ];
+        ts.bids = {};
+        ts.adInit!();
+        const claim = ts.firstImpression!.slots['example-pending-slot'];
+        expect(claim).toBeDefined();
+        if (outcome === 'rendered') claim.phase = 'rendered';
+        if (outcome === 'replaced')
+          document.body.innerHTML = '<div id="example-pending-slot"></div>';
+        if (outcome === 'navigation') ts.navGeneration = 1;
+        expect(() => vi.advanceTimersByTime(5000)).not.toThrow();
+        if (['pending', 'throwing logger', 'missing logger'].includes(outcome)) {
+          expect(claim).toHaveProperty('pendingRenderDiagnostic', {
+            phase: 'delivery_pending',
+            ageMs: 5000,
+          });
+          expect(claim.publisherRegistrationClosed).not.toBe(true);
+          vi.advanceTimersByTime(30000);
+          expect(debug).toHaveBeenCalledTimes(outcome === 'missing logger' ? 0 : 1);
+        } else {
+          expect(claim).not.toHaveProperty('pendingRenderDiagnostic');
+          expect(debug).not.toHaveBeenCalled();
+        }
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it('records one pending snapshot after a publisher-to-TS fallback transition', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100);
+    try {
+      const slot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: () => 'example-fallback-slot',
+      };
+      const pubads = { getSlots: () => [slot], refresh: vi.fn(), enableSingleRequest: vi.fn() };
+      (window as TestWindow).googletag = makeGoogleTag({
+        cmd: { push: (command: () => void) => command() },
+        pubads: () => pubads,
+      });
+      document.body.innerHTML = '<div id="example-fallback-slot"></div>';
+      runBootstrap();
+      const ts = (window as TestWindow).tsjs!;
+      const debug = vi.fn();
+      ts.log = {
+        setLevel: vi.fn(),
+        getLevel: () => 'debug',
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug,
+      };
+      const element = document.getElementById('example-fallback-slot')!;
+      const publisherClaim: FirstImpressionSlotClaim = {
+        generation: 0,
+        slotElementId: element.id,
+        element,
+        owner: 'publisher',
+        phase: 'auctioning',
+        expiresAt: 5_100,
+        publisherAuctions: {
+          original: {
+            token: 'original',
+            adUnitCode: element.id,
+            phase: 'auctioning',
+            expiresAt: 5_100,
+            adIds: [],
+            suppressDelivery: false,
+          },
+        },
+      };
+      ts.firstImpression = {
+        generation: 0,
+        nextToken: 1,
+        slots: { [element.id]: publisherClaim },
+        fallbackSlots: {},
+      };
+      ts.adSlots = [
+        {
+          id: 'example-ad',
+          gam_unit_path: '/123/example',
+          div_id: element.id,
+          formats: [[300, 250]],
+        },
+      ];
+      ts.bids = {};
+      ts.adInit!();
+      expect(ts.firstImpression.fallbackSlots[element.id]).toBe(element);
+      expect(publisherClaim.owner).toBe('publisher');
+
+      // The bootstrap retries one millisecond after the publisher lease expires.
+      vi.advanceTimersByTime(5001);
+      const claim = ts.firstImpression.slots[element.id];
+      expect(claim).toBe(publisherClaim);
+      expect(claim.owner).toBe('trusted_server');
+      expect(claim.publisherAuctions.original.suppressDelivery).toBe(true);
+      vi.advanceTimersByTime(4999);
+      expect(debug).not.toHaveBeenCalled();
+      expect(claim).not.toHaveProperty('pendingRenderDiagnostic');
+      vi.advanceTimersByTime(1);
+      expect(debug).toHaveBeenCalledOnce();
+      expect(claim).toHaveProperty('pendingRenderDiagnostic', {
+        phase: 'delivery_pending',
+        ageMs: 5000,
+      });
+      vi.advanceTimersByTime(30000);
+      expect(debug).toHaveBeenCalledOnce();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps the bootstrap lease synchronized with the bundle contract', () => {
     const bootstrapLease = /var FIRST_IMPRESSION_LEASE_MS = (\d+);/.exec(BOOTSTRAP_SOURCE);
 
@@ -299,55 +452,69 @@ describe('gpt_bootstrap.js fallback', () => {
     }
   });
 
-  it('retains an expired TS suppression tombstone in the persistent bootstrap listener', () => {
-    const queue: Array<() => void> = [];
-    const listeners = new Map<string, (event: { slot: { getSlotElementId(): string } }) => void>();
-    const pubads = {
-      addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
-        listeners.set(name, listener as (event: { slot: { getSlotElementId(): string } }) => void);
-      }),
-      getSlots: vi.fn(() => []),
-      refresh: vi.fn(),
-    };
-    (window as TestWindow).googletag = makeGoogleTag({
-      cmd: queue,
-      pubads: vi.fn(() => pubads),
-    });
-    document.body.innerHTML = '<div id="persistent-slot"></div>';
+  it.each([true, false])(
+    'settles the persistent bootstrap listener on render (empty=%s)',
+    (isEmpty) => {
+      const queue: Array<() => void> = [];
+      const listeners = new Map<
+        string,
+        (event: { slot: { getSlotElementId(): string } }) => void
+      >();
+      const pubads = {
+        addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
+          listeners.set(
+            name,
+            listener as (event: { slot: { getSlotElementId(): string } }) => void
+          );
+        }),
+        getSlots: vi.fn(() => []),
+        refresh: vi.fn(),
+      };
+      (window as TestWindow).googletag = makeGoogleTag({
+        cmd: queue,
+        pubads: vi.fn(() => pubads),
+      });
+      document.body.innerHTML = '<div id="persistent-slot"></div>';
 
-    runBootstrap();
-    [...queue].forEach((command) => command());
-    const element = document.getElementById('persistent-slot')!;
-    const claim: FirstImpressionSlotClaim = {
-      generation: 0,
-      slotElementId: element.id,
-      element,
-      owner: 'trusted_server',
-      phase: 'delivery_pending',
-      expiresAt: 0,
-      publisherAuctions: {
-        late: {
-          token: 'late',
-          adUnitCode: element.id,
-          phase: 'delivery_pending',
-          expiresAt: 0,
-          adIds: ['late-ad'],
-          suppressDelivery: true,
+      runBootstrap();
+      [...queue].forEach((command) => command());
+      const element = document.getElementById('persistent-slot')!;
+      const claim: FirstImpressionSlotClaim = {
+        generation: 0,
+        slotElementId: element.id,
+        element,
+        owner: 'trusted_server',
+        phase: 'delivery_pending',
+        expiresAt: 0,
+        publisherAuctions: {
+          late: {
+            token: 'late',
+            adUnitCode: element.id,
+            phase: 'delivery_pending',
+            expiresAt: 0,
+            adIds: ['late-ad'],
+            suppressDelivery: true,
+          },
         },
-      },
-    };
-    (window as TestWindow).tsjs!.firstImpression = {
-      generation: 0,
-      nextToken: 1,
-      slots: { [element.id]: claim },
-      fallbackSlots: {},
-    };
+      };
+      (window as TestWindow).tsjs!.firstImpression = {
+        generation: 0,
+        nextToken: 1,
+        slots: { [element.id]: claim },
+        fallbackSlots: {},
+      };
 
-    listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
+      listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
 
-    expect(claim.publisherAuctions.late).toBeDefined();
-    expect(claim.publisherRegistrationClosed).toBe(true);
-  });
+      expect(claim.publisherAuctions.late).toBeDefined();
+      expect(claim.publisherRegistrationClosed).not.toBe(true);
+      const renderedEvent = { slot: { getSlotElementId: () => element.id }, isEmpty };
+      listeners.get('slotRenderEnded')!(renderedEvent);
+      expect(claim.publisherRegistrationClosed).toBe(true);
+      listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
+      expect(claim.phase).toBe('rendered');
+    }
+  );
 
   it('prunes a malformed bootstrap registry key before recording the main-document slot', () => {
     const queue: Array<() => void> = [];
