@@ -87,6 +87,10 @@ mod tests {
                 "{name} should expose the secret store under its logical ID"
             );
             assert!(
+                local_server["secret_stores"].get("ts_secrets").is_none(),
+                "{name} should not define the legacy physical secret store"
+            );
+            assert!(
                 local_server["config_stores"]
                     .get("edgezero_runtime_env")
                     .is_none(),

@@ -162,11 +162,12 @@ pub(crate) struct RuntimeStoreConfig {
 impl RuntimeStoreConfig {
     /// Store bindings for the Fastly runtime.
     ///
-    /// Fastly Compute has no process environment. `EdgeZero` links each selected
-    /// physical store to the service version under its logical ID, so the
-    /// runtime opens stores by logical ID and reads the config entry under
-    /// that same ID for every publication target. Staging isolation comes from
-    /// linking a different physical store, never from a different key.
+    /// Store selection is a deploy-time input; no store selector reaches the
+    /// Fastly runtime. `EdgeZero` links each selected physical store to the
+    /// service version under its logical ID, so the runtime opens stores by
+    /// logical ID and reads the config entry under that same ID for every
+    /// publication target. Staging isolation comes from linking a different
+    /// physical store, never from a different key.
     pub(crate) fn logical() -> Self {
         Self {
             config_store_name: StoreName::from(DEFAULT_CONFIG_STORE_ID),

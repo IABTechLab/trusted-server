@@ -271,6 +271,16 @@ Used for storing public configuration (e.g., public keys, key metadata):
 fastly config-store create --name jwks_store
 ```
 
+Trusted Server's app config lives under logical store ID
+`trusted_server_config`. Select its physical store in each deployment
+environment, the same way as the secret store below. Production and staging
+isolate their app config by selecting different physical stores, because the
+config entry key is the logical ID on every target:
+
+```bash
+export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-config-store>
+```
+
 ### Secret Stores
 
 Trusted Server keeps static app-config credentials under logical store ID
@@ -312,8 +322,8 @@ Create the separate request-signing store when that feature is enabled:
 fastly secret-store create --name signing_keys
 ```
 
-Do not copy the same app credential store under a second hardcoded
-`trusted_server_secrets` Fastly link. Configure the mapping instead.
+The deployment creates the `trusted_server_secrets` link itself from the
+selected physical store. Do not create that link by hand.
 
 ## Create EC KV Store
 
