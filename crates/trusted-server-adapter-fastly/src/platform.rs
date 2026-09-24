@@ -15,8 +15,8 @@ use trusted_server_core::platform::{
     PlatformCacheIntent, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
     PlatformHttpRequest, PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode,
     PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
-    PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, StoreId, StoreName,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
+    StoreName,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
 
