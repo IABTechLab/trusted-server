@@ -2348,9 +2348,17 @@ stored as a shared template.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, and schema
-version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
-not: the stored template is decoded identity and the assembled result is encoded
+origin identity, complete template-shaping settings, TSJS content, core build
+inputs, and schema version all participate in an opaque SHA-256 cache key. The
+build digest covers every core source file (including Rust-inlined head scripts),
+the core build script, core and workspace manifests, and the workspace lockfile
+when present. Any change to these inputs causes a cold template fill per URL
+variant after deployment, even if the change does not affect rendered HTML.
+Manual schema bumps remain necessary for cached metadata, seam marker, and
+assembly-contract changes.
+
+`Accept-Encoding` does not participate in the key: the stored template is decoded
+identity and the assembled result is encoded
 for each reader with `Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the

@@ -91,6 +91,9 @@ jobs:
       - name: Run Axum adapter tests
         run: cargo test-axum
 
+      - name: Test template build digest inputs (native)
+        run: cargo test -p trusted-server-core --test template_build_digest
+
       - name: Run HTML processor benchmarks (smoke)
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
         run: cargo bench -p trusted-server-core --bench html_processor_bench -- --test
