@@ -148,6 +148,12 @@ fn main() {
         .expect("should write generated module entry");
     }
     codegen.push_str("];\n");
+    writeln!(
+        codegen,
+        "pub(crate) const ALL_MODULE_IDS: [&str; {0}] = {{\n    let mut ids = [\"\"; {0}];\n    let mut index = 0;\n    while index < {0} {{\n        ids[index] = TSJS_MODULES[index].id;\n        index += 1;\n    }}\n    ids\n}};",
+        modules.len()
+    )
+    .expect("should write generated module IDs");
     codegen.push_str("\npub(crate) struct TsjsModuleMeta {\n");
     codegen.push_str("    pub bundle: &'static str,\n");
     codegen.push_str("    pub id: &'static str,\n");

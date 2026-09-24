@@ -16,8 +16,8 @@ pub fn module_bundle(id: &str) -> Option<&'static str> {
 /// Return all available module IDs, in discovery order (core first).
 #[must_use]
 #[inline]
-pub fn all_module_ids() -> Vec<&'static str> {
-    TSJS_MODULES.iter().map(|module| module.id).collect()
+pub const fn all_module_ids() -> &'static [&'static str] {
+    &ALL_MODULE_IDS
 }
 
 /// Concatenate core + the requested integration modules into a single JS string.
@@ -136,6 +136,16 @@ mod tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn all_module_ids_matches_generated_module_list() {
+        let from_modules: Vec<&str> = TSJS_MODULES.iter().map(|module| module.id).collect();
+        assert_eq!(
+            all_module_ids(),
+            from_modules.as_slice(),
+            "the generated ID list should match the generated module table"
+        );
     }
 
     #[test]
