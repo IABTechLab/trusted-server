@@ -159,10 +159,11 @@ when an active diagnostics recorder exists, so an inactive console does not chan
 Prebid-visible behavior.
 
 Server auction timing and browser GPT timing use separate clocks and are never
-subtracted from each other. Initial SSAT offsets use edge-request T0. SPA TS auction
-offsets use a local server clock started when the page-bids handler begins, not the
-browser's navigation clock or the edge's request-receipt time. Diagnostics retains that
-timing origin separately from aggregate classification. The server facts are:
+subtracted from each other. Both initial SSAT and SPA TS auction offsets use the
+adapter's server-request clock. Initial offsets belong to the document request, while
+SPA offsets belong to the later `/_ts/page-bids` request. Neither server clock is the
+browser's navigation clock. Diagnostics retains that request origin separately from
+aggregate classification. The server facts are:
 
 - `auctionDispatchedMs`: bid dispatch offset from that timing origin.
 - `auctionResolvedMs`: offset when auction collection completed, including timeout handling.

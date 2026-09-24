@@ -280,9 +280,11 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Server auction winner: example-bidder');
     expect(responseSentArticle).toContain('Server bid price bucket: 1.20 USD');
     expect(responseSentArticle).not.toContain('(currency not supplied)');
-    expect(responseSentArticle).toContain('Edge request T0 → auction dispatched 4 ms');
-    expect(responseSentArticle).toContain('Edge request T0 → auction collected 84 ms');
-    expect(responseSentArticle).toContain('Edge request T0 → bids ready 85 ms');
+    expect(responseSentArticle).toContain(
+      'Initial document request T0 → auction dispatched 4 ms'
+    );
+    expect(responseSentArticle).toContain('Initial document request T0 → auction collected 84 ms');
+    expect(responseSentArticle).toContain('Initial document request T0 → bids ready 85 ms');
     expect(responseSentArticle).toContain('Auction collection wait (in stream) 80 ms');
     expect(responseSentArticle).toContain('Opportunity → request 0 ms');
     expect(responseSentArticle).toContain('Server bid available; creative source present');
@@ -308,8 +310,8 @@ describe('GptDiagnosticsOverlay', () => {
     const selectedArticle = slotArticle(root!, 'selected-slot').textContent ?? '';
     expect(selectedArticle).toContain('Request path: Multiple paths observed');
     expect(selectedArticle).toContain('Auction evidence: TS auction: SPA server auction');
-    expect(selectedArticle).toContain('SPA page-bids T0 → auction dispatched 0 ms');
-    expect(selectedArticle).toContain('SPA page-bids T0 → auction collected 40 ms');
+    expect(selectedArticle).toContain('SPA page-bids request T0 → auction dispatched 0 ms');
+    expect(selectedArticle).toContain('SPA page-bids request T0 → auction collected 40 ms');
     expect(selectedArticle).toContain('Server bid available; creative source incomplete');
     expect(selectedArticle).toContain('Trusted Server creative request observed at 23 ms');
     expect(selectedArticle).not.toContain('Trusted Server markup response sent');
@@ -601,8 +603,12 @@ describe('GptDiagnosticsOverlay', () => {
     runNextFrame(frames);
     runNextFrame(frames);
 
-    expect(root?.textContent).toContain('SPA page-bids T0 → auction dispatched Unavailable');
-    expect(root?.textContent).not.toContain('Edge request T0 → auction dispatched Unavailable');
+    expect(root?.textContent).toContain(
+      'SPA page-bids request T0 → auction dispatched Unavailable'
+    );
+    expect(root?.textContent).not.toContain(
+      'Initial document request T0 → auction dispatched Unavailable'
+    );
     overlay.destroy();
   });
 

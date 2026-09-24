@@ -48,7 +48,8 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
 
 use crate::middleware::{
-    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
+    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, RequestTimingMiddleware,
+    SanitizeRequestMiddleware,
 };
 use crate::platform::build_runtime_services;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -868,6 +869,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // any middleware registered ahead of it would observe the
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(RequestTimingMiddleware::new())
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip

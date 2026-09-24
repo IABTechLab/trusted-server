@@ -6963,14 +6963,13 @@ pub async fn handle_page_bids(
     ec_context: &mut EcContext,
     mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Same defaulted-handle rule as `handle_publisher_request`: adapters
-    // install the request-scoped collector before routing, and a request
-    // without the extension records into a collector nothing reads.
-    let timings = req
-        .extensions()
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    // Keep a local collector for direct-handler callers, but only expose
+    // browser timings from an adapter-attached request clock. Otherwise an
+    // adapter that forgets the extension would silently report a different
+    // handler-entry timing origin.
+    let request_timings = req.extensions().get::<RequestTimings>().cloned();
+    let has_request_timings = request_timings.is_some();
+    let timings = request_timings.unwrap_or_default();
 
     // Adapter fallbacks prepare this before routing. Keep this idempotent call as
     // a direct-handler safety net and retain the session decision after the
@@ -7223,7 +7222,7 @@ pub async fn handle_page_bids(
                     );
                     timings.mark_auction_resolved();
 
-                    if gpt_diagnostics.browser_session_active() {
+                    if gpt_diagnostics.browser_session_active() && has_request_timings {
                         let timing_snapshot = timings.snapshot();
                         auction_diagnostics = Some(BrowserAuctionDiagnostics {
                             auction_dispatched_ms: timing_snapshot.auction_dispatched_ms,
@@ -23346,6 +23345,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn active_page_bids_omits_timings_without_adapter_collector() {
+            let mut settings = settings_with_co();
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let slots = article_slot();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"winner".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::new(Mutex::new(None)), true);
+            let mut ec_context = consent_allowing_ec_context();
+
+            let response = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &mut ec_context,
+                make_active_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return page-bids response");
+            let body: serde_json::Value = serde_json::from_slice(
+                &response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read page-bids response body"),
+            )
+            .expect("should serialize page-bids response as JSON");
+
+            assert!(
+                body.get("auctionDiagnostics").is_none(),
+                "missing adapter timing context must not emit handler-local timing facts"
+            );
+        }
+
+        #[tokio::test]
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
             settings.auction.providers =
@@ -23429,6 +23475,10 @@ mod tests {
             let resolved_ms = timing("auctionResolvedMs");
             let committed_ms = timing("auctionCommittedMs");
             let wait_ms = timing("auctionWaitMs");
+            assert!(
+                dispatched_ms > 0,
+                "page-bids dispatch should include time since adapter request entry"
+            );
             assert!(
                 dispatched_ms <= resolved_ms && resolved_ms <= committed_ms,
                 "page-bids auction milestones should be monotonic"
