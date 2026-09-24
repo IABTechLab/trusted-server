@@ -258,7 +258,8 @@ fn verdict(observations: &[Observation], ending: &Ending) -> String {
     }
 
     if observations.iter().all(|o| o.instance.is_none()) {
-        return "reuse: unverified (no counters; enable debug.sandbox_metrics_enabled)\n"
+        return "reuse: unverified (no counters; enable debug.sandbox_metrics_enabled, \
+                and probe a route whose response is private and no-store)\n"
             .to_owned();
     }
 
