@@ -258,7 +258,15 @@ async function runAuction(pageWindow, fetchSpy) {
       {
         code: 'ad-slot-1',
         mediaTypes: { banner: { sizes: [[300, 250]] } },
-        bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 1 } },
+          { bidder: 'trustedServer', params: { storedRequest: undefined } },
+        ],
+      },
+      {
+        code: 'ad-slot-2',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [],
       },
     ],
     timeout: 1000,
@@ -284,6 +292,13 @@ async function runAuction(pageWindow, fetchSpy) {
   expect(adUnit.code).toBe('ad-slot-1');
   const trustedServerBid = adUnit.bids.find((bid) => bid.bidder === 'trustedServer');
   expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: { placementId: 1 } });
+  // An authored storedRequest left explicitly undefined must not serialize onto
+  // the wire, or the server reads it as a stored-request demand.
+  expect(trustedServerBid.params).not.toHaveProperty('storedRequest');
+  // A slot the publisher left without bids must not demand a Prebid Server
+  // stored request, or the whole auction is answered from stored config.
+  const generated = payload.adUnits.find((unit) => unit.code === 'ad-slot-2');
+  expect(generated.bids[0].params).toEqual({ bidderParams: {}, storedRequest: false });
 }
 
 function expectManifest(manifest, analytics) {
@@ -311,10 +326,12 @@ describe('tsjs-prebid production artifacts', () => {
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
     // A value-import of Prebid or a private rendering helper would multiply
     // the shim size. The bound sits just above the normal compact shim output,
-    // which is roughly 40 KB: tight enough that material growth has to be
-    // noticed and re-justified here, and far enough below a multiplication
-    // that one still fails loudly. The bundle beside it is 200 KB and up.
-    expect(shimCode.length).toBeLessThan(41_000);
+    // which is roughly 42 KB once the LiveRamp managed integration and the GPT
+    // auction diagnostics evidence both ship: tight enough that material growth
+    // has to be noticed and re-justified here, and far enough below a
+    // multiplication that one still fails loudly. The bundle beside it is
+    // 200 KB and up.
+    expect(shimCode.length).toBeLessThan(43_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 

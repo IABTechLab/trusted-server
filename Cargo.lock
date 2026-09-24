@@ -202,6 +202,7 @@ dependencies = [
  "compression-core",
  "futures-io",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -787,7 +788,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1427,15 +1428,19 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "toml",
+ "walkdir",
 ]
 
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1463,7 +1468,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1486,7 +1491,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1515,7 +1520,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1542,7 +1547,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
  "chrono",
  "clap",
@@ -1567,7 +1572,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1598,7 +1603,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=12c3215c2637d961a27eefa12e235033fadb4c4a#12c3215c2637d961a27eefa12e235033fadb4c4a"
 dependencies = [
  "log",
  "proc-macro2",
@@ -5282,12 +5287,17 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "bitflags 2.13.0",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
@@ -5365,6 +5375,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "derive_more",
  "edgezero-adapter-cloudflare",
  "edgezero-core",
  "error-stack",
@@ -5373,6 +5384,7 @@ dependencies = [
  "log",
  "serde_json",
  "tokio",
+ "toml",
  "trusted-server-core",
  "trusted-server-js",
  "worker",
@@ -5396,6 +5408,7 @@ dependencies = [
  "futures",
  "log",
  "log-fastly",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "toml",
@@ -5439,6 +5452,7 @@ dependencies = [
  "edgezero-cli",
  "edgezero-core",
  "error-stack",
+ "flate2",
  "futures",
  "glob",
  "http",
@@ -5449,6 +5463,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "regex",
+ "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
  "scraper",
@@ -6021,7 +6036,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

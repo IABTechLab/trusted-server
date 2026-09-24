@@ -1,6 +1,7 @@
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
 use trusted_server_core::config::TrustedServerAppConfig;
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 
 use crate::common::runtime::{TestError, TestResult};
 
@@ -35,7 +36,7 @@ pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
 
 pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
     let envelope = integration_app_config_envelope(origin_port)?;
-    serde_json::to_string(&serde_json::json!({ "app_config": envelope })).map_err(|error| {
+    serde_json::to_string(&serde_json::json!({ CONFIG_BLOB_KEY: envelope })).map_err(|error| {
         Report::new(TestError::ConfigGeneration).attach(format!(
             "failed to serialize Cloudflare config binding: {error}"
         ))
@@ -46,8 +47,7 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
 mod tests {
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
-    const VICEROY_SECRET_STORE_MAPPING_KEY: &str =
-        "EDGEZERO__SERVICES__0000000000000000000000__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME";
+    const LOGICAL_SECRET_STORE_ID: &str = "trusted_server_secrets";
 
     #[test]
     fn local_fastly_config_defines_runtime_kv_stores() {
@@ -74,26 +74,28 @@ mod tests {
     }
 
     #[test]
-    fn local_fastly_secret_store_mapping_is_service_scoped() {
+    fn local_fastly_secret_store_is_exposed_under_its_logical_id() {
         for (name, config) in [
             ("fastly.toml", FASTLY_CONFIG),
             ("Viceroy integration template", VICEROY_TEMPLATE),
         ] {
             let parsed: toml::Value =
                 toml::from_str(config).expect("should parse Fastly configuration");
-            let runtime_env =
-                &parsed["local_server"]["config_stores"]["edgezero_runtime_env"]["contents"];
+            let local_server = &parsed["local_server"];
 
-            assert_eq!(
-                runtime_env[VICEROY_SECRET_STORE_MAPPING_KEY].as_str(),
-                Some("ts_secrets"),
-                "{name} should scope the secret-store mapping to Viceroy's service ID"
+            assert!(
+                local_server["secret_stores"][LOGICAL_SECRET_STORE_ID].is_array(),
+                "{name} should expose the secret store under its logical ID"
             );
             assert!(
-                runtime_env
-                    .get("EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME")
+                local_server["secret_stores"].get("ts_secrets").is_none(),
+                "{name} should not define the legacy physical secret store"
+            );
+            assert!(
+                local_server["config_stores"]
+                    .get("edgezero_runtime_env")
                     .is_none(),
-                "{name} should not define the ignored unscoped secret-store mapping"
+                "{name} should not define the legacy runtime selector store"
             );
         }
     }
@@ -102,9 +104,9 @@ mod tests {
     fn local_fastly_config_defines_starter_secret_references() {
         let parsed: toml::Value =
             toml::from_str(FASTLY_CONFIG).expect("should parse root fastly.toml");
-        let entries = parsed["local_server"]["secret_stores"]["ts_secrets"]
+        let entries = parsed["local_server"]["secret_stores"][LOGICAL_SECRET_STORE_ID]
             .as_array()
-            .expect("fastly.toml should define ts_secrets");
+            .expect("fastly.toml should define trusted_server_secrets");
 
         for key in [
             "publisher_proxy_secret",

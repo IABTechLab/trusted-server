@@ -74,6 +74,18 @@ mod tests {
             .replace("\"example.com\"", "\"publisher.example.com\"")
             .replace("\".example.com\"", "\".publisher.example.com\"")
             .replace(
+                "password = \"handler_password\"",
+                "password = \"test-admin-password-32-bytes-minimum\"",
+            )
+            .replace(
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
+            )
+            .replace(
+                "proxy_secret = \"publisher_proxy_secret\"",
+                "proxy_secret = \"test-proxy-secret-32-bytes-minimum\"",
+            )
+            .replace(
                 "https://origin.example.com",
                 "https://origin.publisher.example.com",
             )

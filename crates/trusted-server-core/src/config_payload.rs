@@ -17,8 +17,19 @@ use crate::settings::Settings;
 /// Canonical logical secret store used by Trusted Server app-config secrets.
 pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 
+/// Default logical config-store id, from `[stores.config].default` in `edgezero.toml`.
+///
+/// Derived at build time so every adapter uses the repository manifest's default.
+pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID");
+
 /// Default config-store key containing the Trusted Server app-config blob.
-pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
+///
+/// Intentionally matches the logical store ID: an ordinary `ts config push`
+/// writes there unless `--key` selects another key. This constant does not apply
+/// runtime overrides; use [`crate::settings_data::config_key`] with the adapter's
+/// runtime configuration, or [`crate::settings_data::default_config_key`] for
+/// process-environment overrides.
+pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
 ///
@@ -61,16 +72,30 @@ pub fn settings_from_config_blob(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    if data
-        .pointer("/tinybird/enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        && let Some(tinybird) = data
-            .get_mut("tinybird")
-            .and_then(serde_json::Value::as_object_mut)
+    if let Some(tinybird) = data
+        .get_mut("tinybird")
+        .and_then(serde_json::Value::as_object_mut)
     {
-        tinybird.remove("auction_token_secret");
-        tinybird.remove("access_token_secret");
+        let enabled = tinybird.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+        if !enabled {
+            tinybird.remove("auction_token_secret");
+            tinybird.remove("access_token_secret");
+        } else {
+            if tinybird
+                .get("auction_enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                tinybird.remove("auction_token_secret");
+            }
+            if tinybird
+                .get("access_enabled")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                tinybird.remove("access_token_secret");
+            }
+        }
     }
 
     if let Some(partners) = data
@@ -127,7 +152,10 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::integrations::IntegrationRegistry;
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
@@ -834,9 +862,15 @@ mod tests {
     #[test]
     fn runtime_blob_accepts_disabled_browser_bidder_ownership_overlap() {
         let original = settings_with_browser_bidder_overlap(false);
+        let reconstructed = load_settings(&envelope_json(&original))
+            .expect("should decode dormant conflicting runtime blob");
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&reconstructed)
+                .expect("should compile decoded disabled auction plan"),
+        );
 
-        load_settings(&envelope_json(&original))
-            .expect("runtime should accept disabled browser bidder ownership overlap");
+        IntegrationRegistry::with_plan(&reconstructed, plan)
+            .expect("runtime registry should accept disabled ownership overlap");
     }
 
     #[test]

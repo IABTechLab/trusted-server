@@ -14,11 +14,18 @@ use crate::constants::COOKIE_TS_TESTER;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
+/// Lifetime of the tester cookie in seconds (30 days).
+///
+/// Without an explicit lifetime the cookie is session-scoped, and Safari
+/// deletes session cookies when the browser quits, so testers silently fall
+/// back to the baseline arm on their next visit.
+const TESTER_COOKIE_MAX_AGE_SECONDS: u32 = 2_592_000;
+
 /// Formats the tester cookie `Set-Cookie` header value.
 fn format_tester_cookie(domain: &str) -> String {
     format!(
-        "{}=true; Domain={}; Path=/; Secure; SameSite=Lax",
-        COOKIE_TS_TESTER, domain,
+        "{}=true; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        COOKIE_TS_TESTER, domain, TESTER_COOKIE_MAX_AGE_SECONDS,
     )
 }
 
@@ -34,7 +41,8 @@ fn format_clear_tester_cookie(domain: &str) -> String {
 ///
 /// Returns `404 Not Found` while `[tester_cookie].enabled` is false. When the
 /// feature is enabled, returns `204 No Content` with `Set-Cookie: ts-tester=true`
-/// scoped to `publisher.cookie_domain`.
+/// scoped to `publisher.cookie_domain` and persisted for
+/// [`TESTER_COOKIE_MAX_AGE_SECONDS`].
 ///
 /// # Errors
 ///
@@ -138,8 +146,9 @@ mod tests {
             .to_str()
             .expect("should render set-cookie as utf-8");
         assert_eq!(
-            set_cookie, "ts-tester=true; Domain=.tester.example; Path=/; Secure; SameSite=Lax",
-            "tester cookie should use publisher.cookie_domain"
+            set_cookie,
+            "ts-tester=true; Domain=.tester.example; Path=/; Secure; SameSite=Lax; Max-Age=2592000",
+            "tester cookie should use publisher.cookie_domain and persist across browser restarts"
         );
     }
 

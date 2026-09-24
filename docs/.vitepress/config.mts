@@ -160,11 +160,17 @@ export default withMermaid(
               text: 'Google Tag Manager',
               link: '/guide/integrations/google_tag_manager',
             },
+            { text: 'GAM', link: '/guide/integrations/gam' },
             { text: 'GPT', link: '/guide/integrations/gpt' },
             {
               text: 'GPT Runtime Diagnostics',
               link: '/guide/integrations/gpt-diagnostics',
             },
+            {
+              text: 'GPT Diagnostics Label Dictionary',
+              link: '/guide/integrations/gpt-diagnostics-dictionary',
+            },
+            { text: 'Kargo', link: '/guide/integrations/kargo' },
             { text: 'Lockr', link: '/guide/integrations/lockr' },
             { text: 'Next.js', link: '/guide/integrations/nextjs' },
             { text: 'Osano', link: '/guide/integrations/osano' },

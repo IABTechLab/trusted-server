@@ -3,14 +3,12 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::config_payload::DEFAULT_SECRET_STORE_ID;
-use crate::config_payload::settings_from_config_blob;
+pub use crate::config_payload::DEFAULT_CONFIG_STORE_ID;
+use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
 use crate::settings::Settings;
 
-/// Canonical logical config store used by Trusted Server app config.
-pub const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 
@@ -42,13 +40,23 @@ pub fn config_key(env: &EnvConfig) -> String {
     env.store_key("config", DEFAULT_CONFIG_STORE_ID)
 }
 
-/// Returns the default `EdgeZero` app-config store name.
+/// Resolves the `EdgeZero` app-config store name from the process environment.
+///
+/// Native adapters such as Axum use this wrapper. Fastly instead supplies an
+/// `EnvConfig` populated from service-scoped entries in `edgezero_runtime_env`
+/// and resolves the store name from that configuration. Without an override,
+/// both paths use the manifest default logical store ID.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
     config_store_name(&EnvConfig::from_env())
 }
 
-/// Returns the default config-store key containing the app-config blob.
+/// Resolves the app-config blob key from the process environment.
+///
+/// Native adapters such as Axum use this wrapper. Fastly resolves the key from
+/// service-scoped entries in `edgezero_runtime_env` instead. A runtime `__KEY`
+/// override must match `ts config push --key`; an ordinary push without that
+/// flag writes at the logical store ID, regardless of the `__KEY` override.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
@@ -198,7 +206,7 @@ fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_payload::CONFIG_BLOB_KEY;
+    use crate::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
     use crate::platform::{PlatformError, StoreId};
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
@@ -281,6 +289,34 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_match_edgezero_manifest() {
+        let manifest = edgezero_core::manifest::ManifestLoader::try_load_from_str(include_str!(
+            "../../../edgezero.toml"
+        ))
+        .expect("should load the repository EdgeZero manifest");
+        let manifest_default = manifest
+            .manifest()
+            .stores
+            .config
+            .as_ref()
+            .expect("should declare [stores.config]")
+            .default_id();
+
+        assert_eq!(
+            DEFAULT_CONFIG_STORE_ID, manifest_default,
+            "compiled default should match edgezero.toml"
+        );
+        assert_eq!(
+            CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID,
+            "default blob key should match the default config store id"
+        );
+        assert_eq!(
+            manifest_default, "trusted_server_config",
+            "Trusted Server should retain its expected default config store"
+        );
+    }
+
+    #[test]
     fn config_selectors_default_to_the_logical_store_id() {
         let env = EnvConfig::default();
 
@@ -331,8 +367,12 @@ mod tests {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), envelope_json)]),
         };
 
-        let loaded = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect("should load settings");
+        let loaded = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -378,8 +418,12 @@ mod tests {
             ]),
         };
 
-        let loaded = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect("should load settings");
+        let loaded = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -408,8 +452,12 @@ mod tests {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]),
         };
 
-        let err = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect_err("should reject malformed chunk length metadata");
+        let err = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect_err("should reject malformed chunk length metadata");
 
         assert!(
             err.to_string().contains("chunk lengths total mismatch"),
@@ -423,8 +471,12 @@ mod tests {
             entries: BTreeMap::new(),
         };
 
-        let err = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-            .expect_err("should fail when blob is missing");
+        let err = load_settings(
+            &store,
+            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            CONFIG_BLOB_KEY,
+        )
+        .expect_err("should fail when blob is missing");
 
         assert!(
             err.to_string().contains(CONFIG_BLOB_KEY),

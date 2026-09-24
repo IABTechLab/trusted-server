@@ -43,6 +43,7 @@ mod template_assembly;
 mod template_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod timed_kv;
 mod traits;
 mod types;
 
@@ -53,8 +54,8 @@ pub use backend_naming::{
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
-    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSelectResult, UnavailableHttpClient,
+    PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
 };
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
@@ -70,8 +71,9 @@ pub use template_cache::{
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
     TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
     TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
-    UnavailableTemplateCache, VaryHeaderValues, VarySpec,
+    UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
+pub use timed_kv::TimedKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,

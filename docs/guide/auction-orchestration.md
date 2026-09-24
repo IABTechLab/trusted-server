@@ -774,6 +774,22 @@ centrally routed or trusted stored-request demand. The `prebid-server` profile
 rejects `all_eligible` because PBS requires bidder or stored-request demand on
 each impression.
 
+For PBS, `trustedServer.params.storedRequest` controls stored fallback, not
+provider selection. `false` suppresses stored demand on every PBS instance;
+`true` permits it; omission retains legacy empty-envelope and routed-empty-param
+fallback. Invalid intent, including `null`, rejects the envelope atomically.
+After provider-local overrides, usable inline params win. Otherwise only permitted
+stored demand becomes `imp.ext.prebid.storedrequest.id`, using the slot code.
+Demandless impressions are omitted, and a provider with no remaining impressions
+makes no transport request. Server-owned explicit routes remain internal and do
+not authorize demandless PBS wire impressions. APS and standard `all_eligible`
+participation is unchanged. Intentional and legacy stored demand still fan out to
+PBS instances and can fail if a slot-code ID is absent there.
+
+New TSJS envelopes explicitly disable stored fallback, while publisher-authored
+omission remains compatible. Follow the [server-first deployment sequence](/guide/integrations/prebid#stored-intent-deployment)
+before serving new JS; Rust builds embed those bundles.
+
 Provider IDs must match `^[a-z][a-z0-9-]{0,62}$`. Bidder IDs are limited to 128
 UTF-8 bytes and cannot be the exact reserved browser envelope ID
 `trustedServer`. Static standard-profile `request_ext` and `imp_ext` objects
@@ -816,8 +832,8 @@ not belong to the browser integration.
 ### Environment variable overrides
 
 The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
-override existing scalar leaves. The pinned EdgeZero loader does not create
-missing leaves or replace arrays, tables, maps, or rules. Existing configs must add
+override existing scalar leaves. EdgeZero's env overlay does not create missing
+leaves or replace arrays, tables, maps, or rules. Existing configs must add
 `rewrite_creatives = true` and `sanitize_creatives = false` before relying on
 those scalar overrides. Edit and re-push TOML for other values. Provider map
 keys preserve hyphens, so `pbs-main` uses the `PBS-MAIN` segment and needs

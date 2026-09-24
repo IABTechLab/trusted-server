@@ -10,6 +10,7 @@ mod unit_template;
 mod validate;
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -295,19 +296,16 @@ fn build_audit_outputs(collected: &collector::CollectedPage) -> CliResult<AuditO
         page_has_prebid,
     );
     let ad_slot_count = slots.slots.len();
-    let draft = build_draft_config_with_generator(
-        &final_url,
-        &artifact,
-        &slots,
-        &mut RandomOpaqueAssetPathGenerator,
-    )?;
+    let mut path_generator = RandomOpaqueAssetPathGenerator;
+    let draft_config =
+        build_draft_config_with_generator(&final_url, &artifact, &slots, &mut path_generator)?;
 
     Ok(AuditOutputs {
         artifact,
         js_assets_toml,
-        draft_config_toml: draft.toml,
+        draft_config_toml: draft_config.toml,
         ad_slot_count,
-        js_asset_proxy_candidate_count: draft.js_asset_proxy_candidate_count,
+        js_asset_proxy_candidate_count: draft_config.js_asset_proxy_candidate_count,
     })
 }
 
@@ -414,13 +412,9 @@ fn build_draft_config(
     artifact: &AuditArtifact,
     slots: &gpt_slots::DiscoveredSlots,
 ) -> CliResult<String> {
-    build_draft_config_with_generator(
-        target_url,
-        artifact,
-        slots,
-        &mut RandomOpaqueAssetPathGenerator,
-    )
-    .map(|draft| draft.toml)
+    let mut path_generator = RandomOpaqueAssetPathGenerator;
+    build_draft_config_with_generator(target_url, artifact, slots, &mut path_generator)
+        .map(|draft| draft.toml)
 }
 
 fn build_draft_config_with_generator(
@@ -580,10 +574,10 @@ fn build_js_asset_proxy_section(
             ));
         }
         toml.push_str("[[integrations.js_asset_proxy.assets]]\n");
-        toml.push_str(&format!("path = {}\n", toml_string(&generated_path)));
+        toml.push_str(&format!("path = {}\n", toml_quoted_string(&generated_path)));
         toml.push_str(&format!(
             "origin_url = {}\n",
-            toml_string(&candidate.origin_url)
+            toml_quoted_string(&candidate.origin_url)
         ));
         if Url::parse(&candidate.origin_url).is_ok_and(|url| url.query().is_some()) {
             toml.push_str(
@@ -762,6 +756,25 @@ fn sanitized_comment_value(value: &str) -> String {
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect()
+}
+
+fn toml_quoted_string(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            ch if ch.is_control() => {
+                write!(&mut quoted, "\\u{:04X}", ch as u32).expect("should write to string");
+            }
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {
@@ -1997,6 +2010,19 @@ mod tests {
         collected
     }
 
+    fn audited_asset(url: &str, party: AssetParty, integration: Option<&str>) -> AuditedAsset {
+        AuditedAsset {
+            kind: "script".to_string(),
+            url: url.to_string(),
+            host: Url::parse(url)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_string))
+                .unwrap_or_default(),
+            party,
+            integration: integration.map(str::to_string),
+        }
+    }
+
     fn audit_args(url: &str) -> GenerateArgs {
         GenerateArgs {
             url: url.to_string(),
@@ -2355,19 +2381,6 @@ mod tests {
             self.paths
                 .pop_front()
                 .expect("should have a fixed generated asset path")
-        }
-    }
-
-    fn audited_asset(url: &str, party: AssetParty, integration: Option<&str>) -> AuditedAsset {
-        AuditedAsset {
-            kind: "script".to_string(),
-            url: url.to_string(),
-            host: Url::parse(url)
-                .ok()
-                .and_then(|parsed| parsed.host_str().map(str::to_string))
-                .unwrap_or_default(),
-            party,
-            integration: integration.map(str::to_string),
         }
     }
 

@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 #[cfg(test)]
 use std::time::Duration;
@@ -526,6 +525,14 @@ pub struct PrebidIntegrationConfig {
     pub enabled: bool,
     #[serde(default)]
     pub account_id: Option<String>,
+    /// Prebid User ID modules that Trusted Server installs and keeps installed.
+    ///
+    /// Each entry is forwarded to Prebid.js verbatim; publisher-configured
+    /// entries with other names are preserved. Names must be unique, and no two
+    /// names may resolve to the same Prebid User ID submodule.
+    #[serde(default)]
+    #[validate(nested, custom(function = "validate_unique_managed_user_id_names"))]
+    pub managed_user_ids: Vec<PrebidManagedUserIdConfig>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
     #[serde(default)]
@@ -552,14 +559,6 @@ pub struct PrebidIntegrationConfig {
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
     pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
-    /// Prebid User ID modules that Trusted Server installs and keeps installed.
-    ///
-    /// Each entry is forwarded to Prebid.js verbatim; publisher-configured
-    /// entries with other names are preserved. Names must be unique, and no two
-    /// names may resolve to the same Prebid User ID submodule.
-    #[serde(default)]
-    #[validate(nested, custom(function = "validate_unique_managed_user_id_names"))]
-    pub managed_user_ids: Vec<PrebidManagedUserIdConfig>,
     /// CLI-only external bundle build inputs; runtime registration ignores these fields.
     #[serde(default)]
     pub bundle: PrebidBundleBuildConfig,
@@ -570,6 +569,7 @@ impl Default for PrebidIntegrationConfig {
         Self {
             enabled: default_enabled(),
             account_id: None,
+            managed_user_ids: Vec::new(),
             timeout_ms: default_timeout_ms(),
             debug: false,
             script_patterns: default_script_patterns(),
@@ -578,7 +578,6 @@ impl Default for PrebidIntegrationConfig {
             external_bundle_sri: None,
             client_side_bidders: Vec::new(),
             excluded_gam_ad_unit_path_suffixes: Vec::new(),
-            managed_user_ids: Vec::new(),
             bundle: PrebidBundleBuildConfig::default(),
         }
     }
@@ -596,6 +595,7 @@ impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
         Self {
             enabled: config.enabled,
             account_id: config.account_id.clone(),
+            managed_user_ids: config.managed_user_ids.clone(),
             timeout_ms: config.timeout_ms,
             debug: config.debug,
             script_patterns: config.script_patterns.clone(),
@@ -604,7 +604,6 @@ impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
             external_bundle_sri: config.external_bundle_sri.clone(),
             client_side_bidders: config.client_side_bidders.clone(),
             excluded_gam_ad_unit_path_suffixes: config.excluded_gam_ad_unit_path_suffixes.clone(),
-            managed_user_ids: config.managed_user_ids.clone(),
             bundle: PrebidBundleBuildConfig::default(),
         }
     }
@@ -2707,8 +2706,8 @@ impl PrebidAuctionProvider {
         // Build user object — populate consent at both OpenRTB 2.6 top-level
         // and Prebid ext-based locations (dual placement).
         // In cookies_only mode, cookie-sourced consent travels through the
-        // forwarded Cookie header. KV/policy-sourced consent has no inbound
-        // cookie to forward, so carry it in the OpenRTB body instead.
+        // forwarded Cookie header. Policy-sourced consent has no inbound cookie
+        // to forward, so carry it in the OpenRTB body instead.
         let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
             self.config.consent_forwarding.includes_body_consent()
                 || !matches!(ctx.source, crate::consent::ConsentSource::Cookie)
@@ -4387,7 +4386,6 @@ server_url = "https://prebid.example/openrtb2/auction"
             "should manage no User ID modules by default"
         );
     }
-
     #[test]
     fn excluded_gam_ad_unit_path_suffixes_reject_invalid_values() {
         for (suffix, expected_message) in [
@@ -5323,6 +5321,97 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn prepared_browser_injection_uses_only_plan_routes_and_browser_timeout_debug() {
+        let integration = PrebidIntegration::new(base_config());
+        let mut browser_config = PrebidIntegrationConfig::default();
+        browser_config.account_id = Some("browser-account".to_string());
+        browser_config.timeout_ms = 1750;
+        browser_config.debug = false;
+        let plan = AuctionPlan::compile(AuctionPlanConfig {
+            timeout_ms: 2500,
+            providers: BTreeMap::from([
+                (
+                    ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
+                    ProviderConfig {
+                        protocol: "openrtb-2.6".to_string(),
+                        profile: "prebid-server".to_string(),
+                        endpoint: "https://primary.example.test/openrtb".to_string(),
+                        timeout_ms: Some(3000),
+                        routing: RoutingMode::Explicit,
+                        notifications: NotificationConfig::default(),
+                        profile_config: json!({"debug": true}),
+                    },
+                ),
+                (
+                    ProviderId::from_str("pbs-secondary").expect("should parse provider ID"),
+                    ProviderConfig {
+                        protocol: "openrtb-2.6".to_string(),
+                        profile: "prebid-server".to_string(),
+                        endpoint: "https://secondary.example.test/openrtb".to_string(),
+                        timeout_ms: Some(4000),
+                        routing: RoutingMode::Explicit,
+                        notifications: NotificationConfig::default(),
+                        profile_config: json!({"debug": true}),
+                    },
+                ),
+            ]),
+            bidders: BTreeMap::from([
+                (
+                    BidderId::from_str("secondaryRoute").expect("should parse bidder ID"),
+                    BidderRouteConfig {
+                        provider: ProviderId::from_str("pbs-secondary")
+                            .expect("should parse provider ID"),
+                    },
+                ),
+                (
+                    BidderId::from_str("primaryRoute").expect("should parse bidder ID"),
+                    BidderRouteConfig {
+                        provider: ProviderId::from_str("pbs-primary")
+                            .expect("should parse provider ID"),
+                    },
+                ),
+            ]),
+            mediator: None,
+            request_signing: None,
+        })
+        .expect("should compile plan while browser integration is not part of compilation");
+
+        let inserts = integration.head_inserts_for_plan(&browser_config, &plan);
+        let script = &inserts[0];
+
+        assert!(script.contains(r#""timeout":1750,"debug":false"#));
+        assert!(
+            script.contains(r#""serverSideBidders":["primaryRoute","secondaryRoute"]"#),
+            "should inject deterministic browser route codes: {script}"
+        );
+        assert!(!script.contains("pbs-primary"));
+        assert!(!script.contains("pbs-secondary"));
+        assert!(!script.contains("3000"));
+        assert!(!script.contains("4000"));
+
+        let disabled_plan = plan.clone().with_enabled(false);
+        let disabled_inserts = integration.head_inserts_for_plan(&browser_config, &disabled_plan);
+        assert!(
+            disabled_inserts[0].contains(r#""serverSideBidders":[]"#),
+            "auction kill switch should suppress browser server-side bidders: {}",
+            disabled_inserts[0]
+        );
+    }
+
+    #[test]
+    fn browser_only_config_defaults_are_independent_and_can_be_disabled() {
+        let config = PrebidIntegrationConfig {
+            enabled: false,
+            ..PrebidIntegrationConfig::default()
+        };
+
+        assert!(!config.enabled);
+        assert_eq!(config.timeout_ms, 1000);
+        assert!(!config.debug);
+    }
+
+    #[test]
     fn planned_registration_injects_managed_user_ids() {
         let mut settings = make_settings();
         settings
@@ -5457,85 +5546,6 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
-    fn prepared_browser_injection_uses_only_plan_routes_and_browser_timeout_debug() {
-        let integration = PrebidIntegration::new(base_config());
-        let mut browser_config = PrebidIntegrationConfig::default();
-        browser_config.account_id = Some("browser-account".to_string());
-        browser_config.timeout_ms = 1750;
-        browser_config.debug = false;
-        let plan = AuctionPlan::compile(AuctionPlanConfig {
-            timeout_ms: 2500,
-            providers: BTreeMap::from([
-                (
-                    ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
-                    ProviderConfig {
-                        protocol: "openrtb-2.6".to_string(),
-                        profile: "prebid-server".to_string(),
-                        endpoint: "https://primary.example.test/openrtb".to_string(),
-                        timeout_ms: Some(3000),
-                        routing: RoutingMode::Explicit,
-                        notifications: NotificationConfig::default(),
-                        profile_config: json!({"debug": true}),
-                    },
-                ),
-                (
-                    ProviderId::from_str("pbs-secondary").expect("should parse provider ID"),
-                    ProviderConfig {
-                        protocol: "openrtb-2.6".to_string(),
-                        profile: "prebid-server".to_string(),
-                        endpoint: "https://secondary.example.test/openrtb".to_string(),
-                        timeout_ms: Some(4000),
-                        routing: RoutingMode::Explicit,
-                        notifications: NotificationConfig::default(),
-                        profile_config: json!({"debug": true}),
-                    },
-                ),
-            ]),
-            bidders: BTreeMap::from([
-                (
-                    BidderId::from_str("secondaryRoute").expect("should parse bidder ID"),
-                    BidderRouteConfig {
-                        provider: ProviderId::from_str("pbs-secondary")
-                            .expect("should parse provider ID"),
-                    },
-                ),
-                (
-                    BidderId::from_str("primaryRoute").expect("should parse bidder ID"),
-                    BidderRouteConfig {
-                        provider: ProviderId::from_str("pbs-primary")
-                            .expect("should parse provider ID"),
-                    },
-                ),
-            ]),
-            mediator: None,
-            request_signing: None,
-        })
-        .expect("should compile plan while browser integration is not part of compilation");
-
-        let inserts = integration.head_inserts_for_plan(&browser_config, &plan);
-        let script = &inserts[0];
-
-        assert!(script.contains(r#""timeout":1750,"debug":false"#));
-        assert!(
-            script.contains(r#""serverSideBidders":["primaryRoute","secondaryRoute"]"#),
-            "should inject deterministic browser route codes: {script}"
-        );
-        assert!(!script.contains("pbs-primary"));
-        assert!(!script.contains("pbs-secondary"));
-        assert!(!script.contains("3000"));
-        assert!(!script.contains("4000"));
-
-        let disabled_plan = plan.clone().with_enabled(false);
-        let disabled_inserts = integration.head_inserts_for_plan(&browser_config, &disabled_plan);
-        assert!(
-            disabled_inserts[0].contains(r#""serverSideBidders":[]"#),
-            "auction kill switch should suppress browser server-side bidders: {}",
-            disabled_inserts[0]
-        );
-    }
-
-    #[test]
     fn head_injector_escapes_script_breakout_in_managed_user_ids() {
         let mut config = base_config();
         config.managed_user_ids = vec![PrebidManagedUserIdConfig {
@@ -5566,18 +5576,6 @@ external_bundle_sri = "sha384-AAAA"
             1,
             "should contain only the legitimate outer closing script tag"
         );
-    }
-
-    #[test]
-    fn browser_only_config_defaults_are_independent_and_can_be_disabled() {
-        let config = PrebidIntegrationConfig {
-            enabled: false,
-            ..PrebidIntegrationConfig::default()
-        };
-
-        assert!(!config.enabled);
-        assert_eq!(config.timeout_ms, 1000);
-        assert!(!config.debug);
     }
 
     #[test]
@@ -6055,16 +6053,16 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn to_openrtb_includes_kv_consent_when_cookies_only_has_no_cookie_to_forward() {
+    fn to_openrtb_includes_policy_default_consent_when_cookies_only_has_no_cookie_to_forward() {
         let mut config = base_config();
         config.consent_forwarding = ConsentForwardingMode::CookiesOnly;
         let provider = PrebidAuctionProvider::new(config);
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOkv-backed-consent-string".to_string()),
+            raw_tc_string: Some("BOpolicy-consent-string".to_string()),
             raw_us_privacy: Some("1YNN".to_string()),
             gdpr_applies: true,
-            source: ConsentSource::KvStore,
+            source: ConsentSource::PolicyDefault,
             ..Default::default()
         });
 
@@ -6085,15 +6083,15 @@ external_bundle_sri = "sha384-AAAA"
 
         assert_eq!(
             openrtb.user.as_ref().and_then(|u| u.consent.as_deref()),
-            Some("BOkv-backed-consent-string"),
-            "cookies_only should fall back to body consent when consent came from KV"
+            Some("BOpolicy-consent-string"),
+            "cookies_only should carry policy-sourced consent in the body"
         );
         let regs = openrtb.regs.as_ref().expect("should include consent regs");
         assert_eq!(regs.gdpr, Some(true), "should carry GDPR applicability");
         assert_eq!(
             regs.us_privacy.as_deref(),
             Some("1YNN"),
-            "should carry non-cookie consent strings from KV"
+            "should carry policy-sourced consent strings"
         );
     }
 

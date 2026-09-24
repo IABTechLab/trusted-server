@@ -48,7 +48,8 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
 
 use crate::middleware::{
-    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
+    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, RequestTimingMiddleware,
+    SanitizeRequestMiddleware,
 };
 use crate::platform::build_runtime_services;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -221,7 +222,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -230,6 +231,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
         ("/_ts/admin/ec", &[Method::GET]),
         ("/_ts/admin/ec/{id}", &[Method::GET]),
         ("/_ts/admin/eids", &[Method::GET]),
+        ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
@@ -429,6 +431,20 @@ fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Reque
         })
 }
 
+fn cache_purge_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Template cache purge is not supported on Spin.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 fn admin_key_management_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
         "Admin key management is not supported on Fermyon Spin.\n\
@@ -622,6 +638,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let admin_not_supported_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
+
+        let cache_purge_unsupported_handler =
+            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
 
         let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
@@ -868,6 +887,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // any middleware registered ahead of it would observe the
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(RequestTimingMiddleware::new())
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip
@@ -921,6 +941,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/first-party/sign", fp_sign_post_handler)
             .get("/first-party/proxy-rebuild", fp_rebuild_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/admin/cache/purge",
+                method.clone(),
+                cache_purge_unsupported_handler,
+            );
+        }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);

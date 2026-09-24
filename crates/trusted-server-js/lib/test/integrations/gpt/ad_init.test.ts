@@ -442,6 +442,65 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'unrenderable_candidate',
       'auction-123',
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+      }
+    );
+  });
+
+  it('snapshots auction timing with the bids before queued GPT work runs', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      { hb_pb: '1.00', hb_bidder: 'example', hb_adid: 'creative-1' },
+      recordTrustedServerOpportunity
+    );
+    const ts = (window as TestWindow).tsjs!;
+    ts.auctionDiagnostics = { auctionResolvedMs: 84 };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    let queued: (() => void) | undefined;
+    const googletag = (window as TestWindow).googletag as {
+      cmd: { push(callback: () => void): void };
+    };
+    googletag.cmd.push = (callback) => {
+      queued = callback;
+    };
+
+    ts.adInit!();
+    ts.auctionDiagnostics.auctionResolvedMs = 99;
+    queued?.();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+        serverTimings: { auctionResolvedMs: 84 },
+      }
+    );
+  });
+
+  it('does not infer an SPA auction from navigation generation alone', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
+    (window as TestWindow).tsjs!.navGeneration = 1;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate',
+      undefined,
       undefined
     );
   });
@@ -3135,6 +3194,13 @@ describe('installTsRenderBridge', () => {
     return { iframe, slot, source: iframe.contentWindow!, wrapper };
   }
 
+  // The APS capability path runs on publisher Prebid ad units, so diagnostics
+  // resolve the GPT slot by element ID rather than through TS slot mapping.
+  function stubGoogletagSlot(elementId: string): void {
+    const slot = { getSlotElementId: () => elementId };
+    vi.stubGlobal('googletag', { pubads: () => ({ getSlots: () => [slot] }) });
+  }
+
   async function captureBridgeListener(): Promise<(e: MessageEvent) => unknown> {
     let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
     const origAdd = window.addEventListener.bind(window);
@@ -3252,6 +3318,40 @@ describe('installTsRenderBridge', () => {
     expect(outerWrapper.style.width).toBe('728px');
     expect(outerWrapper.style.height).toBe('90px');
   });
+
+  it.each([
+    ['width', '1px', '120px', '728px', '120px'],
+    ['height', '640px', '1px', '640px', '90px'],
+  ] as const)(
+    'changes only a collapsed %s on an ancestor',
+    async (_dimension, initialWidth, initialHeight, expectedWidth, expectedHeight) => {
+      const tsjs = (window as TestWindow).tsjs!;
+      tsjs.bids.homepage_header.adm = '<div>Fictional creative</div>';
+      tsjs.bids.homepage_header.w = 728;
+      tsjs.bids.homepage_header.h = 90;
+      delete tsjs.bids.homepage_header.nurl;
+      delete tsjs.bids.homepage_header.burl;
+      const bridgeListener = await captureBridgeListener();
+      const collapsed = createCollapsedTrustedSlotIframe();
+      const outerWrapper = document.createElement('div');
+      outerWrapper.style.width = initialWidth;
+      outerWrapper.style.height = initialHeight;
+      collapsed.slot.insertBefore(outerWrapper, collapsed.wrapper);
+      outerWrapper.appendChild(collapsed.wrapper);
+
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [{ postMessage: vi.fn() }],
+          source: collapsed.iframe.contentWindow!,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(outerWrapper.style.width).toBe(expectedWidth);
+      expect(outerWrapper.style.height).toBe(expectedHeight);
+    }
+  );
 
   it.each(['fixed', 'anchor', 'expanded', 'oversized'] as const)(
     'does not resize a %s Universal Creative shell',
@@ -3540,6 +3640,7 @@ describe('installTsRenderBridge', () => {
     const marker = enablePublisherNativeMode();
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const portMessages: string[] = [];
@@ -3579,6 +3680,7 @@ describe('installTsRenderBridge', () => {
     const marker = enablePublisherNativeMode();
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const portMessages: string[] = [];
@@ -3663,6 +3765,97 @@ describe('installTsRenderBridge', () => {
     foreignIframe.remove();
   });
 
+  it('records a creative attempt for a registered APS renderer so delivery is attributable', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-diagnostics-ad-id';
+    const recordTrustedServerOpportunity = vi.fn();
+    const recordTrustedServerCreativeRequest = vi.fn(() => 7);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity,
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      stubGoogletagSlot('div-header');
+      const bridgeListener = await captureBridgeListener();
+      const portMessages: string[] = [];
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source: createTrustedSlotIframe(),
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(portMessages).toHaveLength(1);
+      expect(recordTrustedServerOpportunity.mock.calls[0]?.slice(1, 3)).toEqual([
+        'div-header',
+        'renderable_candidate',
+      ]);
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('div-header');
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(7);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
+  it('records the tombstone reason when a consumed APS ad ID is replayed', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-replayed-ad-id';
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity: vi.fn(),
+      recordTrustedServerCreativeRequest: vi.fn(() => 11),
+      recordTrustedServerCreativeResponse: vi.fn(),
+      recordTrustedServerCreativeFailure,
+    } as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      stubGoogletagSlot('div-header');
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const request = (): MessageEvent =>
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: () => {} }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent;
+
+      bridgeListener(request());
+      recordTrustedServerCreativeFailure.mockClear();
+      bridgeListener(request());
+
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(11, 'aps_consumed_tombstone');
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
   it('contract test: fails a registered APS runner without a Universal Creative response or markUsed', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'native-prebid-decline-ad-id';
@@ -3690,6 +3883,10 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent;
 
       bridgeListener(request);
+      expect(
+        (window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId],
+        'the registered capability should be consumed before native rendering'
+      ).toBeUndefined();
       nativeRunnerIn('div-header').runner.dispatchEvent(new Event('error'));
       await Promise.resolve();
       await Promise.resolve();
@@ -3732,6 +3929,10 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent;
 
       bridgeListener(request);
+      expect(
+        (window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId],
+        'the registered capability should be consumed before native rendering'
+      ).toBeUndefined();
       expect(markUsed).not.toHaveBeenCalled();
       const native = nativeRunnerIn('div-header');
       native.runner.dispatchEvent(new Event('load'));
@@ -4320,6 +4521,7 @@ describe('installTsRenderBridge', () => {
     });
 
     try {
+      stubGoogletagSlot('div-header');
       const bridgeListener = await captureBridgeListener();
       const source = createTrustedSlotIframe();
       const postMessage = vi.fn();
@@ -4401,6 +4603,48 @@ describe('installTsRenderBridge', () => {
     expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
     beaconSpy.mockRestore();
+  });
+
+  it('keeps cache response and billing evidence when shell resizing throws', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest: vi.fn().mockReturnValue(55),
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const collapsed = createCollapsedTrustedSlotIframe();
+    const postMessage = vi.fn();
+    const computedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation(() => {
+      throw new Error('style unavailable');
+    });
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [{ postMessage }],
+          source: collapsed.source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(postMessage).toHaveBeenCalledOnce();
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(55);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+      expect(beaconSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      computedStyleSpy.mockRestore();
+      beaconSpy.mockRestore();
+    }
   });
 
   it('records only response_post_failed when posting cached markup throws', async () => {

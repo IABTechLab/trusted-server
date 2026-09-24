@@ -294,10 +294,10 @@ impl GenericOpenRtbProvider {
         )? {
             OpenRtbBuildOutcome::Ready(request) => request,
             OpenRtbBuildOutcome::NoImpressions => {
-                return Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
-                    self.provider_name(),
-                    0,
-                )));
+                return Ok(ProviderRequestOutcome::Immediate(
+                    AuctionResponse::no_bid(self.provider_name(), 0)
+                        .with_metadata("routing", json!({"skipped_no_usable_demand": true})),
+                ));
             }
         };
 
@@ -399,11 +399,20 @@ impl GenericOpenRtbProvider {
                 provider_id: self.provider_name().to_string(),
                 input: input.clone(),
             },
-            CompiledOpenRtbProfile::PrebidServer(_) => GenericOpenRtbParseState::Prebid {
-                provider_id: self.provider_name().to_string(),
-                auction_id: input.common_request().id.clone(),
-                input: input.clone(),
-            },
+            CompiledOpenRtbProfile::PrebidServer(_) => {
+                let sent_impression_ids = request
+                    .imp
+                    .iter()
+                    .filter_map(|impression| impression.id.as_deref())
+                    .collect::<HashSet<_>>();
+                GenericOpenRtbParseState::Prebid {
+                    provider_id: self.provider_name().to_string(),
+                    auction_id: input.common_request().id.clone(),
+                    input: input.filtered_slots(|slot| {
+                        sent_impression_ids.contains(slot.slot().id.as_str())
+                    }),
+                }
+            }
             CompiledOpenRtbProfile::Aps(_) => GenericOpenRtbParseState::Aps {
                 provider_id: self.provider_name().to_string(),
                 input: input.clone(),

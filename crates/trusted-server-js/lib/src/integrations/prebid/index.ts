@@ -26,7 +26,7 @@ import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot, TsjsApi } from '../../core/types';
+import type { AuctionSlot, GptDiagnosticsAuctionWinner, TsjsApi } from '../../core/types';
 
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
@@ -152,6 +152,7 @@ const APS_BID_RESPONSE_LISTENER_SENTINEL = '__tsApsBidResponseListenerInstalled'
 // Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
 const MAX_OPENRTB_ATYPE = 2_147_483_647;
 const BIDDER_PARAMS_KEY = 'bidderParams';
+const STORED_REQUEST_KEY = 'storedRequest';
 const ZONE_KEY = 'zone';
 const TS_REFRESH_TARGETING_KEYS = [
   'ts_initial',
@@ -956,6 +957,7 @@ type TrustedServerAdUnit = {
 };
 type ClientSideBidSnapshot = { bidder: string; params: Record<string, unknown> };
 type PublisherAdUnitSnapshot = {
+  storedRequest?: unknown;
   bidderParams: Record<string, Record<string, unknown>>;
   clientSideBids: ClientSideBidSnapshot[];
   zone?: string;
@@ -1025,6 +1027,136 @@ function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
   } catch {
     // Diagnostics must not suppress the GAM request.
   }
+}
+
+const MAX_PREBID_DIAGNOSTIC_ATTEMPTS = 128;
+const PREBID_DIAGNOSTIC_WINDOW_MS = 30_000;
+
+interface PrebidDiagnosticAttempt {
+  slot: RefreshGptSlot;
+  generation: number;
+  expiresAtMs: number;
+}
+
+const prebidDiagnosticAttempts = new Map<string, PrebidDiagnosticAttempt>();
+
+function prebidDiagnosticKey(auctionId: string, adUnitCode: string): string {
+  return `${auctionId}\u0000${adUnitCode}`;
+}
+
+function boundedTargetingValue(
+  slot: RefreshGptSlot,
+  key: string,
+  maxBytes: number
+): string | undefined {
+  let values: string[] | undefined;
+  try {
+    values = slot.getTargeting?.(key);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(values) || values.length !== 1) return undefined;
+  const value = values[0]?.trim();
+  if (!value || new TextEncoder().encode(value).length > maxBytes) return undefined;
+  return value;
+}
+
+function targetingCandidate(slot: RefreshGptSlot): GptDiagnosticsAuctionWinner | undefined {
+  const bidder = boundedTargetingValue(slot, 'hb_bidder', 128);
+  const priceBucket = boundedTargetingValue(slot, 'hb_pb', 64);
+  if (!bidder || !priceBucket || !/^\d+(?:\.\d+)?$/.test(priceBucket)) return undefined;
+  return { bidder, priceBucket };
+}
+
+function recordCompletedPrebidAuction(
+  rawAuctionId: unknown,
+  auctionSlots: RefreshGptSlot[],
+  adUnitCodes: string[]
+): void {
+  const recorder = window.tsjs?.gptDiagnosticsRecorder;
+  if (!recorder || typeof rawAuctionId !== 'string') return;
+  const auctionId = rawAuctionId;
+  if (
+    !auctionId ||
+    auctionId !== auctionId.trim() ||
+    new TextEncoder().encode(auctionId).length > 256
+  )
+    return;
+  if (auctionSlots.length !== adUnitCodes.length) return;
+  installPrebidWinDiagnostics();
+  const counts = new Map<string, number>();
+  for (const code of adUnitCodes) counts.set(code, (counts.get(code) ?? 0) + 1);
+  const nowMs = performance.now();
+  for (const [key, attempt] of prebidDiagnosticAttempts) {
+    if (nowMs > attempt.expiresAtMs) prebidDiagnosticAttempts.delete(key);
+  }
+  const generation = window.tsjs?.navGeneration ?? 0;
+  for (let index = 0; index < auctionSlots.length; index += 1) {
+    const slot = auctionSlots[index];
+    const code = adUnitCodes[index];
+    if (!slot || !code || counts.get(code) !== 1) continue;
+    try {
+      recorder.recordPrebidAuction(slot, auctionId, targetingCandidate(slot));
+    } catch {
+      // Diagnostics must not suppress the GAM request.
+    }
+    const key = prebidDiagnosticKey(auctionId, code);
+    prebidDiagnosticAttempts.delete(key);
+    prebidDiagnosticAttempts.set(key, {
+      slot,
+      generation,
+      expiresAtMs: nowMs + PREBID_DIAGNOSTIC_WINDOW_MS,
+    });
+    while (prebidDiagnosticAttempts.size > MAX_PREBID_DIAGNOSTIC_ATTEMPTS) {
+      const oldest = prebidDiagnosticAttempts.keys().next().value;
+      if (oldest === undefined) break;
+      prebidDiagnosticAttempts.delete(oldest);
+    }
+  }
+}
+
+function installPrebidWinDiagnostics(): void {
+  const diagnosticPbjs = pbjs as PbjsGlobal & { __tsDiagnosticsBidWonInstalled?: boolean };
+  if (diagnosticPbjs.__tsDiagnosticsBidWonInstalled || typeof pbjs.onEvent !== 'function') return;
+  diagnosticPbjs.__tsDiagnosticsBidWonInstalled = true;
+  pbjs.onEvent('bidWon', (rawBid: unknown) => {
+    if (typeof rawBid !== 'object' || rawBid === null) return;
+    const bid = rawBid as Record<string, unknown>;
+    const auctionId = typeof bid.auctionId === 'string' ? bid.auctionId : undefined;
+    const adUnitCode = typeof bid.adUnitCode === 'string' ? bid.adUnitCode : undefined;
+    if (
+      !auctionId ||
+      !adUnitCode ||
+      (bid.latestTargetedAuctionId !== undefined && bid.latestTargetedAuctionId !== auctionId)
+    )
+      return;
+    const key = prebidDiagnosticKey(auctionId, adUnitCode);
+    const attempt = prebidDiagnosticAttempts.get(key);
+    prebidDiagnosticAttempts.delete(key);
+    if (
+      !attempt ||
+      performance.now() > attempt.expiresAtMs ||
+      (window.tsjs?.navGeneration ?? 0) !== attempt.generation
+    ) {
+      return;
+    }
+    const adserverTargeting =
+      typeof bid.adserverTargeting === 'object' && bid.adserverTargeting !== null
+        ? (bid.adserverTargeting as Record<string, unknown>)
+        : {};
+    const winner = targetingCandidate({
+      getTargeting: (targetingKey) => {
+        const value = adserverTargeting[targetingKey];
+        return typeof value === 'string' ? [value] : [];
+      },
+    });
+    if (!winner) return;
+    try {
+      window.tsjs?.gptDiagnosticsRecorder?.recordPrebidWin(attempt.slot, auctionId, winner);
+    } catch {
+      // Diagnostics must not alter delivery.
+    }
+  });
 }
 
 function dispatchPrebidRefresh<T>(
@@ -1273,7 +1405,15 @@ function foldedBidderParams(
   );
 }
 
-/** Capture immutable request-scoped bidder and zone data before the shim mutates an ad unit. */
+/** Preserve authored presence and values, including invalid values for server validation. */
+function storedRequestParams(bid: TrustedServerBid | undefined): { storedRequest?: unknown } {
+  if (!bid) return { storedRequest: false };
+  return Object.prototype.hasOwnProperty.call(bid.params ?? {}, STORED_REQUEST_KEY)
+    ? { storedRequest: copyParamValue(bid.params?.[STORED_REQUEST_KEY]) }
+    : {};
+}
+
+/** Capture immutable request-scoped demand and zone data before the shim mutates an ad unit. */
 function capturePublisherAdUnitSnapshot(
   unit: TrustedServerAdUnit,
   serverSideBidders: Set<string>
@@ -1305,6 +1445,7 @@ function capturePublisherAdUnitSnapshot(
   const zone = unit.mediaTypes?.banner?.name;
 
   return {
+    ...storedRequestParams(existingTsBid),
     bidderParams,
     clientSideBids,
     ...(zone ? { zone } : {}),
@@ -1388,6 +1529,24 @@ function serverSideBidderParamsForRefresh(
           copyParams(params),
         ])
       )
+    : {};
+}
+
+/** Use the same live-unit authority and snapshot fallback as refresh bidder params. */
+function storedRequestParamsForRefresh(candidateCodes: Array<string | undefined>): {
+  storedRequest?: unknown;
+} {
+  const match = findRefreshAdUnit(candidateCodes);
+  if (match) {
+    const bid = Array.isArray(match.bids)
+      ? match.bids.find((bid) => bid?.bidder === ADAPTER_CODE)
+      : undefined;
+    return storedRequestParams(bid);
+  }
+  const snapshot = findRefreshSnapshot(candidateCodes);
+  if (!snapshot) return { storedRequest: false };
+  return Object.prototype.hasOwnProperty.call(snapshot, STORED_REQUEST_KEY)
+    ? { storedRequest: copyParamValue(snapshot[STORED_REQUEST_KEY]) }
     : {};
 }
 
@@ -2432,6 +2591,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           bidder: ADAPTER_CODE,
           params: {
             [BIDDER_PARAMS_KEY]: bidderParams,
+            [STORED_REQUEST_KEY]: false,
             ...(zone ? { [ZONE_KEY]: zone } : {}),
           },
         });
@@ -2659,7 +2819,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             DEFAULT_REFRESH_SIZES,
           ...(zone ? { name: zone } : {}),
         };
-        const tsParams: Record<string, unknown> = zone ? { [ZONE_KEY]: zone } : {};
+        const tsParams: Record<string, unknown> = {
+          ...storedRequestParamsForRefresh(candidateCodes),
+          ...(zone ? { [ZONE_KEY]: zone } : {}),
+        };
         // Carry the publisher's inline server-side (PBS) bidder params captured
         // on the initial ad unit so refresh/scroll auctions don't drop them.
         const serverSideParams = serverSideBidderParamsForRefresh(candidateCodes);
@@ -2704,7 +2867,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // slots, and a late callback cannot issue a second GAM request.
       let completed = false;
       let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
-      function completeRefresh(applyTargeting: boolean): void {
+      function completeRefresh(applyTargeting: boolean, completedAuctionId?: string): void {
         if (completed) return;
         completed = true;
         if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
@@ -2743,15 +2906,27 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         const completedAdUnitCodes = refreshAdUnitCodes.filter(
           (_code, index) => !callbackFilteredSlots.has(auctionSlots[index])
         );
-        if (applyTargeting) {
+        const completedAuctionSlots = auctionSlots.filter(
+          (slot) => !callbackFilteredSlots.has(slot)
+        );
+        let targetingApplied = false;
+        if (applyTargeting && typeof pbjs.setTargetingForGPTAsync === 'function') {
           try {
-            pbjs.setTargetingForGPTAsync?.(completedAdUnitCodes);
+            pbjs.setTargetingForGPTAsync(completedAdUnitCodes);
+            targetingApplied = true;
           } catch (error) {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
         completedSlots.forEach(consumeGptPublisherRefreshSuppression);
         recordPrebidRefreshForDiagnostics(completedSlots);
+        if (targetingApplied) {
+          recordCompletedPrebidAuction(
+            completedAuctionId,
+            completedAuctionSlots,
+            completedAdUnitCodes
+          );
+        }
         // Preserve the publisher's original refresh form unless one losing
         // first-impression slot was filtered. A delayed bare call must also
         // become explicit so slots added after the auction snapshot cannot join.
@@ -2763,7 +2938,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       try {
         pbjs.requestBids({
           adUnits,
-          bidsBackHandler: () => completeRefresh(true),
+          bidsBackHandler: (_bids, _timedOut, auctionId) => completeRefresh(true, auctionId),
           timeout: timeoutMs,
         });
         // A one-shot watchdog completes the GAM request even if Prebid never

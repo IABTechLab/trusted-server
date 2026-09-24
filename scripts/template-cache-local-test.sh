@@ -10,17 +10,26 @@
 # Usage:
 #   ./scripts/template-cache-local-test.sh              # esi mode (shared template + edge assembly)
 #   ./scripts/template-cache-local-test.sh inline       # today's shipped behaviour, as a control
+#   ./scripts/template-cache-local-test.sh purge        # store -> hit -> purge -> miss, end to end
 
 set -euo pipefail
 
 MODE="${1:-esi}"
 case "$MODE" in
-  inline | esi) ;;
+  inline | esi | purge) ;;
   *)
-    echo "Unknown mode '$MODE'. Use one of: inline, esi." >&2
+    echo "Unknown mode '$MODE'. Use one of: inline, esi, purge." >&2
     exit 1
     ;;
 esac
+
+# `purge` exercises the same shared-template configuration as `esi`, then invalidates it.
+# Everything upstream of the purge assertions is identical, so the config generator and
+# every esi assertion keep running unchanged.
+CONFIG_MODE="$MODE"
+if [ "$MODE" = "purge" ]; then
+  CONFIG_MODE="esi"
+fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 ORIGIN_PORT="${ORIGIN_PORT:-9099}"
@@ -235,7 +244,7 @@ ORIGIN_PID=$!
 sleep 1
 
 info "Generating stub config (mode: $MODE)"
-python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$MODE" \
+python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$CONFIG_MODE" \
   "$ORIGIN_PORT" "$BID_PORT" <<'PYEOF'
 import sys
 
@@ -254,6 +263,7 @@ s = replace_once(
     f'origin_url = "http://127.0.0.1:{origin_port}"',
     "publisher origin",
 )
+# The example publisher domains are reserved placeholders that validation rejects.
 s = replace_once(
     s,
     'domain = "example.com"',
@@ -266,6 +276,7 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
+
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
@@ -387,15 +398,15 @@ import sys
 
 with open(sys.argv[1], "a") as manifest:
     manifest.write('''
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "publisher_proxy_secret"
 data = "fictional-local-publisher-proxy-secret-value"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "ec_passphrase"
 data = "fictional-local-ec-passphrase-secret-value"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "handler_password"
 data = "fictional-local-handler-password-secret-value"
 ''')
@@ -517,7 +528,7 @@ check_post_reaches_origin() {
     "$(( $(grep -cF "origin: received POST /article" "$WORK/origin.log" || true) - before ))" "1"
 }
 
-if [ "$MODE" = "inline" ]; then
+if [ "$CONFIG_MODE" = "inline" ]; then
   check "inline fetches the origin every time" "$FETCHES" "2"
   check "inline writes no shared template" \
     "$(grep -c 'template_cache stored' "$WORK/viceroy.log" || true)" "0"
@@ -667,7 +678,7 @@ NODEEOF
   check_post_reaches_origin
 fi
 
-if [ "$MODE" = "esi" ]; then
+if [ "$CONFIG_MODE" = "esi" ]; then
   info "Where the marker actually lives"
   echo "  The cached template (the shared copy — has a hole where bids go):"
   grep -oE "template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
@@ -757,7 +768,7 @@ COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
 if ! [[ "$FIRST_BODY" =~ ^[0-9]+$ && "$COMPLETE" =~ ^[0-9]+$ ]]; then
   bad "socket probe did not return numeric body timings: '$B_LINE'"
 else
-  if [ "$MODE" = "inline" ]; then
+  if [ "$CONFIG_MODE" = "inline" ]; then
     check "inline delivers the article before the auction resolves" \
       "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
       "yes"
@@ -772,7 +783,7 @@ else
   printf '    first body byte %sms, complete %sms\n\n' "$FIRST_BODY" "$COMPLETE"
 fi
 
-if [ "$MODE" != "inline" ]; then
+if [ "$CONFIG_MODE" != "inline" ]; then
   # Guards a regression where assembly rewrote a reader's accepted gzip origin request
   # to identity, making the origin send ~674KB where it would have sent ~100KB. The
   # cache still stores identity; that does not require changing what this reader accepts.
@@ -780,8 +791,91 @@ if [ "$MODE" != "inline" ]; then
     "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
 fi
 
+if [ "$MODE" = "purge" ]; then
+  info "Purge invalidates the shared template"
+
+  # The config's `password = "handler_password"` is a secret-store *reference*; the basic
+  # auth value is the seeded secret itself. Read it back from the generated manifest so
+  # this cannot drift from the seeding block above.
+  ADMIN_PASSWORD=$(awk -F'"' '/^key = "handler_password"/ { found = 1; next } \
+    found && /^data = / { print $2; exit }' "$WORK/fastly.toml")
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    bad "could not read the seeded admin password from the generated manifest"
+    ADMIN_PASSWORD="unreadable"
+  fi
+
+  # Viceroy 0.17 implements purge_surrogate_key against the same in-process cache it
+  # serves reads from, so store -> hit -> purge -> miss is genuinely end to end here. No
+  # Fastly service is involved, which is what makes this the strongest check available
+  # for the purge path.
+
+  fetch_article_state() {
+    local headers
+    headers=$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -D- -o /dev/null \
+      -H "Host: ts.example.com" \
+      -H "Accept-Encoding: gzip" \
+      -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
+      "http://127.0.0.1:$TS_PORT/article")
+    echo "$headers" > "$WORK/purge-probe.headers"
+    template_cache_state "$WORK/purge-probe.headers"
+  }
+
+  purge() {
+    curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o "$WORK/purge.out" -w '%{http_code}' \
+      -X POST \
+      -u "admin:$ADMIN_PASSWORD" \
+      -H "Host: ts.example.com" \
+      -H "Content-Type: application/json" \
+      --data "$1" \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge"
+  }
+
+  # The suite above has already warmed the cache; confirm that before purging, or a
+  # "miss after purge" result would prove nothing.
+  check "the template is warm before the purge" "$(fetch_article_state)" "hit"
+
+  check "purge-all is accepted" "$(purge '{"scope":"all"}')" "200"
+  check "purge-all reports success" \
+    "$(grep -c '\"purged\":true' "$WORK/purge.out" || true)" "1"
+
+  check "the next request misses after a purge, and refills" \
+    "$(fetch_article_state)" "miss-stored"
+  check "the cache refills after the purge" "$(fetch_article_state)" "hit"
+
+  info "Purge guards"
+
+  check "an unauthenticated purge is refused" \
+    "$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+      -X POST -H "Host: ts.example.com" -H "Content-Type: application/json" \
+      --data '{"scope":"all"}' \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge")" "401"
+
+  # The guard the route claims every method for: an unclaimed method would fall through
+  # to the publisher with the Authorization header still attached.
+  check "a GET is answered locally, not forwarded to the origin" \
+    "$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+      -u "admin:$ADMIN_PASSWORD" -H "Host: ts.example.com" \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge")" "405"
+
+  check "a form-postable content type is refused" \
+    "$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+      -X POST -u "admin:$ADMIN_PASSWORD" -H "Host: ts.example.com" \
+      -H "Content-Type: text/plain" --data '{"scope":"all"}' \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge")" "415"
+
+  check "scope all carrying a url is refused rather than flushing" \
+    "$(purge '{"scope":"all","url":"http://ts.example.com/article"}')" "400"
+
+  # Purging one reader-facing URL, which is the scope a CMS webhook uses.
+  check "the template is warm before the url purge" "$(fetch_article_state)" "hit"
+  check "purge-url is accepted" \
+    "$(purge '{"scope":"url","url":"http://ts.example.com/article"}')" "200"
+  check "the next request misses after a url purge, and refills" \
+    "$(fetch_article_state)" "miss-stored"
+fi
+
 info "Cookie variant isolation and session bypass (mode: $MODE)"
-if python3 - "$TS_PORT" "$MODE" "$WORK/origin.log" "$REQUEST_TIMEOUT_SECONDS" <<'PYEOF'
+if python3 - "$TS_PORT" "$CONFIG_MODE" "$WORK/origin.log" "$REQUEST_TIMEOUT_SECONDS" <<'PYEOF'
 import gzip
 import sys
 import urllib.request

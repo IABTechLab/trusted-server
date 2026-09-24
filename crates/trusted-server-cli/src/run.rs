@@ -29,6 +29,9 @@ enum Command {
     Auth(AuthArgs),
     /// Build the project for a target adapter.
     Build(BuildArgs),
+    /// Shared template cache commands.
+    #[command(subcommand)]
+    Cache(crate::commands::cache::CacheCommand),
     /// Trusted Server app-config commands.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -47,6 +50,9 @@ enum Command {
     /// Local developer tools (e.g. the macOS-only production-hostname proxy).
     #[command(subcommand)]
     Dev(crate::commands::dev::DevCommand),
+    /// Questions about a publisher origin's behaviour.
+    #[command(subcommand)]
+    Origin(crate::commands::origin::OriginCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -160,6 +166,16 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Rollback(args) => edgezero_cli::run_rollback(&args).map(|()| RunOutcome::Success),
         Command::Serve(args) => edgezero_cli::run_serve(&args).map(|()| RunOutcome::Success),
         Command::Dev(command) => crate::commands::dev::run(command).map(|()| RunOutcome::Success),
+        Command::Cache(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
+        Command::Origin(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::origin::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
     }
 }
 
@@ -174,6 +190,12 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
+    }
+
+    #[test]
+    fn run_outcomes_use_documented_exit_codes() {
+        assert_eq!(RunOutcome::Success.exit_code(), 0);
+        assert_eq!(RunOutcome::AssertionFailed.exit_code(), 1);
     }
 
     #[test]
@@ -384,12 +406,6 @@ mod tests {
             vec!["--comment", "ci"],
             "should capture args after -- as adapter passthrough"
         );
-    }
-
-    #[test]
-    fn run_outcomes_use_documented_exit_codes() {
-        assert_eq!(RunOutcome::Success.exit_code(), 0);
-        assert_eq!(RunOutcome::AssertionFailed.exit_code(), 1);
     }
 
     #[test]

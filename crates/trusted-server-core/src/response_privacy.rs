@@ -68,7 +68,8 @@ pub fn apply_inactive_ad_stack_browser_cache_policy(response: &mut Response) {
 ///
 /// Call this after every configurable response mutation. It deliberately overwrites
 /// `Cache-Control` and strips validators, expiry metadata, and runtime edge-cache
-/// directives so a later integration cannot turn an assembled document into C3.
+/// directives so a later integration cannot turn an assembled document into something a
+/// shared cache would store.
 pub fn enforce_private_no_store(response: &mut Response) {
     CacheControlPolicy::NoStorePrivate
         .apply_to_headers(response.headers_mut(), EdgeCacheHeader::None);

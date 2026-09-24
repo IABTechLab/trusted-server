@@ -1,6 +1,7 @@
 use core::future::Future;
 use std::sync::Arc;
 
+use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -295,6 +296,7 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     AdminNotSupported,
+    CachePurgeNotSupported,
     AdminEcNotSupported,
     AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
@@ -324,7 +326,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 16] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -348,6 +350,14 @@ fn named_routes() -> [NamedRoute; 16] {
             path: "/_ts/admin/keys/deactivate",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // Every method, for the same reason as the Fastly adapter: a method this route
+        // does not claim falls through to the publisher with the caller's `Authorization`
+        // header still attached.
+        NamedRoute {
+            path: "/_ts/admin/cache/purge",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::CachePurgeNotSupported,
         },
         // Admin EC lookup routes. Registered explicitly (like the key routes
         // above) so they never fall through to the publisher fallback, and
@@ -448,6 +458,22 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::VerifySignature => {
                         handle_verify_signature(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::CachePurgeNotSupported => {
+                        // The Axum dev server has no template cache to purge. 501 rather
+                        // than a fallthrough 404, so a CMS webhook can tell "not supported
+                        // here" from "endpoint does not exist".
+                        let body = edgezero_core::body::Body::from(
+                            "Template cache purge is not supported on the Axum dev server.\n\
+                             Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+                        );
+                        let mut resp = Response::new(body);
+                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        Ok(resp)
                     }
                     NamedRouteHandler::AdminNotSupported => {
                         // Config/secret-store writes are backed by read-only env vars on the
@@ -591,15 +617,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        build_router(&state)
+        Self::routes_with_server_timing_flag().0
     }
 }
 
@@ -619,6 +637,44 @@ impl TrustedServerApp {
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
+    }
+
+    /// The dev server's fully configured tower service: the application
+    /// router wrapped in the terminal timing layer
+    /// ([`crate::timing::TimingService`]), with `server_timing_enabled`
+    /// read from the same settings snapshot that built the router.
+    ///
+    /// This is the standard construction path for serving this adapter.
+    /// [`Hooks::routes`] satisfies the `Hooks` trait contract and returns
+    /// the bare router without the timing layer; callers who serve traffic
+    /// should use this instead so `server_timing_enabled` is never
+    /// silently discarded.
+    #[must_use]
+    pub fn dev_server_service() -> crate::timing::TimingService<EdgeZeroAxumService> {
+        let (router, server_timing_enabled) = Self::routes_with_server_timing_flag();
+        crate::timing::TimingService::new(EdgeZeroAxumService::new(router), server_timing_enabled)
+    }
+
+    /// Build the router alongside whether `Server-Timing` emission is
+    /// enabled, read from the same settings snapshot used to build the
+    /// router.
+    ///
+    /// The Axum dev server's terminal timing layer ([`crate::timing`]) needs
+    /// this flag once at startup: unlike the Fastly adapter, which rebuilds
+    /// `Settings` per request, the Axum dev server builds its application
+    /// state once and reuses the same [`RouterService`] for every request.
+    #[must_use]
+    fn routes_with_server_timing_flag() -> (RouterService, bool) {
+        let state = match build_state() {
+            Ok(s) => s,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return (startup_error_router(e), false);
+            }
+        };
+
+        let server_timing_enabled = state.settings.observability.server_timing_enabled;
+        (build_router(&state), server_timing_enabled)
     }
 
     /// Build the full router with explicit settings and runtime services.

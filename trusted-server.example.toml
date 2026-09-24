@@ -319,6 +319,12 @@ provider = "pbs-main"
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
 
+[observability]
+# Keep this leaf present so the environment override can apply; the overlay
+# cannot create a missing configuration leaf. The Server-Timing header stays
+# off until enabled.
+server_timing_enabled = false
+
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
 [creative_opportunities]
 # Set false to disable server-side ad templates while keeping slot definitions
@@ -337,11 +343,11 @@ price_granularity = "dense"
 # only if your SSPs need more headroom and analytics confirm the DCL slip is OK.
 auction_timeout_ms = 500
 #
-# Initial-page delivery mode (spike/experimental). `inline` is the default and
-# current production behaviour; `esi` is an opt-in Fastly Core Cache experiment
-# storing an inert comment in a shared, reader-neutral template cache. See
-# docs/guide/configuration.md before enabling. This and the cache-safety
-# keys below belong in this [creative_opportunities] table.
+# Initial-page delivery mode. `inline` is the default and current production
+# behaviour; `esi` is opt-in per deployment and stores an inert comment in a
+# shared, reader-neutral template cache. See docs/guide/configuration.md and run
+# scripts/template-cache-local-test.sh esi before enabling. This and the
+# cache keys below belong in this [creative_opportunities] table.
 # assembly_mode = "inline"
 # Request headers (besides Accept-Encoding) the origin may name in Vary. Every
 # emitted Vary name must be covered here or template storage is refused. Never
@@ -364,7 +370,9 @@ auction_timeout_ms = 500
 # With either list nonempty, false bypasses unlisted cookies; true asserts those
 # cookies do not change origin HTML. No identity or consent cookie is exempt.
 # With both lists empty, false bypasses all Cookie headers, as before.
-# An origin `Vary: Cookie` is always refused, regardless of these settings.
+# On the template path, origin `Vary: Cookie` is always refused. Readthrough
+# has no response-side guard; run `ts origin probe-shareability` before enabling.
+# Configured key-cookie dimensions disable readthrough, preserving template variants.
 # origin_is_cookie_independent = false
 # Invalid names, duplicates, cross-list overlap, and TS identity cookies in the
 # key list reject configuration. Named policies bypass ambiguous/nonconforming
@@ -373,6 +381,18 @@ auction_timeout_ms = 500
 # template_cache_vary; that header alone cannot separate arms at TS.
 # Rollback: older binaries reject both new fields even as empty lists. Remove
 # both fields AND restore independence=false or disable ESI when HTML uses cookies.
+#
+# Applies shareability checks to the platform's origin cache. Default false keeps
+# the existing policy: ad-serving requests bypass; other publisher requests use
+# the platform default. True admits shareable ad requests and bypasses unshareable
+# non-ad requests. A DIFFERENT cache from the template cache
+# above, and a weaker one: the decision is made before the origin replies, so
+# none of the template cache's response-side refusals (`Set-Cookie`, CSP nonce,
+# missing freshness) apply. `ts origin probe-shareability` must pass on every
+# axis and verdict first. Tagged readthrough objects can be purged with
+# ts cache purge (--all or the exact reader-facing --page URL). Older untagged
+# objects must expire on the origin TTL; see the configuration guide's rollback note.
+# origin_readthrough_enabled = false
 #
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id
@@ -423,8 +443,14 @@ auction_timeout_ms = 500
 # [tinybird]
 # enabled = true
 # api_host = "api.us-east.tinybird.example"   # required when enabled; host only
-# auction_dataset = "auction_events"          # Events API datasource name
+# auction_enabled = true                       # emit auction telemetry
+# auction_dataset = "auction_events_raw"      # auction Events API datasource
 # auction_token_secret = "tinybird_auction_append_token"  # Key in trusted_server_secrets
+# access_enabled = false                       # emit sampled access telemetry
+# access_dataset = "access_logs_raw"          # access Events API datasource
+# access_token_secret = "tinybird_access_append_token"    # Key in trusted_server_secrets
+# access_sample_rate = 0.0                     # fraction from 0.0 through 1.0
+# max_body_bytes = 1048576                     # maximum NDJSON request body
 
 # Debug endpoints (all default false — never enable in production).
 # [debug]
