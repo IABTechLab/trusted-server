@@ -19,11 +19,10 @@ use error_stack::{Report, ResultExt};
 
 use crate::error::TrustedServerError;
 
-use super::current_timestamp;
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
-use super::{EcKvSnapshot, log_id};
+use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 5;
@@ -1052,9 +1051,17 @@ impl KvIdentityGraph {
         )
     }
 
-    fn withdrawal_marker_exists(&self, ec_id: &str) -> Result<bool, Report<TrustedServerError>> {
+    fn withdrawal_marker_exists(
+        &self,
+        ec_id: &str,
+        now: Option<u64>,
+    ) -> Result<bool, Report<TrustedServerError>> {
+        // An unusable clock cannot prove the tombstone is still valid. Ignore
+        // completion markers and let withdrawal strongly check the root instead.
+        let Some(now) = now else {
+            return Ok(false);
+        };
         let marker_prefix = Self::withdrawal_marker_prefix(ec_id);
-        let now = current_timestamp();
         Ok(self
             .store
             .list_keys_with_prefix(&marker_prefix, WITHDRAWAL_MARKER_LIST_LIMIT)?
@@ -1253,10 +1260,15 @@ impl KvIdentityGraph {
     /// there is nothing to withdraw, and a forged cookie must not mint a row. A
     /// key that provably exists is tombstoned unconditionally because no CAS
     /// generation is available after a missed read. Marker-check failure falls
-    /// back to that privacy write; root-existence failure leaves withdrawal
-    /// unresolved rather than silently dropped.
-    fn tombstone_unproven_missing(&self, ec_id: &str, missing: EcKvSnapshot) -> EcKvSnapshot {
-        match self.withdrawal_marker_exists(ec_id) {
+    /// back to that privacy write, as does an unusable clock; root-existence
+    /// failure leaves withdrawal unresolved rather than silently dropped.
+    fn tombstone_unproven_missing(
+        &self,
+        ec_id: &str,
+        missing: EcKvSnapshot,
+        now: Option<u64>,
+    ) -> EcKvSnapshot {
+        match self.withdrawal_marker_exists(ec_id, now) {
             Ok(true) => {
                 log::debug!(
                     "withdrawal tombstone for '{}': completion marker already exists",
@@ -1371,7 +1383,11 @@ impl KvIdentityGraph {
                 EcKvSnapshot::Missing {
                     ec_id: ref snapshot_id,
                 } if snapshot_id == ec_id => {
-                    return self.tombstone_unproven_missing(ec_id, current);
+                    return self.tombstone_unproven_missing(
+                        ec_id,
+                        current,
+                        checked_current_timestamp(),
+                    );
                 }
                 // A refreshed read that failed (or any other unusable state)
                 // fails closed rather than silently dropping the withdrawal.
@@ -2648,7 +2664,7 @@ mod tests {
         let snapshot = kv.load_snapshot(&ec_id);
         kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
         assert!(
-            kv.withdrawal_marker_exists(&ec_id)
+            kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
                 .expect("should read withdrawal marker"),
             "withdrawal should record completion"
         );
@@ -2662,7 +2678,7 @@ mod tests {
             .expect("should find revived entry");
         assert!(loaded.consent.ok, "should be live after revive");
         assert!(
-            !kv.withdrawal_marker_exists(&ec_id)
+            !kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
                 .expect("should read withdrawal marker"),
             "revival should clear stale withdrawal completion"
         );
@@ -2717,7 +2733,134 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_marker_existence_requires_an_exact_key() {
+    fn withdrawal_failed_clock_stale_miss_tombstones_live_root() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::with_stale_lookups(
+            Arc::clone(&operations),
+            1,
+        ));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &concurrent_live_entry())
+            .expect("should seed a live row with partner IDs");
+        graph
+            .write_withdrawal_marker(&ec_id, 1000)
+            .expect("should seed a completion marker left after root recreation");
+        operations.reset();
+        let missing = graph.load_snapshot(&ec_id);
+        assert!(
+            matches!(missing, EcKvSnapshot::Missing { .. }),
+            "should reproduce a stale point-read miss for the live row"
+        );
+
+        // None is the checked clock's failure result, not Unix epoch zero.
+        let outcome = graph.tombstone_unproven_missing(&ec_id, missing, None);
+
+        let (stored, generation) = graph
+            .get(&ec_id)
+            .expect("should read back persisted withdrawal")
+            .expect("should retain the root");
+        assert!(
+            !stored.consent.ok,
+            "an unusable clock must not let a marker suppress withdrawal"
+        );
+        assert!(
+            stored.ids.is_empty(),
+            "withdrawal should clear stored partner IDs"
+        );
+        assert_eq!(
+            generation, 2,
+            "withdrawal should write the existing root once"
+        );
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "clock failure should not fail a strongly confirmed withdrawal"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            1,
+            "should strongly check the root"
+        );
+        assert_eq!(
+            operations.inserts(),
+            vec![
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Overwrite,
+                    ttl: TOMBSTONE_TTL
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Add,
+                    ttl: TOMBSTONE_TTL
+                },
+            ],
+            "should write only the root tombstone and its completion marker"
+        );
+    }
+
+    #[test]
+    fn withdrawal_failed_clock_does_not_create_absent_root() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+        let ec_id = snapshot_ec_id();
+        graph
+            .write_withdrawal_marker(&ec_id, 1000)
+            .expect("should seed a marker without a root");
+        operations.reset();
+        let missing = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_unproven_missing(&ec_id, missing, None);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "absent root should remain missing"
+        );
+        assert!(
+            graph
+                .get(&ec_id)
+                .expect("should read absent root")
+                .is_none(),
+            "clock failure must not mint an unknown root"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            1,
+            "should prove root absence despite the marker"
+        );
+        assert!(
+            operations.inserts().is_empty(),
+            "absent identity should cause no writes"
+        );
+    }
+
+    #[test]
+    fn withdrawal_marker_validity_requires_a_usable_clock_before_expiry() {
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        graph
+            .write_withdrawal_marker(&ec_id, 1000)
+            .expect("should seed marker");
+        let valid_until = 1000 + TOMBSTONE_TTL.as_secs();
+
+        for (now, expected) in [
+            (Some(valid_until - 1), true),
+            (Some(valid_until), false),
+            (Some(valid_until + 1), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                graph
+                    .withdrawal_marker_exists(&ec_id, now)
+                    .expect("should check marker validity"),
+                expected,
+                "marker validity should honor clock availability and exclusive expiry at {now:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn withdrawal_marker_existence_rejects_malformed_expiry_suffix() {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let marker_key = KvIdentityGraph::withdrawal_marker_key(
             &ec_id,
@@ -2739,9 +2882,9 @@ mod tests {
         let kv = KvIdentityGraph::new(store);
 
         assert!(
-            !kv.withdrawal_marker_exists(&ec_id)
-                .expect("should check exact withdrawal marker"),
-            "a longer marker key must not answer for this identity"
+            !kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
+                .expect("should validate withdrawal marker expiry"),
+            "a malformed expiry suffix must not prove withdrawal completion"
         );
     }
 
@@ -2793,7 +2936,7 @@ mod tests {
             "both marker add attempts should reach the store"
         );
         assert!(
-            kv.withdrawal_marker_exists(&ec_id)
+            kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
                 .expect("should read completion marker"),
             "completion marker should remain valid"
         );
@@ -2881,7 +3024,7 @@ mod tests {
             .expect("should accept a marker removed by another request");
 
         assert!(
-            !kv.withdrawal_marker_exists(&ec_id)
+            !kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
                 .expect("should confirm marker removal"),
             "completion marker should remain absent"
         );
@@ -2902,7 +3045,7 @@ mod tests {
             "a marker that remains after delete failure should block revival"
         );
         assert!(
-            kv.withdrawal_marker_exists(&ec_id)
+            kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
                 .expect("should confirm marker remains"),
             "completion marker should remain present"
         );
@@ -2926,7 +3069,7 @@ mod tests {
         kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
 
         assert!(
-            kv.withdrawal_marker_exists(&ec_id)
+            kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
                 .expect("should read withdrawal marker"),
             "withdrawal should record completion"
         );
@@ -2949,9 +3092,12 @@ mod tests {
 
         kv.delete(&ec_id).expect("should delete entry and marker");
 
-        assert!(kv.get(&ec_id).expect("should read store").is_none());
         assert!(
-            !kv.withdrawal_marker_exists(&ec_id)
+            kv.get(&ec_id).expect("should read store").is_none(),
+            "hard delete should remove the root"
+        );
+        assert!(
+            !kv.withdrawal_marker_exists(&ec_id, checked_current_timestamp())
                 .expect("should read withdrawal marker"),
             "hard delete should remove withdrawal completion"
         );
@@ -3093,7 +3239,10 @@ mod tests {
 
         let outcome = kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
 
-        assert!(matches!(outcome, EcKvSnapshot::Missing { .. }));
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "withdrawal should preserve the missing snapshot for an absent identity"
+        );
         assert!(
             kv.get(&ec_id).expect("should read store").is_none(),
             "withdrawal must not create a tombstone for an absent key"
@@ -3541,7 +3690,8 @@ mod tests {
         assert!(
             outcome
                 .entry_for(&ec_id)
-                .is_some_and(|e| e.ids.contains_key("ssp_x"))
+                .is_some_and(|e| e.ids.contains_key("ssp_x")),
+            "refreshing an unavailable generation should persist the partner update"
         );
     }
 
@@ -4023,11 +4173,12 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_stale_miss_accepts_marker_when_root_check_fails() {
+    fn tombstone_stale_miss_valid_marker_skips_root_check_and_writes() {
         let ec_id = snapshot_ec_id();
         let operations = Arc::new(RecordedEcKvOperations::default());
         let graph = KvIdentityGraph::new(RecordingEcKv::completed_with_root_check_failure(
-            operations, &ec_id,
+            Arc::clone(&operations),
+            &ec_id,
         ));
 
         let outcome = graph.tombstone_existing_from_snapshot(
@@ -4040,6 +4191,25 @@ mod tests {
         assert!(
             matches!(outcome, EcKvSnapshot::Missing { .. }),
             "a completion marker should resolve a repeated stale miss"
+        );
+        assert_eq!(
+            operations.lookup_count(),
+            1,
+            "should retry the stale point read once"
+        );
+        assert_eq!(
+            operations.list_count(),
+            1,
+            "should strongly list completion markers once"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            0,
+            "valid marker should bypass the failing root check"
+        );
+        assert!(
+            operations.inserts().is_empty(),
+            "valid marker should prevent redundant writes"
         );
     }
 

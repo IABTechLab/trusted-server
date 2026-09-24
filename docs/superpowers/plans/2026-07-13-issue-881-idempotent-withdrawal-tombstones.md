@@ -1,7 +1,7 @@
 # Issue #881: Idempotent EC Withdrawal Tombstones Plan
 
 - **Date:** 2026-07-13
-- **Status:** Implemented and verified
+- **Status:** Implemented; clock-safety review fixes independently reviewed and full local gates passed
 - **Issue:** [#881 — Make EC withdrawal tombstoning idempotent across request bursts](https://github.com/IABTechLab/trusted-server/issues/881)
 - **Stack base:** [Draft PR #900 — Avoid no-op EC KV reads in post-send pull sync](https://github.com/IABTechLab/trusted-server/pull/900)
 - **Underlying dependency:** [PR #885 — Request-scoped EC KV snapshot and orphan recovery](https://github.com/IABTechLab/trusted-server/pull/885)
@@ -17,7 +17,8 @@ state returns without reading or writing KV. When an eventually consistent
 point read instead misses the existing tombstone, a strongly listed marker
 prevents an unconditional replacement write only while the original tombstone
 should still exist. An expired marker cannot suppress withdrawal of a recreated
-live row.
+live row. An unusable clock cannot establish marker validity and must fall back
+to strong root existence, never skip withdrawal or create an unknown root.
 
 Browser-cookie deletion remains synchronous and best-effort KV failure must
 never block the response.
@@ -44,6 +45,9 @@ never block the response.
 - A repeated stale point-read miss uses the strongly consistent completion
   marker to avoid another unconditional root write. The marker key records
   `consent.updated + TOMBSTONE_TTL` and is ignored at or after that bound.
+  `checked_current_timestamp()` preserves clock failure as `None`; it cannot
+  use the legacy `current_timestamp()` epoch-zero sentinel to validate a marker.
+  Without a usable clock, strong root existence still gates any overwrite.
 - Completion-marker failure never suppresses the privacy write. Explicit
   same-key CAS revival and hard deletion clear the marker before replacing or
   removing the tombstoned generation.
@@ -65,10 +69,15 @@ never block the response.
   partner-upsert semantics beyond preserving tombstone rejection.
 - Do not make withdrawal dominate a re-consent that occurs after withdrawal's
   linearization point.
-- Do not rewrite archival specs that describe the superseded unconditional
-  helper.
+- Do not rewrite archival lifecycle descriptions; add only the completion-key
+  namespace annotation to the historical technical spec.
+- Defer a marker-value redesign: an eventually consistent point read cannot
+  replace strong listing for completion proof.
+- Defer Fastly list `ItemNotFound` normalization until an operation-specific
+  platform contract confirms that it means an empty key set. SDK propagation
+  alone does not establish that contract.
 
-## Current Behavior
+## Original Baseline (Before Issue #881)
 
 `KvIdentityGraph::tombstone_existing_from_snapshot` already preserves PR #885's
 existing-key-only and CAS behavior, but it writes a fresh tombstone whenever the
@@ -76,10 +85,9 @@ snapshot is `Present`, including when that entry is already a tombstone. Paralle
 withdrawals therefore converge safely but still perform a redundant CAS write,
 and repeated requests reset the tombstone's 24-hour TTL.
 
-The unconditional `write_withdrawal_tombstone` helper remains necessary when
-point reads miss a root that the strong list still sees. Without durable
-completion state, repeated stale misses bypass the `Present` fast path and keep
-rewriting that root.
+An unconditional root overwrite remains necessary when point reads miss a root
+that the strong list still sees. Without durable completion state, repeated
+stale misses bypass the `Present` fast path and keep rewriting that root.
 
 Finalization already:
 
@@ -127,21 +135,28 @@ absolute validity bound. The marker namespace cannot collide with EC IDs and is
 excluded from hash-prefix cluster counts. If a later point read misses and a
 strong prefix list returns a correctly shaped marker whose bound is still in
 the future, withdrawal returns without a second strong root-existence check or
-root rewrite. Expired or malformed markers are ignored. Marker read or write
-failures fall back to the root privacy write. Explicit same-key CAS revival and
-hard deletion remove markers for that EC ID. Fresh-ID creation does not read
-marker state.
+root rewrite. This is a bounded prefix list plus expiry-suffix validation, not
+an exact-key existence check: each completion key includes its own validity
+bound. Expired or malformed markers and an unusable clock are ignored. Marker
+list failure falls back to strong root existence before any privacy write;
+marker write failure preserves an already completed root write. Explicit
+same-key CAS revival and hard deletion remove markers for that EC ID. Fresh-ID
+creation does not read marker state.
 
 ### 2. Contain the unconditional fallback
 
-Keep `write_withdrawal_tombstone` only for the case where eventually consistent
-point reads miss a root that the strong list still sees. Record completion after
-that write so another stale miss cannot refresh the root. The marker is
+Production withdrawal uses `tombstone_existing_from_snapshot`; its
+`tombstone_unproven_missing` fallback checks marker validity, then confirms
+strong root existence before calling `overwrite_withdrawal_tombstone`.
+`write_withdrawal_tombstone` and `tombstone_held_identity` are test-only helpers
+that retain the legacy strong-existence-then-overwrite behavior. Record
+completion after a successful root write so another stale miss cannot refresh
+the root. The marker is
 best-effort after a successful root write; marker failure is logged and cannot
 turn a completed privacy write into a reported failure.
 
 Update hard deletion and same-key revival to remove completion state. Historical
-design documents may remain unchanged.
+lifecycle descriptions remain unchanged apart from the namespace annotation.
 
 ### 3. Prove operation-level idempotency
 
@@ -162,6 +177,9 @@ each write's mode and TTL. Tests must show:
   generation and `consent.updated` unchanged;
 - an expired root recreated under the same key is tombstoned when the point
   read misses, because the older marker's absolute bound is no longer valid;
+- an unusable clock plus a marker and stale point-read miss still tombstones a
+  strongly confirmed live row, clearing partner IDs; an absent root stays absent;
+- marker validity is checked immediately before, at, and after its expiry bound;
 - two stale live snapshots model parallel requests: the first writes the
   tombstone; the second conflicts, rereads the tombstone, and performs no
   replacement write;
@@ -217,6 +235,15 @@ Production finalization should not change unless these tests expose a defect.
   - Keep fresh-ID creation independent of marker availability.
   - Update withdrawal documentation.
   - Add operation-count, repetition, stale-read, and concurrency tests.
+  - Pass the checked timestamp into the private missing-row/marker helpers for
+    deterministic clock-failure tests without a global clock override.
+- `crates/trusted-server-core/src/ec/mod.rs`
+  - Add an optional checked timestamp; preserve legacy epoch-zero fallback for
+    unrelated callers.
+- `crates/trusted-server-core/src/ec/kv_backend.rs`
+  - Document strong single-page listing, truncation, and caller responsibilities.
+- `docs/superpowers/specs/2026-03-24-ssc-technical-spec-design.md`
+  - Annotate the internal completion-marker namespace only.
 - `crates/trusted-server-core/src/ec/finalize.rs`
   - Add two-ID, repeated-withdrawal, and KV-failure integration coverage.
 - `docs/guide/edge-cookies.md`
@@ -228,7 +255,7 @@ Production finalization should not change unless these tests expose a defect.
   - Record the reviewed design and verification contract.
 
 No dependency, configuration, adapter, JavaScript, or public wire-format change
-is expected. The EC store gains an internal completion-marker key namespace.
+is included. The EC store gains an internal completion-marker key namespace.
 
 ## Implementation Tasks
 
@@ -280,11 +307,33 @@ is expected. The EC store gains an internal completion-marker key namespace.
       failure.
 - [x] Run focused withdrawal/finalization tests.
 
-### Task 5 — Review and full verification
+### Task 5 — Original review and full verification (historical)
 
 - [x] Run independent correctness/concurrency and test-quality reviews.
 - [x] Apply only fixes required by issue scope.
 - [x] Mark this plan implemented only after all checks below pass.
+
+### Review follow-up — Clock safety
+
+The original checklist above records the prior implementation, not fresh full
+verification of these review fixes.
+
+- [x] Preserve failed clock reads as `None` at completion-marker validation.
+- [x] Reproduce live-row suppression before the guard; prove persisted consent
+      is false and partner IDs are empty afterward using `RecordingEcKv`.
+- [x] Cover absent roots and valid/at-expiry/expired marker boundaries.
+- [x] Verify restoring the unsafe epoch-zero fallback fails the regression,
+      then revert the mutation.
+- [x] Add missing assertion messages and precise marker test names/counts.
+- [x] Clarify bounded strong listing and the completion-key namespace.
+- [x] Rerun every full repository verification gate for the review follow-up.
+
+Follow-up validation passed all six clippy targets, all four adapter test
+commands, parity and CLI tests, Rust/JS/docs formatting, JS tests/build, and the
+release Fastly WASM build. Rust suites reported 3,208 passed and 10 ignored;
+Vitest reported 959 passed. Independent correctness review found no defects.
+Clock failure is injected at the private withdrawal decision; an actual failed
+host clock and production Fastly list-error semantics were not exercised.
 
 ## Acceptance Mapping
 
@@ -359,9 +408,10 @@ git diff --check
   generation/timestamp alone is not sufficient evidence.
 - **Stale-miss completion:** Write the marker only after the root tombstone
   succeeds. Encode the original tombstone's absolute validity bound in the key
-  and ignore the marker after that bound. Marker failures must fall back to the
-  privacy write. Explicit same-key CAS revival and hard deletion must remove
-  stale completion state. Revival and hard deletion fail closed before changing
+  and ignore the marker at or after that bound, or whenever the clock is
+  unusable. Marker lookup failure or clock failure must fall back to strong
+  root existence, not a blind write or a failed withdrawal. Explicit same-key
+  CAS revival and hard deletion must remove stale completion state. Revival and hard deletion fail closed before changing
   the root when a bounded marker list is full, rather than making partial
   cleanup progress that could leave a future live row next to an unseen marker.
 - **Fallback containment:** Strongly list and validate completion markers first.
