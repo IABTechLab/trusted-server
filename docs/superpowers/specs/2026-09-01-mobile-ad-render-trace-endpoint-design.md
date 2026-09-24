@@ -503,9 +503,20 @@ Rules (route responses below apply after configured authentication):
 - For both POST paths, accept absent or exactly-zero `Content-Length` only
   when the body is empty; reject `Transfer-Encoding`, positive/invalid lengths,
   and any actual body bytes with local `413 Payload Too Large` and no mutation.
-  Precheck headers, then use `Body::into_bytes_bounded(0)` to check emptiness,
-  following the header-precheck/body-size-check pattern in
-  `crates/trusted-server-core/src/auction/endpoints.rs`. This is an application
+  Precheck headers, then explicitly match both body variants: accept
+  `Body::Once` only when its bytes are empty; for `Body::Stream`, consume chunks
+  until EOF, skipping empty chunks and rejecting the first non-empty chunk
+  with a local `413`. A stream read error returns local `400 Bad Request`
+  without mutation; only a clean EOF proves a streamed body empty. Build the
+  `StatusCode::PAYLOAD_TOO_LARGE` response explicitly, as in the
+  header-precheck/body-size-check pattern in
+  `crates/trusted-server-core/src/auction/endpoints.rs`. Do not copy that
+  handler's `into_bytes().unwrap_or_default()`: `Body::into_bytes` returns
+  `None` for streams, which would incorrectly treat a non-empty streamed body
+  as empty. Nor should `Body::into_bytes_bounded(0)` errors be propagated as
+  the response: overflow is `EdgeError::bad_request`, which maps to `400`,
+  and `EdgeError` has no `413` variant. All local body-validation errors use
+  the section 12.3 response hardening. This is an application
   acceptance limit, not a transport read or allocation limit. Pinned EdgeZero
   v0.0.8 buffers the Fastly body with blocking `read_to_end` and the Cloudflare
   body with `req.bytes().await` before core handling. Spin also buffers the
@@ -1424,12 +1435,16 @@ object-src 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'self
 img-src data:
 ```
 
-The shell supplies a fixed data-URL favicon; `img-src data:` allows it without
-an automatic publisher `/favicon.ico` fetch. All styles live in the fixed CSS
-asset: toggle classes or the `hidden` attribute, with no inline style attributes,
+The shell declares a fixed data-URL favicon with `<link rel="icon">` to suppress
+the implicit publisher `/favicon.ico` fallback; `img-src data:` permits that
+declared data URL to load despite `default-src 'none'`. All styles live in the
+fixed CSS asset: toggle classes or the `hidden` attribute, with no inline style attributes,
 style blocks, or JavaScript style-property writes. JSON download uses a Blob
 object URL assigned directly to an `<a download>` followed by a click, then
-revokes the URL after the download has started. Do not fetch the blob URL or
+schedules `URL.revokeObjectURL` with `setTimeout` for 1000 ms after the click.
+Never revoke synchronously after `click()`; the delay gives the browser time
+to acquire the Blob and is not a download-completion signal. Each download
+schedules cleanup of its own object URL. Do not fetch the blob URL or
 embed it in a frame. This fixes the download mechanism without widening
 `connect-src` or enabling frames; browser tests exercise it under this exact CSP.
 
@@ -1577,8 +1592,11 @@ results, never a prerequisite for returning them.
   with no claim that inactive proves the cookie is absent.
 - Empty-body enforcement rejects positive/invalid lengths, transfer encoding,
   nonempty bodies even with absent/zero lengths, and verifies no mutation on
-  rejection. Tests must not claim a transport bound or timeout that the pinned
-  adapters cannot enforce.
+  rejection. Cover both `Body::Once` and `Body::Stream`, including clean EOF,
+  empty chunks before EOF or a non-empty chunk, and stream read errors. Assert
+  local `413` for body bytes and local `400` for read errors, with section 12.3
+  hardening and no cookie mutation. Tests must not claim a transport bound or
+  timeout that the pinned adapters cannot enforce.
 - Endpoint skips EC generation/finalization, EID ingestion, auction, telemetry,
   configured filters, ordinary event context, and origin fetch.
 - Cookie-health scanner covers multiple header fields; zero, one, and duplicate
@@ -1646,6 +1664,8 @@ results, never a prerequisite for returning them.
   shadowing a broad rule to pin first-match-wins behavior.
 - GET, HEAD, state-changing POST, and unsupported methods obey the same
   lifecycle contract across adapters.
+- Enable/end POSTs without `Content-Type` accept empty bodies and reject actual
+  body bytes without cookie mutation, including Axum's streaming path.
 - Every adapter omits JA4/H2 and rejects control characters or overlong platform
   strings.
 
@@ -1715,6 +1735,9 @@ results, never a prerequisite for returning them.
   stored copies containing any excluded property are rejected. Numbered
   slot/cycle correlation still joins after redaction.
 - Download filename and MIME type are deterministic.
+- Fake timers verify that each download clicks its Blob-backed anchor before
+  scheduling cleanup, never revokes synchronously, and revokes its own URL
+  when the 1000 ms timer fires, including repeated downloads.
 - Formatted-JSON copy and JSON-file Web Share success, rejection, absence, and
   download/copy fallback behavior.
 - 320-pixel layout, keyboard navigation, focus handling, and accessible status
@@ -1722,6 +1745,10 @@ results, never a prerequisite for returning them.
 
 ### 14.4 Browser integration tests
 
+- Under the exact section 12.3 CSP, JSON downloads contain the complete report
+  with deferred URL cleanup, including the storage-failure recovery path and
+  clipboard/Web Share fallback. The declared data-URL favicon loads without
+  an implicit `/favicon.ico` request.
 - First endpoint GET is read-only and shows setup state; a user-initiated,
   same-origin enable POST sets the session.
 - Successful in-page activation adds no history entry, so Back can return to
