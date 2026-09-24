@@ -3806,6 +3806,166 @@ mod tests {
         );
     }
 
+    // One distinctive canary per `Redacted<String>` field reachable from
+    // `Settings`'s derived `Debug` impl. This is a regression guard over the
+    // field list below, not a completeness guarantee: a new secret field
+    // added without the `Redacted` wrapper has no canary here and will pass
+    // this test while leaking. Adding the canary is a manual step.
+    //
+    // Integration configs are deliberately out of scope. They reach
+    // `Settings` as opaque JSON under `IntegrationSettings`, whose
+    // hand-written `Debug` impl prints only integration IDs, never values.
+    //
+    // Do not use `..Struct::default()` anywhere in this function. A default
+    // spread would let a new secret field be added to `Handler`,
+    // `TinybirdSettings`, or any other struct built here without forcing
+    // anyone to consider it. The compile break is the prompt; the canary
+    // list below is still maintained by hand. List every field explicitly.
+    #[test]
+    fn settings_debug_output_redacts_every_secret_field() {
+        const CANARY_PROXY_SECRET: &str = "CANARY-PROXY-SECRET-0123456789";
+        const CANARY_EC_PASSPHRASE: &str = "CANARY-EC-PASSPHRASE-0123456789";
+        const CANARY_HANDLER_USERNAME: &str = "CANARY-HANDLER-USERNAME-0123456789";
+        const CANARY_HANDLER_PASSWORD: &str = "CANARY-HANDLER-PASSWORD-0123456789";
+        const CANARY_EC_PARTNER_API_TOKEN: &str = "CANARY-EC-PARTNER-API-TOKEN-0123456789";
+        const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
+        const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
+            "CANARY-TRUSTED-CLIENT-IP-SHARED-SECRET-0123456789";
+        const CANARY_S3_ACCESS_KEY_ID: &str = "CANARY-S3-ACCESS-KEY-ID-0123456789";
+        const CANARY_S3_SECRET_ACCESS_KEY: &str = "CANARY-S3-SECRET-ACCESS-KEY-0123456789";
+        const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
+        const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
+        const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
+        const CANARY_DATADOME_SERVER_SIDE_KEY: &str = "CANARY-DATADOME-SERVER-SIDE-KEY-0123456789";
+
+        let mut settings = create_test_settings();
+
+        settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
+        settings.ec.passphrase = Redacted::new(CANARY_EC_PASSPHRASE.to_string());
+
+        settings.handlers = vec![Handler {
+            path: "^/secure".to_string(),
+            username: Redacted::new(CANARY_HANDLER_USERNAME.to_string()),
+            password: Redacted::new(CANARY_HANDLER_PASSWORD.to_string()),
+            regex: OnceLock::new(),
+        }];
+
+        settings.ec.partners = vec![EcPartner {
+            name: "canary-partner".to_string(),
+            source_domain: "canary-partner.example".to_string(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: false,
+            api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: Vec::new(),
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
+        }];
+
+        settings.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "fastly-client-ip".to_string(),
+            auth_header: "x-trusted-client-auth".to_string(),
+            shared_secret: Redacted::new(CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET.to_string()),
+        });
+
+        let mut asset_route = ProxyAssetRoute::new("/s3-assets/", "https://s3.canary.example");
+        asset_route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new(CANARY_S3_ACCESS_KEY_ID.to_string()),
+            secret_access_key: Redacted::new(CANARY_S3_SECRET_ACCESS_KEY.to_string()),
+            session_token: Some(Redacted::new(CANARY_S3_SESSION_TOKEN.to_string())),
+            origin_query: None,
+        }));
+        settings.proxy.asset_routes = vec![asset_route];
+
+        settings.tinybird = TinybirdSettings {
+            auction_token_secret: Some(Redacted::new(CANARY_TINYBIRD_AUCTION_TOKEN.to_string())),
+            access_token_secret: Some(Redacted::new(CANARY_TINYBIRD_ACCESS_TOKEN.to_string())),
+            enabled: false,
+            api_host: String::new(),
+            secret_store: None,
+            auction_dataset: String::new(),
+            access_enabled: false,
+            access_dataset: String::new(),
+            access_sample_rate: 0.0f64,
+            max_body_bytes: 0,
+        };
+
+        // `IntegrationSettings` stores integration configs as opaque JSON and
+        // relies on a hand-written `Debug` impl to suppress their values. That
+        // impl is the only thing keeping resolved DataDome credentials out of
+        // this output, so pin it here.
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &json!({
+                    "enabled": true,
+                    "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
+                }),
+            )
+            .expect("should insert datadome integration config");
+
+        let debug = format!("{settings:?}");
+
+        assert!(
+            debug.contains("[REDACTED]"),
+            "should redact secret fields in Settings debug output"
+        );
+        assert!(
+            debug.contains("^/secure"),
+            "should leave non-secret handler path visible in debug output"
+        );
+
+        let canaries = [
+            ("publisher.proxy_secret", CANARY_PROXY_SECRET),
+            ("ec.passphrase", CANARY_EC_PASSPHRASE),
+            ("handlers[].username", CANARY_HANDLER_USERNAME),
+            ("handlers[].password", CANARY_HANDLER_PASSWORD),
+            ("ec.partners[].api_token", CANARY_EC_PARTNER_API_TOKEN),
+            (
+                "ec.partners[].ts_pull_token",
+                CANARY_EC_PARTNER_TS_PULL_TOKEN,
+            ),
+            (
+                "trusted_client_ip.shared_secret",
+                CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET,
+            ),
+            (
+                "proxy.asset_routes[].auth.access_key_id",
+                CANARY_S3_ACCESS_KEY_ID,
+            ),
+            (
+                "proxy.asset_routes[].auth.secret_access_key",
+                CANARY_S3_SECRET_ACCESS_KEY,
+            ),
+            (
+                "proxy.asset_routes[].auth.session_token",
+                CANARY_S3_SESSION_TOKEN,
+            ),
+            (
+                "tinybird.auction_token_secret",
+                CANARY_TINYBIRD_AUCTION_TOKEN,
+            ),
+            ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
+            (
+                "integrations.datadome.server_side_key_secret_name",
+                CANARY_DATADOME_SERVER_SIDE_KEY,
+            ),
+        ];
+
+        for (field, canary) in canaries {
+            assert!(
+                !debug.contains(canary),
+                "should redact {field} in Settings debug output"
+            );
+        }
+    }
+
     #[test]
     fn trusted_client_ip_accepts_x_prefixed_ip_header() {
         let settings = Settings::from_toml(&trusted_client_ip_toml(
