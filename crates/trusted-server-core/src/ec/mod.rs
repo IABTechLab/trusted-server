@@ -234,10 +234,11 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
-    /// EIDs parsed from the current request's own payload (e.g. the `/auction`
-    /// JSON body), when the route has one. Carried to response finalization so
-    /// KV ingestion can use the full set the client actually sent instead of
-    /// being limited to whatever fits in the size-capped `ts-eids` cookie.
+    /// EIDs the route resolved from the current request: the `/auction` JSON
+    /// body, or the `ts-eids` cookie when the body carried none. Carried to
+    /// response finalization so KV ingestion can use the full set the client
+    /// sent instead of being limited to whatever fits in the size-capped
+    /// `ts-eids` cookie.
     client_eids: Option<Vec<Eid>>,
 }
 

@@ -10,7 +10,7 @@ use error_stack::Report;
 use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
-use crate::consent::gate_eids_by_consent;
+use crate::consent::{ConsentContext, allows_eid_persistence};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -71,33 +71,29 @@ pub fn ec_finalize_response(
     // Returning user: consent is granted and EC came from request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
-            let updates = collect_consent_gated_eid_updates(
+            let collected = collect_eid_updates(
                 eids_cookie,
                 sharedid_cookie,
-                ec_context,
+                ec_context.client_eids(),
                 registry,
             );
+            let had_eid_updates = !collected.is_empty();
+            let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
             // `upsert_partner_ids_from_snapshot` early-returns the incoming
             // snapshot unrefreshed when `updates` is empty, which is correct
             // when there was never anything to write (an unconfigured
             // registry, or no EID cookies/body this request — the case
             // `finalize_not_read_snapshot_does_not_rotate` covers). But when
-            // Purpose 4 denial is what emptied `updates`, the request *did*
-            // have EID data, and orphan recovery below still needs an actual
-            // `Missing` read to detect an orphaned cookie. An unread
-            // `NotRead` snapshot proves nothing, so a Purpose-4-only denial
-            // must not also skip that one read on a recovery-eligible
-            // request.
+            // consent gating (e.g. TCF Purpose 4 denial) is what emptied
+            // `updates`, the request *did* have EID data, and orphan recovery
+            // below still needs an actual `Missing` read to detect an
+            // orphaned cookie. An unread `NotRead` snapshot proves nothing, so
+            // consent gating must not also skip that one read on a
+            // recovery-eligible request.
             let snapshot = if updates.is_empty()
+                && had_eid_updates
                 && ec_context.recovery_eligible()
                 && matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead)
-                && !collect_eid_updates(
-                    eids_cookie,
-                    sharedid_cookie,
-                    ec_context.client_eids(),
-                    registry,
-                )
-                .is_empty()
             {
                 graph.load_snapshot(&ec_id)
             } else {
@@ -131,8 +127,15 @@ pub fn ec_finalize_response(
             return;
         };
 
-        let updates =
-            collect_consent_gated_eid_updates(eids_cookie, sharedid_cookie, ec_context, registry);
+        let updates = gate_eid_updates_by_consent(
+            collect_eid_updates(
+                eids_cookie,
+                sharedid_cookie,
+                ec_context.client_eids(),
+                registry,
+            ),
+            ec_context.consent(),
+        );
         let snapshot = graph.upsert_partner_ids_from_snapshot(
             &ec_id,
             &updates,
@@ -147,30 +150,30 @@ pub fn ec_finalize_response(
     }
 }
 
-/// Collects EID-derived KV updates and applies TCF Purpose 4 (personalized
-/// ads) consent gating on top of the Purpose 1 (EC) gate `ec_finalize_response`
+/// Withholds EID-derived KV updates when consent does not allow EID
+/// persistence, on top of the Purpose 1 (EC) gate `ec_finalize_response`
 /// already enforces before reaching this point.
 ///
 /// `consent_allows_ec` only requires Purpose 1 (device storage), but EIDs
-/// additionally require Purpose 4 before they may be transmitted — the same
-/// rule [`gate_eids_by_consent`](crate::consent::gate_eids_by_consent) applies
-/// to the outbound `/auction` bid request. Without this, a user who denies
-/// Purpose 4 would have their EIDs correctly stripped from the bid request
-/// but still written to the identity graph from the `ts-eids`/`sharedId`
-/// cookies or the `/auction` request body.
-fn collect_consent_gated_eid_updates(
-    eids_cookie: Option<&str>,
-    sharedid_cookie: Option<&str>,
-    ec_context: &EcContext,
-    registry: &PartnerRegistry,
+/// additionally require Purpose 4 (personalized ads) — the same rule
+/// [`gate_eids_by_consent`](crate::consent::gate_eids_by_consent) applies to
+/// the outbound `/auction` bid request, evaluated here through
+/// [`allows_eid_persistence`]. Without this, a user who denies Purpose 4
+/// would have their EIDs correctly stripped from the bid request but still
+/// written to the identity graph from the `ts-eids`/`sharedId` cookies or the
+/// `/auction` request body.
+fn gate_eid_updates_by_consent(
+    updates: Vec<super::kv::PartnerIdUpdate>,
+    consent: &ConsentContext,
 ) -> Vec<super::kv::PartnerIdUpdate> {
-    let updates = collect_eid_updates(
-        eids_cookie,
-        sharedid_cookie,
-        ec_context.client_eids(),
-        registry,
+    if updates.is_empty() || allows_eid_persistence(consent) {
+        return updates;
+    }
+    log::debug!(
+        "EC KV: withholding {} EID updates, EID consent (TCF Purpose 1 + 4) missing",
+        updates.len()
     );
-    gate_eids_by_consent(Some(updates), Some(ec_context.consent())).unwrap_or_default()
+    Vec::new()
 }
 
 fn recover_orphaned_ec(
@@ -1015,22 +1018,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
-        // Regression test: this request has real EID data (a configured
-        // partner and a captured client EID), but TCF Purpose 4 denial gates
-        // it away, emptying the update list. That must not also suppress the
-        // snapshot refresh that orphan recovery depends on. Without a
-        // preloaded snapshot (a non-GET publisher navigation never calls
-        // `should_preload_ec_snapshot`), the context starts at `NotRead`; only
-        // an actual KV read can prove the row is missing and let recovery run.
-        //
-        // This is distinct from `finalize_not_read_snapshot_does_not_rotate`,
-        // which covers a request with no EID data at all (nothing gated it
-        // away) and must still not rotate.
-        let settings = create_test_settings();
-        let orphaned_ec = sample_ec_id("orphn2");
-        let purpose1_only_consent = ConsentContext {
+    /// GDPR consent granting TCF Purpose 1 (storage/EC) but denying Purpose 4
+    /// (personalized ads), so EC is allowed while EID persistence is not.
+    fn purpose_one_only_consent() -> ConsentContext {
+        ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             gdpr_applies: true,
             tcf: Some(TcfConsent {
@@ -1056,7 +1047,25 @@ mod tests {
             }),
             source: ConsentSource::Cookie,
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
+        // Regression test: this request has real EID data (a configured
+        // partner and a captured client EID), but TCF Purpose 4 denial gates
+        // it away, emptying the update list. That must not also suppress the
+        // snapshot refresh that orphan recovery depends on. Without a
+        // preloaded snapshot (a non-GET publisher navigation never calls
+        // `should_preload_ec_snapshot`), the context starts at `NotRead`; only
+        // an actual KV read can prove the row is missing and let recovery run.
+        //
+        // This is distinct from `finalize_not_read_snapshot_does_not_rotate`,
+        // which covers a request with no EID data at all (nothing gated it
+        // away) and must still not rotate.
+        let settings = create_test_settings();
+        let orphaned_ec = sample_ec_id("orphn2");
+        let purpose1_only_consent = purpose_one_only_consent();
         let mut ec_context = EcContext::new_for_test_with_ip(
             Some(orphaned_ec.clone()),
             purpose1_only_consent,
@@ -1247,33 +1256,7 @@ mod tests {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("purp4x");
         let graph = KvIdentityGraph::in_memory("test_store");
-        let purpose1_only_consent = ConsentContext {
-            jurisdiction: Jurisdiction::Gdpr,
-            gdpr_applies: true,
-            tcf: Some(TcfConsent {
-                version: 2,
-                cmp_id: 1,
-                cmp_version: 1,
-                consent_screen: 0,
-                consent_language: "EN".to_owned(),
-                vendor_list_version: 1,
-                tcf_policy_version: 4,
-                created_ds: 0,
-                last_updated_ds: 0,
-                // Purpose 1 (index 0) granted; Purpose 4 (index 3) denied.
-                purpose_consents: {
-                    let mut purposes = vec![false; 24];
-                    purposes[0] = true;
-                    purposes
-                },
-                purpose_legitimate_interests: vec![false; 24],
-                vendor_consents: Vec::new(),
-                vendor_legitimate_interests: Vec::new(),
-                special_feature_opt_ins: vec![false; 12],
-            }),
-            source: ConsentSource::Cookie,
-            ..Default::default()
-        };
+        let purpose1_only_consent = purpose_one_only_consent();
         let live = KvEntry::new(
             &purpose1_only_consent,
             None,

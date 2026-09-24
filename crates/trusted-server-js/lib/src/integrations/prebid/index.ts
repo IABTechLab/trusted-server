@@ -1971,7 +1971,7 @@ function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
   while (payload.length > 0) {
     const encoded = btoa(JSON.stringify(payload));
     if (encoded.length <= MAX_EID_COOKIE_BYTES) {
-      warnAboutDroppedEidSources(droppedSources, trimmedSources);
+      logTrimmedEidSources(droppedSources, trimmedSources);
       return payload;
     }
 
@@ -1985,18 +1985,21 @@ function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
     const dropped = payload.pop();
     if (dropped) {
       droppedSources.add(dropped.source);
+      // A source trimmed and then dropped is reported once, as dropped.
+      trimmedSources.delete(dropped.source);
     }
   }
 
-  warnAboutDroppedEidSources(droppedSources, trimmedSources);
+  logTrimmedEidSources(droppedSources, trimmedSources);
   return undefined;
 }
 
-/** Logs which EID sources `fitAuctionEidsToCookie` had to drop or trim UIDs from, if any. */
-function warnAboutDroppedEidSources(
-  droppedSources: Set<string>,
-  trimmedSources: Set<string>
-): void {
+/**
+ * Logs which EID sources `fitAuctionEidsToCookie` had to drop or trim UIDs
+ * from, if any. Debug level: `/auction` sends the untrimmed set in the request
+ * body, so a trimmed cookie is expected steady state rather than a warning.
+ */
+function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<string>): void {
   if (droppedSources.size === 0 && trimmedSources.size === 0) {
     return;
   }
@@ -2007,7 +2010,7 @@ function warnAboutDroppedEidSources(
   if (trimmedSources.size > 0) {
     parts.push(`trimmed uids from sources: ${[...trimmedSources].join(', ')}`);
   }
-  log.warn(
+  log.debug(
     `[tsjs-prebid] ts-eids cookie exceeded ${MAX_EID_COOKIE_BYTES} bytes; ${parts.join('; ')}`
   );
 }

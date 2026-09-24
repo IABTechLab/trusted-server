@@ -1551,8 +1551,9 @@ describe('prebid/installPrebidNpm', () => {
       ]);
     });
 
-    it('trims an oversized ts-eids cookie deterministically and warns which sources were dropped', () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    it('trims an oversized ts-eids cookie deterministically and logs which sources were dropped', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+      const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
       });
@@ -1585,17 +1586,18 @@ describe('prebid/installPrebidNpm', () => {
       expect(persistedSources).not.toContain('dropped.example');
       expect(persistedSources).toContain('id5-sync.com');
 
-      const warnedMessage = warnSpy.mock.calls
+      const loggedMessage = debugSpy.mock.calls
         .map((call) => call.at(-1))
         .find(
           (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
         );
-      expect(warnedMessage).toBeDefined();
-      expect(warnedMessage).toContain('dropped.example');
+      expect(loggedMessage).toBeDefined();
+      expect(loggedMessage).toContain('dropped.example');
+      expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('ts-eids cookie exceeded'));
     });
 
-    it('warns about a source whose UIDs were partially trimmed but retained', () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    it('logs a source whose UIDs were partially trimmed but retained', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
       });
@@ -1625,13 +1627,51 @@ describe('prebid/installPrebidNpm', () => {
       const persistedSource = persisted.find((eid) => eid.source === 'id5-sync.com');
       expect(persistedSource!.uids.length).toBeLessThan(10);
 
-      const warnedMessage = warnSpy.mock.calls
+      const loggedMessage = debugSpy.mock.calls
         .map((call) => call.at(-1))
         .find(
           (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
         );
-      expect(warnedMessage).toBeDefined();
-      expect(warnedMessage).toContain('trimmed uids from sources: id5-sync.com');
+      expect(loggedMessage).toBeDefined();
+      expect(loggedMessage).toContain('trimmed uids from sources: id5-sync.com');
+    });
+
+    it('reports a source trimmed and then dropped only as dropped', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      // The tail source has several UIDs that are each too large to fit: the
+      // trimmer first removes UIDs from it, then drops it entirely.
+      const hugeUid = 'y'.repeat(2500);
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'id5-sync.com', uids: [{ id: 'kept', atype: 1 }] },
+        {
+          source: 'dropped.example',
+          uids: Array.from({ length: 3 }, (_, i) => ({ id: `${hugeUid}${i}`, atype: 1 })),
+        },
+      ]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      const persistedSources = (JSON.parse(atob(cookieValue!)) as Array<{ source: string }>).map(
+        (eid) => eid.source
+      );
+      expect(persistedSources).toEqual(['id5-sync.com']);
+
+      const loggedMessage = debugSpy.mock.calls
+        .map((call) => call.at(-1))
+        .find(
+          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
+        );
+      expect(loggedMessage).toBeDefined();
+      expect(loggedMessage).toContain('dropped sources: dropped.example');
+      expect(loggedMessage).not.toContain('trimmed uids from sources');
     });
 
     it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
