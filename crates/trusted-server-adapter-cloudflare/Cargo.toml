@@ -23,6 +23,7 @@ cloudflare = ["edgezero-adapter-cloudflare/cloudflare", "dep:worker"]
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
+derive_more = { workspace = true }
 edgezero-adapter-cloudflare = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
@@ -42,4 +43,5 @@ worker = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
