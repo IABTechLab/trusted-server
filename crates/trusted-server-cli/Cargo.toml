@@ -26,6 +26,28 @@ http = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
+# `ts dev audit headers` fetches origin responses over HTTP. Scoped to host
+# targets (not the repo-default wasm32-wasip1) alongside the other native-only
+# deps so unsupported targets do not try to build reqwest's TLS stack.
+#
+# Deliberately NOT `workspace = true`: the workspace feature list enables
+# `rustls-tls`, which resolves to reqwest's `__rustls-ring` and turns on
+# `rustls/ring` on top of the `rustls/aws-lc-rs` that `ts dev proxy` uses on
+# macOS. With both providers compiled in, rustls cannot determine a
+# process-level `CryptoProvider` and every `ts dev proxy` TLS config build
+# panics. The `-no-provider` variant bakes in no provider, so it never adds
+# `ring` and cannot collide with the proxy's aws-lc-rs.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls-webpki-roots-no-provider",
+] }
+# The `-no-provider` reqwest variant expects the process-level rustls
+# `CryptoProvider` to be installed by the caller. `ts dev proxy` only exists on
+# macOS, so on other hosts nothing else pulls a rustls provider; this pins
+# aws-lc-rs (rustls's default) on every host target so `ts dev audit` can
+# install it before its first HTTPS fetch. On macOS it deduplicates with the
+# proxy's aws-lc-rs — still exactly one provider, so no ambiguity.
+rustls = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
