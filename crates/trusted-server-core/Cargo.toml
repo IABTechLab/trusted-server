@@ -72,6 +72,13 @@ edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = { workspace = true }
+
+[build-dependencies]
+hex = { workspace = true }
+sha2 = { workspace = true }
+
 [[bench]]
 name = "consent_decode"
 harness = false

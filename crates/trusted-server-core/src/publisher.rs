@@ -34,6 +34,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
+use sha2::Digest as _;
 
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
@@ -88,6 +89,8 @@ use crate::streaming_processor::{
     STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
 };
 use crate::streaming_replacer::create_url_replacer;
+
+include!(concat!(env!("OUT_DIR"), "/template_build_digest.rs"));
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2058,22 +2061,27 @@ fn assemble_if_shared(
     Ok((out, Some(AssemblyResponseState::ByteSeamFallback)))
 }
 
-/// Fingerprint of every configuration input plus the compiled browser bundle.
+/// Fingerprint of settings, browser bundles, and the core implementation.
 ///
 /// This intentionally over-invalidates. Trying to maintain a hand-written list already
 /// omitted publisher origin identity and creative-opportunity shaping fields. A digest of
 /// the complete typed settings cannot expose secret values and makes future config fields
 /// safe by default: a change misses until someone proves it irrelevant, never cross-serves
-/// an old template under new behavior.
+/// an old template under new behavior. The build digest additionally covers core source
+/// files (including embedded head scripts), build logic, manifests, and the workspace
+/// lockfile when present, so implementation edits automatically invalidate templates.
 ///
 /// # Panics
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
 fn template_fingerprint(settings: &Settings) -> String {
-    use sha2::Digest as _;
+    template_fingerprint_with_build_digest(settings, TEMPLATE_BUILD_DIGEST)
+}
 
+fn template_fingerprint_with_build_digest(settings: &Settings, build_digest: &str) -> String {
     let mut hasher = sha2::Sha256::new();
+    hasher.update(build_digest.as_bytes());
     hasher.update(
         trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
     );
@@ -2081,7 +2089,7 @@ fn template_fingerprint(settings: &Settings) -> String {
     // independently deserialized HashMaps canonical before they are serialized again.
     let canonical = serde_json::to_value(settings)
         .and_then(|value| serde_json::to_vec(&value))
-        .expect("serializing typed settings should be infallible");
+        .expect("should serialize typed settings infallibly");
     hasher.update(canonical);
     hex::encode(hasher.finalize())
 }
@@ -4860,8 +4868,8 @@ pub async fn handle_publisher_request(
                 // failure could only truncate the response mid-body. Failing here falls
                 // back to the origin instead, which is a slower correct page.
                 //
-                // `schema_version` should make either failure unreachable, so reaching
-                // it means the transform changed without the version moving.
+                // The build fingerprint and schema version isolate incompatible
+                // templates. Keep this check as a defense against unusable entries.
                 //
                 // Asked of the mode, not of every template. The key covers
                 // `assembly_mode`, so a hit was stored by this same mode.
@@ -4871,7 +4879,7 @@ pub async fn handle_publisher_request(
                 if let Some(err) = seam_check {
                     log::error!(
                         "template_cache hit is unusable ({err}); treating as a miss. \
-                         The transform changed without TEMPLATE_SCHEMA_VERSION moving."
+                         The cached template violates the assembly marker contract."
                     );
                     if let Err(purge_err) = services.template_cache().purge_url(key).await {
                         log::warn!(
@@ -8853,6 +8861,43 @@ mod tests {
                 }),
             );
             settings
+        }
+
+        #[test]
+        fn production_fingerprint_uses_the_generated_build_digest() {
+            let settings = settings_with_prebid(true, 1000);
+            assert_eq!(
+                TEMPLATE_BUILD_DIGEST.len(),
+                64,
+                "should generate a SHA-256 digest"
+            );
+            assert!(
+                TEMPLATE_BUILD_DIGEST
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+                "should encode the build digest as hexadecimal"
+            );
+            assert_eq!(
+                template_fingerprint(&settings),
+                template_fingerprint_with_build_digest(&settings, TEMPLATE_BUILD_DIGEST),
+                "should use the generated digest in production"
+            );
+            assert_ne!(
+                template_fingerprint(&settings),
+                template_fingerprint_with_build_digest(&settings, ""),
+                "should not omit the build digest in production"
+            );
+        }
+
+        #[test]
+        fn changing_only_the_build_digest_changes_the_fingerprint() {
+            let settings = settings_with_prebid(true, 1000);
+
+            assert_ne!(
+                template_fingerprint_with_build_digest(&settings, "build-before-head-edit"),
+                template_fingerprint_with_build_digest(&settings, "build-after-head-edit"),
+                "should select a new template when only compiled head code changes"
+            );
         }
 
         #[test]
