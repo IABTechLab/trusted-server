@@ -43,10 +43,11 @@ explicitly; filesystem discovery order will never affect execution. For
 auction providers, that order is also operational priority: it controls launch
 and response order, mediator input order, and local equal-price tie-breaking.
 
-This design intentionally changes the auction configuration introduced by PR
-#1016 while preserving that work's compiled-plan and runtime guarantees. It
-adopts only the typed-registration portion of PR #1084 and excludes that PR's
-external provider ecosystem and unrelated provider systems.
+The compatibility baseline is the behavior shipped on `origin/main` at
+`4c6d26a16`, not either prior pull request discussed below. This design changes
+only the configuration, activation, and ordering behavior called out explicitly
+in this document; all other current runtime, browser, CLI, and cache behavior is
+preserved.
 
 This remains one design, but it has two merge milestones. The crate and runtime
 boundary moves first without changing operator configuration. The ordered,
@@ -56,7 +57,7 @@ forcing the packaging move and configuration migration into one deployment.
 
 ## Context
 
-On `main` at `6cae7f5da`, neutral registry machinery and concrete integrations
+On `origin/main` at `4c6d26a16`, neutral registry machinery and concrete integrations
 share `crates/trusted-server-core/src/integrations`. The concrete Rust units
 are:
 
@@ -89,6 +90,21 @@ embeds bundles and hashes into the `trusted-server-js` Rust crate. APS renderer
 code is imported directly by browser core even though APS does not currently
 have its own `index.ts`.
 
+The same baseline includes managed Prebid User IDs and their OpenRTB EID/EC
+flow, LiveRamp configuration through that existing managed-ID facility,
+analytics-adapter selection in external Prebid bundles, cookie-keyed publisher
+template caching, additional CLI ad-template and audit config consumers, and
+documentation-snippet verification. These are current behavior and remain in
+scope for parity even though they landed after this design was first drafted.
+
+`core/src/ec/prebid_eids.rs` is historically named after the first browser
+producer, but its `ts-eids` ingestion, consent checks, EC finalization,
+partner-graph ingestion, and admin diagnostics are shared identity machinery.
+They remain in core and may be renamed to an integration-neutral module during
+the move. Prebid-owned configuration and browser-module management move out;
+the shared EID/EC machinery does not become a new capability family, and
+LiveRamp does not become another integration definition.
+
 Configuration is also split by implementation detail. Browser/page settings
 use `[integrations.<id>]`, while server auction providers use
 `[auction.providers.<instance>]` plus `profile = "aps"` or
@@ -108,16 +124,18 @@ These conditions produce five related problems:
 5. Runtime integration order is not a stable property of the operator
    configuration.
 
-## Relationship to Existing Work
+## Historical Pull Requests (Non-Normative)
+
+The following pull requests explain how some current code arrived in the
+repository. They are not design authorities for this specification. The
+normative inputs are the decisions in this document and behavior present on the
+current baseline above.
 
 ### PR #1016
 
-PR #1016 made auction providers configuration-driven and introduced a single
-validated, immutable auction plan shared by adapter backend construction,
-runtime dispatch, browser demand, routing, and telemetry. It also separated a
-configured provider instance from the OpenRTB profile implementation it uses.
-
-This design preserves those runtime guarantees:
+PR #1016 introduced the ancestor of the current compiled auction plan. The
+following properties are now baseline repository behavior and are preserved
+because current consumers depend on them, not because the PR is authoritative:
 
 - Multiple configured instances may use one integration implementation.
 - One validated provider identity remains shared by bidder routing, backend
@@ -140,26 +158,12 @@ remaining shared auction budget after earlier providers launch.
 
 ### PR #1084
 
-PR #1084 proposes a much broader compile-time provider ecosystem: public
-registration for external vendor crates, provider systems for identity, geo,
-device, permission signals, demand and ad servers, a permission/jurisdiction
-model, client-cycle EC resolution, provider-code governance, adapter and
-EdgeZero composition work, and independent vendor ownership expectations.
-
-This design shares one idea with that proposal: one integration may register
-multiple typed capabilities. It does not create the external ecosystem. The
-new contracts serve the integrations compiled in this workspace; they are not
-a stable third-party SDK or independent release boundary.
-
-The current PR #1084 configuration convention is mutually exclusive with this
-design. PR #1084 selects implementations through top-level `[integration]`,
-`[demand]`, and `[adserver]` provider selectors, removes `enabled` from
-integration blocks, and does not treat APS as an integration. This design
-deliberately chooses one ordered `[integrations]` inventory, explicit
-`enabled`, and APS as a multi-capability integration. The two configurations
-must not merge as parallel conventions. If this design is accepted, the
-conflicting configuration and auction sections of PR #1084 must be superseded
-or revised before that broader provider work proceeds.
+PR #1084 explores a broader external-provider and plugin ecosystem. That scope
+and its alternate configuration convention are not inputs to this design. This
+specification independently chooses static workspace crates, typed capabilities
+needed by current implementations, one ordered `[integrations]` inventory,
+explicit `enabled`, and APS as an integration. No `[integration]`, `[demand]`,
+or `[adserver]` selector convention is carried forward.
 
 ## Goals
 
@@ -177,9 +181,8 @@ or revised before that broader provider work proceeds.
    lifecycle imports from core.
 7. Make `[integrations]` the single ordered inventory for concrete integration
    configuration, including auction providers.
-8. Preserve the runtime behavior and compiled-plan guarantees of PR #1016,
-   except that deterministic provider priority moves from lexical ID order to
-   configuration order.
+8. Preserve behavior on the current `origin/main` baseline except for the
+   explicitly documented configuration, activation, and ordering changes.
 9. Make core compile without depending on either integrations crate.
 10. Keep all integrations statically linked; no runtime loading is introduced.
 
@@ -193,7 +196,9 @@ This design does not introduce:
 - A stable public plugin or integration SDK.
 - Independent vendor release, compatibility, security-response, or governance
   policies.
-- Identity, EC, geo, device, or permission-signal provider systems.
+- New identity, EC, geo, device, or permission-signal provider systems. The
+  existing neutral `ts-eids`/EC flow and managed Prebid User ID behavior remain
+  supported.
 - A jurisdiction or permission-policy redesign.
 - Client-cycle EC resolution or provider-code allocation.
 - Upstream EdgeZero lifecycle, host-evidence, store, or adapter changes.
@@ -247,7 +252,8 @@ crates/
     lib/
       package.json
       package-lock.json
-      build-browser.mjs
+      build-all.mjs
+      build-prebid-external.mjs
       src/core/
       test/core/
     src/
@@ -286,10 +292,14 @@ crates/
         aps/
           index.ts
           render.ts
+          renderer-document.html
         creative/
           index.ts
         datadome/
           index.ts
+        prebid/
+          index.ts
+          user_id_modules.json
         ...
       test/
         integrations/
@@ -307,7 +317,10 @@ sixteen definitions: fifteen moved implementations plus the new `openrtb`
 adapter.
 
 JavaScript-only `creative` remains valid without a Rust directory. Rust-only
-integrations remain valid without a browser directory.
+integrations remain valid without a browser directory. Cross-adapter Playwright
+and parity tests remain in `trusted-server-integration-tests`; their paths and
+load-order assertions change, but system tests do not become source owned by
+one integration crate.
 
 `creative` is the sole fixed, non-configurable browser prelude in this design;
 it is runtime support rather than an operator integration. Directory discovery
@@ -359,6 +372,7 @@ directory of implementations. It owns:
   validate, diff, and push mechanics.
 - The public runtime entry points that load a config-store blob and return one
   composed runtime value.
+- A validated source-config view used by non-runtime CLI commands.
 
 `TrustedServerAppConfig` contains neutral core configuration plus the ordered
 integration-owned source configuration. Concrete integration configuration is
@@ -376,11 +390,19 @@ values and constructs the plan, registry, and browser assets. Both phases use
 the same static catalog and integration schemas, but only adapters receive the
 final `TrustedServerComposition`.
 
+The source phase returns a conceptual `ValidatedSourceConfig`. It retains the
+typed operator configuration and exposes only the views CLI consumers need:
+neutral global settings, ordered integration and qualified-provider metadata,
+and integration-owned read models such as Prebid external-bundle inputs. This
+is not a runtime registry and contains no resolved secret values or executable
+capability objects.
+
 That runtime value, conceptually `TrustedServerComposition`, contains the
-validated neutral `Settings`, one `Arc<AuctionPlan>`, and one
-`IntegrationRegistry`, plus the composed `BrowserDocumentAssets`. Adapters
-consume this value; they do not separately compile the auction plan, rebuild
-the integration registry, or enumerate browser bundles.
+validated neutral `Settings`, one `Arc<AuctionPlan>`, one
+`IntegrationRegistry`, the composed `BrowserDocumentAssets`, and a canonical
+digest of the complete normalized resolved configuration. Adapters consume
+this value; they do not separately compile the auction plan, rebuild the
+integration registry, enumerate browser bundles, or reconstruct the digest.
 
 Core retains neutral config-store access, Fastly chunk reconstruction, blob
 envelope verification, secret-resolution primitives, global settings types,
@@ -400,11 +422,27 @@ config-store bytes
   → TrustedServerComposition
 ```
 
-The CLI imports `TrustedServerAppConfig` and its config command wrappers from
-`trusted-server-integrations`. Each wrapper performs the source-aware pre-pass
-and source-phase catalog validation before delegating storage and diff mechanics
-to EdgeZero's typed CLI functions. No EdgeZero source change or new host service
-is required.
+The CLI imports `TrustedServerAppConfig`, `ValidatedSourceConfig`, and its
+config command wrappers from `trusted-server-integrations`. Each wrapper
+performs the source-aware pre-pass and source-phase catalog validation before
+delegating storage and diff mechanics to EdgeZero's typed CLI functions. The
+validated bytes are passed to EdgeZero through an immutable temporary snapshot,
+so the bytes checked by the pre-pass are exactly the bytes diffed or pushed;
+the original operator path remains the path shown in diagnostics. No EdgeZero
+source change or new host service is required.
+
+Read-only `config ad-templates` and `audit ad-templates` commands load the
+effective source view with the existing optional environment overlay. Mutating
+or generator commands load file bytes without the overlay, so environment-only
+values are never persisted. Recovery-oriented ad-template generation may run a
+structural-only pre-pass against an otherwise invalid baseline, preserving its
+current warning and non-disclosure behavior, but the final candidate must pass
+the complete source validation before atomic write. `ts prebid bundle` obtains
+typed bidder, User ID, analytics, and managed-module requirements through the
+Prebid source-view facade; it retains process invocation and atomic metadata
+patching but no longer maintains a partial duplicate Prebid schema. Provider
+diagnostics display qualified providers in configuration order rather than
+alphabetizing a detached map.
 
 ## Static Rust Catalog and Browser Discovery
 
@@ -433,17 +471,31 @@ project, one lockfile, and one set of Vitest, ESLint, Prettier, Vite, and Prebid
 aliases. The canonical project root remains
 `crates/trusted-server-js/lib`; `trusted-server-integrations-js` does not add a
 second `package.json` or lockfile. Neutral browser sources remain under
-`trusted-server-js`; integration sources, fixtures, and tests live under
-`trusted-server-integrations-js`. Separate build targets emit neutral and
-integration artifacts into their owning Rust crates. The build helpers
-coordinate dependency installation and output generation so parallel Cargo
-build scripts cannot race or consume stale artifacts.
+`trusted-server-js`; integration sources, owned unit/artifact fixtures, and
+owned unit/artifact tests live under `trusted-server-integrations-js`. The
+shared TypeScript, lint, format, and test configurations include that sibling
+source root explicitly. Separate build targets emit neutral and integration
+artifacts into owner-specific output directories and validate per-target
+manifests before embedding them. One cross-process lock covers dependency
+installation, output cleanup, build execution, discovery, manifest validation,
+and artifact copy, so parallel Cargo build scripts cannot race or consume stale
+or partially replaced output.
 
 The integration build discovers immediate directories containing `index.ts`
 and emits one self-contained IIFE per entry point. Its Cargo build embeds each
-output and its SHA-256 hash. CI, Dependabot, browser integration scripts, and
-the CLI Prebid builder use the single workspace root rather than maintaining a
-second dependency graph.
+output and its SHA-256 hash. CI, browser integration scripts, and the CLI
+Prebid builder use the single workspace root rather than maintaining a second
+dependency graph; Dependabot continues to watch only its one lockfile.
+
+`build-prebid-external.mjs` and its npm command remain at the canonical Node
+root as build orchestration, not browser runtime. The Prebid registry, aliases,
+shims, and other integration-owned source inputs move with Prebid into
+`trusted-server-integrations-js`. The launcher receives their resolved sibling
+paths explicitly and has no hard-coded `src/integrations/prebid` assumption.
+The CLI resolves the canonical package root for dependencies and obtains the
+integration-owned input paths and typed module requirements from the
+integrations facade; it does not locate a registry through its own relative
+path constant.
 
 The generated Rust API exposes typed module identifiers rather than accepting
 unchecked strings. A Rust registration referencing a missing browser module
@@ -559,8 +611,9 @@ runtime, after secrets are resolved:
 1. Parse `[integrations]` into an ordered sequence.
 2. Resolve each ID against the static definition catalog.
 3. Ask the owning definition to parse and validate its complete configuration.
-4. For each enabled integration, construct its typed capability registrations
-   in the validated integration order restored from the storage sidecar.
+4. For each enabled integration, construct the typed capability registrations
+   activated by its validated settings, in integration order restored from the
+   storage sidecar.
 5. Collect integration-owned auction provider instances and profiles.
 6. Ask core to compile the single canonical auction plan.
 7. Resolve typed browser modules and construct the neutral integration
@@ -568,24 +621,50 @@ runtime, after secrets are resolved:
 
 An absent integration is inactive. Every explicit parent integration table must
 contain `enabled = true` or `enabled = false`; there is no integration-specific
-default. An explicitly disabled integration may retain its settings and provider
-instances but contributes no runtime capabilities or providers. Configuration
-cannot activate APS through an auction plan while omitting
-`[integrations.aps]`, and bidder or mediator references to a disabled
-integration fail validation.
+default. `enabled` is the integration's master gate, not an assertion that every
+optional capability is configured. An explicitly disabled integration may
+retain its settings and provider instances but contributes no runtime
+capabilities or providers. Configuration cannot activate APS or Prebid through
+an auction plan while omitting its parent, and bidder or mediator references to
+a disabled integration fail validation.
 
-The APS rule is an intentional activation break from PR #1016. Today an APS
-auction profile can activate server-side rendering support without an enabled
-`[integrations.aps]` browser block. After cutover, every APS provider requires
-an explicit `[integrations.aps]` parent with `enabled = true`; that one parent
-activates APS's server, page, and browser capabilities together.
+Provider-owning integrations use the following explicit activation rules. They
+do not add capability names or implementation discriminators to operator
+configuration.
 
-Disabled configuration still receives structural validation: unknown fields,
-wrong types, duplicate IDs, and invalid values that are present fail. Missing
-active-only required values and inactive secret references do not fail until
-the integration is enabled. This permits operators to turn off an integration
-without deleting prepared configuration while preventing disabled behavior from
-leaking into the runtime plan.
+| Integration     | Enabled configuration                            | Runtime contribution                                                                                                                            |
+| --------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `aps`           | No provider instances                            | No runtime contribution; retained settings remain structurally validated.                                                                       |
+| `aps`           | One or more provider instances                   | One OpenRTB provider plan per instance plus coupled APS renderer/head/browser support and the mode-dependent proxy required by those providers. |
+| `prebid`        | No providers and no `external_bundle_url`        | No runtime contribution; retained settings remain structurally validated.                                                                       |
+| `prebid`        | Provider instances, but no `external_bundle_url` | Server-side OpenRTB provider plans only; no proxy, rewriter, head injector, managed browser User IDs, or deferred browser module.               |
+| `prebid`        | Valid `external_bundle_url` and browser settings | Existing Prebid proxy, rewriter, head injector, managed User IDs, and deferred browser module, with zero or more server providers.              |
+| `openrtb`       | Zero or more provider instances                  | One standard OpenRTB provider plan per instance; zero instances is a valid staged no-op.                                                        |
+| `adserver_mock` | Enabled parent                                   | The existing mediator capability, independently of provider count.                                                                              |
+
+Thus a current server-only Prebid provider migrates beneath an enabled Prebid
+parent without activating Prebid's page/browser behavior. Browser-only Prebid
+continues to be selected by the same required external-bundle URL that current
+startup validation already uses. Managed User ID or other browser-only settings
+without that URL fail validation rather than activating a partial browser path.
+For APS, a configured provider necessarily activates its renderer support; an
+enabled APS parent with no provider is a staged no-op.
+
+Requiring the enabled parent is an intentional activation change from the
+current split inventory. Today an APS auction profile can activate rendering
+support without an enabled `[integrations.aps]` block. After cutover, every APS
+provider requires an explicit enabled parent, and its coupled server and
+renderer capabilities activate together.
+
+Disabled configuration receives schema-safety validation only: unknown fields,
+wrong types, integration/provider ID grammar, duplicates, and secret-reference
+name/store-reference/collision/adapter rules still fail. Active-only required
+fields and value validators—including ranges, endpoint policy, format patterns,
+and cross-field rules—are deferred until the integration is enabled. This preserves current
+disabled placeholders such as the example Google Tag Manager container while
+preventing malformed structure or secret references from being stored. At
+runtime, integration-owned preprocessing removes inactive secret paths before
+value resolution, so disabled behavior does not leak into the runtime plan.
 
 The four adapters share the runtime composition path. The CLI and adapters
 share the source/catalog validation rules; runtime and deploy validation cannot
@@ -603,7 +682,6 @@ the built-in `openrtb` integration.
 ```toml
 [integrations.prebid]
 enabled = true
-client_side_bidders = ["example-browser"]
 
 [integrations.prebid.auction.providers.pbs-main]
 endpoint = "https://prebid.example.com/openrtb2/auction"
@@ -635,6 +713,12 @@ providers therefore do not accept `profile`, `implementation`, or
 `profile_config`. Common provider fields and integration-specific profile
 fields form one typed provider schema owned by that integration. Common
 notification settings may remain in the nested `notifications` table.
+
+The legacy `protocol = "openrtb-2.6"` field is also retired and rejected with
+migration guidance. Every provider capability in this design uses the existing
+OpenRTB 2.6 engine, so repeating its one accepted protocol value adds no choice.
+A future non-OpenRTB engine requires a separate capability design rather than a
+string switch in this schema.
 
 Multiple named provider instances are supported beneath one integration.
 
@@ -742,6 +826,12 @@ The contract is:
    if the deadline expires or adapter timeout canonicalization reaches zero
    during that launch loop.
 
+Ordered runtime introspection carries the configured ordinal with each
+integration and provider. Lookup indexes may use maps, but iterating a
+`BTreeMap`, `HashMap`, or alphabetized metadata view never defines or displays
+execution priority. CLI diagnostics and registry metadata that show order use
+the ordered plan/registration view.
+
 The current hard-coded requirement that `js_asset_proxy` remain the first
 rewriter is retired. Rewriter chaining follows the same operator-visible
 integration order as every other hook. Migration guidance places
@@ -770,20 +860,25 @@ then permits the existing EdgeZero scalar environment overlay; overlays may
 replace values but may not create, remove, or reorder integration or provider
 tables.
 
-Every entry point that accepts TOML uses this pre-pass, including local loading
-and the Trusted Server wrappers around CLI validate, diff, and push. EdgeZero's
-typed mechanics remain responsible for overlay, validation invocation, diff,
-envelope construction, consent, and store writes after the pre-pass succeeds.
+Every entry point that accepts TOML uses this pre-pass, including local loading,
+CLI validate/diff/push, ad-template diagnostics and candidate validation, and
+the Prebid bundle command. Recovery mutators may request the structural-only
+mode described above, but final candidate validation always uses the complete
+mode. EdgeZero's typed mechanics remain responsible for overlay, validation
+invocation, diff, envelope construction, consent, and store writes after the
+pre-pass succeeds.
 
 EdgeZero does not currently expose a pre-parse hook. The Trusted Server wrappers
-therefore deliberately duplicate its app-config path rule: an explicit
-`--app-config` wins; otherwise the path is `<manifest-dir>/<app.name>.toml`.
-The wrapper reads that source for structural validation and EdgeZero reads it
-again for typed processing. Parity tests cover explicit and default paths,
-manifest paths with and without parent directories, and `--no-env`. The
-environment overlay can replace only scalar leaves already present in TOML; it
-cannot create an omitted `enabled` field, integration, provider, table, or
-array. Operator templates must contain every leaf intended for overlay.
+therefore duplicate its app-config path rule: an explicit `--app-config` wins;
+otherwise the path is `<manifest-dir>/<app.name>.toml`. A wrapper reads the
+source once, performs the pre-pass, and delegates typed processing against a
+private immutable snapshot of those exact bytes; it does not validate one read
+and allow EdgeZero to reopen a concurrently changed operator file. Parity tests
+cover exact-byte delegation, explicit and default paths, manifest paths with and
+without parent directories, and `--no-env`. The environment overlay can replace
+only scalar leaves already present in TOML; it cannot create an omitted
+`enabled` field, integration, provider, table, or array. Operator templates must
+contain every leaf intended for overlay.
 
 ### Config-store representation
 
@@ -843,7 +938,10 @@ constructed. Integration-owned inactive-secret preprocessing also receives the
 object-shaped integration entry by ID and writes any resolved value back to the
 same entry; it never searches an `{ id, config }` sequence. End-to-end tests
 prove both active DataDome secret fields are presence-checked, resolved, and
-removed when inactive.
+removed when inactive. Before storage, EdgeZero's static secret metadata still
+validates every reference actually present in source, including a reference
+retained under a disabled integration; runtime filtering prevents inactive
+value resolution, not source syntax or adapter validation.
 
 The private Rust type names may differ, but the serialized order must be
 explicit and covered by compatibility tests across:
@@ -853,8 +951,8 @@ trusted-server.toml
   → typed CLI configuration
   → hash-verified blob envelope
   → config store
-  → runtime Settings
-  → registry, JavaScript lists, and AuctionPlan
+  → runtime composition
+  → Settings, registry, JavaScript lists, configuration digest, and AuctionPlan
 ```
 
 ## Configuration Ownership and Validation
@@ -890,7 +988,8 @@ Validation fails for:
 
 - An unknown integration ID.
 - A parent integration table with a missing or non-boolean `enabled` field.
-- Integration configuration not accepted by its owner.
+- Integration configuration not accepted by its owner under the enabled or
+  disabled validation phase defined above.
 - A descendant integration or provider table declared before its explicit
   parent.
 - Duplicate local provider IDs or duplicate qualified provider identities.
@@ -918,20 +1017,25 @@ never merges inventories.
 
 Representative mappings are:
 
-| Previous configuration                                          | New configuration                                         |
-| --------------------------------------------------------------- | --------------------------------------------------------- |
-| `[auction.providers.pbs-main]` with `profile = "prebid-server"` | `[integrations.prebid.auction.providers.pbs-main]`        |
-| `[auction.providers.aps-main]` with `profile = "aps"`           | `[integrations.aps.auction.providers.aps-main]`           |
-| APS provider with no `[integrations.aps]` parent                | Add `[integrations.aps]` with `enabled = true`            |
-| A standard profile provider named `example-direct`              | `[integrations.openrtb.auction.providers.example-direct]` |
-| `[auction.providers.<id>.profile_config]`                       | Flattened into the owning integration's provider table    |
-| Bidder route `provider = "pbs-main"`                            | `provider = "prebid.pbs-main"`                            |
+| Previous configuration                                          | New configuration                                                                                     |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `[auction.providers.pbs-main]` with `profile = "prebid-server"` | `[integrations.prebid.auction.providers.pbs-main]`                                                    |
+| `[auction.providers.aps-main]` with `profile = "aps"`           | `[integrations.aps.auction.providers.aps-main]`                                                       |
+| APS provider with no `[integrations.aps]` parent                | Add `[integrations.aps]` with `enabled = true`                                                        |
+| Server-only Prebid provider with no Prebid browser block        | Add `[integrations.prebid]` with `enabled = true`; omit `external_bundle_url` and browser-only fields |
+| Existing browser Prebid block with `enabled = true`             | Retain its browser fields and nest any server providers beneath the same enabled parent               |
+| Any retained integration parent that relied on a default        | Add an explicit `enabled = true` or `enabled = false`                                                 |
+| A standard profile provider named `example-direct`              | `[integrations.openrtb.auction.providers.example-direct]`                                             |
+| `[auction.providers.<id>.profile_config]`                       | Flattened into the owning integration's provider table                                                |
+| `protocol = "openrtb-2.6"`                                      | Remove it; the registered provider capability fixes the protocol                                      |
+| Bidder route `provider = "pbs-main"`                            | `provider = "prebid.pbs-main"`                                                                        |
 
-Old `[auction.providers]`, `profile`, and `profile_config` fields fail with an
-actionable message naming the new integration-owned location. A mixed old/new
-operator configuration also fails. There is no deprecation interval for
-operator TOML. The temporary old-blob reader is not an accepted source format
-and does not make old fields valid in the new CLI.
+Old `[auction.providers]`, `profile`, `profile_config`, and `protocol` fields
+fail with an actionable message naming the new integration-owned location or
+instructing the operator to remove the fixed protocol. A mixed old/new operator
+configuration also fails. There is no deprecation interval for operator TOML.
+The temporary old-blob reader is not an accepted source format and does not
+make old fields valid in the new CLI.
 
 Examples, integration fixtures, environment-overlay tests, CLI documentation,
 and operator guides migrate in the same change.
@@ -964,6 +1068,13 @@ Rollout is ordered:
 5. Verify registry order, provider order, browser asset hashes, and auction
    health before declaring the cutover complete.
 
+The rollout runbook must name and drill a concrete export and restore mechanism
+for every deployed adapter before milestone 2. This is an external release
+precondition, not an assumed CLI feature. In particular, the current default
+remote Spin deployment path cannot read deployed config through the locked
+EdgeZero CLI; it must use a verified platform/control-plane export and restore
+facility or the schema-2 rollout for that target is blocked.
+
 An old binary must never serve a schema-2 blob. Rolling back after step 4 first
 restores the archived schema-1 envelope, verifies that restoration, and only
 then rolls the binary back. If the platform cannot coordinate those operations,
@@ -992,6 +1103,15 @@ requirements before template-cache and origin-selection decisions, carries the
 result through HTML processing, and enforces final response privacy. This is a
 processing contract, not a general policy, permission, or vendor-state system.
 
+Registry requirements are an additional monotonic veto, never an alternate
+cache authorization path. Shared-template eligibility remains the conjunction
+of all current method, request-cache, diagnostics, key-cookie, bypass-cookie,
+unlisted-cookie, cookie-independent-origin, assembly-mode, and origin-response
+checks plus the registry requirement. The same combined request decision still
+governs both warm lookup and cold-store authorization. A registry hook can make
+an otherwise shareable request private or origin-bound; it cannot make a
+request shareable when any existing cookie or cache gate rejected it.
+
 DataDome sets these requirements inside the request-filter hook at the point
 where it already decides client-tag suppression. Its tag-suppression detail
 remains opaque integration-owned request/document state. Core sees only the
@@ -1008,9 +1128,13 @@ between them.
 Preparation returns the opaque per-integration decision plus its declared
 `RequestProcessingRequirements`. The neutral requirements are available before
 the existing template-cache/private decision; under ESI, request-private opaque
-state is never copied into a shared template. Adapters invoke registry
-preparation at the existing boundaries and core invokes finalization on the
-existing response path. No additional lifecycle call site is introduced.
+state is never copied into a shared template. Registry preparation remains at
+both existing locations: adapter boundaries and the idempotent core publisher
+safety-net boundary used by direct core callers. Request extensions make a
+second preparation a no-op. Core invokes finalization on the existing response
+path. The current GPT-enabled auction-correlation check becomes a neutral
+registry/request-state query, so core retains neither a concrete GPT import nor
+a new lifecycle call site.
 
 ## Browser Composition and APS Renderer
 
@@ -1018,8 +1142,10 @@ existing response path. No additional lifecycle call site is introduced.
 the existing shared facilities integrations actually use: logging, slot lookup
 and render helpers, normalized auction-response access, first-impression state,
 and renderer registration and dispatch. Integration bundles import only
-type-only declarations and call the installed browser API; Rollup/Vite treats
-the runtime shim as external.
+type-only declarations. Runtime calls go through a stateless accessor mapped by
+the integration build to the already-installed Trusted Server browser
+namespace; an integration IIFE does not rely on an unresolved ESM import or
+bundle a second state owner.
 
 The core IIFE initializes exactly one stateful registration object on the
 Trusted Server browser namespace before any integration IIFE runs. Integration
@@ -1050,16 +1176,35 @@ Trusted attributes from immediate assets are merged onto the unified script
 tag. Duplicate names with different values fail composition; equal duplicates
 collapse to one attribute.
 
-Static serving, cache-busting URLs, immutable-cache validation, and publisher
-template keys consume `BrowserDocumentAssets`; core no longer performs a
-crate-global `all_module_ids()` lookup. The fingerprint includes only assets
-that can affect the composed document and includes GPT bootstrap bytes. It is
-recomputed during composition whenever configuration or embedded bytes change.
-Each head injector whose output varies with integration configuration supplies
-a deterministic fingerprint contribution from the exact fields that affect its
+Static serving, cache-busting URLs, and immutable-cache validation consume
+`BrowserDocumentAssets`; core no longer performs a crate-global
+`all_module_ids()` lookup. Its document fingerprint includes only assets that
+can affect the composed document and includes GPT bootstrap bytes. Each head
+injector whose generated inline output varies with integration configuration
+supplies the exact immutable bytes or a deterministic contribution for that
 output. Request-dependent head variation is permitted only when its neutral
 `RequestProcessingRequirements` bypass shared-template reuse; request data is
-never folded into the composition-wide fingerprint.
+never folded into a composition-wide fingerprint.
+
+Publisher template invalidation is broader than the browser document. During
+composition, `trusted-server-integrations` hashes a canonical serialization of
+the complete normalized resolved configuration: all neutral `Settings` and the
+full configuration of every integration in configuration order, including
+disabled retained entries. Hashing the complete model deliberately
+over-invalidates so a future rewriter, postprocessor, proxy mapping, cookie
+policy, or other HTML-shaping field cannot be omitted from a hand-maintained
+allowlist. The serialized bytes and resolved secret values are fed directly to
+the digest and are never logged, returned, or used as cache-key plaintext.
+
+Core computes the existing template fingerprint from that configuration digest
+and `BrowserDocumentAssets.document_fingerprint`. This composite replaces only
+the old complete-`Settings` plus global-bundle digest; it does not replace any
+other `TemplateCacheKey` dimension. Full URL, request host and scheme, origin
+identity, assembly mode, ordered `Vary` values, selected cookie values, and
+`TEMPLATE_SCHEMA_VERSION` remain independent key inputs. Transform-shape
+changes still bump `TEMPLATE_SCHEMA_VERSION`. Tests prove neutral settings,
+non-head integration rewriter settings, external and inline assets, and cookie
+policy changes invalidate templates without exposing raw configuration.
 
 Browser core currently imports APS renderer logic directly. Replace that
 reverse dependency with one neutral renderer registration mechanism:
@@ -1081,6 +1226,12 @@ the synchronous unified script tag is executing, and the APS-owned trusted
 attribute remains on that tag. A future switch to a standalone or deferred APS
 asset requires replacing `document.currentScript` configuration first.
 
+GPT is also immediate. Its current bootstrap reads `document.currentScript`
+during module evaluation, so `data-ts-gam-attribution` remains on the unified
+synchronous tag and an artifact-level test proves the value is available at
+evaluation time. Moving source ownership must not silently make GPT deferred or
+move that attribute to a later tag.
+
 Renderer failure is scoped to the owning renderer-bearing bid or message. A
 missing or rejecting renderer suppresses that bid with no generic-creative or
 native-Prebid fallback; unrelated bids and the page continue. A duplicate type
@@ -1090,6 +1241,15 @@ or beacon side effect occurs before the selected handler accepts the payload.
 
 The serialized descriptor, validation, sandbox flags, message authentication,
 timeouts, and render results do not change.
+
+The production `APS_RENDERER_DOCUMENT`, including its inline browser
+JavaScript, moves from the APS Rust source into
+`trusted-server-integrations-js/lib/src/integrations/aps/renderer-document.html`.
+The browser crate exports its immutable bytes and hash; APS Rust serves those
+exact bytes with the existing content type, CSP, and other response headers.
+The document's nonce binding, sandbox, message authentication, runner load, and
+failure tests move with the asset. No production browser program remains as a
+Rust string literal.
 
 `gpt_bootstrap.js` moves with GPT into `trusted-server-integrations-js` and is
 exported as a hashed integration-owned inline asset. GPT's Rust head injector
@@ -1141,13 +1301,28 @@ provider-ID order to qualified configuration order. It preserves:
   order.
 - Existing provider identity fields, with values migrated from local IDs such
   as `pbs-main` to qualified IDs such as `prebid.pbs-main`.
-- Cache privacy and full-buffer decisions.
+- Managed Prebid User ID aliases, collision checks, consent gating, opaque
+  LiveRamp envelopes, OpenRTB EID production, EC partner ingestion, and admin
+  diagnostics.
+- External Prebid bidder, User ID, and analytics-module selection, manifests,
+  hashes, SRI values, and runtime codes.
+- Cache privacy, full-buffer decisions, cookie-key and bypass policy, and every
+  existing publisher template-key dimension.
+- Current CLI ad-template diagnostics, audit/generator recovery behavior, and
+  Prebid bundle mutation behavior.
 - The route and behavioral parity of Fastly, Axum, Cloudflare, and Spin.
 
 The intentional compatibility breaks are:
 
 - Auction providers move from `[auction.providers]` beneath their owning
   integration and references become qualified.
+- The fixed legacy `protocol = "openrtb-2.6"` field is removed from operator
+  source rather than copied into each integration-owned provider.
+- Every retained integration parent requires an explicit `enabled` value,
+  including parents whose current schema supplies a default.
+- Integration and provider parents must use ordinary table headers in
+  parent-before-descendant order; dotted-key or inline-table parent shorthand
+  is rejected.
 - APS providers no longer activate without an enabled `[integrations.aps]`
   parent.
 - `js_asset_proxy` is no longer implicitly first; migration examples and
@@ -1162,10 +1337,9 @@ The intentional compatibility breaks are:
   rollout decoder, not the steady-state schema, provides temporary old-blob
   compatibility.
 
-This specification does not preserve or coexist with PR #1084's current
-`[integration]`, `[demand]`, and `[adserver]` configuration convention. That
-conflict is resolved in favor of this single `[integrations]` design rather
-than hidden behind aliases or precedence rules.
+No alternate `[integration]`, `[demand]`, or `[adserver]` selector convention
+is supported alongside the single `[integrations]` design. There are no aliases
+or precedence rules between competing inventories.
 
 Bundle hashes and cache-busting URLs may change because browser sources are
 rebuilt in different crates. The server must emit URLs matching the new
@@ -1194,7 +1368,7 @@ normalizer with the new source parser.
 Intermediate commits may add unused neutral contracts or new crates, but no
 merged state may have two active catalogs, two simultaneously interpreted
 provider inventories, or adapter-specific composition paths. This scope does
-not include the external plugin ecosystem proposed by PR #1084.
+not include an external plugin ecosystem.
 
 The milestone-one normalizer is a compatibility boundary, not a second
 catalog. It accepts only the current operator and stored shape, resolves current
@@ -1204,6 +1378,23 @@ activation, and emits the one neutral model consumed by composition. Milestone
 two atomically replaces that source parser with the new `[integrations]` parser;
 it does not accept both operator inventories. Only the read-only stored-blob
 decoder continues to accept the complete legacy shape during rollout.
+
+Milestone exit criteria are independent:
+
+- **Milestone 1 — crate boundary:** only the current operator and stored schema
+  are accepted; fixed integration-builder order, lexical provider priority,
+  implicit APS activation, and all current browser, CLI, cache, and adapter
+  behavior remain unchanged. Every live consumer uses the new composition root,
+  old concrete sources and the old catalog are deleted together, and the full
+  repository gates pass.
+- **Milestone 2 — ordered configuration cutover:** the new operator source is
+  the only writable shape; the dual stored-schema reader is deployed; qualified
+  identities and order sidecars are used end to end; every normal and recovery
+  path uses plan ordinals; activation rules, CLI output, examples, diagnostics,
+  scripts, documentation, and the rollout runbook are updated together; and the
+  full repository and rollout tests pass before schema 2 is pushed.
+- **Later release — cleanup:** the schema-1 reader is removed only after the
+  rollback and support conditions in the rollout contract are satisfied.
 
 ## Migration Sequence
 
@@ -1222,10 +1413,12 @@ some integrations or browser assets from each catalog.
 2. Replace the closed APS and Prebid profile variants and the mediator's legacy
    `AuctionProvider` use while implementations are still in core. Convert GPT
    diagnostics and DataDome call sites to the neutral lifecycle contracts.
-3. Create `trusted-server-integrations-js`, move all integration browser
-   sources, tests, GPT bootstrap, and shared fixtures, remove every browser-core
-   APS import, and make the composed asset set authoritative for bytes and
-   hashes.
+3. Create `trusted-server-integrations-js`, move all integration-owned browser
+   sources, unit/artifact tests, GPT bootstrap, the APS renderer document,
+   registry inputs, and shared fixtures, remove every browser-core APS import,
+   and make the composed asset set authoritative for bytes and hashes. Retain
+   cross-adapter system tests in `trusted-server-integration-tests` and update
+   their paths and load order.
 4. Create `trusted-server-integrations` with the explicit static catalog. Move
    ordinary integrations first, then move DataDome and GPT diagnostics after
    their lifecycle seams, APS and Prebid after the profile seam, and
@@ -1251,6 +1444,11 @@ some integrations or browser assets from each catalog.
 9. Remove the read-only schema-1 blob decoder only in the later release defined
    by the rollout contract.
 
+Steps 6 through 8 are one deployable milestone-two cutover. They may be
+implemented as separately reviewed commits, but schema 2 must not merge or
+deploy while lexical recovery ordering, CLI consumers, or operator guidance
+still implement the old contract.
+
 When files leave core, the Fastly-SDK migration guard is not weakened. Its
 integration `include_str!` entries move to an equivalent guard owned by
 `trusted-server-integrations`; neutral core entries remain in core. Integration
@@ -1271,6 +1469,9 @@ to preserve `cfg(test)` imports.
 - Core has no dependency on either integrations crate.
 - Browser core imports no integration source.
 - Adapters and CLI import no concrete integration module.
+- A dedicated native test/clippy gate executes the integrations catalog and
+  host-only completeness tests; relying on adapter dependency builds is not
+  sufficient to run them.
 
 ### Configuration and ordering tests
 
@@ -1286,10 +1487,28 @@ to preserve `cfg(test)` imports.
   values fail before secrets are resolved.
 - Config-store loading produces the same registry, JavaScript, and provider
   order that the CLI validated.
+- Registry metadata and CLI provider diagnostics report configured ordinals;
+  lookup-map or alphabetic iteration cannot masquerade as execution order.
 - CLI validation never constructs runtime capabilities from unresolved secret
   key names; the post-resolution runtime phase rejects unresolved values.
-- Disabled integrations may retain valid provider settings, contribute no
+- Read-only CLI consumers see the effective overlay through
+  `ValidatedSourceConfig`; mutators and generators operate on file-only bytes,
+  retain invalid-baseline recovery where currently supported, and fully
+  validate the final candidate without persisting overlay values.
+- Validate/diff/push delegate the exact immutable source snapshot that passed
+  the pre-pass; a concurrent edit cannot substitute different pushed bytes.
+- Prebid bundle selection and managed-module requirements come from the
+  integration-owned source view, not a CLI-local partial schema or hard-coded
+  registry path.
+- Disabled integrations may retain structurally valid provider settings, contribute no
   providers or capabilities, and do not reorder enabled neighbors.
+- Disabled placeholder values that current examples rely on, including the
+  Google Tag Manager placeholder container, deserialize safely and defer their
+  active-only format validation until enabled.
+- Retained secret references in disabled source still pass EdgeZero name,
+  store-reference, collision, and adapter validation; omitted active-only
+  references are accepted, and inactive paths are not value-resolved at
+  runtime.
 - Bidder and mediator references to disabled integrations fail, including while
   the global auction is disabled.
 - Nested-only, unknown, missing-enabled, descendant-before-parent, and mixed
@@ -1305,6 +1524,9 @@ to preserve `cfg(test)` imports.
   lexical provider sorting.
 - APS, Prebid, and `openrtb` fixtures cover enabled parents, disabled-parent
   retention, missing-enabled rejection, and the nested provider migration.
+- Activation-matrix tests cover APS and Prebid with zero and multiple
+  providers, server-only Prebid without browser activation, browser-only Prebid,
+  standard OpenRTB, and the `adserver_mock` mediator.
 - Qualified IDs that alias under Axum's legacy normalization receive distinct
   correlation names or fail target validation before deployment.
 
@@ -1318,9 +1540,12 @@ to preserve `cfg(test)` imports.
 - DataDome privacy and buffering behavior remains unchanged.
 - GPT diagnostics preparation, bootstrap injection, finalization, and caching
   remain unchanged on every adapter path.
+- GPT diagnostics preparation is idempotent across adapter preparation and the
+  core publisher safety net, and auction correlation uses neutral registry
+  request state rather than a concrete GPT import.
 - APS and Prebid request construction, transport, parsing, response admission,
-  and auction results remain equivalent to PR #1016 behavior except for the
-  documented provider-priority change.
+  and auction results remain equivalent to current `origin/main` behavior
+  except for the documented provider-priority change.
 - Prepared response parsers consume profile-owned request state without `Any`,
   downcasts, vendor enums, or cross-provider state reuse.
 - Bidder routing, backend naming, notification suppression, telemetry identity,
@@ -1328,9 +1553,16 @@ to preserve `cfg(test)` imports.
 - Active DataDome secrets are presence-checked and resolved through unchanged
   object paths; inactive protection and bypass secrets are removed before the
   shared resolver.
+- Neutral `ts-eids` ingestion retains managed User ID aliases and collision
+  checks, opaque LiveRamp envelopes, consent gating, OpenRTB EID production, EC
+  partner ingestion, and admin diagnostics without adding a LiveRamp catalog
+  definition or an identity-provider capability system.
 - Request-processing requirements preserve DataDome origin bypass, full-body
   buffering, and final private caching, and prevent request-private GPT
   diagnostics state from entering ESI templates.
+- Warm-hit and cold-store matrices combine DataDome/GPT requirements with key,
+  bypass, malformed, unlisted, absent, and empty cookies; integration privacy
+  can only restrict the existing cookie/cache decision.
 - The dedicated mediator capability preserves request construction, ordered
   response input, bounded transport, parsing, and local-ranking fallback without
   exposing the legacy `AuctionProvider` trait.
@@ -1343,8 +1575,13 @@ to preserve `cfg(test)` imports.
 - Core, GPT, and Prebid artifacts contain no private copy of APS renderer state.
 - Existing APS validation, sandbox, messaging, timeout, and rendering tests pass
   through neutral dispatch.
+- APS Rust serves the exported integration-owned renderer-document bytes with
+  unchanged CSP and response headers; no production APS browser program remains
+  embedded as a Rust literal.
 - APS remains immediate and reads its rendering mode from the synchronous
   unified tag; a deferred APS renderer is rejected during composition.
+- GPT remains immediate and reads `data-ts-gam-attribution` from the unified
+  tag through `document.currentScript` at evaluation time.
 - Equal duplicate trusted script attributes collapse, while conflicting values
   fail composition before HTML is served.
 - Missing or rejecting renderers drop only the renderer-bearing bid with no
@@ -1357,6 +1594,16 @@ to preserve `cfg(test)` imports.
   template reuse through processing requirements.
 - GPT bootstrap and APS shared fixtures resolve from their integration-owned
   package locations.
+- External Prebid artifacts preserve bidder, User ID, and analytics category
+  selection, manifest/hash/SRI generation, managed-name alias and collision
+  checks, `identityLinkIdSystem` requirements, consent behavior, and runtime
+  codes after registry and shim paths move.
+- Owner-specific output directories and manifests reject stale or partial
+  output, and concurrent neutral/integration Cargo builds exercise the one
+  cross-process toolchain lock.
+- Cross-adapter Playwright tests remain in
+  `trusted-server-integration-tests` and verify core, creative, APS, GPT, and
+  Prebid load order using the moved assets.
 
 ### Repository gates
 
@@ -1366,8 +1613,24 @@ cross-adapter parity tests, required native and WASM builds, JavaScript builds
 and Vitest suites for both browser source roots, JavaScript formatting, and
 documentation formatting. The explicit package lists in every Fastly
 build/check/clippy/test alias include both new Rust crates where applicable;
-host-target tests still run catalog-completeness and integration test support.
-The migrated Fastly-SDK guard continues to scan the moved integration sources.
+the CLI and codegen host lint gates remain intact; and a dedicated host gate runs
+catalog completeness and integration test support. The migrated Fastly-SDK
+guard continues to scan the moved integration sources.
+
+The path migration covers repository automation as well as compiled code:
+GitHub workflows and PR templates, Dependabot, `AGENTS.md`, `.claude` agents and
+commands, the CLI Prebid builder, browser and template-cache smoke scripts,
+TypeScript/Vitest/format/lint configuration, crate READMEs, reader-facing docs,
+`trusted-server.example.toml`, and documentation-snippet tests. In particular,
+the GPT bootstrap fixture path, APS Rust fixture includes, browser integration
+build script, and local template-cache harness must resolve the new owners.
+VitePress lint/build and `documentation_snippets` remain gates. Historical
+archived specs are not rewritten as though they described the new layout.
+
+A repository path guard rejects active code or tooling that still points to
+`trusted-server-js/lib/src/integrations` or concrete
+`trusted-server-core/src/integrations/<vendor>` paths, except for an explicitly
+allowlisted historical reference. Dependabot remains rooted at the one lockfile.
 
 ## Risks and Mitigations
 
@@ -1414,7 +1677,7 @@ Provider order affects launch budget, mediator input, response order, and equal
 price ties. Treating it as cosmetic would make operator edits surprising.
 
 Mitigation: define configuration order as operational priority, document the
-change from PR #1016's lexical order, and test each observable consequence.
+change from the baseline's lexical order, and test each observable consequence.
 
 ### Hidden reverse dependencies
 
@@ -1431,18 +1694,20 @@ CLI validation and adapter startup could use different catalogs or schemas.
 Mitigation: both call the same catalog-backed source-validation API, and only
 adapter startup continues through the post-secret runtime composition API. No
 secondary validation inventory is allowed. Adapters receive the already
-composed settings, plan, registry, and browser assets rather than reconstructing
-any of them.
+composed settings, plan, registry, browser assets, and configuration digest
+rather than reconstructing any of them. Non-runtime CLI commands consume the
+validated source view rather than deserializing integration fragments locally.
 
 ### Stale or incorrectly ordered browser artifacts
 
 Splitting Rust ownership while sharing one Node workspace can embed previous
 output, race build scripts, or load APS too late.
 
-Mitigation: coordinate the one workspace's build/install lock, retain
-stale-output refusal, hash built bytes, load core and the creative prelude
-first, reject deferred APS composition, and run artifact-level renderer,
-fingerprint, and ordering tests.
+Mitigation: hold one cross-process lock across install, cleanup, build,
+discovery, manifest verification, and copy; use owner-specific output
+directories; retain stale-output refusal; hash built bytes; load core and the
+creative prelude first; reject deferred APS composition; and run artifact-level
+renderer, fingerprint, and ordering tests.
 
 ## Acceptance Criteria
 
@@ -1454,8 +1719,9 @@ The change is complete when:
    `trusted-server-integrations/src/<id>/`.
 3. The standard provider configuration is supplied by the built-in Rust-only
    `openrtb` integration, making sixteen static definitions in total.
-4. All integration browser sources, assets, fixtures, and tests live under
-   `trusted-server-integrations-js`.
+4. All integration-owned browser sources, assets, unit/artifact fixtures, and
+   unit/artifact tests live under `trusted-server-integrations-js`; cross-adapter
+   system tests remain in the integration-test crate.
 5. Rust definitions use one explicit compile-checked catalog with a directory
    completeness test; browser modules remain directory-discovered.
 6. Core owns only neutral contracts and execution engines and imports no
@@ -1466,34 +1732,48 @@ The change is complete when:
    inventory.
 9. Configuration and provider ordering survive config push and runtime loading
    through validated order sidecars and define the documented auction priority.
-10. The old `[auction.providers]` schema is rejected with targeted migration
-    guidance.
-11. The compiled auction plan retains PR #1016 behavior after normalization,
-    except for the explicit change from lexical to configuration-order provider
-    priority.
+10. The old `[auction.providers]`, `profile`, `profile_config`, and fixed
+    `protocol` fields are rejected with targeted migration guidance.
+11. The compiled auction plan retains current-baseline behavior after
+    normalization, except for the explicit change from lexical to
+    configuration-order provider priority.
 12. Browser core imports no concrete integration, and APS rendering works
     through one immediate registration without private copies in core, GPT, or
-    Prebid bundles.
-13. `TrustedServerAppConfig`, integration secret handling, and final runtime
-    composition are owned by `trusted-server-integrations`; core has no concrete
-    config or loader dependency.
+    Prebid bundles; GPT also retains its synchronous-tag bootstrap contract.
+13. `TrustedServerAppConfig`, `ValidatedSourceConfig`, integration secret
+    handling, and final runtime composition are owned by
+    `trusted-server-integrations`; core has no concrete config or loader
+    dependency, and the CLI has no duplicate integration schema.
 14. The CLI and adapters use the same catalog-backed source validation, and all
     adapters receive one post-secret-resolution
-    settings/plan/registry/browser-assets composition.
+    settings/plan/registry/browser-assets/configuration-digest composition.
 15. OpenRTB request-local state crosses the transport boundary through a
     prepared response parser without `Any` or vendor enum variants in core.
-16. Explicit `enabled`, parent-before-descendant, disabled-retention, local-ID,
-    and qualified-ID rules have end-to-end tests.
+16. Explicit `enabled`, parent-before-descendant, disabled-retention, activation
+    matrix, local-ID, and qualified-ID rules have end-to-end tests, including a
+    server-only Prebid migration that does not activate browser behavior.
 17. Schema-1 blobs remain readable for the documented rollout release, schema-2
     blobs preserve existing secret paths, and binary rollback requires verified
-    restoration of the archived schema-1 envelope.
-18. Browser assets carry bytes and hashes through composition, publisher
-    template fingerprints vary with every composition-time external or inline
-    asset change, and request-dependent head variants bypass shared reuse.
+    restoration of the archived schema-1 envelope through a drill-tested
+    adapter-specific mechanism.
+18. Browser assets carry bytes and hashes through composition; publisher
+    template fingerprints combine the full normalized configuration digest with
+    the exact document-assets fingerprint; all existing URL, host, scheme,
+    origin, assembly, Vary, cookie, and schema-version key dimensions remain;
+    and request-dependent variants bypass shared reuse.
 19. Core test support, the Fastly-SDK migration guard, Cargo aliases, CI,
-    Dependabot, browser scripts, and the CLI Prebid builder cover the new crate
-    boundaries.
-20. The full repository verification gates pass.
+    Dependabot, repository automation, browser and cache smoke scripts,
+    documentation and snippet tests, and the CLI Prebid builder cover the new
+    crate boundaries, with a stale-path guard and a dedicated native
+    integrations-crate gate.
+20. Managed Prebid User IDs and external bundle bidder/User-ID/analytics
+    selection retain their current alias, collision, consent, manifest, hash,
+    SRI, and runtime-code behavior.
+21. Neutral OpenRTB-EID/EC ingestion, including opaque LiveRamp envelopes,
+    partner ingestion, and admin diagnostics, remains in core without creating
+    another integration definition or provider framework.
+22. Both milestone exit criteria and the full repository verification gates
+    pass.
 
 ## Deferred Work
 
@@ -1502,7 +1782,7 @@ The following require separate designs and real consumers:
 - External vendor-owned crates or adapter-supplied registrations.
 - Runtime integration loading or a stable integration SDK.
 - Independent integration release and compatibility policies.
-- Identity, EC, geo, device, and permission-signal providers.
+- New identity, EC, geo, device, and permission-signal provider systems.
 - Permission and jurisdiction policy changes.
 - Non-OpenRTB auction provider factories.
 - Upstream EdgeZero composition and host-service changes.
