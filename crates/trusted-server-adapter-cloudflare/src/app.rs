@@ -299,6 +299,20 @@ fn admin_key_management_not_supported() -> Response {
     response
 }
 
+fn cache_purge_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Template cache purge is not supported on Cloudflare Workers.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 fn admin_ec_lookup_not_supported() -> Response {
     core_admin_ec_lookup_not_supported()
 }
@@ -670,6 +684,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         for path in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
             router = router.route(path, Method::GET, page_bids.clone());
             router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
+        }
+
+        let cache_purge_unsupported =
+            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                Ok(cache_purge_not_supported())
+            });
+        for method in publisher_fallback_methods() {
+            router = router.route(
+                "/_ts/admin/cache/purge",
+                method,
+                cache_purge_unsupported.clone(),
+            );
         }
 
         let legacy_admin_deny =
