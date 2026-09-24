@@ -661,6 +661,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tchunk_boundary_preserves_partial_scheme_colon() {
+        let rewriter = RscUrlRewriter::new();
+        for slashes in ["//", r"\/\/"] {
+            let content = format!(r#"{{"u":"https:{slashes}origin.example.com/a"}}"#);
+            // Cover every boundary within the scheme, including the reported T7 case.
+            for length in 7..=12 {
+                let payload = format!("1:T{length:x},{content}");
+                for request_host in [
+                    "origin.example.com",
+                    "short.example.com",
+                    "longer.proxy.example.com",
+                ] {
+                    let expected = payload.replace("origin.example.com", request_host);
+                    for payloads in [vec![payload.as_str()], vec![payload.as_str(), "2:T4,done"]] {
+                        let result = rewrite_rsc_scripts_combined_with_limit(
+                            &payloads,
+                            &rewriter,
+                            "origin.example.com",
+                            request_host,
+                            "https",
+                            DEFAULT_MAX_COMBINED_PAYLOAD_BYTES,
+                        );
+
+                        assert_eq!(
+                            result[0], expected,
+                            "should preserve the URL and T-length for {payload}"
+                        );
+                        assert_eq!(
+                            result.len(),
+                            payloads.len(),
+                            "should preserve script boundaries"
+                        );
+                        if result.len() == 2 {
+                            assert_eq!(
+                                result[1], "2:T4,done",
+                                "should preserve the following T-chunk"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tchunk_length_recalculation() {
         let content = r#"1a:T29,{"url":"https://origin.example.com/path"}"#;
         let rewriter = RscUrlRewriter::new();

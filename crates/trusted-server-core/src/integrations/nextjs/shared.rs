@@ -254,7 +254,9 @@ impl RscUrlRewriter {
             if caps.get(1).is_some() {
                 format!("{request_scheme}:{slashes}{request_host}{host_suffix}")
             } else {
-                format!("{slashes}{request_host}{host_suffix}")
+                // A T-chunk boundary can leave only the tail of a scheme here.
+                let colon = caps.get(2).map_or("", |m| m.as_str());
+                format!("{colon}{slashes}{request_host}{host_suffix}")
             }
         });
 
@@ -356,6 +358,31 @@ mod tests {
         let input = r#"{"url":"\/\/origin.example.com/path"}"#;
         let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "https");
         assert_eq!(result, r#"{"url":"\/\/proxy.example.com/path"}"#);
+    }
+
+    #[test]
+    fn rsc_url_rewriter_preserves_partial_scheme_colon() {
+        let rewriter = RscUrlRewriter::new();
+        for prefix in [":", "ttps:", "tps:", "ps:", "s:"] {
+            for slashes in ["//", r"\/\/"] {
+                for request_host in [
+                    "origin.example.com",
+                    "short.example.com",
+                    "longer.proxy.example.com",
+                ] {
+                    let input = format!("{prefix}{slashes}origin.example.com:8443/a");
+                    let expected = format!("{prefix}{slashes}{request_host}:8443/a");
+
+                    let result =
+                        rewriter.rewrite(&input, "origin.example.com", request_host, "https");
+
+                    assert_eq!(
+                        result, expected,
+                        "should preserve the partial scheme in {input}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
