@@ -160,25 +160,22 @@ impl EcKvStore for FastlyEcKvStore {
         }
     }
 
-    fn count_keys_with_prefix(
+    fn list_keys_with_prefix(
         &self,
         prefix: &str,
         limit: u32,
-    ) -> Result<u32, Report<TrustedServerError>> {
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
         let store = self.open_store()?;
-        let page = store
+        store
             .build_list()
             .prefix(prefix)
             .limit(limit)
             .execute()
+            .map(ListPage::into_keys)
             .change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
                 message: format!("Failed to list keys with prefix '{}'", log_id(prefix)),
-            })?;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let count = page.keys().len() as u32;
-        Ok(count)
+            })
     }
 
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
