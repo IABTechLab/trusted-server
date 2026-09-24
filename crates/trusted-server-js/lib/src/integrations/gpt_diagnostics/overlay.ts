@@ -761,6 +761,8 @@ export class GptDiagnosticsOverlay {
       note.setAttribute('role', 'status');
       note.textContent = `Ad #${this.selectedRequest.runtimeSlotNumber}, Request #${this.selectedRequest.requestNumber} is no longer retained.`;
       panel.append(note);
+      this.selectedRequest = undefined;
+      this.selectedRequestHasFocus = false;
     }
 
     const content = this.document.createElement('div');

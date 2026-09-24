@@ -5335,6 +5335,9 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       bidder: 'example-client',
       priceBucket: '2.40',
     });
+    expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+      recordPrebidAuction.mock.invocationCallOrder[0]
+    );
     expect(getTargeting).not.toHaveBeenCalledWith('hb_cur');
     const bidWon = mockOnEvent.mock.calls.find(([event]) => event === 'bidWon')?.[1];
     expect(bidWon).toBeTypeOf('function');
@@ -5346,6 +5349,14 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(recordPrebidWin).not.toHaveBeenCalled();
     bidWon?.({
       auctionId: 'example-client-auction',
+      latestTargetedAuctionId: 'later-client-auction',
+      adUnitCode: 'example-client-slot',
+      adserverTargeting: { hb_bidder: 'stale-client', hb_pb: '9.99' },
+    });
+    expect(recordPrebidWin).not.toHaveBeenCalled();
+    bidWon?.({
+      auctionId: 'example-client-auction',
+      latestTargetedAuctionId: 'example-client-auction',
       adUnitCode: 'example-client-slot',
       adserverTargeting: { hb_bidder: 'example-client', hb_pb: '2.40' },
     });
