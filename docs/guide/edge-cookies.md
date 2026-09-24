@@ -119,7 +119,7 @@ flowchart TD
     J -- "Unknown<br/>(no geo data)" --> Deny
 ```
 
-- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented.
+- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented. Writing partner EIDs into the identity graph additionally requires TCF Purpose 4 (personalized ads); see [Partner Sync Channels](#partner-sync-channels).
 - **US State**: Opt-out model with three-tier fallback — GPC always blocks, then TCF if a CMP uses it, then US Privacy string, then fail-closed.
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
@@ -133,7 +133,7 @@ Partner identities flow into the KV identity graph through three channels. Each 
 ```mermaid
 flowchart LR
     subgraph Browser-initiated
-        Prebid["Prebid EID Cookies<br/><i>ts-eids + sharedId</i><br/>Passive cookie ingestion"]
+        Prebid["Prebid EIDs<br/><i>/auction body + ts-eids + sharedId</i><br/>Response-time ingestion"]
     end
 
     subgraph Server-initiated
@@ -146,9 +146,17 @@ flowchart LR
     Pull --> KV
 ```
 
-### Prebid EID Cookie Flow
+### Prebid EID Flow
 
-The `ts-eids` cookie bridges client-side Prebid user ID modules with the server-side identity graph.
+Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a response. It collects matched partner UIDs from three request-local sources, applied in this order so a later source wins for the same partner:
+
+1. the `ts-eids` cookie,
+2. the `eids` array in the `/auction` request body,
+3. the `sharedId` cookie.
+
+The `/auction` body carries the full EID set Prebid.js resolved, so `/auction` ingestion is not limited by the size cap TSJS applies to the `ts-eids` cookie. The cookie still bridges Prebid user ID modules with the identity graph on requests that carry no EID body, such as `GET /_ts/page-bids` and page navigations.
+
+Identity-graph EID writes follow the same consent rule as bidstream EID forwarding: when a TCF signal is present, Purpose 1 (store/access device) and Purpose 4 (personalized ads) must both be consented, and when GDPR applies without a TCF signal the writes are withheld. A user who consents to Purpose 1 but not Purpose 4 keeps their EC, but no EIDs from the request are persisted.
 
 ```mermaid
 sequenceDiagram
@@ -165,10 +173,10 @@ sequenceDiagram
     TSJS->>TSJS: Base64 encode full OpenRTB-style EID array<br/>[{source, uids:[{id, atype, ext?}]}]
     TSJS->>B: document.cookie = "ts-eids=..."
 
-    Note over B,TS: Next page request
+    Note over B,TS: Next request without an EID body
     B->>TS: Request with ts-eids cookie
     TS->>TS: Base64 decode → parse OpenRTB-style EIDs<br/>match source domains to partners
-    TS->>KV: upsert_partner_id() per match<br/>(skips write when UID unchanged)
+    TS->>KV: Upsert matched partner UIDs<br/>(requires TCF Purpose 1 + 4 under GDPR;<br/>skips write when UID unchanged)
 ```
 
 Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shape in `ts-eids`. The server remains backward-compatible with earlier flattened `{source, id, atype}` cookies during rollout, but new cookies use the structured `uids[]` form.
@@ -195,7 +203,7 @@ sequenceDiagram
     else Prebid sync seeds browser EIDs
         B->>B: Prebid User ID modules resolve IDs
         B->>TSJS: getUserIdsAsEids()
-        TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs
+        TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs (size-capped)
         B->>TS: Next request with ts-eids
         TS->>KV: Decode cookie and upsert matched partner UIDs
     end
@@ -211,6 +219,7 @@ sequenceDiagram
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available
+    TS->>KV: Upsert matched partner UIDs from request eids[]<br/>+ ts-eids/sharedId cookies (TCF Purpose 1 + 4 under GDPR)
 ```
 
 The relevant OpenRTB structure forwarded to Prebid Server and downstream partners is:
@@ -248,7 +257,7 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 }
 ```
 
-Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `ts-eids` cookie carries a different value for the same configured partner source.
+Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `/auction` request body, `ts-eids` cookie, or `sharedId` cookie carries a different value for the same configured partner source.
 
 ## Configuration
 

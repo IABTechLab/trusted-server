@@ -356,7 +356,7 @@ For Prebid-routed auctions, Trusted Server now forwards identity using a hybrid 
 - The edge resolves additional EIDs from the EC/KV identity graph.
 - The auction handler merges and deduplicates both sets.
 - The Prebid provider forwards the merged result to Prebid Server as `user.ext.eids`.
-- The `ts-eids` cookie is still ingested after the response so future requests can benefit from those IDs even without fresh browser-side resolution.
+- After the response, the `/auction` request-body EIDs are written to the EC identity graph together with the `ts-eids` and `sharedId` cookies (precedence: `ts-eids`, then body, then `sharedId`), subject to TCF Purpose 1 and Purpose 4 consent under GDPR. The size-capped `ts-eids` cookie remains the ingestion and fallback source for requests without an EID body, such as `GET /_ts/page-bids` and page navigations.
 
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
 
