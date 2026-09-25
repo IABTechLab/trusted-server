@@ -65,6 +65,16 @@ Panel status is `GPT observed` or `Waiting for GPT`. Filter values are `All`, `V
 
 Bidder names are limited to 128 UTF-8 bytes, numeric bucket strings to 64 bytes, currencies to three ASCII letters, and auction IDs to 256 UTF-8 bytes. Prebid supplies its own auction ID through `bidsBackHandler`; diagnostics does not override Prebid auction identity. Duplicate, ambiguous, expired, late, prior-navigation, and malformed observations are rejected. Only an active diagnostics recorder installs the `bidWon` listener or retains candidate/win state, which is bounded to 128 pending attempts and 30 seconds. No raw CPM, creative markup, targeting dump, or losing bids are retained.
 
+First-party GPT and Prebid integrations never populate `currency`. The optional field
+accepts currency supplied through the internal `gptDiagnosticsRecorder` channel; that
+channel is not a supported operator API. Diagnostics does not infer a currency or read
+`hb_cur`, and missing currency adds no suffix to the price bucket.
+
+`Auction not observed` also covers the Prebid watchdog fallback: targeting can be
+applied even when Prebid never invokes `bidsBackHandler`, so no completed-auction ID
+is available to correlate with the GPT request. Targeting alone is not proof of a
+completed auction.
+
 ## Request paths and opportunities
 
 | Label                                              | Raw value                 | Meaning                                                                                                                                    |

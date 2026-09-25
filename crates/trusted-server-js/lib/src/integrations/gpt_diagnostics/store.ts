@@ -1101,6 +1101,8 @@ export class GptDiagnosticsStore {
       this.nextRequestIntentId += 1;
       this.pendingRequestIntents.set(slot, intent);
     }
+    // Replace rather than merge: a later bare refresh must not carry an
+    // earlier auction's evidence into the next GPT request.
     intent.sources.set(source, { observedAtMs, ...facts });
   }
 

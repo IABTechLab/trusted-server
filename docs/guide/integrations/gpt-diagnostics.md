@@ -494,6 +494,13 @@ The allowlisted export contains:
   timestamps, and safe failure enums.
 - The bounded winning bidder and bucketed price plus server auction timing fields and
   their `navigation` or `spa_auction` origin when direct auction evidence was observed.
+- Completed client-side Prebid evidence (`prebidAuction`): Prebid's opaque `auctionId`,
+  plus bounded bidder and bucketed price fields in `targetingCandidate` and `win`,
+  when a completed attempt and any documented `bidWon` observation were correlated
+  to that exact request. Neither candidate nor win evidence proves the final served bidder.
+- Optional `currency` on server winner, Prebid candidate, and Prebid win evidence,
+  when supplied through the internal recorder. Values are normalized to three uppercase
+  ASCII letters; first-party integrations do not populate this field.
 - The per-auction diagnostics token (`trustedServerAuctionId`) and the
   opportunity-to-request duration, when a direct opportunity was observed.
 - Replacement facts for a re-rendered slot: `replacedRequestNumber`,
@@ -504,16 +511,23 @@ The allowlisted export contains:
 - Separate callback issues, attribution issues, coverage counters, and retention
   counters.
 
-It does not contain raw targeting, bid IDs, exact unbucketed bid prices, losing bidder
-identity, creative markup, cache URLs, cache payloads, cache or bridge error details,
-cookies, user identifiers, query strings, or URL fragments. It does contain the winning
-bidder and bucketed `hb_pb` value described above. The exported `trustedServerAuctionId`
+It does not contain raw targeting, bid IDs, exact unbucketed bid prices, losing bid
+lists, creative markup, cache URLs, cache payloads, cache or bridge error details,
+cookies, user identifiers, query strings, or URL fragments. It does contain the server
+winner and the Prebid candidate and win bidder names with their bucketed `hb_pb` values
+as described above, even when the final served bidder is unconfirmed. The exported `trustedServerAuctionId`
 is the `hb_auction_id` value described in
 [Auction correlation token](#auction-correlation-token): minted fresh for each
 server-side auction, not derived from the Edge Cookie ID or any other visitor
 identifier, and never repeated across auctions, so it cannot be joined back to a
 visitor. Diagnostics retain it only after trimming to a non-empty value of at most
 256 UTF-8 bytes.
+
+The exported `prebidAuction.auctionId` is supplied by Prebid for auction correlation,
+not visitor identity. Diagnostics does not generate or replace it and retains only
+non-empty values of at most 256 UTF-8 bytes. Bidder names are limited to 128 UTF-8
+bytes and numeric price bucket strings to 64 bytes. These bounds limit retained data;
+they do not establish how a publisher's Prebid configuration generated its auction ID.
 
 Captured records are memory-only. Diagnostics do not add an upload, diagnostics
 network request, `localStorage`, `sessionStorage`, IndexedDB, or other persistence.

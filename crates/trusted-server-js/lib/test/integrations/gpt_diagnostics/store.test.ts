@@ -710,6 +710,30 @@ describe('GptDiagnosticsStore', () => {
     });
   });
 
+  it('does not carry an earlier auction into a later bare Prebid refresh', () => {
+    let now = 10;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot('prebid-replaced-intent');
+    store.recordPrebidRefresh([slot]);
+    store.recordPrebidAuction(slot, 'auction-client-1', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+
+    now = 20;
+    store.recordPrebidRefresh([slot]);
+    store.recordSlotRequested(slot);
+    store.recordPrebidWin(slot, 'auction-client-1', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.requestPath).toBe('prebid_refresh');
+    expect(cycle.auctionType).toBeUndefined();
+    expect(cycle.prebidAuction).toBeUndefined();
+  });
+
   it('retains bounded winner and server timing facts for a Trusted Server auction', () => {
     const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
     const slot = fakeSlot('auction-facts');
