@@ -4,146 +4,218 @@
     reason = "build script failures should stop Cargo with a clear diagnostic"
 )]
 
-use std::cmp::Ordering;
+#[path = "build/bundle_set.rs"]
+mod bundle_set;
+
 use std::env;
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
-use build_print::{info, warn};
+use build_print::info;
 use sha2::{Digest as _, Sha256};
 
-fn main() {
-    // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under lib/
-    println!("cargo:rerun-if-changed=lib");
-    watch_dir_recursively(Path::new("lib"));
+use crate::bundle_set::{bundle_file_name, check_bundle_set, expected_module_ids, scan_bundle_dir};
 
-    // Allow opt-out or force via env
-    let skip = env::var("TSJS_SKIP_BUILD").is_ok_and(|value| value == "1");
+const PREBUILT_DIR_VAR: &str = "TSJS_PREBUILT_DIR";
+const SKIP_BUILD_VAR: &str = "TSJS_SKIP_BUILD";
+const TEST_VAR: &str = "TSJS_TEST";
+
+fn main() {
+    // Cargo scans directories recursively, so these cover every TS source.
+    for path in [
+        "lib/src",
+        "lib/build-all.mjs",
+        "lib/package.json",
+        "lib/package-lock.json",
+        "lib/tsconfig.json",
+        "lib/node_modules/.package-lock.json",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    for var in [PREBUILT_DIR_VAR, SKIP_BUILD_VAR, TEST_VAR] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
 
     let crate_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("should set CARGO_MANIFEST_DIR for build script"),
     );
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("should set OUT_DIR for build script"));
     let ts_dir = crate_dir.join("lib");
-    let dist_dir = crate_dir.join("dist");
+    // Private to this build script run: concurrent builds never share it.
+    let bundle_dir = out_dir.join("tsjs-dist");
 
-    // Ensure dist exists
-    fs::create_dir_all(&dist_dir).expect("should create dist directory");
+    let expected = expected_module_ids(&ts_dir.join("src"))
+        .unwrap_or_else(|err| panic!("tsjs: failed to discover modules: {err}"));
 
-    // Only try to build if we have a library project
-    if !ts_dir.join("package.json").exists() {
-        // No TS project; rely on prebuilt dist if present
-        return;
+    if let Some(prebuilt_dir) = env::var_os(PREBUILT_DIR_VAR).map(PathBuf::from) {
+        println!("cargo:rerun-if-changed={}", prebuilt_dir.display());
+        info!(
+            "tsjs: Using prebuilt bundles from {}",
+            prebuilt_dir.display()
+        );
+        validate_bundle_dir(&expected, &prebuilt_dir);
+        copy_prebuilt_bundles(&expected, &prebuilt_dir, &bundle_dir);
+    } else {
+        build_bundles(&ts_dir, &bundle_dir);
     }
 
-    // If Node/npm is absent, keep going if dist exists
-    let npm = which::which("npm").ok();
-    if npm.is_none() {
-        warn!("tsjs: npm not found; will use existing dist if available");
-    }
+    validate_bundle_dir(&expected, &bundle_dir);
+    info!(
+        "tsjs: Embedding {} module files: {:?}",
+        expected.len(),
+        expected
+    );
 
-    // Install deps if node_modules missing
-    if !skip
-        && let Some(npm_path) = npm.as_deref()
-        && !ts_dir.join("node_modules").exists()
-    {
-        let status = Command::new(npm_path)
-            .arg("ci")
-            .current_dir(&ts_dir)
-            .status();
-        if !status.as_ref().is_ok_and(ExitStatus::success) {
-            warn!("tsjs: npm ci failed; using existing dist if available");
-        }
-    }
+    write_module_table(&expected, &bundle_dir, &out_dir);
+}
 
-    // Run tests if requested
-    if !skip
-        && env::var("TSJS_TEST").is_ok_and(|value| value == "1")
-        && let Some(npm_path) = npm.as_deref()
-    {
-        Command::new(npm_path)
+fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
+    let how_to_prebuild = format!(
+        "To embed prebuilt bundles instead, run `npm run build` in {} and set \
+         {PREBUILT_DIR_VAR} to the directory holding the tsjs-*.js files (by default {}).",
+        ts_dir.display(),
+        ts_dir.with_file_name("dist").display()
+    );
+
+    assert!(
+        env::var_os(SKIP_BUILD_VAR).is_none(),
+        "tsjs: {SKIP_BUILD_VAR} is no longer supported because it embedded whatever \
+         dist/ held. {how_to_prebuild}"
+    );
+    assert!(
+        ts_dir.join("package.json").is_file(),
+        "tsjs: {} not found. {how_to_prebuild}",
+        ts_dir.join("package.json").display()
+    );
+    let npm = which::which("npm").unwrap_or_else(|_| {
+        panic!("tsjs: npm not found on PATH; Node.js is required to build the tsjs bundles. {how_to_prebuild}")
+    });
+
+    install_dependencies_if_missing(&npm, ts_dir);
+    ensure_dependencies_fresh(ts_dir);
+
+    if env::var(TEST_VAR).is_ok_and(|value| value == "1") {
+        let status = Command::new(&npm)
             .args(["run", "test", "--", "--run"])
-            .current_dir(&ts_dir)
-            .status()
-            .expect("should run requested TSJS tests");
-    }
-
-    // Build all module files
-    if !skip && let Some(npm_path) = npm.as_deref() {
-        info!("tsjs: Building per-module bundles");
-
-        let status = Command::new(npm_path)
-            .args(["run", "build"])
-            .current_dir(&ts_dir)
+            .current_dir(ts_dir)
             .status();
         assert!(
             status.as_ref().is_ok_and(ExitStatus::success),
-            "tsjs: npm run build failed - refusing to use stale bundles"
+            "tsjs: {TEST_VAR}=1 requested the tsjs tests and they failed"
         );
     }
 
-    // Discover all tsjs-*.js files in dist/
-    let mut modules: Vec<(String, String)> = Vec::new(); // (id, filename)
-    if let Ok(entries) = fs::read_dir(&dist_dir) {
-        for entry in entries.flatten() {
-            let filename = entry.file_name().to_string_lossy().to_string();
-            if let Some(id) = filename
-                .strip_prefix("tsjs-")
-                .and_then(|stem| stem.strip_suffix(".js"))
-            {
-                modules.push((id.to_owned(), filename));
-            }
-        }
-    }
-
-    // Sort alphabetically but ensure "core" is always first
-    modules.sort_by(|left, right| {
-        if left.0 == "core" {
-            Ordering::Less
-        } else if right.0 == "core" {
-            Ordering::Greater
-        } else {
-            left.0.cmp(&right.0)
-        }
-    });
-
-    assert!(
-        !modules.is_empty(),
-        "tsjs: no tsjs-*.js files found in {}. Ensure `npm run build` succeeds.",
-        dist_dir.display()
-    );
-
     info!(
-        "tsjs: Discovered {} module files: {:?}",
-        modules.len(),
-        modules
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .collect::<Vec<_>>()
+        "tsjs: Building per-module bundles into {}",
+        bundle_dir.display()
     );
+    let status = Command::new(&npm)
+        .args(["run", "build", "--", "--out-dir"])
+        .arg(bundle_dir)
+        .current_dir(ts_dir)
+        .status();
+    assert!(
+        status.as_ref().is_ok_and(ExitStatus::success),
+        "tsjs: npm run build failed - refusing to embed incomplete bundles"
+    );
+}
 
-    // Copy each module file to OUT_DIR
-    for (_, filename) in &modules {
-        copy_bundle(filename, true, &dist_dir, &out_dir);
+/// Run `npm ci` when `node_modules` is absent, serialized across build scripts.
+fn install_dependencies_if_missing(npm: &Path, ts_dir: &Path) {
+    let node_modules = ts_dir.join("node_modules");
+
+    // Two build scripts must not run `npm ci` in the same directory at once.
+    // Check only while holding the lock: `npm ci` creates node_modules seconds
+    // before it finishes, so an unlocked check can see a partial install. The
+    // lock is released when `lock_file` drops.
+    let lock_path = ts_dir.join(".tsjs-npm-ci.lock");
+    let lock_file = File::create(&lock_path)
+        .unwrap_or_else(|err| panic!("tsjs: failed to create {}: {err}", lock_path.display()));
+    lock_file
+        .lock()
+        .unwrap_or_else(|err| panic!("tsjs: failed to lock {}: {err}", lock_path.display()));
+
+    if node_modules.exists() {
+        return;
     }
 
-    // Generate tsjs_modules.rs with include_str!() for each module
+    info!("tsjs: node_modules missing; running npm ci");
+    let status = Command::new(npm).arg("ci").current_dir(ts_dir).status();
+    assert!(
+        status.as_ref().is_ok_and(ExitStatus::success),
+        "tsjs: npm ci failed in {}",
+        ts_dir.display()
+    );
+}
+
+/// Fail when `node_modules` is older than `package-lock.json`.
+///
+/// Uses npm's own freshness signal, the hidden lockfile it writes on install.
+/// Reinstalling automatically would delete `node_modules` under any other
+/// build script that is running, so this only reports the problem.
+fn ensure_dependencies_fresh(ts_dir: &Path) {
+    let lockfile = ts_dir.join("package-lock.json");
+    let hidden_lockfile = ts_dir.join("node_modules").join(".package-lock.json");
+    let stale_message = format!(
+        "tsjs: node_modules is out of date with package-lock.json; run `npm ci` in {}",
+        ts_dir.display()
+    );
+
+    let Ok(lockfile_modified) = fs::metadata(&lockfile).and_then(|meta| meta.modified()) else {
+        return;
+    };
+    let hidden_modified = fs::metadata(&hidden_lockfile)
+        .and_then(|meta| meta.modified())
+        .unwrap_or_else(|_| panic!("{stale_message} ({} missing)", hidden_lockfile.display()));
+    assert!(hidden_modified >= lockfile_modified, "{stale_message}");
+}
+
+fn validate_bundle_dir(expected: &[String], dir: &Path) {
+    let found = scan_bundle_dir(dir).unwrap_or_else(|err| panic!("tsjs: {err}"));
+    if let Err(err) = check_bundle_set(expected, &found) {
+        panic!("tsjs: invalid bundle set in {}: {err}", dir.display());
+    }
+}
+
+fn copy_prebuilt_bundles(expected: &[String], prebuilt_dir: &Path, bundle_dir: &Path) {
+    if bundle_dir.exists() {
+        fs::remove_dir_all(bundle_dir)
+            .unwrap_or_else(|err| panic!("tsjs: failed to clean {}: {err}", bundle_dir.display()));
+    }
+    fs::create_dir_all(bundle_dir)
+        .unwrap_or_else(|err| panic!("tsjs: failed to create {}: {err}", bundle_dir.display()));
+    for id in expected {
+        let file_name = bundle_file_name(id);
+        let source = prebuilt_dir.join(&file_name);
+        let target = bundle_dir.join(&file_name);
+        fs::copy(&source, &target).unwrap_or_else(|err| {
+            panic!(
+                "tsjs: failed to copy {} to {}: {err}",
+                source.display(),
+                target.display()
+            )
+        });
+    }
+}
+
+fn write_module_table(expected: &[String], bundle_dir: &Path, out_dir: &Path) {
     let mut codegen = String::new();
     codegen.push_str("// Auto-generated by build.rs - DO NOT EDIT\n\n");
 
     writeln!(
         codegen,
         "pub(crate) const TSJS_MODULES: [TsjsModuleMeta; {}] = [",
-        modules.len()
+        expected.len()
     )
     .expect("should write generated module header");
-    for (id, filename) in &modules {
-        let sha256 = bundle_sha256(&out_dir.join(filename));
+    for id in expected {
+        let filename = bundle_file_name(id);
+        let sha256 = bundle_sha256(&bundle_dir.join(&filename));
         writeln!(
             codegen,
-            "    TsjsModuleMeta {{\n        bundle: include_str!(concat!(env!(\"OUT_DIR\"), \"/{filename}\")),\n        id: \"{id}\",\n        sha256: \"{sha256}\",\n    }},\n"
+            "    TsjsModuleMeta {{\n        bundle: include_str!(concat!(env!(\"OUT_DIR\"), \"/tsjs-dist/{filename}\")),\n        id: \"{id}\",\n        sha256: \"{sha256}\",\n    }},\n"
         )
         .expect("should write generated module entry");
     }
@@ -166,56 +238,9 @@ fn main() {
 fn bundle_sha256(path: &Path) -> String {
     let content = fs::read(path).unwrap_or_else(|err| {
         panic!(
-            "tsjs: failed to read copied bundle {} for hashing: {err}",
+            "tsjs: failed to read bundle {} for hashing: {err}",
             path.display()
         );
     });
     hex::encode(Sha256::digest(&content))
-}
-
-fn copy_bundle(filename: &str, required: bool, dist_dir: &Path, out_dir: &Path) {
-    let source = dist_dir.join(filename);
-    let target = out_dir.join(filename);
-
-    if source.exists() {
-        if let Err(err) = fs::copy(&source, &target) {
-            assert!(
-                !required,
-                "tsjs: failed to copy {} to {}: {err}",
-                source.display(),
-                target.display()
-            );
-        }
-        return;
-    }
-
-    assert!(
-        !required,
-        "tsjs: bundle {filename} not found: {}. Ensure Node is installed and `npm run build` succeeds, or commit dist/{filename}.",
-        source.display()
-    );
-
-    fs::write(&target, "").expect("should write optional empty bundle placeholder");
-}
-
-fn watch_dir_recursively(root: &Path) {
-    if !root.exists() {
-        return;
-    }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(read) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            // Always ask Cargo to rerun if this path changes
-            if let Some(path_str) = path.to_str() {
-                println!("cargo:rerun-if-changed={path_str}");
-            }
-            if path.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
 }

@@ -612,11 +612,36 @@ npm run build
 npm run lint
 ```
 
-4. Skip TSJS build temporarily:
+4. Embed bundles you built yourself instead of building them during `cargo build`:
 
 ```bash
-TSJS_SKIP_BUILD=1 cargo build
+cd crates/trusted-server-js/lib && npm run build && cd -
+TSJS_PREBUILT_DIR="$PWD/crates/trusted-server-js/dist" cargo build
 ```
+
+`TSJS_PREBUILT_DIR` is checked the same way as a normal build: every expected
+bundle must be present and non-empty. `TSJS_SKIP_BUILD` is no longer supported.
+
+---
+
+### TSJS build script errors
+
+The `trusted-server-js` build script builds the bundles into a private
+directory under Cargo's `OUT_DIR` and fails rather than embed an incomplete
+set. It never reads `crates/trusted-server-js/dist`, which only `npm run build`
+writes.
+
+| Error message contains                                           | Cause and fix                                                                                                                               |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tsjs: npm not found on PATH`                                    | Node.js is not installed or not on `PATH`. Install Node.js, or set `TSJS_PREBUILT_DIR` as shown above.                                      |
+| `tsjs: TSJS_SKIP_BUILD is no longer supported`                   | Unset `TSJS_SKIP_BUILD` and use `TSJS_PREBUILT_DIR` instead.                                                                                |
+| `tsjs: node_modules is out of date with package-lock.json`       | Dependencies changed, for example after switching branches. Run `npm ci` in `crates/trusted-server-js/lib`.                                 |
+| `tsjs: npm ci failed`                                            | `node_modules` was missing and the automatic install failed. Run `npm ci` in `crates/trusted-server-js/lib` to see the error.               |
+| `tsjs: invalid bundle set ... missing bundles` / `empty bundles` | The Node build or the `TSJS_PREBUILT_DIR` directory did not produce one `tsjs-<id>.js` per `core` and `lib/src/integrations/<id>/index.ts`. |
+| `tsjs: invalid bundle set ... unexpected bundles`                | `TSJS_PREBUILT_DIR` holds bundles from a different source tree. Rebuild it with `npm run build`.                                            |
+
+Set `TSJS_TEST=1` to run the TypeScript tests before the build; a failing test
+fails the build.
 
 ---
 
