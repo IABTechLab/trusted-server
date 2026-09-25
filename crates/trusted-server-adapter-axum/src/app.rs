@@ -858,6 +858,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 mod tests {
     use edgezero_core::http::request_builder;
     use edgezero_core::params::PathParams;
+    // These fixtures supply no integration builders, so they compile the plan
+    // without them rather than through the module-aware compiler the adapter
+    // itself uses.
+    use trusted_server_core::auction::compile_auction_plan;
 
     use super::*;
 
