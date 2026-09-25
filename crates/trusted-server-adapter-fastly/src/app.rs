@@ -104,8 +104,7 @@ use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
-    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
-    compile_auction_plan_with,
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
